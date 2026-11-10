@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sea_orm::{
@@ -73,7 +74,7 @@ async fn race_network_creates(
 ) -> [Result<crate::encryption_network::NetworkDescriptor, EncryptionServiceError>; 2] {
     let backend = Arc::new(BarrierKeyBackend {
         inner: LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32])),
-        generate_barrier: Arc::new(Barrier::new(2)),
+        generate_barrier: Arc::new(GenerateBarrier::new(2)),
     });
     let service = Arc::new(EncryptionService::new(db, NODE_DID.to_string(), backend));
     let owner = owner_did();
@@ -121,9 +122,78 @@ async fn assert_losing_create_ceremony_is_failed(db: &DatabaseConnection) {
     assert!(failed.completed_at.is_some());
 }
 
+struct GenerateBarrier {
+    parties: usize,
+    state: Mutex<GenerateBarrierState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GenerateBarrierState {
+    waiting: usize,
+    released: bool,
+    broken: bool,
+}
+
+impl GenerateBarrier {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: Mutex::new(GenerateBarrierState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), KeyBackendError> {
+        let mut state = self.state.lock().expect("generate barrier mutex poisoned");
+        if state.broken {
+            return Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ));
+        }
+        state.waiting += 1;
+        if state.waiting == self.parties {
+            state.released = true;
+            self.changed.notify_all();
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.released && !state.broken {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            };
+            let (next_state, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("generate barrier mutex poisoned");
+            state = next_state;
+            if timeout.timed_out() && !state.released {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            }
+        }
+
+        if state.broken {
+            Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct BarrierKeyBackend {
     inner: LocalOneOfOneBackend,
-    generate_barrier: Arc<Barrier>,
+    generate_barrier: Arc<GenerateBarrier>,
 }
 
 impl KeyBackend for BarrierKeyBackend {
@@ -132,7 +202,7 @@ impl KeyBackend for BarrierKeyBackend {
     }
 
     fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
-        self.generate_barrier.wait();
+        tokio::task::block_in_place(|| self.generate_barrier.wait())?;
         self.inner.generate()
     }
 
@@ -1359,7 +1429,7 @@ async fn stored_unknown_state_is_refused_as_corrupt() {
 
 // PostgreSQL-backed. Locally these return early unless
 // TINYCLOUD_TEST_POSTGRES_URL is set; CI runs them with a PostgreSQL service.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
     let Some(fixture) = PostgresTestSchema::migrated_through(
         "postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists",
@@ -1371,8 +1441,14 @@ async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_alread
     };
     let db = fixture.connect(4).await;
 
-    let results = race_network_creates(db.clone()).await;
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let results = tokio::time::timeout(Duration::from_secs(30), race_network_creates(db.clone()))
+        .await
+        .expect("concurrent network creation must finish within 30 seconds");
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "results: {results:?}"
+    );
     assert_eq!(
         results
             .iter()
