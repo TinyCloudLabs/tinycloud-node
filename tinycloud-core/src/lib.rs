@@ -47,7 +47,7 @@ pub use db::{
     TxStoreError,
 };
 pub use db_pool::RecoveringConnection;
-pub use encryption::ColumnEncryption;
+pub use encryption::{ColumnEncryption, RowBinding};
 pub use libp2p;
 pub use read_audit::{ReadAuditError, ReadAuditHealth, DEFAULT_READ_AUDIT_WAIT};
 pub use sea_orm;

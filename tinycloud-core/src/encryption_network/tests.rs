@@ -238,7 +238,7 @@ fn unwrap_with_secret(secret: &X25519StaticSecret, wrapped: &[u8]) -> Vec<u8> {
     let pub_peer = PublicKey::from(peer);
     let shared = secret.diffie_hellman(&pub_peer);
     ColumnEncryption::new(*shared.as_bytes())
-        .decrypt(&wrapped[32..])
+        .decrypt_legacy(&wrapped[32..])
         .expect("decrypt rewrapped key")
 }
 

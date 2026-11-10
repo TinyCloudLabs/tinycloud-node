@@ -13,6 +13,7 @@ pub struct Model {
     pub abilities_json: Option<String>,
     pub callback_url: String,
     pub encrypted_secret: Vec<u8>,
+    pub encrypted_secret_format: i16,
     pub secret_key_id: String,
     pub active: bool,
     pub created_at: String,

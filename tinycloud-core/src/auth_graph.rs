@@ -211,7 +211,7 @@ async fn load_closure<C: ConnectionTrait>(
 /// Each branch projects the same columns, with a distinct slot for each
 /// underlying SQL type. In particular, JSON and text never share a UNION
 /// slot, and the legacy model decoders still parse every field in Rust.
-fn snapshot_branch(kind: i32, fields: [SimpleExpr; 12]) -> SelectStatement {
+fn snapshot_branch(kind: i32, fields: [SimpleExpr; 13]) -> SelectStatement {
     let mut query = Query::select();
     query.expr_as(Expr::val(kind), Alias::new("kind"));
     for (name, expr) in [
@@ -224,6 +224,7 @@ fn snapshot_branch(kind: i32, fields: [SimpleExpr; 12]) -> SelectStatement {
         "not_before",
         "facts",
         "serialization",
+        "serialization_format",
         "resource",
         "ability",
         "caveats",
@@ -386,6 +387,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             Expr::col((delegation::Entity, delegation::Column::NotBefore)).into(),
             Expr::col((delegation::Entity, delegation::Column::Facts)).into(),
             Expr::col((delegation::Entity, delegation::Column::Serialization)).into(),
+            Expr::col((delegation::Entity, delegation::Column::SerializationFormat)).into(),
             Expr::col((abilities::Entity, abilities::Column::Resource)).into(),
             Expr::col((abilities::Entity, abilities::Column::Ability)).into(),
             Expr::col((abilities::Entity, abilities::Column::Caveats)).into(),
@@ -401,6 +403,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         [
             field(bounded_name.clone(), child),
             field(bounded_name.clone(), parent),
+            null(),
             null(),
             null(),
             null(),
@@ -427,6 +430,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             Expr::col((delegation::Entity, delegation::Column::NotBefore)).into(),
             Expr::col((delegation::Entity, delegation::Column::Facts)).into(),
             Expr::col((delegation::Entity, delegation::Column::Serialization)).into(),
+            Expr::col((delegation::Entity, delegation::Column::SerializationFormat)).into(),
             null(),
             null(),
             null(),
@@ -454,6 +458,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             null(),
             null(),
             null(),
+            null(),
             Expr::col((abilities::Entity, abilities::Column::Resource)).into(),
             Expr::col((abilities::Entity, abilities::Column::Ability)).into(),
             Expr::col((abilities::Entity, abilities::Column::Caveats)).into(),
@@ -470,7 +475,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .and_where(within_budget());
     query.union(UnionType::All, abilities_query);
     let revocation_fields = || {
-        let mut fields: [SimpleExpr; 12] = std::array::from_fn(|_| null());
+        let mut fields: [SimpleExpr; 13] = std::array::from_fn(|_| null());
         fields[0] = node(lookup_name.clone());
         fields
     };
@@ -602,6 +607,7 @@ impl AuthGraphSnapshot {
                             not_before: row.try_get("", "not_before")?,
                             facts: row.try_get("", "facts")?,
                             serialization: row.try_get("", "serialization")?,
+                            serialization_format: row.try_get("", "serialization_format")?,
                         },
                     );
                 }
@@ -935,6 +941,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -1136,6 +1143,7 @@ mod tests {
                     not_before: Set(None),
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
+                    serialization_format: Set(0),
                 }
                 .insert(db)
                 .await
@@ -1322,7 +1330,7 @@ mod tests {
         // rather than changing unrelated migrations for a query equivalence test.
         for ddl in [
             "CREATE TABLE actor (id VARCHAR(191) PRIMARY KEY)",
-            "CREATE TABLE delegation (id VARBINARY(34) PRIMARY KEY, delegator VARCHAR(191) NOT NULL, delegatee VARCHAR(191) NOT NULL, expiry DATETIME NULL, issued_at DATETIME NULL, not_before DATETIME NULL, facts JSON NULL, serialization BLOB NOT NULL)",
+            "CREATE TABLE delegation (id VARBINARY(34) PRIMARY KEY, delegator VARCHAR(191) NOT NULL, delegatee VARCHAR(191) NOT NULL, expiry DATETIME NULL, issued_at DATETIME NULL, not_before DATETIME NULL, facts JSON NULL, serialization BLOB NOT NULL, serialization_format SMALLINT NOT NULL DEFAULT 0)",
             "CREATE TABLE parent_delegation (child VARBINARY(34) NOT NULL, parent VARBINARY(34) NOT NULL, PRIMARY KEY (parent, child))",
             "CREATE TABLE ability (resource VARCHAR(255) NOT NULL, ability VARCHAR(255) NOT NULL, delegation VARBINARY(34) NOT NULL, caveats JSON NOT NULL, PRIMARY KEY (resource, ability, delegation))",
             "CREATE TABLE revocation (id VARBINARY(34) PRIMARY KEY, revoker VARCHAR(191) NOT NULL, revoked VARBINARY(34) NOT NULL, serialization BLOB NOT NULL, revoked_at DATETIME NULL)",
@@ -1351,6 +1359,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await

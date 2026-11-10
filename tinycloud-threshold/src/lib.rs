@@ -64,6 +64,8 @@ pub use reshare::{
 pub use seal::{CeremonyHpkePublicKey, CeremonyHpkeSecretKey, SealedDealing};
 
 #[cfg(test)]
+mod chain;
+#[cfg(test)]
 mod checkpoint;
 #[cfg(test)]
 mod dkg_relay;

@@ -270,6 +270,7 @@ The following common options are available:
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
+| column_encryption.strict | TINYCLOUD_COLUMN_ENCRYPTION__STRICT | Require authenticated envelopes for recorded legacy columns; default `false`. Recorded v2 columns always require v2. |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 | (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
 
@@ -322,6 +323,15 @@ The keepalive options are set by a vendored, patched sqlx-core 0.8.6 (`vendor/sq
 #### Migrations
 
 TinyCloud Protocol will automatically apply the relevant migrations to your chosen SQL database. Use caution if you are sharing this database with another application.
+
+New encrypted delegation, invocation (including read-audit), share-policy and
+webhook-secret writes use the v2 column format with key ids and row-bound
+authentication. Columns and webhook secrets use separate derived keys. Format
+metadata is stored alongside each value; existing rows retain format `0`.
+Existing v1 values remain readable. Set `strict = true` in
+`[global.column_encryption]` to require authenticated legacy reads as well.
+Startup adds format metadata without rewriting existing values. Details:
+TC-2516, TC-2517.
 
 ### Staging Config
 

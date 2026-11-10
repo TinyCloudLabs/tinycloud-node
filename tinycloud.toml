@@ -93,6 +93,11 @@ cors = true
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
 
+[global.column_encryption]
+    ## Require encrypted values on recorded column reads. Off preserves legacy plaintext.
+    ## Env: TINYCLOUD_COLUMN_ENCRYPTION__STRICT
+    strict = false
+
 [global.encryption_network]
     ## Emit TCW2 response wraps independently of incoming-wrap policy.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2

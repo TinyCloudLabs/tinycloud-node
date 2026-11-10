@@ -427,7 +427,7 @@ pub fn wrap_to_public_key(
     let cipher = ColumnEncryption::new(*shared.as_bytes());
     let mut envelope = Vec::with_capacity(32 + plaintext.len() + 32);
     envelope.extend_from_slice(ephemeral_pub.as_bytes());
-    let ct = cipher.encrypt(plaintext);
+    let ct = cipher.encrypt_legacy(plaintext);
     envelope.extend_from_slice(&ct);
     Ok(envelope)
 }
@@ -457,7 +457,7 @@ fn unwrap_with_secret(secret: &StaticSecret, wrapped: &[u8]) -> Result<Vec<u8>, 
         return Err(KeyBackendError::NonContributory);
     }
     let cipher = ColumnEncryption::new(*shared.as_bytes());
-    Ok(cipher.decrypt_strict(&wrapped[32..])?)
+    Ok(cipher.decrypt_legacy(&wrapped[32..])?)
 }
 
 const NAMED_KEY_SALT: &[u8] = b"tinycloud.encryption.named-key/v1";
@@ -538,7 +538,7 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         sealed_private_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt_strict(sealed_private_key)?);
+        let opened = Zeroizing::new(self.seal.decrypt_legacy(sealed_private_key)?);
         if opened.len() != 32 {
             return Err(KeyBackendError::InvalidSealedKey);
         }
@@ -552,7 +552,7 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
-        let sealed = self.seal.encrypt(secret.as_bytes());
+        let sealed = self.seal.encrypt_legacy(secret.as_bytes());
         Ok(GeneratedKey {
             public_key: public.as_bytes().to_vec(),
             sealed_private_key: sealed,
@@ -597,12 +597,12 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
         let mut bytes = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(bytes.as_mut_slice());
-        let sealed = self.seal.encrypt(bytes.as_slice());
+        let sealed = self.seal.encrypt_legacy(bytes.as_slice());
         Ok((KeySeed::from_bytes(*bytes), sealed))
     }
 
     fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt_strict(sealed_seed)?);
+        let opened = Zeroizing::new(self.seal.decrypt_legacy(sealed_seed)?);
         let bytes: [u8; 32] = opened
             .as_slice()
             .try_into()
@@ -1010,6 +1010,17 @@ mod tests {
     }
 
     #[test]
+    fn network_key_opening_requires_a_legacy_seal() {
+        let backend = LocalOneOfOneBackend::new(seal_key());
+        assert!(backend.open_network_secret(&[0x42; 32]).is_err());
+        let generated = backend.generate().unwrap();
+        assert_eq!(generated.sealed_private_key[0], 1);
+        assert!(backend
+            .open_network_secret(&generated.sealed_private_key)
+            .is_ok());
+    }
+
+    #[test]
     fn rewrap_to_receiver_key() {
         let backend = LocalOneOfOneBackend::new(seal_key());
         let symmetric = [0x12u8; 32];
@@ -1311,7 +1322,7 @@ mod tests {
             );
         }
         // A sealed value that is not 32 bytes is refused.
-        let short = ColumnEncryption::new([7u8; 32]).encrypt(&[1u8; 16]);
+        let short = ColumnEncryption::new([7u8; 32]).encrypt_legacy(&[1u8; 16]);
         assert!(matches!(
             backend.open_seed(&short),
             Err(KeyBackendError::InvalidSealedKey)
