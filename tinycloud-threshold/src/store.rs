@@ -116,6 +116,9 @@ struct State {
     seen_ceremonies: Vec<CeremonyId>,
     retired: Vec<RetiredGeneration>,
     seq: u64,
+    /// Activated equivocation froze the store; terminal and durable — it
+    /// outlives the loss of the fork evidence itself.
+    frozen: bool,
 }
 
 fn encode_state(state: &State) -> Vec<u8> {
@@ -159,6 +162,7 @@ fn encode_state(state: &State) -> Vec<u8> {
         e.u64(retired.erased_at);
     }
     e.u64(state.seq);
+    e.u8(u8::from(state.frozen));
     e.finish()
 }
 
@@ -223,6 +227,7 @@ fn decode_state(bytes: &[u8]) -> Result<State, StoreError> {
         });
     }
     let seq = d.u64()?;
+    let frozen = d.u8()? == 1;
     d.finish()?;
     Ok(State {
         pin,
@@ -231,6 +236,7 @@ fn decode_state(bytes: &[u8]) -> Result<State, StoreError> {
         seen_ceremonies,
         retired,
         seq,
+        frozen,
     })
 }
 
@@ -636,6 +642,10 @@ impl ShareStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e.into()),
         };
+        // The decoded record before any in-memory bookkeeping: if a freeze
+        // is discovered the persist write must carry only the flag flip —
+        // never incidental mutations like orphan dealt-marker recording.
+        let decoded_state = state.clone();
         let mut state_dirty = false;
 
         // Orphan dealt markers: a marker whose id was never recorded consumed
@@ -684,7 +694,10 @@ impl ShareStore {
         // pin at the fork.
         let mut verified: BTreeMap<CertDigest, VerifiedCertificate> = BTreeMap::new();
         let mut chain: Vec<CertDigest> = Vec::new();
-        let mut equivocation = false;
+        // A durably-frozen store stays frozen even when the fork evidence
+        // itself is later lost; the freeze is terminal by record, not by
+        // recomputation.
+        let mut equivocation = state.frozen;
         // Every flagged activation is verified before it can extend the pin
         // or count toward a fork; an activation flag alone proves nothing.
         let mut geneses: Vec<VerifiedCertificate> = Vec::new();
@@ -783,10 +796,14 @@ impl ShareStore {
 
         // A recorded pin must be a verified activated certificate: either on
         // the surviving chain or an equivocated branch descendant. Anything
-        // else is corruption.
-        if let Some(recorded) = state.pin {
-            if !verified.contains_key(&recorded) {
-                return Err(StoreError::Corrupt);
+        // else is corruption. A durably frozen store skips the check: the
+        // freeze is terminal and the pin's own proof may legitimately be
+        // the evidence that was lost.
+        if !state.frozen {
+            if let Some(recorded) = state.pin {
+                if !verified.contains_key(&recorded) {
+                    return Err(StoreError::Corrupt);
+                }
             }
         }
 
@@ -802,6 +819,15 @@ impl ShareStore {
             && computed_pin.is_some_and(|tip| state.retired.iter().any(|r| r.digest == tip))
         {
             equivocation = true;
+        }
+        // Persist a newly-discovered freeze before honoring it: the freeze
+        // is terminal, so it must outlive the evidence that produced it.
+        if equivocation && !state.frozen {
+            state = State {
+                frozen: true,
+                ..decoded_state
+            };
+            write_atomic(&network_dir.join("state"), &encode_state(&state))?;
         }
 
         // Candidate reconciliation and R1/C2/S1 erasure run ONLY on an
@@ -898,7 +924,12 @@ impl ShareStore {
                 if verified.contains_key(&digest) {
                     // Superseded activated generation (R1).
                     if !state.retired.iter().any(|r| r.digest == digest) {
-                        let predecessor = proofs[&digest].body.previous().copied();
+                        let predecessor = proofs
+                            .get(&digest)
+                            .ok_or(StoreError::Corrupt)?
+                            .body
+                            .previous()
+                            .copied();
                         record_retired(&mut state, digest, predecessor);
                         state.pin = computed_pin;
                         write_atomic(&network_dir.join("state"), &encode_state(&state))?;
@@ -1151,6 +1182,8 @@ impl ShareStore {
                     &proof_path(&self.network_dir, &fork.digest()),
                     &encode_proof(signed, Some(activation), receipts),
                 )?;
+                inner.state.frozen = true;
+                write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
                 inner.equivocation = true;
                 return Err(StoreError::Equivocation);
             }
@@ -1165,6 +1198,8 @@ impl ShareStore {
                 &proof_path(&self.network_dir, &root.digest()),
                 &encode_proof(signed, Some(activation), receipts),
             )?;
+            inner.state.frozen = true;
+            write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
             inner.equivocation = true;
             return Err(StoreError::Equivocation);
         }
@@ -2615,6 +2650,7 @@ mod tests {
                 take(8, &mut cur)?; // erased_at
             }
             take(8, &mut cur)?; // seq
+            take(1, &mut cur)?; // frozen (v3)
             if cur != bytes.len() {
                 return None;
             }
@@ -2785,9 +2821,15 @@ mod tests {
                 // pin, candidate (with its receipt flag, I6) and the
                 // admissible ceremony are exactly what the disk records.
                 if let Some(p) = &parsed {
+                    // Under freeze the disk pin is the recorded freeze
+                    // point — the model's own tip may project further.
+                    let expected_pin = if m.frozen {
+                        m.frozen_pin
+                    } else {
+                        m.pins.last().map(|p| p.digest())
+                    };
                     assert_eq!(
-                        p.pin,
-                        m.pins.last().map(|p| p.digest()),
+                        p.pin, expected_pin,
                         "seed {seed} step {step}: disk pin diverged from model"
                     );
                     assert_eq!(
@@ -2799,11 +2841,10 @@ mod tests {
                         "seed {seed} step {step}: disk admissible ceremony diverged"
                     );
                     // Rule 7 tail: `retired` never names a live generation.
-                    let pin_d = m.pins.last().map(|p| p.digest());
                     let pend_d = m.pending.map(|(d, _)| d);
                     for r in &p.retired {
                         assert!(
-                            Some(CertDigest::new(*r)) != pin_d
+                            Some(CertDigest::new(*r)) != expected_pin
                                 && Some(CertDigest::new(*r)) != pend_d,
                             "seed {seed} step {step}: retired names a live share"
                         );
@@ -2825,9 +2866,12 @@ mod tests {
                     );
                     // The recorded pin stands — it may be an older
                     // generation than the model's tip when a late fault
-                    // moved the model past the durable write.
+                    // moved the model past the durable write. The durable
+                    // record is the truth: when a fault also destroyed the
+                    // pin's own proof there is no cert to expose, and
+                    // `pinned()` can only offer the chain tip.
                     assert_eq!(
-                        store.pinned().map(|p| p.digest()),
+                        parsed.and_then(|p| p.pin),
                         m.frozen_pin,
                         "seed {seed} step {step}: frozen pin moved"
                     );
@@ -3025,6 +3069,12 @@ mod tests {
                 let parsed = fs::read(self.ndir().join("state"))
                     .ok()
                     .and_then(|b| parse_state(&b));
+                // A rollback may land on a backup that predates a recorded
+                // retirement: the disk's retired set replaces the model's,
+                // matching what the restored store actually refuses.
+                if let Some(p) = &parsed {
+                    self.model.retired = p.retired.clone();
+                }
                 let store = self.store.as_ref().unwrap();
                 if store.equivocation() {
                     // The freeze point is recorded once: everything after
@@ -3041,14 +3091,28 @@ mod tests {
                                 .position(|p| p.digest() == pin.digest());
                             if let Some(pos) = pos {
                                 self.model.pins.truncate(pos + 1);
+                            } else {
+                                // The recorded pin is off the model chain — a
+                                // rollback to an older backup that already
+                                // named a chain the model never built. Keep
+                                // the longest prefix whose tip is still on
+                                // disk; nothing can extend the foreign tip.
+                                let keep = self
+                                    .model
+                                    .pins
+                                    .iter()
+                                    .position(|p| !proof_path(&self.ndir(), &p.digest()).exists())
+                                    .unwrap_or(self.model.pins.len());
+                                self.model.pins.truncate(keep);
                             }
                         }
                         None => self.model.pins.clear(),
                     }
-                    if self.model.frozen_pin.is_none() {
-                        self.model.frozen_pin = store.pinned().map(|p| p.digest());
-                        self.model.frozen_files = Some(self.share_files());
-                    }
+                    // A rollback can land before the old freeze — the
+                    // freeze point is per-timeline: re-record it on every
+                    // frozen resync, not only the first.
+                    self.model.frozen_pin = parsed.as_ref().and_then(|p| p.pin);
+                    self.model.frozen_files = Some(self.share_files());
                     self.model.frozen = true;
                     // Frozen resync still reads what the disk records: the
                     // state file is the durable truth for pending/active
@@ -3057,7 +3121,15 @@ mod tests {
                     self.model.pending = parsed.as_ref().and_then(|p| p.candidate);
                     return;
                 }
+                // Thaw is only honest when the operator's rollback removed
+                // the freeze's basis — restore to a pre-fork world. Reset
+                // the model's freeze bookkeeping for the new timeline.
                 let m = &mut self.model;
+                if m.frozen {
+                    m.frozen = false;
+                    m.frozen_pin = None;
+                    m.frozen_files = None;
+                }
                 match store.pinned() {
                     Some(pin) => {
                         if let Some(pos) = m.pins.iter().position(|p| p.digest() == pin.digest()) {
@@ -3138,11 +3210,18 @@ mod tests {
                         "seed {seed} step {step}: frozen open erased a share"
                     );
                 }
+                // `state` may differ only in the trailing durable-freeze
+                // byte — the one write an open that newly discovers
+                // equivocation is required to make.
                 let state_after = fs::read(self.ndir().join("state")).ok();
-                if let Some(before) = state_before {
-                    assert_eq!(
-                        before.as_slice(),
-                        state_after.as_deref().unwrap_or(&[]),
+                if let (Some(before), Some(after)) = (state_before, state_after) {
+                    let freeze_write = before.len() == after.len()
+                        && before[..before.len().saturating_sub(1)]
+                            == after[..after.len().saturating_sub(1)]
+                        && *before.last().unwrap_or(&1) == 0
+                        && *after.last().unwrap_or(&0) == 1;
+                    assert!(
+                        *before == after || freeze_write,
                         "seed {seed} step {step}: frozen open rewrote state"
                     );
                 }
@@ -4399,6 +4478,7 @@ mod tests {
             seen_ceremonies: Vec::new(),
             retired: Vec::new(),
             seq: 0,
+            frozen: false,
         };
         // One reachable entry + a pile of dead ones.
         record_retired(&mut state, CertDigest::new([0xAA; 32]), Some(pin));
