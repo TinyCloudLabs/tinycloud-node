@@ -32,6 +32,7 @@ pub mod ids;
 mod poly;
 pub mod reshare;
 pub mod seal;
+pub mod store;
 
 pub use activation::{
     activation_preimage, readiness_preimage, verify_activation, ReadinessReceipt, ReadyQuorum,
