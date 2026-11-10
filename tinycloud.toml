@@ -99,6 +99,12 @@ cors = true
     strict = false
 
 [global.encryption_network]
+    ## Emit TCW2 response wraps independently of incoming-wrap policy.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2
+    key_wrap_v2 = false
+    ## Require TCW2 incoming network-key wraps; receiver responses are independent.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_REQUIRE_V2
+    key_wrap_require_v2 = false
     ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
     ## GET /info. Only while on are the key routes mounted, key and key-prefix
     ## resources accepted in delegations and named-key decrypt served on

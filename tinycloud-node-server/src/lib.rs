@@ -835,7 +835,9 @@ pub async fn app_with_control(
         database_connection.clone(),
         node_keypair,
         encryption_backend,
-    );
+    )
+    .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
+    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2);
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.

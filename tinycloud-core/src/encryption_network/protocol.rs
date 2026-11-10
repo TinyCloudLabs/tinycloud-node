@@ -37,6 +37,7 @@ pub struct DecryptRequestBody {
     pub target_node: String,
     #[serde(rename = "networkId")]
     pub network_id: NetworkId,
+    /// Algorithm of `encryptedSymmetricKey`, independent of descriptor/response algorithms.
     pub alg: String,
     #[serde(rename = "keyVersion")]
     pub key_version: i64,
@@ -72,6 +73,7 @@ pub struct DecryptResponseBody {
     /// Base64-encoded symmetric key wrapped to the receiver public key.
     #[serde(rename = "wrappedKey")]
     pub wrapped_key: String,
+    /// Algorithm of the returned wrap, selected by the node's writer setting.
     pub alg: String,
     #[serde(rename = "keyVersion")]
     pub key_version: i64,

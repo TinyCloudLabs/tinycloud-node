@@ -2405,3 +2405,308 @@ async fn postgres_key_writes_wait_for_the_network_row_lock() {
         result.unwrap_or_else(|e| panic!("{operation}: {e}"));
     }
 }
+
+#[tokio::test]
+async fn plaintext_stored_network_secret_is_refused() {
+    use crate::models::encryption_network;
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    let net = network_id();
+    let secret = X25519StaticSecret::from([7u8; 32]);
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(net.to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.public_key = Set(PublicKey::from(&secret).as_bytes().to_vec());
+    row.sealed_private_key = Set(Some(secret.as_bytes().to_vec()));
+    row.update(&db).await.unwrap();
+    let ctx = make_client_request(PublicKey::from(&secret).as_bytes());
+    let (_, body) = build_body(&ctx, &net);
+    let invocation = build_invocation(&net, &body, &ctx, |_| {});
+    assert!(matches!(
+        svc.decrypt(&net, &invocation, &body).await,
+        Err(EncryptionServiceError::Backend(
+            super::backend::KeyBackendError::SealedKeyUnreadable
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn wrap_versions_are_independent_on_native_root_and_named_decrypt() {
+    use super::backend::{
+        open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
+        KeyWrapVersion,
+    };
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
+        for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
+            for path in ["", "docs/alpha", "apps/notes/alpha"] {
+                let svc = make_service(fresh_db().await)
+                    .with_key_wrap_v2(writer_v2)
+                    .with_key_wrap_require_v2(require_v2);
+                create_network(&svc).await;
+                let net = network_id();
+                let public = if path.is_empty() {
+                    svc.get_network(&net).await.unwrap().public_encryption_key
+                } else {
+                    svc.create_key(&key_loc(path), path.starts_with("apps/"))
+                        .await
+                        .unwrap()
+                        .public_encryption_key
+                };
+                assert_eq!(
+                    svc.get_network(&net).await.unwrap().alg,
+                    ALG_X25519_AES256GCM
+                );
+                let network = net.to_string();
+                let metadata = BTreeMap::from([("contentType".into(), "text/plain".into())]);
+                let context = KeyWrapContext {
+                    purpose: KeyWrapPurpose::NetworkKey,
+                    network_id: &network,
+                    key_path: path,
+                    key_version: 1,
+                    metadata: Some(&metadata),
+                };
+                let mut ctx = make_client_request(&public);
+                ctx.wrapped_key =
+                    wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                        .unwrap();
+                let (mut body, _) = build_body(&ctx, &net);
+                body.alg = incoming.alg().to_string();
+                body.key_path = (!path.is_empty()).then(|| path.to_string());
+                let body_value = serde_json::to_value(&body).unwrap();
+                let facts = serde_json::to_value(DecryptFacts {
+                    ty: DECRYPT_REQUEST_TYPE.into(),
+                    target_node: NODE_DID.into(),
+                    network_id: net.clone(),
+                    body_hash: canonical_hash(&body_value),
+                    encrypted_symmetric_key_hash: body.encrypted_symmetric_key_hash.clone(),
+                    receiver_public_key_hash: body.receiver_public_key_hash.clone(),
+                    alg: body.alg.clone(),
+                    key_version: 1,
+                    key_path: body.key_path.clone(),
+                })
+                .unwrap();
+                let target = if path.is_empty() {
+                    DecryptTarget::Root(net.clone())
+                } else {
+                    DecryptTarget::from_resource(&canonical_key_urn(&key_loc(path))).unwrap()
+                };
+                let resource = if path.is_empty() {
+                    network.clone()
+                } else {
+                    canonical_key_urn(&key_loc(path))
+                };
+                let invocation =
+                    build_session_invocation_for(&resource, DECRYPT_ACTION, vec![facts], NODE_DID);
+                let preflight = svc
+                    .validate_authorized_decrypt_request(&target, &invocation, &body_value)
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        preflight,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                } else {
+                    preflight.unwrap();
+                }
+                let result = svc
+                    .decrypt_authorized(&target, &invocation, &body_value)
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        result,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                    continue;
+                }
+                let response = result.unwrap().response;
+                let output_version = if writer_v2 {
+                    KeyWrapVersion::V2
+                } else {
+                    KeyWrapVersion::V1
+                };
+                assert_eq!(response.alg, output_version.alg());
+                let empty = BTreeMap::new();
+                let expected = KeyWrapContext {
+                    purpose: KeyWrapPurpose::ReceiverKey,
+                    metadata: Some(&empty),
+                    ..context
+                };
+                assert_eq!(
+                    open_wrapped_key(
+                        &ctx.receiver_secret,
+                        &STANDARD.decode(response.wrapped_key).unwrap(),
+                        &expected
+                    )
+                    .unwrap(),
+                    ctx.symmetric,
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn standalone_decrypt_reads_both_versions_and_uses_writer_flag() {
+    use super::backend::{
+        open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
+        KeyWrapVersion,
+    };
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
+        for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
+            let svc = make_service(fresh_db().await)
+                .with_key_wrap_v2(writer_v2)
+                .with_key_wrap_require_v2(require_v2);
+            create_network(&svc).await;
+            let net = network_id();
+            let public = svc.get_network(&net).await.unwrap().public_encryption_key;
+            let network = net.to_string();
+            let empty = BTreeMap::new();
+            let context = KeyWrapContext {
+                purpose: KeyWrapPurpose::NetworkKey,
+                network_id: &network,
+                key_path: "",
+                key_version: 1,
+                metadata: Some(&empty),
+            };
+            let mut ctx = make_client_request(&public);
+            ctx.wrapped_key =
+                wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                    .unwrap();
+            let (mut body, _) = build_body(&ctx, &net);
+            body.alg = incoming.alg().into();
+            let body_value = serde_json::to_value(body).unwrap();
+            let inv = build_invocation(&net, &body_value, &ctx, |inv| {
+                inv.facts.alg = incoming.alg().into()
+            });
+            let result = svc.decrypt(&net, &inv, &body_value).await;
+            if require_v2 && incoming == KeyWrapVersion::V1 {
+                assert!(matches!(
+                    result,
+                    Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                ));
+                continue;
+            }
+            let response = result.unwrap().response;
+            assert_eq!(
+                response.alg,
+                if writer_v2 {
+                    KeyWrapVersion::V2.alg()
+                } else {
+                    KeyWrapVersion::V1.alg()
+                }
+            );
+            let expected = KeyWrapContext {
+                purpose: KeyWrapPurpose::ReceiverKey,
+                ..context
+            };
+            assert_eq!(
+                open_wrapped_key(
+                    &ctx.receiver_secret,
+                    &STANDARD.decode(response.wrapped_key).unwrap(),
+                    &expected
+                )
+                .unwrap(),
+                ctx.symmetric
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_decrypt_checks_wrap_context_and_outer_algorithm() {
+    use super::backend::{
+        wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose, KeyWrapVersion,
+    };
+    for path in ["", "docs/alpha", "apps/notes/alpha"] {
+        for mismatch in [
+            "network",
+            "path",
+            "version",
+            "purpose",
+            "algorithm",
+            "algorithm-v1",
+        ] {
+            let svc = make_service(fresh_db().await);
+            create_network(&svc).await;
+            let net = network_id();
+            let network = net.to_string();
+            let public = if path.is_empty() {
+                svc.get_network(&net).await.unwrap().public_encryption_key
+            } else {
+                svc.create_key(&key_loc(path), path.starts_with("apps/"))
+                    .await
+                    .unwrap()
+                    .public_encryption_key
+            };
+            let context = KeyWrapContext {
+                purpose: if mismatch == "purpose" {
+                    KeyWrapPurpose::ReceiverKey
+                } else {
+                    KeyWrapPurpose::NetworkKey
+                },
+                network_id: if mismatch == "network" {
+                    "urn:tinycloud:encryption:did:key:z6Mk:other"
+                } else {
+                    &network
+                },
+                key_path: if mismatch == "path" {
+                    "docs/beta"
+                } else {
+                    path
+                },
+                key_version: if mismatch == "version" { 2 } else { 1 },
+                metadata: None,
+            };
+            let mut ctx = make_client_request(&public);
+            let incoming = if mismatch == "algorithm-v1" {
+                KeyWrapVersion::V1
+            } else {
+                KeyWrapVersion::V2
+            };
+            ctx.wrapped_key =
+                wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                    .unwrap();
+            let (mut body, _) = build_body(&ctx, &net);
+            body.key_path = (!path.is_empty()).then(|| path.to_string());
+            body.alg = if mismatch == "algorithm" {
+                KeyWrapVersion::V1
+            } else {
+                KeyWrapVersion::V2
+            }
+            .alg()
+            .into();
+            let body_value = serde_json::to_value(&body).unwrap();
+            let facts = serde_json::to_value(DecryptFacts {
+                ty: DECRYPT_REQUEST_TYPE.into(),
+                target_node: NODE_DID.into(),
+                network_id: net.clone(),
+                body_hash: canonical_hash(&body_value),
+                encrypted_symmetric_key_hash: body.encrypted_symmetric_key_hash.clone(),
+                receiver_public_key_hash: body.receiver_public_key_hash.clone(),
+                alg: body.alg.clone(),
+                key_version: 1,
+                key_path: body.key_path.clone(),
+            })
+            .unwrap();
+            let resource = if path.is_empty() {
+                network.clone()
+            } else {
+                canonical_key_urn(&key_loc(path))
+            };
+            let target = DecryptTarget::from_resource(&resource).unwrap();
+            let invocation =
+                build_session_invocation_for(&resource, DECRYPT_ACTION, vec![facts], NODE_DID);
+            assert!(
+                svc.decrypt_authorized(&target, &invocation, &body_value)
+                    .await
+                    .is_err(),
+                "{path}: {mismatch}"
+            );
+        }
+    }
+}
