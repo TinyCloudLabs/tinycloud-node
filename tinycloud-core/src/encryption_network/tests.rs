@@ -2752,3 +2752,37 @@ async fn serving_named_unwrap_refuses_seed_transplant() {
         Err(EncryptionServiceError::CorruptKeyRow)
     ));
 }
+
+#[tokio::test]
+async fn cond_legacy_network_returns_clear_migration_required() {
+    let (db, svc) = service_with_network().await;
+    use crate::models::encryption_network;
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(network_id().to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.sealed_private_key = Set(Some(
+        ColumnEncryption::new([0xAB; 32]).encrypt_legacy(&[42; 32]),
+    ));
+    row.update(&db).await.unwrap();
+    let loc = KeyLocation::new(&network_id(), "docs/migration").unwrap();
+    let err = svc.public_key(&loc).await.unwrap_err();
+    assert!(err.to_string().starts_with("migration_required:"));
+}
+
+#[tokio::test]
+async fn cond_legacy_seed_returns_clear_migration_required() {
+    let (db, svc) = service_with_network().await;
+    let loc = KeyLocation::new(&network_id(), "apps/app/migration").unwrap();
+    svc.create_key(&loc, true).await.unwrap();
+    let mut row: encryption_network_key::ActiveModel = key_row(&db, loc.path()).await.into();
+    row.sealed_seed = Set(Some(
+        ColumnEncryption::new([0xAB; 32]).encrypt_legacy(&[43; 32]),
+    ));
+    row.update(&db).await.unwrap();
+    let err = svc.unwrap_named_key(&loc, &[0; 64], 1).await.unwrap_err();
+    assert!(err.to_string().starts_with("migration_required:"));
+}

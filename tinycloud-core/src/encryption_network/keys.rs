@@ -614,7 +614,12 @@ impl EncryptionService {
                 Some(
                     self.backend
                         .open_seed(sealed_seed, &row.network_id, &row.key_path)
-                        .map_err(|_| EncryptionServiceError::CorruptKeyRow)?,
+                        .map_err(|err| match err {
+                            KeyBackendError::MigrationRequired => {
+                                EncryptionServiceError::MigrationRequired
+                            }
+                            _ => EncryptionServiceError::CorruptKeyRow,
+                        })?,
                 )
             }
         };

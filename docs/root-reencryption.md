@@ -7,6 +7,20 @@ activation flag, or change to the current ROOT acquisition path. The injectable
 the existing generation 1 ROOT and the exact legacy column and seal keys.
 Existing serving configuration continues selecting its existing keys.
 
+## Deployment restriction
+
+This PR must ship only as part of the TC-2713 rotation event. Do not deploy it
+standalone to a node holding v1 network-key or seed rows. Before deployment,
+the rotation integration must have a production-wired migration runner, a
+verified snapshot manifest and custody record, and an offline migration window
+with serving stopped. Migrate and verify all existing material before resuming
+serving. Unmigrated v1 requests return HTTP 503 with `migration_required`.
+
+The library's `manifest::run_offline` entry verifies a file and its separately
+supplied digest before any database access, checks manifest coverage, and drives
+the fenced job. It does not acquire production roots or install new serving
+rings. Those integration steps remain prerequisites for the rotation event.
+
 ## Storage behavior
 
 Column and webhook keys retain #535's HKDF salt and purpose labels. A new
@@ -30,30 +44,39 @@ Network private-key bindings include `network_id`; seed bindings include
 verify the network private key against the row's public key. Named-key opens
 also check the derived public key against the key row. Serving rejects v1 private-key
 and seed seals. Only the migration may decode legacy seals after checking the
-independent witnesses described below; rewritten seals use PK-bound v2.
+verified external manifest described below; rewritten seals use PK-bound v2.
 Every migrated value is authenticated and checked for byte-for-byte plaintext
 equality after it is written back.
 
 ## Legacy seal migration prerequisites
 
-Before re-sealing a v1 network private key, the migration requires exactly one
-`initial` ceremony for its network. The ceremony must be completed, record its
-completion, and have `transcript_hash = hash_hex(public_key)`. The unsealed
-private key must also derive that public key. Missing, duplicate, conflicting,
-incomplete or mismatching ceremony evidence aborts the page before re-sealing.
+Both networks and seeds require one externally pinned manifest from a dated,
+trusted PlanetScale backup of `tinycloud-node-production-usw`, exported from a
+local restored snapshot. The [manifest format and export procedure](rekey-manifest.md)
+define its canonical encoding, snapshot checksum, custodian and custody record.
+The expected manifest SHA-256 must be recorded separately before the window.
+The target database must never supply its own trusted identities or expected pin.
 
-V1 named-key seeds require a caller-supplied `TrustedSeedIdentities` map keyed by
-`(network_id, key_path, key_version)`. Populate it only from an independently
-authenticated external manifest or equivalent trusted creation evidence. The
-migration does not supply a manifest automatically, and the rows being migrated
-must never be used to synthesize it. Each supplied public key must match the key
-derived from the unsealed seed and the registered row public key.
+`VerifiedManifest` can be constructed only by checking the bytes against that
+separate pin, the required provenance metadata, canonical encoding and identities.
+Every `step` accepts this verified input, with no raw-map constructor or fallback.
+For v1 network seals, the manifest entry `(network_id, key_version)` must equal
+the stored public key and the public key derived from the private key. For v1
+seeds, `(network_id, key_path, key_version)` must equal the derived named-key
+public key and the stored public key.
 
-Pass this map explicitly to every `step` call. An empty map supplies no legacy
-seed witnesses: a missing or mismatching entry aborts the page, preserves its
-checkpoint, and prevents completion and old-root retirement. Serving requests
-for unmigrated v1 seals fail closed until the witnessed migration succeeds.
-Client-wrapped key v1 and v2 protocols remain unchanged.
+Network ceremonies are additional database consistency checks, not independent
+provenance. Exactly one completed `initial` ceremony, a completion record, no
+failure and `transcript_hash = hash_hex(public_key)` are required in addition to
+the external manifest. A missing or mismatching manifest entry or inconsistent
+ceremony aborts the page, preserves ciphertext/checkpoint, and prevents completion
+and old-root retirement.
+
+The runner reports missing or mismatched identities as counts-only blocking
+coverage categories; it never skips them. Networks or seeds created after the
+snapshot require a fresh trusted snapshot immediately before the migration
+window. Authenticated client-held public-key pins may become a later second
+source. Client-wrapped key v1 and v2 protocols remain unchanged.
 
 ## Activation and recovery
 

@@ -783,6 +783,7 @@ fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
 
 pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
     let status = match err {
+        EncryptionServiceError::MigrationRequired => Status::ServiceUnavailable,
         EncryptionServiceError::NetworkNotFound => Status::NotFound,
         EncryptionServiceError::NetworkAlreadyExists => Status::Conflict,
         EncryptionServiceError::Db(_) => Status::InternalServerError,
@@ -823,3 +824,28 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
 
 #[cfg(feature = "dstack")]
 pub fn _docs() {}
+
+#[cfg(test)]
+mod migration_required_tests {
+    use super::*;
+    use tinycloud_core::encryption::ColumnEncryption;
+    use tinycloud_core::encryption_network::backend::{KeyBackend, LocalOneOfOneBackend};
+
+    #[test]
+    fn legacy_seals_have_a_clear_unavailable_response() {
+        let ring = ColumnEncryption::new([7; 32]);
+        let legacy = ring.encrypt_legacy(&[42; 32]);
+        let backend = LocalOneOfOneBackend::new(ring);
+        for err in [
+            backend
+                .open_network_secret(&legacy, "network", &[0; 32])
+                .err()
+                .unwrap(),
+            backend.open_seed(&legacy, "network", "path").err().unwrap(),
+        ] {
+            let (status, message) = map_service_err(EncryptionServiceError::from(err));
+            assert_eq!(status, Status::ServiceUnavailable);
+            assert!(message.starts_with("migration_required:"));
+        }
+    }
+}

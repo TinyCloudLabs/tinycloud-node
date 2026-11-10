@@ -13,11 +13,18 @@ fn rings() -> Rings {
     Rings::from_source(&Source, [8; 32], [7; 32], [9; 32]).unwrap()
 }
 // Test identities come from trusted creation inputs, never queried row fields.
-fn trusted_seed_identities() -> TrustedSeedIdentities {
-    let mut trusted = TrustedSeedIdentities::new();
+fn trusted_document() -> manifest::Document {
+    let mut rows = Vec::new();
     let backend = LocalOneOfOneBackend::new(rings().seals);
     for (name, byte) in [("alpha", 31), ("beta", 32)] {
         let network = NetworkId::new(OWNER, name).unwrap();
+        rows.push(manifest::IdentityRow {
+            kind: manifest::Kind::Network,
+            network_id: network.to_string(),
+            key_path: None,
+            key_version: 1,
+            public_key: hex::encode(PublicKey::from(&StaticSecret::from([byte; 32])).as_bytes()),
+        });
         for path in ["apps/app/a", "apps/app/z"] {
             let location = KeyLocation::new(&network, path).unwrap();
             let public = backend
@@ -27,13 +34,53 @@ fn trusted_seed_identities() -> TrustedSeedIdentities {
                     Some(&KeySeed::from_bytes([43; 32])),
                 )
                 .unwrap();
-            trusted.insert(
-                (network.to_string(), path.to_string(), 1),
-                public.try_into().unwrap(),
-            );
+            rows.push(manifest::IdentityRow {
+                kind: manifest::Kind::Seed,
+                network_id: network.to_string(),
+                key_path: Some(path.into()),
+                key_version: 1,
+                public_key: hex::encode(public),
+            });
         }
     }
-    trusted
+    rows.sort();
+    manifest::Document {
+        version: 1,
+        provenance: manifest::Provenance {
+            source_database: "tinycloud-node-production-usw".into(),
+            backup_id: "test-backup".into(),
+            snapshot_timestamp: "2026-01-01T00:00:00Z".into(),
+            snapshot_sha256: crate::encryption_network::canonical::hash_hex(
+                b"trusted test snapshot",
+            ),
+            exported_by: "test-custodian".into(),
+            storage_location: "test-snapshot://fixture".into(),
+            custody_record: "test-custody://record".into(),
+        },
+        rows,
+    }
+}
+fn verify_document(mut document: manifest::Document) -> VerifiedManifest {
+    document.rows.sort();
+    let bytes = serde_json::to_vec(&document).unwrap();
+    VerifiedManifest::verify(
+        &bytes,
+        &crate::encryption_network::canonical::hash_hex(&bytes),
+    )
+    .unwrap()
+}
+fn trusted_seed_identities() -> VerifiedManifest {
+    verify_document(trusted_document())
+}
+fn empty_manifest() -> VerifiedManifest {
+    let mut doc = trusted_document();
+    doc.rows.clear();
+    verify_document(doc)
+}
+fn seedless_manifest() -> VerifiedManifest {
+    let mut doc = trusted_document();
+    doc.rows.retain(|r| r.kind == manifest::Kind::Network);
+    verify_document(doc)
 }
 async fn database() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -907,15 +954,11 @@ async fn missing_legacy_seed_witness_case(db: &DatabaseConnection) {
     fixtures(db).await;
     let active = activate(db, &rings()).await.unwrap();
     // Commit both network rewrites and advance to the seed page.
-    assert!(step(db, &active, 2, &TrustedSeedIdentities::new())
-        .await
-        .is_ok());
-    assert!(step(db, &active, 2, &TrustedSeedIdentities::new())
-        .await
-        .is_ok());
+    assert!(step(db, &active, 2, &seedless_manifest()).await.is_ok());
+    assert!(step(db, &active, 2, &seedless_manifest()).await.is_ok());
     let checkpoint = progress(db).await.unwrap().rewritten;
     assert!(matches!(
-        step(db, &active, 2, &TrustedSeedIdentities::new()).await,
+        step(db, &active, 2, &seedless_manifest()).await,
         Err(Error::Integrity { .. })
     ));
     assert_eq!(progress(db).await.unwrap().rewritten, checkpoint);
@@ -967,11 +1010,20 @@ async fn postgres_legacy_network_requires_unique_completed_ceremony() {
 
 async fn supplied_seed_witness_case(db: &DatabaseConnection, variant: &str) {
     fixtures(db).await;
-    let mut trusted = trusted_seed_identities();
+    let mut document = trusted_document();
     let network = NetworkId::new(OWNER, "alpha").unwrap();
     let path = "apps/app/a";
     if variant == "mismatch" {
-        trusted.insert((network.to_string(), path.into(), 1), [0; 32]);
+        document
+            .rows
+            .iter_mut()
+            .find(|r| {
+                r.kind == manifest::Kind::Seed
+                    && r.network_id == network.to_string()
+                    && r.key_path.as_deref() == Some(path)
+            })
+            .unwrap()
+            .public_key = hex::encode([0; 32]);
     } else if variant == "transplant" {
         let backend = LocalOneOfOneBackend::new(rings().seals);
         let public = backend
@@ -983,6 +1035,7 @@ async fn supplied_seed_witness_case(db: &DatabaseConnection, variant: &str) {
             .unwrap();
         exec(db,"UPDATE encryption_network_key SET public_key=?,sealed_seed=? WHERE network_id=? AND key_path=?",vec![public.into(),ColumnEncryption::new([9;32]).encrypt_legacy(&[44;32]).into(),network.to_string().into(),path.into()]).await;
     }
+    let trusted = verify_document(document);
     let active = activate(db, &rings()).await.unwrap();
     assert!(step(db, &active, 2, &trusted).await.is_ok());
     assert!(step(db, &active, 2, &trusted).await.is_ok());
@@ -1051,4 +1104,372 @@ async fn postgres_legacy_seed_external_witness_rejects_mismatch_and_transplant()
         };
         supplied_seed_witness_case(&f.conn, variant).await;
     }
+}
+
+async fn forged_ceremony_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    exec(db, "DELETE FROM encryption_network_key", vec![]).await;
+    let network = NetworkId::new(OWNER, "alpha").unwrap().to_string();
+    let copied = StaticSecret::from([32; 32]);
+    let public = PublicKey::from(&copied);
+    exec(
+        db,
+        "UPDATE encryption_network SET public_key=?,sealed_private_key=? WHERE network_id=?",
+        vec![
+            public.as_bytes().to_vec().into(),
+            ColumnEncryption::new([9; 32])
+                .encrypt_legacy(copied.as_bytes())
+                .into(),
+            network.clone().into(),
+        ],
+    )
+    .await;
+    exec(
+        db,
+        "UPDATE encryption_ceremony SET transcript_hash=? WHERE network_id=?",
+        vec![
+            crate::encryption_network::canonical::hash_hex(public.as_bytes()).into(),
+            network.into(),
+        ],
+    )
+    .await;
+    let active = activate(db, &rings()).await.unwrap();
+    let mut blocked = false;
+    for _ in 0..100 {
+        match step(db, &active, 1, &trusted_seed_identities()).await {
+            Err(Error::Integrity { .. }) => {
+                blocked = true;
+                break;
+            }
+            Ok(page) => assert!(!page.complete),
+            Err(other) => panic!("unexpected migration failure: {other}"),
+        }
+    }
+    assert!(blocked);
+    assert_eq!(progress(db).await.unwrap().rewritten, 0);
+    assert_eq!(census(db).await.unwrap()[0].legacy, 2);
+}
+
+#[tokio::test]
+async fn cond_sqlite_forged_ceremony_cannot_authorize_network_transplant() {
+    forged_ceremony_case(&database().await).await;
+}
+
+#[tokio::test]
+async fn cond_postgres_forged_ceremony_cannot_authorize_network_transplant() {
+    let Some(f) =
+        crate::test_support::PostgresTestSchema::new("postgres_rekey_forged_ceremony").await
+    else {
+        return;
+    };
+    forged_ceremony_case(&f.conn).await;
+}
+
+async fn absent_network_witness_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    let active = activate(db, &rings()).await.unwrap();
+    assert!(matches!(
+        step(db, &active, 1, &empty_manifest()).await,
+        Err(Error::Integrity { .. })
+    ));
+    assert_eq!(progress(db).await.unwrap().rewritten, 0);
+    assert_eq!(census(db).await.unwrap()[0].legacy, 2);
+}
+
+#[tokio::test]
+async fn cond_sqlite_network_requires_external_witness() {
+    absent_network_witness_case(&database().await).await;
+}
+
+#[tokio::test]
+async fn cond_postgres_network_requires_external_witness() {
+    let Some(f) =
+        crate::test_support::PostgresTestSchema::new("postgres_rekey_absent_network_witness").await
+    else {
+        return;
+    };
+    absent_network_witness_case(&f.conn).await;
+}
+
+#[test]
+fn manifest_requires_pinned_hash_date_custody_and_canonical_encoding() {
+    let document = trusted_document();
+    let bytes = serde_json::to_vec(&document).unwrap();
+    let hash = crate::encryption_network::canonical::hash_hex(&bytes);
+    assert!(VerifiedManifest::verify(&bytes, &hash).is_ok());
+    assert!(VerifiedManifest::verify(&bytes, &"00".repeat(32)).is_err());
+    let pretty = serde_json::to_vec_pretty(&document).unwrap();
+    assert!(VerifiedManifest::verify(
+        &pretty,
+        &crate::encryption_network::canonical::hash_hex(&pretty)
+    )
+    .is_err());
+    for variant in 0..10 {
+        let mut doc = document.clone();
+        match variant {
+            0 => doc.provenance.custody_record.clear(),
+            1 => doc.provenance.exported_by.clear(),
+            2 => doc.provenance.snapshot_timestamp = "not-a-date".into(),
+            3 => doc.provenance.snapshot_timestamp = "9999-01-01T00:00:00Z".into(),
+            4 => doc.provenance.snapshot_sha256 = "wrong".into(),
+            5 => doc.provenance.backup_id.clear(),
+            6 => doc.provenance.storage_location.clear(),
+            7 => {
+                doc.rows.push(doc.rows[0].clone());
+                doc.rows.sort();
+            }
+            8 => doc.rows.reverse(),
+            _ => doc.provenance.source_database = "other".into(),
+        }
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        assert!(VerifiedManifest::verify(
+            &bytes,
+            &crate::encryption_network::canonical::hash_hex(&bytes)
+        )
+        .is_err());
+    }
+}
+
+fn manifest_test_dir() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "tc2713-manifest-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+async fn manifest_runner_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    let dir = manifest_test_dir();
+    let path = dir.join("manifest.json");
+    let bytes = serde_json::to_vec(&trusted_document()).unwrap();
+    let pin = crate::encryption_network::canonical::hash_hex(&bytes);
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        manifest::run_offline(db, &rings(), &path, &"00".repeat(32), 1).await,
+        Err(Error::Manifest)
+    ));
+    let target = || {
+        bound(
+            db.get_database_backend(),
+            "SELECT target FROM storage_rekey WHERE id=1",
+            vec![],
+        )
+    };
+    assert!(matches!(
+        manifest::run_offline(db, &rings(), &path, &pin, 0).await,
+        Err(Error::Checkpoint)
+    ));
+    assert_eq!(
+        db.query_one(target())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i32>("", "target")
+            .unwrap(),
+        0
+    );
+    let mut absent = trusted_document();
+    absent.rows.clear();
+    let bytes = serde_json::to_vec(&absent).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    match manifest::run_offline(
+        db,
+        &rings(),
+        &path,
+        &crate::encryption_network::canonical::hash_hex(&bytes),
+        1,
+    )
+    .await
+    {
+        Err(Error::ManifestCoverage(c)) => {
+            assert_eq!(c.missing_networks, 2);
+            assert_eq!(c.missing_seeds, 4);
+        }
+        _ => panic!("missing identities must be a blocking category"),
+    }
+    assert_eq!(
+        db.query_one(target())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i32>("", "target")
+            .unwrap(),
+        0
+    );
+    let bytes = serde_json::to_vec(&trusted_document()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let network = NetworkId::new(OWNER, "alpha").unwrap();
+    let new_path = "docs/after-snapshot";
+    let public = LocalOneOfOneBackend::new(rings().seals)
+        .derive_named_public_key(
+            &StaticSecret::from([31; 32]),
+            &canonical_key_urn(&KeyLocation::new(&network, new_path).unwrap()),
+            None,
+        )
+        .unwrap();
+    exec(db,"INSERT INTO encryption_network_key (network_id,key_path,kind,state,public_key,sealed_seed,key_version,created_at,updated_at) VALUES (?,?,'deterministic','active',?,NULL,1,'now','now')",vec![network.to_string().into(),new_path.into(),public.into()]).await;
+    match manifest::run_offline(db, &rings(), &path, &pin, 1).await {
+        Err(Error::ManifestCoverage(c)) => assert_eq!(c.missing_seeds, 1),
+        _ => panic!("post-snapshot identities must block, including keys with no seed"),
+    }
+    assert_eq!(
+        db.query_one(target())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i32>("", "target")
+            .unwrap(),
+        0
+    );
+    exec(
+        db,
+        "DELETE FROM encryption_network_key WHERE network_id=? AND key_path=?",
+        vec![network.to_string().into(), new_path.into()],
+    )
+    .await;
+    let beta = NetworkId::new(OWNER, "beta").unwrap().to_string();
+    exec(db,"UPDATE encryption_network SET public_key=?,sealed_private_key=NULL,state='pending' WHERE network_id=?",vec![Vec::<u8>::new().into(),beta.clone().into()]).await;
+    match manifest::run_offline(db, &rings(), &path, &pin, 1).await {
+        Err(Error::ManifestCoverage(c)) => assert_eq!(c.mismatched_networks, 1),
+        _ => panic!("an allocated snapshot identity cannot become an ignored pending row"),
+    }
+    let secret = StaticSecret::from([32; 32]);
+    exec(db,"UPDATE encryption_network SET public_key=?,sealed_private_key=?,state='active' WHERE network_id=?",vec![PublicKey::from(&secret).as_bytes().to_vec().into(),ColumnEncryption::new([9;32]).encrypt_legacy(secret.as_bytes()).into(),beta.into()]).await;
+    assert!(
+        manifest::run_offline(db, &rings(), &path, &pin, 1)
+            .await
+            .unwrap()
+            .complete
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_manifest_runner_checks_proof_before_fencing_and_completes() {
+    manifest_runner_case(&database().await).await;
+}
+
+#[tokio::test]
+async fn postgres_manifest_runner_checks_proof_before_fencing_and_completes() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("postgres_manifest_runner").await
+    else {
+        return;
+    };
+    manifest_runner_case(&f.conn).await;
+}
+
+async fn exporter_case(db: &DatabaseConnection, postgres: bool) {
+    let dir = manifest_test_dir();
+    let archive = dir.join("snapshot.dump");
+    let output = dir.join("manifest.json");
+    let file_db = if postgres {
+        None
+    } else {
+        let db = Database::connect(format!("sqlite:{}?mode=rwc", archive.display()))
+            .await
+            .unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        Some(db)
+    };
+    let db = file_db.as_ref().unwrap_or(db);
+    fixtures(db).await;
+    let mut command = std::process::Command::new("python3");
+    command.arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tools/export-rekey-manifest.py"
+    ));
+    if postgres {
+        let url = crate::test_support::postgres_test_url("manifest_exporter").unwrap();
+        let schema: String = db
+            .query_one(bound(
+                db.get_database_backend(),
+                "SELECT current_schema() AS schema",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "schema")
+            .unwrap();
+        let result = std::process::Command::new("pg_dump")
+            .args([
+                "--no-password",
+                "--dbname",
+                &url,
+                "--schema",
+                &schema,
+                "--file",
+            ])
+            .arg(&archive)
+            .env("PGPASSFILE", "/dev/null")
+            .env_remove("PGHOSTADDR")
+            .env_remove("PGSERVICE")
+            .env_remove("PGSERVICEFILE")
+            .env("PGOPTIONS", "-c default_transaction_read_only=on")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "test snapshot export failed");
+        command.args(["--restored-postgres-url", &url, "--schema", &schema]);
+    } else {
+        db.query_one(bound(
+            db.get_database_backend(),
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        command.arg("--sqlite-snapshot").arg(&archive);
+    }
+    let result = command
+        .arg("--snapshot-file")
+        .arg(&archive)
+        .args([
+            "--backup-id",
+            "test-backup",
+            "--snapshot-timestamp",
+            "2026-01-01T00:00:00Z",
+            "--exported-by",
+            "test-custodian",
+            "--storage-location",
+            "test-snapshot://archive",
+            "--custody-record",
+            "test-custody://record",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "read-only manifest export failed");
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report.as_object().unwrap().len(), 3);
+    let proof =
+        VerifiedManifest::load(&output, report["manifest_sha256"].as_str().unwrap()).unwrap();
+    assert_eq!(proof.counts(), (2, 4));
+    assert!(!manifest::coverage(db, &proof).await.unwrap().blocked());
+    assert_eq!(census(db).await.unwrap()[0].legacy, 2);
+    let bytes = std::fs::read(&output).unwrap();
+    let doc: manifest::Document = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        doc.provenance.snapshot_sha256,
+        crate::encryption_network::canonical::hash_hex(&std::fs::read(&archive).unwrap())
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_read_only_snapshot_export_is_canonical_and_loadable() {
+    exporter_case(&database().await, false).await;
+}
+
+#[tokio::test]
+async fn postgres_read_only_snapshot_export_is_canonical_and_loadable() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("postgres_manifest_export").await
+    else {
+        return;
+    };
+    exporter_case(&f.conn, true).await;
 }

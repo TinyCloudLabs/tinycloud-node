@@ -29,13 +29,17 @@ pub struct Rings {
     pub webhooks: ColumnEncryption,
     pub seals: ColumnEncryption,
 }
-/// Migration-only public identities, keyed by (network_id, key_path, key_version).
-/// Populate only from an independently authenticated manifest, never from the
-/// rows being migrated. An empty map does not authorize legacy seed conversion.
-pub type TrustedSeedIdentities = BTreeMap<(String, String, i64), [u8; 32]>;
+/// Only hash-pinned, dated and custody-recorded manifests authorize migration.
+#[path = "reencrypt_manifest.rs"]
+pub mod manifest;
+pub use manifest::VerifiedManifest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid manifest proof: verify the file, pinned digest, date and custody record")]
+    Manifest,
+    #[error("manifest coverage blocks migration: {0:?}")]
+    ManifestCoverage(manifest::Coverage),
     #[error("database operation failed")]
     Database,
     #[error("invalid re-encryption checkpoint or options")]
@@ -170,6 +174,7 @@ struct Row {
     public_key: Option<Vec<u8>>,
     network_blob: Option<Vec<u8>>,
     network_public: Option<Vec<u8>>,
+    network_version: Option<i64>,
     enforcement_cid: Option<String>,
     format: i16,
     state: Option<String>,
@@ -231,7 +236,7 @@ async fn select_batch<C: ConnectionTrait>(
         .unwrap_or_else(|| ", CAST(0 AS SMALLINT) AS format".into());
     let extra = match spec.identity {
         Identity::Network => ", t.public_key AS expected_public, t.state AS state, t.key_backend AS backend, t.key_version AS key_version",
-        Identity::Seed => ", t.public_key AS expected_public, n.sealed_private_key AS network_blob, n.public_key AS network_public, t.state AS state, t.kind AS kind, t.key_version AS key_version",
+        Identity::Seed => ", t.public_key AS expected_public, n.sealed_private_key AS network_blob, n.public_key AS network_public, n.key_version AS network_version, t.state AS state, t.kind AS kind, t.key_version AS key_version",
         Identity::Enforcement => ", t.enforcement_delegation_cid AS expected_cid",
         _ => "",
     };
@@ -315,6 +320,11 @@ async fn select_batch<C: ConnectionTrait>(
                 } else {
                     None
                 },
+                network_version: if matches!(spec.identity, Identity::Seed) {
+                    row.try_get("", "network_version")?
+                } else {
+                    None
+                },
                 enforcement_cid: if matches!(spec.identity, Identity::Enforcement) {
                     Some(row.try_get("", "expected_cid")?)
                 } else {
@@ -345,16 +355,21 @@ fn matches_raw_cid(expected: &str, bytes: &[u8]) -> bool {
 }
 
 // V1 seals have no row AAD. The migration alone may open them after checking
-// independent creation evidence. Serving backends accept only v2 seals.
-async fn legacy_network_witness<C: ConnectionTrait>(
+// external manifest evidence. Ceremonies are corroborative DB consistency only.
+async fn legacy_network_consistency<C: ConnectionTrait>(
     db: &C,
     network: &str,
     public: &[u8],
+    version: i64,
+    trusted: &VerifiedManifest,
 ) -> Result<(), Error> {
     let mismatch = || Error::Integrity {
         table: "encryption_network",
         column: "sealed_private_key",
     };
+    if trusted.network(network, version).map(|p| p.as_slice()) != Some(public) {
+        return Err(mismatch());
+    }
     let evidence=db.query_all(bound(db.get_database_backend(),"SELECT state,transcript_hash,completed_at,failure FROM encryption_ceremony WHERE network_id=? AND kind='initial' LIMIT 2",vec![network.into()])).await?;
     if evidence.len() != 1 {
         return Err(mismatch());
@@ -381,10 +396,12 @@ async fn migration_network_secret<C: ConnectionTrait>(
     network: &str,
     blob: &[u8],
     public: &[u8],
+    version: i64,
+    trusted: &VerifiedManifest,
 ) -> Result<StaticSecret, Error> {
     let opened = Zeroizing::new(
         if blob.first() == Some(&1) {
-            legacy_network_witness(db, network, public).await?;
+            legacy_network_consistency(db, network, public, version, trusted).await?;
             seal.decrypt_legacy(blob)
         } else {
             seal.decrypt_v2(
@@ -416,6 +433,7 @@ async fn validate_shape<C: ConnectionTrait>(
     spec: Column,
     row: &Row,
     seal: &ColumnEncryption,
+    trusted: &VerifiedManifest,
 ) -> Result<(), Error> {
     use crate::encryption_network::{key_id::KeyKind, types::NetworkState};
     match spec.identity {
@@ -468,6 +486,8 @@ async fn validate_shape<C: ConnectionTrait>(
                     column: spec.column,
                 })?,
                 row.network_public.as_deref().ok_or(Error::Verify)?,
+                row.network_version.ok_or(Error::Verify)?,
+                trusted,
             )
             .await?;
             match (kind, row.state.as_deref(), row.blob.is_some()) {
@@ -492,7 +512,7 @@ async fn validate_shape<C: ConnectionTrait>(
 
 async fn identity<C: ConnectionTrait>(
     db: &C,
-    trusted: &TrustedSeedIdentities,
+    trusted: &VerifiedManifest,
     spec: Column,
     row: &Row,
     plaintext: &[u8],
@@ -563,16 +583,14 @@ async fn identity<C: ConnectionTrait>(
                 network,
                 network_blob,
                 row.network_public.as_deref().ok_or_else(mismatch)?,
+                row.network_version.ok_or_else(mismatch)?,
+                trusted,
             )
             .await?;
             let expected = if row.blob.as_deref().is_some_and(|b| b.first() == Some(&1)) {
                 Some(
                     trusted
-                        .get(&(
-                            network.clone(),
-                            path.clone(),
-                            row.key_version.ok_or_else(mismatch)?,
-                        ))
+                        .seed(network, path, row.key_version.ok_or_else(mismatch)?)
                         .ok_or_else(mismatch)?,
                 )
             } else {
@@ -981,7 +999,7 @@ pub async fn step<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
     batch: u64,
-    trusted: &TrustedSeedIdentities,
+    trusted: &VerifiedManifest,
 ) -> Result<Progress, Error> {
     step_page(
         db,
@@ -998,7 +1016,7 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
     batch: u64,
-    trusted: &TrustedSeedIdentities,
+    trusted: &VerifiedManifest,
     #[cfg(test)] abort_after: Option<i64>,
 ) -> Result<Progress, Error> {
     if batch == 0 || batch > 10000 {
@@ -1050,7 +1068,7 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
     let mut last = None;
     for row in &rows {
         last = Some(row.key.encoded()?);
-        validate_shape(&tx, spec, row, &rings.seals).await?;
+        validate_shape(&tx, spec, row, &rings.seals, trusted).await?;
         let Some(old) = &row.blob else {
             if verifying {
                 verified += 1;
@@ -1073,10 +1091,12 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
                     let Key::Text(network) = &row.key else {
                         return Err(Error::Verify);
                     };
-                    legacy_network_witness(
+                    legacy_network_consistency(
                         &tx,
                         network,
                         row.public_key.as_deref().ok_or(Error::Verify)?,
+                        row.key_version.ok_or(Error::Verify)?,
+                        trusted,
                     )
                     .await?;
                 }

@@ -192,6 +192,8 @@ fn key_denial_outcome(err: &EncryptionServiceError) -> &'static str {
 
 #[derive(Debug, Error)]
 pub enum EncryptionServiceError {
+    #[error("migration_required: stored encryption keys require offline migration before serving")]
+    MigrationRequired,
     #[error("db error: {0}")]
     Db(#[from] DbErr),
     #[error("network_not_found: no network exists with this id")]
@@ -227,7 +229,7 @@ pub enum EncryptionServiceError {
     #[error("nonce already used")]
     NonceReplay,
     #[error("key backend error: {0}")]
-    Backend(#[from] KeyBackendError),
+    Backend(KeyBackendError),
     #[error("decrypt request body is malformed: {0}")]
     InvalidBody(String),
     #[error("receiver_key_invalid: receiverPublicKey must be a 32-byte X25519 public key that is not a low-order point")]
@@ -260,6 +262,15 @@ pub enum EncryptionServiceError {
     KeyNotDeletable,
     #[error("{0} key rows under apps/ are not deletable keys; list them with: SELECT network_id, key_path, kind FROM encryption_network_key WHERE (key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/') AND kind <> 'deletable'")]
     StrayAppKeyRows(u64),
+}
+
+impl From<KeyBackendError> for EncryptionServiceError {
+    fn from(err: KeyBackendError) -> Self {
+        match err {
+            KeyBackendError::MigrationRequired => Self::MigrationRequired,
+            other => Self::Backend(other),
+        }
+    }
 }
 
 pub struct EncryptionService {
@@ -1167,8 +1178,9 @@ impl EncryptionService {
                             err,
                             KeyBackendError::SealedKeyMissing
                                 | KeyBackendError::SealedKeyUnreadable
+                                | KeyBackendError::MigrationRequired
                         ) {
-                            EncryptionServiceError::Backend(err)
+                            EncryptionServiceError::from(err)
                         } else {
                             EncryptionServiceError::KeyUnwrapFailed(err)
                         }

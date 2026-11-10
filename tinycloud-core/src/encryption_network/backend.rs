@@ -28,6 +28,8 @@ use super::types::{ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM};
 
 #[derive(Debug, Error)]
 pub enum KeyBackendError {
+    #[error("migration_required: stored encryption keys require offline migration before serving")]
+    MigrationRequired,
     #[error("private key material unavailable")]
     SealedKeyMissing,
     #[error("network private key could not be unsealed")]
@@ -552,6 +554,9 @@ impl KeyBackend for LocalOneOfOneBackend {
         network_id: &str,
         expected_public_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError> {
+        if sealed_private_key.first() == Some(&1) {
+            return Err(KeyBackendError::MigrationRequired);
+        }
         let pk = [network_id.as_bytes()];
         let binding =
             crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &pk);
@@ -593,7 +598,10 @@ impl KeyBackend for LocalOneOfOneBackend {
     ) -> Result<Vec<u8>, KeyBackendError> {
         let secret = self
             .open_network_secret(sealed_private_key, context.network_id, expected_public_key)
-            .map_err(|_| KeyBackendError::SealedKeyUnreadable)?;
+            .map_err(|err| match err {
+                KeyBackendError::MigrationRequired => err,
+                _ => KeyBackendError::SealedKeyUnreadable,
+            })?;
         open_wrapped_key(&secret, wrapped_key, context)
     }
 
@@ -640,6 +648,9 @@ impl KeyBackend for LocalOneOfOneBackend {
         network_id: &str,
         key_path: &str,
     ) -> Result<KeySeed, KeyBackendError> {
+        if sealed_seed.first() == Some(&1) {
+            return Err(KeyBackendError::MigrationRequired);
+        }
         let pk = [network_id.as_bytes(), key_path.as_bytes()];
         let opened = Zeroizing::new(self.seal.decrypt_v2(
             sealed_seed,
