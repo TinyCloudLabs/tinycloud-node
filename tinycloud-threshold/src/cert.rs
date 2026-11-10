@@ -109,33 +109,42 @@ impl CandidateShare {
     /// The caller owns the returned buffer's erasure; it is wrapped in
     /// [`zeroize::Zeroizing`] so a dropped copy clears itself. [`CandidateShare::from_bytes`]
     /// restores the candidate for [`KeyShare::bind`] against the pinned certificate.
+    /// The encoding is written directly into the guarded output and the raw
+    /// scalar is guarded; no unguarded secret copy is produced.
     pub fn to_bytes(&self) -> zeroize::Zeroizing<[u8; 67]> {
-        let mut e = crate::encoding::Encoder::new();
-        e.u8(1);
-        e.fixed(self.transcript.as_bytes());
-        e.u16(self.index.get());
-        e.fixed(&self.scalar.to_bytes());
-        let bytes = e.finish();
         let mut out = zeroize::Zeroizing::new([0u8; 67]);
-        out.copy_from_slice(&bytes);
+        let scalar = zeroize::Zeroizing::new(self.scalar.to_bytes());
+        let (version, rest) = out.split_at_mut(1);
+        version.copy_from_slice(&[1u8]);
+        let (transcript, rest) = rest.split_at_mut(32);
+        transcript.copy_from_slice(self.transcript.as_bytes());
+        let (index, scalar_slot) = rest.split_at_mut(2);
+        index.copy_from_slice(&self.index.get().to_be_bytes());
+        scalar_slot.copy_from_slice(&*scalar);
         out
     }
 
     /// Canonical decode only: version 1, index 1..=16, scalar < r and != 0, exact length. Details: TC-2221
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let mut d = crate::encoding::Decoder::new(bytes)?;
-        if d.u8()? != 1 {
+        if bytes.len() != 67 || bytes.first() != Some(&1) {
             return Err(Error::InvalidEncoding);
         }
-        let transcript = TranscriptHash::new(d.fixed()?);
-        let index = MemberIndex::new(d.u16()?)?;
-        let scalar = Scalar::from_bytes(&d.fixed::<32>()?)?;
+        let mut transcript = [0u8; 32];
+        transcript.copy_from_slice(bytes.get(1..33).ok_or(Error::InvalidEncoding)?);
+        let index = MemberIndex::new(u16::from_be_bytes([
+            *bytes.get(33).ok_or(Error::InvalidEncoding)?,
+            *bytes.get(34).ok_or(Error::InvalidEncoding)?,
+        ]))?;
+        let raw = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(bytes.get(35..67).ok_or(Error::InvalidEncoding)?)
+                .map_err(|_| Error::InvalidEncoding)?,
+        );
+        let scalar = Scalar::from_bytes(&*raw)?;
         if scalar.is_zero() {
             return Err(Error::InvalidScalar);
         }
-        d.finish()?;
         Ok(Self {
-            transcript,
+            transcript: TranscriptHash::new(transcript),
             index,
             scalar,
         })

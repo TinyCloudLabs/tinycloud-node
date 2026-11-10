@@ -8,21 +8,27 @@
 //!
 //! Layout under `<dir>/<network-hash>/`:
 //!
+//! * `lock`: advisory exclusive lock held for the store's lifetime; exactly
+//!   one `ShareStore` may be open for a network at a time.
 //! * `state`: versioned record of the pinned certificate, the pending
 //!   candidate, accepted ceremony ids and retired generations.
 //! * `proofs/<cert-digest>`: the signed certificate bytes plus, once
 //!   activated, the owner activation statement and readiness receipts.
 //! * `share-<cert-digest>`: `CandidateShare::to_bytes()` for this member's
 //!   share under that certificate.
-//! * `dealt/<ceremony-id>`: marker written before the first secret-bearing
-//!   message of that ceremony leaves; the id is consumed forever.
+//! * `dealt/<ceremony-id>`: marker written once a ceremony id is consumed;
+//!   the id is never fresh again.
 //!
-//! Every write is write-temp, fsync, rename, fsync-directory. The pin is the
-//! highest-epoch certificate whose activation chain verifies from genesis; a
-//! restart replays `proofs/` to recompute it and refuses a recorded `state`
-//! pin the proofs cannot support. Shares are erased only on positive proof:
-//! a verified activation that moves past them, a fresh ceremony for their
-//! predecessor, or no record at all.
+//! Every write is write-temp, fsync, rename, fsync-directory, and temporary
+//! files are uniquely named, created with `create_new`, and zeroed plus
+//! unlinked on any failure; the next open sweeps leftovers. The pin is the
+//! highest certificate on the single chain verified from genesis through
+//! `verify_activation` for every activated proof; a restart refuses a
+//! recorded `state` pin the proofs cannot support. Shares are erased only
+//! on positive proof — a verified activation that moves past them, a fresh
+//! ceremony for their predecessor, or no record at all — and the `state`
+//! record commits every removal before its file unlink, so a crash is
+//! always recovered as "erasure owed", never as a missing promised share.
 
 use std::{
     collections::BTreeMap,
@@ -43,7 +49,7 @@ use crate::{
     },
     encoding::{Decoder, Encoder},
     error::{CertError, Error},
-    ids::{CeremonyId, CertDigest, MemberIndex, NetworkUrn},
+    ids::{CeremonyId, CertDigest, Did, MemberIndex, NetworkUrn},
     KeyShare,
 };
 
@@ -261,6 +267,9 @@ pub enum StoreError {
     /// Activated equivocation froze the pin; further activations are refused.
     #[error("activated equivocation froze the pin")]
     Equivocation,
+    /// Another `ShareStore` already holds this network's lock.
+    #[error("share store is already open for this network")]
+    Busy,
 }
 
 /// Result of presenting an authorized ceremony to the store. Details: TC-2221
@@ -274,42 +283,60 @@ pub enum AcceptOutcome {
 }
 
 /// One member's durable share store for one network. Details: TC-2221
+///
+/// `member` is this node's DID; a ceremony is accepted only when it names
+/// this member among its recipients. `open` holds an exclusive advisory
+/// lock on the network directory for the store's lifetime, so two openers
+/// — same process or sibling processes — can never cache divergent state.
 pub struct ShareStore {
     network_dir: PathBuf,
     anchor: TrustAnchor,
+    member: Did,
+    _lock: fs::File,
     inner: Mutex<Inner>,
 }
 
 struct Inner {
     state: State,
     pin: Option<VerifiedCertificate>,
+    /// Every certificate on the verified activated chain, by digest.
+    verified: BTreeMap<CertDigest, VerifiedCertificate>,
     equivocation: bool,
 }
 
-fn create_file(path: &Path) -> Result<fs::File, StoreError> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    Ok(options.open(path)?)
-}
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let tmp = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut file = create_file(&tmp)?;
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tag = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!(
+        "{}.tmp-{}-{tag}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("part"),
+        std::process::id()
+    );
+    let tmp = path.with_file_name(name);
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // The temp may hold plaintext secret bytes: zero before unlinking.
+        let _ = erase_share_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    result
 }
 
 fn erase_share_file(path: &Path) -> Result<(), StoreError> {
@@ -388,6 +415,26 @@ fn store_dir(dir: &Path, network: &NetworkUrn) -> PathBuf {
     dir.join(name)
 }
 
+/// Zero and unlink any leftover `*.tmp-*` or `*.tmp` write-temp file under
+/// the network directory. Runs inside `open` after the lock is taken.
+fn sweep_temps(network_dir: &Path) -> Result<(), StoreError> {
+    for sub in [
+        network_dir.to_path_buf(),
+        network_dir.join("proofs"),
+        network_dir.join("dealt"),
+    ] {
+        for entry in fs::read_dir(&sub)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") || name.contains(".tmp-") {
+                let _ = erase_share_file(&entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ShareStore {
     /// Open or create the member's share directory and converge it. Details: TC-2221
     ///
@@ -399,6 +446,7 @@ impl ShareStore {
         dir: &Path,
         network: &NetworkUrn,
         anchor: TrustAnchor,
+        member: Did,
         v: &impl DidSignatureVerifier,
     ) -> Result<Self, StoreError> {
         let network_dir = store_dir(dir, network);
@@ -409,6 +457,26 @@ impl ShareStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&network_dir, fs::Permissions::from_mode(0o700))?;
         }
+        // Fsync every parent so the directory hierarchy itself is durable
+        // even if power is lost before the first write completes.
+        fs::File::open(&network_dir)?.sync_all()?;
+        fs::File::open(dir)?.sync_all()?;
+
+        // One opener per network directory, held for the store's lifetime.
+        let lock_path = network_dir.join("lock");
+        let lock_file = {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&lock_path)?
+        };
+        lock_file.try_lock().map_err(|_| StoreError::Busy)?;
+
+        sweep_temps(&network_dir)?;
 
         let mut state = match fs::read(network_dir.join("state")) {
             Ok(bytes) => decode_state(&bytes)?,
@@ -444,8 +512,7 @@ impl ShareStore {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.ends_with(".tmp") {
-                let _ = fs::remove_file(entry.path());
+            if name.ends_with(".tmp") || name.contains(".tmp-") {
                 continue;
             }
             let (signed, activation) = decode_proof(&fs::read(entry.path())?)?;
@@ -465,17 +532,32 @@ impl ShareStore {
         let mut verified: BTreeMap<CertDigest, VerifiedCertificate> = BTreeMap::new();
         let mut chain: Vec<CertDigest> = Vec::new();
         let mut equivocation = false;
+        // Every flagged activation is verified before it can extend the pin
+        // or count toward a fork; an activation flag alone proves nothing.
         let mut geneses: Vec<VerifiedCertificate> = Vec::new();
         for signed in proofs.values() {
-            if signed.body.previous().is_some() || !activations.contains_key(&signed.body.digest())
-            {
+            let Some((statement, receipts)) = activations.get(&signed.body.digest()) else {
+                continue;
+            };
+            if signed.body.previous().is_some() {
                 continue;
             }
-            geneses.push(verify_certificate(&anchor, signed, v)?);
+            let verified_cert = verify_certificate(&anchor, signed, v)?;
+            verify_activation(
+                &verified_cert,
+                receipts,
+                ReadyQuorum::AllHolders,
+                statement,
+                v,
+            )?;
+            geneses.push(verified_cert);
         }
         geneses.sort_by(|a, b| a.digest().as_bytes().cmp(b.digest().as_bytes()));
         if geneses.len() > 1 {
             equivocation = true;
+        }
+        for genesis in &geneses {
+            verified.insert(genesis.digest(), genesis.clone());
         }
         if let Some(first) = geneses.into_iter().next() {
             let mut current = first;
@@ -484,25 +566,30 @@ impl ShareStore {
             loop {
                 let mut successors: Vec<VerifiedCertificate> = Vec::new();
                 for signed in proofs.values() {
-                    if signed.body.previous() != Some(&current.digest())
-                        || !activations.contains_key(&signed.body.digest())
-                    {
+                    if signed.body.previous() != Some(&current.digest()) {
                         continue;
                     }
-                    successors.push(verify_successor(&current, signed, v)?);
+                    let Some((statement, receipts)) = activations.get(&signed.body.digest()) else {
+                        continue;
+                    };
+                    let next = verify_successor(&current, signed, v)?;
+                    verify_activation(&next, receipts, ReadyQuorum::AllHolders, statement, v)?;
+                    successors.push(next);
                 }
                 successors.sort_by(|a, b| a.digest().as_bytes().cmp(b.digest().as_bytes()));
                 if successors.len() > 1 {
-                    // The pin stops advancing at the fork.
+                    // The pin stops advancing at the fork; every verified fork
+                    // child is retained so a recorded pin among them is
+                    // proven (not corruption) and their shares retire.
                     equivocation = true;
+                    for next in successors {
+                        verified.insert(next.digest(), next);
+                    }
                     break;
                 }
                 let Some(next) = successors.into_iter().next() else {
                     break;
                 };
-                let (statement, receipts) =
-                    activations.get(&next.digest()).ok_or(StoreError::Corrupt)?;
-                verify_activation(&next, receipts, ReadyQuorum::AllHolders, statement, v)?;
                 verified.insert(next.digest(), next.clone());
                 chain.push(next.digest());
                 current = next;
@@ -511,27 +598,25 @@ impl ShareStore {
         let computed_pin = chain.last().copied();
         let pin = computed_pin.and_then(|d| verified.get(&d).cloned());
 
-        // A recorded pin the activated chain cannot prove is corruption.
+        // A recorded pin must be a verified activated certificate: either on
+        // the surviving chain or an equivocated fork child. Anything else is
+        // corruption.
         if let Some(recorded) = state.pin {
-            if !chain.contains(&recorded) {
+            if !verified.contains_key(&recorded) {
                 return Err(StoreError::Corrupt);
             }
         }
 
-        // Candidate reconciliation.
+        // Candidate reconciliation. Chain membership and C2 losses are
+        // judged BEFORE the missing-file check: a candidate already retired
+        // by durable proof is settled even when its share is gone, while a
+        // still-live receipt-bearing candidate that lost its share is the
+        // only case that is truly corrupt.
+        let mut owed_erasures: Vec<PathBuf> = Vec::new();
         if let Some(candidate) = state.candidate.clone() {
             let share = share_path(&network_dir, &candidate.digest);
             let proof = proof_path(&network_dir, &candidate.digest);
-            if !share.exists() || !proof.exists() {
-                if candidate.receipt_sent {
-                    // A receipt was signed over a durable install; a missing
-                    // file means the member promised what it cannot serve.
-                    return Err(StoreError::Corrupt);
-                }
-                let _ = erase_share_file(&share);
-                state.candidate = None;
-                state_dirty = true;
-            } else if chain.contains(&candidate.digest) {
+            if chain.contains(&candidate.digest) {
                 // Already activated before the crash; the chain is the record.
                 state.candidate = None;
                 state_dirty = true;
@@ -549,15 +634,31 @@ impl ShareStore {
                         }),
                 };
                 if lost {
-                    erase_share_file(&share)?;
+                    // Commit the retirement first; the unlink is owed work a
+                    // crash simply re-discovers as S1.
                     record_retired(&mut state, candidate.digest);
                     state.candidate = None;
-                    state_dirty = true;
+                    state.pin = computed_pin;
+                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                    owed_erasures.push(share);
+                } else if !share.exists() || !proof.exists() {
+                    if candidate.receipt_sent {
+                        // A receipt was signed over a durable install; a
+                        // missing file means the member promised what it
+                        // cannot serve.
+                        return Err(StoreError::Corrupt);
+                    }
+                    state.candidate = None;
+                    state.pin = computed_pin;
+                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                    owed_erasures.push(share);
                 }
             }
         }
 
-        // R1 and S1 over share files.
+        // R1 and S1 over share files. Every retirement is committed to
+        // `state` before its unlink; files left by a crash re-enter here as
+        // owed work on the next open.
         for entry in fs::read_dir(&network_dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -577,13 +678,15 @@ impl ShareStore {
             if is_pin || is_candidate {
                 continue;
             }
-            if chain.contains(&digest) {
+            if verified.contains_key(&digest) {
                 // Superseded activated generation (R1).
-                erase_share_file(&entry.path())?;
                 if !state.retired.iter().any(|r| r.digest == digest) {
                     record_retired(&mut state, digest);
-                    state_dirty = true;
+                    state.pin = computed_pin;
+                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                    state_dirty = false;
                 }
+                owed_erasures.push(entry.path());
             } else {
                 // Outside the activated chain and named in no record: S1
                 // erases unconditionally (the pin's existence changes
@@ -597,12 +700,25 @@ impl ShareStore {
             write_atomic(&network_dir.join("state"), &encode_state(&state))?;
         }
 
+        // Owed unlinks run only after every corresponding `state` commit.
+        for path in &owed_erasures {
+            erase_share_file(path)?;
+        }
+
+        if state.pin != computed_pin || state_dirty {
+            state.pin = computed_pin;
+            write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+        }
+
         Ok(Self {
             network_dir,
             anchor,
+            member,
+            _lock: lock_file,
             inner: Mutex::new(Inner {
                 state,
                 pin,
+                verified,
                 equivocation,
             }),
         })
@@ -628,41 +744,49 @@ impl ShareStore {
 
     /// The bound share for the pinned certificate, or none when this member
     /// holds no share for it. Details: TC-2221
+    ///
+    /// Returns `Equivocation` when a disk-discovered fork froze the pin: a
+    /// frozen store never exports share material.
     pub fn current_share(&self) -> Result<Option<KeyShare>, StoreError> {
-        let pin = self
-            .inner
-            .lock()
-            .map_err(|_| StoreError::Corrupt)?
-            .pin
-            .clone();
-        let Some(pin) = pin else { return Ok(None) };
+        use std::io::Read;
+        let inner = self.inner.lock().map_err(|_| StoreError::Corrupt)?;
+        if inner.equivocation {
+            return Err(StoreError::Equivocation);
+        }
+        let Some(pin) = inner.pin.clone() else {
+            return Ok(None);
+        };
         let path = share_path(&self.network_dir, &pin.digest());
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = Zeroizing::new(fs::read(path)?);
-        let candidate = CandidateShare::from_bytes(&bytes)?;
+        let mut bytes = Zeroizing::new([0u8; 67]);
+        fs::File::open(&path)?.read_exact(&mut *bytes)?;
+        let candidate = CandidateShare::from_bytes(&*bytes)?;
         Ok(Some(KeyShare::bind(candidate, &pin)?))
     }
 
     /// The pending candidate's digest and member index, awaiting its
     /// readiness receipt. Details: TC-2221
     pub fn pending_candidate(&self) -> Option<(CertDigest, MemberIndex)> {
+        use std::io::Read;
         let inner = self.inner.lock().ok()?;
         let candidate = inner.state.candidate.as_ref()?;
         let path = share_path(&self.network_dir, &candidate.digest);
-        let bytes = fs::read(path).ok()?;
-        let share = CandidateShare::from_bytes(&bytes).ok()?;
+        let mut bytes = Zeroizing::new([0u8; 67]);
+        fs::File::open(path).ok()?.read_exact(&mut *bytes).ok()?;
+        let share = CandidateShare::from_bytes(&*bytes).ok()?;
         Some((candidate.digest, share.index()))
     }
 
     /// Durably install a candidate share for `signed`. Details: TC-2221
     ///
     /// `signed` must verify as the successor of the current pin (or as a
-    /// genesis before any pin). The candidate's bytes bind against the
-    /// certificate, then proof and share are written before the state record:
-    /// a crash before the record leaves orphan files the next open sweeps.
-    /// Returns the candidate certificate digest.
+    /// genesis before any pin), `ceremony` must be one this store already
+    /// accepted for that predecessor, and the persisted file is read back
+    /// and bound before the candidate is recorded — a receipt can never be
+    /// signed over bytes that were not verified durable. Returns the
+    /// candidate certificate digest.
     pub fn install_candidate(
         &self,
         signed: &SignedCertificate,
@@ -670,9 +794,23 @@ impl ShareStore {
         ceremony: &AuthorizedCeremony,
         v: &impl DidSignatureVerifier,
     ) -> Result<CertDigest, StoreError> {
+        use std::io::Read;
         let mut inner = self.inner.lock().map_err(|_| StoreError::Corrupt)?;
+        if inner.equivocation {
+            return Err(StoreError::Equivocation);
+        }
         if inner.state.candidate.is_some() {
             return Err(StoreError::CandidateExists);
+        }
+        // The candidate may only be installed under a ceremony this store
+        // accepted for the same predecessor.
+        if ceremony.anchor() != &self.anchor
+            || !inner
+                .state
+                .seen_ceremonies
+                .contains(&ceremony.statement().id)
+        {
+            return Err(Error::InvalidCeremony.into());
         }
         let (verified, predecessor) = match &inner.pin {
             Some(pin) => (verify_successor(pin, signed, v)?, Some(pin.digest())),
@@ -686,16 +824,24 @@ impl ShareStore {
         if ceremony.statement().current != predecessor {
             return Err(StoreError::InvalidActivation);
         }
-        let bytes = candidate.to_bytes();
-        let reloaded = CandidateShare::from_bytes(bytes.as_slice())?;
-        // The written form must bind before it is persisted.
-        let _bound = KeyShare::bind(reloaded, &verified)?;
         let digest = verified.digest();
+        let index = candidate.index();
         write_atomic(
             &proof_path(&self.network_dir, &digest),
             &encode_proof(signed, None, &[]),
         )?;
-        write_atomic(&share_path(&self.network_dir, &digest), bytes.as_slice())?;
+        let bytes = candidate.to_bytes();
+        write_atomic(&share_path(&self.network_dir, &digest), &*bytes)?;
+        drop(bytes);
+        // §5.3: read the persisted file back and bind it before the
+        // candidate is permitted to receive a receipt.
+        let mut persisted = Zeroizing::new([0u8; 67]);
+        fs::File::open(share_path(&self.network_dir, &digest))?.read_exact(&mut *persisted)?;
+        let reloaded = CandidateShare::from_bytes(&*persisted)?;
+        if reloaded.index() != index {
+            return Err(StoreError::Corrupt);
+        }
+        let _bound = KeyShare::bind(reloaded, &verified)?;
         inner.state.candidate = Some(CandidateRecord {
             digest,
             ceremony: ceremony.statement().id,
@@ -736,14 +882,29 @@ impl ShareStore {
         if inner.equivocation {
             return Err(StoreError::Equivocation);
         }
-        // Idempotent: a certificate already activated on the pinned chain is
-        // a no-op, so concurrent or replayed recordings converge.
-        if inner
-            .pin
-            .as_ref()
-            .is_some_and(|pin| pin.digest() == signed.body.digest())
-        {
+        // Idempotent: a certificate already on the verified activated chain
+        // is a no-op, so concurrent or replayed recordings converge.
+        if inner.verified.contains_key(&signed.body.digest()) {
             return Ok(());
+        }
+        // A certificate naming any verified chain certificate other than the
+        // pin as its predecessor is activated fork evidence: persist the
+        // activated proof durably first, then freeze the store.
+        if let Some(parent) = signed.body.previous().and_then(|p| inner.verified.get(p)) {
+            if inner
+                .pin
+                .as_ref()
+                .is_none_or(|pin| pin.digest() != parent.digest())
+            {
+                let fork = verify_successor(parent, signed, v)?;
+                verify_activation(&fork, receipts, ReadyQuorum::AllHolders, activation, v)?;
+                write_atomic(
+                    &proof_path(&self.network_dir, &fork.digest()),
+                    &encode_proof(signed, Some(activation), receipts),
+                )?;
+                inner.equivocation = true;
+                return Err(StoreError::Equivocation);
+            }
         }
         let verified = match &inner.pin {
             Some(pin) => verify_successor(pin, signed, v)?,
@@ -755,64 +916,92 @@ impl ShareStore {
             &proof_path(&self.network_dir, &digest),
             &encode_proof(signed, Some(activation), receipts),
         )?;
+        // `state` commits every removal BEFORE the unlink, so a crash is
+        // recovered as "erasure owed", never as a missing promised share.
+        let mut erasures: Vec<PathBuf> = Vec::new();
         // C2: a pending candidate that lost to this activation is erased; the
         // winning candidate's record is cleared (the chain is its record).
         if let Some(candidate) = inner.state.candidate.take() {
-            if candidate.digest != digest {
-                erase_share_file(&share_path(&self.network_dir, &candidate.digest))?;
-                if !inner
+            if candidate.digest != digest
+                && !inner
                     .state
                     .retired
                     .iter()
                     .any(|r| r.digest == candidate.digest)
-                {
-                    record_retired(&mut inner.state, candidate.digest);
-                }
+            {
+                record_retired(&mut inner.state, candidate.digest);
+                erasures.push(share_path(&self.network_dir, &candidate.digest));
             }
         }
         // R1: the outgoing pin's share is retired.
         if let Some(old_pin) = &inner.pin {
             let old = old_pin.digest();
-            erase_share_file(&share_path(&self.network_dir, &old))?;
             if !inner.state.retired.iter().any(|r| r.digest == old) {
                 record_retired(&mut inner.state, old);
+                erasures.push(share_path(&self.network_dir, &old));
             }
         }
-        inner.pin = Some(verified);
+        inner.pin = Some(verified.clone());
+        inner.verified.insert(digest, verified);
         inner.state.pin = Some(digest);
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))
+        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
+        for path in &erasures {
+            erase_share_file(path)?;
+        }
+        Ok(())
     }
 
     /// Present a freshly verified authorized ceremony before any dealing.
     /// Details: TC-2221
     ///
-    /// A new id erases any unactivated candidate for the same predecessor
-    /// (C1), writes the dealt marker and consumes the id; a replayed id
-    /// changes nothing.
+    /// The ceremony must be anchored to this store's owner/network, name this
+    /// member among its recipients, and pin the current certificate as its
+    /// predecessor. A fresh id then erases any unactivated candidate for that
+    /// predecessor (C1), writes the dealt marker and consumes the id; a
+    /// replayed id changes nothing.
     pub fn accept_ceremony(
         &self,
         ceremony: &AuthorizedCeremony,
     ) -> Result<AcceptOutcome, StoreError> {
-        let id = ceremony.statement().id;
         let mut inner = self.inner.lock().map_err(|_| StoreError::Corrupt)?;
-        if inner.state.seen_ceremonies.contains(&id) {
+        if inner.equivocation {
+            return Err(StoreError::Equivocation);
+        }
+        let statement = ceremony.statement();
+        // A ceremony for another owner/network, another member, or a chain
+        // position this store is not at is not ours to consume.
+        if ceremony.anchor() != &self.anchor
+            || !statement.recipients.iter().any(|r| r.node == self.member)
+            || statement.current != inner.pin.as_ref().map(|p| p.digest())
+        {
+            return Err(Error::InvalidCeremony.into());
+        }
+        if inner.state.seen_ceremonies.contains(&statement.id) {
             return Ok(AcceptOutcome::Replay);
         }
-        let predecessor = ceremony.statement().current;
+        // `state` commits the removal before the unlink and before the dealt
+        // marker; a crash re-discovers the unlink as S1.
+        let mut owed: Option<PathBuf> = None;
         if let Some(candidate) = &inner.state.candidate {
-            if candidate.predecessor == predecessor {
+            if candidate.predecessor == statement.current {
                 let digest = candidate.digest;
-                erase_share_file(&share_path(&self.network_dir, &digest))?;
                 record_retired(&mut inner.state, digest);
                 inner.state.candidate = None;
+                owed = Some(share_path(&self.network_dir, &digest));
             }
         }
+        inner.state.seen_ceremonies.push(statement.id);
+        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
         write_atomic(
-            &self.network_dir.join("dealt").join(hex(id.as_bytes())),
+            &self
+                .network_dir
+                .join("dealt")
+                .join(hex(statement.id.as_bytes())),
             b"",
         )?;
-        inner.state.seen_ceremonies.push(id);
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
+        if let Some(path) = owed {
+            erase_share_file(&path)?;
+        }
         Ok(AcceptOutcome::Fresh)
     }
 }
@@ -854,6 +1043,7 @@ mod tests {
             dir,
             &signers.anchor().network,
             signers.anchor().clone(),
+            Signers::did(1),
             signers,
         )
         .unwrap()
@@ -897,6 +1087,7 @@ mod tests {
         let share = shares.remove(0);
         let signed = cert::tests::sign(cert.body().clone(), signers);
         let candidate = mk_candidate(share, cert.body());
+        store.accept_ceremony(&signers.genesis()).unwrap();
         store
             .install_candidate(&signed, candidate, &signers.genesis(), signers)
             .unwrap();
@@ -986,20 +1177,38 @@ mod tests {
             11,
         );
         let candidate = mk_candidate(raw.remove(0), &s_succ.body);
+        assert_eq!(
+            store.accept_ceremony(&ceremony).unwrap(),
+            AcceptOutcome::Fresh
+        );
         let digest = store
             .install_candidate(&s_succ, candidate, &ceremony, &signers)
             .unwrap();
         drop(store);
 
         // Restart: the persisted candidate is pending, the old pin stands.
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert_eq!(store.pinned().unwrap().digest(), cert.digest());
         assert_eq!(store.pending_candidate().unwrap().0, digest);
         assert!(store.current_share().unwrap().is_some());
         drop(store);
 
         // Activate, then restart again: new pin, old share retired.
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         let succ = verify_successor(&cert, &s_succ, &signers).unwrap();
         let receipts = receipts_for(&succ, &signers);
         let activation = activation_for(&succ, &receipts, &signers);
@@ -1007,7 +1216,14 @@ mod tests {
             .record_activation(&s_succ, &activation, &receipts, &signers)
             .unwrap();
         drop(store);
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert_eq!(store.pinned().unwrap().digest(), succ.digest());
         assert!(store.pending_candidate().is_none());
         let share = store.current_share().unwrap().unwrap();
@@ -1026,7 +1242,14 @@ mod tests {
         let ndir = netdir(&dir, &network);
         let stray = ndir.join(format!("share-{}", hex(&[7; 32])));
         fs::write(&stray, [9u8; 67]).unwrap();
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert!(!stray.exists());
         assert!(store.current_share().unwrap().is_some());
     }
@@ -1047,6 +1270,7 @@ mod tests {
                 11,
             );
             let candidate = mk_candidate(raw.remove(0), &s_succ.body);
+            store.accept_ceremony(&ceremony).unwrap();
             let digest = store
                 .install_candidate(&s_succ, candidate, &ceremony, &signers)
                 .unwrap();
@@ -1054,7 +1278,14 @@ mod tests {
             let ndir = netdir(&dir, &network);
             fs::remove_file(ndir.join(format!("share-{}", hex(digest.as_bytes())))).unwrap();
         }
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert!(store.pending_candidate().is_none());
         assert!(store.current_share().unwrap().is_some());
     }
@@ -1075,6 +1306,7 @@ mod tests {
                 11,
             );
             let candidate = mk_candidate(raw.remove(0), &s_succ.body);
+            store.accept_ceremony(&ceremony).unwrap();
             let digest = store
                 .install_candidate(&s_succ, candidate, &ceremony, &signers)
                 .unwrap();
@@ -1083,7 +1315,14 @@ mod tests {
             let ndir = netdir(&dir, &network);
             fs::remove_file(ndir.join(format!("share-{}", hex(digest.as_bytes())))).unwrap();
         }
-        assert!(ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).is_err());
+        assert!(ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers
+        )
+        .is_err());
     }
 
     #[test]
@@ -1154,6 +1393,7 @@ mod tests {
             11,
         );
         let cand = mk_candidate(raw.remove(0), &s_d.body);
+        store.accept_ceremony(&ceremony_d).unwrap();
         let digest_d = store
             .install_candidate(&s_d, cand, &ceremony_d, &signers)
             .unwrap();
@@ -1186,6 +1426,7 @@ mod tests {
         let share = shares.remove(0);
         let signed_g1 = cert::tests::sign(cert_g1.body().clone(), &signers);
         let cand = mk_candidate(share, cert_g1.body());
+        store.accept_ceremony(&signers.genesis()).unwrap();
         let digest_g1 = store
             .install_candidate(&signed_g1, cand, &signers.genesis(), &signers)
             .unwrap();
@@ -1251,7 +1492,14 @@ mod tests {
             )
             .unwrap();
         }
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert_eq!(store.pinned().unwrap().digest(), digest_succ);
         let ndir = netdir(&dir, &network);
         assert!(!ndir
@@ -1273,7 +1521,14 @@ mod tests {
         let mut state = decode_state(&fs::read(&state_path).unwrap()).unwrap();
         state.pin = Some(CertDigest::new([0xee; 32]));
         fs::write(&state_path, encode_state(&state)).unwrap();
-        assert!(ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).is_err());
+        assert!(ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers
+        )
+        .is_err());
     }
 
     #[test]
@@ -1306,7 +1561,14 @@ mod tests {
                 .unwrap();
             }
         }
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert!(store.equivocation());
         assert_eq!(store.pinned().unwrap().digest(), old_digest);
     }
@@ -1328,6 +1590,7 @@ mod tests {
                 11,
             );
             let cand = mk_candidate(raw.remove(0), &s.body);
+            store.accept_ceremony(&c).unwrap();
             store.install_candidate(&s, cand, &c, &signers).unwrap();
             store.mark_receipt_sent().unwrap();
             s_succ = s;
@@ -1354,7 +1617,14 @@ mod tests {
             j.join().unwrap();
         }
         drop(store);
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert_eq!(store.pinned().unwrap().digest(), succ.digest());
         let ndir = netdir(&dir, &network);
         assert!(!ndir
@@ -1388,10 +1658,312 @@ mod tests {
             b"",
         )
         .unwrap();
-        let store = ShareStore::open(&dir, &network, signers.anchor().clone(), &signers).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
         assert_eq!(
             store.accept_ceremony(&ceremony).unwrap(),
             AcceptOutcome::Replay
         );
+    }
+
+    #[test]
+    fn unverified_activation_flag_is_never_trusted() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let network = signers.anchor().network.clone();
+        {
+            let store = open(&dir, &signers);
+            let (_signed, cert) = activated_genesis(&store, &signers);
+            let (s_succ, mut raw, ceremony) = cert_tests::successor(
+                &signers,
+                &cert,
+                CeremonyKind::Reshare,
+                Threshold::new(2, 3).unwrap(),
+                11,
+            );
+            let candidate = mk_candidate(raw.remove(0), &s_succ.body);
+            store.accept_ceremony(&ceremony).unwrap();
+            store
+                .install_candidate(&s_succ, candidate, &ceremony, &signers)
+                .unwrap();
+            // A flagged activation with an empty statement and zero receipts.
+            let succ = verify_successor(&cert, &s_succ, &signers).unwrap();
+            let activation = SignedStatement {
+                bytes: Vec::new(),
+                signature: Vec::new(),
+            };
+            let ndir = netdir(&dir, &network);
+            fs::write(
+                ndir.join(format!("proofs/{}", hex(succ.digest().as_bytes()))),
+                encode_proof(&s_succ, Some(&activation), &[]),
+            )
+            .unwrap();
+        }
+        // The flag alone must not pin the successor.
+        assert!(ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn second_opener_is_refused_while_first_holds_lock() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let store = open(&dir, &signers);
+        let network = signers.anchor().network.clone();
+        assert!(matches!(
+            ShareStore::open(
+                &dir,
+                &network,
+                signers.anchor().clone(),
+                Signers::did(1),
+                &signers
+            ),
+            Err(StoreError::Busy)
+        ));
+        drop(store);
+        let _reopened = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn foreign_or_unbound_ceremony_is_rejected() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let store = open(&dir, &signers);
+        let (_signed, cert) = activated_genesis(&store, &signers);
+        let ndir = netdir(&dir, &signers.anchor().network);
+
+        // Install a candidate under the genuine successor ceremony.
+        let (s_x, mut raw, ceremony_x) = cert_tests::successor(
+            &signers,
+            &cert,
+            CeremonyKind::Reshare,
+            Threshold::new(2, 3).unwrap(),
+            11,
+        );
+        store.accept_ceremony(&ceremony_x).unwrap();
+        let cand = mk_candidate(raw.remove(0), &s_x.body);
+        let digest_x = store
+            .install_candidate(&s_x, cand, &ceremony_x, &signers)
+            .unwrap();
+        let share_path = ndir.join(format!("share-{}", hex(digest_x.as_bytes())));
+        assert!(share_path.exists());
+
+        // A ceremony verified under a different anchor is not ours.
+        let other = TrustAnchor {
+            expected_owner: Signers::did(9),
+            network: NetworkUrn::new("tinycloud:test:other").unwrap(),
+        };
+        let mut foreign_stmt = signers.body(CeremonyKind::Genesis, Threshold::new(2, 3).unwrap());
+        foreign_stmt.id = CeremonyId::new([0xf1; 32]);
+        foreign_stmt.owner = Signers::did(9);
+        foreign_stmt.network = other.network.clone();
+        let foreign =
+            AuthorizedCeremony::verify_genesis(&other, &signers.statement(&foreign_stmt), &signers)
+                .unwrap();
+        assert!(store.accept_ceremony(&foreign).is_err());
+        assert!(share_path.exists());
+
+        // A ceremony that drops this member from its recipients is rejected.
+        let mut stmt = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+        stmt.id = CeremonyId::new([0xf2; 32]);
+        stmt.current = Some(cert.digest());
+        stmt.epoch = cert.body().epoch().checked_next().unwrap();
+        stmt.rekey = cert.body().rekey();
+        stmt.recipients[0].node = Signers::did(9);
+        let excluding =
+            AuthorizedCeremony::verify_for(&cert, &signers.statement(&stmt), &signers).unwrap();
+        assert!(store.accept_ceremony(&excluding).is_err());
+        assert!(share_path.exists());
+
+        // A ceremony for a stale chain position is rejected: activate the
+        // candidate, then present a different authorized ceremony still
+        // pinned to the old certificate.
+        let cert_x = verify_successor(&cert, &s_x, &signers).unwrap();
+        let receipts = receipts_for(&cert_x, &signers);
+        let activation = activation_for(&cert_x, &receipts, &signers);
+        store
+            .record_activation(&s_x, &activation, &receipts, &signers)
+            .unwrap();
+        let mut stmt = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+        stmt.id = CeremonyId::new([0xf3; 32]);
+        stmt.current = Some(cert.digest());
+        stmt.epoch = cert.body().epoch().checked_next().unwrap();
+        stmt.rekey = cert.body().rekey();
+        let stale =
+            AuthorizedCeremony::verify_for(&cert, &signers.statement(&stmt), &signers).unwrap();
+        assert!(store.accept_ceremony(&stale).is_err());
+
+        drop(store);
+    }
+
+    #[test]
+    fn forked_activation_is_persisted_and_freezes_everything() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let network = signers.anchor().network.clone();
+        let digest_b;
+        {
+            let store = open(&dir, &signers);
+            let (_signed, cert) = activated_genesis(&store, &signers);
+            let (s1, mut raw, c1) = cert_tests::successor(
+                &signers,
+                &cert,
+                CeremonyKind::Reshare,
+                Threshold::new(2, 3).unwrap(),
+                11,
+            );
+            store.accept_ceremony(&c1).unwrap();
+            let cand = mk_candidate(raw.remove(0), &s1.body);
+            store.install_candidate(&s1, cand, &c1, &signers).unwrap();
+            store.mark_receipt_sent().unwrap();
+            // The candidate activates; then a sibling activation over the
+            // same predecessor arrives: fork evidence for a verified
+            // predecessor that is no longer the pin.
+            let cert_a = verify_successor(&cert, &s1, &signers).unwrap();
+            let receipts_a = receipts_for(&cert_a, &signers);
+            let activation_a = activation_for(&cert_a, &receipts_a, &signers);
+            store
+                .record_activation(&s1, &activation_a, &receipts_a, &signers)
+                .unwrap();
+            let s_b = sibling_successor(&signers, &cert, &c1, 0xb1);
+            let cert_b = verify_successor(&cert, &s_b, &signers).unwrap();
+            digest_b = cert_b.digest();
+            let receipts_b = receipts_for(&cert_b, &signers);
+            let activation_b = activation_for(&cert_b, &receipts_b, &signers);
+            assert!(matches!(
+                store.record_activation(&s_b, &activation_b, &receipts_b, &signers),
+                Err(StoreError::Equivocation)
+            ));
+            assert!(store.equivocation());
+            // The fork proof must be durable.
+            assert!(netdir(&dir, &network)
+                .join(format!("proofs/{}", hex(digest_b.as_bytes())))
+                .exists());
+            // A frozen store exports nothing and accepts nothing new.
+            assert!(matches!(
+                store.current_share(),
+                Err(StoreError::Equivocation)
+            ));
+            let mut stmt_c = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+            stmt_c.id = CeremonyId::new([0xcc; 32]);
+            stmt_c.current = Some(cert.digest());
+            stmt_c.epoch = cert.body().epoch().checked_next().unwrap();
+            stmt_c.rekey = cert.body().rekey();
+            let c_ceremony =
+                AuthorizedCeremony::verify_for(&cert, &signers.statement(&stmt_c), &signers)
+                    .unwrap();
+            assert!(store.accept_ceremony(&c_ceremony).is_err());
+        }
+        // The freeze persists across restart.
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
+        assert!(store.equivocation());
+        let _ = digest_b;
+    }
+
+    #[test]
+    fn retired_receipted_candidate_with_missing_share_converges() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let network = signers.anchor().network.clone();
+        let digest_c;
+        let succ_digest;
+        {
+            let store = open(&dir, &signers);
+            let (_signed, cert) = activated_genesis(&store, &signers);
+            let (s_c, mut raw, ceremony_c) = cert_tests::successor(
+                &signers,
+                &cert,
+                CeremonyKind::Reshare,
+                Threshold::new(2, 3).unwrap(),
+                11,
+            );
+            store.accept_ceremony(&ceremony_c).unwrap();
+            let cand = mk_candidate(raw.remove(0), &s_c.body);
+            digest_c = store
+                .install_candidate(&s_c, cand, &ceremony_c, &signers)
+                .unwrap();
+            store.mark_receipt_sent().unwrap();
+            // A different successor activates; the proof lands but the
+            // candidate's share file is lost before `state` commits (the
+            // crash window this ordering now survives).
+            let s_w = sibling_successor(&signers, &cert, &ceremony_c, 0xd0);
+            let cert_w = verify_successor(&cert, &s_w, &signers).unwrap();
+            succ_digest = cert_w.digest();
+            let receipts = receipts_for(&cert_w, &signers);
+            let activation = activation_for(&cert_w, &receipts, &signers);
+            let ndir = netdir(&dir, &network);
+            fs::write(
+                ndir.join(format!("proofs/{}", hex(succ_digest.as_bytes()))),
+                encode_proof(&s_w, Some(&activation), &receipts),
+            )
+            .unwrap();
+            fs::remove_file(ndir.join(format!("share-{}", hex(digest_c.as_bytes())))).unwrap();
+        }
+        // Restart: the durable retirement proof settles the candidate even
+        // though its share is gone; the store converges, not Corrupt.
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
+        assert_eq!(store.pinned().unwrap().digest(), succ_digest);
+        assert!(store.pending_candidate().is_none());
+        assert!(store.retired().iter().any(|r| r.digest == digest_c));
+    }
+
+    #[test]
+    fn leftover_temp_files_are_swept_on_open() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let network = signers.anchor().network.clone();
+        {
+            let store = open(&dir, &signers);
+            activated_genesis(&store, &signers);
+        }
+        let ndir = netdir(&dir, &network);
+        let plain = ndir.join("share-0123456789abcdef.tmp-99-7");
+        fs::write(&plain, [0x55u8; 67]).unwrap();
+        let old_style = ndir.join("state.tmp");
+        fs::write(&old_style, [0x55u8; 4]).unwrap();
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
+        assert!(!plain.exists());
+        assert!(!old_style.exists());
+        assert!(store.current_share().unwrap().is_some());
     }
 }
