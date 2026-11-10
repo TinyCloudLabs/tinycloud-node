@@ -457,6 +457,16 @@ impl EncryptionService {
         };
         if let Err(err) = model.insert(&self.db).await {
             if is_supported_unique_violation(&err) {
+                let mut ceremony_active: encryption_ceremony::ActiveModel =
+                    encryption_ceremony::Entity::find_by_id(ceremony_id.clone())
+                        .one(&self.db)
+                        .await?
+                        .ok_or(EncryptionServiceError::NetworkNotFound)?
+                        .into();
+                ceremony_active.state = Set("failed".to_string());
+                ceremony_active.failure = Set(Some("network_already_exists".to_string()));
+                ceremony_active.completed_at = Set(Some(now_rfc3339()));
+                ceremony_active.update(&self.db).await?;
                 return Err(EncryptionServiceError::NetworkAlreadyExists);
             }
             return Err(err.into());

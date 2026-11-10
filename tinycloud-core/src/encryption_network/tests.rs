@@ -95,6 +95,30 @@ async fn race_network_creates(
     });
     [first.await.unwrap(), second.await.unwrap()]
 }
+async fn assert_losing_create_ceremony_is_failed(db: &DatabaseConnection) {
+    let ceremonies = encryption_ceremony::Entity::find()
+        .all(db)
+        .await
+        .expect("load create ceremonies");
+    assert_eq!(ceremonies.len(), 2);
+    assert_eq!(
+        ceremonies
+            .iter()
+            .filter(|row| row.state == "completed")
+            .count(),
+        1
+    );
+    assert!(
+        ceremonies.iter().all(|row| row.state != "started"),
+        "the losing create must not leave a started ceremony"
+    );
+    let failed = ceremonies
+        .iter()
+        .find(|row| row.state == "failed")
+        .expect("losing create ceremony is failed");
+    assert_eq!(failed.failure.as_deref(), Some("network_already_exists"));
+    assert!(failed.completed_at.is_some());
+}
 
 struct BarrierKeyBackend {
     inner: LocalOneOfOneBackend,
@@ -181,7 +205,7 @@ async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists(
     let db = Database::connect(options).await.expect("connect sqlite");
     Migrator::up(&db, None).await.expect("migrate");
 
-    let results = race_network_creates(db).await;
+    let results = race_network_creates(db.clone()).await;
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
         results
@@ -191,6 +215,7 @@ async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists(
         1,
         "duplicate create should map to 409, never a DB error/500"
     );
+    assert_losing_create_ceremony_is_failed(&db).await;
 }
 
 fn owner_keypair() -> Keypair {
@@ -1313,7 +1338,7 @@ async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_alread
     };
     let db = fixture.connect(4).await;
 
-    let results = race_network_creates(db).await;
+    let results = race_network_creates(db.clone()).await;
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
         results
@@ -1323,6 +1348,7 @@ async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_alread
         1,
         "duplicate create should map to 409, never a DB error/500"
     );
+    assert_losing_create_ceremony_is_failed(&db).await;
 }
 
 #[tokio::test]
