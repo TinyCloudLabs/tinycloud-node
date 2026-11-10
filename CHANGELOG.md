@@ -2,13 +2,22 @@
 
 ## [Unreleased]
 ### Changes
-- Encryption root and named keys read both v1 and TCW2 key wraps by default. The independent, default-off `key_wrap_require_v2` policy requires v2 incoming network-key wraps without restricting receiver responses. Response wraps remain v1 by default; `key_wrap_v2 = true` selects v2. V1 writers avoid the reserved TCW2 prefix, malformed surrogate headers are refused, and stored network secrets require encrypted seals. Descriptors and payload schemas are unchanged. Details: TC-2518
-- Encryption network reader policy is checked during `/invoke` preflight, before replay reservation. Details: TC-2518
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
+
+## [1.25.20] - 2026-11-10
+
+### Changes
+
+- Encryption networks read both v1 and TCW2 key wraps. Writes stay v1 unless you opt in, and there is no schema or data migration. Two settings control this, both default `false`:
+  - `[global.encryption_network] key_wrap_v2` (env `TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2`): write new key wraps as v2.
+  - `[global.encryption_network] key_wrap_require_v2` (env `TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_REQUIRE_V2`): accept only v2 for incoming network-key wraps. Receiver responses aren't restricted.
+
+  The reader policy is checked when an `/invoke` request is validated, before it's recorded for replay protection. Descriptors and payload schemas are unchanged. Details: TC-2518
+- Creating the same encryption network twice at once now returns the same conflict response (`409`) to the second request as a sequential duplicate gets. Other database errors are reported as before. No schema, data migration or configuration change. Details: TC-2712
 
 ## [1.25.17] - 2026-11-03
 
