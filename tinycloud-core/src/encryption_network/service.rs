@@ -9,7 +9,12 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{
+    error::{RuntimeErr, SqlxError},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, DbErr, EntityTrait, QueryFilter,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -450,7 +455,12 @@ impl EncryptionService {
             created_at: Set(now.clone()),
             updated_at: Set(now.clone()),
         };
-        model.insert(&self.db).await?;
+        if let Err(err) = model.insert(&self.db).await {
+            if is_supported_unique_violation(&err) {
+                return Err(EncryptionServiceError::NetworkAlreadyExists);
+            }
+            return Err(err.into());
+        }
 
         encryption_network_member::ActiveModel {
             network_id: Set(network_id.to_string()),
@@ -1526,10 +1536,20 @@ pub(super) fn now_rfc3339() -> String {
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
-
 pub(super) fn is_unique_violation(err: &DbErr) -> bool {
     let s = err.to_string().to_lowercase();
     s.contains("unique") || s.contains("primary") || s.contains("duplicate")
+}
+
+fn is_supported_unique_violation(err: &DbErr) -> bool {
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = err
+    else {
+        return false;
+    };
+
+    matches!(database.code().as_deref(), Some("23505" | "1555" | "2067"))
 }
 
 fn encode_base64(bytes: &[u8]) -> String {

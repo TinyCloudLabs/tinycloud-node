@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sea_orm::{
@@ -28,7 +28,10 @@ use tinycloud_auth::{
 };
 
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::backend::{wrap_to_public_key, LocalOneOfOneBackend};
+use crate::encryption_network::backend::{
+    wrap_to_public_key, GeneratedKey, KeyBackendError, KeySeed, KeyWrapContext, KeyWrapVersion,
+    LocalOneOfOneBackend,
+};
 use crate::encryption_network::canonical::{canonical_hash, canonical_json_bytes};
 use crate::encryption_network::key_id::{parse as parse_resource, EncryptionResource, KeyLocation};
 use crate::encryption_network::keys::KeyState;
@@ -63,6 +66,131 @@ fn make_service(db: DatabaseConnection) -> EncryptionService {
     let seal = ColumnEncryption::new([0xABu8; 32]);
     let backend = Arc::new(LocalOneOfOneBackend::new(seal));
     EncryptionService::new(db, NODE_DID.to_string(), backend)
+}
+async fn race_network_creates(
+    db: DatabaseConnection,
+) -> [Result<crate::encryption_network::NetworkDescriptor, EncryptionServiceError>; 2] {
+    let backend = Arc::new(BarrierKeyBackend {
+        inner: LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32])),
+        generate_barrier: Arc::new(Barrier::new(2)),
+    });
+    let service = Arc::new(EncryptionService::new(db, NODE_DID.to_string(), backend));
+    let owner = owner_did();
+    let request = || CreateNetworkRequest {
+        name: NETWORK_NAME.to_string(),
+        owner_did: owner.clone(),
+        threshold: Threshold::one_of_one(),
+    };
+
+    let first_service = service.clone();
+    let first_request = request();
+    let first =
+        tokio::spawn(async move { first_service.create_one_of_one_network(first_request).await });
+    let second_service = service;
+    let second_request = request();
+    let second = tokio::spawn(async move {
+        second_service
+            .create_one_of_one_network(second_request)
+            .await
+    });
+    [first.await.unwrap(), second.await.unwrap()]
+}
+
+struct BarrierKeyBackend {
+    inner: LocalOneOfOneBackend,
+    generate_barrier: Arc<Barrier>,
+}
+
+impl KeyBackend for BarrierKeyBackend {
+    fn kind(&self) -> KeyBackendKind {
+        self.inner.kind()
+    }
+
+    fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
+        self.generate_barrier.wait();
+        self.inner.generate()
+    }
+
+    fn unwrap(
+        &self,
+        sealed_private_key: &[u8],
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner.unwrap(sealed_private_key, wrapped_key, context)
+    }
+
+    fn rewrap(
+        &self,
+        symmetric_key: &[u8],
+        receiver_public_key: &[u8],
+        context: &KeyWrapContext<'_>,
+        version: KeyWrapVersion,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .rewrap(symmetric_key, receiver_public_key, context, version)
+    }
+
+    fn open_network_secret(
+        &self,
+        sealed_private_key: &[u8],
+    ) -> Result<X25519StaticSecret, KeyBackendError> {
+        self.inner.open_network_secret(sealed_private_key)
+    }
+
+    fn derive_named_public_key(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .derive_named_public_key(network_secret, canonical_urn, seed)
+    }
+
+    fn unwrap_named(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .unwrap_named(network_secret, canonical_urn, seed, wrapped_key, context)
+    }
+
+    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+        self.inner.generate_seed()
+    }
+
+    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
+        self.inner.open_seed(sealed_seed)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("race.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+
+    let results = race_network_creates(db).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
 }
 
 fn owner_keypair() -> Keypair {
@@ -1173,6 +1301,30 @@ async fn stored_unknown_state_is_refused_as_corrupt() {
 
 // PostgreSQL-backed. Locally these return early unless
 // TINYCLOUD_TEST_POSTGRES_URL is set; CI runs them with a PostgreSQL service.
+#[tokio::test]
+async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+
+    let results = race_network_creates(db).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
+}
+
 #[tokio::test]
 async fn postgres_concurrent_identical_creates_return_one_row() {
     let Some(fixture) = PostgresTestSchema::migrated_through(
