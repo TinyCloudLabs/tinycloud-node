@@ -1736,7 +1736,7 @@ async fn app_key_is_deletable_seeded_and_differs_from_the_deterministic_derivati
 
     let row = key_row(&db, "apps/foo/x").await;
     let sealed = row.sealed_seed.expect("a deletable key stores a seed");
-    assert_eq!(sealed[0], 0x01, "sealed with the column key");
+    assert_eq!(sealed[0], 0x02, "sealed with the storage keyring");
     let backend = LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32]));
     assert!(backend.open_seed(&sealed).is_ok());
 

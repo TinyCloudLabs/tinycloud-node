@@ -604,6 +604,9 @@ where
             tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
                 .await?;
         }
+        crate::reencrypt::check_writer(&tx, encryption.as_ref())
+            .await
+            .map_err(|_| DbErr::Custom("storage generation fence".into()))?;
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)

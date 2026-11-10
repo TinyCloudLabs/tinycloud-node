@@ -519,6 +519,13 @@ fn named_key_secret(
 /// Local one-of-one backend. The DB encryption key is reused to seal the
 /// network private key at rest — the same protection used elsewhere for
 /// sensitive DB columns.
+// Seals predate row-aware backend APIs. These stable purpose bindings allow
+// sealed values to be opened by every existing backend call without row IDs.
+pub const NETWORK_SEAL_BINDING: crate::encryption::RowBinding<'static> =
+    crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &[]);
+pub const SEED_SEAL_BINDING: crate::encryption::RowBinding<'static> =
+    crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &[]);
+
 pub struct LocalOneOfOneBackend {
     seal: ColumnEncryption,
 }
@@ -538,7 +545,10 @@ impl KeyBackend for LocalOneOfOneBackend {
         &self,
         sealed_private_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt_legacy(sealed_private_key)?);
+        let opened = Zeroizing::new(
+            self.seal
+                .decrypt(sealed_private_key, NETWORK_SEAL_BINDING)?,
+        );
         if opened.len() != 32 {
             return Err(KeyBackendError::InvalidSealedKey);
         }
@@ -552,7 +562,7 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
-        let sealed = self.seal.encrypt_legacy(secret.as_bytes());
+        let sealed = self.seal.encrypt(secret.as_bytes(), NETWORK_SEAL_BINDING);
         Ok(GeneratedKey {
             public_key: public.as_bytes().to_vec(),
             sealed_private_key: sealed,
@@ -597,12 +607,12 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
         let mut bytes = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(bytes.as_mut_slice());
-        let sealed = self.seal.encrypt_legacy(bytes.as_slice());
+        let sealed = self.seal.encrypt(bytes.as_slice(), SEED_SEAL_BINDING);
         Ok((KeySeed::from_bytes(*bytes), sealed))
     }
 
     fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt_legacy(sealed_seed)?);
+        let opened = Zeroizing::new(self.seal.decrypt(sealed_seed, SEED_SEAL_BINDING)?);
         let bytes: [u8; 32] = opened
             .as_slice()
             .try_into()
@@ -670,12 +680,12 @@ mod tests {
         let backend = LocalOneOfOneBackend::new(seal_key());
         assert!(backend.open_network_secret(&[7u8; 32]).is_err());
         let generated = backend.generate().unwrap();
-        assert_eq!(generated.sealed_private_key[0], 0x01);
+        assert_eq!(generated.sealed_private_key[0], 0x02);
         assert!(backend
             .open_network_secret(&generated.sealed_private_key)
             .is_ok());
         let (_, seed) = backend.generate_seed().unwrap();
-        assert_eq!(seed[0], 0x01);
+        assert_eq!(seed[0], 0x02);
         assert!(backend.open_seed(&seed).is_ok());
     }
 
@@ -1010,11 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn network_key_opening_requires_a_legacy_seal() {
+    fn network_key_opening_requires_an_authenticated_seal() {
         let backend = LocalOneOfOneBackend::new(seal_key());
         assert!(backend.open_network_secret(&[0x42; 32]).is_err());
         let generated = backend.generate().unwrap();
-        assert_eq!(generated.sealed_private_key[0], 1);
+        assert_eq!(generated.sealed_private_key[0], 2);
         assert!(backend
             .open_network_secret(&generated.sealed_private_key)
             .is_ok());
