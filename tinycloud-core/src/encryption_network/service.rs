@@ -457,16 +457,37 @@ impl EncryptionService {
         };
         if let Err(err) = model.insert(&self.db).await {
             if is_supported_unique_violation(&err) {
-                let mut ceremony_active: encryption_ceremony::ActiveModel =
-                    encryption_ceremony::Entity::find_by_id(ceremony_id.clone())
-                        .one(&self.db)
-                        .await?
-                        .ok_or(EncryptionServiceError::NetworkNotFound)?
-                        .into();
-                ceremony_active.state = Set("failed".to_string());
-                ceremony_active.failure = Set(Some("network_already_exists".to_string()));
-                ceremony_active.completed_at = Set(Some(now_rfc3339()));
-                ceremony_active.update(&self.db).await?;
+                let finalize_result: Result<bool, DbErr> = async {
+                    let Some(ceremony) =
+                        encryption_ceremony::Entity::find_by_id(ceremony_id.clone())
+                            .one(&self.db)
+                            .await?
+                    else {
+                        return Ok(false);
+                    };
+                    let mut ceremony_active: encryption_ceremony::ActiveModel = ceremony.into();
+                    ceremony_active.state = Set("failed".to_string());
+                    ceremony_active.failure = Set(Some("network_already_exists".to_string()));
+                    ceremony_active.completed_at = Set(Some(now_rfc3339()));
+                    ceremony_active.update(&self.db).await?;
+                    Ok(true)
+                }
+                .await;
+                match finalize_result {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        target: "tinycloud::encryption_network",
+                        event = "network_create_conflict_ceremony_update_failed",
+                        failure_kind = "missing_record",
+                        "could not mark losing network create ceremony as failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        target: "tinycloud::encryption_network",
+                        event = "network_create_conflict_ceremony_update_failed",
+                        failure_kind = "database_error",
+                        "could not mark losing network create ceremony as failed"
+                    ),
+                }
                 return Err(EncryptionServiceError::NetworkAlreadyExists);
             }
             return Err(err.into());

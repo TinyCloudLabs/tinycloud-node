@@ -8,7 +8,8 @@ use std::sync::{Arc, Barrier};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
@@ -216,6 +217,38 @@ async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists(
         "duplicate create should map to 409, never a DB error/500"
     );
     assert_losing_create_ceremony_is_failed(&db).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_network_conflict_survives_ceremony_cleanup_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cleanup-failure.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+    db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TRIGGER fail_losing_ceremony_update \
+         BEFORE UPDATE ON encryption_ceremony \
+         WHEN NEW.state = 'failed' \
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+    ))
+    .await
+    .expect("install cleanup failure trigger");
+
+    let results = race_network_creates(db).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "cleanup failure must not replace the conflict response with a 500"
+    );
 }
 
 fn owner_keypair() -> Keypair {
