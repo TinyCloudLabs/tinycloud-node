@@ -3,7 +3,10 @@ use super::{select_batch, Error, Rings, COLUMNS};
 use crate::encryption_network::{key_id::KeyLocation, NetworkId};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +185,10 @@ pub async fn coverage<C: ConnectionTrait>(
     proof: &VerifiedManifest,
 ) -> Result<Coverage, Error> {
     let mut counts = Coverage::default();
+    // A DB row cannot erase a snapshot allocation by changing its version,
+    // clearing it to pending, or disappearing entirely. No extra DB scan or
+    // unbounded transaction is needed: remove exact identities as pages arrive.
+    let mut unseen_networks: BTreeSet<_> = proof.networks.keys().cloned().collect();
     for (index, spec) in COLUMNS[..2].iter().enumerate() {
         let mut after = None;
         loop {
@@ -201,7 +208,10 @@ pub async fn coverage<C: ConnectionTrait>(
                 {
                     let version = row.key_version.ok_or(Error::Verify)?;
                     let expected = match &row.key {
-                        super::Key::Text(id) => proof.network(id, version),
+                        super::Key::Text(id) => {
+                            unseen_networks.remove(&(id.clone(), version));
+                            proof.network(id, version)
+                        }
                         super::Key::Pair(id, path) => proof.seed(id, path, version),
                         _ => return Err(Error::Verify),
                     };
@@ -215,6 +225,16 @@ pub async fn coverage<C: ConnectionTrait>(
                                 counts.mismatched_seeds += 1;
                             }
                         }
+                        Some(_)
+                            if index == 0
+                                && (row.blob.as_ref().is_none_or(|b| b.is_empty())
+                                    || !matches!(
+                                        row.state.as_deref(),
+                                        Some("active" | "rotating" | "revoked")
+                                    )) =>
+                        {
+                            counts.missing_networks += 1;
+                        }
                         _ => {}
                     }
                 }
@@ -222,6 +242,7 @@ pub async fn coverage<C: ConnectionTrait>(
             }
         }
     }
+    counts.missing_networks += unseen_networks.len() as u64;
     Ok(counts)
 }
 

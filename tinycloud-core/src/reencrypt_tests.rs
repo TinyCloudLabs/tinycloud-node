@@ -1230,21 +1230,17 @@ fn manifest_requires_pinned_hash_date_custody_and_canonical_encoding() {
     }
 }
 
-fn manifest_test_dir() -> std::path::PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "tc2713-manifest-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&path).unwrap();
-    path
+fn manifest_test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("tc2713-manifest-")
+        .tempdir()
+        .unwrap()
 }
 
 async fn manifest_runner_case(db: &DatabaseConnection) {
     fixtures(db).await;
     let dir = manifest_test_dir();
-    let path = dir.join("manifest.json");
+    let path = dir.path().join("manifest.json");
     let bytes = serde_json::to_vec(&trusted_document()).unwrap();
     let pin = crate::encryption_network::canonical::hash_hex(&bytes);
     std::fs::write(&path, &bytes).unwrap();
@@ -1345,12 +1341,82 @@ async fn manifest_runner_case(db: &DatabaseConnection) {
             .unwrap()
             .complete
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
 async fn sqlite_manifest_runner_checks_proof_before_fencing_and_completes() {
     manifest_runner_case(&database().await).await;
+}
+
+async fn manifest_snapshot_network_case(db: &DatabaseConnection, version_changed: bool) {
+    fixtures(db).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    let bytes = serde_json::to_vec(&trusted_document()).unwrap();
+    let pin = crate::encryption_network::canonical::hash_hex(&bytes);
+    std::fs::write(&path, bytes).unwrap();
+    let beta = NetworkId::new(OWNER, "beta").unwrap().to_string();
+    exec(
+        db,
+        "DELETE FROM encryption_network_key WHERE network_id=?",
+        vec![beta.clone().into()],
+    )
+    .await;
+    if version_changed {
+        exec(db,"UPDATE encryption_network SET key_version=7,public_key=?,sealed_private_key=NULL,state='pending' WHERE network_id=?",vec![Vec::<u8>::new().into(),beta.into()]).await;
+    } else {
+        exec(db,"UPDATE encryption_network SET sealed_private_key=NULL,state='pending' WHERE network_id=?",vec![beta.into()]).await;
+    }
+    let counts = manifest::coverage(db, &trusted_seed_identities())
+        .await
+        .unwrap();
+    assert!(
+        counts.blocked(),
+        "snapshot network identity and seal must remain present at the pinned version"
+    );
+    assert!(matches!(
+        manifest::run_offline(db, &rings(), &path, &pin, 1).await,
+        Err(Error::ManifestCoverage(_))
+    ));
+    let row = db
+        .query_one(bound(
+            db.get_database_backend(),
+            "SELECT target,rewritten FROM storage_rekey WHERE id=1",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i32>("", "target").unwrap(), 0);
+    assert_eq!(row.try_get::<i64>("", "rewritten").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_manifest_snapshot_version_mutation_blocks_before_fence() {
+    manifest_snapshot_network_case(&database().await, true).await;
+}
+
+#[tokio::test]
+async fn postgres_manifest_snapshot_version_mutation_blocks_before_fence() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("manifest_snapshot_version").await
+    else {
+        return;
+    };
+    manifest_snapshot_network_case(&f.conn, true).await;
+}
+
+#[tokio::test]
+async fn sqlite_manifest_snapshot_missing_seal_blocks_before_fence() {
+    manifest_snapshot_network_case(&database().await, false).await;
+}
+
+#[tokio::test]
+async fn postgres_manifest_snapshot_missing_seal_blocks_before_fence() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("manifest_snapshot_seal").await
+    else {
+        return;
+    };
+    manifest_snapshot_network_case(&f.conn, false).await;
 }
 
 #[tokio::test]
@@ -1364,8 +1430,8 @@ async fn postgres_manifest_runner_checks_proof_before_fencing_and_completes() {
 
 async fn exporter_case(db: &DatabaseConnection, postgres: bool) {
     let dir = manifest_test_dir();
-    let archive = dir.join("snapshot.dump");
-    let output = dir.join("manifest.json");
+    let archive = dir.path().join("snapshot.dump");
+    let output = dir.path().join("manifest.json");
     let file_db = if postgres {
         None
     } else {
@@ -1457,7 +1523,6 @@ async fn exporter_case(db: &DatabaseConnection, postgres: bool) {
         doc.provenance.snapshot_sha256,
         crate::encryption_network::canonical::hash_hex(&std::fs::read(&archive).unwrap())
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

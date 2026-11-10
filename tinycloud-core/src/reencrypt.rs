@@ -862,7 +862,7 @@ pub(crate) async fn pre_activation_guards<C: ConnectionTrait>(
 /// All serving instances first install overlap readers with old writers.
 /// Only after the fence commits does this return rings selecting the new writer.
 /// Stale writers fail at the database boundary, including inserts behind cursors.
-pub async fn activate<C: ConnectionTrait + TransactionTrait>(
+pub(crate) async fn activate<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
 ) -> Result<Rings, Error> {
@@ -995,7 +995,7 @@ async fn check_alias<C: ConnectionTrait>(
 
 /// One transaction, one bounded page. Dropping this future rolls the whole page
 /// back; committed cursors and counters advance with the verified ciphertext.
-pub async fn step<C: ConnectionTrait + TransactionTrait>(
+pub(crate) async fn step<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
     batch: u64,

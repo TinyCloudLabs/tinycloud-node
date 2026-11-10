@@ -9,22 +9,42 @@ record, not a hash generated from the target database during migration.
 The source is a dated, trusted PlanetScale backup snapshot of
 `tinycloud-node-production-usw`. The custodian records the backup ID, RFC3339
 snapshot timestamp, archive SHA-256, exporter identity, storage location and
-custody record reference. Restore the checked archive into an isolated local
-database with no other writers. For PostgreSQL, use a different local database
-name; the exporter refuses the live database name and non-loopback endpoints.
-No production endpoint is queried by the exporter.
+custody record reference. Naomi designates the rotation custodian, who holds the
+separately pinned manifest digest. Before the offline window, that custodian must
+record the archive and manifest SHA-256 values, backup ID, snapshot timestamp,
+exporter, storage location and custody reference in an authenticated private
+TC-2713 Linear comment, and record the same manifest digest in a TinyCloud
+Secrets entry named `TC2713_REKEY_MANIFEST_SHA256`. These records are operational
+prerequisites; the exporter does not create them.
 
-The custodian must verify that the restored source corresponds to the recorded
-archive, authenticate the export, and record the manifest SHA-256 in the separate
-access-controlled custody record before the offline window. A checksum supplied
-beside an untrusted file without that custody process is not an authenticated pin.
-The runner takes the file and the independently obtained pin; it never chooses
-the pin by hashing whichever file it receives.
+The custodian verifies the archive digest against that custody record, then
+restores **that exact archive** into a newly created, isolated local database or
+private PostgreSQL cluster with no other writers. Record the restore command,
+local cluster/database identity and checked archive digest in the custody record.
+For PostgreSQL, use a different local database name. Tunnels, proxies, port
+forwards, `pscale connect` and SSH forwarding are prohibited during export:
+loopback alone does not prove the source is a local restore. The exporter rejects
+remote and multi-host destinations, query overrides and the live database name,
+but cannot establish that a supplied archive produced the connected PostgreSQL
+database. The custodian's checked restore and custody record provide that binding;
+hashing an unrelated `--snapshot-file` is insufficient. No production endpoint
+may be queried by the exporter.
+
+The runner operator independently authenticates to Linear and TinyCloud Secrets,
+retrieves the digest from both custody records, and compares them before supplying
+the expected digest to the runner. Stop if either record is unavailable or they
+differ. Do not obtain the expected digest from the target database, the manifest
+file, a sidecar delivered with it, or a fresh hash of the received file. The runner
+takes the file and this independently obtained pin; it never chooses its own pin.
 
 Networks or seeds created after the snapshot are not covered. Take a fresh
 trusted snapshot immediately before the migration window. Missing identities
 are blocking categories, never exemptions. Client-held authenticated key pins
 are a possible later second source, not an implemented fallback.
+Coverage also checks the reverse direction: every snapshot network must still
+exist at its pinned key version with the same public key and a stored seal.
+Deleting it, changing its version or clearing it to pending blocks migration
+before the writer fence.
 
 ## Canonical version 1 encoding
 
@@ -86,6 +106,8 @@ file is converted into private network/seed maps inside `VerifiedManifest`; ther
 is no raw-map conversion into that type. Coverage runs in bounded pages and
 reports only missing/mismatched network and seed counts. Any nonzero category
 blocks activation. Per-row migration checks remain mandatory after coverage.
+The activation and page-step helpers are crate-private; integrations use
+`run_offline` so they cannot bypass the coverage preflight.
 
 This entry point does not provide a production root source or stop serving.
 Do not deploy #541 standalone on nodes with v1 rows. It ships only within the

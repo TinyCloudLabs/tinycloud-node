@@ -9,6 +9,23 @@ spec.loader.exec_module(exporter)
 
 
 class ExportGuards(unittest.TestCase):
+    def test_multihost_and_ambiguous_ports_are_refused_before_connecting(self):
+        for url in (
+            "postgres://localhost:5432,db.prod.example:5432/restored",
+            "postgres://127.0.0.1:1,remote/restored",
+            "postgres://[::1]:5432,remote:5432/restored",
+            "postgres://user,name@localhost:5432/restored",
+            "postgres://localhost:not-a-port/restored",
+            "postgres://localhost:65536/restored",
+            "postgres://127.0.0.2/restored",
+            "postgres://localhost/restored?hostaddr=192.0.2.1",
+            "postgres://localhost/restored?service=remote",
+        ):
+            with self.subTest(url=url), mock.patch.object(exporter.subprocess, "run") as connect:
+                with self.assertRaises(ValueError):
+                    exporter.read_postgres(url, "public")
+                connect.assert_not_called()
+
     def test_nonlocal_live_database_and_override_urls_are_refused_before_connecting(self):
         with mock.patch.object(exporter.subprocess, "run") as connect:
             for url in (

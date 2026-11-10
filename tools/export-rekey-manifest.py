@@ -7,7 +7,6 @@ output contains only its SHA-256 and network/seed counts.
 import argparse
 import datetime
 import hashlib
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -67,9 +66,12 @@ def read_postgres(url, schema):
     parsed = urlsplit(url)
     host = parsed.hostname
     if (parsed.scheme not in ("postgres", "postgresql") or parsed.query or parsed.fragment
+            or "," in parsed.netloc
             or unquote(parsed.path).rstrip("/").endswith("/tinycloud-node-production-usw")):
         raise ValueError("only an explicit restored loopback database is accepted")
-    if host != "localhost" and (not host or not ipaddress.ip_address(host).is_loopback):
+    # Accessing port validates the integer and range before libpq sees the URI.
+    port = parsed.port
+    if host not in ("localhost", "127.0.0.1", "::1") or (port is not None and port < 1):
         raise ValueError("only loopback is accepted")
     if not re.fullmatch("[a-zA-Z_][a-zA-Z0-9_]*", schema):
         raise ValueError("invalid restored schema")
