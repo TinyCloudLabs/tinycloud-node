@@ -820,6 +820,25 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
     };
     (status, err.to_string())
 }
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_duplicate_maps_to_conflict_but_other_database_errors_stay_internal() {
+        assert_eq!(
+            map_service_err(EncryptionServiceError::NetworkAlreadyExists).0,
+            Status::Conflict
+        );
+        assert_eq!(
+            map_service_err(EncryptionServiceError::Db(
+                tinycloud_core::sea_orm::DbErr::Custom("database failure".to_string())
+            ))
+            .0,
+            Status::InternalServerError
+        );
+    }
+}
 
 #[cfg(feature = "dstack")]
 pub fn _docs() {}

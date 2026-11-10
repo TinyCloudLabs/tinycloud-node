@@ -4,11 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
@@ -28,7 +30,10 @@ use tinycloud_auth::{
 };
 
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::backend::{wrap_to_public_key, LocalOneOfOneBackend};
+use crate::encryption_network::backend::{
+    wrap_to_public_key, GeneratedKey, KeyBackendError, KeySeed, KeyWrapContext, KeyWrapVersion,
+    LocalOneOfOneBackend,
+};
 use crate::encryption_network::canonical::{canonical_hash, canonical_json_bytes};
 use crate::encryption_network::key_id::{parse as parse_resource, EncryptionResource, KeyLocation};
 use crate::encryption_network::keys::KeyState;
@@ -63,6 +68,274 @@ fn make_service(db: DatabaseConnection) -> EncryptionService {
     let seal = ColumnEncryption::new([0xABu8; 32]);
     let backend = Arc::new(LocalOneOfOneBackend::new(seal));
     EncryptionService::new(db, NODE_DID.to_string(), backend)
+}
+async fn race_network_creates(
+    db: DatabaseConnection,
+) -> [Result<crate::encryption_network::NetworkDescriptor, EncryptionServiceError>; 2] {
+    let backend = Arc::new(BarrierKeyBackend {
+        inner: LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32])),
+        generate_barrier: Arc::new(GenerateBarrier::new(2)),
+    });
+    let service = Arc::new(EncryptionService::new(db, NODE_DID.to_string(), backend));
+    let owner = owner_did();
+    let request = || CreateNetworkRequest {
+        name: NETWORK_NAME.to_string(),
+        owner_did: owner.clone(),
+        threshold: Threshold::one_of_one(),
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let first_service = service.clone();
+    let first_request = request();
+    tasks.spawn(async move { first_service.create_one_of_one_network(first_request).await });
+    let second_service = service;
+    let second_request = request();
+    tasks.spawn(async move {
+        second_service
+            .create_one_of_one_network(second_request)
+            .await
+    });
+
+    match tokio::time::timeout(Duration::from_secs(30), async {
+        let first = tasks.join_next().await.expect("first create task").unwrap();
+        let second = tasks
+            .join_next()
+            .await
+            .expect("second create task")
+            .unwrap();
+        [first, second]
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            tasks.abort_all();
+            panic!("concurrent network creation must finish within 30 seconds");
+        }
+    }
+}
+async fn assert_losing_create_ceremony_is_failed(db: &DatabaseConnection) {
+    let ceremonies = encryption_ceremony::Entity::find()
+        .all(db)
+        .await
+        .expect("load create ceremonies");
+    assert_eq!(ceremonies.len(), 2);
+    assert_eq!(
+        ceremonies
+            .iter()
+            .filter(|row| row.state == "completed")
+            .count(),
+        1
+    );
+    assert!(
+        ceremonies.iter().all(|row| row.state != "started"),
+        "the losing create must not leave a started ceremony"
+    );
+    let failed = ceremonies
+        .iter()
+        .find(|row| row.state == "failed")
+        .expect("losing create ceremony is failed");
+    assert_eq!(failed.failure.as_deref(), Some("network_already_exists"));
+    assert!(failed.completed_at.is_some());
+}
+
+struct GenerateBarrier {
+    parties: usize,
+    state: Mutex<GenerateBarrierState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GenerateBarrierState {
+    waiting: usize,
+    released: bool,
+    broken: bool,
+}
+
+impl GenerateBarrier {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: Mutex::new(GenerateBarrierState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), KeyBackendError> {
+        let mut state = self.state.lock().expect("generate barrier mutex poisoned");
+        if state.broken {
+            return Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ));
+        }
+        state.waiting += 1;
+        if state.waiting == self.parties {
+            state.released = true;
+            self.changed.notify_all();
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.released && !state.broken {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            };
+            let (next_state, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("generate barrier mutex poisoned");
+            state = next_state;
+            if timeout.timed_out() && !state.released {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            }
+        }
+
+        if state.broken {
+            Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BarrierKeyBackend {
+    inner: LocalOneOfOneBackend,
+    generate_barrier: Arc<GenerateBarrier>,
+}
+
+impl KeyBackend for BarrierKeyBackend {
+    fn kind(&self) -> KeyBackendKind {
+        self.inner.kind()
+    }
+
+    fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
+        tokio::task::block_in_place(|| self.generate_barrier.wait())?;
+        self.inner.generate()
+    }
+
+    fn unwrap(
+        &self,
+        sealed_private_key: &[u8],
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner.unwrap(sealed_private_key, wrapped_key, context)
+    }
+
+    fn rewrap(
+        &self,
+        symmetric_key: &[u8],
+        receiver_public_key: &[u8],
+        context: &KeyWrapContext<'_>,
+        version: KeyWrapVersion,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .rewrap(symmetric_key, receiver_public_key, context, version)
+    }
+
+    fn open_network_secret(
+        &self,
+        sealed_private_key: &[u8],
+    ) -> Result<X25519StaticSecret, KeyBackendError> {
+        self.inner.open_network_secret(sealed_private_key)
+    }
+
+    fn derive_named_public_key(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .derive_named_public_key(network_secret, canonical_urn, seed)
+    }
+
+    fn unwrap_named(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .unwrap_named(network_secret, canonical_urn, seed, wrapped_key, context)
+    }
+
+    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+        self.inner.generate_seed()
+    }
+
+    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
+        self.inner.open_seed(sealed_seed)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("race.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+
+    let results = race_network_creates(db.clone()).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
+    assert_losing_create_ceremony_is_failed(&db).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_network_conflict_survives_ceremony_cleanup_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cleanup-failure.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+    db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TRIGGER fail_losing_ceremony_update \
+         BEFORE UPDATE ON encryption_ceremony \
+         WHEN NEW.state = 'failed' \
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+    ))
+    .await
+    .expect("install cleanup failure trigger");
+
+    let results = race_network_creates(db).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "cleanup failure must not replace the conflict response with a 500"
+    );
 }
 
 fn owner_keypair() -> Keypair {
@@ -1173,6 +1446,35 @@ async fn stored_unknown_state_is_refused_as_corrupt() {
 
 // PostgreSQL-backed. Locally these return early unless
 // TINYCLOUD_TEST_POSTGRES_URL is set; CI runs them with a PostgreSQL service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+
+    let results = race_network_creates(db.clone()).await;
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "results: {results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
+    assert_losing_create_ceremony_is_failed(&db).await;
+}
+
 #[tokio::test]
 async fn postgres_concurrent_identical_creates_return_one_row() {
     let Some(fixture) = PostgresTestSchema::migrated_through(
