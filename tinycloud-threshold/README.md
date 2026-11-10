@@ -4,7 +4,7 @@ BLS12-381 identity-based wrapping of 32-byte data keys and context-bound encrypt
 
 The crate is a workspace member with `publish = false`. No other workspace crate depends on it; the node server remains the default member. Release-plz neither releases nor publishes it.
 
-## Implemented surface through S0.5
+## Implemented surface through S0.6
 
 - Bounded, canonical scalar, point, identity, ciphertext, request and share encodings.
 - Boneh–Franklin FullIdent wrapping and unwrapping with the TinyCloud domains in [SPEC.md](SPEC.md).
@@ -18,8 +18,9 @@ The crate is a workspace member with `publish = false`. No other workspace crate
 - Genesis and re-key DKG (GJKR New-DKG) over owner-closed rounds, the re-key under an owner-authorized `re-key` ceremony pinned to the current certificate with the genesis fault budget: consume-self member states for dealing, complaints, answers, Feldman extraction, the common R5 round and R6 reconstruction, and `dkg_verify_transcript`, which recomputes the outcome from the raw signed round records.
 - Redistribution for reshare and refresh over owner-closed rounds R1–R3: Feldman dealings from the current certificate's members to an authorized cohort with a new threshold, complaints and answers, deterministic selection of the first t eligible dealers, and `reshare_verify_transcript`. The master public key is unchanged; the output is a candidate for the successor certificate.
 - A real-ceremony chain test: genesis 2-of-3, reshare to 3-of-4 and back to 2-of-3, refresh, re-key, and further reshares and re-keys, with a certificate, readiness receipts and activation at every generation and each retired generation's shares refused in the next context.
+- A durable share store: `CandidateShare::to_bytes`/`from_bytes` (canonical, secret-guarded bytes), one file per generation under a per-network directory, install before any readiness receipt, a pin recomputed from verified activated proofs on every open, and positive-proof retirement.
 
-`VerifiedCertificate` supplies `KeyContext` and `PublicKeySet`; `KeyShare::bind` validates a candidate against its certificate. Raw candidate-scalar construction remains crate-private, and the dealer exists only under `#[cfg(test)]`. Redistribution does not erase earlier shares; old and new shares carry different key contexts. Durable storage, retirement and node-runtime paths remain separate slices. Their contracts and the implemented canonical byte layouts are recorded in [SPEC.md](SPEC.md).
+`VerifiedCertificate` supplies `KeyContext` and `PublicKeySet`; `KeyShare::bind` validates a candidate against its certificate. Raw candidate-scalar construction remains crate-private, and the dealer exists only under `#[cfg(test)]`. Redistribution does not erase earlier shares; old and new shares carry different key contexts. The `store` module implements the file-volume durable share store and retirement; node-runtime wiring remains a separate slice. Their contracts and the implemented canonical byte layouts are recorded in [SPEC.md](SPEC.md).
 
 The §3.6 request-digest amendment is explicit in SPEC.md. It makes an identity or transport-key transplant a context mismatch before share equations are evaluated.
 

@@ -231,7 +231,7 @@ All integer fields below are big-endian. `lp` is u32 length followed by bytes.
 - No S0.1 public decoder consumes a member list; lists introduced in later slices use the §3.2 sorted/count rules.
 - An availability budget counts all unavailable ready signers, including dishonest claims: `q - b >= t′`. All four ready holders in 3-of-4 support one unavailable holder, not two. `WithOutageBudget(0)` is not accepted.
 
-## Implemented surface through S0.5
+## Implemented surface through S0.6
 
 S0.1 implements §§3.1–3.6 and the typed parameters in §3.0. S0.2 adds the authenticated-context boundaries in §3.0, the certificate and fault-proof APIs in §3.9, and the receipt/activation verification in §3.12:
 
@@ -248,7 +248,9 @@ S0.4 adds the §3.8 redistribution for reshare and refresh: dealer and recipient
 
 S0.5 runs the §3.7 DKG under a `re-key` ceremony (`dkg_start` and `dkg_verify_transcript` accept kinds `genesis` and `re-key` and refuse reshare and refresh with `InvalidCeremony`), executes the full genesis → reshare → reshare → refresh → re-key chain with real ceremonies, certificates, readiness receipts and activation, and freezes the chain and re-key vectors described in the S0.5 appendix.
 
-The dealer remains test-only. Durable storage/retirement and node-runtime integration are separate slices. The crate remains an unwired workspace member.
+S0.6 adds the `store` module: the durable file-volume share store of §3.11–3.12 — `CandidateShare` canonical byte persistence, one proof and one share file per certificate, receipt-only-after-install, the activated-chain pin recomputed from verified proofs at open, and positive-proof retirement (superseded generations, losing candidates, unnamed files and replayed ceremony ids). Its layouts are in the S0.6 appendix below.
+
+The dealer remains test-only. Node-runtime integration (volume mount, peer/DB pin sources, boot freshness, audit rows) is a separate slice. The crate remains an unwired workspace member.
 
 ## Verifier conformance
 
@@ -545,3 +547,15 @@ A chain of generations is: genesis; then any sequence of reshare, refresh and re
 `vectors/v1/dkg-rekey.json` has the shape of `dkg-genesis.json` with `"spec_sections"` naming `S0.5 re-key appendix`, and each case adds `inputs.current_certificate`, the signed pinned certificate (`body` and `owner_signature`, as in `reshare.json`). The cases mirror the genesis cases under a re-key ceremony; names begin `rekey_` (`insufficient_*` keep their names).
 
 `vectors/v1/chain.json` has one case per generation, in chain order, with operation `chain_step`. A case's inputs are the signed ceremony statement and its digest, the initial transcript link, every owner closure and member message, `previous_certificate` (absent for genesis, otherwise the previous case's `certificate`), the candidate `certificate` (`body` and `owner_signature`), one readiness receipt (`member`, `signature`) per holder, `quorum` `all_holders` and the owner's `activation` statement (`body` is the exact 32-byte activation preimage). The outputs are the recomputed kind, epoch, re-key counter, genesis t, threshold, members, mpk, commitments, public shares, transcript hash, certificate digest, activation preimage and the ceremony outcome (`qual` and `reconstructed` for genesis and re-key, `dealers` for reshare and refresh). A verifier recomputes the ceremony outcome from the transcript (S0.3 or S0.4 rules), rebuilds the certificate body from that outcome and the pinned predecessor, requires it to equal the supplied body byte for byte, verifies the owner signature and lineage (S0.2 appendix), verifies every receipt and the activation, and compares its own results with the outputs; it never takes an output field as input to its decision.
+
+## S0.6 durable share-store appendix
+
+The `store` module keeps one member's share material for one network under `<dir>/<sha256(network)[..16]-hex>/` (directory mode 0700, files 0600). Every write is write-temp, fsync, rename, fsync-directory; erasure is zero-overwrite, fsync, unlink, fsync-directory. Shares exist only as files named `share-<cert-digest-hex>`; `proofs/<cert-digest-hex>` holds certificate and activation evidence; `dealt/<ceremony-id-hex>` is an empty marker; `state` is the single mutable record.
+
+**Candidate share file.** `version:u8=1 || transcript_hash:32 || index:u16 || scalar:32` (67 bytes). Decode is canonical only: exact length, version 1, index 1..=16, scalar < r and non-zero. Secret bytes travel inside `Zeroizing` and `bind` re-verifies them against the certificate before use.
+
+**Proof file.** `version:u8=1 || lp(signed_certificate) || activation_flag:u8 || [lp(activation_bytes) || lp(owner_signature) || receipt_count:u16 || (index:u16 || lp(signature))…]`. The signed certificate is `version:u8=1 || lp(certificate_body) || lp(owner_signature)`.
+
+**State file.** `version:u8=1 || option(pin:32) || option(candidate: digest:32 || ceremony_id:32 || option(predecessor:32) || receipt_sent:u8) || seen_count:u32 || seen_ceremony_id:32… || retired_count:u32 || (digest:32 || erased_at:u64)… || seq:u64`.
+
+**Rules.** At most one candidate record exists at a time and only for the pinned predecessor (or for genesis before any pin); a `receipt_sent` flag may be set only after proof and share files are durable. Open recomputes the activated chain from `proofs/` (genesis through verified `AllHolders` activations), refuses a recorded pin the chain cannot prove, and freezes at any activated equivocation. A share file is erased when the pin's chain passes its certificate (R1), when a candidate's predecessor is covered or superseded (C2), when a fresh ceremony id arrives for its predecessor (C1, applied in `accept_ceremony` before any dealing), or when no record names it (S1). A `dealt/` marker consumes its ceremony id even when the state write never happened; replayed ids change nothing. `record_activation` is idempotent per certificate digest.

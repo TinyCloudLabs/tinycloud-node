@@ -104,7 +104,44 @@ impl CandidateShare {
     pub fn index(&self) -> MemberIndex {
         self.index
     }
+    /// Secret bytes: version(1) ‖ transcript hash(32) ‖ index u16be(2) ‖ scalar(32). Details: TC-2221
+    ///
+    /// The caller owns the returned buffer's erasure; it is wrapped in
+    /// [`zeroize::Zeroizing`] so a dropped copy clears itself. [`CandidateShare::from_bytes`]
+    /// restores the candidate for [`KeyShare::bind`] against the pinned certificate.
+    pub fn to_bytes(&self) -> zeroize::Zeroizing<[u8; 67]> {
+        let mut e = crate::encoding::Encoder::new();
+        e.u8(1);
+        e.fixed(self.transcript.as_bytes());
+        e.u16(self.index.get());
+        e.fixed(&self.scalar.to_bytes());
+        let bytes = e.finish();
+        let mut out = zeroize::Zeroizing::new([0u8; 67]);
+        out.copy_from_slice(&bytes);
+        out
+    }
+
+    /// Canonical decode only: version 1, index 1..=16, scalar < r and != 0, exact length. Details: TC-2221
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let mut d = crate::encoding::Decoder::new(bytes)?;
+        if d.u8()? != 1 {
+            return Err(Error::InvalidEncoding);
+        }
+        let transcript = TranscriptHash::new(d.fixed()?);
+        let index = MemberIndex::new(d.u16()?)?;
+        let scalar = Scalar::from_bytes(&d.fixed::<32>()?)?;
+        if scalar.is_zero() {
+            return Err(Error::InvalidScalar);
+        }
+        d.finish()?;
+        Ok(Self {
+            transcript,
+            index,
+            scalar,
+        })
+    }
 }
+
 impl fmt::Debug for CandidateShare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CandidateShare([REDACTED])")
@@ -416,6 +453,18 @@ impl CertificateBody {
     /// Transcript committed by this certificate. Details: TC-2222
     pub fn transcript_hash(&self) -> TranscriptHash {
         self.transcript
+    }
+    /// Pinned predecessor digest, absent only at genesis. Details: TC-2221
+    pub fn previous(&self) -> Option<&CertDigest> {
+        self.previous.as_ref()
+    }
+    /// Certificate epoch. Details: TC-2221
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    /// Re-key counter. Details: TC-2221
+    pub fn rekey(&self) -> RekeyCounter {
+        self.rekey
     }
 }
 
