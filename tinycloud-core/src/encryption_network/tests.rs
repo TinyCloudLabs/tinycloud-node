@@ -84,18 +84,35 @@ async fn race_network_creates(
         threshold: Threshold::one_of_one(),
     };
 
+    let mut tasks = tokio::task::JoinSet::new();
     let first_service = service.clone();
     let first_request = request();
-    let first =
-        tokio::spawn(async move { first_service.create_one_of_one_network(first_request).await });
+    tasks.spawn(async move { first_service.create_one_of_one_network(first_request).await });
     let second_service = service;
     let second_request = request();
-    let second = tokio::spawn(async move {
+    tasks.spawn(async move {
         second_service
             .create_one_of_one_network(second_request)
             .await
     });
-    [first.await.unwrap(), second.await.unwrap()]
+
+    match tokio::time::timeout(Duration::from_secs(30), async {
+        let first = tasks.join_next().await.expect("first create task").unwrap();
+        let second = tasks
+            .join_next()
+            .await
+            .expect("second create task")
+            .unwrap();
+        [first, second]
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            tasks.abort_all();
+            panic!("concurrent network creation must finish within 30 seconds");
+        }
+    }
 }
 async fn assert_losing_create_ceremony_is_failed(db: &DatabaseConnection) {
     let ceremonies = encryption_ceremony::Entity::find()
@@ -1441,9 +1458,7 @@ async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_alread
     };
     let db = fixture.connect(4).await;
 
-    let results = tokio::time::timeout(Duration::from_secs(30), race_network_creates(db.clone()))
-        .await
-        .expect("concurrent network creation must finish within 30 seconds");
+    let results = race_network_creates(db.clone()).await;
     assert_eq!(
         results.iter().filter(|result| result.is_ok()).count(),
         1,
