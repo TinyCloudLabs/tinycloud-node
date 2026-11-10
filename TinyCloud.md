@@ -2,18 +2,18 @@ MEMO: TinyCloud – Building Interoperable, Sovereign Apps and Data
 
 1. Overview and Motivation
 
-TinyCloud is an emerging framework for creating interoperable software applications where users retain full sovereignty over their data. As the cost of writing software approaches zero—largely due to advances in AI and the commoditization of development—the true competitive moats are shifting to data and network effects. TinyCloud is designed to give individuals and organizations control over their data and the ability to layer new interoperable apps on top of it without ceding ownership or privacy to third parties.
+TinyCloud is a framework for interoperable applications built around user-controlled data spaces and capability-based access. As the cost of writing software approaches zero—largely due to advances in AI and the commoditization of development—the true competitive moats are shifting to data and network effects. TinyCloud lets individuals and organizations grant apps and agents scoped access to shared data without tying that data to one application. This product vision includes proposed capabilities, not guarantees of current deployment behavior.
 
 By consolidating data—ranging from real-time location to personal conversation transcripts—users can unlock transformative, AI-driven capabilities that would otherwise be locked in proprietary silos. TinyCloud is grounded in the conviction that sovereignty, privacy, and the user’s agency must remain central as AI applications become increasingly powerful.
 
 2. Core Values
 	1.	Sovereignty
-	•	TinyCloud is built so that each user controls their data outright. Requests to access or compute on that data must be explicitly permissioned.
+	•	TinyCloud uses capabilities to let users approve scoped access to their data. Hosted operators and authorized processing services remain within the trust boundary.
 	•	This design is intended to resist the looming dynamics of “techno-feudalism,” in which corporations or states control the rails and data exhaust of all AI applications.
 	2.	Privacy
-	•	Data is stored, streamed, and computed upon in ways that minimize leakage.
-	•	Encryption strategies (e.g., eventually adopting fully auditable or decentralized approaches) ensure users do not need to trust an external party with their raw data.
-	•	Fine-grained permissioning allows you to decide, for instance, whether someone can see if you are “in NYC” without giving away your exact coordinates or entire location history.
+	•	Capability-based access lets users choose the scopes granted to apps and agents.
+	•	Ordinary data on hosted nodes is currently stored in plaintext at rest. TinyCloud does not currently provide encryption at rest or end-to-end encryption for that stored data; operators can access unencrypted values.
+	•	A limited answer, such as whether you are in a city, can reduce what a recipient receives; it does not hide the underlying location from the service processing it.
 	3.	Interoperability
 	•	Embracing artifact-based formats—Markdown, JSON Canvas, CSV, and SQLite—so that data remains portable and future-proof.
 	•	If any one TinyCloud-based app fails, your data remains accessible in standard file formats or in other interoperable apps.
@@ -28,11 +28,11 @@ a) TinyCloud Framework
 	•	Instead of data silos, each user has a single, cohesive store of data (e.g., location, transcripts, knowledge graphs) that authorized apps can read or process.
 	2.	Key Components
 	•	Key-Value Store & Buckets: Simple, flexible storage (akin to an S3-like interface).
-	•	Compute Layer: The ability to run functions or queries on your data. E.g., “Am I within 1 km of my friend?” without revealing the exact coordinates to any third party.
-	•	Encryption / Capabilities: Fine-grained permission tokens or data-logic (“DataLog” / “biscuit tokens”) letting you define, for instance, “Friend X can see only yes/no if I’m in Berlin today.”
+	•	Compute Layer: Functions or queries can return limited answers, such as “Am I within 1 km of my friend?” The service processing the query may still read the underlying data.
+	•	Capabilities: Scoped permissions define which resources and actions an app or agent may use. They do not encrypt those resources.
 	3.	First Use Cases
 	•	Location Streamer: An app that continuously streams a user’s location into their TinyCloud node.
-	•	‘Find My Friends’ Clone: A privacy-preserving way to see if your friend is nearby or in a particular city—without ceding real-time location data to a third party’s servers.
+	•	‘Find My Friends’ Clone: A proposed app that shares a nearby-or-in-city result with a friend rather than an entire location history. Hosted processing still has access to the underlying data.
 	4.	Free & Paid Tiers
 	•	The overarching plan is to offer a free tier (basic storage, limited compute) and a paid tier (expanded storage, advanced compute, premium encryption or replication features).
 
@@ -72,13 +72,12 @@ Muse is a capture tool and personal AI companion app that integrates seamlessly 
 	•	Basic app features for short transcripts or limited usage.
 	•	Premium for larger, continuous audio logs, advanced integrations, AI summarizations, etc.
 
-4. Encryption and Permissioning
-	•	Key Management
-	•	Each artifact or data bucket is encrypted under keys that live with the user.
-	•	To share or compute on data, the user issues ephemeral permissions that can be revoked or narrowly scoped.
-	•	Path Forward
-	•	Adopting standardized approaches to capabilities-based security (e.g., biscuit tokens or DataLog for flexible policy logic).
-	•	Ensuring that “post-quantum” or advanced cryptographic methods can be integrated over time.
+4. Access Control and Encryption Boundaries
+	•	Users grant apps and agents capability scopes for the data they need.
+	•	Signing with your own wallet keeps its key under your control. OpenKey-managed keys use a separate service custody model; signing keys do not by themselves encrypt stored data.
+	•	Revocation support and limits depend on the access path. Ending access cannot recall copies already read.
+	•	Encryption at rest is planned, not a current hosted-storage guarantee. See the [at-rest implementation status](docs/at-rest/INTERFACES.md).
+	•	See [Security and trust](https://docs.tinycloud.xyz/concepts/security-and-trust) for operator access, application-specific encryption, key custody and authorized-client boundaries.
 
 5. Potential Apps and Extensions
 	1.	Chat App Clone
@@ -86,7 +85,7 @@ Muse is a capture tool and personal AI companion app that integrates seamlessly 
 	2.	Personal Analytics
 	•	From heart rate correlating with location or conversation transcripts, to advanced “personal RAG” (Retrieval-Augmented Generation) scenarios.
 	3.	Creative Tools
-	•	AI-powered storyboarding, brainstorming, or rewriting using your entire knowledge base—without exposing it to third parties.
+	•	AI-powered storyboarding, brainstorming, or rewriting using the knowledge base you authorize it to read. The processing service receives the context it uses.
 
 6. Risks
 	1.	Competitive Landscape
@@ -111,6 +110,6 @@ Next Steps / Action Items
 	2.	Release Autograph API: Accept transcripts, build the knowledge graph, sync via Git or TinyCloud.
 	3.	Refine Muse: Expand real-time transcription, improve AI summarization, and offer a more intuitive UI for capturing and browsing transcripts.
 	4.	Plan for Designer Hiring: Once traction is shown, bring on world-class UX/UI designers to craft user-friendly, sovereignty-first experiences.
-	5.	Expand Encryption & Permissioning: Consider DataLog-based approaches and integrated encryption schemes, ensuring robust privacy in all workflows.
+	5.	Expand Encryption & Permissioning: Continue the planned at-rest work and evaluate additional encryption approaches without presenting them as shipped guarantees.
 
-These steps will push TinyCloud and its related products from an innovative concept to a thriving ecosystem that preserves user privacy, fosters sovereignty, and harnesses the full potential of personal AI.
+These proposals aim to support interoperable personal AI with user-controlled access. Current security boundaries and implementation limits remain those described in [Security and trust](https://docs.tinycloud.xyz/concepts/security-and-trust).
