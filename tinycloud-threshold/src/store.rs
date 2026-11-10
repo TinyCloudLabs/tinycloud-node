@@ -317,6 +317,10 @@ pub enum StoreError {
     /// Another `ShareStore` already holds this network's lock.
     #[error("share store is already open for this network")]
     Busy,
+    /// The certificate belongs to a retired generation; its share was erased
+    /// under durable proof and must never come back.
+    #[error("certificate belongs to a retired generation")]
+    Retired,
     /// The filesystem cannot provide the exclusive open lock.
     #[error("share store lock unsupported on this filesystem")]
     LockUnsupported,
@@ -390,10 +394,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 }
 
 fn erase_share_file(path: &Path) -> Result<(), StoreError> {
-    if !path.exists() {
+    // Never follow links or traverse directories: a store path that is not a
+    // regular file is removed as a bare name, never written through — a
+    // `*.tmp-*` symlink can otherwise make `open` zero a victim file
+    // outside the store.
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() {
+        if meta.is_dir() {
+            fs::remove_dir(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         return Ok(());
     }
-    let length = usize::try_from(fs::metadata(path)?.len()).unwrap_or(usize::MAX);
+    let length = usize::try_from(meta.len()).unwrap_or(usize::MAX);
     {
         use std::io::Write;
         let mut file = fs::OpenOptions::new().write(true).open(path)?;
@@ -502,6 +521,11 @@ impl ShareStore {
         v: &impl DidSignatureVerifier,
     ) -> Result<Self, StoreError> {
         let network_dir = store_dir(dir, network);
+        // Fsync only what this call created — network_dir, proofs, dealt,
+        // and the first pre-existing parent that must record them. Ancestors
+        // above that belong to the caller; an execute-only one must not be
+        // required readable.
+        let existed = network_dir.exists();
         fs::create_dir_all(network_dir.join("proofs"))?;
         fs::create_dir_all(network_dir.join("dealt"))?;
         #[cfg(unix)]
@@ -509,13 +533,13 @@ impl ShareStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&network_dir, fs::Permissions::from_mode(0o700))?;
         }
-        // Fsync every directory in the created hierarchy — including the
-        // parents of the caller's base directory — so the tree itself is
-        // durable even if power is lost before the first write completes.
-        let mut ancestor = Some(network_dir.as_path());
-        while let Some(dir_path) = ancestor {
-            fs::File::open(dir_path)?.sync_all()?;
-            ancestor = dir_path.parent();
+        fs::File::open(&network_dir)?.sync_all()?;
+        fs::File::open(network_dir.join("proofs"))?.sync_all()?;
+        fs::File::open(network_dir.join("dealt"))?.sync_all()?;
+        if !existed {
+            if let Some(parent) = network_dir.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
         }
 
         // One opener per network directory, held for the store's lifetime.
@@ -699,108 +723,131 @@ impl ShareStore {
             }
         }
 
-        // Candidate reconciliation. Chain membership and C2 losses are
-        // judged BEFORE the missing-file check: a candidate already retired
-        // by durable proof is settled even when its share is gone, while a
-        // still-live receipt-bearing candidate that lost its share is the
-        // only case that is truly corrupt.
-        let mut owed_erasures: Vec<PathBuf> = Vec::new();
-        if let Some(candidate) = state.candidate.clone() {
-            let share = share_path(&network_dir, &candidate.digest);
-            let proof = proof_path(&network_dir, &candidate.digest);
-            if chain.contains(&candidate.digest) {
-                // Already activated before the crash; the chain is the record.
-                state.candidate = None;
-                state_dirty = true;
-            } else {
-                // C2: the candidate lost if its predecessor is covered by the
-                // pin (any pin for a genesis predecessor) or the chain moved
-                // past it through another certificate.
-                let lost = match candidate.predecessor {
-                    None => computed_pin.is_some(),
-                    Some(p) => chain
-                        .iter()
-                        .position(|d| *d == p)
-                        .map_or(computed_pin.is_some(), |i| {
-                            computed_pin != Some(p) || i.saturating_add(1) < chain.len()
-                        }),
-                };
-                if lost {
-                    // Commit the retirement first; the unlink is owed work a
-                    // crash simply re-discovers as S1.
-                    record_retired(&mut state, candidate.digest);
+        // Candidate reconciliation and R1/C2/S1 erasure run ONLY on an
+        // unequivocal chain. Once activated equivocation is on disk the
+        // store freezes in place: the recorded verified pin stands, every
+        // share file is kept (losing nothing is the whole point of the
+        // freeze), and only the operator's recovery path rewrites it.
+        if !equivocation {
+            // Candidate reconciliation. Chain membership and C2 losses are
+            // judged BEFORE the missing-file check: a candidate already
+            // retired by durable proof is settled even when its share is
+            // gone, while a still-live receipt-bearing candidate that lost
+            // its share is the only case that is truly corrupt.
+            let mut owed_erasures: Vec<PathBuf> = Vec::new();
+            if let Some(candidate) = state.candidate.clone() {
+                let share = share_path(&network_dir, &candidate.digest);
+                let proof = proof_path(&network_dir, &candidate.digest);
+                if chain.contains(&candidate.digest) {
+                    // Already activated before the crash; the chain is the
+                    // record.
                     state.candidate = None;
-                    state.pin = computed_pin;
-                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
-                    owed_erasures.push(share);
-                } else if !share.exists() || !proof.exists() {
-                    if candidate.receipt_sent {
-                        // A receipt was signed over a durable install; a
-                        // missing file means the member promised what it
-                        // cannot serve.
-                        return Err(StoreError::Corrupt);
+                    state_dirty = true;
+                } else {
+                    // C2: the candidate lost if its predecessor is covered
+                    // by the pin (any pin for a genesis predecessor) or the
+                    // chain moved past it through another certificate.
+                    let lost = match candidate.predecessor {
+                        None => computed_pin.is_some(),
+                        Some(p) => chain
+                            .iter()
+                            .position(|d| *d == p)
+                            .map_or(computed_pin.is_some(), |i| {
+                                computed_pin != Some(p) || i.saturating_add(1) < chain.len()
+                            }),
+                    };
+                    if lost {
+                        // Commit the retirement first; the unlink is owed
+                        // work a crash simply re-discovers as S1.
+                        record_retired(&mut state, candidate.digest);
+                        state.candidate = None;
+                        state.pin = computed_pin;
+                        write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                        owed_erasures.push(share);
+                    } else if !share.exists() || !proof.exists() {
+                        if candidate.receipt_sent {
+                            // A receipt was signed over a durable install;
+                            // a missing file means the member promised what
+                            // it cannot serve.
+                            return Err(StoreError::Corrupt);
+                        }
+                        state.candidate = None;
+                        state.pin = computed_pin;
+                        write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                        owed_erasures.push(share);
                     }
-                    state.candidate = None;
-                    state.pin = computed_pin;
-                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
-                    owed_erasures.push(share);
                 }
             }
-        }
 
-        // R1 and S1 over share files. Every retirement is committed to
-        // `state` before its unlink; files left by a crash re-enter here as
-        // owed work on the next open.
-        for entry in fs::read_dir(&network_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(hex_digest) = name.strip_prefix("share-") else {
-                continue;
-            };
-            let Some(digest_bytes) = decode_hex(hex_digest) else {
-                // An unnamed partial write (including .tmp leftovers) can
-                // never have been recorded; S1 erases it.
-                erase_share_file(&entry.path())?;
-                continue;
-            };
-            let digest = CertDigest::new(digest_bytes);
-            let is_pin = computed_pin == Some(digest);
-            let is_candidate = state.candidate.as_ref().is_some_and(|c| c.digest == digest);
-            if is_pin || is_candidate {
-                continue;
-            }
-            if verified.contains_key(&digest) {
-                // Superseded activated generation (R1).
-                if !state.retired.iter().any(|r| r.digest == digest) {
-                    record_retired(&mut state, digest);
-                    state.pin = computed_pin;
-                    write_atomic(&network_dir.join("state"), &encode_state(&state))?;
-                    state_dirty = false;
+            // R1 and S1 over share files. Every retirement is committed to
+            // `state` before its unlink; files left by a crash re-enter here
+            // as owed work on the next open.
+            for entry in fs::read_dir(&network_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(hex_digest) = name.strip_prefix("share-") else {
+                    continue;
+                };
+                let Some(digest_bytes) = decode_hex(hex_digest) else {
+                    // An unnamed partial write (including .tmp leftovers)
+                    // can never have been recorded; S1 erases it.
+                    erase_share_file(&entry.path())?;
+                    continue;
+                };
+                let digest = CertDigest::new(digest_bytes);
+                let is_pin = computed_pin == Some(digest);
+                let is_candidate = state.candidate.as_ref().is_some_and(|c| c.digest == digest);
+                if is_pin || is_candidate {
+                    continue;
                 }
-                owed_erasures.push(entry.path());
-            } else {
-                // Outside the activated chain and named in no record: S1
-                // erases unconditionally (the pin's existence changes
-                // nothing — such a file never had a durable install record).
-                erase_share_file(&entry.path())?;
+                if verified.contains_key(&digest) {
+                    // Superseded activated generation (R1).
+                    if !state.retired.iter().any(|r| r.digest == digest) {
+                        record_retired(&mut state, digest);
+                        state.pin = computed_pin;
+                        write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+                        state_dirty = false;
+                    }
+                    owed_erasures.push(entry.path());
+                } else {
+                    // Outside the activated chain and named in no record:
+                    // S1 erases unconditionally (the pin's existence changes
+                    // nothing — such a file never had a durable install
+                    // record).
+                    erase_share_file(&entry.path())?;
+                }
+            }
+
+            if state.pin != computed_pin || state_dirty {
+                state.pin = computed_pin;
+                write_atomic(&network_dir.join("state"), &encode_state(&state))?;
+            }
+
+            // Owed unlinks run only after every corresponding `state`
+            // commit.
+            for path in &owed_erasures {
+                erase_share_file(path)?;
+            }
+
+            if state.pin != computed_pin || state_dirty {
+                state.pin = computed_pin;
+                write_atomic(&network_dir.join("state"), &encode_state(&state))?;
             }
         }
 
-        if state.pin != computed_pin || state_dirty {
-            state.pin = computed_pin;
-            write_atomic(&network_dir.join("state"), &encode_state(&state))?;
-        }
-
-        // Owed unlinks run only after every corresponding `state` commit.
-        for path in &owed_erasures {
-            erase_share_file(path)?;
-        }
-
-        if state.pin != computed_pin || state_dirty {
-            state.pin = computed_pin;
-            write_atomic(&network_dir.join("state"), &encode_state(&state))?;
-        }
+        // The in-memory pin: normally the computed chain tip; on
+        // equivocation the recorded verified pin (a branch descendant is
+        // proven, not corruption), so a reopen is the same freeze the live
+        // store hit.
+        let pin = if equivocation {
+            state
+                .pin
+                .and_then(|d| verified.get(&d).cloned())
+                .or_else(|| computed_pin.and_then(|d| verified.get(&d).cloned()))
+        } else {
+            pin
+        };
 
         Ok(Self {
             network_dir,
@@ -921,6 +968,13 @@ impl ShareStore {
             return Err(StoreError::InvalidActivation);
         }
         let digest = verified.digest();
+        // The certificate body carries no ceremony id, so a superseded
+        // ceremony's certificate could arrive under the fresh admissible
+        // label. The durable retirement record — not the label — decides:
+        // an erased share never resurrects.
+        if inner.state.retired.iter().any(|r| r.digest == digest) {
+            return Err(StoreError::Retired);
+        }
         let index = candidate.index();
         write_atomic(
             &proof_path(&self.network_dir, &digest),
@@ -938,13 +992,15 @@ impl ShareStore {
             return Err(StoreError::Corrupt);
         }
         let _bound = KeyShare::bind(reloaded, &verified)?;
-        inner.state.candidate = Some(CandidateRecord {
+        let mut next = inner.state.clone();
+        next.candidate = Some(CandidateRecord {
             digest,
             ceremony: ceremony.statement().id,
             predecessor,
             receipt_sent: false,
         });
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
+        write_atomic(&self.network_dir.join("state"), &encode_state(&next))?;
+        inner.state = next;
         Ok(digest)
     }
 
@@ -954,11 +1010,14 @@ impl ShareStore {
     /// `receipt_sent` with a missing share file refuses to open.
     pub fn mark_receipt_sent(&self) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().map_err(|_| StoreError::Corrupt)?;
-        let Some(candidate) = &mut inner.state.candidate else {
+        let mut next = inner.state.clone();
+        let Some(candidate) = &mut next.candidate else {
             return Err(StoreError::Corrupt);
         };
         candidate.receipt_sent = true;
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))
+        write_atomic(&self.network_dir.join("state"), &encode_state(&next))?;
+        inner.state = next;
+        Ok(())
     }
 
     /// Record a verified activation; promotes the candidate when it matches
@@ -1008,42 +1067,47 @@ impl ShareStore {
         };
         verify_activation(&verified, receipts, ReadyQuorum::AllHolders, activation, v)?;
         let digest = verified.digest();
+        // The durable retirement record rules out re-activation too: a
+        // losing candidate whose share was erased must never be re-pinned
+        // by a late `record_activation` — the erased share cannot serve.
+        if inner.state.retired.iter().any(|r| r.digest == digest) {
+            return Err(StoreError::Retired);
+        }
         write_atomic(
             &proof_path(&self.network_dir, &digest),
             &encode_proof(signed, Some(activation), receipts),
         )?;
         // `state` commits every removal BEFORE the unlink, so a crash is
-        // recovered as "erasure owed", never as a missing promised share.
+        // recovered as "erasure owed", never as a missing promised share;
+        // the in-memory record moves only after its durable copy exists.
+        let mut next = inner.state.clone();
         let mut erasures: Vec<PathBuf> = Vec::new();
         // C2: a pending candidate that lost to this activation is erased; the
         // winning candidate's record is cleared (the chain is its record).
-        if let Some(candidate) = inner.state.candidate.take() {
+        if let Some(candidate) = next.candidate.take() {
             if candidate.digest != digest
-                && !inner
-                    .state
-                    .retired
-                    .iter()
-                    .any(|r| r.digest == candidate.digest)
+                && !next.retired.iter().any(|r| r.digest == candidate.digest)
             {
-                record_retired(&mut inner.state, candidate.digest);
+                record_retired(&mut next, candidate.digest);
                 erasures.push(share_path(&self.network_dir, &candidate.digest));
             }
         }
         // R1: the outgoing pin's share is retired.
         if let Some(old_pin) = &inner.pin {
             let old = old_pin.digest();
-            if !inner.state.retired.iter().any(|r| r.digest == old) {
-                record_retired(&mut inner.state, old);
+            if !next.retired.iter().any(|r| r.digest == old) {
+                record_retired(&mut next, old);
                 erasures.push(share_path(&self.network_dir, &old));
             }
         }
-        inner.pin = Some(verified.clone());
-        inner.verified.insert(digest, verified);
-        inner.state.pin = Some(digest);
+        next.pin = Some(digest);
         // Ceremonies accepted against the old pin are stale: the next
         // admissible ceremony must be accepted afresh for this pin.
-        inner.state.active_ceremony = None;
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
+        next.active_ceremony = None;
+        write_atomic(&self.network_dir.join("state"), &encode_state(&next))?;
+        inner.state = next;
+        inner.pin = Some(verified.clone());
+        inner.verified.insert(digest, verified);
         for path in &erasures {
             erase_share_file(path)?;
         }
@@ -1080,22 +1144,27 @@ impl ShareStore {
         }
         // `state` commits the removal and the new admissible ceremony before
         // the unlink and before the dealt marker; a crash re-discovers the
-        // unlink as S1 and the marker's id as consumed.
+        // unlink as S1 and the marker's id as consumed. The in-memory record
+        // is touched only after its durable copy exists, so a failed write
+        // leaves the live state identical to disk — a retry sees the same
+        // ceremony as fresh, not a phantom replay.
+        let mut next = inner.state.clone();
         let mut owed: Option<PathBuf> = None;
-        if let Some(candidate) = &inner.state.candidate {
+        if let Some(candidate) = &next.candidate {
             if candidate.predecessor == statement.current {
                 let digest = candidate.digest;
-                record_retired(&mut inner.state, digest);
-                inner.state.candidate = None;
+                record_retired(&mut next, digest);
+                next.candidate = None;
                 owed = Some(share_path(&self.network_dir, &digest));
             }
         }
-        inner.state.seen_ceremonies.push(statement.id);
-        inner.state.active_ceremony = Some(ActiveCeremony {
+        next.seen_ceremonies.push(statement.id);
+        next.active_ceremony = Some(ActiveCeremony {
             id: statement.id,
             predecessor: statement.current,
         });
-        write_atomic(&self.network_dir.join("state"), &encode_state(&inner.state))?;
+        write_atomic(&self.network_dir.join("state"), &encode_state(&next))?;
+        inner.state = next;
         let marker = write_atomic(
             &self
                 .network_dir
@@ -1134,12 +1203,29 @@ mod tests {
 
     static TAG: AtomicU64 = AtomicU64::new(0);
 
-    fn tmpdir() -> PathBuf {
+    /// A temporary store directory removed on drop — tests leave nothing
+    /// under `/tmp` behind.
+    struct Tmp(PathBuf);
+
+    impl std::ops::Deref for Tmp {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmpdir() -> Tmp {
         let tag = TAG.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("tc2221-store-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
-        path
+        Tmp(path)
     }
 
     fn netdir(dir: &Path, network: &NetworkUrn) -> PathBuf {
@@ -2203,11 +2289,13 @@ mod tests {
             let store = open(&dir, &signers);
             activated_genesis(&store, &signers);
         }
-        // A directory where a temp file is expected cannot be overwritten or
-        // unlinked as a file — the sweep must refuse the open.
+        // A non-empty directory where a temp file is expected cannot be
+        // overwritten, unlinked as a file, or removed as an empty dir —
+        // the sweep must refuse the open.
         let ndir = netdir(&dir, &network);
         let stuck = ndir.join("state.tmp-1-1");
         fs::create_dir(&stuck).unwrap();
+        fs::write(stuck.join("content"), [0x55u8; 4]).unwrap();
         assert!(ShareStore::open(
             &dir,
             &network,
@@ -2216,7 +2304,7 @@ mod tests {
             &signers
         )
         .is_err());
-        fs::remove_dir(&stuck).unwrap();
+        fs::remove_dir_all(&stuck).unwrap();
         let _reopened = ShareStore::open(
             &dir,
             &network,
@@ -2282,6 +2370,78 @@ mod tests {
             /// boundary in this harness (it never injects I/O failures).
             debt: BTreeSet<[u8; 32]>,
             frozen: bool,
+            /// The pin and share-file set recorded at the moment the store
+            /// froze: the freeze is terminal, so neither may ever move.
+            frozen_pin: Option<CertDigest>,
+            frozen_files: Option<BTreeSet<[u8; 32]>>,
+        }
+
+        /// The model's own parser for the on-disk v2 `state` record — the
+        /// observable contract a crash leaves behind, independent of the
+        /// store's internals. Returns `None` for any unreadable or
+        /// unparsable file.
+        struct ParsedState {
+            pin: Option<CertDigest>,
+            candidate: Option<(CertDigest, bool)>,
+            active: Option<(CeremonyId, Option<CertDigest>)>,
+            retired: BTreeSet<[u8; 32]>,
+        }
+
+        fn parse_state(bytes: &[u8]) -> Option<ParsedState> {
+            let mut cur = 0usize;
+            let take = |n: usize, cur: &mut usize| -> Option<&[u8]> {
+                let end = cur.checked_add(n)?;
+                let slice = bytes.get(*cur..end)?;
+                *cur = end;
+                Some(slice)
+            };
+            if take(1, &mut cur)? != [2] {
+                return None;
+            }
+            let opt32 = |cur: &mut usize| -> Option<Option<[u8; 32]>> {
+                match take(1, cur)? {
+                    [0] => Some(None),
+                    [1] => take(32, cur).map(|s| Some(s.try_into().unwrap())),
+                    _ => None,
+                }
+            };
+            let pin = opt32(&mut cur)?.map(CertDigest::new);
+            let candidate = if take(1, &mut cur)? == [1] {
+                let digest = CertDigest::new(take(32, &mut cur)?.try_into().unwrap());
+                take(32, &mut cur)?; // ceremony id
+                opt32(&mut cur)?; // predecessor
+                let receipt = take(1, &mut cur)? == [1];
+                Some((digest, receipt))
+            } else {
+                None
+            };
+            let active = if take(1, &mut cur)? == [1] {
+                let id = CeremonyId::new(take(32, &mut cur)?.try_into().unwrap());
+                let pred = opt32(&mut cur)?.map(CertDigest::new);
+                Some((id, pred))
+            } else {
+                None
+            };
+            let seen_len = u32::from_be_bytes(take(4, &mut cur)?.try_into().unwrap()) as usize;
+            for _ in 0..seen_len {
+                take(32, &mut cur)?;
+            }
+            let retired_len = u32::from_be_bytes(take(4, &mut cur)?.try_into().unwrap()) as usize;
+            let mut retired = BTreeSet::new();
+            for _ in 0..retired_len {
+                retired.insert(take(32, &mut cur)?.try_into().unwrap());
+                take(8, &mut cur)?; // erased_at
+            }
+            take(8, &mut cur)?; // seq
+            if cur != bytes.len() {
+                return None;
+            }
+            Some(ParsedState {
+                pin,
+                candidate,
+                active,
+                retired,
+            })
         }
 
         struct Runner<'a> {
@@ -2296,6 +2456,9 @@ mod tests {
             /// Set when the disk promises a receipted share it cannot serve:
             /// Corrupt is the store's only honest answer and the run ends.
             dead: bool,
+            /// Whether this seed may inject fork evidence; a quarter of
+            /// seeds never fork so most runs exercise long unfrozen chains.
+            fork_allowed: bool,
             transcript: u8,
         }
 
@@ -2306,6 +2469,36 @@ mod tests {
 
             fn store(&mut self) -> &mut ShareStore {
                 self.store.as_mut().unwrap()
+            }
+
+            /// A cheap digest of every regular file under the network dir —
+            /// used to prove a refused second opener touches nothing.
+            fn disk_hash(&self) -> u64 {
+                let mut hash = 0xcbf29ce484222325u64;
+                for sub in [
+                    self.ndir(),
+                    self.ndir().join("proofs"),
+                    self.ndir().join("dealt"),
+                ] {
+                    let mut entries: Vec<(String, Vec<u8>)> = fs::read_dir(&sub)
+                        .map(|rd| {
+                            rd.flatten()
+                                .filter_map(|e| {
+                                    let name = e.file_name().to_str()?.to_owned();
+                                    let bytes = fs::read(e.path()).ok()?;
+                                    Some((name, bytes))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    entries.sort();
+                    for (name, bytes) in entries {
+                        for b in name.bytes().chain(bytes) {
+                            hash = (hash ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                }
+                hash
             }
 
             fn share_files(&self) -> BTreeSet<[u8; 32]> {
@@ -2347,9 +2540,45 @@ mod tests {
                     return;
                 };
                 let files = self.share_files();
+                // Rule 11: the state file is always exactly one v2 record.
+                let parsed = fs::read(self.ndir().join("state"))
+                    .ok()
+                    .and_then(|b| parse_state(&b));
+                assert!(
+                    parsed.is_some(),
+                    "seed {seed} step {step}: state file does not parse as v2"
+                );
+                // Rule 12: the model and the parsed state never diverge —
+                // pin, candidate (with its receipt flag, I6) and the
+                // admissible ceremony are exactly what the disk records.
+                if let Some(p) = &parsed {
+                    assert_eq!(
+                        p.pin,
+                        m.pins.last().map(|p| p.digest()),
+                        "seed {seed} step {step}: disk pin diverged from model"
+                    );
+                    assert_eq!(
+                        p.candidate, m.pending,
+                        "seed {seed} step {step}: disk candidate diverged from model"
+                    );
+                    assert_eq!(
+                        p.active, m.active,
+                        "seed {seed} step {step}: disk admissible ceremony diverged"
+                    );
+                    // Rule 7 tail: `retired` never names a live generation.
+                    let pin_d = m.pins.last().map(|p| p.digest());
+                    let pend_d = m.pending.map(|(d, _)| d);
+                    for r in &p.retired {
+                        assert!(
+                            Some(CertDigest::new(*r)) != pin_d
+                                && Some(CertDigest::new(*r)) != pend_d,
+                            "seed {seed} step {step}: retired names a live share"
+                        );
+                    }
+                }
                 // Rule 4: once frozen, frozen forever — the recorded pin and
-                // candidate stay visible for the operator's audit, but no
-                // share material may leave the store.
+                // share set are immutable; nothing is ever erased or
+                // exported.
                 if m.frozen {
                     assert!(
                         store.equivocation(),
@@ -2358,6 +2587,18 @@ mod tests {
                     assert!(
                         matches!(store.current_share(), Err(StoreError::Equivocation)),
                         "seed {seed} step {step}: frozen store exports a share"
+                    );
+                    // The pin never decreases and no share is lost after the
+                    // freeze: both are pinned at the moment it happened.
+                    assert_eq!(
+                        store.pinned().map(|p| p.digest()),
+                        m.frozen_pin,
+                        "seed {seed} step {step}: frozen pin moved"
+                    );
+                    assert_eq!(
+                        files,
+                        m.frozen_files.clone().unwrap_or_default(),
+                        "seed {seed} step {step}: share files changed after freeze"
                     );
                     for digest in &files {
                         assert!(
@@ -2527,14 +2768,24 @@ mod tests {
             /// what the store actually exposes (truncating the pin chain and
             /// forgetting the admissible id if the state reverted).
             fn resync(&mut self, seed: u64, step: usize) {
-                let m = &mut self.model;
+                let parsed = fs::read(self.ndir().join("state"))
+                    .ok()
+                    .and_then(|b| parse_state(&b));
                 let store = self.store.as_ref().unwrap();
-                m.frozen = store.equivocation();
-                if m.frozen {
-                    m.active = None;
-                    m.pending = None;
+                if store.equivocation() {
+                    // The freeze point is recorded once: everything after
+                    // is terminal immutability, checked at every boundary.
+                    if self.model.frozen_pin.is_none() {
+                        self.model.frozen_pin = store.pinned().map(|p| p.digest());
+                        self.model.frozen_files = Some(self.share_files());
+                    }
+                    self.model.frozen = true;
+                    self.model.active = None;
+                    self.model.pending = None;
                     return;
                 }
+                self.model.frozen = false;
+                let m = &mut self.model;
                 match store.pinned() {
                     Some(pin) => {
                         let pos = m
@@ -2548,7 +2799,14 @@ mod tests {
                     }
                     None => m.pins.clear(),
                 }
-                m.pending = store.pending_candidate().map(|(d, _)| (d, false));
+                // The candidate record on disk is the durable truth: digest
+                // AND the receipt flag (I6 survives every reopen).
+                m.pending = parsed.as_ref().and_then(|p| p.candidate);
+                assert_eq!(
+                    store.pending_candidate().map(|(d, _)| d),
+                    m.pending.map(|(d, _)| d),
+                    "seed {seed} step {step}: disk candidate ≠ exposed candidate"
+                );
                 // A reopened candidate must be the pin's successor — open's
                 // own convergence rule, asserted here too.
                 if let (Some((d, _)), Some(pin)) = (m.pending, m.pins.last()) {
@@ -2559,18 +2817,10 @@ mod tests {
                         "seed {seed} step {step}: reopened candidate is not the pin's successor"
                     );
                 }
-                // The admissible ceremony is persisted; resync reads what a
-                // crash-revert actually restored — an id whose recorded
-                // predecessor is again the pin may install, any other is
-                // contextually stale and must be refused.
-                m.active = store
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .state
-                    .active_ceremony
-                    .as_ref()
-                    .map(|a| (a.id, a.predecessor));
+                // The admissible ceremony is persisted on disk; a reverted
+                // id whose predecessor is again the pin may install, any
+                // other is contextually stale and must be refused.
+                m.active = parsed.and_then(|p| p.active);
             }
 
             fn reopen(&mut self, seed: u64, step: usize) {
@@ -2585,23 +2835,49 @@ mod tests {
                     Ok(store) => {
                         self.store = Some(store);
                         self.resync(seed, step);
+                        // Open idempotence: while the store is not frozen,
+                        // open∘open is byte-identical with open — the second
+                        // open rewrites nothing on disk.
+                        if !self.model.frozen && self.rng.pick(5) == 0 {
+                            let before = fs::read(self.ndir().join("state")).unwrap();
+                            self.store = None;
+                            self.store = Some(
+                                ShareStore::open(
+                                    self.dir,
+                                    &self.network,
+                                    self.signers.anchor().clone(),
+                                    Signers::did(1),
+                                    self.signers,
+                                )
+                                .unwrap_or_else(|e| {
+                                    panic!("seed {seed} step {step}: idempotent reopen: {e:?}")
+                                }),
+                            );
+                            let after = fs::read(self.ndir().join("state")).unwrap();
+                            assert_eq!(
+                                before, after,
+                                "seed {seed} step {step}: second open rewrote state"
+                            );
+                        }
                     }
                     Err(e) => {
-                        // The only lawful refusal: the recorded state
-                        // promises a receipted share whose file is gone —
-                        // real disk damage the store must not guess past.
-                        let state = fs::read(self.ndir().join("state"))
+                        // Two lawful refusals: (a) the recorded state itself
+                        // is unreadable (a torn file is disk damage the store
+                        // must never guess past), (b) the parsed record
+                        // promises a receipted share whose file is gone.
+                        let parsed = fs::read(self.ndir().join("state"))
                             .ok()
-                            .and_then(|b| decode_state(&b).ok());
-                        let promised_missing = state.is_some_and(|s| {
-                            s.candidate.is_some_and(|c| {
-                                c.receipt_sent && !share_path(&self.ndir(), &c.digest).exists()
-                            })
-                        });
-                        assert!(
-                            matches!(e, StoreError::Corrupt) && promised_missing,
-                            "seed {seed} step {step}: reopen failed: {e:?}"
-                        );
+                            .and_then(|b| parse_state(&b));
+                        let lawful = match parsed {
+                            None => true,
+                            Some(p) => {
+                                matches!(e, StoreError::Corrupt)
+                                    && p.candidate.is_some_and(|(d, sent)| {
+                                        sent && !share_path(&self.ndir(), &d).exists()
+                                    })
+                            }
+                        };
+                        assert!(lawful, "seed {seed} step {step}: reopen failed: {e:?}");
                         self.dead = true;
                     }
                 }
@@ -2654,6 +2930,7 @@ mod tests {
                 snapshots: VecDeque::new(),
                 transcript: 63,
                 dead: false,
+                fork_allowed: seed % 4 != 3,
             };
             let (signed, cert) = activated_genesis(runner.store.as_ref().unwrap(), signers);
             runner.model.pins.push(cert);
@@ -2672,6 +2949,7 @@ mod tests {
                 }
                 let frozen = runner.model.frozen;
                 let pending = runner.model.pending;
+                let fork_allowed = runner.fork_allowed;
                 let roll = runner.rng.pick(100);
                 match roll {
                     // Fresh accept + install under the admissible id.
@@ -2706,7 +2984,7 @@ mod tests {
                     }
                     // Stale install: any non-admissible ceremony id —
                     // including retired ones — must fail.
-                    38..=43 if !frozen => {
+                    38..=41 if !frozen => {
                         let stale: Vec<AuthorizedCeremony> = runner
                             .model
                             .ceremonies
@@ -2794,34 +3072,154 @@ mod tests {
                         runner.model.pending = None;
                         runner.model.active = None;
                     }
-                    // Write an activated sibling proof for an interior
-                    // predecessor: discovered at next open → frozen.
-                    74..=79 if !frozen && runner.model.pins.len() >= 2 => {
-                        let i = 1 + runner.rng.pick((runner.model.pins.len() - 1) as u64) as usize;
-                        let pred = runner.model.pins[i - 1].clone();
-                        let ceremony =
-                            runner.model.ceremonies_by_pred[pred.digest().as_bytes()].clone();
-                        runner.transcript = runner.transcript.wrapping_add(1);
-                        let signed =
-                            sibling_successor(signers, &pred, &ceremony, runner.transcript);
-                        let cert = verify_successor(&pred, &signed, signers).unwrap();
-                        let receipts = receipts_for(&cert, signers);
-                        let activation = activation_for(&cert, &receipts, signers);
-                        let path = proof_path(&runner.ndir(), &cert.digest());
-                        fs::write(&path, encode_proof(&signed, Some(&activation), &receipts))
+                    // Fork evidence — rare, and gated per seed so most runs
+                    // stay long-lived. Two paths: an activated sibling or
+                    // second genesis proof written to disk (discovered at
+                    // next open), or a live record_activation fork.
+                    68..=70 if !frozen && fork_allowed => {
+                        let live = runner.rng.pick(3) == 0;
+                        let genesis_fork = runner.model.pins.len() < 2 || runner.rng.pick(3) == 0;
+                        let (signed, cert, receipts, activation) = if genesis_fork {
+                            // A second activated genesis is equivocation at
+                            // the chain root.
+                            let ceremony = signers.genesis();
+                            let (public, _shares) =
+                                cert_tests::material(17, Threshold::new(2, 3).unwrap());
+                            let body = CertificateBody::genesis(
+                                &signers.anchor(),
+                                &ceremony,
+                                &public,
+                                &TranscriptHash::new([0xF1; 32]),
+                            )
                             .unwrap();
+                            let signed = cert::tests::sign(body, signers);
+                            let cert =
+                                verify_certificate(&signers.anchor(), &signed, signers).unwrap();
+                            let receipts = receipts_for(&cert, signers);
+                            let activation = activation_for(&cert, &receipts, signers);
+                            (signed, cert, receipts, activation)
+                        } else {
+                            let i =
+                                1 + runner.rng.pick((runner.model.pins.len() - 1) as u64) as usize;
+                            let pred = runner.model.pins[i - 1].clone();
+                            let ceremony =
+                                runner.model.ceremonies_by_pred[pred.digest().as_bytes()].clone();
+                            runner.transcript = runner.transcript.wrapping_add(1);
+                            let signed =
+                                sibling_successor(signers, &pred, &ceremony, runner.transcript);
+                            let cert = verify_successor(&pred, &signed, signers).unwrap();
+                            let receipts = receipts_for(&cert, signers);
+                            let activation = activation_for(&cert, &receipts, signers);
+                            (signed, cert, receipts, activation)
+                        };
                         runner
                             .model
                             .signed
-                            .insert(*cert.digest().as_bytes(), signed);
-                        runner.reopen(seed, step);
+                            .insert(*cert.digest().as_bytes(), signed.clone());
+                        if live && !genesis_fork {
+                            // The live path: the store itself detects and
+                            // persists the fork, then freezes.
+                            assert!(matches!(
+                                runner.store().record_activation(
+                                    &signed,
+                                    &activation,
+                                    &receipts,
+                                    signers
+                                ),
+                                Err(StoreError::Equivocation)
+                            ));
+                            runner.reopen(seed, step);
+                        } else {
+                            let path = proof_path(&runner.ndir(), &cert.digest());
+                            fs::write(&path, encode_proof(&signed, Some(&activation), &receipts))
+                                .unwrap();
+                            runner.reopen(seed, step);
+                        }
                         assert!(
                             runner.model.frozen,
                             "seed {seed} step {step}: activated fork did not freeze"
                         );
                     }
-                    // Rule 10: a second opener changes nothing.
-                    80..=85 => {
+                    // Proof-file loss: an activated certificate's proof
+                    // disappears before reopen — convergence to an earlier
+                    // crash-free point, never corruption.
+                    71..=73 => {
+                        let proofs: Vec<PathBuf> = fs::read_dir(runner.ndir().join("proofs"))
+                            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                            .unwrap_or_default();
+                        if !proofs.is_empty() {
+                            runner.store = None;
+                            let path =
+                                proofs[runner.rng.pick(proofs.len() as u64) as usize].clone();
+                            let _ = fs::remove_file(path);
+                            runner.reopen(seed, step);
+                        }
+                    }
+                    // Resurrection probe: a retired certificate must never
+                    // reinstall, even under the admissible ceremony id.
+                    74..=77 if !frozen && runner.model.pending.is_none() => {
+                        let pin = runner.model.pins.last().map(|p| p.digest());
+                        let candidates: Vec<SignedCertificate> = runner
+                            .model
+                            .retired
+                            .iter()
+                            .filter_map(|d| runner.model.signed.get(d))
+                            .filter(|s| s.body.previous().copied() == pin)
+                            .cloned()
+                            .collect();
+                        if let (Some((id, _)), false) = (runner.model.active, candidates.is_empty())
+                        {
+                            let signed = candidates
+                                [runner.rng.pick(candidates.len() as u64) as usize]
+                                .clone();
+                            let ceremony = runner
+                                .model
+                                .ceremonies
+                                .iter()
+                                .find(|c| c.statement().id == id)
+                                .unwrap()
+                                .clone();
+                            let (_, mut shares) =
+                                cert_tests::material(11, Threshold::new(2, 3).unwrap());
+                            let candidate = mk_candidate(shares.remove(0), &signed.body);
+                            assert!(
+                                matches!(
+                                    runner
+                                        .store()
+                                        .install_candidate(&signed, candidate, &ceremony, signers),
+                                    Err(StoreError::Retired)
+                                ),
+                                "seed {seed} step {step}: retired certificate reinstalled"
+                            );
+                            // The activation path must refuse a retired
+                            // digest too (C1/C2): an erased share can never
+                            // be re-pinned by a late record_activation.
+                            let cert = verify_successor(
+                                runner.model.pins.last().unwrap(),
+                                &signed,
+                                signers,
+                            )
+                            .unwrap();
+                            let receipts = receipts_for(&cert, signers);
+                            let activation = activation_for(&cert, &receipts, signers);
+                            assert!(
+                                matches!(
+                                    runner.store().record_activation(
+                                        &signed,
+                                        &activation,
+                                        &receipts,
+                                        signers
+                                    ),
+                                    Err(StoreError::Retired)
+                                ),
+                                "seed {seed} step {step}: retired certificate reactivated"
+                            );
+                        }
+                    }
+                    // Rule 10: a second opener is Busy and changes nothing
+                    // on disk.
+                    78..=83 => {
+                        let before = runner.disk_hash();
                         assert!(matches!(
                             ShareStore::open(
                                 dir,
@@ -2832,15 +3230,21 @@ mod tests {
                             ),
                             Err(StoreError::Busy)
                         ));
+                        assert_eq!(
+                            runner.disk_hash(),
+                            before,
+                            "seed {seed} step {step}: Busy opener mutated the disk"
+                        );
                     }
                     // Clean reopen.
-                    86..=90 => runner.reopen(seed, step),
-                    // Crash replays: revert `state` to a recent snapshot
-                    // (commit-without-completion), delete a dealt marker
-                    // (post-commit pre-marker crash), or leave temp debris;
-                    // every variant ends in a reopen + resync.
+                    84..=88 => runner.reopen(seed, step),
+                    // Crash replays and disk damage: revert `state` to a
+                    // recent snapshot, delete a dealt marker, drop temp
+                    // debris, truncate `state` to a torn prefix, delete a
+                    // non-live share file (unrecorded disk damage), or just
+                    // drop unclosed; every variant ends in a reopen + resync.
                     _ => {
-                        match runner.rng.pick(4) {
+                        match runner.rng.pick(6) {
                             0 if !runner.snapshots.is_empty() => {
                                 runner.store = None;
                                 let i = runner.rng.pick(runner.snapshots.len() as u64) as usize;
@@ -2862,6 +3266,63 @@ mod tests {
                                     .ndir()
                                     .join(format!("share-{}.tmp-1-9", hex(&[0xAB; 32])));
                                 fs::write(&debris, [0x55u8; 67]).unwrap();
+                            }
+                            3 => {
+                                // A torn `state`: atomic renames make this
+                                // disk damage, so open must refuse — never
+                                // adopt a truncated record.
+                                runner.store = None;
+                                let state = runner.ndir().join("state");
+                                if let Ok(bytes) = fs::read(&state) {
+                                    if bytes.len() > 4 {
+                                        fs::write(&state, &bytes[..bytes.len() / 2]).unwrap();
+                                    }
+                                }
+                                assert!(
+                                    ShareStore::open(
+                                        dir,
+                                        &network,
+                                        signers.anchor().clone(),
+                                        Signers::did(1),
+                                        signers
+                                    )
+                                    .is_err(),
+                                    "seed {seed} step {step}: torn state opened"
+                                );
+                            }
+                            4 => {
+                                // Delete a share file the state does not
+                                // record: unrecorded disk damage.
+                                runner.store = None;
+                                let live: BTreeSet<[u8; 32]> = {
+                                    let mut s = BTreeSet::new();
+                                    if let Some(p) = runner.model.pins.last() {
+                                        s.insert(*p.digest().as_bytes());
+                                    }
+                                    if let Some((d, _)) = runner.model.pending {
+                                        s.insert(*d.as_bytes());
+                                    }
+                                    s
+                                };
+                                let victims: Vec<PathBuf> = fs::read_dir(runner.ndir())
+                                    .map(|rd| {
+                                        rd.flatten()
+                                            .filter(|e| {
+                                                e.file_name()
+                                                    .to_str()
+                                                    .and_then(|n| n.strip_prefix("share-"))
+                                                    .and_then(decode_hex)
+                                                    .is_some_and(|d| !live.contains(&d))
+                                            })
+                                            .map(|e| e.path())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if !victims.is_empty() {
+                                    let _ = fs::remove_file(
+                                        &victims[runner.rng.pick(victims.len() as u64) as usize],
+                                    );
+                                }
                             }
                             _ => runner.store = None,
                         }
@@ -2928,5 +3389,214 @@ mod tests {
                 run_seed(&dir, &signers, seed, 220);
             }
         }
+    }
+
+    /// P1-a: a frozen reopen keeps the recorded verified pin and erases
+    /// NOTHING — the member's last share is never lost to a fork.
+    /// Details: TC-2221
+    #[test]
+    fn frozen_reopen_keeps_pin_and_every_share() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let network = signers.anchor().network.clone();
+        let digest_a;
+        let digest_z;
+        {
+            let store = open(&dir, &signers);
+            let (_signed_g, cert_g) = activated_genesis(&store, &signers);
+            // A: activated candidate (retires G); Z: receipted candidate on A.
+            let (s_a, mut raw_a, c_a) = cert_tests::successor(
+                &signers,
+                &cert_g,
+                CeremonyKind::Reshare,
+                Threshold::new(2, 3).unwrap(),
+                11,
+            );
+            store.accept_ceremony(&c_a).unwrap();
+            store
+                .install_candidate(
+                    &s_a,
+                    mk_candidate(raw_a.remove(0), &s_a.body),
+                    &c_a,
+                    &signers,
+                )
+                .unwrap();
+            store.mark_receipt_sent().unwrap();
+            let cert_a = verify_successor(&cert_g, &s_a, &signers).unwrap();
+            digest_a = cert_a.digest();
+            let receipts_a = receipts_for(&cert_a, &signers);
+            let activation_a = activation_for(&cert_a, &receipts_a, &signers);
+            store
+                .record_activation(&s_a, &activation_a, &receipts_a, &signers)
+                .unwrap();
+            let mut stmt_z = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+            stmt_z.id = CeremonyId::new([0x62; 32]);
+            stmt_z.current = Some(cert_a.digest());
+            stmt_z.epoch = cert_a.body().epoch().checked_next().unwrap();
+            stmt_z.rekey = cert_a.body().rekey();
+            let c_z =
+                AuthorizedCeremony::verify_for(&cert_a, &signers.statement(&stmt_z), &signers)
+                    .unwrap();
+            let body_z = CertificateBody::successor(
+                &cert_a,
+                &c_z,
+                &cert_tests::material(11, Threshold::new(2, 3).unwrap()).0,
+                &TranscriptHash::new([0x5a; 32]),
+            )
+            .unwrap();
+            let s_z = cert::tests::sign(body_z, &signers);
+            let mut raw_z = cert_tests::material(11, Threshold::new(2, 3).unwrap()).1;
+            store.accept_ceremony(&c_z).unwrap();
+            digest_z = store
+                .install_candidate(
+                    &s_z,
+                    mk_candidate(raw_z.remove(0), &s_z.body),
+                    &c_z,
+                    &signers,
+                )
+                .unwrap();
+            store.mark_receipt_sent().unwrap();
+            // Fork evidence: an activated sibling of A.
+            let s_fork = sibling_successor(&signers, &cert_g, &c_a, 0xf0);
+            let cert_f = verify_successor(&cert_g, &s_fork, &signers).unwrap();
+            let receipts_f = receipts_for(&cert_f, &signers);
+            let activation_f = activation_for(&cert_f, &receipts_f, &signers);
+            assert!(matches!(
+                store.record_activation(&s_fork, &activation_f, &receipts_f, &signers),
+                Err(StoreError::Equivocation)
+            ));
+        }
+        let store = ShareStore::open(
+            &dir,
+            &network,
+            signers.anchor().clone(),
+            Signers::did(1),
+            &signers,
+        )
+        .unwrap();
+        assert!(store.equivocation());
+        // The recorded pin stands — verified activated, never lowered.
+        assert_eq!(store.pinned().unwrap().digest(), digest_a);
+        // Nothing is erased while equivocated: A's share and the receipted
+        // candidate's share both survive.
+        let ndir = netdir(&dir, &network);
+        assert!(ndir
+            .join(format!("share-{}", hex(digest_a.as_bytes())))
+            .exists());
+        assert!(ndir
+            .join(format!("share-{}", hex(digest_z.as_bytes())))
+            .exists());
+    }
+
+    /// P1-b: a retired candidate certificate can never be reinstalled,
+    /// even under the currently admissible ceremony. Details: TC-2221
+    #[test]
+    fn retired_candidate_cert_cannot_reinstall() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let store = open(&dir, &signers);
+        let (_signed_g, cert_g) = activated_genesis(&store, &signers);
+        let (s_x, mut raw_x, c_x) = cert_tests::successor(
+            &signers,
+            &cert_g,
+            CeremonyKind::Reshare,
+            Threshold::new(2, 3).unwrap(),
+            11,
+        );
+        store.accept_ceremony(&c_x).unwrap();
+        let digest_x = store
+            .install_candidate(
+                &s_x,
+                mk_candidate(raw_x.remove(0), &s_x.body),
+                &c_x,
+                &signers,
+            )
+            .unwrap();
+        store.mark_receipt_sent().unwrap();
+        // A fresh ceremony supersedes X (C1 retires and erases the share).
+        let mut stmt_y = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+        stmt_y.id = CeremonyId::new([0x61; 32]);
+        stmt_y.current = Some(cert_g.digest());
+        stmt_y.epoch = cert_g.body().epoch().checked_next().unwrap();
+        stmt_y.rekey = cert_g.body().rekey();
+        let ceremony_y =
+            AuthorizedCeremony::verify_for(&cert_g, &signers.statement(&stmt_y), &signers).unwrap();
+        assert_eq!(
+            store.accept_ceremony(&ceremony_y).unwrap(),
+            AcceptOutcome::Fresh
+        );
+        assert!(store.retired().iter().any(|r| r.digest == digest_x));
+        // Reinstalling X's certificate — the same cert whose share C1
+        // erased — under the now-admissible ceremony must be refused.
+        let (s_x2, mut raw_x2, _c) = cert_tests::successor(
+            &signers,
+            &cert_g,
+            CeremonyKind::Reshare,
+            Threshold::new(2, 3).unwrap(),
+            11,
+        );
+        assert_eq!(s_x2.body.digest(), digest_x);
+        assert!(matches!(
+            store.install_candidate(
+                &s_x2,
+                mk_candidate(raw_x2.remove(0), &s_x2.body),
+                &ceremony_y,
+                &signers
+            ),
+            Err(StoreError::Retired)
+        ));
+    }
+
+    /// The activation path obeys the retirement record too: a C1-retired
+    /// candidate's certificate — still a valid successor of the pin — must
+    /// never be re-pinned by a late `record_activation`. Details: TC-2221
+    #[test]
+    fn retired_candidate_cert_cannot_reactivate() {
+        let signers = Signers::new();
+        let dir = tmpdir();
+        let store = open(&dir, &signers);
+        let (_signed_g, cert_g) = activated_genesis(&store, &signers);
+        let (s_x, mut raw_x, c_x) = cert_tests::successor(
+            &signers,
+            &cert_g,
+            CeremonyKind::Reshare,
+            Threshold::new(2, 3).unwrap(),
+            11,
+        );
+        store.accept_ceremony(&c_x).unwrap();
+        let digest_x = store
+            .install_candidate(
+                &s_x,
+                mk_candidate(raw_x.remove(0), &s_x.body),
+                &c_x,
+                &signers,
+            )
+            .unwrap();
+        store.mark_receipt_sent().unwrap();
+        // A fresh ceremony over the same pin retires and erases X (C1).
+        let mut stmt_y = signers.body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+        stmt_y.id = CeremonyId::new([0x62; 32]);
+        stmt_y.current = Some(cert_g.digest());
+        stmt_y.epoch = cert_g.body().epoch().checked_next().unwrap();
+        stmt_y.rekey = cert_g.body().rekey();
+        let ceremony_y =
+            AuthorizedCeremony::verify_for(&cert_g, &signers.statement(&stmt_y), &signers).unwrap();
+        assert_eq!(
+            store.accept_ceremony(&ceremony_y).unwrap(),
+            AcceptOutcome::Fresh
+        );
+        assert!(store.retired().iter().any(|r| r.digest == digest_x));
+        // X's certificate is still a perfectly valid successor of the pin;
+        // the durable retirement record — not lineage — refuses it.
+        let cert_x = verify_successor(&cert_g, &s_x, &signers).unwrap();
+        let receipts = receipts_for(&cert_x, &signers);
+        let activation = activation_for(&cert_x, &receipts, &signers);
+        assert!(matches!(
+            store.record_activation(&s_x, &activation, &receipts, &signers),
+            Err(StoreError::Retired)
+        ));
+        // The pin did not move and the erased share stays erased.
+        assert_eq!(store.pinned().map(|p| p.digest()), Some(cert_g.digest()));
+        assert!(!share_path(&netdir(&dir, &signers.anchor().network), &digest_x).exists());
     }
 }
