@@ -10,9 +10,11 @@ Existing serving configuration continues selecting its existing keys.
 ## Storage behavior
 
 Column and webhook keys retain #535's HKDF salt and purpose labels. A new
-network-seal purpose separates the next seal key from both. Readers retain
-legacy v1 keys, generation 1 purpose keys, and generation 0 seals. Injected rings initially keep the existing writers and add generation 2 read
-keys. After activation commits, the returned rings select generation 2 writers. Client wrap-v1 and wrap-v2 envelopes
+network-seal purpose separates the next seal key from both. Column readers retain
+legacy v1 keys and generation 1 purpose keys; migration retains legacy seal keys.
+Serving accepts PK-bound v2 seals with generation 0 or 2. Injected rings initially
+keep the existing writers and add generation 2 read keys. After activation commits,
+the returned rings select generation 2 writers. Client wrap-v1 and wrap-v2 envelopes
 are unchanged: the job opens and re-seals server private keys and seeds, without
 changing the underlying X25519 keys or any client ciphertext.
 
@@ -26,10 +28,32 @@ Column rewrites retain the exact table, column and ordered PK binding from #535.
 Network private-key bindings include `network_id`; seed bindings include
 `network_id` and `key_path` in database PK order. Serving opens and migration
 verify the network private key against the row's public key. Named-key opens
-also check the derived public key against the key row. Legacy v1 seals remain an
-explicit authenticated compatibility path; rewritten seals use PK-bound v2.
+also check the derived public key against the key row. Serving rejects v1 private-key
+and seed seals. Only the migration may decode legacy seals after checking the
+independent witnesses described below; rewritten seals use PK-bound v2.
 Every migrated value is authenticated and checked for byte-for-byte plaintext
 equality after it is written back.
+
+## Legacy seal migration prerequisites
+
+Before re-sealing a v1 network private key, the migration requires exactly one
+`initial` ceremony for its network. The ceremony must be completed, record its
+completion, and have `transcript_hash = hash_hex(public_key)`. The unsealed
+private key must also derive that public key. Missing, duplicate, conflicting,
+incomplete or mismatching ceremony evidence aborts the page before re-sealing.
+
+V1 named-key seeds require a caller-supplied `TrustedSeedIdentities` map keyed by
+`(network_id, key_path, key_version)`. Populate it only from an independently
+authenticated external manifest or equivalent trusted creation evidence. The
+migration does not supply a manifest automatically, and the rows being migrated
+must never be used to synthesize it. Each supplied public key must match the key
+derived from the unsealed seed and the registered row public key.
+
+Pass this map explicitly to every `step` call. An empty map supplies no legacy
+seed witnesses: a missing or mismatching entry aborts the page, preserves its
+checkpoint, and prevents completion and old-root retirement. Serving requests
+for unmigrated v1 seals fail closed until the witnessed migration succeeds.
+Client-wrapped key v1 and v2 protocols remain unchanged.
 
 ## Activation and recovery
 

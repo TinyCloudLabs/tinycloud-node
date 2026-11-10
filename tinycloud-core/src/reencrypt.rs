@@ -29,6 +29,11 @@ pub struct Rings {
     pub webhooks: ColumnEncryption,
     pub seals: ColumnEncryption,
 }
+/// Migration-only public identities, keyed by (network_id, key_path, key_version).
+/// Populate only from an independently authenticated manifest, never from the
+/// rows being migrated. An empty map does not authorize legacy seed conversion.
+pub type TrustedSeedIdentities = BTreeMap<(String, String, i64), [u8; 32]>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("database operation failed")]
@@ -339,9 +344,79 @@ fn matches_raw_cid(expected: &str, bytes: &[u8]) -> bool {
     }
 }
 
+// V1 seals have no row AAD. The migration alone may open them after checking
+// independent creation evidence. Serving backends accept only v2 seals.
+async fn legacy_network_witness<C: ConnectionTrait>(
+    db: &C,
+    network: &str,
+    public: &[u8],
+) -> Result<(), Error> {
+    let mismatch = || Error::Integrity {
+        table: "encryption_network",
+        column: "sealed_private_key",
+    };
+    let evidence=db.query_all(bound(db.get_database_backend(),"SELECT state,transcript_hash,completed_at,failure FROM encryption_ceremony WHERE network_id=? AND kind='initial' LIMIT 2",vec![network.into()])).await?;
+    if evidence.len() != 1 {
+        return Err(mismatch());
+    }
+    let row = &evidence[0];
+    if row.try_get::<String>("", "state")? != "completed"
+        || row
+            .try_get::<Option<String>>("", "completed_at")?
+            .is_none_or(|s| s.is_empty())
+        || row.try_get::<Option<String>>("", "failure")?.is_some()
+        || row
+            .try_get::<Option<String>>("", "transcript_hash")?
+            .as_deref()
+            != Some(crate::encryption_network::canonical::hash_hex(public).as_str())
+    {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+async fn migration_network_secret<C: ConnectionTrait>(
+    db: &C,
+    seal: &ColumnEncryption,
+    network: &str,
+    blob: &[u8],
+    public: &[u8],
+) -> Result<StaticSecret, Error> {
+    let opened = Zeroizing::new(
+        if blob.first() == Some(&1) {
+            legacy_network_witness(db, network, public).await?;
+            seal.decrypt_legacy(blob)
+        } else {
+            seal.decrypt_v2(
+                blob,
+                RowBinding::new(
+                    "encryption_network",
+                    "sealed_private_key",
+                    &[network.as_bytes()],
+                ),
+            )
+        }
+        .map_err(|_| Error::Verify)?,
+    );
+    let bytes = Zeroizing::new(<[u8; 32]>::try_from(opened.as_slice()).map_err(|_| Error::Verify)?);
+    let secret = StaticSecret::from(*bytes);
+    if PublicKey::from(&secret).as_bytes().as_slice() != public {
+        return Err(Error::Integrity {
+            table: "encryption_network",
+            column: "sealed_private_key",
+        });
+    }
+    Ok(secret)
+}
+
 // NULL is accepted only for a lifecycle state that intentionally holds no
 // sealed material. Required seals, invalid metadata and orphan key rows abort.
-fn validate_shape(spec: Column, row: &Row, seal: &ColumnEncryption) -> Result<(), Error> {
+async fn validate_shape<C: ConnectionTrait>(
+    db: &C,
+    spec: Column,
+    row: &Row,
+    seal: &ColumnEncryption,
+) -> Result<(), Error> {
     use crate::encryption_network::{key_id::KeyKind, types::NetworkState};
     match spec.identity {
         Identity::Network => {
@@ -384,16 +459,17 @@ fn validate_shape(spec: Column, row: &Row, seal: &ColumnEncryption) -> Result<()
                 return Err(Error::Verify);
             }
             let backend = LocalOneOfOneBackend::new(seal.clone());
-            let secret = backend
-                .open_network_secret(
-                    row.network_blob.as_deref().ok_or(Error::Integrity {
-                        table: spec.table,
-                        column: spec.column,
-                    })?,
-                    network,
-                    row.network_public.as_deref().ok_or(Error::Verify)?,
-                )
-                .map_err(|_| Error::Verify)?;
+            let secret = migration_network_secret(
+                db,
+                seal,
+                network,
+                row.network_blob.as_deref().ok_or(Error::Integrity {
+                    table: spec.table,
+                    column: spec.column,
+                })?,
+                row.network_public.as_deref().ok_or(Error::Verify)?,
+            )
+            .await?;
             match (kind, row.state.as_deref(), row.blob.is_some()) {
                 (KeyKind::Deterministic, _, false) => {
                     let public = backend
@@ -414,7 +490,9 @@ fn validate_shape(spec: Column, row: &Row, seal: &ColumnEncryption) -> Result<()
     Ok(())
 }
 
-fn identity(
+async fn identity<C: ConnectionTrait>(
+    db: &C,
+    trusted: &TrustedSeedIdentities,
     spec: Column,
     row: &Row,
     plaintext: &[u8],
@@ -479,22 +557,27 @@ fn identity(
             let Key::Pair(network, path) = &row.key else {
                 return Err(mismatch());
             };
-            let pk = [network.as_bytes()];
-            let network_bytes = Zeroizing::new(
-                seal.decrypt(
-                    network_blob,
-                    RowBinding::new("encryption_network", "sealed_private_key", &pk),
+            let secret = migration_network_secret(
+                db,
+                seal,
+                network,
+                network_blob,
+                row.network_public.as_deref().ok_or_else(mismatch)?,
+            )
+            .await?;
+            let expected = if row.blob.as_deref().is_some_and(|b| b.first() == Some(&1)) {
+                Some(
+                    trusted
+                        .get(&(
+                            network.clone(),
+                            path.clone(),
+                            row.key_version.ok_or_else(mismatch)?,
+                        ))
+                        .ok_or_else(mismatch)?,
                 )
-                .map_err(|_| mismatch())?,
-            );
-            let network_bytes = Zeroizing::new(
-                <[u8; 32]>::try_from(network_bytes.as_slice()).map_err(|_| mismatch())?,
-            );
-            let secret = StaticSecret::from(*network_bytes);
-            if row.network_public.as_deref() != Some(PublicKey::from(&secret).as_bytes().as_slice())
-            {
-                return Err(mismatch());
-            }
+            } else {
+                None
+            };
             let network: NetworkId = network.parse().map_err(|_| mismatch())?;
             let location = KeyLocation::new(&network, path).map_err(|_| mismatch())?;
             let backend = LocalOneOfOneBackend::new(seal.clone());
@@ -505,6 +588,9 @@ fn identity(
                     Some(&KeySeed::from_bytes(*bytes)),
                 )
                 .map_err(|_| mismatch())?;
+            if expected.is_some_and(|expected| expected.as_slice() != public.as_slice()) {
+                return Err(mismatch());
+            }
             if row.public_key.as_deref() != Some(public.as_slice()) {
                 return Err(mismatch());
             }
@@ -830,7 +916,8 @@ pub async fn activate<C: ConnectionTrait + TransactionTrait>(
     }
     // Any data mutation invalidates a paged verification snapshot. These updates
     // use the same singleton lock as each job page and boot validation.
-    let mut tables = std::collections::BTreeSet::from(["delegation_cid_alias"]);
+    let mut tables =
+        std::collections::BTreeSet::from(["delegation_cid_alias", "encryption_ceremony"]);
     tables.extend(COLUMNS.iter().map(|s| s.table));
     for (i, table) in tables.into_iter().enumerate() {
         if backend == DbBackend::Sqlite {
@@ -894,11 +981,13 @@ pub async fn step<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
     batch: u64,
+    trusted: &TrustedSeedIdentities,
 ) -> Result<Progress, Error> {
     step_page(
         db,
         rings,
         batch,
+        trusted,
         #[cfg(test)]
         None,
     )
@@ -909,6 +998,7 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
     batch: u64,
+    trusted: &TrustedSeedIdentities,
     #[cfg(test)] abort_after: Option<i64>,
 ) -> Result<Progress, Error> {
     if batch == 0 || batch > 10000 {
@@ -960,7 +1050,7 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
     let mut last = None;
     for row in &rows {
         last = Some(row.key.encoded()?);
-        validate_shape(spec, row, &rings.seals)?;
+        validate_shape(&tx, spec, row, &rings.seals).await?;
         let Some(old) = &row.blob else {
             if verifying {
                 verified += 1;
@@ -978,12 +1068,25 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
         let plain = Zeroizing::new(
             if spec.format().is_some() {
                 ring.decrypt_recorded(old, binding, row.format)
+            } else if old.first() == Some(&1) {
+                if matches!(spec.identity, Identity::Network) {
+                    let Key::Text(network) = &row.key else {
+                        return Err(Error::Verify);
+                    };
+                    legacy_network_witness(
+                        &tx,
+                        network,
+                        row.public_key.as_deref().ok_or(Error::Verify)?,
+                    )
+                    .await?;
+                }
+                ring.decrypt_legacy(old)
             } else {
-                ring.decrypt(old, binding)
+                ring.decrypt_v2(old, binding)
             }
             .map_err(|_| Error::Verify)?,
         );
-        identity(spec, row, &plain, &rings.seals)?;
+        identity(&tx, trusted, spec, row, &plain, &rings.seals).await?;
         if verifying {
             if old.get(..2) != Some(&[2, kid]) || (spec.format().is_some() && row.format != 2) {
                 return Err(Error::Verify);
@@ -1055,12 +1158,16 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
             .ok_or(Error::Conflict)?;
         let saved: Vec<u8> = saved.try_get("", "blob")?;
         if saved != new
-            || Zeroizing::new(ring.decrypt(&saved, binding).map_err(|_| Error::Verify)?).as_slice()
+            || Zeroizing::new(
+                ring.decrypt_v2(&saved, binding)
+                    .map_err(|_| Error::Verify)?,
+            )
+            .as_slice()
                 != plain.as_slice()
         {
             return Err(Error::Verify);
         }
-        identity(spec, row, &plain, &rings.seals)?;
+        identity(&tx, trusted, spec, row, &plain, &rings.seals).await?;
         done += 1;
         #[cfg(test)]
         if abort_after == Some(done) {

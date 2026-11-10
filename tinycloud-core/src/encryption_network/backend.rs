@@ -358,7 +358,8 @@ pub trait KeyBackend: Send + Sync {
         version: KeyWrapVersion,
     ) -> Result<Vec<u8>, KeyBackendError>;
 
-    /// Unseal the network private key. A failure here is a backend fault,
+    /// Open a PK-bound v2 network seal. Legacy seals require migration.
+    /// A failure here is a backend fault,
     /// reported separately from a failed unwrap.
     fn open_network_secret(
         &self,
@@ -396,9 +397,8 @@ pub trait KeyBackend: Send + Sync {
         key_path: &str,
     ) -> Result<(KeySeed, Vec<u8>), KeyBackendError>;
 
-    /// Opens a sealed seed. Only the strict unseal is used: input that is not
-    /// a versioned sealed value, or that does not hold exactly 32 bytes, is
-    /// refused.
+    /// Open only a PK-bound v2 seed containing exactly 32 bytes.
+    /// Legacy seals require migration and are refused by serving paths.
     fn open_seed(
         &self,
         sealed_seed: &[u8],
@@ -555,7 +555,7 @@ impl KeyBackend for LocalOneOfOneBackend {
         let pk = [network_id.as_bytes()];
         let binding =
             crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &pk);
-        let opened = Zeroizing::new(self.seal.decrypt(sealed_private_key, binding)?);
+        let opened = Zeroizing::new(self.seal.decrypt_v2(sealed_private_key, binding)?);
         if opened.len() != 32 {
             return Err(KeyBackendError::InvalidSealedKey);
         }
@@ -641,7 +641,7 @@ impl KeyBackend for LocalOneOfOneBackend {
         key_path: &str,
     ) -> Result<KeySeed, KeyBackendError> {
         let pk = [network_id.as_bytes(), key_path.as_bytes()];
-        let opened = Zeroizing::new(self.seal.decrypt(
+        let opened = Zeroizing::new(self.seal.decrypt_v2(
             sealed_seed,
             crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &pk),
         )?);
@@ -1401,7 +1401,14 @@ mod tests {
             );
         }
         // A sealed value that is not 32 bytes is refused.
-        let short = ColumnEncryption::new([7u8; 32]).encrypt_legacy(&[1u8; 16]);
+        let short = ColumnEncryption::new([7u8; 32]).encrypt(
+            &[1u8; 16],
+            crate::encryption::RowBinding::new(
+                "encryption_network_key",
+                "sealed_seed",
+                &[NETWORK.as_bytes(), b"seed-path"],
+            ),
+        );
         assert!(matches!(
             backend.open_seed(&short, NETWORK, "seed-path"),
             Err(KeyBackendError::InvalidSealedKey)
@@ -1498,7 +1505,7 @@ mod tests {
 mod seal_binding_regression_tests {
     use super::*;
     #[test]
-    fn legacy_seals_require_expected_public_and_v2_never_falls_back_to_empty_pk() {
+    fn persisted_seals_require_v2_and_never_fall_back_to_empty_pk() {
         let ring = ColumnEncryption::new([7; 32]);
         let backend = LocalOneOfOneBackend::new(ring.clone());
         let secret = StaticSecret::from([42; 32]);
@@ -1506,7 +1513,11 @@ mod seal_binding_regression_tests {
         let legacy = ring.encrypt_legacy(secret.as_bytes());
         assert!(backend
             .open_network_secret(&legacy, "network-a", public.as_bytes())
-            .is_ok());
+            .is_err());
+        let legacy_seed = ring.encrypt_legacy(&[43; 32]);
+        assert!(backend
+            .open_seed(&legacy_seed, "network-a", "path-a")
+            .is_err());
         assert!(backend
             .open_network_secret(&legacy, "network-a", &[0; 32])
             .is_err());

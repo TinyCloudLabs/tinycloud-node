@@ -12,6 +12,29 @@ fn rings() -> Rings {
     }
     Rings::from_source(&Source, [8; 32], [7; 32], [9; 32]).unwrap()
 }
+// Test identities come from trusted creation inputs, never queried row fields.
+fn trusted_seed_identities() -> TrustedSeedIdentities {
+    let mut trusted = TrustedSeedIdentities::new();
+    let backend = LocalOneOfOneBackend::new(rings().seals);
+    for (name, byte) in [("alpha", 31), ("beta", 32)] {
+        let network = NetworkId::new(OWNER, name).unwrap();
+        for path in ["apps/app/a", "apps/app/z"] {
+            let location = KeyLocation::new(&network, path).unwrap();
+            let public = backend
+                .derive_named_public_key(
+                    &StaticSecret::from([byte; 32]),
+                    &canonical_key_urn(&location),
+                    Some(&KeySeed::from_bytes([43; 32])),
+                )
+                .unwrap();
+            trusted.insert(
+                (network.to_string(), path.to_string(), 1),
+                public.try_into().unwrap(),
+            );
+        }
+    }
+    trusted
+}
 async fn database() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     crate::migrations::Migrator::up(&db, None).await.unwrap();
@@ -39,6 +62,7 @@ pub(super) async fn fixtures(db: &impl ConnectionTrait) {
         let network = NetworkId::new(OWNER, name).unwrap().to_string();
         let secret = StaticSecret::from([secret_byte; 32]);
         exec(db, "INSERT INTO encryption_network (network_id,owner_did,name,alg,key_version,public_key,state,threshold_n,threshold_t,key_backend,sealed_private_key,created_at,updated_at) VALUES (?, ?, ?, 'X25519-AES256GCM', 1, ?, 'active', 1, 1, 'local-one-of-one', ?, 'now', 'now')", vec![network.clone().into(), OWNER.into(), name.into(), PublicKey::from(&secret).as_bytes().to_vec().into(), ColumnEncryption::new([9; 32]).encrypt_legacy(secret.as_bytes()).into()]).await;
+        exec(db,"INSERT INTO encryption_ceremony (ceremony_id,network_id,kind,state,transcript_hash,started_at,completed_at) VALUES (?,?,'initial','completed',?,'now','now')",vec![format!("initial:{name}").into(),network.clone().into(),crate::encryption_network::canonical::hash_hex(PublicKey::from(&secret).as_bytes()).into()]).await;
         for path in ["apps/app/a", "apps/app/z"] {
             let seed = KeySeed::from_bytes([43; 32]);
             let public = backend
@@ -129,11 +153,20 @@ async fn exercise(db: &DatabaseConnection) {
     .await
     .is_err());
     // Fail after a CAS, before commit: ciphertext, cursor and count all roll back.
-    assert!(step_page(db, &rings, 2, Some(1)).await.is_err());
+    assert!(
+        step_page(db, &rings, 2, &trusted_seed_identities(), Some(1))
+            .await
+            .is_err()
+    );
     assert_eq!(progress(db).await.unwrap().rewritten, 0);
     assert_eq!(census(db).await.unwrap()[0].legacy, before[0].legacy);
     // A committed batch followed by process loss must resume from its cursor.
-    assert!(!step(db, &rings, 1).await.unwrap().complete);
+    assert!(
+        !step(db, &rings, 1, &trusted_seed_identities())
+            .await
+            .unwrap()
+            .complete
+    );
     let checkpoint = progress(db).await.unwrap();
     assert_eq!(checkpoint.rewritten, 1);
     loop {
@@ -147,7 +180,11 @@ async fn exercise(db: &DatabaseConnection) {
         )
         .await;
         assert!(boot.is_ok(), "mixed state boot failed: {:?}", boot.err());
-        if step(db, &rings, 1).await.unwrap().complete {
+        if step(db, &rings, 1, &trusted_seed_identities())
+            .await
+            .unwrap()
+            .complete
+        {
             break;
         }
     }
@@ -156,7 +193,12 @@ async fn exercise(db: &DatabaseConnection) {
         .iter()
         .all(|c| c.legacy == 0 && c.kids.keys().all(|k| *k == 2)));
     let done = progress(db).await.unwrap().rewritten;
-    assert!(step(db, &rings, 10).await.unwrap().complete);
+    assert!(
+        step(db, &rings, 10, &trusted_seed_identities())
+            .await
+            .unwrap()
+            .complete
+    );
     assert_eq!(progress(db).await.unwrap().rewritten, done);
     // The database fence rejects stale writers, including inserts behind cursor.
     let stale = ColumnEncryption::new([7; 32]).encrypt_legacy(b"stale");
@@ -194,7 +236,7 @@ async fn integrity_failure_aborts_at_first_bad_row_without_advancing() {
     .await;
     let rings = activate(&db, &rings).await.unwrap();
     assert!(matches!(
-        step(&db, &rings, 10).await,
+        step(&db, &rings, 10, &trusted_seed_identities()).await,
         Err(Error::Integrity { .. })
     ));
     assert_eq!(progress(&db).await.unwrap().rewritten, 0);
@@ -202,7 +244,7 @@ async fn integrity_failure_aborts_at_first_bad_row_without_advancing() {
 }
 
 #[test]
-fn existing_v1_and_v2_kid0_seals_and_wrap_v2_survive_root_change() {
+fn serving_v2_kid0_seals_remain_compatible_and_v1_requires_migration() {
     use crate::encryption_network::backend::*;
     let old = LocalOneOfOneBackend::new(ColumnEncryption::new([9; 32]));
     let new = LocalOneOfOneBackend::new(rings().seals);
@@ -215,7 +257,7 @@ fn existing_v1_and_v2_kid0_seals_and_wrap_v2_survive_root_change() {
     let legacy = ColumnEncryption::new([9; 32]).encrypt_legacy(legacy_secret.as_bytes());
     assert!(new
         .open_network_secret(&legacy, "", PublicKey::from(&legacy_secret).as_bytes())
-        .is_ok());
+        .is_err());
 
     assert!(new
         .open_network_secret(&generated.sealed_private_key, "", &generated.public_key)
@@ -314,13 +356,17 @@ async fn verification_review_cases(db: &DatabaseConnection) {
     fixtures(db).await;
     let rings = activate(db, &rings()).await.unwrap();
     loop {
-        let page = step(db, &rings, 1).await.unwrap();
+        let page = step(db, &rings, 1, &trusted_seed_identities())
+            .await
+            .unwrap();
         if page.verifying {
             break;
         }
         assert!(!page.complete);
     }
-    let first = step(db, &rings, 1).await.unwrap();
+    let first = step(db, &rings, 1, &trusted_seed_identities())
+        .await
+        .unwrap();
     assert!(first.verifying && !first.complete);
     assert_eq!(first.verified, 1);
     // Prefix, size and kid remain valid; final verification must authenticate.
@@ -336,7 +382,7 @@ async fn verification_review_cases(db: &DatabaseConnection) {
     let mut failed = false;
     for _ in 0..100 {
         let before = progress(db).await.unwrap();
-        match step(db, &rings, 1).await {
+        match step(db, &rings, 1, &trusted_seed_identities()).await {
             Ok(page) => {
                 assert!(!page.complete);
                 assert!(page.verified - before.verified <= 1);
@@ -371,7 +417,7 @@ async fn orphan_review_case(db: &DatabaseConnection) {
     let rings = activate(db, &rings()).await.unwrap();
     let mut failed = false;
     for _ in 0..100 {
-        match step(db, &rings, 1).await {
+        match step(db, &rings, 1, &trusted_seed_identities()).await {
             Ok(p) => assert!(!p.complete),
             Err(Error::Integrity { .. }) => {
                 failed = true;
@@ -407,7 +453,11 @@ async fn legacy_seal_review_case(db: &DatabaseConnection) {
         .unwrap();
     assert!(ColumnEncryption::new([9; 32]).decrypt_legacy(&old).is_ok());
     let active = activate(db, &rings()).await.unwrap();
-    while !step(db, &active, 1).await.unwrap().complete {}
+    while !step(db, &active, 1, &trusted_seed_identities())
+        .await
+        .unwrap()
+        .complete
+    {}
     let networks = select_batch(db, COLUMNS[0], None, 10).await.unwrap();
     let backend = LocalOneOfOneBackend::new(active.seals.clone());
     for row in networks {
@@ -589,7 +639,7 @@ async fn null_review_case(db: &DatabaseConnection, seed: bool) {
     let active = activate(db, &rings()).await.unwrap();
     let mut failed = false;
     for _ in 0..100 {
-        match step(db, &active, 1).await {
+        match step(db, &active, 1, &trusted_seed_identities()).await {
             Ok(p) => assert!(!p.complete),
             Err(Error::Verify | Error::Integrity { .. }) => {
                 failed = true;
@@ -641,7 +691,11 @@ async fn valid_null_review_case(db: &DatabaseConnection) {
     let network = NetworkId::new(OWNER, "pending").unwrap().to_string();
     exec(db,"INSERT INTO encryption_network (network_id,owner_did,name,alg,key_version,public_key,state,threshold_n,threshold_t,key_backend,sealed_private_key,created_at,updated_at) VALUES (?,?,'pending','x25519-aes256gcm/v1',1,?,'pending',1,1,'local-one-of-one',NULL,'now','now')",vec![network.into(),OWNER.into(),Vec::<u8>::new().into()]).await;
     let active = activate(db, &rings()).await.unwrap();
-    while !step(db, &active, 1).await.unwrap().complete {}
+    while !step(db, &active, 1, &trusted_seed_identities())
+        .await
+        .unwrap()
+        .complete
+    {}
     assert!(progress(db).await.unwrap().verified > 0);
 }
 #[tokio::test]
@@ -660,11 +714,25 @@ async fn postgres_schema_valid_nulls_complete() {
 async fn verification_crash_and_alias_case(db: &DatabaseConnection) {
     fixtures(db).await;
     let active = activate(db, &rings()).await.unwrap();
-    while !step(db, &active, 1).await.unwrap().verifying {}
+    while !step(db, &active, 1, &trusted_seed_identities())
+        .await
+        .unwrap()
+        .verifying
+    {}
     // A failed verification page must not commit its cursor or checked count.
-    assert!(step_page(db, &active, 2, Some(1)).await.is_err());
+    assert!(
+        step_page(db, &active, 2, &trusted_seed_identities(), Some(1))
+            .await
+            .is_err()
+    );
     assert_eq!(progress(db).await.unwrap().verified, 0);
-    assert_eq!(step(db, &active, 1).await.unwrap().verified, 1);
+    assert_eq!(
+        step(db, &active, 1, &trusted_seed_identities())
+            .await
+            .unwrap()
+            .verified,
+        1
+    );
     // A subsequent write invalidates that verified prefix and restarts the pass.
     exec(
         db,
@@ -672,10 +740,16 @@ async fn verification_crash_and_alias_case(db: &DatabaseConnection) {
         vec![vec![0u8; 34].into()],
     )
     .await;
-    assert_eq!(step(db, &active, 1).await.unwrap().verified, 1);
+    assert_eq!(
+        step(db, &active, 1, &trusted_seed_identities())
+            .await
+            .unwrap()
+            .verified,
+        1
+    );
     let mut refused = false;
     for _ in 0..100 {
-        match step(db, &active, 1).await {
+        match step(db, &active, 1, &trusted_seed_identities()).await {
             Ok(p) => assert!(!p.complete),
             Err(Error::Verify) => {
                 refused = true;
@@ -713,7 +787,11 @@ async fn early_write_case(db: &DatabaseConnection) {
     assert!(db.execute(update()).await.is_err());
     let active = activate(db, &overlap).await.unwrap();
     assert!(db.execute(update()).await.is_ok());
-    while !step(db, &active, 1).await.unwrap().complete {}
+    while !step(db, &active, 1, &trusted_seed_identities())
+        .await
+        .unwrap()
+        .complete
+    {}
 }
 #[tokio::test]
 async fn sqlite_database_refuses_new_kid_before_fence() {
@@ -726,4 +804,251 @@ async fn postgres_database_refuses_new_kid_before_fence() {
         return;
     };
     early_write_case(&f.conn).await;
+}
+
+async fn serving_v1_refusal_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    let backend = LocalOneOfOneBackend::new(rings().seals);
+    let net = select_batch(db, COLUMNS[0], None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let Key::Text(id) = net.key else {
+        panic!("network key type");
+    };
+    assert!(backend
+        .open_network_secret(
+            net.blob.as_deref().unwrap(),
+            &id,
+            net.public_key.as_deref().unwrap()
+        )
+        .is_err());
+    let seed = select_batch(db, COLUMNS[1], None, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let Key::Pair(id, path) = seed.key else {
+        panic!("seed key type");
+    };
+    assert!(backend
+        .open_seed(seed.blob.as_deref().unwrap(), &id, &path)
+        .is_err());
+}
+#[tokio::test]
+async fn sqlite_serving_v1_refusal() {
+    serving_v1_refusal_case(&database().await).await;
+}
+#[tokio::test]
+async fn postgres_serving_v1_refusal() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("postgres_rekey_serving_v1").await
+    else {
+        return;
+    };
+    serving_v1_refusal_case(&f.conn).await;
+}
+async fn legacy_network_evidence_case(db: &DatabaseConnection, variant: &str) {
+    fixtures(db).await;
+    exec(db, "DELETE FROM encryption_ceremony", vec![]).await;
+    let network = NetworkId::new(OWNER, "alpha").unwrap().to_string();
+    let original = StaticSecret::from([31; 32]);
+    let expected =
+        crate::encryption_network::canonical::hash_hex(PublicKey::from(&original).as_bytes());
+    if variant != "missing" {
+        exec(db,"INSERT INTO encryption_ceremony (ceremony_id,network_id,kind,state,transcript_hash,started_at,completed_at) VALUES ('witness',?,'initial','completed',?,'now','now')",vec![network.clone().into(),expected.clone().into()]).await;
+    }
+    match variant {
+        "transplant" => {
+            let replacement = StaticSecret::from([32; 32]);
+            exec(db,"UPDATE encryption_network SET public_key=?,sealed_private_key=? WHERE network_id=?",vec![PublicKey::from(&replacement).as_bytes().to_vec().into(),ColumnEncryption::new([9;32]).encrypt_legacy(replacement.as_bytes()).into(),network.clone().into()]).await;
+        }
+        "multiple" | "conflicting" => {
+            let digest = if variant == "multiple" {
+                expected
+            } else {
+                "different".into()
+            };
+            exec(db,"INSERT INTO encryption_ceremony (ceremony_id,network_id,kind,state,transcript_hash,started_at,completed_at) VALUES ('duplicate',?,'initial','completed',?,'now','now')",vec![network.clone().into(),digest.into()]).await;
+        }
+        "incomplete" => {
+            exec(db,"UPDATE encryption_ceremony SET state='started',completed_at=NULL WHERE network_id=?",vec![network.clone().into()]).await;
+        }
+        "mismatch" => {
+            exec(
+                db,
+                "UPDATE encryption_ceremony SET transcript_hash='different' WHERE network_id=?",
+                vec![network.clone().into()],
+            )
+            .await;
+        }
+        _ => {}
+    }
+    let active = activate(db, &rings()).await.unwrap();
+    assert!(matches!(
+        step(db, &active, 1, &trusted_seed_identities()).await,
+        Err(Error::Integrity { .. })
+    ));
+    assert_eq!(progress(db).await.unwrap().rewritten, 0);
+    assert_eq!(census(db).await.unwrap()[0].legacy, 2);
+}
+#[tokio::test]
+async fn sqlite_legacy_network_evidence_rejects_transplant() {
+    legacy_network_evidence_case(&database().await, "transplant").await;
+}
+#[tokio::test]
+async fn postgres_legacy_network_evidence_rejects_transplant() {
+    let Some(f) =
+        crate::test_support::PostgresTestSchema::new("postgres_rekey_ceremony_transplant").await
+    else {
+        return;
+    };
+    legacy_network_evidence_case(&f.conn, "transplant").await;
+}
+async fn missing_legacy_seed_witness_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    let active = activate(db, &rings()).await.unwrap();
+    // Commit both network rewrites and advance to the seed page.
+    assert!(step(db, &active, 2, &TrustedSeedIdentities::new())
+        .await
+        .is_ok());
+    assert!(step(db, &active, 2, &TrustedSeedIdentities::new())
+        .await
+        .is_ok());
+    let checkpoint = progress(db).await.unwrap().rewritten;
+    assert!(matches!(
+        step(db, &active, 2, &TrustedSeedIdentities::new()).await,
+        Err(Error::Integrity { .. })
+    ));
+    assert_eq!(progress(db).await.unwrap().rewritten, checkpoint);
+    assert!(!progress(db).await.unwrap().complete);
+    assert_eq!(census(db).await.unwrap()[1].legacy, 4);
+}
+#[tokio::test]
+async fn sqlite_legacy_seed_requires_external_witness() {
+    missing_legacy_seed_witness_case(&database().await).await;
+}
+#[tokio::test]
+async fn postgres_legacy_seed_requires_external_witness() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("postgres_rekey_seed_witness").await
+    else {
+        return;
+    };
+    missing_legacy_seed_witness_case(&f.conn).await;
+}
+
+#[tokio::test]
+async fn sqlite_legacy_network_requires_unique_completed_ceremony() {
+    for variant in [
+        "missing",
+        "multiple",
+        "conflicting",
+        "incomplete",
+        "mismatch",
+    ] {
+        legacy_network_evidence_case(&database().await, variant).await;
+    }
+}
+#[tokio::test]
+async fn postgres_legacy_network_requires_unique_completed_ceremony() {
+    for variant in [
+        "missing",
+        "multiple",
+        "conflicting",
+        "incomplete",
+        "mismatch",
+    ] {
+        let Some(f) =
+            crate::test_support::PostgresTestSchema::new("postgres_rekey_ceremony_evidence").await
+        else {
+            return;
+        };
+        legacy_network_evidence_case(&f.conn, variant).await;
+    }
+}
+
+async fn supplied_seed_witness_case(db: &DatabaseConnection, variant: &str) {
+    fixtures(db).await;
+    let mut trusted = trusted_seed_identities();
+    let network = NetworkId::new(OWNER, "alpha").unwrap();
+    let path = "apps/app/a";
+    if variant == "mismatch" {
+        trusted.insert((network.to_string(), path.into(), 1), [0; 32]);
+    } else if variant == "transplant" {
+        let backend = LocalOneOfOneBackend::new(rings().seals);
+        let public = backend
+            .derive_named_public_key(
+                &StaticSecret::from([31; 32]),
+                &canonical_key_urn(&KeyLocation::new(&network, path).unwrap()),
+                Some(&KeySeed::from_bytes([44; 32])),
+            )
+            .unwrap();
+        exec(db,"UPDATE encryption_network_key SET public_key=?,sealed_seed=? WHERE network_id=? AND key_path=?",vec![public.into(),ColumnEncryption::new([9;32]).encrypt_legacy(&[44;32]).into(),network.to_string().into(),path.into()]).await;
+    }
+    let active = activate(db, &rings()).await.unwrap();
+    assert!(step(db, &active, 2, &trusted).await.is_ok());
+    assert!(step(db, &active, 2, &trusted).await.is_ok());
+    let checkpoint = progress(db).await.unwrap().rewritten;
+    if variant != "valid" {
+        let before = select_batch(db, COLUMNS[1], None, 1)
+            .await
+            .unwrap()
+            .remove(0)
+            .blob;
+        assert!(matches!(
+            step(db, &active, 1, &trusted).await,
+            Err(Error::Integrity { .. })
+        ));
+        assert!(
+            select_batch(db, COLUMNS[1], None, 1)
+                .await
+                .unwrap()
+                .remove(0)
+                .blob
+                == before
+        );
+        assert_eq!(progress(db).await.unwrap().rewritten, checkpoint);
+        assert!(!progress(db).await.unwrap().complete);
+        assert_eq!(census(db).await.unwrap()[1].legacy, 4);
+    } else {
+        while !step(db, &active, 1, &trusted).await.unwrap().complete {}
+        assert!(census(db)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.legacy == 0 && c.kids.keys().all(|kid| *kid == 2)));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_legacy_seed_trusted_external_witness_completes() {
+    supplied_seed_witness_case(&database().await, "valid").await;
+}
+
+#[tokio::test]
+async fn postgres_legacy_seed_trusted_external_witness_completes() {
+    let Some(f) =
+        crate::test_support::PostgresTestSchema::new("postgres_rekey_seed_valid_witness").await
+    else {
+        return;
+    };
+    supplied_seed_witness_case(&f.conn, "valid").await;
+}
+
+#[tokio::test]
+async fn sqlite_legacy_seed_external_witness_rejects_mismatch_and_transplant() {
+    for variant in ["mismatch", "transplant"] {
+        supplied_seed_witness_case(&database().await, variant).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_legacy_seed_external_witness_rejects_mismatch_and_transplant() {
+    for variant in ["mismatch", "transplant"] {
+        let Some(f) =
+            crate::test_support::PostgresTestSchema::new("postgres_rekey_seed_invalid_witness")
+                .await
+        else {
+            return;
+        };
+        supplied_seed_witness_case(&f.conn, variant).await;
+    }
 }

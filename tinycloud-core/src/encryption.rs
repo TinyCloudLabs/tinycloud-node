@@ -302,11 +302,22 @@ impl ColumnEncryption {
         data: &[u8],
         binding: RowBinding<'_>,
     ) -> Result<Vec<u8>, EncryptionError> {
-        let kid = match data.first().copied() {
-            Some(VERSION_LEGACY) => return self.decrypt_legacy(data),
-            Some(VERSION_KEYRING) => *data.get(1).ok_or(EncryptionError::TooShort)?,
-            _ => return Err(EncryptionError::UnsupportedVersion),
-        };
+        if data.first().copied() == Some(VERSION_LEGACY) {
+            return self.decrypt_legacy(data);
+        }
+        self.decrypt_v2(data, binding)
+    }
+
+    /// Decode only authenticated, row-bound v2 storage envelopes.
+    pub fn decrypt_v2(
+        &self,
+        data: &[u8],
+        binding: RowBinding<'_>,
+    ) -> Result<Vec<u8>, EncryptionError> {
+        if data.first().copied() != Some(VERSION_KEYRING) {
+            return Err(EncryptionError::UnsupportedVersion);
+        }
+        let kid = *data.get(1).ok_or(EncryptionError::TooShort)?;
         let aad = binding.aad(kid);
         self.open(data, kid, 2, &aad)
     }
