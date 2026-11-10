@@ -63,6 +63,8 @@ def read_sqlite(path):
 
 
 def read_postgres(url, schema):
+    if not url.startswith(("postgres://", "postgresql://")):
+        raise ValueError("only lowercase PostgreSQL URLs are accepted")
     parsed = urlsplit(url)
     host = parsed.hostname
     if (parsed.scheme not in ("postgres", "postgresql") or parsed.query or parsed.fragment

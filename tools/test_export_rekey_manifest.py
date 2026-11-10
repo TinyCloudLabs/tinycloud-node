@@ -9,6 +9,13 @@ spec.loader.exec_module(exporter)
 
 
 class ExportGuards(unittest.TestCase):
+    def test_postgres_scheme_must_be_lowercase_before_connecting(self):
+        for scheme in ("POSTGRES", "Postgres", "POSTGRESQL", "PostgreSQL"):
+            with self.subTest(scheme=scheme), mock.patch.object(exporter.subprocess, "run") as connect:
+                with self.assertRaises(ValueError):
+                    exporter.read_postgres(f"{scheme}://localhost:55478/restored", "public")
+                connect.assert_not_called()
+
     def test_multihost_and_ambiguous_ports_are_refused_before_connecting(self):
         for url in (
             "postgres://localhost:5432,db.prod.example:5432/restored",

@@ -45,6 +45,11 @@ Coverage also checks the reverse direction: every snapshot network must still
 exist at its pinned key version with the same public key and a stored seal.
 Deleting it, changing its version or clearing it to pending blocks migration
 before the writer fence.
+Every snapshot seed identity must also remain present at its pinned network,
+key path and key version with the same public key. Removing the row blocks
+coverage even if its parent network is intact. Existing deterministic or deleted
+key rows may retain their schema-valid NULL seed; their public identity is still
+checked.
 
 ## Canonical version 1 encoding
 
@@ -81,7 +86,7 @@ and, for a restored PostgreSQL snapshot, `psql`. Supply these explicit arguments
 
 | Argument | Meaning |
 | --- | --- |
-| `--restored-postgres-url` | Loopback-only restored PostgreSQL database; URL query options are refused. |
+| `--restored-postgres-url` | Loopback-only restored PostgreSQL database; lowercase `postgres://` or `postgresql://` prefix required; URL query options are refused. |
 | `--schema` | Restored schema, default `public`. |
 | `--sqlite-snapshot` | Alternative read-only SQLite image; must also be `--snapshot-file`. |
 | `--snapshot-file` | Actual checked backup archive whose bytes the exporter hashes. |

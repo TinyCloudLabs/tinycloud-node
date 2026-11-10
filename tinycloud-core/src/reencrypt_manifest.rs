@@ -189,6 +189,7 @@ pub async fn coverage<C: ConnectionTrait>(
     // clearing it to pending, or disappearing entirely. No extra DB scan or
     // unbounded transaction is needed: remove exact identities as pages arrive.
     let mut unseen_networks: BTreeSet<_> = proof.networks.keys().cloned().collect();
+    let mut unseen_seeds: BTreeSet<_> = proof.seeds.keys().cloned().collect();
     for (index, spec) in COLUMNS[..2].iter().enumerate() {
         let mut after = None;
         loop {
@@ -212,7 +213,10 @@ pub async fn coverage<C: ConnectionTrait>(
                             unseen_networks.remove(&(id.clone(), version));
                             proof.network(id, version)
                         }
-                        super::Key::Pair(id, path) => proof.seed(id, path, version),
+                        super::Key::Pair(id, path) => {
+                            unseen_seeds.remove(&(id.clone(), path.clone(), version));
+                            proof.seed(id, path, version)
+                        }
                         _ => return Err(Error::Verify),
                     };
                     match expected {
@@ -243,6 +247,7 @@ pub async fn coverage<C: ConnectionTrait>(
         }
     }
     counts.missing_networks += unseen_networks.len() as u64;
+    counts.missing_seeds += unseen_seeds.len() as u64;
     Ok(counts)
 }
 

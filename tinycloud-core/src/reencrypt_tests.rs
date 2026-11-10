@@ -1419,6 +1419,60 @@ async fn postgres_manifest_snapshot_missing_seal_blocks_before_fence() {
     manifest_snapshot_network_case(&f.conn, false).await;
 }
 
+async fn manifest_deleted_seed_case(db: &DatabaseConnection) {
+    fixtures(db).await;
+    let dir = manifest_test_dir();
+    let path = dir.path().join("manifest.json");
+    let bytes = serde_json::to_vec(&trusted_document()).unwrap();
+    let pin = crate::encryption_network::canonical::hash_hex(&bytes);
+    std::fs::write(&path, bytes).unwrap();
+    let network = NetworkId::new(OWNER, "beta").unwrap().to_string();
+    exec(
+        db,
+        "DELETE FROM encryption_network_key WHERE network_id=? AND key_path=?",
+        vec![network.into(), "apps/app/a".into()],
+    )
+    .await;
+    let counts = manifest::coverage(db, &trusted_seed_identities())
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.missing_seeds, 1,
+        "a removed snapshot seed identity must block coverage"
+    );
+    assert_eq!(counts.missing_networks, 0);
+    assert_eq!(counts.mismatched_networks, 0);
+    assert_eq!(counts.mismatched_seeds, 0);
+    assert!(
+        matches!(manifest::run_offline(db, &rings(), &path, &pin, 1).await, Err(Error::ManifestCoverage(c)) if c.missing_seeds == 1)
+    );
+    let row = db
+        .query_one(bound(
+            db.get_database_backend(),
+            "SELECT target,rewritten FROM storage_rekey WHERE id=1",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i32>("", "target").unwrap(), 0);
+    assert_eq!(row.try_get::<i64>("", "rewritten").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_manifest_deleted_seed_blocks_before_fence() {
+    manifest_deleted_seed_case(&database().await).await;
+}
+
+#[tokio::test]
+async fn postgres_manifest_deleted_seed_blocks_before_fence() {
+    let Some(f) = crate::test_support::PostgresTestSchema::new("manifest_deleted_seed").await
+    else {
+        return;
+    };
+    manifest_deleted_seed_case(&f.conn).await;
+}
+
 #[tokio::test]
 async fn postgres_manifest_runner_checks_proof_before_fencing_and_completes() {
     let Some(f) = crate::test_support::PostgresTestSchema::new("postgres_manifest_runner").await
