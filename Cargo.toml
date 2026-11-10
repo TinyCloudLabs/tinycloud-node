@@ -115,3 +115,6 @@ publish-jobs = ["homebrew"]
 cargo-dist-version = "0.32.0"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
