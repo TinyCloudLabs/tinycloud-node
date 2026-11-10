@@ -216,6 +216,13 @@ impl ColumnEncryption {
         self.keys.v2.contains_key(&kid)
     }
 
+    /// Internal capability check; reports generations without exposing material.
+    pub(crate) fn has_exact_read_generations(&self, kids: &[u8], legacy: bool) -> bool {
+        self.keys.v2.len() == kids.len()
+            && kids.iter().all(|kid| self.has_key(*kid))
+            && (self.keys.legacy_v1.is_some() || self.keys.v2.contains_key(&0)) == legacy
+    }
+
     /// Select a different writer while retaining every read key and read policy.
     pub fn for_kid(&self, kid: u8) -> Result<Self, EncryptionError> {
         if !self.has_key(kid) {

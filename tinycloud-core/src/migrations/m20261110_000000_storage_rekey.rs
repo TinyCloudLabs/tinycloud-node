@@ -4,11 +4,12 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.get_connection().execute_unprepared("CREATE TABLE storage_rekey (id INTEGER PRIMARY KEY, target INTEGER NOT NULL, column_index INTEGER NOT NULL, cursor TEXT NULL, rewritten BIGINT NOT NULL, complete BOOLEAN NOT NULL)").await?;
+        manager.get_connection().execute_unprepared("CREATE TABLE storage_rekey (id INTEGER PRIMARY KEY, target INTEGER NOT NULL, column_index INTEGER NOT NULL, cursor TEXT NULL, rewritten BIGINT NOT NULL, complete BOOLEAN NOT NULL, phase INTEGER NOT NULL DEFAULT 0, verified BIGINT NOT NULL DEFAULT 0, revision BIGINT NOT NULL DEFAULT 0, verify_revision BIGINT NOT NULL DEFAULT 0)").await?;
         manager
             .get_connection()
-            .execute_unprepared("INSERT INTO storage_rekey VALUES (1,0,0,NULL,0,FALSE)")
+            .execute_unprepared("INSERT INTO storage_rekey (id,target,column_index,cursor,rewritten,complete) VALUES (1,0,0,NULL,0,FALSE)")
             .await?;
+        crate::reencrypt::pre_activation_guards(manager.get_connection(), true).await?;
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -25,6 +26,7 @@ impl MigrationTrait for Migration {
                 "activated storage rekey fencing cannot be downgraded".into(),
             ));
         }
+        crate::reencrypt::pre_activation_guards(db, false).await?;
         db.execute_unprepared("DROP TABLE storage_rekey").await?;
         Ok(())
     }

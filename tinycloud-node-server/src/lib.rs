@@ -829,7 +829,8 @@ pub async fn app_with_control(
     // private key into DStack-derived key management.
     let encryption_seal =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/encryption/network-seal"));
-    let encryption_backend = std::sync::Arc::new(LocalOneOfOneBackend::new(encryption_seal));
+    let encryption_backend =
+        std::sync::Arc::new(LocalOneOfOneBackend::new(encryption_seal.clone()));
     let node_keypair = key_setup.node_keypair();
     let encryption_service = EncryptionService::new_with_node_keypair(
         database_connection.clone(),
@@ -853,11 +854,15 @@ pub async fn app_with_control(
         Either::B(local) => Either::B(local.open().await?),
     };
     let orphan_store = block_store.clone();
-    let tinycloud = TinyCloud::new_with_encryption(
+    let tinycloud = TinyCloud::new_with_storage_rings(
         database_connection,
         block_store,
         key_setup.setup(()).await?,
-        Some(column_encryption),
+        tinycloud_core::reencrypt::Rings {
+            columns: column_encryption,
+            webhooks: webhook_encryption.clone(),
+            seals: encryption_seal,
+        },
     )
     .await?
     .with_sql_sizes(sql_sizes.clone())

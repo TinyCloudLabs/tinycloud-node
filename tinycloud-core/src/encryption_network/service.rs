@@ -432,7 +432,7 @@ impl EncryptionService {
         .insert(&self.db)
         .await?;
 
-        let generated = self.backend.generate()?;
+        let generated = self.backend.generate(&network_id.to_string())?;
         let transcript = hash_hex(&generated.public_key);
 
         let model = encryption_network::ActiveModel {
@@ -934,6 +934,7 @@ impl EncryptionService {
         };
         let symmetric = Zeroizing::new(self.backend.unwrap(
             sealed_private_key,
+            &network_row.public_key,
             &wrapped_key_bytes,
             &context,
         )?);
@@ -1155,7 +1156,12 @@ impl EncryptionService {
                         ))?;
                 let symmetric = self
                     .backend
-                    .unwrap(sealed_private_key, &wrapped_key_bytes, &context)
+                    .unwrap(
+                        sealed_private_key,
+                        &descriptor.public_encryption_key,
+                        &wrapped_key_bytes,
+                        &context,
+                    )
                     .map_err(|err| {
                         if matches!(
                             err,

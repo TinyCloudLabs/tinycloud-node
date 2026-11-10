@@ -340,11 +340,12 @@ pub fn open_wrapped_key(
 pub trait KeyBackend: Send + Sync {
     fn kind(&self) -> super::types::KeyBackendKind;
 
-    fn generate(&self) -> Result<GeneratedKey, KeyBackendError>;
+    fn generate(&self, network_id: &str) -> Result<GeneratedKey, KeyBackendError>;
 
     fn unwrap(
         &self,
         sealed_private_key: &[u8],
+        expected_public_key: &[u8],
         wrapped_key: &[u8],
         context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError>;
@@ -362,6 +363,8 @@ pub trait KeyBackend: Send + Sync {
     fn open_network_secret(
         &self,
         sealed_private_key: &[u8],
+        network_id: &str,
+        expected_public_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError>;
 
     /// Public key of the named key at `canonical_urn` under `network_secret`.
@@ -387,12 +390,21 @@ pub trait KeyBackend: Send + Sync {
 
     /// A fresh 32-byte seed from the OS CSPRNG, with its sealed form for
     /// storage.
-    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError>;
+    fn generate_seed(
+        &self,
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<(KeySeed, Vec<u8>), KeyBackendError>;
 
     /// Opens a sealed seed. Only the strict unseal is used: input that is not
     /// a versioned sealed value, or that does not hold exactly 32 bytes, is
     /// refused.
-    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError>;
+    fn open_seed(
+        &self,
+        sealed_seed: &[u8],
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<KeySeed, KeyBackendError>;
 }
 
 fn valid_v1_ephemeral_prefix(public: &[u8]) -> bool {
@@ -519,13 +531,6 @@ fn named_key_secret(
 /// Local one-of-one backend. The DB encryption key is reused to seal the
 /// network private key at rest — the same protection used elsewhere for
 /// sensitive DB columns.
-// Seals predate row-aware backend APIs. These stable purpose bindings allow
-// sealed values to be opened by every existing backend call without row IDs.
-pub const NETWORK_SEAL_BINDING: crate::encryption::RowBinding<'static> =
-    crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &[]);
-pub const SEED_SEAL_BINDING: crate::encryption::RowBinding<'static> =
-    crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &[]);
-
 pub struct LocalOneOfOneBackend {
     seal: ColumnEncryption,
 }
@@ -544,11 +549,13 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn open_network_secret(
         &self,
         sealed_private_key: &[u8],
+        network_id: &str,
+        expected_public_key: &[u8],
     ) -> Result<StaticSecret, KeyBackendError> {
-        let opened = Zeroizing::new(
-            self.seal
-                .decrypt(sealed_private_key, NETWORK_SEAL_BINDING)?,
-        );
+        let pk = [network_id.as_bytes()];
+        let binding =
+            crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &pk);
+        let opened = Zeroizing::new(self.seal.decrypt(sealed_private_key, binding)?);
         if opened.len() != 32 {
             return Err(KeyBackendError::InvalidSealedKey);
         }
@@ -556,13 +563,20 @@ impl KeyBackend for LocalOneOfOneBackend {
         arr.copy_from_slice(&opened);
         let secret = StaticSecret::from(arr);
         arr.zeroize();
+        if PublicKey::from(&secret).as_bytes().as_slice() != expected_public_key {
+            return Err(KeyBackendError::InvalidSealedKey);
+        }
         Ok(secret)
     }
 
-    fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
+    fn generate(&self, network_id: &str) -> Result<GeneratedKey, KeyBackendError> {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
-        let sealed = self.seal.encrypt(secret.as_bytes(), NETWORK_SEAL_BINDING);
+        let pk = [network_id.as_bytes()];
+        let sealed = self.seal.encrypt(
+            secret.as_bytes(),
+            crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &pk),
+        );
         Ok(GeneratedKey {
             public_key: public.as_bytes().to_vec(),
             sealed_private_key: sealed,
@@ -573,11 +587,12 @@ impl KeyBackend for LocalOneOfOneBackend {
     fn unwrap(
         &self,
         sealed_private_key: &[u8],
+        expected_public_key: &[u8],
         wrapped_key: &[u8],
         context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError> {
         let secret = self
-            .open_network_secret(sealed_private_key)
+            .open_network_secret(sealed_private_key, context.network_id, expected_public_key)
             .map_err(|_| KeyBackendError::SealedKeyUnreadable)?;
         open_wrapped_key(&secret, wrapped_key, context)
     }
@@ -604,15 +619,32 @@ impl KeyBackend for LocalOneOfOneBackend {
         open_wrapped_key(&secret, wrapped_key, context)
     }
 
-    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+    fn generate_seed(
+        &self,
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
         let mut bytes = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(bytes.as_mut_slice());
-        let sealed = self.seal.encrypt(bytes.as_slice(), SEED_SEAL_BINDING);
+        let pk = [network_id.as_bytes(), key_path.as_bytes()];
+        let sealed = self.seal.encrypt(
+            bytes.as_slice(),
+            crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &pk),
+        );
         Ok((KeySeed::from_bytes(*bytes), sealed))
     }
 
-    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
-        let opened = Zeroizing::new(self.seal.decrypt(sealed_seed, SEED_SEAL_BINDING)?);
+    fn open_seed(
+        &self,
+        sealed_seed: &[u8],
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<KeySeed, KeyBackendError> {
+        let pk = [network_id.as_bytes(), key_path.as_bytes()];
+        let opened = Zeroizing::new(self.seal.decrypt(
+            sealed_seed,
+            crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &pk),
+        )?);
         let bytes: [u8; 32] = opened
             .as_slice()
             .try_into()
@@ -634,6 +666,7 @@ impl KeyBackend for LocalOneOfOneBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const NETWORK: &str = "urn:tinycloud:encryption:did:key:z6Mk:default";
 
     fn seal_key() -> ColumnEncryption {
         ColumnEncryption::new([7u8; 32])
@@ -642,7 +675,7 @@ mod tests {
     fn legacy_context() -> KeyWrapContext<'static> {
         KeyWrapContext {
             purpose: KeyWrapPurpose::NetworkKey,
-            network_id: "",
+            network_id: NETWORK,
             key_path: "",
             key_version: 1,
             metadata: None,
@@ -678,15 +711,21 @@ mod tests {
     #[test]
     fn network_secrets_require_sealed_storage_and_new_seals_are_versioned() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        assert!(backend.open_network_secret(&[7u8; 32]).is_err());
-        let generated = backend.generate().unwrap();
+        assert!(backend
+            .open_network_secret(&[7u8; 32], NETWORK, &[0; 32])
+            .is_err());
+        let generated = backend.generate(NETWORK).unwrap();
         assert_eq!(generated.sealed_private_key[0], 0x02);
         assert!(backend
-            .open_network_secret(&generated.sealed_private_key)
+            .open_network_secret(
+                &generated.sealed_private_key,
+                NETWORK,
+                &generated.public_key
+            )
             .is_ok());
-        let (_, seed) = backend.generate_seed().unwrap();
+        let (_, seed) = backend.generate_seed(NETWORK, "seed-path").unwrap();
         assert_eq!(seed[0], 0x02);
-        assert!(backend.open_seed(&seed).is_ok());
+        assert!(backend.open_seed(&seed, NETWORK, "seed-path").is_ok());
     }
 
     #[test]
@@ -1010,11 +1049,16 @@ mod tests {
     #[test]
     fn generate_and_unwrap_round_trip() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let gk = backend.generate().unwrap();
+        let gk = backend.generate(NETWORK).unwrap();
         let symmetric = [0xABu8; 32];
         let wrapped = wrap_to_public_key(&gk.public_key, &symmetric).unwrap();
         let recovered = backend
-            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .unwrap(
+                &gk.sealed_private_key,
+                &gk.public_key,
+                &wrapped,
+                &legacy_context(),
+            )
             .unwrap();
         assert_eq!(recovered, symmetric);
     }
@@ -1022,11 +1066,17 @@ mod tests {
     #[test]
     fn network_key_opening_requires_an_authenticated_seal() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        assert!(backend.open_network_secret(&[0x42; 32]).is_err());
-        let generated = backend.generate().unwrap();
+        assert!(backend
+            .open_network_secret(&[0x42; 32], NETWORK, &[0; 32])
+            .is_err());
+        let generated = backend.generate(NETWORK).unwrap();
         assert_eq!(generated.sealed_private_key[0], 2);
         assert!(backend
-            .open_network_secret(&generated.sealed_private_key)
+            .open_network_secret(
+                &generated.sealed_private_key,
+                NETWORK,
+                &generated.public_key
+            )
             .is_ok());
     }
 
@@ -1052,12 +1102,12 @@ mod tests {
     #[test]
     fn unwrap_fails_when_sealed_key_corrupted() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let gk = backend.generate().unwrap();
+        let gk = backend.generate(NETWORK).unwrap();
         let wrapped = wrap_to_public_key(&gk.public_key, &[1u8; 32]).unwrap();
         let mut corrupted = gk.sealed_private_key.clone();
         corrupted[5] ^= 0xFF;
         assert!(backend
-            .unwrap(&corrupted, &wrapped, &legacy_context())
+            .unwrap(&corrupted, &gk.public_key, &wrapped, &legacy_context())
             .is_err());
     }
 
@@ -1219,8 +1269,10 @@ mod tests {
     #[test]
     fn named_key_round_trip_and_isolation() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let gk = backend.generate().unwrap();
-        let network = backend.open_network_secret(&gk.sealed_private_key).unwrap();
+        let gk = backend.generate(NETWORK).unwrap();
+        let network = backend
+            .open_network_secret(&gk.sealed_private_key, NETWORK, &gk.public_key)
+            .unwrap();
         let named_pub = backend
             .derive_named_public_key(&network, KAT_URN_NOTES, None)
             .unwrap();
@@ -1235,18 +1287,27 @@ mod tests {
             .unwrap_named(&network, KAT_URN_A, None, &wrapped, &legacy_context())
             .is_err());
         assert!(backend
-            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .unwrap(
+                &gk.sealed_private_key,
+                &gk.public_key,
+                &wrapped,
+                &legacy_context()
+            )
             .is_err());
     }
 
     #[test]
     fn seeded_key_round_trip_and_isolation() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let gk = backend.generate().unwrap();
-        let network = backend.open_network_secret(&gk.sealed_private_key).unwrap();
-        let (seed, sealed_seed) = backend.generate_seed().unwrap();
-        let (other_seed, _) = backend.generate_seed().unwrap();
-        let opened = backend.open_seed(&sealed_seed).unwrap();
+        let gk = backend.generate(NETWORK).unwrap();
+        let network = backend
+            .open_network_secret(&gk.sealed_private_key, NETWORK, &gk.public_key)
+            .unwrap();
+        let (seed, sealed_seed) = backend.generate_seed(NETWORK, "seed-path").unwrap();
+        let (other_seed, _) = backend.generate_seed(NETWORK, "seed-path").unwrap();
+        let opened = backend
+            .open_seed(&sealed_seed, NETWORK, "seed-path")
+            .unwrap();
 
         let public = backend
             .derive_named_public_key(&network, KAT_URN_NOTES, Some(&seed))
@@ -1288,7 +1349,12 @@ mod tests {
             )
             .is_err());
         assert!(backend
-            .unwrap(&gk.sealed_private_key, &wrapped, &legacy_context())
+            .unwrap(
+                &gk.sealed_private_key,
+                &gk.public_key,
+                &wrapped,
+                &legacy_context()
+            )
             .is_err());
         // The same URN with and without a seed names different keys.
         assert_ne!(
@@ -1302,13 +1368,16 @@ mod tests {
     #[test]
     fn generated_seeds_differ_and_open_to_the_stored_bytes() {
         let backend = LocalOneOfOneBackend::new(seal_key());
-        let (first, first_sealed) = backend.generate_seed().unwrap();
-        let (second, second_sealed) = backend.generate_seed().unwrap();
+        let (first, first_sealed) = backend.generate_seed(NETWORK, "seed-path").unwrap();
+        let (second, second_sealed) = backend.generate_seed(NETWORK, "seed-path").unwrap();
         assert_ne!(first.as_bytes(), second.as_bytes());
         assert_ne!(first_sealed, second_sealed);
         assert_ne!(first.as_bytes(), &[0u8; 32]);
         assert_eq!(
-            backend.open_seed(&first_sealed).unwrap().as_bytes(),
+            backend
+                .open_seed(&first_sealed, NETWORK, "seed-path")
+                .unwrap()
+                .as_bytes(),
             first.as_bytes()
         );
     }
@@ -1326,7 +1395,7 @@ mod tests {
             vec![0x01; 10],
         ] {
             assert!(
-                backend.open_seed(&refused).is_err(),
+                backend.open_seed(&refused, NETWORK, "seed-path").is_err(),
                 "opened {} bytes",
                 refused.len()
             );
@@ -1334,14 +1403,14 @@ mod tests {
         // A sealed value that is not 32 bytes is refused.
         let short = ColumnEncryption::new([7u8; 32]).encrypt_legacy(&[1u8; 16]);
         assert!(matches!(
-            backend.open_seed(&short),
+            backend.open_seed(&short, NETWORK, "seed-path"),
             Err(KeyBackendError::InvalidSealedKey)
         ));
         // A seed sealed under another key does not open.
         let (_, other) = LocalOneOfOneBackend::new(ColumnEncryption::new([8u8; 32]))
-            .generate_seed()
+            .generate_seed(NETWORK, "seed-path")
             .unwrap();
-        assert!(backend.open_seed(&other).is_err());
+        assert!(backend.open_seed(&other, NETWORK, "seed-path").is_err());
     }
 
     #[test]
@@ -1422,5 +1491,38 @@ mod tests {
             err,
             KeyBackendError::Encryption(EncryptionError::Decrypt(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod seal_binding_regression_tests {
+    use super::*;
+    #[test]
+    fn legacy_seals_require_expected_public_and_v2_never_falls_back_to_empty_pk() {
+        let ring = ColumnEncryption::new([7; 32]);
+        let backend = LocalOneOfOneBackend::new(ring.clone());
+        let secret = StaticSecret::from([42; 32]);
+        let public = PublicKey::from(&secret);
+        let legacy = ring.encrypt_legacy(secret.as_bytes());
+        assert!(backend
+            .open_network_secret(&legacy, "network-a", public.as_bytes())
+            .is_ok());
+        assert!(backend
+            .open_network_secret(&legacy, "network-a", &[0; 32])
+            .is_err());
+        let empty = ring.encrypt(
+            secret.as_bytes(),
+            crate::encryption::RowBinding::new("encryption_network", "sealed_private_key", &[]),
+        );
+        assert!(backend
+            .open_network_secret(&empty, "network-a", public.as_bytes())
+            .is_err());
+        let empty_seed = ring.encrypt(
+            &[43; 32],
+            crate::encryption::RowBinding::new("encryption_network_key", "sealed_seed", &[]),
+        );
+        assert!(backend
+            .open_seed(&empty_seed, "network-a", "path-a")
+            .is_err());
     }
 }

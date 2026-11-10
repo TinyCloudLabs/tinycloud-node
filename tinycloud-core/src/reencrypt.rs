@@ -134,11 +134,7 @@ impl Column {
         }
     }
     fn binding<'a>(&self, pk: &'a [&'a [u8]]) -> RowBinding<'a> {
-        match self.identity {
-            Identity::Network => crate::encryption_network::backend::NETWORK_SEAL_BINDING,
-            Identity::Seed => crate::encryption_network::backend::SEED_SEAL_BINDING,
-            _ => RowBinding::new(self.table, self.column, pk),
-        }
+        RowBinding::new(self.table, self.column, pk)
     }
 }
 
@@ -171,6 +167,10 @@ struct Row {
     network_public: Option<Vec<u8>>,
     enforcement_cid: Option<String>,
     format: i16,
+    state: Option<String>,
+    kind: Option<String>,
+    backend: Option<String>,
+    key_version: Option<i64>,
 }
 
 // Only static SQL and fixed identifiers from COLUMNS reach this helper. Values
@@ -225,8 +225,8 @@ async fn select_batch<C: ConnectionTrait>(
         .map(|f| format!(", t.{f} AS format"))
         .unwrap_or_else(|| ", CAST(0 AS SMALLINT) AS format".into());
     let extra = match spec.identity {
-        Identity::Network => ", t.public_key AS expected_public",
-        Identity::Seed => ", t.public_key AS expected_public, n.sealed_private_key AS network_blob, n.public_key AS network_public",
+        Identity::Network => ", t.public_key AS expected_public, t.state AS state, t.key_backend AS backend, t.key_version AS key_version",
+        Identity::Seed => ", t.public_key AS expected_public, n.sealed_private_key AS network_blob, n.public_key AS network_public, t.state AS state, t.kind AS kind, t.key_version AS key_version",
         Identity::Enforcement => ", t.enforcement_delegation_cid AS expected_cid",
         _ => "",
     };
@@ -272,6 +272,27 @@ async fn select_batch<C: ConnectionTrait>(
         .map(|row| {
             Ok(Row {
                 format: row.try_get("", "format")?,
+                state: if matches!(spec.identity, Identity::Network | Identity::Seed) {
+                    Some(row.try_get("", "state")?)
+                } else {
+                    None
+                },
+                kind: if matches!(spec.identity, Identity::Seed) {
+                    Some(row.try_get("", "kind")?)
+                } else {
+                    None
+                },
+                backend: if matches!(spec.identity, Identity::Network) {
+                    Some(row.try_get("", "backend")?)
+                } else {
+                    None
+                },
+                key_version: if matches!(spec.identity, Identity::Network | Identity::Seed) {
+                    Some(row.try_get("", "key_version")?)
+                } else {
+                    None
+                },
+
                 key: key_from_row(row, spec)?,
                 blob: row.try_get("", "blob")?,
                 public_key: if matches!(spec.identity, Identity::Network | Identity::Seed) {
@@ -316,6 +337,81 @@ fn matches_raw_cid(expected: &str, bytes: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+// NULL is accepted only for a lifecycle state that intentionally holds no
+// sealed material. Required seals, invalid metadata and orphan key rows abort.
+fn validate_shape(spec: Column, row: &Row, seal: &ColumnEncryption) -> Result<(), Error> {
+    use crate::encryption_network::{key_id::KeyKind, types::NetworkState};
+    match spec.identity {
+        Identity::Network => {
+            let Key::Text(id) = &row.key else {
+                return Err(Error::Verify);
+            };
+            id.parse::<NetworkId>().map_err(|_| Error::Verify)?;
+            let state = NetworkState::parse(row.state.as_deref().ok_or(Error::Verify)?)
+                .ok_or(Error::Verify)?;
+            if row.backend.as_deref() != Some("local-one-of-one")
+                || row.key_version.is_none_or(|v| v < 1)
+            {
+                return Err(Error::Verify);
+            }
+            if row.blob.is_none() {
+                if !matches!(
+                    state,
+                    NetworkState::Pending | NetworkState::Generating | NetworkState::Failed
+                ) || row.public_key.as_deref() != Some(&[])
+                {
+                    return Err(Error::Verify);
+                }
+            } else if row.public_key.as_ref().is_none_or(|p| p.len() != 32) {
+                return Err(Error::Verify);
+            }
+        }
+        Identity::Seed => {
+            let Key::Pair(network, path) = &row.key else {
+                return Err(Error::Verify);
+            };
+            let network_id: NetworkId = network.parse().map_err(|_| Error::Verify)?;
+            let location = KeyLocation::new(&network_id, path).map_err(|_| Error::Verify)?;
+            let kind =
+                KeyKind::parse(row.kind.as_deref().ok_or(Error::Verify)?).ok_or(Error::Verify)?;
+            if kind != KeyKind::for_path(path)
+                || !matches!(row.state.as_deref(), Some("active" | "blocked" | "deleted"))
+                || row.key_version.is_none_or(|v| v < 1)
+                || row.public_key.as_ref().is_none_or(|p| p.len() != 32)
+            {
+                return Err(Error::Verify);
+            }
+            let backend = LocalOneOfOneBackend::new(seal.clone());
+            let secret = backend
+                .open_network_secret(
+                    row.network_blob.as_deref().ok_or(Error::Integrity {
+                        table: spec.table,
+                        column: spec.column,
+                    })?,
+                    network,
+                    row.network_public.as_deref().ok_or(Error::Verify)?,
+                )
+                .map_err(|_| Error::Verify)?;
+            match (kind, row.state.as_deref(), row.blob.is_some()) {
+                (KeyKind::Deterministic, _, false) => {
+                    let public = backend
+                        .derive_named_public_key(&secret, &canonical_key_urn(&location), None)
+                        .map_err(|_| Error::Verify)?;
+                    if Some(public.as_slice()) != row.public_key.as_deref() {
+                        return Err(Error::Verify);
+                    }
+                }
+                (KeyKind::Deletable, Some("deleted"), false) => {}
+                (KeyKind::Deletable, Some("active" | "blocked"), true) => {}
+                _ => return Err(Error::Verify),
+            }
+        }
+        _ if row.blob.is_none() => return Err(Error::Verify),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn identity(
@@ -379,13 +475,15 @@ fn identity(
         }
         Identity::Seed => {
             let bytes = Zeroizing::new(<[u8; 32]>::try_from(plaintext).map_err(|_| mismatch())?);
-            let Some(network_blob) = &row.network_blob else {
-                return Ok(false);
+            let network_blob = row.network_blob.as_ref().ok_or_else(mismatch)?;
+            let Key::Pair(network, path) = &row.key else {
+                return Err(mismatch());
             };
+            let pk = [network.as_bytes()];
             let network_bytes = Zeroizing::new(
                 seal.decrypt(
                     network_blob,
-                    crate::encryption_network::backend::NETWORK_SEAL_BINDING,
+                    RowBinding::new("encryption_network", "sealed_private_key", &pk),
                 )
                 .map_err(|_| mismatch())?,
             );
@@ -397,9 +495,6 @@ fn identity(
             {
                 return Err(mismatch());
             }
-            let Key::Pair(network, path) = &row.key else {
-                return Err(mismatch());
-            };
             let network: NetworkId = network.parse().map_err(|_| mismatch())?;
             let location = KeyLocation::new(&network, path).map_err(|_| mismatch())?;
             let backend = LocalOneOfOneBackend::new(seal.clone());
@@ -435,14 +530,49 @@ impl Rings {
             return Err(Error::Fence);
         }
         let make = |legacy, purpose| {
-            ColumnEncryption::for_roots(2, [(1, *old_root), (2, *new_root)], legacy, purpose)
-                .map_err(|_| Error::Fence)
+            ColumnEncryption::for_roots(
+                if matches!(purpose, EncryptionPurpose::NetworkSeals) {
+                    0
+                } else {
+                    1
+                },
+                if matches!(purpose, EncryptionPurpose::NetworkSeals) {
+                    vec![(2, *new_root)]
+                } else {
+                    vec![(1, *old_root), (2, *new_root)]
+                },
+                legacy,
+                purpose,
+            )
+            .map_err(|_| Error::Fence)
         };
         Ok(Self {
             columns: make(*legacy_columns, EncryptionPurpose::Columns)?,
             webhooks: make(*legacy_columns, EncryptionPurpose::Webhooks)?,
             seals: make(*legacy_seal, EncryptionPurpose::NetworkSeals)?,
         })
+    }
+    fn select_writer(&self, kid: u8) -> Result<Self, Error> {
+        Ok(Self {
+            columns: self.columns.for_kid(kid).map_err(|_| Error::Fence)?,
+            webhooks: self.webhooks.for_kid(kid).map_err(|_| Error::Fence)?,
+            seals: self.seals.for_kid(kid).map_err(|_| Error::Fence)?,
+        })
+    }
+    fn overlap_readers(&self) -> bool {
+        self.columns.has_exact_read_generations(&[1, 2], true)
+            && self.webhooks.has_exact_read_generations(&[1, 2], true)
+            && self.seals.has_exact_read_generations(&[0, 2], true)
+    }
+    fn overlap(&self) -> Result<(), Error> {
+        if self.columns.write_kid() != 1
+            || self.webhooks.write_kid() != 1
+            || self.seals.write_kid() != 0
+            || !self.overlap_readers()
+        {
+            return Err(Error::Fence);
+        }
+        Ok(())
     }
     fn kid(&self) -> Result<u8, Error> {
         let kid = self.columns.write_kid();
@@ -502,26 +632,36 @@ pub async fn census<C: ConnectionTrait>(db: &C) -> Result<Vec<Count>, Error> {
 #[derive(Debug)]
 pub struct Progress {
     pub rewritten: i64,
+    pub verified: i64,
+    pub verifying: bool,
     pub complete: bool,
 }
 pub async fn progress<C: ConnectionTrait>(db: &C) -> Result<Progress, Error> {
     let row = db
         .query_one(Statement::from_string(
             db.get_database_backend(),
-            "SELECT rewritten, complete FROM storage_rekey WHERE id=1",
+            "SELECT rewritten, verified, phase, complete FROM storage_rekey WHERE id=1",
         ))
         .await?
         .ok_or(Error::Checkpoint)?;
     Ok(Progress {
         rewritten: row.try_get("", "rewritten")?,
+        verified: row.try_get("", "verified")?,
+        verifying: row.try_get::<i32>("", "phase")? == 1,
         complete: row.try_get("", "complete")?,
     })
 }
-/// Reject stale/keyless boot after activation; triggers also fence live writers.
+
+/// Validate all serving rings against one locked database generation snapshot.
+/// The caller holds its boot write transaction through alias validation.
 pub async fn check_writer<C: ConnectionTrait>(
     db: &C,
-    ring: Option<&ColumnEncryption>,
+    columns: Option<&ColumnEncryption>,
+    webhooks: Option<&ColumnEncryption>,
+    seals: Option<&ColumnEncryption>,
 ) -> Result<(), Error> {
+    db.execute_unprepared("UPDATE storage_rekey SET target=target WHERE id=1")
+        .await?;
     let row = db
         .query_one(Statement::from_string(
             db.get_database_backend(),
@@ -530,9 +670,44 @@ pub async fn check_writer<C: ConnectionTrait>(
         .await?
         .ok_or(Error::Checkpoint)?;
     let target: i32 = row.try_get("", "target")?;
-    if target != 0 && ring.map(|r| i32::from(r.write_kid())) != Some(target) {
+    let options = [columns, webhooks, seals];
+    if target == 0 {
+        if columns.is_some_and(|r| r.write_kid() > 1)
+            || webhooks.is_some_and(|r| r.write_kid() > 1)
+            || seals.is_some_and(|r| r.write_kid() != 0)
+        {
+            return Err(Error::Fence);
+        }
+        if options.into_iter().flatten().any(|r| r.has_key(2)) {
+            let rings = Rings {
+                columns: columns.ok_or(Error::Fence)?.clone(),
+                webhooks: webhooks.ok_or(Error::Fence)?.clone(),
+                seals: seals.ok_or(Error::Fence)?.clone(),
+            };
+            rings.overlap()?;
+        } else if webhooks.is_some() || seals.is_some() {
+            // Normal serving, before any next ROOT is injected.
+            if columns.is_none_or(|r| !r.has_exact_read_generations(&[1], true))
+                || webhooks.is_none_or(|r| !r.has_exact_read_generations(&[1], true))
+                || seals.is_none_or(|r| !r.has_exact_read_generations(&[0], true))
+            {
+                return Err(Error::Fence);
+            }
+        }
+    } else if target == 2 {
+        let rings = Rings {
+            columns: columns.ok_or(Error::Fence)?.clone(),
+            webhooks: webhooks.ok_or(Error::Fence)?.clone(),
+            seals: seals.ok_or(Error::Fence)?.clone(),
+        };
+        rings.kid()?;
+        if !rings.overlap_readers() {
+            return Err(Error::Fence);
+        }
+    } else {
         return Err(Error::Fence);
     }
+
     Ok(())
 }
 
@@ -544,14 +719,50 @@ fn filter(spec: Column) -> String {
         .join(" AND ")
 }
 
+/// Migration-owned guards keep generation 2 read-only until activation commits.
+pub(crate) async fn pre_activation_guards<C: ConnectionTrait>(
+    db: &C,
+    install: bool,
+) -> Result<(), DbErr> {
+    let backend = db.get_database_backend();
+    if !matches!(backend, DbBackend::Sqlite | DbBackend::Postgres) {
+        return Ok(());
+    }
+    for (i, spec) in COLUMNS.iter().enumerate() {
+        let column = spec.column;
+        let table = spec.table;
+        let name = format!("storage_rekey_overlap_{i}");
+        if backend == DbBackend::Sqlite {
+            for event in ["INSERT", "UPDATE"] {
+                if install {
+                    db.execute_unprepared(&format!("CREATE TRIGGER {name}_{event} BEFORE {event} ON {table} WHEN NEW.{column} IS NOT NULL AND substr(NEW.{column},1,2)=X'0202' AND (SELECT target FROM storage_rekey WHERE id=1)=0 BEGIN SELECT RAISE(ABORT,'storage generation fence'); END")).await?;
+                } else {
+                    db.execute_unprepared(&format!("DROP TRIGGER {name}_{event}"))
+                        .await?;
+                }
+            }
+        } else if install {
+            db.execute_unprepared(&format!("CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.{column} IS NOT NULL AND substring(NEW.{column} from 1 for 2)=decode('0202','hex') AND (SELECT target FROM storage_rekey WHERE id=1)=0 THEN RAISE EXCEPTION 'storage generation fence'; END IF; RETURN NEW; END $$")).await?;
+            db.execute_unprepared(&format!("CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION {name}()")).await?;
+        } else {
+            db.execute_unprepared(&format!("DROP TRIGGER {name} ON {table}"))
+                .await?;
+            db.execute_unprepared(&format!("DROP FUNCTION {name}()"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Atomically install a permanent database write fence and initialize progress.
-/// All serving instances must already hold both roots before calling this API.
+/// All serving instances first install overlap readers with old writers.
+/// Only after the fence commits does this return rings selecting the new writer.
 /// Stale writers fail at the database boundary, including inserts behind cursors.
 pub async fn activate<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     rings: &Rings,
-) -> Result<(), Error> {
-    let kid = rings.kid()?;
+) -> Result<Rings, Error> {
+    let kid = 2u8;
     let tx = db.begin().await?;
     // A write obtains SQLite's writer reservation; PostgreSQL locks this singleton.
     tx.execute_unprepared("UPDATE storage_rekey SET target=target WHERE id=1")
@@ -565,12 +776,16 @@ pub async fn activate<C: ConnectionTrait + TransactionTrait>(
         .ok_or(Error::Checkpoint)?;
     let target: i32 = state.try_get("", "target")?;
     if target == i32::from(kid) {
+        if !rings.overlap_readers() || (rings.overlap().is_err() && rings.kid().is_err()) {
+            return Err(Error::Fence);
+        }
         tx.commit().await?;
-        return Ok(());
+        return rings.select_writer(kid);
     }
     if target != 0 {
         return Err(Error::Fence);
     }
+    rings.overlap()?;
     let backend = tx.get_database_backend();
     if !matches!(backend, DbBackend::Sqlite | DbBackend::Postgres) {
         return Err(Error::Fence);
@@ -613,6 +828,20 @@ pub async fn activate<C: ConnectionTrait + TransactionTrait>(
             tx.execute_unprepared(&format!("CREATE TRIGGER storage_rekey_{i} BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION storage_rekey_{i}()")).await?;
         }
     }
+    // Any data mutation invalidates a paged verification snapshot. These updates
+    // use the same singleton lock as each job page and boot validation.
+    let mut tables = std::collections::BTreeSet::from(["delegation_cid_alias"]);
+    tables.extend(COLUMNS.iter().map(|s| s.table));
+    for (i, table) in tables.into_iter().enumerate() {
+        if backend == DbBackend::Sqlite {
+            for event in ["INSERT", "UPDATE", "DELETE"] {
+                tx.execute_unprepared(&format!("CREATE TRIGGER storage_rekey_revision_{i}_{event} AFTER {event} ON {table} BEGIN UPDATE storage_rekey SET revision=revision+1, complete=FALSE WHERE id=1; END")).await?;
+            }
+        } else {
+            tx.execute_unprepared(&format!("CREATE FUNCTION storage_rekey_revision_{i}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE storage_rekey SET revision=revision+1, complete=FALSE WHERE id=1; RETURN NULL; END $$")).await?;
+            tx.execute_unprepared(&format!("CREATE TRIGGER storage_rekey_revision_{i} AFTER INSERT OR UPDATE OR DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION storage_rekey_revision_{i}()")).await?;
+        }
+    }
     tx.execute(bound(
         backend,
         "UPDATE storage_rekey SET target=? WHERE id=1",
@@ -620,6 +849,42 @@ pub async fn activate<C: ConnectionTrait + TransactionTrait>(
     ))
     .await?;
     tx.commit().await?;
+    rings.select_writer(kid)
+}
+
+// Alias hashes are verified alongside the signed delegation that defines them.
+async fn check_alias<C: ConnectionTrait>(
+    db: &C,
+    spec: Column,
+    row: &Row,
+    plain: &[u8],
+    create: bool,
+) -> Result<(), Error> {
+    if spec.table != "delegation" {
+        return Ok(());
+    }
+    let canonical: Vec<u8> = crate::models::delegation_cid_alias::canonical_hash(plain)
+        .map_err(|_| Error::Verify)?
+        .into();
+    let Key::Bytes(id) = &row.key else {
+        return Err(Error::Verify);
+    };
+    if create {
+        db.execute(bound(db.get_database_backend(),"INSERT INTO delegation_cid_alias (id,canonical,encrypted) VALUES (?,?,TRUE) ON CONFLICT (id) DO NOTHING",vec![id.clone().into(),canonical.clone().into()])).await?;
+    }
+    let alias = db
+        .query_one(bound(
+            db.get_database_backend(),
+            "SELECT canonical,encrypted FROM delegation_cid_alias WHERE id=?",
+            vec![id.clone().into()],
+        ))
+        .await?
+        .ok_or(Error::Verify)?;
+    if alias.try_get::<Vec<u8>>("", "canonical")? != canonical
+        || (!create && !alias.try_get::<bool>("", "encrypted")?)
+    {
+        return Err(Error::Verify);
+    }
     Ok(())
 }
 
@@ -654,47 +919,52 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
     tx.execute_unprepared("UPDATE storage_rekey SET target=target WHERE id=1")
         .await?;
     let backend = tx.get_database_backend();
-    let state = tx
-        .query_one(Statement::from_string(
-            backend,
-            "SELECT target, column_index, cursor, rewritten FROM storage_rekey WHERE id=1",
-        ))
-        .await?
-        .ok_or(Error::Checkpoint)?;
+    let state=tx.query_one(Statement::from_string(backend,"SELECT target,column_index,cursor,phase,verified,revision,verify_revision FROM storage_rekey WHERE id=1")).await?.ok_or(Error::Checkpoint)?;
     if state.try_get::<i32>("", "target")? != i32::from(kid) {
         return Err(Error::Fence);
     }
-    let index = state.try_get::<i32>("", "column_index")? as usize;
-    let cursor: Option<String> = state.try_get("", "cursor")?;
+    let mut index = state.try_get::<i32>("", "column_index")? as usize;
+    let mut cursor: Option<String> = state.try_get("", "cursor")?;
+    let phase = state.try_get::<i32>("", "phase")?;
+    let verifying = phase == 1;
+    if !matches!(phase, 0 | 1) || index > COLUMNS.len() {
+        return Err(Error::Checkpoint);
+    }
+    let revision: i64 = state.try_get("", "revision")?;
+    let snapshot: i64 = state.try_get("", "verify_revision")?;
+    let mut verified = state.try_get::<i64>("", "verified")?;
+    if verifying && revision != snapshot {
+        // A serving write during verification requires a new complete pass.
+        index = 0;
+        cursor = None;
+        verified = 0;
+        tx.execute_unprepared("UPDATE storage_rekey SET column_index=0,cursor=NULL,verified=0,verify_revision=revision,complete=FALSE WHERE id=1").await?;
+    }
+    if index == COLUMNS.len() {
+        if verifying {
+            tx.execute_unprepared("UPDATE storage_rekey SET complete=TRUE WHERE id=1")
+                .await?;
+        } else {
+            tx.execute_unprepared("UPDATE storage_rekey SET phase=1,column_index=0,cursor=NULL,verified=0,verify_revision=revision WHERE id=1").await?;
+        }
+        let report = progress(&tx).await?;
+        tx.commit().await?;
+        return Ok(report);
+    }
     let after: Option<Key> = cursor
         .map(|v| serde_json::from_str(&v).map_err(|_| Error::Checkpoint))
         .transpose()?;
-    let rewritten: i64 = state.try_get("", "rewritten")?;
-    if index >= COLUMNS.len() {
-        // Fence prevents new old-kid rows; verify every value, even already-target
-        // rows, before declaring completion. Reset to a fresh pass for idempotence.
-        let remaining = census(&tx).await?;
-        if remaining
-            .iter()
-            .any(|c| c.legacy > 0 || c.plaintext > 0 || c.kids.keys().any(|k| *k != kid))
-        {
-            return Err(Error::Verify);
-        }
-        tx.execute_unprepared("UPDATE storage_rekey SET complete=TRUE WHERE id=1")
-            .await?;
-        tx.commit().await?;
-        return Ok(Progress {
-            rewritten,
-            complete: true,
-        });
-    }
     let spec = COLUMNS[index];
     let rows = select_batch(&tx, spec, after.as_ref(), batch).await?;
     let mut done = 0i64;
     let mut last = None;
     for row in &rows {
         last = Some(row.key.encoded()?);
+        validate_shape(spec, row, &rings.seals)?;
         let Some(old) = &row.blob else {
+            if verifying {
+                verified += 1;
+            }
             continue;
         };
         let keybytes: Vec<Vec<u8>> = match &row.key {
@@ -714,6 +984,19 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
             .map_err(|_| Error::Verify)?,
         );
         identity(spec, row, &plain, &rings.seals)?;
+        if verifying {
+            if old.get(..2) != Some(&[2, kid]) || (spec.format().is_some() && row.format != 2) {
+                return Err(Error::Verify);
+            }
+            check_alias(&tx, spec, row, &plain, false).await?;
+            verified += 1;
+            #[cfg(test)]
+            if abort_after == Some(verified - state.try_get::<i64>("", "verified")?) {
+                return Err(Error::Verify);
+            }
+            continue;
+        }
+        check_alias(&tx, spec, row, &plain, true).await?;
         if old.get(..2) == Some(&[2, kid]) && (spec.format().is_none() || row.format == 2) {
             continue;
         }
@@ -785,12 +1068,10 @@ async fn step_page<C: ConnectionTrait + TransactionTrait>(
         }
     }
     let next = if rows.is_empty() { index + 1 } else { index };
-    tx.execute(bound(backend,"UPDATE storage_rekey SET column_index=?, cursor=?, rewritten=rewritten+?, complete=FALSE WHERE id=1",vec![(next as i32).into(),last.into(),done.into()])).await?;
+    tx.execute(bound(backend,"UPDATE storage_rekey SET column_index=?,cursor=?,rewritten=rewritten+?,verified=?,complete=FALSE WHERE id=1",vec![(next as i32).into(),last.into(),done.into(),verified.into()])).await?;
+    let report = progress(&tx).await?;
     tx.commit().await?;
-    Ok(Progress {
-        rewritten: rewritten + done,
-        complete: false,
-    })
+    Ok(report)
 }
 
 #[cfg(test)]

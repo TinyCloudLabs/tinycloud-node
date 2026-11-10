@@ -1738,7 +1738,9 @@ async fn app_key_is_deletable_seeded_and_differs_from_the_deterministic_derivati
     let sealed = row.sealed_seed.expect("a deletable key stores a seed");
     assert_eq!(sealed[0], 0x02, "sealed with the storage keyring");
     let backend = LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32]));
-    assert!(backend.open_seed(&sealed).is_ok());
+    assert!(backend
+        .open_seed(&sealed, &network_id().to_string(), "apps/foo/x")
+        .is_ok());
 
     // The same URN derived without the seed is a different key.
     let network_row =
@@ -1748,7 +1750,11 @@ async fn app_key_is_deletable_seeded_and_differs_from_the_deterministic_derivati
             .unwrap()
             .unwrap();
     let network_secret = backend
-        .open_network_secret(network_row.sealed_private_key.as_deref().unwrap())
+        .open_network_secret(
+            network_row.sealed_private_key.as_deref().unwrap(),
+            &network_row.network_id,
+            &network_row.public_key,
+        )
         .unwrap();
     let unseeded = backend
         .derive_named_public_key(&network_secret, &canonical_key_urn(&loc), None)
@@ -2709,4 +2715,40 @@ async fn native_decrypt_checks_wrap_context_and_outer_algorithm() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn serving_derivation_refuses_mismatched_network_public_key() {
+    let (db, svc) = service_with_network().await;
+    use crate::models::encryption_network;
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(network_id().to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.public_key = Set(vec![0u8; 32]);
+    row.update(&db).await.unwrap();
+    let loc = KeyLocation::new(&network_id(), "docs/row-binding").unwrap();
+    assert!(svc.public_key(&loc).await.is_err());
+    assert!(svc.create_key(&loc, false).await.is_err());
+}
+
+#[tokio::test]
+async fn serving_named_unwrap_refuses_seed_transplant() {
+    let (db, svc) = service_with_network().await;
+    let first = KeyLocation::new(&network_id(), "apps/app/first").unwrap();
+    let second = KeyLocation::new(&network_id(), "apps/app/second").unwrap();
+    let created = svc.create_key(&first, true).await.unwrap();
+    svc.create_key(&second, true).await.unwrap();
+    let seed = key_row(&db, first.path()).await.sealed_seed;
+    let mut target: encryption_network_key::ActiveModel = key_row(&db, second.path()).await.into();
+    target.sealed_seed = Set(seed);
+    target.update(&db).await.unwrap();
+    let wrapped = wrap_to_public_key(&created.public_encryption_key, &[42; 32]).unwrap();
+    assert!(matches!(
+        svc.unwrap_named_key(&second, &wrapped, 1).await,
+        Err(EncryptionServiceError::CorruptKeyRow)
+    ));
 }
