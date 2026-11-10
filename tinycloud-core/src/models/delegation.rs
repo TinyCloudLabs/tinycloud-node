@@ -29,6 +29,7 @@ pub struct Model {
     pub not_before: Option<OffsetDateTime>,
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
+    pub serialization_format: i16,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -1072,7 +1073,15 @@ async fn save<C: ConnectionTrait>(
     let hash: Hash = crate::hash::hash(&serialization);
 
     // Encrypt for storage if encryption is configured
-    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
+    let stored_serialization = crate::encryption::maybe_encrypt(
+        encryption,
+        &serialization,
+        crate::encryption::RowBinding::new(
+            "delegation",
+            "serialization",
+            &[&Vec::<u8>::from(hash)],
+        ),
+    );
 
     // Persist the signed-in `delegationMode` marker. We store ONLY the
     // marker we recognize natively (not the full UCAN facts), keeping the
@@ -1109,6 +1118,7 @@ async fn save<C: ConnectionTrait>(
         not_before: delegation.not_before,
         facts,
         serialization: stored_serialization,
+        serialization_format: if encryption.is_some() { 2 } else { 0 },
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
     if db.get_database_backend() == DbBackend::Postgres {
@@ -1279,6 +1289,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -1316,6 +1327,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(ser_a.clone()),
+            serialization_format: Set(0),
         };
 
         // First insert → row is new.
@@ -1408,6 +1420,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(ser),
+                serialization_format: Set(0),
             })
             .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
             .exec(&db)
@@ -2088,6 +2101,7 @@ mod tests {
                 serde_json::json!("terminal"),
             )])))),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await

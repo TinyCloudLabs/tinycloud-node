@@ -93,6 +93,11 @@ cors = true
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
 
+[global.column_encryption]
+    ## Require encrypted values on recorded column reads. Off preserves legacy plaintext.
+    ## Env: TINYCLOUD_COLUMN_ENCRYPTION__STRICT
+    strict = false
+
 [global.encryption_network]
     ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
     ## GET /info. Only while on are the key routes mounted, key and key-prefix

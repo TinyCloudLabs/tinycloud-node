@@ -1101,6 +1101,7 @@ async fn grant_owner_to_device(
         not_before: Set(None),
         facts: Set(None),
         serialization: Set(label.as_bytes().to_vec()),
+        serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
     }
     .insert(&fixture.conn)
     .await?;
@@ -1499,7 +1500,7 @@ impl DecryptCase {
             "response ephemeral key is non-contributory"
         );
         ColumnEncryption::new(*shared.as_bytes())
-            .decrypt_strict(sealed)
+            .decrypt_legacy(sealed)
             .expect("response opens with the receiver secret")
     }
 }

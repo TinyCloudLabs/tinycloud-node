@@ -33,6 +33,7 @@ pub struct Model {
     pub issued_at: OffsetDateTime,
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
+    pub serialization_format: i16,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -759,7 +760,15 @@ async fn save<C: ConnectionTrait>(
     let invoker = invocation.invoker.clone();
 
     // Encrypt for storage if encryption is configured
-    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
+    let stored_serialization = crate::encryption::maybe_encrypt(
+        encryption,
+        &serialization,
+        crate::encryption::RowBinding::new(
+            "invocation",
+            "serialization",
+            &[&Vec::<u8>::from(hash)],
+        ),
+    );
 
     // Ensure the invoker actor exists before inserting the invocation
     match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
@@ -783,6 +792,7 @@ async fn save<C: ConnectionTrait>(
         id: hash,
         issued_at,
         serialization: stored_serialization,
+        serialization_format: if encryption.is_some() { 2 } else { 0 },
         facts: None,
         invoker,
     }))
@@ -1516,6 +1526,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -1696,6 +1707,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db)
         .await
@@ -2114,6 +2126,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -2281,6 +2294,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -2368,6 +2382,7 @@ mod tests {
                 )],
             )))),
             serialization: Set(parent.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db)
         .await

@@ -299,6 +299,23 @@ pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
 pub type BlockStage = Either<TempFileSystemStage, MemoryStaging>;
 
+/// Builds the serving storage rings, retaining the prior key for legacy reads.
+pub fn storage_keyrings(
+    key_setup: &StaticSecret,
+    config: &config::ColumnEncryptionConfig,
+) -> (ColumnEncryption, ColumnEncryption) {
+    use tinycloud_core::encryption::EncryptionPurpose;
+
+    let root = key_setup.derive_key(b"tinycloud/column-encryption/root");
+    let legacy_key = key_setup.derive_key(b"tinycloud/hooks/webhook-secrets");
+    (
+        ColumnEncryption::for_purpose(root, legacy_key, EncryptionPurpose::Columns)
+            .with_strict(config.strict),
+        ColumnEncryption::for_purpose(root, legacy_key, EncryptionPurpose::Webhooks)
+            .with_strict(config.strict),
+    )
+}
+
 impl From<BlockStorage> for BlockConfig {
     fn from(c: BlockStorage) -> BlockConfig {
         match c {
@@ -745,8 +762,8 @@ pub async fn app_with_control(
     // TC-359: publish the derived public halves so an operator can read the
     // invitation key a dstack-keyed node actually signs with.
     let node_public_keys = NodePublicKeys::derive(&key_setup);
-    let webhook_encryption =
-        ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
+    let (column_encryption, webhook_encryption) =
+        storage_keyrings(&key_setup, &tinycloud_config.column_encryption);
     let hook_runtime = HookRuntime::new(
         tinycloud_config.hooks.clone(),
         key_setup.derive_key(hooks::HOOK_TICKET_KEY_CONTEXT),
@@ -838,7 +855,7 @@ pub async fn app_with_control(
         database_connection,
         block_store,
         key_setup.setup(()).await?,
-        Some(webhook_encryption.clone()),
+        Some(column_encryption),
     )
     .await?
     .with_sql_sizes(sql_sizes.clone())
@@ -1891,6 +1908,7 @@ mod sqlite_tuning_tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"synthetic database race fixture".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&transaction)
         .await

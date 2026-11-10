@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tinycloud_core::ColumnEncryption;
+use tinycloud_core::{encryption::RowBinding, ColumnEncryption};
 
 type WebhookMac = Hmac<Sha256>;
 
@@ -127,7 +127,15 @@ impl WebhookDispatcher {
             return Ok(());
         }
 
-        let secret = match self.encryption.decrypt(&delivery.encrypted_secret) {
+        let secret = match self.encryption.decrypt_recorded(
+            &delivery.encrypted_secret,
+            RowBinding::new(
+                "hook_subscription",
+                "encrypted_secret",
+                &[delivery.subscription_id.as_bytes()],
+            ),
+            delivery.encrypted_secret_format,
+        ) {
             Ok(secret) => secret,
             Err(error) => {
                 self.record_terminal_failure(
@@ -399,6 +407,7 @@ mod tests {
     ) -> Result<()> {
         hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
             hook_subscription::Model {
+                encrypted_secret_format: 2,
                 id: subscription_id.to_string(),
                 subscriber_did: subscriber_did.to_string(),
                 space_id: SPACE_ID.to_string(),
@@ -408,7 +417,14 @@ mod tests {
                     serde_json::to_string(&vec!["tinycloud.kv/put".to_string()]).unwrap(),
                 ),
                 callback_url: callback_url.to_string(),
-                encrypted_secret: encryption.encrypt(b"hook-secret"),
+                encrypted_secret: encryption.encrypt(
+                    b"hook-secret",
+                    RowBinding::new(
+                        "hook_subscription",
+                        "encrypted_secret",
+                        &[subscription_id.as_bytes()],
+                    ),
+                ),
                 secret_key_id: PRIMARY_SECRET_KEY_ID.to_string(),
                 active: true,
                 created_at: "2026-04-09T00:00:00Z".to_string(),
@@ -543,6 +559,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatcher_preserves_legacy_secret_reads() -> Result<()> {
+        let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
+        let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
+        let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+        let mut subscription = hook_subscription::Entity::find_by_id("sub_01")
+            .one(&db)
+            .await?
+            .unwrap()
+            .into_active_model();
+        subscription.encrypted_secret =
+            ActiveValue::Set(encryption.encrypt_legacy(b"legacy-secret"));
+        subscription.encrypted_secret_format = ActiveValue::Set(0);
+        subscription.update(&db).await?;
+        WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig::default(),
+            encryption,
+            EgressPolicy::test_loopback(),
+        )?
+        .dispatch_due_once()
+        .await?;
+        let (body, signature, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await?
+            .expect("legacy callback request");
+        assert_eq!(signature, sign_payload(b"legacy-secret", body.as_bytes())?);
+        let row = hook_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            row.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_requires_v2_for_recorded_v2_secret() -> Result<()> {
+        let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
+        let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
+        let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+        let mut subscription = hook_subscription::Entity::find_by_id("sub_01")
+            .one(&db)
+            .await?
+            .unwrap()
+            .into_active_model();
+        subscription.encrypted_secret = ActiveValue::Set(b"unsealed-secret".to_vec());
+        subscription.update(&db).await?;
+        WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig::default(),
+            encryption,
+            EgressPolicy::test_loopback(),
+        )?
+        .dispatch_due_once()
+        .await?;
+        let row = hook_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            row.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+        );
+        assert!(receiver.try_recv().is_err(), "no callback was sent");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retries_then_dead_letters_failed_delivery() -> Result<()> {
         let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
         let (callback_url, _receiver) =
@@ -607,7 +692,19 @@ mod tests {
         Migrator::up(&db, Some(before_deactivation)).await?;
         let encryption = ColumnEncryption::new([9u8; 32]);
         let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
-        let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+        // This fixture predates the recorded-format columns.
+        use tinycloud_core::sea_orm::{ConnectionTrait, Statement};
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO hook_subscription (id,subscriber_did,space_id,target_service,callback_url,encrypted_secret,secret_key_id,active,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                "sub_01".into(), OWNER_DID.into(), SPACE_ID.into(), "kv".into(),
+                callback_url.clone().into(), encryption.encrypt_legacy(b"hook-secret").into(),
+                PRIMARY_SECRET_KEY_ID.into(), true.into(), "2026-04-09T00:00:00Z".into(),
+            ],
+        )).await?;
+        let delivery_id = "delivery_01".to_string();
+        insert_delivery(&db, "sub_01", &delivery_id, 0).await?;
 
         // Booting the upgraded node applies the remaining migration.
         let tempdir = TempDir::new()?;
@@ -1056,6 +1153,7 @@ mod tests {
                 not_before: ActiveValue::Set(None),
                 facts: ActiveValue::Set(None),
                 serialization: ActiveValue::Set(vec![]),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(db)
             .await

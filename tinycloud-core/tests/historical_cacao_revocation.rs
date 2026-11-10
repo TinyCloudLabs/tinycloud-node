@@ -59,12 +59,12 @@ fn copy_database(fixture: &Fixture) -> (tempfile::TempDir, PathBuf) {
     (directory, path)
 }
 
-// Snapshot only immutable signed records and edges; new alias/migration rows
-// and ordinary new invocation events are deliberately outside this snapshot.
+// Snapshot immutable signed-record fields and edges, independently of additive
+// storage metadata. New alias/migration rows and invocation events are excluded.
 fn signed_snapshot(path: &Path) -> Vec<Vec<Vec<SqlValue>>> {
     let db = rusqlite::Connection::open(path).unwrap();
     [
-        "SELECT * FROM delegation ORDER BY id",
+        "SELECT id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization FROM delegation ORDER BY id",
         "SELECT * FROM parent_delegation WHERE child IN (SELECT id FROM delegation) OR child IN (SELECT id FROM revocation) ORDER BY child, parent",
         "SELECT * FROM revocation ORDER BY id",
     ].into_iter().map(|sql| {
@@ -105,13 +105,29 @@ async fn assert_signed_rows_untouched(db: &TestDb, fixture: &Fixture) {
             .await
             .unwrap()
             .unwrap();
-        let root_bytes =
-            tinycloud_core::encryption::maybe_decrypt(encryption.as_ref(), &root.serialization)
-                .unwrap();
+        let root_bytes = tinycloud_core::encryption::maybe_decrypt(
+            encryption.as_ref(),
+            &root.serialization,
+            tinycloud_core::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(root.id)],
+            ),
+            root.serialization_format,
+        )
+        .unwrap();
         assert_eq!(root_bytes, URL_SAFE.decode(&row.header).unwrap());
-        let child_bytes =
-            tinycloud_core::encryption::maybe_decrypt(encryption.as_ref(), &child.serialization)
-                .unwrap();
+        let child_bytes = tinycloud_core::encryption::maybe_decrypt(
+            encryption.as_ref(),
+            &child.serialization,
+            tinycloud_core::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(child.id)],
+            ),
+            child.serialization_format,
+        )
+        .unwrap();
         assert_eq!(child_bytes, row.child_header.as_bytes());
         let parents = parent_delegations::Entity::find()
             .filter(parent_delegations::Column::Child.eq(child.id))

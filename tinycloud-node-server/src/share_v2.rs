@@ -35,7 +35,7 @@ use tinycloud_auth::{
     share_email_evidence::{normalized_email_hash, verify_detached_ed25519},
 };
 use tinycloud_core::{
-    encryption::{maybe_decrypt, ColumnEncryption},
+    encryption::{maybe_decrypt, ColumnEncryption, RowBinding},
     encryption_network::NetworkId,
     hash::Hash,
     keys::StaticSecret,
@@ -271,9 +271,17 @@ impl ShareV2Runtime {
 
     fn encryption_probe(&self) -> bool {
         let plaintext = b"tinycloud-share-v2-readiness";
-        let encrypted = self.policy_encryption.encrypt(plaintext);
-        maybe_decrypt(Some(&self.policy_encryption), &encrypted)
-            .is_ok_and(|decrypted| decrypted == plaintext)
+        let encrypted = self.policy_encryption.encrypt(
+            plaintext,
+            RowBinding::new("owner_share_policy", "policy_bytes", &[b"readiness-probe"]),
+        );
+        maybe_decrypt(
+            Some(&self.policy_encryption),
+            &encrypted,
+            RowBinding::new("owner_share_policy", "policy_bytes", &[b"readiness-probe"]),
+            2,
+        )
+        .is_ok_and(|decrypted| decrypted == plaintext)
     }
 
     pub fn capability(&self) -> Option<CapabilityDescriptor> {
@@ -395,6 +403,7 @@ pub async fn compose(
     tee_context: Option<TeeContext>,
     tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
+    policy_encryption: ColumnEncryption,
 ) -> anyhow::Result<ShareV2Runtime> {
     let conn = conn.into();
     verify_configured_invitation_key(&config, key_setup)?;
@@ -467,9 +476,7 @@ pub async fn compose(
     let runtime = ShareV2Runtime {
         conn,
         tinycloud,
-        policy_encryption: ColumnEncryption::new(
-            key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"),
-        ),
+        policy_encryption,
         signer: Arc::new(signer),
         enforcer_signer: Arc::new(enforcer_signer),
         signer_did: receipt_signer_did,
@@ -928,8 +935,24 @@ pub async fn register_policy(
         registration_cid: Set(registration.registration_cid.clone()),
         owner_delegation_cid: Set(request.owner_delegation.cid.clone()),
         enforcement_delegation_cid: Set(request.enforcement_delegation.cid.clone()),
-        policy_bytes: Set(runtime.policy_encryption.encrypt(&policy_bytes)),
-        enforcement_delegation_bytes: Set(runtime.policy_encryption.encrypt(&enforcement_record)),
+        policy_bytes: Set(runtime.policy_encryption.encrypt(
+            &policy_bytes,
+            RowBinding::new(
+                "owner_share_policy",
+                "policy_bytes",
+                &[request.policy.cid.as_bytes()],
+            ),
+        )),
+        enforcement_delegation_bytes: Set(runtime.policy_encryption.encrypt(
+            &enforcement_record,
+            RowBinding::new(
+                "owner_share_policy",
+                "enforcement_delegation_bytes",
+                &[request.policy.cid.as_bytes()],
+            ),
+        )),
+        policy_bytes_format: Set(2),
+        enforcement_delegation_bytes_format: Set(2),
         policy_proof: Set(request.policy.proof.clone()),
         policy_digest: Set(b64_digest(&policy_bytes)),
         matcher_digest: Set(b64_digest(&jcs::canonicalize(&matcher))),
@@ -1266,8 +1289,17 @@ async fn verify_owner_delegation(
         .await
         .map_err(|_| ())?
         .ok_or(())?;
-    let stored =
-        maybe_decrypt(Some(&runtime.policy_encryption), &row.serialization).map_err(|_| ())?;
+    let stored = maybe_decrypt(
+        Some(&runtime.policy_encryption),
+        &row.serialization,
+        RowBinding::new(
+            "delegation",
+            "serialization",
+            &[Vec::<u8>::from(row.id).as_slice()],
+        ),
+        row.serialization_format,
+    )
+    .map_err(|_| ())?;
     if stored != bytes {
         return Err(());
     }
@@ -1835,8 +1867,17 @@ async fn registered_policy(
     if row.revoked_at.is_some() || row.policy_cid == row.registration_cid {
         return Err(());
     }
-    let bytes =
-        maybe_decrypt(Some(&runtime.policy_encryption), &row.policy_bytes).map_err(|_| ())?;
+    let bytes = maybe_decrypt(
+        Some(&runtime.policy_encryption),
+        &row.policy_bytes,
+        RowBinding::new(
+            "owner_share_policy",
+            "policy_bytes",
+            &[row.policy_cid.as_bytes()],
+        ),
+        row.policy_bytes_format,
+    )
+    .map_err(|_| ())?;
     if raw_sha256_cid(&bytes) != row.policy_cid
         || b64_digest(&bytes) != row.policy_digest
         || row.policy_proof.is_empty()
@@ -1982,8 +2023,17 @@ async fn verify_registered_ancestors(
         .await
         .map_err(|_| ())?
         .ok_or(())?;
-    let bytes =
-        maybe_decrypt(Some(&runtime.policy_encryption), &row.serialization).map_err(|_| ())?;
+    let bytes = maybe_decrypt(
+        Some(&runtime.policy_encryption),
+        &row.serialization,
+        RowBinding::new(
+            "delegation",
+            "serialization",
+            &[Vec::<u8>::from(row.id).as_slice()],
+        ),
+        row.serialization_format,
+    )
+    .map_err(|_| ())?;
     let owner = OwnerDelegationInput {
         cid: registered.row.owner_delegation_cid.clone(),
         dag_cbor: encode_config(bytes, URL_SAFE_NO_PAD),
@@ -1995,6 +2045,12 @@ async fn verify_registered_ancestors(
         let stored = maybe_decrypt(
             Some(&runtime.policy_encryption),
             &registered.row.enforcement_delegation_bytes,
+            RowBinding::new(
+                "owner_share_policy",
+                "enforcement_delegation_bytes",
+                &[registered.row.policy_cid.as_bytes()],
+            ),
+            registered.row.enforcement_delegation_bytes_format,
         )
         .map_err(|_| ())?;
         serde_json::from_slice(&stored).map_err(|_| ())?
@@ -4033,6 +4089,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&db)
             .await
@@ -4276,6 +4333,7 @@ mod tests {
             tee_context,
             tee_key_derived,
             Arc::new(tinycloud),
+            crate::storage_keyrings(key_setup, &crate::config::ColumnEncryptionConfig::default()).0,
         )
         .await
         .expect("share v2 runtime composes")
@@ -4375,6 +4433,11 @@ mod tests {
             Some(TeeContext::derive_local(&key_setup)),
             true,
             Arc::new(tinycloud),
+            crate::storage_keyrings(
+                &key_setup,
+                &crate::config::ColumnEncryptionConfig::default(),
+            )
+            .0,
         )
         .await;
 
@@ -4471,6 +4534,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(delegation_id.as_ref().to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&conn)
         .await
@@ -4567,6 +4631,11 @@ mod tests {
             Some(tee_context),
             true,
             Arc::new(tinycloud),
+            crate::storage_keyrings(
+                &key_setup,
+                &crate::config::ColumnEncryptionConfig::default(),
+            )
+            .0,
         )
         .await
         .expect("share v2 runtime composes against a populated database");
@@ -4685,6 +4754,11 @@ mod tests {
             Some(tee_context),
             true,
             Arc::new(tinycloud.clone()),
+            crate::storage_keyrings(
+                &key_setup,
+                &crate::config::ColumnEncryptionConfig::default(),
+            )
+            .0,
         )
         .await
         .expect("share v2 runtime composes without the legacy v1 authority material");
@@ -4698,10 +4772,21 @@ mod tests {
         // Ordinary non-TEE production startup shape (no dstack, no
         // local-tee-derived context) must stay fail-closed even with the
         // exact same v2-only config.
-        let production_runtime =
-            compose(conn, &key_setup, config, None, false, Arc::new(tinycloud))
-                .await
-                .expect("share v2 runtime composes even without a TEE context");
+        let production_runtime = compose(
+            conn,
+            &key_setup,
+            config,
+            None,
+            false,
+            Arc::new(tinycloud),
+            crate::storage_keyrings(
+                &key_setup,
+                &crate::config::ColumnEncryptionConfig::default(),
+            )
+            .0,
+        )
+        .await
+        .expect("share v2 runtime composes even without a TEE context");
         let production_response = production_runtime.readiness().await;
         assert!(
             !production_response.ready,

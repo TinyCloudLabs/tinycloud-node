@@ -1103,7 +1103,7 @@ async fn tc2192_legacy_immutable_share_decrypt_uses_signed_wire_digest() -> anyh
     let shared = share.receiver.diffie_hellman(&peer);
     assert_eq!(
         tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
-            .decrypt_strict(sealed)?,
+            .decrypt_legacy(sealed)?,
         vec![0xCD; 32],
     );
 
@@ -1197,7 +1197,7 @@ async fn assert_registered_source_binding(share: ShareDecrypt, route: &str) -> a
     let shared = share.receiver.diffie_hellman(&peer);
     assert_eq!(
         tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
-            .decrypt_strict(sealed)?,
+            .decrypt_legacy(sealed)?,
         vec![0xCD; 32],
     );
     Ok(())
@@ -1371,7 +1371,7 @@ async fn tc2192_legacy_mutable_source_preserves_wrapped_key_rotation() -> anyhow
     let shared = share.receiver.diffie_hellman(&peer);
     assert_eq!(
         tinycloud_core::encryption::ColumnEncryption::new(*shared.as_bytes())
-            .decrypt_strict(sealed)?,
+            .decrypt_legacy(sealed)?,
         vec![0xCD; 32],
     );
     Ok(())

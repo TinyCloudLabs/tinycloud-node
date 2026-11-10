@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
+    encryption::RowBinding,
     events::Invocation,
     hash::Blake3Hasher,
     hash::Hash,
@@ -499,20 +500,26 @@ pub async fn create_webhook(
     let created_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current timestamps should format as RFC3339");
+    let id = hook_subscription_id(
+        &invocation.info().invoker,
+        &normalized,
+        callback_url.as_str(),
+        &created_at,
+    );
+    let encrypted_secret = webhook_encryption.encrypt(
+        request.secret.as_bytes(),
+        RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+    );
     let model = hook_subscription::Model {
-        id: hook_subscription_id(
-            &invocation.info().invoker,
-            &normalized,
-            callback_url.as_str(),
-            &created_at,
-        ),
+        encrypted_secret_format: 2,
+        id,
         subscriber_did: invocation.info().invoker.clone(),
         space_id: normalized.space.clone(),
         target_service: normalized.service.clone(),
         path_prefix: normalized.path_prefix.clone(),
         abilities_json: hook_subscription::Model::set_abilities(&normalized.abilities),
         callback_url: callback_url.to_string(),
-        encrypted_secret: webhook_encryption.encrypt(request.secret.as_bytes()),
+        encrypted_secret,
         secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
         active: true,
         created_at,
@@ -1541,6 +1548,7 @@ mod tests {
             fixture
                 .tinycloud
                 .create_hook_subscription(hook_subscription::Model {
+                    encrypted_secret_format: 2,
                     id: id.clone(),
                     subscriber_did: did_of(&fixture.session.1).into(),
                     space_id: fixture.space.to_string(),
@@ -1548,7 +1556,10 @@ mod tests {
                     path_prefix: Some("documents".into()),
                     abilities_json: None,
                     callback_url: (*callback).into(),
-                    encrypted_secret: ColumnEncryption::new([3; 32]).encrypt(b"secret"),
+                    encrypted_secret: ColumnEncryption::new([3; 32]).encrypt(
+                        b"secret",
+                        RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+                    ),
                     secret_key_id: "primary".into(),
                     active: true,
                     created_at: "2026-10-14T00:00:00Z".into(),
@@ -1653,8 +1664,17 @@ mod tests {
                 .await?
                 .unwrap();
             assert_eq!(stored.callback_url, callback);
+            assert_eq!(stored.encrypted_secret_format, 2);
             assert_eq!(
-                ColumnEncryption::new([3; 32]).decrypt(&stored.encrypted_secret)?,
+                ColumnEncryption::new([3; 32]).decrypt_recorded(
+                    &stored.encrypted_secret,
+                    RowBinding::new(
+                        "hook_subscription",
+                        "encrypted_secret",
+                        &[stored.id.as_bytes()]
+                    ),
+                    stored.encrypted_secret_format,
+                )?,
                 secret.as_bytes()
             );
         }
@@ -1901,6 +1921,7 @@ mod tests {
     #[tokio::test]
     async fn converts_subscription_model_without_secret() {
         let model = hook_subscription::Model {
+            encrypted_secret_format: 0,
             id: "sub_01".to_string(),
             subscriber_did: "did:key:test".to_string(),
             space_id: "tinycloud:space".to_string(),
@@ -2264,6 +2285,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"hooks-session".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&db)
         .await?;
@@ -2838,6 +2860,7 @@ mod tests {
         let existing = fixture
             .tinycloud
             .create_hook_subscription(hook_subscription::Model {
+                encrypted_secret_format: 0,
                 id: "sub_existing".to_string(),
                 subscriber_did: "did:key:someone-else".to_string(),
                 space_id: fixture.space.to_string(),
@@ -3130,6 +3153,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&fixture.db)
             .await?;
@@ -3357,6 +3381,7 @@ mod tests {
             hook_route_fixture(&[("hooks", "kv/my_docs", "tinycloud.hooks/list")]).await?;
         let space = fixture.space.to_string();
         let row = |id: &str, path_prefix: &str| hook_subscription::Model {
+            encrypted_secret_format: 0,
             id: id.to_string(),
             subscriber_did: "did:key:other-subscriber".to_string(),
             space_id: space.clone(),

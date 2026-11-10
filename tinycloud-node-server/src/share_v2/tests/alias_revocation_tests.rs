@@ -142,7 +142,17 @@ async fn signed_alias_consumers(reverse: bool) {
             .unwrap()
             .unwrap();
         assert_eq!(
-            maybe_decrypt(Some(&runtime.policy_encryption), &row.serialization).unwrap(),
+            maybe_decrypt(
+                Some(&runtime.policy_encryption),
+                &row.serialization,
+                RowBinding::new(
+                    "delegation",
+                    "serialization",
+                    &[Vec::<u8>::from(row.id).as_slice()]
+                ),
+                row.serialization_format,
+            )
+            .unwrap(),
             *bytes,
             "stored content and its hash must retain the actual signed wire bytes"
         );
