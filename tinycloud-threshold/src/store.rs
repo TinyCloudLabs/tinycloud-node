@@ -895,14 +895,16 @@ impl ShareStore {
             return Err(StoreError::CandidateExists);
         }
         // Only the currently admissible ceremony — the most recently
-        // accepted fresh id for the current pin — may install. Superseded
+        // accepted fresh id FOR the current pin — may install. Superseded
         // and retired ids stay in `seen` as history but can never install,
-        // so a candidate erased by C1 cannot be resurrected.
-        let admissible = inner
-            .state
-            .active_ceremony
-            .as_ref()
-            .is_some_and(|a| a.id == ceremony.statement().id);
+        // so a candidate erased by C1 cannot be resurrected. The recorded
+        // predecessor must equal the actual pin: a crash can restore an
+        // `active_ceremony` whose accepted-for pin the proofs then move
+        // past, and that id is contextually stale, never admissible.
+        let admissible = inner.state.active_ceremony.as_ref().is_some_and(|a| {
+            a.id == ceremony.statement().id
+                && a.predecessor == inner.pin.as_ref().map(|p| p.digest())
+        });
         if ceremony.anchor() != &self.anchor || !admissible {
             return Err(Error::InvalidCeremony.into());
         }
@@ -2223,5 +2225,708 @@ mod tests {
             &signers,
         )
         .unwrap();
+    }
+
+    /// Seeded model-based test: a scripted scheduler drives random sequences
+    /// of accept / install / receipt / activate / fork / reopen /
+    /// crash-at-every-step / second-opener over a real `ShareStore`, and a
+    /// reference model asserts the store's invariants after every step.
+    /// A failing run prints its seed so it can be replayed. Details: TC-2221
+    mod model {
+        use super::super::tests::*;
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+        /// splitmix64; cheap and stable across platforms for reproducing runs.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^ (z >> 31)
+            }
+
+            fn pick(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        /// The reference model: what a correct store may expose after each
+        /// step, derived only from successful operations (never from the
+        /// store's private state).
+        #[derive(Default)]
+        struct Model {
+            /// The activated chain, genesis first; the last entry is the pin.
+            pins: Vec<VerifiedCertificate>,
+            /// Signed certificates ever produced, by digest.
+            signed: BTreeMap<[u8; 32], SignedCertificate>,
+            /// Ceremonies accepted for each pinned predecessor, by the
+            /// predecessor digest; used to build fork siblings.
+            ceremonies_by_pred: BTreeMap<[u8; 32], AuthorizedCeremony>,
+            /// Every ceremony ever accepted (for stale/replay probes).
+            ceremonies: Vec<AuthorizedCeremony>,
+            seen: Vec<CeremonyId>,
+            /// The admissible ceremony: (id, predecessor it was accepted
+            /// for). A restored record whose predecessor is no longer the
+            /// pin is contextually stale.
+            active: Option<(CeremonyId, Option<CertDigest>)>,
+            /// (candidate digest, receipt_sent) — at most one pending
+            /// candidate, always a successor of the pin.
+            pending: Option<(CertDigest, bool)>,
+            /// Digests retired by a committed operation or discovered
+            /// erasure: their share files may exist only as owed debt.
+            retired: BTreeSet<[u8; 32]>,
+            /// Shares whose erasure is owed; empty at every operation
+            /// boundary in this harness (it never injects I/O failures).
+            debt: BTreeSet<[u8; 32]>,
+            frozen: bool,
+        }
+
+        struct Runner<'a> {
+            signers: &'a Signers,
+            dir: &'a Path,
+            network: NetworkUrn,
+            store: Option<ShareStore>,
+            model: Model,
+            rng: Rng,
+            /// Recent `state` file contents for crash replays.
+            snapshots: VecDeque<Vec<u8>>,
+            /// Set when the disk promises a receipted share it cannot serve:
+            /// Corrupt is the store's only honest answer and the run ends.
+            dead: bool,
+            transcript: u8,
+        }
+
+        impl<'a> Runner<'a> {
+            fn ndir(&self) -> PathBuf {
+                netdir(self.dir, &self.network)
+            }
+
+            fn store(&mut self) -> &mut ShareStore {
+                self.store.as_mut().unwrap()
+            }
+
+            fn share_files(&self) -> BTreeSet<[u8; 32]> {
+                let mut out = BTreeSet::new();
+                if let Ok(entries) = fs::read_dir(self.ndir()) {
+                    for entry in entries.flatten() {
+                        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        if let Some(hex) = name.strip_prefix("share-") {
+                            if let Some(digest) = decode_hex(hex) {
+                                out.insert(digest);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+
+            fn snapshot(&mut self) {
+                let state = self.ndir().join("state");
+                if let Ok(bytes) = fs::read(&state) {
+                    self.snapshots.push_back(bytes);
+                    while self.snapshots.len() > 4 {
+                        self.snapshots.pop_front();
+                    }
+                }
+            }
+
+            /// Every rule the store must satisfy at an operation boundary —
+            /// called after EVERY scheduler step. Details: TC-2221
+            fn assert_boundary(&self, seed: u64, step: usize) {
+                let m = &self.model;
+                let Some(store) = self.store.as_ref() else {
+                    assert!(
+                        self.dead,
+                        "seed {seed} step {step}: closed store without Corrupt"
+                    );
+                    return;
+                };
+                let files = self.share_files();
+                // Rule 4: once frozen, frozen forever — the recorded pin and
+                // candidate stay visible for the operator's audit, but no
+                // share material may leave the store.
+                if m.frozen {
+                    assert!(
+                        store.equivocation(),
+                        "seed {seed} step {step}: frozen store thawed"
+                    );
+                    assert!(
+                        matches!(store.current_share(), Err(StoreError::Equivocation)),
+                        "seed {seed} step {step}: frozen store exports a share"
+                    );
+                    for digest in &files {
+                        assert!(
+                            m.signed.contains_key(digest),
+                            "seed {seed} step {step}: foreign share file on frozen store"
+                        );
+                    }
+                    return;
+                }
+                // Rule 3 / rule 1: exactly one pin, and only the pin's share
+                // is ever usable.
+                let pin = m.pins.last().map(|p| p.digest());
+                assert_eq!(
+                    store.pinned().map(|p| p.digest()),
+                    pin,
+                    "seed {seed} step {step}: pin diverged from model"
+                );
+                // At most one pending candidate, always the pin's successor.
+                assert_eq!(
+                    store.pending_candidate().map(|(d, _)| d),
+                    m.pending.map(|(d, _)| d),
+                    "seed {seed} step {step}: pending candidate diverged"
+                );
+                // Rule 2: no live share is lost; rule 7: nothing retired is
+                // live except as recorded debt — the on-disk share set is
+                // exactly {pin?} ∪ {pending?} ∪ debt.
+                let mut live: BTreeSet<[u8; 32]> = BTreeSet::new();
+                if let Some(d) = pin {
+                    live.insert(*d.as_bytes());
+                }
+                if let Some((d, _)) = m.pending {
+                    live.insert(*d.as_bytes());
+                }
+                for digest in &live {
+                    assert!(
+                        files.contains(digest),
+                        "seed {seed} step {step}: live share missing"
+                    );
+                }
+                for digest in &files {
+                    assert!(
+                        live.contains(digest) || m.debt.contains(digest),
+                        "seed {seed} step {step}: share file outside live set and debt"
+                    );
+                }
+                assert!(
+                    m.debt.is_subset(&files),
+                    "seed {seed} step {step}: erasure debt dropped"
+                );
+                // Rule 7 half: a retired share may exist only as debt.
+                for digest in &files {
+                    if m.retired.contains(digest) {
+                        assert!(
+                            m.debt.contains(digest),
+                            "seed {seed} step {step}: retired share live without debt"
+                        );
+                    }
+                }
+                // Rule 6 + usable share: with a pin file on disk the bound
+                // share is exported.
+                if let Some(d) = pin {
+                    if files.contains(d.as_bytes()) {
+                        assert!(
+                            matches!(store.current_share(), Ok(Some(_))),
+                            "seed {seed} step {step}: pinned share not usable"
+                        );
+                    }
+                }
+                // Rule 8: no temp files survive a boundary.
+                if let Ok(entries) = fs::read_dir(self.ndir()) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_str().unwrap_or("");
+                        assert!(
+                            !name.ends_with(".tmp") && !name.contains(".tmp-"),
+                            "seed {seed} step {step}: leftover temp {name}"
+                        );
+                    }
+                }
+            }
+
+            /// Fresh ceremony for the current pin with a never-used id.
+            fn fresh_ceremony(&mut self) -> AuthorizedCeremony {
+                let pin = self.model.pins.last().unwrap();
+                let mut stmt = self
+                    .signers
+                    .body(CeremonyKind::Reshare, Threshold::new(2, 3).unwrap());
+                self.transcript = self.transcript.wrapping_add(1).max(64);
+                let mut id_bytes = [0x60u8; 32];
+                id_bytes[0] = 0x60 ^ (self.transcript);
+                id_bytes[31] = self.transcript;
+                stmt.id = CeremonyId::new(id_bytes);
+                stmt.current = Some(pin.digest());
+                stmt.epoch = pin.body().epoch().checked_next().unwrap();
+                stmt.rekey = pin.body().rekey();
+                AuthorizedCeremony::verify_for(pin, &self.signers.statement(&stmt), self.signers)
+                    .unwrap()
+            }
+
+            /// A signed successor certificate of the pin under `ceremony`.
+            fn fresh_signed(
+                &mut self,
+                ceremony: &AuthorizedCeremony,
+            ) -> (SignedCertificate, KeyShare) {
+                self.transcript = self.transcript.wrapping_add(1).max(64);
+                let pin = self.model.pins.last().unwrap();
+                let (public, mut shares) = cert_tests::material(11, Threshold::new(2, 3).unwrap());
+                let body = match CertificateBody::successor(
+                    pin,
+                    ceremony,
+                    &public,
+                    &TranscriptHash::new([self.transcript; 32]),
+                ) {
+                    Ok(body) => body,
+                    Err(e) => panic!(
+                        "fresh_signed: {e:?} pin={} cer_current={:?} cer_epoch={:?} pin_epoch={:?}",
+                        hex(pin.digest().as_bytes()),
+                        ceremony.statement().current.map(|d| hex(d.as_bytes())),
+                        ceremony.statement().epoch,
+                        pin.body().epoch(),
+                    ),
+                };
+                (cert::tests::sign(body, self.signers), shares.remove(0))
+            }
+
+            fn accept(&mut self, seed: u64, step: usize) -> Option<AuthorizedCeremony> {
+                let ceremony = self.fresh_ceremony();
+                let outcome = self.store().accept_ceremony(&ceremony);
+                match outcome {
+                    Ok(AcceptOutcome::Fresh) => {}
+                    other => panic!("seed {seed} step {step}: fresh accept gave {other:?}"),
+                }
+                // C1: a fresh accept erases any unactivated candidate for
+                // the same predecessor.
+                if let Some((digest, _)) = self.model.pending.take() {
+                    self.model.retired.insert(*digest.as_bytes());
+                }
+                let id = ceremony.statement().id;
+                self.model.seen.push(id);
+                self.model.active = Some((id, ceremony.statement().current));
+                self.model.ceremonies.push(ceremony.clone());
+                let pred = self.model.pins.last().unwrap().digest();
+                self.model
+                    .ceremonies_by_pred
+                    .insert(*pred.as_bytes(), ceremony.clone());
+                Some(ceremony)
+            }
+
+            fn install(&mut self, seed: u64, step: usize, ceremony: &AuthorizedCeremony) {
+                let (signed, raw) = self.fresh_signed(ceremony);
+                let candidate = mk_candidate(raw, &signed.body);
+                let signers = self.signers;
+                let digest = self
+                    .store()
+                    .install_candidate(&signed, candidate, ceremony, signers)
+                    .unwrap_or_else(|e| panic!("seed {seed} step {step}: install failed: {e:?}"));
+                self.model.signed.insert(*digest.as_bytes(), signed);
+                assert!(
+                    self.model.pending.is_none(),
+                    "seed {seed} step {step}: model lost pending"
+                );
+                self.model.pending = Some((digest, false));
+            }
+
+            /// Rule 9: after any crash the reopened store is consistent with
+            /// some crash-free projection of history — resync the model to
+            /// what the store actually exposes (truncating the pin chain and
+            /// forgetting the admissible id if the state reverted).
+            fn resync(&mut self, seed: u64, step: usize) {
+                let m = &mut self.model;
+                let store = self.store.as_ref().unwrap();
+                m.frozen = store.equivocation();
+                if m.frozen {
+                    m.active = None;
+                    m.pending = None;
+                    return;
+                }
+                match store.pinned() {
+                    Some(pin) => {
+                        let pos = m
+                            .pins
+                            .iter()
+                            .position(|p| p.digest() == pin.digest())
+                            .unwrap_or_else(|| {
+                                panic!("seed {seed} step {step}: reopen pinned unknown certificate")
+                            });
+                        m.pins.truncate(pos + 1);
+                    }
+                    None => m.pins.clear(),
+                }
+                m.pending = store.pending_candidate().map(|(d, _)| (d, false));
+                // A reopened candidate must be the pin's successor — open's
+                // own convergence rule, asserted here too.
+                if let (Some((d, _)), Some(pin)) = (m.pending, m.pins.last()) {
+                    let signed = &m.signed[d.as_bytes()];
+                    assert_eq!(
+                        signed.body.previous(),
+                        Some(&pin.digest()),
+                        "seed {seed} step {step}: reopened candidate is not the pin's successor"
+                    );
+                }
+                // The admissible ceremony is persisted; resync reads what a
+                // crash-revert actually restored — an id whose recorded
+                // predecessor is again the pin may install, any other is
+                // contextually stale and must be refused.
+                m.active = store
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .state
+                    .active_ceremony
+                    .as_ref()
+                    .map(|a| (a.id, a.predecessor));
+            }
+
+            fn reopen(&mut self, seed: u64, step: usize) {
+                self.store = None;
+                match ShareStore::open(
+                    self.dir,
+                    &self.network,
+                    self.signers.anchor().clone(),
+                    Signers::did(1),
+                    self.signers,
+                ) {
+                    Ok(store) => {
+                        self.store = Some(store);
+                        self.resync(seed, step);
+                    }
+                    Err(e) => {
+                        // The only lawful refusal: the recorded state
+                        // promises a receipted share whose file is gone —
+                        // real disk damage the store must not guess past.
+                        let state = fs::read(self.ndir().join("state"))
+                            .ok()
+                            .and_then(|b| decode_state(&b).ok());
+                        let promised_missing = state.is_some_and(|s| {
+                            s.candidate.is_some_and(|c| {
+                                c.receipt_sent && !share_path(&self.ndir(), &c.digest).exists()
+                            })
+                        });
+                        assert!(
+                            matches!(e, StoreError::Corrupt) && promised_missing,
+                            "seed {seed} step {step}: reopen failed: {e:?}"
+                        );
+                        self.dead = true;
+                    }
+                }
+            }
+        }
+
+        /// Encode `state` in the pre-release version-1 layout (everything
+        /// except the `active_ceremony` option) to probe legacy decoding.
+        fn encode_state_v1(state: &State) -> Vec<u8> {
+            let mut e = Encoder::new();
+            e.u8(1);
+            e.u8(u8::from(state.pin.is_some()));
+            if let Some(pin) = state.pin {
+                e.fixed(pin.as_bytes());
+            }
+            e.u8(u8::from(state.candidate.is_some()));
+            if let Some(candidate) = &state.candidate {
+                e.fixed(candidate.digest.as_bytes());
+                e.fixed(candidate.ceremony.as_bytes());
+                e.u8(u8::from(candidate.predecessor.is_some()));
+                if let Some(predecessor) = candidate.predecessor {
+                    e.fixed(predecessor.as_bytes());
+                }
+                e.u8(u8::from(candidate.receipt_sent));
+            }
+            e.u32(state.seen_ceremonies.len() as u32);
+            for id in &state.seen_ceremonies {
+                e.fixed(id.as_bytes());
+            }
+            e.u32(state.retired.len() as u32);
+            for retired in &state.retired {
+                e.fixed(retired.digest.as_bytes());
+                e.u64(retired.erased_at);
+            }
+            e.u64(state.seq);
+            e.finish()
+        }
+
+        /// One seeded run: genesis activation, then `steps` weighted random
+        /// operations with boundary assertions after every single step.
+        fn run_seed(dir: &Path, signers: &Signers, seed: u64, steps: usize) {
+            let network = signers.anchor().network.clone();
+            let mut runner = Runner {
+                signers,
+                dir,
+                network: network.clone(),
+                store: Some(open(dir, signers)),
+                model: Model::default(),
+                rng: Rng(seed),
+                snapshots: VecDeque::new(),
+                transcript: 63,
+                dead: false,
+            };
+            let (signed, cert) = activated_genesis(runner.store.as_ref().unwrap(), signers);
+            runner.model.pins.push(cert);
+            runner
+                .model
+                .signed
+                .insert(*signed.body.digest().as_bytes(), signed);
+            let genesis_ceremony = signers.genesis();
+            runner.model.seen.push(genesis_ceremony.statement().id);
+            runner.model.ceremonies.push(genesis_ceremony);
+            runner.snapshot();
+
+            for step in 0..steps {
+                if runner.dead {
+                    break;
+                }
+                let frozen = runner.model.frozen;
+                let pending = runner.model.pending;
+                let roll = runner.rng.pick(100);
+                match roll {
+                    // Fresh accept + install under the admissible id.
+                    0..=21 if !frozen => {
+                        if let Some(ceremony) = runner.accept(seed, step) {
+                            runner.install(seed, step, &ceremony);
+                        }
+                    }
+                    // Accept only (candidate window stays empty).
+                    22..=29 if !frozen => {
+                        runner.accept(seed, step);
+                    }
+                    // Replay or stale accept: a seen id whose context still
+                    // matches the pin replays (informational — the stale
+                    // install op proves it can never install); a contextually
+                    // stale id is refused outright.
+                    30..=37 if !frozen => {
+                        let n = runner.model.ceremonies.len();
+                        if n > 0 {
+                            let ceremony =
+                                runner.model.ceremonies[runner.rng.pick(n as u64) as usize].clone();
+                            let pin = runner.model.pins.last().unwrap().digest();
+                            let expect_replay = ceremony.statement().current == Some(pin);
+                            match runner.store().accept_ceremony(&ceremony) {
+                                Ok(AcceptOutcome::Replay) if expect_replay => {}
+                                Err(e) if !expect_replay && matches!(e, StoreError::Crypto(_)) => {}
+                                other => panic!(
+                                    "seed {seed} step {step}: stale/replay accept gave {other:?}"
+                                ),
+                            }
+                        }
+                    }
+                    // Stale install: any non-admissible ceremony id —
+                    // including retired ones — must fail.
+                    38..=43 if !frozen => {
+                        let stale: Vec<AuthorizedCeremony> = runner
+                            .model
+                            .ceremonies
+                            .iter()
+                            .filter(|c| {
+                                runner.model.active.map(|(id, _)| id) != Some(c.statement().id)
+                            })
+                            .cloned()
+                            .collect();
+                        if !stale.is_empty() {
+                            let ceremony =
+                                stale[runner.rng.pick(stale.len() as u64) as usize].clone();
+                            // The certificate only has to be a valid pin
+                            // successor; the stale ceremony argument is what
+                            // the admissible-id check refuses first.
+                            let construction = runner.fresh_ceremony();
+                            let (signed, raw) = runner.fresh_signed(&construction);
+                            let candidate = mk_candidate(raw, &signed.body);
+                            assert!(
+                                runner
+                                    .store()
+                                    .install_candidate(&signed, candidate, &ceremony, signers)
+                                    .is_err(),
+                                "seed {seed} step {step}: stale ceremony id installed"
+                            );
+                        }
+                    }
+                    // Install under the admissible id when none is pending.
+                    // The restored record binds the pin it was accepted for:
+                    // if a crash revert moved the pin past it the id is
+                    // contextually stale and must be refused, never built.
+                    44..=51 if !frozen && pending.is_none() => {
+                        if let Some((id, pred)) = runner.model.active {
+                            let pin = runner.model.pins.last().unwrap().digest();
+                            let ceremony = runner
+                                .model
+                                .ceremonies
+                                .iter()
+                                .find(|c| c.statement().id == id)
+                                .unwrap()
+                                .clone();
+                            if pred == Some(pin) {
+                                runner.install(seed, step, &ceremony);
+                            } else {
+                                let construction = runner.fresh_ceremony();
+                                let (signed, raw) = runner.fresh_signed(&construction);
+                                let candidate = mk_candidate(raw, &signed.body);
+                                assert!(
+                                    runner
+                                        .store()
+                                        .install_candidate(&signed, candidate, &ceremony, signers)
+                                        .is_err(),
+                                    "seed {seed} step {step}: pin-stale ceremony id installed"
+                                );
+                            }
+                        }
+                    }
+                    // Rule 6: receipt only over a durable share.
+                    52..=59 if !frozen && pending.is_some() => {
+                        runner
+                            .store()
+                            .mark_receipt_sent()
+                            .unwrap_or_else(|e| panic!("seed {seed} step {step}: receipt: {e:?}"));
+                        runner.model.pending = pending.map(|(d, _)| (d, true));
+                    }
+                    // Verified activation: the only legal pin advance.
+                    60..=73 if !frozen && pending.is_some() => {
+                        let (digest, _) = pending.unwrap();
+                        let signed = runner.model.signed[digest.as_bytes()].clone();
+                        let cert =
+                            verify_successor(runner.model.pins.last().unwrap(), &signed, signers)
+                                .unwrap();
+                        let receipts = receipts_for(&cert, signers);
+                        let activation = activation_for(&cert, &receipts, signers);
+                        runner
+                            .store()
+                            .record_activation(&signed, &activation, &receipts, signers)
+                            .unwrap_or_else(|e| {
+                                panic!("seed {seed} step {step}: activation: {e:?}")
+                            });
+                        if let Some(old) = runner.model.pins.last() {
+                            runner.model.retired.insert(*old.digest().as_bytes());
+                        }
+                        runner.model.pins.push(cert);
+                        runner.model.pending = None;
+                        runner.model.active = None;
+                    }
+                    // Write an activated sibling proof for an interior
+                    // predecessor: discovered at next open → frozen.
+                    74..=79 if !frozen && runner.model.pins.len() >= 2 => {
+                        let i = 1 + runner.rng.pick((runner.model.pins.len() - 1) as u64) as usize;
+                        let pred = runner.model.pins[i - 1].clone();
+                        let ceremony =
+                            runner.model.ceremonies_by_pred[pred.digest().as_bytes()].clone();
+                        runner.transcript = runner.transcript.wrapping_add(1);
+                        let signed =
+                            sibling_successor(signers, &pred, &ceremony, runner.transcript);
+                        let cert = verify_successor(&pred, &signed, signers).unwrap();
+                        let receipts = receipts_for(&cert, signers);
+                        let activation = activation_for(&cert, &receipts, signers);
+                        let path = proof_path(&runner.ndir(), &cert.digest());
+                        fs::write(&path, encode_proof(&signed, Some(&activation), &receipts))
+                            .unwrap();
+                        runner
+                            .model
+                            .signed
+                            .insert(*cert.digest().as_bytes(), signed);
+                        runner.reopen(seed, step);
+                        assert!(
+                            runner.model.frozen,
+                            "seed {seed} step {step}: activated fork did not freeze"
+                        );
+                    }
+                    // Rule 10: a second opener changes nothing.
+                    80..=85 => {
+                        assert!(matches!(
+                            ShareStore::open(
+                                dir,
+                                &network,
+                                signers.anchor().clone(),
+                                Signers::did(1),
+                                signers
+                            ),
+                            Err(StoreError::Busy)
+                        ));
+                    }
+                    // Clean reopen.
+                    86..=90 => runner.reopen(seed, step),
+                    // Crash replays: revert `state` to a recent snapshot
+                    // (commit-without-completion), delete a dealt marker
+                    // (post-commit pre-marker crash), or leave temp debris;
+                    // every variant ends in a reopen + resync.
+                    _ => {
+                        match runner.rng.pick(4) {
+                            0 if !runner.snapshots.is_empty() => {
+                                runner.store = None;
+                                let i = runner.rng.pick(runner.snapshots.len() as u64) as usize;
+                                let bytes = runner.snapshots[i].clone();
+                                fs::write(runner.ndir().join("state"), &bytes).unwrap();
+                            }
+                            1 => {
+                                let n = runner.model.seen.len();
+                                if n > 0 {
+                                    let id = runner.model.seen[runner.rng.pick(n as u64) as usize];
+                                    let marker =
+                                        runner.ndir().join("dealt").join(hex(id.as_bytes()));
+                                    let _ = fs::remove_file(marker);
+                                }
+                            }
+                            2 => {
+                                runner.store = None;
+                                let debris = runner
+                                    .ndir()
+                                    .join(format!("share-{}.tmp-1-9", hex(&[0xAB; 32])));
+                                fs::write(&debris, [0x55u8; 67]).unwrap();
+                            }
+                            _ => runner.store = None,
+                        }
+                        runner.reopen(seed, step);
+                    }
+                }
+                runner.assert_boundary(seed, step);
+                runner.snapshot();
+            }
+            eprintln!("model seed {seed}: {steps} steps ok");
+        }
+
+        /// Legacy `state` files must be handled explicitly: anything but the
+        /// current version is refused at decode, never silently upgraded.
+        /// Details: TC-2221
+        #[test]
+        fn legacy_state_versions_are_refused_explicitly() {
+            let signers = Signers::new();
+            let dir = tmpdir();
+            let network = signers.anchor().network.clone();
+            {
+                let store = open(&dir, &signers);
+                activated_genesis(&store, &signers);
+                let state = store.inner.lock().unwrap().state.clone();
+                drop(store);
+                // Version 1 (pre-release, no admissible-ceremony slot).
+                fs::write(
+                    netdir(&dir, &network).join("state"),
+                    encode_state_v1(&state),
+                )
+                .unwrap();
+                assert!(ShareStore::open(
+                    &dir,
+                    &network,
+                    signers.anchor().clone(),
+                    Signers::did(1),
+                    &signers
+                )
+                .is_err());
+                // Unknown future version.
+                let mut future = encode_state(&state);
+                future[0] = 3;
+                fs::write(netdir(&dir, &network).join("state"), &future).unwrap();
+                assert!(ShareStore::open(
+                    &dir,
+                    &network,
+                    signers.anchor().clone(),
+                    Signers::did(1),
+                    &signers
+                )
+                .is_err());
+            }
+        }
+
+        #[test]
+        fn seeded_model_invariants_hold_across_crashes() {
+            // Debug builds pay full fsync + verify cost per step, so CI runs
+            // a bounded slice; the release suite sweeps the wider seed space.
+            // Replay any failure with the printed seed.
+            let seeds: u64 = if cfg!(debug_assertions) { 4 } else { 64 };
+            for seed in 0..seeds {
+                let signers = Signers::new();
+                let dir = tmpdir();
+                run_seed(&dir, &signers, seed, 220);
+            }
+        }
     }
 }
