@@ -197,6 +197,27 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn renewal_invocation_did_matches_jwk_multicodec_public_key() -> anyhow::Result<()> {
+        use tinycloud_auth::{ipld_core::cid::multibase, ssi::jwk::Params};
+
+        let secret = StaticSecret::new(vec![0x73; 32]).expect("fixed test secret is valid");
+        let (jwk, _) = renewal_invocation_signer(&secret)?;
+        let Params::OKP(params) = jwk.params else {
+            panic!("renewal invocation key must be an OKP");
+        };
+        assert_eq!(params.curve, "Ed25519");
+        let mut multicodec_public_key = vec![0xed, 0x01];
+        multicodec_public_key.extend_from_slice(&params.public_key.0);
+        let jwk_did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, multicodec_public_key)
+        );
+
+        assert_eq!(jwk_did, secret.renewal_did());
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_waits_until_half_of_the_signed_period_remains() {
         assert!(!due_for_renewal(100, 116, 30));
         assert!(due_for_renewal(100, 115, 30));
