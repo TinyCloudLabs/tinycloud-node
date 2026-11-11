@@ -11,7 +11,7 @@ use tinycloud_auth::{
 use tinycloud_core::{
     events::Invocation,
     keys::StaticSecret,
-    renewal::{self, LeaseRecord, StampIssue},
+    renewal::{self, LeaseRecord, RenewalStoreError, StampIssue},
 };
 
 use std::future::Future;
@@ -130,9 +130,22 @@ where
     Fut: Future<Output = Result<()>>,
 {
     for lease in leases {
+        let lease_cid = lease.lease_cid.clone();
         if let Err(error) = process(lease).await {
+            if error
+                .downcast_ref::<RenewalStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
+                    )
+                })
+            {
+                continue;
+            }
             ::tracing::warn!(
                 event = "renewal_scheduler_lease_failed",
+                lease_cid = %lease_cid,
                 error = %error,
                 "internal renewal scheduler failed for one lease; continuing"
             );
