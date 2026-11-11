@@ -1255,7 +1255,7 @@ mod tests {
                 .sign_stamp(
                     &original_cid,
                     &lease_cid,
-                    0,
+                    1,
                     &previous.to_cid(0x55).to_string(),
                     &end_text,
                 )

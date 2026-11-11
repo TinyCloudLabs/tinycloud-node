@@ -712,7 +712,10 @@ where
     where
         C: ConnectionTrait,
     {
-        let roots = [target];
+        let effective_root = crate::models::revocation::target_for_cid(&self.conn, target)
+            .await?
+            .map_or(target, |delegation| delegation.id);
+        let roots = [effective_root];
         let snapshot = match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
             (Some(stable_node_did), Some(seed)) => {
                 let (renewer_did, epoch, _) =
@@ -746,7 +749,7 @@ where
                     }
                 })?,
         };
-        Ok(snapshot.effective_expiry(&target))
+        Ok(snapshot.effective_expiry(&effective_root))
     }
 }
 
