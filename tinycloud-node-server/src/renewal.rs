@@ -129,23 +129,25 @@ where
     for lease in leases {
         let lease_cid = lease.lease_cid.clone();
         if let Err(error) = process(lease).await {
-            if error
+            let expected_skip = error
                 .downcast_ref::<RenewalStoreError>()
                 .is_some_and(|error| {
                     matches!(
                         error,
                         RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
                     )
-                })
-            {
-                continue;
+                });
+            if expected_skip {
+                ::tracing::debug!(
+                    event = "renewal_scheduler_lease_skipped",
+                    lease_cid = %lease_cid,
+                );
+            } else {
+                ::tracing::warn!(
+                    event = "renewal_scheduler_lease_failed",
+                    lease_cid = %lease_cid,
+                );
             }
-            ::tracing::warn!(
-                event = "renewal_scheduler_lease_failed",
-                lease_cid = %lease_cid,
-                error = %error,
-                "internal renewal scheduler failed for one lease; continuing"
-            );
         }
     }
 }
@@ -153,7 +155,95 @@ where
 #[cfg(test)]
 mod scheduler_tests {
     use super::{build_scheduled_invocation, due_for_renewal, renewal_invocation_signer};
-    use tinycloud_core::{keys::StaticSecret, renewal::LeaseRecord, util::InvocationInfo};
+    use tinycloud_core::{
+        keys::StaticSecret,
+        renewal::{LeaseRecord, RenewalStoreError},
+        util::InvocationInfo,
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_logs_expected_skips_and_failures_with_only_lease_cid() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedLog::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .finish(),
+        );
+        let lease_cid = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
+        let cases = [
+            ("unavailable", "renewal_scheduler_lease_skipped", "DEBUG"),
+            ("old-epoch", "renewal_scheduler_lease_skipped", "DEBUG"),
+            ("unexpected", "renewal_scheduler_lease_failed", "WARN"),
+        ];
+        let leases = cases
+            .iter()
+            .map(|(original_cid, _, _)| LeaseRecord {
+                original_cid: (*original_cid).to_owned(),
+                lease_cid: lease_cid.to_owned(),
+                grantor: "did:key:owner".to_owned(),
+                renewer_did: "did:key:renewer".to_owned(),
+                renewer_epoch: 1,
+                lease_expiry: 2_000,
+                period_seconds: 30,
+                state: "active".to_owned(),
+                generation: 1,
+            })
+            .collect();
+        super::for_each_scheduled_lease(leases, |lease| async move {
+            let error = match lease.original_cid.as_str() {
+                "unavailable" => anyhow::Error::new(RenewalStoreError::LeaseUnavailable),
+                "old-epoch" => anyhow::Error::new(RenewalStoreError::IdentityEpoch),
+                _ => anyhow::anyhow!("private error detail"),
+            };
+            Err(error)
+        })
+        .await;
+
+        let output = captured.0.lock().unwrap().clone();
+        let output = String::from_utf8(output).expect("captured logs are UTF-8");
+        let events: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("log event is JSON"))
+            .collect();
+        assert_eq!(events.len(), cases.len(), "{output}");
+        for (event, (_, expected_event, expected_level)) in events.iter().zip(cases) {
+            assert_eq!(event["level"], expected_level);
+            assert_eq!(
+                event["fields"],
+                serde_json::json!({
+                    "event": expected_event,
+                    "lease_cid": lease_cid,
+                })
+            );
+        }
+    }
 
     #[test]
     fn scheduler_builds_a_single_lease_bound_renewal_invocation() -> anyhow::Result<()> {
