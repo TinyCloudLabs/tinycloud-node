@@ -5,7 +5,7 @@
 //! seed is synthetic and public; it is not a production key.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tinycloud_core::{hash::hash, keys::StaticSecret};
 
 fn raw_blake3_cid(bytes: &[u8]) -> String {
@@ -28,10 +28,7 @@ fn renewal_stamp_v1_matches_pinned_bytes_cid_and_signature() {
     let domain = fixture["stampDomain"].as_str().unwrap();
     let master_secret = decode_hex(&fixture["testOnlyMasterSecretHex"]);
     let node_secret = StaticSecret::new(master_secret).expect("32-byte test seed");
-    let signing_seed: [u8; 32] = node_secret
-        .derive_key(key_context)
-        .try_into()
-        .expect("fixed-length derivation");
+    let signing_seed = node_secret.derive_key(key_context);
     let signer = SigningKey::from_bytes(&signing_seed);
 
     let original_cid = raw_blake3_cid(&dag_cbor(&fixture["originalArtifact"]));
