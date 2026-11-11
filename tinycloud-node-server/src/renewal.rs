@@ -6,7 +6,6 @@ pub use tinycloud_core::renewal::{
 use anyhow::{anyhow, Result};
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, InvocationOptions, TinyCloudInvocation},
-    resolver::DID_METHODS,
     ssi::jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
 };
 use tinycloud_core::{
@@ -37,10 +36,7 @@ fn renewal_invocation_signer(secret: &StaticSecret) -> Result<(JWK, String)> {
         )),
     }));
     jwk.algorithm = Some(Algorithm::EdDSA);
-    let did = DID_METHODS.generate(&jwk, "key")?.to_string();
-    if did != secret.renewal_did() {
-        return Err(anyhow!("derived renewal DID mismatch"));
-    }
+    let did = secret.renewal_did();
     let fragment = did
         .rsplit_once(':')
         .map(|(_, fragment)| fragment)
