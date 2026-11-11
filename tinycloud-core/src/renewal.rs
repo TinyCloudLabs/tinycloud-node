@@ -1062,6 +1062,11 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
 ) -> Result<StampRecord, RenewalStoreError> {
     let (original_cid, original) = canonical_cid(&request.original_cid)?;
     let (lease_cid, lease) = canonical_cid(&request.lease_cid)?;
+    let (stored_renewer_did, stored_epoch, _) =
+        current_renewal_identity_from_seed(tx, secret.derive_key(RENEWER_KEY_CONTEXT)).await?;
+    if stored_renewer_did != identity.renewer_did || stored_epoch != identity.epoch {
+        return Err(RenewalStoreError::IdentityEpoch);
+    }
     let backend = tx.get_database_backend();
     let lease_row = tx.query_one(Statement::from_sql_and_values(
         backend,
@@ -1874,6 +1879,13 @@ mod tests {
             renewer_did: next_did.clone(),
             epoch: next_epoch,
         };
+        let mut stale_process_request = request.clone();
+        stale_process_request.replay_hash = hash(b"stale process identity");
+        stale_process_request.replay_expires_at = now + 120;
+        assert!(matches!(
+            issue_stamp_at(&db, stale_process_request, &secret, &identity, now + 60,).await,
+            Err(RenewalStoreError::IdentityEpoch)
+        ));
         let next_snapshot = load_renewal_snapshot(
             &db,
             &[original, lease],
