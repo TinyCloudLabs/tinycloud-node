@@ -207,6 +207,7 @@ pub async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Res
         .is_some())
 }
 
+#[cfg(test)]
 pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
     db: &C,
     start: &Hash,
@@ -530,6 +531,25 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     action: ControlAction,
     target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
+    control_proof_decision_at(
+        db,
+        signer,
+        proofs,
+        action,
+        target,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
+pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+    action: ControlAction,
+    target: &Hash,
+    now: OffsetDateTime,
+) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
         return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
     }
@@ -537,7 +557,6 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         return Ok(ControlProofDecision::Denied);
     }
 
-    let now = OffsetDateTime::now_utc();
     let proof_id = Hash::from(proofs[0]);
     let renewal_lease_proof = db
         .query_one(Statement::from_sql_and_values(
@@ -1269,7 +1288,7 @@ mod tests {
         .await;
         db.execute(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',0,'did:key:owner','did:key:renewer',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2592000,$3)",
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:owner','did:key:renewer',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2592000,$3)",
             [
                 sea_orm::Value::Bytes(Some(Box::new(original.as_ref().to_vec()))),
                 sea_orm::Value::Bytes(Some(Box::new(lease.as_ref().to_vec()))),
@@ -1308,7 +1327,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(!matches!(decision, ControlProofDecision::Scoped(_)));
+            assert!(matches!(decision, ControlProofDecision::Denied));
         }
     }
 

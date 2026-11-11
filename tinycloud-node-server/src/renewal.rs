@@ -3,6 +3,179 @@ pub use tinycloud_core::renewal::{
     RenewalError, RenewalSigner, RENEWER_KEY_CONTEXT, STAMP_DOMAIN,
 };
 
+use anyhow::{anyhow, Result};
+use tinycloud_auth::{
+    authorization::{make_invocation_from_uris, InvocationOptions, TinyCloudInvocation},
+    resolver::DID_METHODS,
+    ssi::jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
+};
+use tinycloud_core::{
+    events::Invocation,
+    keys::StaticSecret,
+    renewal::{self, LeaseRecord, RenewalStoreError, StampIssue},
+};
+
+pub(crate) const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+const INVOCATION_LIFETIME_SECONDS: i64 = 300;
+
+fn due_for_renewal(now: i64, end: i64, period_seconds: u64) -> bool {
+    let horizon = now.saturating_add((period_seconds / 2).max(1).min(i64::MAX as u64) as i64);
+    end <= horizon
+}
+
+fn renewal_invocation_signer(secret: &StaticSecret) -> Result<(JWK, String)> {
+    let keypair = secret.renewal_keypair();
+    let public_key = keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|error| anyhow!("{error}"))?;
+    let mut jwk = JWK::from(Params::OKP(OctetParams {
+        curve: "Ed25519".to_owned(),
+        public_key: Base64urlUInt(public_key.to_bytes().to_vec()),
+        private_key: Some(Base64urlUInt(
+            secret.derive_key(RENEWER_KEY_CONTEXT).to_vec(),
+        )),
+    }));
+    jwk.algorithm = Some(Algorithm::EdDSA);
+    let did = DID_METHODS.generate(&jwk, "key")?.to_string();
+    if did != secret.renewal_did() {
+        return Err(anyhow!("derived renewal DID mismatch"));
+    }
+    let fragment = did
+        .rsplit_once(':')
+        .map(|(_, fragment)| fragment)
+        .ok_or_else(|| anyhow!("renewal DID has no key fragment"))?;
+    Ok((jwk, format!("{did}#{fragment}")))
+}
+
+fn build_scheduled_invocation(
+    lease: &LeaseRecord,
+    signer: &JWK,
+    verification_method: &str,
+    now: i64,
+) -> Result<(TinyCloudInvocation, i64)> {
+    let lease_cid = lease.lease_cid.parse()?;
+    let expiry = now
+        .checked_add(INVOCATION_LIFETIME_SECONDS)
+        .ok_or_else(|| anyhow!("renewal invocation expiry overflow"))?;
+    let invocation = make_invocation_from_uris(
+        [(
+            format!("urn:cid:{}", lease.original_cid).parse()?,
+            ["tinycloud.delegation/renew".parse()?],
+        )],
+        &lease_cid,
+        signer,
+        verification_method,
+        expiry as f64,
+        InvocationOptions {
+            nonce: Some(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+            proof: Some(vec![lease_cid]),
+            ..Default::default()
+        },
+    )?;
+    Ok((invocation, expiry))
+}
+
+pub(crate) async fn scheduler_tick(
+    tinycloud: &crate::TinyCloud,
+    secret: &StaticSecret,
+) -> Result<()> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let conn = tinycloud.connection();
+    let leases = renewal::active_leases_for_current_epoch(conn).await?;
+    let (signer, verification_method) = renewal_invocation_signer(secret)?;
+    for lease in leases {
+        if lease.state != "active" || lease.renewer_did != secret.renewal_did() {
+            continue;
+        }
+        let Some(end) =
+            renewal::effective_end(conn, &lease.original_cid, &lease.lease_cid, now, secret)
+                .await?
+        else {
+            continue;
+        };
+        if !due_for_renewal(now, end, lease.period_seconds) {
+            continue;
+        }
+        let (signed, replay_expires_at) =
+            build_scheduled_invocation(&lease, &signer, &verification_method, now)?;
+        let encoded = signed.encode()?;
+        let event = Invocation::from_header_ser::<TinyCloudInvocation>(&encoded)
+            .map_err(|error| anyhow!("{error:?}"))?;
+        let replay_hash = event.content_hash();
+        let issue = StampIssue {
+            invocation: event.0,
+            original_cid: lease.original_cid,
+            lease_cid: lease.lease_cid,
+            replay_hash,
+            replay_expires_at,
+        };
+        if let Err(error) = tinycloud.issue_renewal_stamp(issue).await {
+            if !matches!(
+                &error,
+                RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
+            ) {
+                ::tracing::warn!(
+                    event = "renewal_scheduler_issue_failed",
+                    error = %error,
+                    "internal renewal scheduler did not issue a stamp"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::{build_scheduled_invocation, due_for_renewal, renewal_invocation_signer};
+    use tinycloud_core::{keys::StaticSecret, renewal::LeaseRecord, util::InvocationInfo};
+
+    #[test]
+    fn scheduler_builds_a_single_lease_bound_renewal_invocation() -> anyhow::Result<()> {
+        let secret = StaticSecret::new(vec![0x73; 32]).unwrap();
+        let (signer, verification_method) = renewal_invocation_signer(&secret)?;
+        let lease = LeaseRecord {
+            original_cid: "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4".to_owned(),
+            lease_cid: "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq".to_owned(),
+            grantor: "did:key:owner".to_owned(),
+            renewer_did: secret.renewal_did(),
+            renewer_epoch: 7,
+            lease_expiry: 2_000,
+            period_seconds: 30,
+            state: "active".to_owned(),
+            generation: 1,
+        };
+        let (signed, expiry) =
+            build_scheduled_invocation(&lease, &signer, &verification_method, 1_000)?;
+        let info = InvocationInfo::try_from(signed)?;
+        assert_eq!(info.invoker, lease.renewer_did);
+        assert_eq!(info.parents.len(), 1);
+        assert_eq!(info.parents[0].to_string(), lease.lease_cid);
+        assert_eq!(info.capabilities.len(), 1);
+        assert_eq!(
+            info.capabilities[0].ability.as_ref().as_ref(),
+            "tinycloud.delegation/renew"
+        );
+        assert_eq!(
+            info.capabilities[0].resource.to_string(),
+            format!("urn:cid:{}", lease.original_cid)
+        );
+        assert_eq!(expiry, 1_300);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_waits_until_half_of_the_signed_period_remains() {
+        assert!(!due_for_renewal(100, 116, 30));
+        assert!(due_for_renewal(100, 115, 30));
+        assert!(due_for_renewal(100, 101, 30));
+        assert!(!due_for_renewal(100, 102, 1));
+        assert!(due_for_renewal(100, 100, 1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -89,7 +262,7 @@ mod tests {
     #[test]
     fn renewal_signer_is_the_lease_audience_key_not_the_stable_node_identity_key() {
         let node = StaticSecret::new(vec![0x42; 32]).unwrap();
-        let signer = RenewalSigner::from_seed(node.renewal_seed().unwrap(), node.node_did());
+        let signer = RenewalSigner::from_seed(node.renewal_seed().unwrap(), node.node_did(), 1);
         let (bytes, signature, _) = signer
             .sign_stamp("original", "lease", 1, "lease", "2024-01-12T22:13:20Z")
             .unwrap();

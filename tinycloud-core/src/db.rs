@@ -584,7 +584,10 @@ where
 {
     /// Open an unencrypted delegation database and complete historical CID
     /// indexing before accepting requests.
-    pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr> {
+    pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr>
+    where
+        K: Secrets,
+    {
         Self::new_with_encryption(conn, storage, secrets, None).await
     }
 
@@ -596,7 +599,10 @@ where
         storage: B,
         secrets: K,
         encryption: Option<ColumnEncryption>,
-    ) -> Result<Self, DbErr> {
+    ) -> Result<Self, DbErr>
+    where
+        K: Secrets,
+    {
         let pool: RecoveringConnection = conn.clone().into();
         // sea-orm-migration's schema manager accepts only the raw sea-orm
         // connection. Migrations run once at boot, before any request.
@@ -608,6 +614,11 @@ where
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
+        if let Some((seed, _)) = secrets.renewal_seed().zip(secrets.renewal_node_did()) {
+            crate::renewal::initialize_renewal_identity(&pool, seed)
+                .await
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+        }
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
         let read_audit = ReadAuditPipeline::start(pool.clone(), writer_lock.clone());
@@ -691,6 +702,51 @@ where
 
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
         self.secrets.stage_keypair(space_id).await.map(get_did_key)
+    }
+    /// Returns the authorization graph's current effective end for a delegation.
+    pub async fn delegation_effective_expiry(
+        &self,
+        target: Hash,
+        verifier_now: i64,
+    ) -> Result<Option<i64>, crate::renewal::RenewalStoreError>
+    where
+        C: ConnectionTrait,
+    {
+        let roots = [target];
+        let snapshot = match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
+            (Some(stable_node_did), Some(seed)) => {
+                let (renewer_did, epoch, _) =
+                    crate::renewal::current_renewal_identity_from_seed(&self.conn, seed).await?;
+                crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                    &self.conn,
+                    &roots,
+                    &stable_node_did,
+                    &renewer_did,
+                    epoch,
+                    verifier_now,
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::models::revocation::ChainTraversalError::Db(error) => {
+                        crate::renewal::RenewalStoreError::Db(error)
+                    }
+                    crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                        crate::renewal::RenewalStoreError::InvalidInput
+                    }
+                })?
+            }
+            _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
+                .await
+                .map_err(|error| match error {
+                    crate::models::revocation::ChainTraversalError::Db(error) => {
+                        crate::renewal::RenewalStoreError::Db(error)
+                    }
+                    crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                        crate::renewal::RenewalStoreError::InvalidInput
+                    }
+                })?,
+        };
+        Ok(snapshot.effective_expiry(&target))
     }
 }
 
@@ -2260,7 +2316,10 @@ where
         target: Hash,
         invoker: &str,
         proofs: &[tinycloud_auth::authorization::Cid],
-    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>>
+    where
+        K: Secrets,
+    {
         if proofs.len() > 1 {
             return Ok(None);
         }
@@ -2328,12 +2387,15 @@ where
         }
 
         let now = OffsetDateTime::now_utc();
-        if delegation
-            .expiry
-            .map(|expiry| now >= expiry)
-            .unwrap_or(false)
-        {
-            return Ok(Some(DelegationStatus::Expired));
+        let effective_expiry = self
+            .delegation_effective_expiry(target, now.unix_timestamp())
+            .await?;
+        match effective_expiry {
+            Some(end) if now.unix_timestamp() >= end => {
+                return Ok(Some(DelegationStatus::Expired));
+            }
+            Some(_) => {}
+            None => return Ok(Some(DelegationStatus::Unavailable)),
         }
         if delegation
             .not_before
@@ -2847,16 +2909,25 @@ where
             let auth_graph_result =
                 match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
                     (Some(stable_node_did), Some(seed)) => {
-                        let (renewer_did, epoch, _) =
-                            crate::renewal::renewal_identity_from_seed(seed);
-                        crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                            &tx,
-                            &roots,
-                            &stable_node_did,
-                            &renewer_did,
-                            epoch,
-                            now.unix_timestamp(),
-                        )
+                        async {
+                            let (renewer_did, epoch, _) =
+                                crate::renewal::current_renewal_identity_from_seed(&tx, seed)
+                                    .await
+                                    .map_err(|error| {
+                                        revocation::ChainTraversalError::Db(DbErr::Custom(
+                                            error.to_string(),
+                                        ))
+                                    })?;
+                            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                                &tx,
+                                &roots,
+                                &stable_node_did,
+                                &renewer_did,
+                                epoch,
+                                now.unix_timestamp(),
+                            )
+                            .await
+                        }
                         .await
                     }
                     _ => crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await,
@@ -3245,16 +3316,27 @@ where
                 let graph_result =
                     match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
                         (Some(stable_node_did), Some(seed)) => {
-                            let (renewer_did, epoch, _) =
-                                crate::renewal::renewal_identity_from_seed(seed);
-                            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                                &self.conn,
-                                &roots,
-                                &stable_node_did,
-                                &renewer_did,
-                                epoch,
-                                now.unix_timestamp(),
-                            )
+                            async {
+                                let (renewer_did, epoch, _) =
+                                    crate::renewal::current_renewal_identity_from_seed(
+                                        &self.conn, seed,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        revocation::ChainTraversalError::Db(DbErr::Custom(
+                                            error.to_string(),
+                                        ))
+                                    })?;
+                                crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                                    &self.conn,
+                                    &roots,
+                                    &stable_node_did,
+                                    &renewer_did,
+                                    epoch,
+                                    now.unix_timestamp(),
+                                )
+                                .await
+                            }
                             .await
                         }
                         _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots).await,
@@ -4024,14 +4106,14 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     crate::kv_sync::lock_space_sequences_not_held(db, event_spaces.keys(), sequence_locks_held)
         .await?;
     let renewal_seed = secrets.renewal_seed();
-    let renewal_identity =
-        secrets
-            .renewal_node_did()
-            .zip(renewal_seed)
-            .map(|(stable_node_did, seed)| {
-                let (renewer_did, epoch, _) = crate::renewal::renewal_identity_from_seed(seed);
-                (stable_node_did, renewer_did, epoch)
-            });
+    let renewal_identity = match (secrets.renewal_node_did(), renewal_seed) {
+        (Some(stable_node_did), Some(seed)) => {
+            let (renewer_did, epoch, _) =
+                crate::renewal::current_renewal_identity_from_seed(db, seed).await?;
+            Some((stable_node_did, renewer_did, epoch))
+        }
+        _ => None,
+    };
     let mut renewal_lease_events = Vec::new();
     for (_, event) in &event_hashes {
         if let Event::Delegation(lease) = event {
@@ -4067,9 +4149,19 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             registered.insert(*hash, reg);
         }
     }
-    if let (Some(seed), Some((stable_node_did, _, _))) = (renewal_seed, renewal_identity.as_ref()) {
+    if let (Some(seed), Some((stable_node_did, _, renewer_epoch))) =
+        (renewal_seed, renewal_identity.as_ref())
+    {
         for lease in renewal_lease_events {
-            crate::renewal::register_lease(db, lease, seed, stable_node_did, encryption).await?;
+            crate::renewal::register_lease(
+                db,
+                lease,
+                seed,
+                *renewer_epoch,
+                stable_node_did,
+                encryption,
+            )
+            .await?;
         }
     }
 

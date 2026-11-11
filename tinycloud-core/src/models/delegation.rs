@@ -1117,6 +1117,7 @@ fn parent_is_terminal(p: &Model) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 async fn ensure_parent_active<C: ConnectionTrait>(db: &C, parent_id: &Hash) -> Result<(), Error> {
     if revocation::is_revoked(db, parent_id).await? {
         return Err(DelegationError::ParentRevoked(parent_id.to_cid(0x55).to_string()).into());
@@ -2004,13 +2005,14 @@ mod tests {
         let signer = crate::renewal::RenewalSigner::from_seed(
             secret.derive_key(crate::renewal::RENEWER_KEY_CONTEXT),
             stable_did.clone(),
+            epoch,
         );
         let (signed_bytes, signature, stamp_cid) = signer
-            .sign_stamp(&original_cid, &lease_cid, 0, &lease_cid, &end_text)
+            .sign_stamp(&original_cid, &lease_cid, 1, &lease_cid, &end_text)
             .unwrap();
         db.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',0,'did:key:other',$3,$4,$5,$6,2592000,$7)",
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:other',$3,$4,$5,$6,2592000,$7)",
             [
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
@@ -2023,7 +2025,7 @@ mod tests {
         )).await.unwrap();
         db.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9)",
+            "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9)",
             [
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(crate::hash::hash(&signed_bytes))))),
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),

@@ -35,8 +35,12 @@ pub struct NodePublicKeys {
 
 impl NodePublicKeys {
     pub fn derive(secret: &StaticSecret) -> Self {
-        let (renewer_did, renewer_epoch, renewer_public_key) =
-            tinycloud_core::renewal::renewal_identity(secret);
+        Self::derive_at_epoch(secret, 1)
+    }
+
+    pub fn derive_at_epoch(secret: &StaticSecret, epoch: u64) -> Self {
+        let (renewer_did, _, renewer_public_key) =
+            tinycloud_core::renewal::renewal_identity_at_epoch(secret, epoch);
         Self {
             node_did: secret.node_did(),
             share_invitation_public_key: encode_config(
@@ -45,7 +49,7 @@ impl NodePublicKeys {
             ),
             renewer_did,
             renewer_public_key: encode_config(renewer_public_key, URL_SAFE_NO_PAD),
-            renewer_epoch,
+            renewer_epoch: epoch,
         }
     }
 }

@@ -7,7 +7,6 @@ use time::OffsetDateTime;
 use tinycloud_auth::ipld_core::cid::Cid;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde_json::json;
 use thiserror::Error;
 
 pub const STAMP_DOMAIN: &str = "tinycloud/node/renewal-stamp/v1";
@@ -73,6 +72,7 @@ pub struct LeaseRecord {
     pub renewer_did: String,
     pub renewer_epoch: u64,
     pub lease_expiry: i64,
+    pub period_seconds: u64,
     pub state: String,
     pub generation: u64,
 }
@@ -156,35 +156,54 @@ pub fn verify_stamp_signature(
     key.verify(signed_bytes, &signature)
         .map_err(|_| RenewalError::InvalidSignature)
 }
+pub(crate) struct SnapshotStampVerification<'a> {
+    pub(crate) signed_bytes: &'a [u8],
+    pub(crate) signature_bytes: &'a [u8],
+    pub(crate) expected_stamp_cid: &'a str,
+    pub(crate) expected_original_cid: &'a str,
+    pub(crate) expected_lease_cid: &'a str,
+    pub(crate) generation: u64,
+    pub(crate) previous_stamp_cid: &'a str,
+    pub(crate) new_end: i64,
+    pub(crate) node_did: &'a str,
+    pub(crate) renewer_epoch: u64,
+    pub(crate) audience_public_key: &'a [u8; 32],
+    pub(crate) verifier_now: i64,
+    pub(crate) period: i64,
+    pub(crate) lease_expiry: i64,
+    pub(crate) ancestor_ends: &'a [i64],
+}
+
 /// Verify the frozen signed stamp representation against its registered chain.
 pub(crate) fn verify_snapshot_stamp(
-    signed_bytes: &[u8],
-    signature_bytes: &[u8],
-    expected_stamp_cid: &str,
-    expected_original_cid: &str,
-    expected_lease_cid: &str,
-    generation: u64,
-    previous_stamp_cid: &str,
-    new_end: i64,
-    node_did: &str,
-    renewer_epoch: u64,
-    audience_public_key: &[u8; 32],
-    verifier_now: i64,
-    period: i64,
-    lease_expiry: i64,
-    ancestor_ends: &[i64],
+    input: SnapshotStampVerification<'_>,
 ) -> Result<(), RenewalStoreError> {
+    let SnapshotStampVerification {
+        signed_bytes,
+        signature_bytes,
+        expected_stamp_cid,
+        expected_original_cid,
+        expected_lease_cid,
+        generation,
+        previous_stamp_cid,
+        new_end,
+        node_did,
+        renewer_epoch,
+        audience_public_key,
+        verifier_now,
+        period,
+        lease_expiry,
+        ancestor_ends,
+    } = input;
     verify_stamp_signature(signed_bytes, signature_bytes, audience_public_key)?;
-    let signed: serde_json::Value = serde_ipld_dagcbor::from_slice(signed_bytes)
+    let signed: CanonicalRenewalStamp<'_> = serde_ipld_dagcbor::from_slice(signed_bytes)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
     if serde_ipld_dagcbor::to_vec(&signed).map_err(|_| RenewalStoreError::InvalidInput)?
         != signed_bytes
     {
         return Err(RenewalStoreError::InvalidInput);
     }
-    let unsigned = signed
-        .get("unsigned")
-        .ok_or(RenewalStoreError::InvalidInput)?;
+    let unsigned = &signed.unsigned;
     let (expected_stamp_cid, _) = canonical_cid(expected_stamp_cid)?;
     let (expected_original_cid, _) = canonical_cid(expected_original_cid)?;
     let (expected_lease_cid, _) = canonical_cid(expected_lease_cid)?;
@@ -192,36 +211,51 @@ pub(crate) fn verify_snapshot_stamp(
     let end_string = unix_time(new_end)?
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
-    if signed.as_object().is_none_or(|map| map.len() != 2)
-        || unsigned.as_object().is_none_or(|map| map.len() != 9)
-        || signed.get("domain").and_then(serde_json::Value::as_str) != Some(STAMP_DOMAIN)
-        || unsigned.get("type").and_then(serde_json::Value::as_str) != Some("TinyCloudRenewalStamp")
-        || unsigned.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-        || unsigned
-            .get("originalCid")
-            .and_then(serde_json::Value::as_str)
-            != Some(&expected_original_cid)
-        || unsigned.get("leaseCid").and_then(serde_json::Value::as_str) != Some(&expected_lease_cid)
-        || unsigned
-            .get("leaseGeneration")
-            .and_then(serde_json::Value::as_u64)
-            != Some(generation)
-        || unsigned
-            .get("previousStampCid")
-            .and_then(serde_json::Value::as_str)
-            != Some(&previous_stamp_cid)
-        || unsigned.get("nodeDid").and_then(serde_json::Value::as_str) != Some(node_did)
-        || unsigned
-            .get("renewerEpoch")
-            .and_then(serde_json::Value::as_u64)
-            != Some(renewer_epoch)
-        || unsigned.get("newEnd").and_then(serde_json::Value::as_str) != Some(&end_string)
+    if signed.domain != STAMP_DOMAIN
+        || unsigned.stamp_type != "TinyCloudRenewalStamp"
+        || unsigned.version != 1
+        || unsigned.original_cid != expected_original_cid
+        || unsigned.lease_cid != expected_lease_cid
+        || unsigned.lease_generation != generation
+        || unsigned.previous_stamp_cid != previous_stamp_cid
+        || unsigned.node_did != node_did
+        || unsigned.renewer_epoch != renewer_epoch
+        || unsigned.new_end != end_string
         || crate::hash::hash(signed_bytes).to_cid(0x55).to_string() != expected_stamp_cid
     {
         return Err(RenewalStoreError::InvalidInput);
     }
     validate_stamp_end(new_end, verifier_now, period, lease_expiry, ancestor_ends)?;
     Ok(())
+}
+
+// This declaration order is the frozen canonical DAG-CBOR key order.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRenewalStamp<'a> {
+    #[serde(borrow)]
+    domain: &'a str,
+    unsigned: CanonicalRenewalStampUnsigned<'a>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalRenewalStampUnsigned<'a> {
+    #[serde(rename = "type", borrow)]
+    stamp_type: &'a str,
+    #[serde(borrow)]
+    new_end: &'a str,
+    #[serde(borrow)]
+    node_did: &'a str,
+    version: u64,
+    #[serde(borrow)]
+    lease_cid: &'a str,
+    #[serde(borrow)]
+    original_cid: &'a str,
+    renewer_epoch: u64,
+    lease_generation: u64,
+    #[serde(borrow)]
+    previous_stamp_cid: &'a str,
 }
 
 pub struct RenewalSigner {
@@ -231,12 +265,9 @@ pub struct RenewalSigner {
 }
 
 impl RenewalSigner {
-    pub fn from_seed(seed: [u8; 32], node_did: String) -> Self {
-        let key = SigningKey::from_bytes(&seed);
-        let digest = blake3::hash(&key.verifying_key().to_bytes());
-        let renewer_epoch = u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap());
+    pub fn from_seed(seed: [u8; 32], node_did: String, renewer_epoch: u64) -> Self {
         Self {
-            key,
+            key: SigningKey::from_bytes(&seed),
             node_did,
             renewer_epoch,
         }
@@ -258,34 +289,43 @@ impl RenewalSigner {
         (Vec<u8>, Vec<u8>, String),
         serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>,
     > {
-        let unsigned = json!({
-            "type": "TinyCloudRenewalStamp",
-            "version": 1,
-            "originalCid": original_cid,
-            "leaseCid": lease_cid,
-            "leaseGeneration": lease_generation,
-            "previousStampCid": previous_stamp_cid,
-            "nodeDid": self.node_did,
-            "renewerEpoch": self.renewer_epoch,
-            "newEnd": new_end,
-        });
-        let signed = json!({"domain": STAMP_DOMAIN, "unsigned": unsigned});
+        let signed = CanonicalRenewalStamp {
+            domain: STAMP_DOMAIN,
+            unsigned: CanonicalRenewalStampUnsigned {
+                stamp_type: "TinyCloudRenewalStamp",
+                new_end,
+                node_did: &self.node_did,
+                version: 1,
+                lease_cid,
+                original_cid,
+                renewer_epoch: self.renewer_epoch,
+                lease_generation,
+                previous_stamp_cid,
+            },
+        };
         let bytes = serde_ipld_dagcbor::to_vec(&signed)?;
         let signature = self.key.sign(&bytes).to_bytes().to_vec();
         let cid = crate::hash::hash(&bytes).to_cid(0x55).to_string();
         Ok((bytes, signature, cid))
     }
 }
-/// Return the dedicated node renewer DID, its stable key epoch, and raw public key.
+
+/// Return the dedicated node renewer DID, initial epoch, and raw public key.
 pub fn renewal_identity(secret: &StaticSecret) -> (String, u64, [u8; 32]) {
-    renewal_identity_from_seed(secret.derive_key(RENEWER_KEY_CONTEXT))
+    renewal_identity_at_epoch(secret, 1)
+}
+
+pub fn renewal_identity_at_epoch(secret: &StaticSecret, epoch: u64) -> (String, u64, [u8; 32]) {
+    renewal_identity_from_seed_at_epoch(secret.derive_key(RENEWER_KEY_CONTEXT), epoch)
 }
 
 pub fn renewal_identity_from_seed(seed: [u8; 32]) -> (String, u64, [u8; 32]) {
+    renewal_identity_from_seed_at_epoch(seed, 1)
+}
+
+pub fn renewal_identity_from_seed_at_epoch(seed: [u8; 32], epoch: u64) -> (String, u64, [u8; 32]) {
     let signer = SigningKey::from_bytes(&seed);
     let bytes = signer.verifying_key().to_bytes();
-    let digest = blake3::hash(&bytes);
-    let epoch = u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap());
     let public = libp2p::identity::ed25519::PublicKey::try_from_bytes(&bytes)
         .expect("32-byte Ed25519 public key");
     let did = crate::keys::public_key_to_did_key(public.into());
@@ -296,25 +336,109 @@ pub fn is_renewer_did(secret: &StaticSecret, did: &str) -> bool {
     renewal_identity(secret).0 == did
 }
 
-/// The control capability is exact: no prefix, alternate service or resource form.
 pub fn is_renewal_capability(ability: &str, resource: &str, original_cid: &str) -> bool {
     ability == "tinycloud.delegation/renew"
         && resource == format!("urn:cid:{original_cid}")
         && canonical_cid(original_cid).is_ok()
+}
+/// Persist and return the current renewer identity during node startup.
+pub async fn initialize_renewal_identity<C: TransactionTrait + ConnectionTrait>(
+    conn: &C,
+    seed: [u8; 32],
+) -> Result<(String, u64, [u8; 32]), RenewalStoreError> {
+    let (current_did, _, public_key) = renewal_identity_from_seed(seed);
+    let tx = crate::db::begin_write_transaction(conn, None).await?;
+    let backend = tx.get_database_backend();
+    tx.execute_unprepared(
+        "INSERT INTO renewal_identity (id, renewer_did, epoch) VALUES (1, NULL, 0) ON CONFLICT (id) DO NOTHING",
+    )
+    .await?;
+    let query = match backend {
+        DatabaseBackend::Postgres => {
+            "SELECT renewer_did, epoch FROM renewal_identity WHERE id = 1 FOR UPDATE"
+        }
+        DatabaseBackend::Sqlite => "SELECT renewer_did, epoch FROM renewal_identity WHERE id = 1",
+        DatabaseBackend::MySql => return Err(RenewalStoreError::InvalidInput),
+    };
+    let row = tx
+        .query_one(Statement::from_string(backend, query))
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    let previous_did: Option<String> = row.try_get("", "renewer_did")?;
+    let previous_epoch: i64 = row.try_get("", "epoch")?;
+    let epoch = match previous_did.as_deref() {
+        None if previous_epoch == 0 => 1,
+        Some(previous) if previous == current_did && previous_epoch > 0 => previous_epoch as u64,
+        Some(_) if previous_epoch > 0 && previous_epoch < i64::MAX => previous_epoch as u64 + 1,
+        _ => return Err(RenewalStoreError::InvalidInput),
+    };
+    if previous_did.as_deref() != Some(current_did.as_str()) {
+        tx.execute(Statement::from_sql_and_values(
+            backend,
+            "UPDATE renewal_identity SET renewer_did = $1, epoch = $2 WHERE id = 1",
+            [
+                Value::String(Some(Box::new(current_did.clone()))),
+                Value::BigInt(Some(epoch as i64)),
+            ],
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+    Ok((current_did, epoch, public_key))
+}
+
+pub async fn current_renewal_identity<C: ConnectionTrait>(
+    db: &C,
+    secret: &StaticSecret,
+) -> Result<(String, u64, [u8; 32]), RenewalStoreError> {
+    current_renewal_identity_from_seed(db, secret.derive_key(RENEWER_KEY_CONTEXT)).await
+}
+
+pub async fn current_renewal_identity_from_seed<C: ConnectionTrait>(
+    db: &C,
+    seed: [u8; 32],
+) -> Result<(String, u64, [u8; 32]), RenewalStoreError> {
+    let backend = db.get_database_backend();
+    let query = match backend {
+        DatabaseBackend::Postgres => {
+            "SELECT renewer_did, epoch FROM renewal_identity WHERE id = 1 FOR SHARE"
+        }
+        DatabaseBackend::Sqlite => "SELECT renewer_did, epoch FROM renewal_identity WHERE id = 1",
+        DatabaseBackend::MySql => return Err(RenewalStoreError::InvalidInput),
+    };
+    let row = db
+        .query_one(Statement::from_string(backend, query))
+        .await?
+        .ok_or(RenewalStoreError::IdentityEpoch)?;
+    let stored_did: Option<String> = row.try_get("", "renewer_did")?;
+    let epoch: i64 = row.try_get("", "epoch")?;
+    let (derived_did, _, public_key) = renewal_identity_from_seed(seed);
+    if stored_did.as_deref() != Some(derived_did.as_str()) || epoch <= 0 {
+        return Err(RenewalStoreError::IdentityEpoch);
+    }
+    Ok((derived_did, epoch as u64, public_key))
 }
 
 pub async fn lease_for_original<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
 ) -> Result<Option<LeaseRecord>, RenewalStoreError> {
+    lease_for_original_at(db, original_cid, OffsetDateTime::now_utc().unix_timestamp()).await
+}
+
+async fn lease_for_original_at<C: ConnectionTrait>(
+    db: &C,
+    original_cid: &str,
+    verifier_now: i64,
+) -> Result<Option<LeaseRecord>, RenewalStoreError> {
     let (original_cid, original) = canonical_cid(original_cid)?;
     if is_revoked_chain(db, &original).await? {
         return Ok(None);
     }
-    let now = db_datetime(OffsetDateTime::now_utc().unix_timestamp())?;
+    let now = db_datetime(verifier_now)?;
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
-        "SELECT lease_cid, grantor, renewer_did, renewer_epoch, lease_expiry, state, generation FROM renewal_lease WHERE original_canonical = $1 AND state = 'active' AND lease_expiry > $2 ORDER BY lease_cid",
+        "SELECT lease_cid, grantor, renewer_did, renewer_epoch, lease_expiry, period_seconds, state, generation FROM renewal_lease WHERE original_canonical = $1 AND state = 'active' AND lease_expiry > $2 AND renewer_did = (SELECT renewer_did FROM renewal_identity WHERE id = 1) AND renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1) ORDER BY lease_cid",
         [
             Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
             Value::TimeDateTime(Some(Box::new(now))),
@@ -338,19 +462,57 @@ pub async fn lease_for_original<C: ConnectionTrait>(
             renewer_did: row.try_get("", "renewer_did")?,
             renewer_epoch: row.try_get::<i64>("", "renewer_epoch")? as u64,
             lease_expiry: expiry.unix_timestamp(),
+            period_seconds: row.try_get::<i64>("", "period_seconds")? as u64,
             state: row.try_get("", "state")?,
             generation: row.try_get::<i64>("", "generation")? as u64,
         });
     }
     Ok(selected)
 }
+/// Lists the active leases belonging to the node's persisted current renewer epoch.
+pub async fn active_leases_for_current_epoch<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<LeaseRecord>, RenewalStoreError> {
+    let backend = db.get_database_backend();
+    let now = db_datetime(OffsetDateTime::now_utc().unix_timestamp())?;
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            backend,
+            "SELECT DISTINCT original_canonical FROM renewal_lease WHERE state = 'active' AND lease_expiry > $1 AND renewer_did = (SELECT renewer_did FROM renewal_identity WHERE id = 1) AND renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1) ORDER BY original_canonical",
+            [Value::TimeDateTime(Some(Box::new(now)))],
+        ))
+        .await?;
+    let mut leases = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes: Vec<u8> = row.try_get("", "original_canonical")?;
+        let original = Hash::try_from(bytes).map_err(DbErr::from)?;
+        let original_cid = original.to_cid(0x55).to_string();
+        if let Some(lease) = lease_for_original(db, &original_cid).await? {
+            leases.push(lease);
+        }
+    }
+    Ok(leases)
+}
 
-/// Authorize a dedicated `/invoke` control request without the generic graph
-/// authorization or the space-owner shortcuts.
 pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
     db: &C,
     invocation: &crate::util::InvocationInfo,
     original_cid: &str,
+) -> Result<(), RenewalStoreError> {
+    authorize_renewal_invocation_at(
+        db,
+        invocation,
+        original_cid,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .await
+}
+
+async fn authorize_renewal_invocation_at<C: ConnectionTrait>(
+    db: &C,
+    invocation: &crate::util::InvocationInfo,
+    original_cid: &str,
+    verifier_now: i64,
 ) -> Result<(), RenewalStoreError> {
     use crate::models::revocation::{ControlAction, ControlProofDecision};
     if invocation.capabilities.len() != 1
@@ -363,10 +525,15 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
     {
         return Err(RenewalStoreError::Unauthorized);
     }
-    let lease = lease_for_original(db, original_cid)
+    let lease = lease_for_original_at(db, original_cid, verifier_now)
         .await?
         .ok_or(RenewalStoreError::LeaseUnavailable)?;
     if invocation.invoker != lease.renewer_did {
+        return Err(RenewalStoreError::Unauthorized);
+    }
+    let lease_parent =
+        Cid::from_str(&lease.lease_cid).map_err(|_| RenewalStoreError::InvalidInput)?;
+    if invocation.parents.as_slice() != [lease_parent] {
         return Err(RenewalStoreError::Unauthorized);
     }
     let (_, target) = canonical_cid(original_cid)?;
@@ -377,12 +544,13 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
         .await?
         .ok_or(RenewalStoreError::Unauthorized)?;
 
-    match crate::models::revocation::control_proof_decision(
+    match crate::models::revocation::control_proof_decision_at(
         db,
         &invocation.invoker,
         &invocation.parents,
         ControlAction::Renew,
         &target,
+        unix_time(verifier_now)?,
     )
     .await?
     {
@@ -537,8 +705,30 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     tx: &C,
     lease_event: &crate::events::Delegation,
     renewal_seed: [u8; 32],
+    renewer_epoch: u64,
     stable_node_did: &str,
     encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<(), RenewalStoreError> {
+    register_lease_at(
+        tx,
+        lease_event,
+        renewal_seed,
+        renewer_epoch,
+        stable_node_did,
+        encryption,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .await
+}
+
+async fn register_lease_at<C: ConnectionTrait>(
+    tx: &C,
+    lease_event: &crate::events::Delegation,
+    renewal_seed: [u8; 32],
+    renewer_epoch: u64,
+    stable_node_did: &str,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+    now: i64,
 ) -> Result<(), RenewalStoreError> {
     let lease_bytes = lease_event.serialized_bytes();
     let lease = signed_delegation_info(lease_bytes)?;
@@ -613,13 +803,13 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     {
         return Err(RenewalStoreError::InvalidInput);
     }
-    let (renewer_did, renewer_epoch, audience_public_key) =
-        renewal_identity_from_seed(renewal_seed);
+    let (renewer_did, _, audience_public_key) =
+        renewal_identity_from_seed_at_epoch(renewal_seed, renewer_epoch);
     if lease.delegator != original_info.delegator || lease.delegate != renewer_did {
         return Err(RenewalStoreError::Unauthorized);
     }
     lock_original(tx, &original).await?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+
     let lease_horizon = now
         .checked_add(MAX_LEASE_SECONDS)
         .ok_or(RenewalStoreError::InvalidInput)?;
@@ -705,17 +895,22 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     .await?;
     live_chain_effective_ends(&snapshot, &original, now)?;
     live_chain_effective_ends(&snapshot, &lease_hash, now)?;
-    let old_leases = tx.query_all(Statement::from_sql_and_values(
-        backend,
-        "SELECT lease_cid, lease_expiry, state FROM renewal_lease WHERE original_canonical = $1",
-        [Value::Bytes(Some(Box::new(Vec::<u8>::from(original))))],
-    )).await?;
+    let old_leases = tx
+        .query_all(Statement::from_sql_and_values(
+            backend,
+            "SELECT lease_cid, lease_expiry, state FROM renewal_lease WHERE original_canonical = $1 AND renewer_epoch = $2",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                Value::BigInt(Some(renewer_epoch as i64)),
+            ],
+        ))
+        .await?;
     for old in old_leases {
         let old_bytes: Vec<u8> = old.try_get("", "lease_cid")?;
         let old_id = Hash::try_from(old_bytes).map_err(DbErr::from)?;
         let old_state: String = old.try_get("", "state")?;
         if old_state == "revoked" || is_revoked_chain(tx, &old_id).await? {
-            return Err(RenewalStoreError::LeaseUnavailable);
+            continue;
         }
         let old_expiry: OffsetDateTime = old.try_get("", "lease_expiry")?;
         if old_expiry.unix_timestamp() <= now {
@@ -737,7 +932,7 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     }
     tx.execute(Statement::from_sql_and_values(
         backend,
-        "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1, $2, 'active', 0, $3, $4, $5, $6, $7, $8, $9)",
+        "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1, $2, 'active', 1, $3, $4, $5, $6, $7, $8, $9)",
         [
             Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
             Value::Bytes(Some(Box::new(Vec::<u8>::from(lease_hash)))),
@@ -749,7 +944,8 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
             Value::BigInt(Some(period)),
             Value::Bytes(Some(Box::new(audience_public_key.to_vec()))),
         ],
-    )).await?;
+    ))
+    .await?;
     Ok(())
 }
 
@@ -758,12 +954,47 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
     request: StampIssue,
     secret: &StaticSecret,
 ) -> Result<StampRecord, RenewalStoreError> {
+    issue_stamp_at(
+        conn,
+        request,
+        secret,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .await
+}
+
+async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
+    conn: &C,
+    request: StampIssue,
+    secret: &StaticSecret,
+    now: i64,
+) -> Result<StampRecord, RenewalStoreError> {
     let (_, original) = canonical_cid(&request.original_cid)?;
     let tx = crate::db::begin_write_transaction(conn, None).await?;
     let result = async {
         lock_original(&tx, &original).await?;
-        authorize_renewal_invocation(&tx, &request.invocation, &request.original_cid).await?;
-        issue_stamp_in_transaction(&tx, request, secret).await
+        if request.replay_expires_at <= now {
+            return Err(RenewalStoreError::InvalidInput);
+        }
+        if let Err(error) = tx
+            .execute(Statement::from_sql_and_values(
+                tx.get_database_backend(),
+                "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(request.replay_hash)))),
+                    Value::TimeDateTime(Some(Box::new(db_datetime(request.replay_expires_at)?))),
+                ],
+            ))
+            .await
+        {
+            if is_unique_violation(&error) {
+                return Err(RenewalStoreError::Replay);
+            }
+            return Err(error.into());
+        }
+        authorize_renewal_invocation_at(&tx, &request.invocation, &request.original_cid, now)
+            .await?;
+        issue_stamp_in_transaction(&tx, request, secret, now).await
     }
     .await;
     match result {
@@ -782,13 +1013,10 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     tx: &C,
     request: StampIssue,
     secret: &StaticSecret,
+    now: i64,
 ) -> Result<StampRecord, RenewalStoreError> {
     let (original_cid, original) = canonical_cid(&request.original_cid)?;
     let (lease_cid, lease) = canonical_cid(&request.lease_cid)?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    if request.replay_expires_at <= now {
-        return Err(RenewalStoreError::InvalidInput);
-    }
     let backend = tx.get_database_backend();
     let lease_row = tx.query_one(Statement::from_sql_and_values(
         backend,
@@ -800,7 +1028,7 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     )).await?.ok_or(RenewalStoreError::LeaseUnavailable)?;
     let state: String = lease_row.try_get("", "state")?;
     let generation: i64 = lease_row.try_get("", "generation")?;
-    if generation < 0 {
+    if generation <= 0 {
         return Err(RenewalStoreError::InvalidInput);
     }
     let renewer_did: String = lease_row.try_get("", "renewer_did")?;
@@ -809,7 +1037,7 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     let original_expiry: OffsetDateTime = lease_row.try_get("", "original_expiry")?;
     let period: i64 = lease_row.try_get("", "period_seconds")?;
     let audience: Vec<u8> = lease_row.try_get("", "audience_public_key")?;
-    let (current_did, current_epoch, _) = renewal_identity(secret);
+    let (current_did, current_epoch, _) = current_renewal_identity(tx, secret).await?;
     if state != "active" || now >= lease_expiry.unix_timestamp() {
         return Err(RenewalStoreError::LeaseUnavailable);
     }
@@ -847,11 +1075,14 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         return Err(RenewalStoreError::LeaseUnavailable);
     }
     let new_end = new_end(now, period, lease_expiry.unix_timestamp(), &ancestor_ends)?;
-    if new_end <= now {
+    if new_end <= current_original_end {
         return Err(RenewalStoreError::LeaseUnavailable);
     }
-    let signer =
-        RenewalSigner::from_seed(secret.derive_key(RENEWER_KEY_CONTEXT), secret.node_did());
+    let signer = RenewalSigner::from_seed(
+        secret.derive_key(RENEWER_KEY_CONTEXT),
+        secret.node_did(),
+        u64::try_from(renewer_epoch).map_err(|_| RenewalStoreError::InvalidInput)?,
+    );
     let new_end_string = unix_time(new_end)?
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
@@ -876,22 +1107,7 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         lease_expiry.unix_timestamp(),
         &ancestor_ends,
     )?;
-    if let Err(error) = tx
-        .execute(Statement::from_sql_and_values(
-            backend,
-            "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
-            [
-                Value::Bytes(Some(Box::new(Vec::<u8>::from(request.replay_hash)))),
-                Value::TimeDateTime(Some(Box::new(db_datetime(request.replay_expires_at)?))),
-            ],
-        ))
-        .await
-    {
-        if is_unique_violation(&error) {
-            return Err(RenewalStoreError::Replay);
-        }
-        return Err(error.into());
-    }
+
     let stamp_hash = canonical_cid(&cid)?.1;
     tx.execute(Statement::from_sql_and_values(
         backend,
@@ -992,7 +1208,7 @@ pub async fn effective_end<C: ConnectionTrait>(
 ) -> Result<Option<i64>, RenewalStoreError> {
     let (_, original) = canonical_cid(original_cid)?;
     let (_, lease) = canonical_cid(lease_cid)?;
-    let (renewer_did, renewer_epoch, _) = renewal_identity(secret);
+    let (renewer_did, renewer_epoch, _) = current_renewal_identity(db, secret).await?;
     let snapshot = load_renewal_snapshot(
         db,
         &[original, lease],
@@ -1064,7 +1280,9 @@ pub async fn renewal_history<C: ConnectionTrait>(
     invoker: &str,
     proofs: &[Cid],
 ) -> Result<Vec<StampRecord>, RenewalStoreError> {
-    let (_, original_id) = canonical_cid(original_cid)?;
+    let original_id = Cid::from_str(original_cid)
+        .map(Hash::from)
+        .map_err(|_| RenewalStoreError::InvalidInput)?;
     if !status_authorized(db, invoker, proofs, original_id).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
@@ -1101,10 +1319,69 @@ pub async fn renewal_history<C: ConnectionTrait>(
 mod tests {
     use super::*;
     use crate::hash::hash;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use sea_orm::sea_query::Value;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, Statement};
     use sea_orm_migration::MigratorTrait;
+    use std::collections::BTreeMap;
     use time::OffsetDateTime;
+    use tinycloud_auth::{
+        authorization::TinyCloudDelegation,
+        resolver::DID_METHODS,
+        siwe_recap::Ability,
+        ssi::{
+            claims::jwt::NumericDate,
+            jwk::{Algorithm, JWK},
+            ucan::Payload,
+        },
+        ucan_capabilities_object::Capabilities,
+    };
+
+    fn fixed_test_ed25519_jwk(seed: [u8; 32]) -> JWK {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let x = URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes());
+        let d = URL_SAFE_NO_PAD.encode(seed);
+
+        serde_json::from_value(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "alg": "EdDSA",
+            "x": x,
+            "d": d,
+        }))
+        .unwrap()
+    }
+
+    fn signed_test_renewal_lease(
+        audience: &str,
+        original_cid: &str,
+        not_before: i64,
+        expiration: i64,
+    ) -> String {
+        let owner_jwk = fixed_test_ed25519_jwk([0x11; 32]);
+        let owner_did = DID_METHODS.generate(&owner_jwk, "key").unwrap().to_string();
+        let owner_method = format!("{owner_did}#{}", owner_did.trim_start_matches("did:key:"));
+        let mut capabilities = Capabilities::<serde_json::Value>::new();
+        capabilities.with_action(
+            format!("urn:cid:{original_cid}").parse().unwrap(),
+            "tinycloud.delegation/renew".parse::<Ability>().unwrap(),
+            [BTreeMap::<String, serde_json::Value>::new()],
+        );
+        Payload::<serde_json::Value> {
+            issuer: owner_method.parse().unwrap(),
+            audience: audience.parse().unwrap(),
+            not_before: Some(NumericDate::try_from_seconds(not_before as f64).unwrap()),
+            expiration: NumericDate::try_from_seconds(expiration as f64).unwrap(),
+            nonce: Some("epoch-rotation-renewal-lease".to_owned()),
+            facts: None,
+            proof: Vec::new(),
+            attenuation: capabilities,
+        }
+        .sign(Algorithm::EdDSA, &owner_jwk)
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
 
     #[test]
     fn signed_period_and_ancestor_bounds_are_enforced() {
@@ -1124,7 +1401,7 @@ mod tests {
     #[test]
     fn stamp_signature_is_verified_with_lease_audience_key() {
         let stable_node_did = renewal_identity_from_seed([8; 32]).0;
-        let signer = RenewalSigner::from_seed([7; 32], stable_node_did.clone());
+        let signer = RenewalSigner::from_seed([7; 32], stable_node_did.clone(), 1);
         assert_ne!(renewal_identity_from_seed([7; 32]).0, stable_node_did);
         let (bytes, signature, _) = signer
             .sign_stamp(
@@ -1139,7 +1416,7 @@ mod tests {
             verify_stamp_signature(&bytes, &signature, &signer.public_key()),
             Ok(())
         );
-        let node_identity_key = RenewalSigner::from_seed([8; 32], stable_node_did.clone());
+        let node_identity_key = RenewalSigner::from_seed([8; 32], stable_node_did.clone(), 1);
         assert_eq!(renewal_identity_from_seed([8; 32]).0, stable_node_did);
         assert_eq!(
             verify_stamp_signature(&bytes, &signature, &node_identity_key.public_key()),
@@ -1151,46 +1428,46 @@ mod tests {
     fn snapshot_stamp_binds_registered_chain_and_bounds() {
         let original = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
         let lease = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
-        let signer = RenewalSigner::from_seed([7; 32], "did:key:stable-node".to_owned());
+        let signer = RenewalSigner::from_seed([7; 32], "did:key:stable-node".to_owned(), 1);
         let (bytes, signature, stamp) = signer
             .sign_stamp(original, lease, 0, lease, "1970-01-01T00:33:20Z")
             .unwrap();
-        verify_snapshot_stamp(
-            &bytes,
-            &signature,
-            &stamp,
-            original,
-            lease,
-            0,
-            lease,
-            2000,
-            &signer.node_did,
-            signer.renewer_epoch,
-            &signer.public_key(),
-            1000,
-            2000,
-            4000,
-            &[3000],
-        )
+        verify_snapshot_stamp(SnapshotStampVerification {
+            signed_bytes: &bytes,
+            signature_bytes: &signature,
+            expected_stamp_cid: &stamp,
+            expected_original_cid: original,
+            expected_lease_cid: lease,
+            generation: 0,
+            previous_stamp_cid: lease,
+            new_end: 2000,
+            node_did: &signer.node_did,
+            renewer_epoch: signer.renewer_epoch,
+            audience_public_key: &signer.public_key(),
+            verifier_now: 1000,
+            period: 2000,
+            lease_expiry: 4000,
+            ancestor_ends: &[3000],
+        })
         .unwrap();
         assert!(matches!(
-            verify_snapshot_stamp(
-                &bytes,
-                &signature,
-                &stamp,
-                original,
-                lease,
-                0,
-                lease,
-                2000,
-                "did:key:wrong-node",
-                signer.renewer_epoch,
-                &signer.public_key(),
-                1000,
-                2000,
-                4000,
-                &[3000],
-            ),
+            verify_snapshot_stamp(SnapshotStampVerification {
+                signed_bytes: &bytes,
+                signature_bytes: &signature,
+                expected_stamp_cid: &stamp,
+                expected_original_cid: original,
+                expected_lease_cid: lease,
+                generation: 0,
+                previous_stamp_cid: lease,
+                new_end: 2000,
+                node_did: "did:key:wrong-node",
+                renewer_epoch: signer.renewer_epoch,
+                audience_public_key: &signer.public_key(),
+                verifier_now: 1000,
+                period: 2000,
+                lease_expiry: 4000,
+                ancestor_ends: &[3000],
+            }),
             Err(RenewalStoreError::InvalidInput)
         ));
     }
@@ -1199,28 +1476,28 @@ mod tests {
     fn snapshot_chain_allows_expired_predecessor_with_active_tip() {
         let original = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
         let lease = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
-        let signer = RenewalSigner::from_seed([7; 32], "did:key:stable-node".to_owned());
+        let signer = RenewalSigner::from_seed([7; 32], "did:key:stable-node".to_owned(), 1);
         let (old_bytes, old_signature, old_cid) = signer
             .sign_stamp(original, lease, 0, lease, "1970-01-01T00:16:40Z")
             .unwrap();
         let verify = |bytes: &[u8], signature: &[u8], cid: &str, previous: &str, end| {
-            verify_snapshot_stamp(
-                bytes,
-                signature,
-                cid,
-                original,
-                lease,
-                0,
-                previous,
-                end,
-                &signer.node_did,
-                signer.renewer_epoch,
-                &signer.public_key(),
-                2_000,
-                5_000,
-                9_000,
-                &[8_000],
-            )
+            verify_snapshot_stamp(SnapshotStampVerification {
+                signed_bytes: bytes,
+                signature_bytes: signature,
+                expected_stamp_cid: cid,
+                expected_original_cid: original,
+                expected_lease_cid: lease,
+                generation: 0,
+                previous_stamp_cid: previous,
+                new_end: end,
+                node_did: &signer.node_did,
+                renewer_epoch: signer.renewer_epoch,
+                audience_public_key: &signer.public_key(),
+                verifier_now: 2_000,
+                period: 5_000,
+                lease_expiry: 9_000,
+                ancestor_ends: &[8_000],
+            })
         };
         verify(&old_bytes, &old_signature, &old_cid, lease, 1_000).unwrap();
 
@@ -1228,17 +1505,60 @@ mod tests {
             .sign_stamp(original, lease, 0, &old_cid, "1970-01-01T00:50:00Z")
             .unwrap();
         verify(&tip_bytes, &tip_signature, &tip_cid, &old_cid, 3_000).unwrap();
-        assert!(3_000 > 2_000);
+        // The tip ends after the verifier time.
     }
 
     #[test]
-    fn renewer_epoch_is_restart_stable_and_rotates_with_secret() {
+    fn renewer_identity_is_deterministic_and_epoch_is_supplied_by_state() {
         let first = StaticSecret::new(vec![1; 32]).unwrap();
         let same = StaticSecret::new(vec![1; 32]).unwrap();
         let rotated = StaticSecret::new(vec![2; 32]).unwrap();
         assert_eq!(renewal_identity(&first), renewal_identity(&same));
-        assert_ne!(renewal_identity(&first).1, renewal_identity(&rotated).1);
+        assert_ne!(renewal_identity(&first).0, renewal_identity(&rotated).0);
+        assert_eq!(renewal_identity(&first).1, 1);
+        assert_eq!(renewal_identity_at_epoch(&rotated, 7).1, 7);
         assert!(is_renewer_did(&first, &renewal_identity(&same).0));
+    }
+
+    #[tokio::test]
+    async fn persisted_renewer_epoch_increments_only_when_identity_changes() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("CREATE TABLE epoch (seq BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE renewal_identity (id INTEGER PRIMARY KEY, renewer_did TEXT, epoch BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        let first_seed = [1; 32];
+        let second_seed = [2; 32];
+
+        let (first_did, first_epoch, _) =
+            initialize_renewal_identity(&db, first_seed).await.unwrap();
+        assert_eq!(first_epoch, 1);
+        assert_eq!(
+            initialize_renewal_identity(&db, first_seed)
+                .await
+                .unwrap()
+                .1,
+            1
+        );
+        let (second_did, second_epoch, _) =
+            initialize_renewal_identity(&db, second_seed).await.unwrap();
+        assert_ne!(first_did, second_did);
+        assert_eq!(second_epoch, 2);
+        assert!(matches!(
+            current_renewal_identity_from_seed(&db, first_seed).await,
+            Err(RenewalStoreError::IdentityEpoch)
+        ));
+        assert_eq!(
+            initialize_renewal_identity(&db, first_seed)
+                .await
+                .unwrap()
+                .1,
+            3
+        );
     }
 
     #[test]
@@ -1283,22 +1603,46 @@ mod tests {
             .await
             .unwrap();
         crate::migrations::Migrator::up(&db, None).await.unwrap();
-        let secret = StaticSecret::new(vec![4; 32]).unwrap();
-        let (renewer_did, renewer_epoch, audience) = renewal_identity(&secret);
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+        ))
+        .unwrap();
+        let original_serialization = fixture["originalToken"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let lease_serialization = fixture["leaseToken"].as_str().unwrap().as_bytes().to_vec();
+        let original_info = signed_delegation_info(&original_serialization).unwrap();
+        let lease_info = signed_delegation_info(&lease_serialization).unwrap();
+        let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+        let (renewer_did, renewer_epoch, audience) =
+            initialize_renewal_identity(&db, secret.derive_key(RENEWER_KEY_CONTEXT))
+                .await
+                .unwrap();
         let original_cid = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
         let lease_cid = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
         let original = canonical_cid(original_cid).unwrap().1;
         let lease = canonical_cid(lease_cid).unwrap().1;
         let ancestor = hash(b"renewal ancestor");
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let end = now + 1000;
-        let grantor = "did:key:renewal-owner";
+        let original_expiry = original_info.expiry.unwrap().unix_timestamp();
+        let lease_expiry = lease_info.expiry.unwrap().unix_timestamp();
+        let period = period_seconds(
+            original_expiry,
+            original_info.not_before.map(|value| value.unix_timestamp()),
+            original_info.issued_at.map(|value| value.unix_timestamp()),
+            OriginalFormat::Ucan,
+        )
+        .unwrap();
+        let now = original_expiry - 4_000;
+        let end = now + 8_000;
+        let grantor = original_info.delegator.clone();
         let tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
         for actor in [
-            grantor.to_owned(),
+            grantor.clone(),
             renewer_did.clone(),
             "did:key:child".to_owned(),
-            "did:key:holder".to_owned(),
+            original_info.delegate.clone(),
         ] {
             tx.execute(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
@@ -1308,7 +1652,11 @@ mod tests {
             .await
             .unwrap();
         }
-        let insert_delegation = |id: Hash, delegator: String, delegatee: String, expiry: i64| {
+        let insert_delegation = |id: Hash,
+                                 delegator: String,
+                                 delegatee: String,
+                                 expiry: i64,
+                                 serialization: Vec<u8>| {
             Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "INSERT INTO delegation (id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization, serialization_format) VALUES ($1,$2,$3,$4,NULL,NULL,NULL,$5,0)",
@@ -1317,31 +1665,34 @@ mod tests {
                     Value::String(Some(Box::new(delegator))),
                     Value::String(Some(Box::new(delegatee))),
                     Value::TimeDateTime(Some(Box::new(db_datetime(expiry).unwrap()))),
-                    Value::Bytes(Some(Box::new(vec![1]))),
+                    Value::Bytes(Some(Box::new(serialization))),
                 ],
             )
         };
         tx.execute(insert_delegation(
             ancestor,
-            grantor.to_owned(),
+            grantor.clone(),
             "did:key:child".to_owned(),
             end,
+            vec![1],
         ))
         .await
         .unwrap();
         tx.execute(insert_delegation(
             original,
-            grantor.to_owned(),
-            "did:key:holder".to_owned(),
-            now + 5000,
+            grantor.clone(),
+            original_info.delegate.clone(),
+            original_expiry,
+            original_serialization.clone(),
         ))
         .await
         .unwrap();
         tx.execute(insert_delegation(
             lease,
-            grantor.to_owned(),
-            renewer_did.clone(),
-            now + 6000,
+            grantor.clone(),
+            lease_info.delegate.clone(),
+            lease_expiry,
+            lease_serialization.clone(),
         ))
         .await
         .unwrap();
@@ -1378,16 +1729,16 @@ mod tests {
         .unwrap();
         tx.execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',0,$3,$4,$5,$6,$7,$8,$9)",
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,$3,$4,$5,$6,$7,$8,$9)",
             [
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
                 Value::String(Some(Box::new(grantor.to_owned()))),
                 Value::String(Some(Box::new(renewer_did.clone()))),
                 Value::BigInt(Some(renewer_epoch as i64)),
-                Value::TimeDateTime(Some(Box::new(db_datetime(now + 6000).unwrap()))),
-                Value::TimeDateTime(Some(Box::new(db_datetime(now + 5000).unwrap()))),
-                Value::BigInt(Some(10_000)),
+                Value::TimeDateTime(Some(Box::new(db_datetime(lease_expiry).unwrap()))),
+                Value::TimeDateTime(Some(Box::new(db_datetime(original_expiry).unwrap()))),
+                Value::BigInt(Some(period)),
                 Value::Bytes(Some(Box::new(audience.to_vec()))),
             ],
         )).await.unwrap();
@@ -1404,16 +1755,16 @@ mod tests {
             .unwrap();
         assert_eq!(stored_audience, audience);
         assert_eq!(
-            RenewalSigner::from_seed(secret.derive_key(RENEWER_KEY_CONTEXT), secret.node_did())
-                .public_key(),
+            RenewalSigner::from_seed(
+                secret.derive_key(RENEWER_KEY_CONTEXT),
+                secret.node_did(),
+                renewer_epoch,
+            )
+            .public_key(),
             audience
         );
         tx.commit().await.unwrap();
 
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
-        ))
-        .unwrap();
         let invocation_token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
             fixture["originalToken"].as_str().unwrap(),
         )
@@ -1436,16 +1787,25 @@ mod tests {
         let mut wrong_caller = request.invocation.clone();
         wrong_caller.invoker = "did:key:attacker".to_owned();
         assert!(matches!(
-            authorize_renewal_invocation(&db, &wrong_caller, original_cid).await,
+            authorize_renewal_invocation_at(&db, &wrong_caller, original_cid, now).await,
             Err(RenewalStoreError::Unauthorized)
         ));
-        authorize_renewal_invocation(&db, &request.invocation, original_cid)
+        let mut extra_parent = request.invocation.clone();
+        extra_parent.parents.push(original_cid.parse().unwrap());
+        assert!(matches!(
+            authorize_renewal_invocation_at(&db, &extra_parent, original_cid, now).await,
+            Err(RenewalStoreError::Unauthorized)
+        ));
+        authorize_renewal_invocation_at(&db, &request.invocation, original_cid, now)
             .await
             .unwrap();
-        let issued = issue_stamp(&db, request.clone(), &secret).await.unwrap();
+        let issued = issue_stamp_at(&db, request.clone(), &secret, now)
+            .await
+            .unwrap();
         assert!(issued.new_end <= end);
+        assert!(issued.new_end > original_expiry);
         assert!(matches!(
-            issue_stamp(&db, request, &secret).await,
+            issue_stamp_at(&db, request.clone(), &secret, now).await,
             Err(RenewalStoreError::Replay)
         ));
 
@@ -1455,6 +1815,126 @@ mod tests {
                 .unwrap(),
             Some(issued.new_end)
         );
+        let next_seed = [8; 32];
+        let (next_did, next_epoch, _) = initialize_renewal_identity(&db, next_seed).await.unwrap();
+        assert_eq!(next_epoch, renewer_epoch + 1);
+        let next_snapshot = load_renewal_snapshot(
+            &db,
+            &[original, lease],
+            &secret.node_did(),
+            &next_did,
+            next_epoch,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_snapshot.effective_expiry(&original),
+            Some(original_expiry)
+        );
+        assert!(lease_for_original_at(&db, original_cid, now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(issue_stamp_at(&db, request, &secret, now).await.is_err());
+
+        let next_not_before = now - 100;
+        let next_expiry = next_not_before + MAX_LEASE_SECONDS;
+        let next_token =
+            signed_test_renewal_lease(&next_did, original_cid, next_not_before, next_expiry);
+        let next_event =
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&next_token).unwrap();
+        let next_lease = crate::hash::hash(next_event.serialized_bytes());
+        let next_info = signed_delegation_info(next_event.serialized_bytes()).unwrap();
+        assert_eq!(next_info.delegator, grantor);
+        assert_eq!(next_info.delegate, next_did);
+        assert_eq!(next_info.expiry.unwrap().unix_timestamp(), next_expiry);
+        let tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO actor (id) VALUES ($1)",
+            [Value::String(Some(Box::new(next_did.clone())))],
+        ))
+        .await
+        .unwrap();
+        tx.execute(insert_delegation(
+            next_lease,
+            grantor.clone(),
+            next_did.clone(),
+            next_expiry,
+            next_token.as_bytes().to_vec(),
+        ))
+        .await
+        .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1,$1,FALSE)",
+            [Value::Bytes(Some(Box::new(Vec::<u8>::from(next_lease))))],
+        ))
+        .await
+        .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO ability (delegation, resource, ability, caveats) VALUES ($1,$2,$3,$4)",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(next_lease)))),
+                Value::String(Some(Box::new(format!("urn:cid:{original_cid}")))),
+                Value::String(Some(Box::new("tinycloud.delegation/renew".to_owned()))),
+                Value::Json(Some(Box::new(serde_json::json!({})))),
+            ],
+        ))
+        .await
+        .unwrap();
+        register_lease_at(
+            &tx,
+            &next_event,
+            next_seed,
+            next_epoch,
+            &secret.node_did(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let expected_next_lease_cid = next_lease.to_cid(0x55).to_string();
+        assert_eq!(
+            lease_for_original_at(&db, original_cid, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .lease_cid,
+            expected_next_lease_cid
+        );
+        let lease_count: i64 = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM renewal_lease WHERE original_canonical = $1",
+                [Value::Bytes(Some(Box::new(Vec::<u8>::from(original))))],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "count")
+            .unwrap();
+        assert_eq!(lease_count, 2);
+        for epoch in [1_i64, next_epoch as i64] {
+            let rows: i64 = db
+                .query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "SELECT COUNT(*) AS count FROM renewal_lease WHERE original_canonical = $1 AND renewer_epoch = $2",
+                    [
+                        Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                        Value::BigInt(Some(epoch)),
+                    ],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "count")
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
         let replay_count: i64 = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Sqlite,
@@ -1536,7 +2016,7 @@ mod tests {
         }
         tx.execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',0,$3,$4,$5,$6,$7,10000,$8)",
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,$3,$4,$5,$6,$7,10000,$8)",
             [
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
@@ -1572,14 +2052,19 @@ mod tests {
             .unwrap()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let signer = RenewalSigner::from_seed(renewal_seed, secret.node_did());
+        let signer = RenewalSigner::from_seed(renewal_seed, secret.node_did(), renewer_epoch);
         let (signed_bytes, signature, _) = signer
-            .sign_stamp(original_cid, lease_cid, 0, lease_cid, &renewed_end_text)
+            .sign_stamp(original_cid, lease_cid, 1, lease_cid, &renewed_end_text)
             .unwrap();
+        let forged_signature =
+            RenewalSigner::from_seed([0xa5; 32], secret.node_did(), renewer_epoch)
+                .sign_stamp(original_cid, lease_cid, 1, lease_cid, &renewed_end_text)
+                .unwrap()
+                .1;
         let stamp_hash = hash(&signed_bytes);
         tx.execute(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8,$9)",
+            "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9)",
             [
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(stamp_hash)))),
                 Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
@@ -1588,8 +2073,32 @@ mod tests {
                 Value::BigInt(Some(renewer_epoch as i64)),
                 Value::TimeDateTime(Some(Box::new(db_datetime(renewed_end).unwrap()))),
                 Value::Bytes(Some(Box::new(signed_bytes.clone()))),
-                Value::Bytes(Some(Box::new(signature))),
+                Value::Bytes(Some(Box::new(forged_signature))),
                 Value::Bytes(Some(Box::new(hash(&signed_bytes).as_ref().to_vec()))),
+            ],
+        ))
+        .await
+        .unwrap();
+        let forged_snapshot = load_renewal_snapshot(
+            &tx,
+            &roots,
+            &secret.node_did(),
+            &renewer_did,
+            renewer_epoch,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            live_chain_effective_ends(&forged_snapshot, &original, now),
+            Err(RenewalStoreError::LeaseUnavailable)
+        ));
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE renewal_stamp SET signature = $1 WHERE cid = $2",
+            [
+                Value::Bytes(Some(Box::new(signature))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(stamp_hash)))),
             ],
         ))
         .await
