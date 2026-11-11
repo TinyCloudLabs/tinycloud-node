@@ -4,6 +4,7 @@
 //! are public test data only; no runtime renewal code is exercised here.
 
 use base64::{encode_config, URL_SAFE};
+use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use tinycloud_auth::{
@@ -136,6 +137,91 @@ fn renewal_lease_v1_pins_real_owner_signed_ucan_and_exact_original_cid() {
     );
     let lease_cid = canonical_ucan_cid(&lease_token);
 
+    let TinyCloudDelegation::Ucan(original_ucan) =
+        TinyCloudDelegation::decode(&original_token).unwrap().0
+    else {
+        panic!("original vector is a UCAN");
+    };
+    let original_payload = original_ucan.payload();
+    let original_not_before = original_payload
+        .not_before
+        .expect("owner-signed original nbf")
+        .as_seconds();
+    let original_expiration = original_payload.expiration.as_seconds();
+    let period_seconds = original_expiration - original_not_before;
+    assert_eq!(period_seconds, 2_592_000.0);
+
+    let TinyCloudDelegation::Ucan(lease_ucan) =
+        TinyCloudDelegation::decode(&lease_token).unwrap().0
+    else {
+        panic!("lease vector is a UCAN");
+    };
+    let lease_payload = lease_ucan.payload();
+    let lease_not_before = lease_payload
+        .not_before
+        .expect("owner-signed lease nbf")
+        .as_seconds();
+    let lease_expiration = lease_payload.expiration.as_seconds();
+    let lease_lifetime_seconds = lease_expiration - lease_not_before;
+    assert_eq!(lease_lifetime_seconds, 31_536_000.0);
+
+    let first_stamp_now = original_expiration - 86_400.0;
+    let first_stamp_end = (first_stamp_now + period_seconds).min(lease_expiration);
+    assert_eq!(
+        first_stamp_end,
+        original_expiration + period_seconds - 86_400.0
+    );
+    let near_lease_end = lease_expiration - 86_400.0;
+    assert_eq!(
+        (near_lease_end + period_seconds).min(lease_expiration),
+        lease_expiration,
+        "the 365-day lease expiry remains an independent upper bound"
+    );
+    let first_stamp_new_end = time::OffsetDateTime::from_unix_timestamp(first_stamp_end as i64)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let node_did = node_secret.node_did();
+    assert_ne!(node_did, renewer_did);
+    let first_stamp = json!({
+        "domain": "tinycloud/node/renewal-stamp/v1",
+        "unsigned": {
+            "type": "TinyCloudRenewalStamp",
+            "version": 1,
+            "originalCid": original_cid,
+            "leaseCid": lease_cid,
+            "leaseGeneration": 1,
+            "previousStampCid": lease_cid,
+            "nodeDid": node_did,
+            "renewerEpoch": 1,
+            "newEnd": first_stamp_new_end,
+        },
+    });
+    let first_stamp_bytes = serde_ipld_dagcbor::to_vec(&first_stamp).unwrap();
+    let stamp_signer = SigningKey::from_bytes(&renewer_seed);
+    let first_stamp_signature = stamp_signer.sign(&first_stamp_bytes);
+    stamp_signer
+        .verifying_key()
+        .verify(&first_stamp_bytes, &first_stamp_signature)
+        .unwrap();
+    let first_stamp_cid = hash(&first_stamp_bytes).to_cid(0x55).to_string();
+    let first_stamp_vector = json!({
+        "stamp": first_stamp,
+        "canonicalDagCborHex": hex::encode(&first_stamp_bytes),
+        "stampCid": first_stamp_cid,
+        "signerDid": renewer_did,
+        "signerPublicKeyHex": hex::encode(stamp_signer.verifying_key().to_bytes()),
+        "signatureHex": hex::encode(first_stamp_signature.to_bytes()),
+    });
+    assert_eq!(
+        first_stamp_vector["stamp"]["unsigned"]["leaseCid"],
+        lease_cid
+    );
+    assert_eq!(
+        first_stamp_vector["stamp"]["unsigned"]["previousStampCid"],
+        lease_cid
+    );
     let vector = json!({
         "schema": "tinycloud/node/renewal-lease-vector/v1",
         "testOnlyOwnerSeedHex": hex::encode(OWNER_SEED),
@@ -145,6 +231,9 @@ fn renewal_lease_v1_pins_real_owner_signed_ucan_and_exact_original_cid() {
         "issuedAt": ISSUED_AT as u64,
         "originalExpiration": ORIGINAL_EXPIRY as u64,
         "leaseExpiration": LEASE_EXPIRY as u64,
+        "renewalPeriodSource": "owner-signed original exp - nbf",
+        "renewalPeriodSeconds": period_seconds as u64,
+        "leaseLifetimeSeconds": lease_lifetime_seconds as u64,
         "ownerDid": owner_did,
         "holderDid": holder_did,
         "renewerDid": renewer_did,
@@ -156,9 +245,26 @@ fn renewal_lease_v1_pins_real_owner_signed_ucan_and_exact_original_cid() {
         "renewResource": lease_resource,
         "leaseToken": lease_token,
         "leaseCid": lease_cid,
+        "firstStamp": first_stamp_vector,
+        "nodeIdentityDid": node_did,
     });
 
     let fixture: Value = serde_json::from_str(include_str!("fixtures/renewal-lease-v1.json"))
         .expect("renewal lease fixture parses");
-    assert_eq!(vector, fixture, "pin the complete signed UCAN vector");
+    assert_eq!(
+        fixture["firstStamp"]["stamp"]["unsigned"]["leaseCid"], fixture["leaseCid"],
+        "the first stamp is rooted at the real signed lease CID"
+    );
+    assert_eq!(
+        fixture["firstStamp"]["stamp"]["unsigned"]["previousStampCid"], fixture["leaseCid"],
+        "the first previous stamp is the real signed lease CID"
+    );
+    assert_eq!(
+        fixture["renewalPeriodSeconds"], period_seconds as u64,
+        "renewal period comes from the owner's signed original exp - nbf"
+    );
+    assert_eq!(
+        vector, fixture,
+        "pin the complete signed UCAN and stamp vectors"
+    );
 }
