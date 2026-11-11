@@ -44,6 +44,7 @@ pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
+pub mod renewal;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
