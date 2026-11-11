@@ -1,15 +1,15 @@
 # Renewal stamp v1 wire contract
 
-This file records the exact v1 signed-stamp representation pinned by fixture commit `377c0cd9269c982bb2e71b60a51bc77367718031`, the owner-signed lease and linked first stamp pinned by #546 commit `bd2f95ca02ff25f4c67890ad0770ff0451c25295`, and the Bobbie-reviewed design `1635acfc1c4d9f965a58101eb5f8a0dcb45f39ef0996225021597157ac757a53`. Runtime code must enforce the validity bounds below.
+This file records the exact v1 signed-stamp representation pinned by fixture commit `377c0cd9269c982bb2e71b60a51bc77367718031`, based on main `d63d4c44ef274d24f67a7f889379226e4769e261`. The selected architecture is the Bobbie-reviewed design `1635acfc1c4d9f965a58101eb5f8a0dcb45f39ef0996225021597157ac757a53`. This specification freezes the wire contract only; it does not implement runtime renewal behavior.
 
 ## Renewal lease authority
 
-A renewal lease is a real owner-signed UCAN/CACAO DAG delegation addressed to the node renewer DID. Its exact control capability is:
+A renewal lease is an existing owner-authorized UCAN/CACAO delegation. This specification does **not** define a new lease serialization, lease signature format, or a real signed lease vector. Its exact control capability is:
 
 - Ability: `tinycloud.delegation/renew`
 - Resource: `urn:cid:<canonical original delegation CID>`
 
-The #546 fixture pins the signed lease token and CID. Its linked first stamp sets both `leaseCid` and `previousStampCid` to that real lease CID. The signed original grant supplies the renewal period; the owner-signed lease expiry is a separate upper bound. For UCAN, `nbf` is required. Only CACAO may use its signed issued-at claim when `nbf` is absent.
+The CIDs named `originalCid` and `leaseCid` in the known-answer fixture are generated from synthetic DAG-CBOR placeholder artifacts. They test stamp encoding and the non-null root link only; they are not signed UCAN/CACAO delegation records and do not freeze the lease's actual bytes.
 
 ## Signed stamp bytes
 
@@ -38,20 +38,18 @@ Encode with the repository's deterministic `serde_ipld_dagcbor` representation. 
 
 Derive the renewer signing seed from the node's `StaticSecret` with the exact context bytes `tinycloud/node/renewer/v1`, using `StaticSecret::derive_key` (Blake3-256 of the static secret followed by the context). This is distinct from the node's identity-key context and storage-key generation.
 
-Verification uses the public key for the renewer DID in the exact owner-signed lease audience; the stable `nodeDid` is not a signing key. A stamp is valid only when its signature verifies under that audience key and its original CID, lease CID, epoch, and previous-stamp link match the registered chain. At creation, `newEnd` is `min(now + signed original period, lease expiry, every ancestor's effective end)`. At creation and verification, `newEnd` MUST be no later than the lease expiry or any ancestor's effective end; at acceptance it MUST also be no later than verifier time plus the signed original period.
+## Pinned vector
 
-## Pinned linked lease and stamp vector
+The synthetic fixture is `tinycloud-node-server/tests/fixtures/renewal-stamp-v1.json`; its assertions are in `tinycloud-node-server/tests/renewal_stamp_v1_vectors.rs`. The fixture's fixed master-secret bytes (`42` repeated 32 times) are public test data only.
 
-The signed lease, original grant, linked first stamp, and assertions are in `tinycloud-node-server/tests/fixtures/renewal-lease-v1.json` and `tinycloud-node-server/tests/renewal_lease_v1_vectors.rs`. The exact lease and first-stamp vectors were independently verified for #546 at `bd2f95ca02ff25f4c67890ad0770ff0451c25295`.
+- Original placeholder CID: `bafkr4ifaiwrq52xkndrm7jbwqvywq3tkilydyxrj24oofckit6ink7f6hy`
+- Lease placeholder CID and first `previousStampCid`: `bafkr4iaiwsgu3x5bvuigtms3hrlhrwpshbv5lxar5oj7uhh5dfg2sbcl4q`
+- Stamp CID: `bafkr4ibtywvyzwld56wljgytygpis2dddualt6h6b343e52rzmsegyw5nq`
+- Signer public key (hex): `49fd44f3fe8930b0e89f61c51333195578deacaf22105a78f647d8c05afc7c5d`
+- Detached signature (hex): `34caf6cc60615a4c0d4f4e934c0263dde1c17fdd5becfa0f693337987b0250f0b430d7fe4518db41a882cc26ee979603736b883798fb83bbc95fb61af077020d`
 
-- Original CID: `bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4`
-- Lease CID and first `previousStampCid`: `bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq`
-- First stamp CID: `bafkr4iewc5ewhaccw5xh3cvxokvkehjvf76atyhvftq4i4eq7ayneimt3e`
-- Signer DID: the dedicated renewer DID in the lease audience, distinct from the stable node identity DID.
+Exact canonical DAG-CBOR bytes (hex):
 
-The separate `renewal-stamp-v1.json` vector remains a stamp-only canonical-byte test. It is not the linked lease vector.
-The linked vector's exact DAG-CBOR bytes, detached signature, signer key and recomputed CIDs are pinned in `renewal-lease-v1.json`; the stamp-only fixture is not authoritative for lease linkage.
-
-## Current node slice boundary
-
-The current node slice implements renewal issuance/use with existing revoke and status behavior. It does not expose STOP or re-enable operations; those are deferred until their owner-authenticated exact-CID control contract is separately frozen and reviewed. Until then, the owner's only way to turn renewal off is to revoke the lease. Revocation is irreversible and immediately invalidates renewed access; it cannot be re-enabled. This delivery boundary does not change the D13/D18 target behavior.
+```text
+a266646f6d61696e781f74696e79636c6f75642f6e6f64652f72656e6577616c2d7374616d702f763168756e7369676e6564a964747970657554696e79436c6f756452656e6577616c5374616d70666e6577456e6474323033302d30312d30325430333a30343a30355a676e6f646544696478386469643a6b65793a7a364d6b7058766555796a7043446536503833724e5971415a6d6f546339716f704a364742755251526f747a337a46376776657273696f6e01686c65617365436964783b6261666b7234696169777367753378356276756967746d733368726c6872777073686276356c786172356f6a3775686835646667327362636c34716b6f726967696e616c436964783b6261666b7234696661697772713532786b6e64726d376a6277717679777133746b696c79647978726a32346f6f66636b697436696e6b37663668796c72656e6577657245706f6368076f6c6561736547656e65726174696f6e037070726576696f75735374616d70436964783b6261666b7234696169777367753378356276756967746d733368726c6872777073686276356c786172356f6a3775686835646667327362636c3471
+```
