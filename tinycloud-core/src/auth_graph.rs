@@ -1368,9 +1368,26 @@ mod tests {
         let original = hash(b"snapshot-invocation-renewed-original");
         let lease = hash(b"snapshot-invocation-renewed-lease");
         let ancestor = hash(b"snapshot-invocation-renewed-ancestor");
+        let holder = "did:key:renewed-holder";
         let (stable_did, renewer_did, epoch) =
             insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
                 .await;
+        actor::ActiveModel {
+            id: Set(holder.to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation SET delegatee = $1 WHERE id = $2",
+            [
+                Value::String(Some(Box::new(holder.to_owned()))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+            ],
+        ))
+        .await
+        .unwrap();
         for id in [original, ancestor] {
             db.execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
@@ -1385,6 +1402,23 @@ mod tests {
             .await
             .unwrap();
         }
+        let capability = crate::util::Capability {
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
+            ability: "tinycloud.kv/get".to_owned().try_into().unwrap(),
+            caveats: Caveats::default(),
+        };
+        let signed_only_graph = AuthGraphSnapshot::load(&db, &[original]).await.unwrap();
+        assert!(crate::models::invocation::authorize_holder_with_graph(
+            &db,
+            holder,
+            &[capability.clone()],
+            &[original.to_cid(0x55)],
+            OffsetDateTime::from_unix_timestamp(2_150).unwrap(),
+            &signed_only_graph,
+        )
+        .await
+        .is_err());
+
         let graph = AuthGraphSnapshot::load_with_renewal_identity(
             &db,
             &[original],
@@ -1395,14 +1429,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let capability = crate::util::Capability {
-            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
-            ability: "tinycloud.kv/get".to_owned().try_into().unwrap(),
-            caveats: Caveats::default(),
-        };
         crate::models::invocation::authorize_holder_with_graph(
             &db,
-            "did:key:actor",
+            holder,
             &[capability],
             &[original.to_cid(0x55)],
             OffsetDateTime::from_unix_timestamp(2_150).unwrap(),

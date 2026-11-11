@@ -11,9 +11,10 @@ use tinycloud_auth::{
 use tinycloud_core::{
     events::Invocation,
     keys::StaticSecret,
-    renewal::{self, LeaseRecord, RenewalStoreError, StampIssue},
+    renewal::{self, LeaseRecord, StampIssue},
 };
 
+use std::future::Future;
 pub(crate) const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 const INVOCATION_LIFETIME_SECONDS: i64 = 300;
 
@@ -83,46 +84,60 @@ pub(crate) async fn scheduler_tick(
         .ok_or_else(|| anyhow!("node renewal identity is not initialized"))?;
     let leases = renewal::active_leases_for_current_epoch(conn, identity).await?;
     let (signer, verification_method) = renewal_invocation_signer(secret)?;
-    for lease in leases {
-        if lease.state != "active" || lease.renewer_did != identity.renewer_did {
-            continue;
-        }
-        let Some(end) =
-            renewal::effective_end(conn, &lease.original_cid, &lease.lease_cid, now, identity)
-                .await?
-        else {
-            continue;
-        };
-        if !due_for_renewal(now, end, lease.period_seconds) {
-            continue;
-        }
-        let (signed, replay_expires_at) =
-            build_scheduled_invocation(&lease, &signer, &verification_method, now)?;
-        let encoded = signed.encode()?;
-        let event = Invocation::from_header_ser::<TinyCloudInvocation>(&encoded)
-            .map_err(|error| anyhow!("{error:?}"))?;
-        let replay_hash = event.content_hash();
-        let issue = StampIssue {
-            invocation: event.0,
-            original_cid: lease.original_cid,
-            lease_cid: lease.lease_cid,
-            replay_hash,
-            replay_expires_at,
-        };
-        if let Err(error) = tinycloud.issue_renewal_stamp(issue).await {
-            if !matches!(
-                &error,
-                RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
-            ) {
-                ::tracing::warn!(
-                    event = "renewal_scheduler_issue_failed",
-                    error = %error,
-                    "internal renewal scheduler did not issue a stamp"
-                );
+    for_each_scheduled_lease(leases, |lease| {
+        let tinycloud = tinycloud;
+        let conn = conn;
+        let identity = identity;
+        let signer = &signer;
+        let verification_method = &verification_method;
+        async move {
+            if lease.state != "active" || lease.renewer_did != identity.renewer_did {
+                return Ok(());
             }
+            let Some(end) =
+                renewal::effective_end(conn, &lease.original_cid, &lease.lease_cid, now, identity)
+                    .await?
+            else {
+                return Ok(());
+            };
+            if !due_for_renewal(now, end, lease.period_seconds) {
+                return Ok(());
+            }
+            let (signed, replay_expires_at) =
+                build_scheduled_invocation(&lease, signer, verification_method, now)?;
+            let encoded = signed.encode()?;
+            let event = Invocation::from_header_ser::<TinyCloudInvocation>(&encoded)
+                .map_err(|error| anyhow!("{error:?}"))?;
+            let replay_hash = event.content_hash();
+            let issue = StampIssue {
+                invocation: event.0,
+                original_cid: lease.original_cid,
+                lease_cid: lease.lease_cid,
+                replay_hash,
+                replay_expires_at,
+            };
+            tinycloud.issue_renewal_stamp(issue).await?;
+            Ok(())
+        }
+    })
+    .await;
+    Ok(())
+}
+
+async fn for_each_scheduled_lease<F, Fut>(leases: Vec<LeaseRecord>, mut process: F)
+where
+    F: FnMut(LeaseRecord) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    for lease in leases {
+        if let Err(error) = process(lease).await {
+            ::tracing::warn!(
+                event = "renewal_scheduler_lease_failed",
+                error = %error,
+                "internal renewal scheduler failed for one lease; continuing"
+            );
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -133,12 +148,13 @@ mod scheduler_tests {
     #[test]
     fn scheduler_builds_a_single_lease_bound_renewal_invocation() -> anyhow::Result<()> {
         let secret = StaticSecret::new(vec![0x73; 32]).unwrap();
+        let expected_renewer_did = secret.renewal_did();
         let (signer, verification_method) = renewal_invocation_signer(&secret)?;
         let lease = LeaseRecord {
             original_cid: "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4".to_owned(),
             lease_cid: "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq".to_owned(),
             grantor: "did:key:owner".to_owned(),
-            renewer_did: secret.renewal_did(),
+            renewer_did: expected_renewer_did.clone(),
             renewer_epoch: 7,
             lease_expiry: 2_000,
             period_seconds: 30,
@@ -148,7 +164,12 @@ mod scheduler_tests {
         let (signed, expiry) =
             build_scheduled_invocation(&lease, &signer, &verification_method, 1_000)?;
         let info = InvocationInfo::try_from(signed)?;
-        assert_eq!(info.invoker, lease.renewer_did);
+        assert_eq!(info.invoker, expected_renewer_did);
+        let fragment = lease.renewer_did.rsplit_once(':').unwrap().1;
+        assert_eq!(
+            verification_method,
+            format!("{}#{fragment}", lease.renewer_did)
+        );
         assert_eq!(info.parents.len(), 1);
         assert_eq!(info.parents[0].to_string(), lease.lease_cid);
         assert_eq!(info.capabilities.len(), 1);
@@ -172,6 +193,37 @@ mod scheduler_tests {
         assert!(due_for_renewal(100, 101, 30));
         assert!(!due_for_renewal(100, 102, 1));
         assert!(due_for_renewal(100, 100, 1));
+    }
+    #[tokio::test]
+    async fn scheduler_continues_after_a_lease_failure() {
+        let lease = |original_cid: &str| LeaseRecord {
+            original_cid: original_cid.to_owned(),
+            lease_cid: "lease".to_owned(),
+            grantor: "did:key:owner".to_owned(),
+            renewer_did: "did:key:renewer".to_owned(),
+            renewer_epoch: 1,
+            lease_expiry: 2_000,
+            period_seconds: 30,
+            state: "active".to_owned(),
+            generation: 1,
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        super::for_each_scheduled_lease(vec![lease("bad"), lease("later")], {
+            let seen = std::sync::Arc::clone(&seen);
+            move |lease| {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    let fails = lease.original_cid == "bad";
+                    seen.lock().unwrap().push(lease.original_cid);
+                    if fails {
+                        anyhow::bail!("invalid ancestor chain");
+                    }
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["bad", "later"]);
     }
 }
 
