@@ -28,7 +28,7 @@ fn renewal_stamp_v1_matches_pinned_bytes_cid_and_signature() {
     let domain = fixture["stampDomain"].as_str().unwrap();
     let master_secret = decode_hex(&fixture["testOnlyMasterSecretHex"]);
     let node_secret = StaticSecret::new(master_secret).expect("32-byte test seed");
-    let signing_seed: [u8; 32] = node_secret.derive_key(key_context);
+    let signing_seed = node_secret.derive_key(key_context);
     let signer = SigningKey::from_bytes(&signing_seed);
 
     let original_cid = raw_blake3_cid(&dag_cbor(&fixture["originalArtifact"]));
