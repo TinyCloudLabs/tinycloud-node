@@ -1411,7 +1411,7 @@ mod tests {
         assert!(crate::models::invocation::authorize_holder_with_graph(
             &db,
             holder,
-            &[capability.clone()],
+            std::slice::from_ref(&capability),
             &[original.to_cid(0x55)],
             OffsetDateTime::from_unix_timestamp(2_150).unwrap(),
             &signed_only_graph,

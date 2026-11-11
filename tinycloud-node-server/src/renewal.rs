@@ -85,9 +85,6 @@ pub(crate) async fn scheduler_tick(
     let leases = renewal::active_leases_for_current_epoch(conn, identity).await?;
     let (signer, verification_method) = renewal_invocation_signer(secret)?;
     for_each_scheduled_lease(leases, |lease| {
-        let tinycloud = tinycloud;
-        let conn = conn;
-        let identity = identity;
         let signer = &signer;
         let verification_method = &verification_method;
         async move {
