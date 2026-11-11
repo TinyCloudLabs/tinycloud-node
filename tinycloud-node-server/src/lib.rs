@@ -863,9 +863,10 @@ pub async fn app_with_control(
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
     .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
-    let (_, renewer_epoch, _) =
-        tinycloud_core::renewal::current_renewal_identity(tinycloud.connection(), &key_setup)
-            .await?;
+    let renewer_epoch = tinycloud
+        .renewal_identity()
+        .map(|identity| identity.epoch)
+        .ok_or_else(|| anyhow::anyhow!("node renewal identity is not initialized"))?;
     let node_public_keys = NodePublicKeys::derive_at_epoch(&key_setup, renewer_epoch);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,

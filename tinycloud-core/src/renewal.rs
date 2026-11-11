@@ -64,6 +64,16 @@ pub struct StampIssue {
     pub replay_expires_at: i64,
 }
 
+/// The node identity persisted during startup and held constant for this
+/// process lifetime. Request paths reuse this snapshot instead of querying
+/// the identity row on every authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewalNodeIdentity {
+    pub stable_node_did: String,
+    pub renewer_did: String,
+    pub epoch: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub original_cid: String,
@@ -422,28 +432,41 @@ pub async fn current_renewal_identity_from_seed<C: ConnectionTrait>(
 pub async fn lease_for_original<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
+    identity: &RenewalNodeIdentity,
 ) -> Result<Option<LeaseRecord>, RenewalStoreError> {
-    lease_for_original_at(db, original_cid, OffsetDateTime::now_utc().unix_timestamp()).await
+    lease_for_original_at(
+        db,
+        original_cid,
+        OffsetDateTime::now_utc().unix_timestamp(),
+        identity,
+    )
+    .await
 }
 
 async fn lease_for_original_at<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
     verifier_now: i64,
+    identity: &RenewalNodeIdentity,
 ) -> Result<Option<LeaseRecord>, RenewalStoreError> {
     let (original_cid, original) = canonical_cid(original_cid)?;
     if is_revoked_chain(db, &original).await? {
         return Ok(None);
     }
     let now = db_datetime(verifier_now)?;
-    let rows = db.query_all(Statement::from_sql_and_values(
-        db.get_database_backend(),
-        "SELECT lease_cid, grantor, renewer_did, renewer_epoch, lease_expiry, period_seconds, state, generation FROM renewal_lease WHERE original_canonical = $1 AND state = 'active' AND lease_expiry > $2 AND renewer_did = (SELECT renewer_did FROM renewal_identity WHERE id = 1) AND renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1) ORDER BY lease_cid",
-        [
-            Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
-            Value::TimeDateTime(Some(Box::new(now))),
-        ],
-    )).await?;
+    let epoch = i64::try_from(identity.epoch).map_err(|_| RenewalStoreError::InvalidInput)?;
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT lease_cid, grantor, renewer_did, renewer_epoch, lease_expiry, period_seconds, state, generation FROM renewal_lease WHERE original_canonical = $1 AND state = 'active' AND lease_expiry > $2 AND renewer_did = $3 AND renewer_epoch = $4 ORDER BY lease_cid",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                Value::TimeDateTime(Some(Box::new(now))),
+                Value::String(Some(Box::new(identity.renewer_did.clone()))),
+                Value::BigInt(Some(epoch)),
+            ],
+        ))
+        .await?;
     let mut selected = None;
     for row in rows {
         let lease_bytes: Vec<u8> = row.try_get("", "lease_cid")?;
@@ -469,17 +492,24 @@ async fn lease_for_original_at<C: ConnectionTrait>(
     }
     Ok(selected)
 }
-/// Lists the active leases belonging to the node's persisted current renewer epoch.
+/// Lists active leases for the identity captured during node startup.
 pub async fn active_leases_for_current_epoch<C: ConnectionTrait>(
     db: &C,
+    identity: &RenewalNodeIdentity,
 ) -> Result<Vec<LeaseRecord>, RenewalStoreError> {
     let backend = db.get_database_backend();
-    let now = db_datetime(OffsetDateTime::now_utc().unix_timestamp())?;
+    let verifier_now = OffsetDateTime::now_utc().unix_timestamp();
+    let now = db_datetime(verifier_now)?;
+    let epoch = i64::try_from(identity.epoch).map_err(|_| RenewalStoreError::InvalidInput)?;
     let rows = db
         .query_all(Statement::from_sql_and_values(
             backend,
-            "SELECT DISTINCT original_canonical FROM renewal_lease WHERE state = 'active' AND lease_expiry > $1 AND renewer_did = (SELECT renewer_did FROM renewal_identity WHERE id = 1) AND renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1) ORDER BY original_canonical",
-            [Value::TimeDateTime(Some(Box::new(now)))],
+            "SELECT DISTINCT original_canonical FROM renewal_lease WHERE state = 'active' AND lease_expiry > $1 AND renewer_did = $2 AND renewer_epoch = $3 ORDER BY original_canonical",
+            [
+                Value::TimeDateTime(Some(Box::new(now))),
+                Value::String(Some(Box::new(identity.renewer_did.clone()))),
+                Value::BigInt(Some(epoch)),
+            ],
         ))
         .await?;
     let mut leases = Vec::with_capacity(rows.len());
@@ -487,7 +517,9 @@ pub async fn active_leases_for_current_epoch<C: ConnectionTrait>(
         let bytes: Vec<u8> = row.try_get("", "original_canonical")?;
         let original = Hash::try_from(bytes).map_err(DbErr::from)?;
         let original_cid = original.to_cid(0x55).to_string();
-        if let Some(lease) = lease_for_original(db, &original_cid).await? {
+        if let Some(lease) =
+            lease_for_original_at(db, &original_cid, verifier_now, identity).await?
+        {
             leases.push(lease);
         }
     }
@@ -498,11 +530,13 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
     db: &C,
     invocation: &crate::util::InvocationInfo,
     original_cid: &str,
+    identity: &RenewalNodeIdentity,
 ) -> Result<(), RenewalStoreError> {
     authorize_renewal_invocation_at(
         db,
         invocation,
         original_cid,
+        identity,
         OffsetDateTime::now_utc().unix_timestamp(),
     )
     .await
@@ -512,6 +546,7 @@ async fn authorize_renewal_invocation_at<C: ConnectionTrait>(
     db: &C,
     invocation: &crate::util::InvocationInfo,
     original_cid: &str,
+    identity: &RenewalNodeIdentity,
     verifier_now: i64,
 ) -> Result<(), RenewalStoreError> {
     use crate::models::revocation::{ControlAction, ControlProofDecision};
@@ -525,7 +560,7 @@ async fn authorize_renewal_invocation_at<C: ConnectionTrait>(
     {
         return Err(RenewalStoreError::Unauthorized);
     }
-    let lease = lease_for_original_at(db, original_cid, verifier_now)
+    let lease = lease_for_original_at(db, original_cid, verifier_now, identity)
         .await?
         .ok_or(RenewalStoreError::LeaseUnavailable)?;
     if invocation.invoker != lease.renewer_did {
@@ -953,11 +988,13 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
     conn: &C,
     request: StampIssue,
     secret: &StaticSecret,
+    identity: &RenewalNodeIdentity,
 ) -> Result<StampRecord, RenewalStoreError> {
     issue_stamp_at(
         conn,
         request,
         secret,
+        identity,
         OffsetDateTime::now_utc().unix_timestamp(),
     )
     .await
@@ -967,6 +1004,7 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
     conn: &C,
     request: StampIssue,
     secret: &StaticSecret,
+    identity: &RenewalNodeIdentity,
     now: i64,
 ) -> Result<StampRecord, RenewalStoreError> {
     let (_, original) = canonical_cid(&request.original_cid)?;
@@ -992,9 +1030,15 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
             }
             return Err(error.into());
         }
-        authorize_renewal_invocation_at(&tx, &request.invocation, &request.original_cid, now)
-            .await?;
-        issue_stamp_in_transaction(&tx, request, secret, now).await
+        authorize_renewal_invocation_at(
+            &tx,
+            &request.invocation,
+            &request.original_cid,
+            identity,
+            now,
+        )
+        .await?;
+        issue_stamp_in_transaction(&tx, request, secret, identity, now).await
     }
     .await;
     match result {
@@ -1013,6 +1057,7 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     tx: &C,
     request: StampIssue,
     secret: &StaticSecret,
+    identity: &RenewalNodeIdentity,
     now: i64,
 ) -> Result<StampRecord, RenewalStoreError> {
     let (original_cid, original) = canonical_cid(&request.original_cid)?;
@@ -1037,18 +1082,20 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     let original_expiry: OffsetDateTime = lease_row.try_get("", "original_expiry")?;
     let period: i64 = lease_row.try_get("", "period_seconds")?;
     let audience: Vec<u8> = lease_row.try_get("", "audience_public_key")?;
-    let (current_did, current_epoch, _) = current_renewal_identity(tx, secret).await?;
+    let current_epoch = identity.epoch;
+    let current_epoch_i64 =
+        i64::try_from(current_epoch).map_err(|_| RenewalStoreError::InvalidInput)?;
     if state != "active" || now >= lease_expiry.unix_timestamp() {
         return Err(RenewalStoreError::LeaseUnavailable);
     }
-    if renewer_did != current_did || renewer_epoch != current_epoch as i64 {
+    if renewer_did != identity.renewer_did || renewer_epoch != current_epoch_i64 {
         return Err(RenewalStoreError::IdentityEpoch);
     }
     let snapshot = load_renewal_snapshot(
         tx,
         &[original, lease],
-        &secret.node_did(),
-        &current_did,
+        &identity.stable_node_did,
+        &identity.renewer_did,
         current_epoch,
         now,
     )
@@ -1080,8 +1127,8 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     }
     let signer = RenewalSigner::from_seed(
         secret.derive_key(RENEWER_KEY_CONTEXT),
-        secret.node_did(),
-        u64::try_from(renewer_epoch).map_err(|_| RenewalStoreError::InvalidInput)?,
+        identity.stable_node_did.clone(),
+        current_epoch,
     );
     let new_end_string = unix_time(new_end)?
         .format(&time::format_description::well_known::Rfc3339)
@@ -1204,17 +1251,16 @@ pub async fn effective_end<C: ConnectionTrait>(
     original_cid: &str,
     lease_cid: &str,
     verifier_now: i64,
-    secret: &StaticSecret,
+    identity: &RenewalNodeIdentity,
 ) -> Result<Option<i64>, RenewalStoreError> {
     let (_, original) = canonical_cid(original_cid)?;
     let (_, lease) = canonical_cid(lease_cid)?;
-    let (renewer_did, renewer_epoch, _) = current_renewal_identity(db, secret).await?;
     let snapshot = load_renewal_snapshot(
         db,
         &[original, lease],
-        &secret.node_did(),
-        &renewer_did,
-        renewer_epoch,
+        &identity.stable_node_did,
+        &identity.renewer_did,
+        identity.epoch,
         verifier_now,
     )
     .await?;
@@ -1620,6 +1666,11 @@ mod tests {
             initialize_renewal_identity(&db, secret.derive_key(RENEWER_KEY_CONTEXT))
                 .await
                 .unwrap();
+        let identity = RenewalNodeIdentity {
+            stable_node_did: secret.node_did(),
+            renewer_did: renewer_did.clone(),
+            epoch: renewer_epoch,
+        };
         let original_cid = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
         let lease_cid = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
         let original = canonical_cid(original_cid).unwrap().1;
@@ -1787,30 +1838,30 @@ mod tests {
         let mut wrong_caller = request.invocation.clone();
         wrong_caller.invoker = "did:key:attacker".to_owned();
         assert!(matches!(
-            authorize_renewal_invocation_at(&db, &wrong_caller, original_cid, now).await,
+            authorize_renewal_invocation_at(&db, &wrong_caller, original_cid, &identity, now).await,
             Err(RenewalStoreError::Unauthorized)
         ));
         let mut extra_parent = request.invocation.clone();
         extra_parent.parents.push(original_cid.parse().unwrap());
         assert!(matches!(
-            authorize_renewal_invocation_at(&db, &extra_parent, original_cid, now).await,
+            authorize_renewal_invocation_at(&db, &extra_parent, original_cid, &identity, now).await,
             Err(RenewalStoreError::Unauthorized)
         ));
-        authorize_renewal_invocation_at(&db, &request.invocation, original_cid, now)
+        authorize_renewal_invocation_at(&db, &request.invocation, original_cid, &identity, now)
             .await
             .unwrap();
-        let issued = issue_stamp_at(&db, request.clone(), &secret, now)
+        let issued = issue_stamp_at(&db, request.clone(), &secret, &identity, now)
             .await
             .unwrap();
         assert!(issued.new_end <= end);
         assert!(issued.new_end > original_expiry);
         assert!(matches!(
-            issue_stamp_at(&db, request.clone(), &secret, now).await,
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
             Err(RenewalStoreError::Replay)
         ));
 
         assert_eq!(
-            effective_end(&db, original_cid, lease_cid, now, &secret)
+            effective_end(&db, original_cid, lease_cid, now, &identity)
                 .await
                 .unwrap(),
             Some(issued.new_end)
@@ -1818,6 +1869,11 @@ mod tests {
         let next_seed = [8; 32];
         let (next_did, next_epoch, _) = initialize_renewal_identity(&db, next_seed).await.unwrap();
         assert_eq!(next_epoch, renewer_epoch + 1);
+        let next_identity = RenewalNodeIdentity {
+            stable_node_did: secret.node_did(),
+            renewer_did: next_did.clone(),
+            epoch: next_epoch,
+        };
         let next_snapshot = load_renewal_snapshot(
             &db,
             &[original, lease],
@@ -1832,11 +1888,21 @@ mod tests {
             next_snapshot.effective_expiry(&original),
             Some(original_expiry)
         );
-        assert!(lease_for_original_at(&db, original_cid, now)
+        assert_eq!(
+            effective_end(&db, original_cid, lease_cid, now, &next_identity)
+                .await
+                .unwrap(),
+            Some(original_expiry)
+        );
+        assert!(
+            lease_for_original_at(&db, original_cid, now, &next_identity)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(issue_stamp_at(&db, request, &secret, &next_identity, now)
             .await
-            .unwrap()
-            .is_none());
-        assert!(issue_stamp_at(&db, request, &secret, now).await.is_err());
+            .is_err());
 
         let next_not_before = now - 100;
         let next_expiry = next_not_before + MAX_LEASE_SECONDS;
@@ -1899,7 +1965,7 @@ mod tests {
         tx.commit().await.unwrap();
         let expected_next_lease_cid = next_lease.to_cid(0x55).to_string();
         assert_eq!(
-            lease_for_original_at(&db, original_cid, now)
+            lease_for_original_at(&db, original_cid, now, &next_identity)
                 .await
                 .unwrap()
                 .unwrap()

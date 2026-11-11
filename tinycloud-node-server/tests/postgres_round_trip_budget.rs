@@ -168,18 +168,17 @@ use tokio::{
 /// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214.
 /// Quota-aware KV puts include the TC-2389 `/invoke` `authorize_admitted`
 /// check before quota/hosting lookup (`WITH RECURSIVE "proof_roots"`); its
-/// net round trip is included in the put ceilings. Renewal-aware `/delegate`
-/// validation reads the persisted renewer identity once per request under a
-/// share lock; full flows therefore add two round trips for their two
-/// delegation requests. Fusion follow-up: TC-2426.
+/// net round trip is included in the put ceilings. Renewal identity is loaded
+/// once at node startup and reused on requests, so it adds no per-request
+/// database round trips. Fusion follow-up: TC-2426.
 const BUDGETS: [(&str, u64); 7] = [
-    ("sign-in", 73),
-    ("kv put", 45),
+    ("sign-in", 71),
+    ("kv put", 43),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
-    ("kv put 2 blobs", 51),
-    ("kv put 1 blob 2 keys", 48),
+    ("kv put 2 blobs", 49),
+    ("kv put 1 blob 2 keys", 46),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.

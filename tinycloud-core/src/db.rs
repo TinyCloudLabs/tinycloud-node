@@ -266,6 +266,7 @@ pub struct SpaceDatabase<C, B, S> {
     candidate_conn: RecoveringConnection,
     storage: B,
     secrets: S,
+    renewal_identity: Option<crate::renewal::RenewalNodeIdentity>,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
     delegated_sql_caveats: bool,
@@ -614,11 +615,20 @@ where
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
-        if let Some((seed, _)) = secrets.renewal_seed().zip(secrets.renewal_node_did()) {
-            crate::renewal::initialize_renewal_identity(&pool, seed)
-                .await
-                .map_err(|error| DbErr::Custom(error.to_string()))?;
-        }
+        let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
+            (Some(seed), Some(stable_node_did)) => {
+                let (renewer_did, epoch, _) =
+                    crate::renewal::initialize_renewal_identity(&pool, seed)
+                        .await
+                        .map_err(|error| DbErr::Custom(error.to_string()))?;
+                Some(crate::renewal::RenewalNodeIdentity {
+                    stable_node_did,
+                    renewer_did,
+                    epoch,
+                })
+            }
+            _ => None,
+        };
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
         let read_audit = ReadAuditPipeline::start(pool.clone(), writer_lock.clone());
@@ -627,6 +637,7 @@ where
             conn,
             storage,
             secrets,
+            renewal_identity,
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
@@ -716,28 +727,24 @@ where
             .await?
             .map_or(target, |delegation| delegation.id);
         let roots = [effective_root];
-        let snapshot = match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
-            (Some(stable_node_did), Some(seed)) => {
-                let (renewer_did, epoch, _) =
-                    crate::renewal::current_renewal_identity_from_seed(&self.conn, seed).await?;
-                crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                    &self.conn,
-                    &roots,
-                    &stable_node_did,
-                    &renewer_did,
-                    epoch,
-                    verifier_now,
-                )
-                .await
-                .map_err(|error| match error {
-                    crate::models::revocation::ChainTraversalError::Db(error) => {
-                        crate::renewal::RenewalStoreError::Db(error)
-                    }
-                    crate::models::revocation::ChainTraversalError::LimitExceeded => {
-                        crate::renewal::RenewalStoreError::InvalidInput
-                    }
-                })?
-            }
+        let snapshot = match self.renewal_identity.as_ref() {
+            Some(identity) => crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                &self.conn,
+                &roots,
+                &identity.stable_node_did,
+                &identity.renewer_did,
+                identity.epoch,
+                verifier_now,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::models::revocation::ChainTraversalError::Db(error) => {
+                    crate::renewal::RenewalStoreError::Db(error)
+                }
+                crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                    crate::renewal::RenewalStoreError::InvalidInput
+                }
+            })?,
             _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
                 .await
                 .map_err(|error| match error {
@@ -774,10 +781,19 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
     where
         C: ConnectionTrait + TransactionTrait,
     {
-        crate::renewal::issue_stamp(&self.conn, request, &self.secrets).await
+        let identity = self
+            .renewal_identity
+            .as_ref()
+            .ok_or(crate::renewal::RenewalStoreError::IdentityEpoch)?;
+        crate::renewal::issue_stamp(&self.conn, request, &self.secrets, identity).await
     }
 }
 impl<C, B, K> SpaceDatabase<C, B, K> {
+    /// Persisted renewal identity captured during database startup.
+    pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
+        self.renewal_identity.as_ref()
+    }
+
     /// Exposes the node's capability database for projections that are
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
@@ -1963,6 +1979,7 @@ where
             &tx,
             &self.storage,
             &self.secrets,
+            self.renewal_identity.as_ref(),
             events,
             self.encryption.as_ref(),
             None,
@@ -2286,6 +2303,7 @@ where
             tx,
             &self.storage,
             &self.secrets,
+            self.renewal_identity.as_ref(),
             delegations
                 .into_iter()
                 .map(|delegation| Event::Delegation(Box::new(delegation)))
@@ -2909,32 +2927,20 @@ where
             // recorded as a failure; it is disarmed to `ok` right before commit.
             let tx_body_timer =
                 crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-            let auth_graph_result =
-                match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
-                    (Some(stable_node_did), Some(seed)) => {
-                        async {
-                            let (renewer_did, epoch, _) =
-                                crate::renewal::current_renewal_identity_from_seed(&tx, seed)
-                                    .await
-                                    .map_err(|error| {
-                                        revocation::ChainTraversalError::Db(DbErr::Custom(
-                                            error.to_string(),
-                                        ))
-                                    })?;
-                            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                                &tx,
-                                &roots,
-                                &stable_node_did,
-                                &renewer_did,
-                                epoch,
-                                now.unix_timestamp(),
-                            )
-                            .await
-                        }
-                        .await
-                    }
-                    _ => crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await,
-                };
+            let auth_graph_result = match self.renewal_identity.as_ref() {
+                Some(identity) => {
+                    crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                        &tx,
+                        &roots,
+                        &identity.stable_node_did,
+                        &identity.renewer_did,
+                        identity.epoch,
+                        now.unix_timestamp(),
+                    )
+                    .await
+                }
+                None => crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await,
+            };
             let auth_graph = match auth_graph_result {
                 Ok(graph) => graph,
                 Err(error) => {
@@ -3012,6 +3018,7 @@ where
                 &tx,
                 &self.storage,
                 &self.secrets,
+                self.renewal_identity.as_ref(),
                 vec![event],
                 self.encryption.as_ref(),
                 Some(&auth_graph),
@@ -3316,34 +3323,20 @@ where
                         .as_ref()
                         .and_then(|sync| sync.retention_grant),
                 );
-                let graph_result =
-                    match (self.secrets.renewal_node_did(), self.secrets.renewal_seed()) {
-                        (Some(stable_node_did), Some(seed)) => {
-                            async {
-                                let (renewer_did, epoch, _) =
-                                    crate::renewal::current_renewal_identity_from_seed(
-                                        &self.conn, seed,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        revocation::ChainTraversalError::Db(DbErr::Custom(
-                                            error.to_string(),
-                                        ))
-                                    })?;
-                                crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                                    &self.conn,
-                                    &roots,
-                                    &stable_node_did,
-                                    &renewer_did,
-                                    epoch,
-                                    now.unix_timestamp(),
-                                )
-                                .await
-                            }
-                            .await
-                        }
-                        _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots).await,
-                    };
+                let graph_result = match self.renewal_identity.as_ref() {
+                    Some(identity) => {
+                        crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                            &self.conn,
+                            &roots,
+                            &identity.stable_node_did,
+                            &identity.renewer_did,
+                            identity.epoch,
+                            now.unix_timestamp(),
+                        )
+                        .await
+                    }
+                    None => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots).await,
+                };
                 Some(graph_result.map_err(|error| match error {
                     revocation::ChainTraversalError::Db(error) => TxError::<B, K>::Db(error),
                     revocation::ChainTraversalError::LimitExceeded => {
@@ -4086,6 +4079,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
     secrets: &K,
+    node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
@@ -4109,14 +4103,13 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     crate::kv_sync::lock_space_sequences_not_held(db, event_spaces.keys(), sequence_locks_held)
         .await?;
     let renewal_seed = secrets.renewal_seed();
-    let renewal_identity = match (secrets.renewal_node_did(), renewal_seed) {
-        (Some(stable_node_did), Some(seed)) => {
-            let (renewer_did, epoch, _) =
-                crate::renewal::current_renewal_identity_from_seed(db, seed).await?;
-            Some((stable_node_did, renewer_did, epoch))
-        }
-        _ => None,
-    };
+    let renewal_identity = node_identity.map(|identity| {
+        (
+            &identity.stable_node_did,
+            &identity.renewer_did,
+            identity.epoch,
+        )
+    });
     let mut renewal_lease_events = Vec::new();
     for (_, event) in &event_hashes {
         if let Event::Delegation(lease) = event {

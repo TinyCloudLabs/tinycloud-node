@@ -82,14 +82,17 @@ pub(crate) async fn scheduler_tick(
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let conn = tinycloud.connection();
-    let leases = renewal::active_leases_for_current_epoch(conn).await?;
+    let identity = tinycloud
+        .renewal_identity()
+        .ok_or_else(|| anyhow!("node renewal identity is not initialized"))?;
+    let leases = renewal::active_leases_for_current_epoch(conn, identity).await?;
     let (signer, verification_method) = renewal_invocation_signer(secret)?;
     for lease in leases {
-        if lease.state != "active" || lease.renewer_did != secret.renewal_did() {
+        if lease.state != "active" || lease.renewer_did != identity.renewer_did {
             continue;
         }
         let Some(end) =
-            renewal::effective_end(conn, &lease.original_cid, &lease.lease_cid, now, secret)
+            renewal::effective_end(conn, &lease.original_cid, &lease.lease_cid, now, identity)
                 .await?
         else {
             continue;
