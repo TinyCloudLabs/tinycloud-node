@@ -85,6 +85,61 @@ impl FileSystemStore {
         })
     }
 
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// Re-list from the beginning after every batch, including after restart.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, IoError> {
+        let suffix = space.suffix();
+        let name = space.name().as_str();
+        for component in [suffix, name] {
+            if component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.contains('/')
+                || component.contains('\\')
+            {
+                return Err(IoError::new(ErrorKind::InvalidInput, "invalid space path"));
+            }
+        }
+        let owner_directory = self.path.join(suffix);
+        match tokio::fs::symlink_metadata(&owner_directory).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "invalid owner directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        let directory = owner_directory.join(name);
+        match tokio::fs::symlink_metadata(&directory).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "invalid space directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        let mut removed = false;
+        for _ in 0..256 {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
+            // Never follow links or recursively traverse unexpected directories.
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == ErrorKind::NotFound => removed = true,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(!removed)
+    }
+
     fn get_path(&self, space: &SpaceId, mh: &Hash, generation: i64) -> PathBuf {
         let mut name = base64::encode_config(mh.as_ref(), base64::URL_SAFE);
         if generation != 0 {
@@ -1749,3 +1804,7 @@ mod test {
         assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
     }
 }
+
+#[cfg(test)]
+#[path = "space_purge_fs_tests.rs"]
+mod space_purge_tests;

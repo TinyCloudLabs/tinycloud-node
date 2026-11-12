@@ -208,6 +208,50 @@ impl S3BlockStore {
         })
     }
 
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// An empty result verifies absence; subsequent calls always re-list.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+        let prefix = format!("{space}/");
+        if space.to_string().contains('/') {
+            return Err(
+                IoError::new(std::io::ErrorKind::InvalidInput, "invalid space path").into(),
+            );
+        }
+        let page = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(256)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        let objects = page.contents();
+        if objects.is_empty() {
+            return Ok(true);
+        }
+        for object in objects {
+            let key = object.key().ok_or_else(|| {
+                IoError::new(std::io::ErrorKind::InvalidData, "missing object key")
+            })?;
+            if !key.starts_with(&prefix) {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    "object outside space prefix",
+                )
+                .into());
+            }
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(S3Error::from)?;
+        }
+        Ok(false)
+    }
+
     pub(crate) fn key_for(space: &SpaceId, id: &Hash, generation: i64) -> String {
         let mut key = format!("{space}/");
         // Hash digests fit in 64 bytes; encode on the stack so generated
@@ -1228,3 +1272,7 @@ mod tests {
         assert!(parse_content_range("bytes */67108864").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "space_purge_s3_tests.rs"]
+mod space_purge_tests;
