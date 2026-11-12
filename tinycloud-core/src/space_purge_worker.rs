@@ -111,3 +111,95 @@ pub async fn retry(
         .rows_affected()
         == 1)
 }
+
+/// Commit terminal progress only for the current object-phase lease, after
+/// authenticating the separately persisted completion ledger record.
+pub async fn complete(
+    db: &sea_orm::DatabaseConnection,
+    job: &ClaimedPurge,
+    keys: &crate::space_purge_ledger::LedgerKeys,
+    record: &crate::space_purge_ledger::LedgerRecord,
+) -> Result<bool, DbErr> {
+    use sea_orm::TransactionTrait;
+    postgres(db)?;
+    let invalid = || DbErr::Custom("invalid completion ledger record".into());
+    let record = keys
+        .verify(
+            &record.object_key().map_err(|_| invalid())?,
+            &record.to_bytes().map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+    if record.kind != "space" || record.state != "complete" || record.operation_id != job.purge_id {
+        return Err(invalid());
+    }
+    let tx = db.begin().await?;
+    let current =
+        crate::models::space_purge_job::Model::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT * FROM space_purge_job WHERE purge_id=$1 AND lease_token=$2
+         AND fence_generation=$3 AND phase='objects' AND lease_until>clock_timestamp() FOR UPDATE",
+            [
+                job.purge_id.clone().into(),
+                job.lease_token.clone().into(),
+                job.fence_generation.into(),
+            ],
+        ))
+        .one(&tx)
+        .await?;
+    let Some(current) = current else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    if current.hmac_key_id != record.key_id
+        || hex::encode(&current.tombstone_hmac) != record.target_hmac
+    {
+        return Err(invalid());
+    }
+    let completed_at =
+        OffsetDateTime::from_unix_timestamp(record.timestamp).map_err(|_| invalid())?;
+    let inserted = tx
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO space_purge_tombstone(tombstone_hmac,hmac_key_id,purge_id,completed_at)
+         VALUES($1,$2,$3,$4) ON CONFLICT(tombstone_hmac,hmac_key_id)
+         DO UPDATE SET completed_at=EXCLUDED.completed_at
+         WHERE space_purge_tombstone.purge_id=EXCLUDED.purge_id",
+            [
+                current.tombstone_hmac.into(),
+                current.hmac_key_id.into(),
+                job.purge_id.clone().into(),
+                completed_at.into(),
+            ],
+        ))
+        .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(invalid());
+    }
+    tx.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM space WHERE id=$1",
+        [current.space.into()],
+    ))
+    .await?;
+    let updated = tx
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE space_purge_job SET phase='complete',space=NULL,updated_at=$4,
+         lease_token=NULL,lease_until=NULL,last_error_code=NULL
+         WHERE purge_id=$1 AND lease_token=$2 AND fence_generation=$3
+         AND phase='objects' AND lease_until>clock_timestamp()",
+            [
+                job.purge_id.clone().into(),
+                job.lease_token.clone().into(),
+                job.fence_generation.into(),
+                completed_at.into(),
+            ],
+        ))
+        .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
