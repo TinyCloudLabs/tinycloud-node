@@ -1,0 +1,46 @@
+{
+  "schema": "tinycloud/node/renewal-lease-vector/v1",
+  "testOnlyOwnerSeedHex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "testOnlyHolderSeedHex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "testOnlyNodeStaticSecretHex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "renewerKeyContext": "tinycloud/node/renewer/v1",
+  "issuedAt": 1700000000,
+  "originalExpiration": 1702592000,
+  "leaseExpiration": 1731536000,
+  "renewalPeriodSource": "owner-signed original exp - nbf",
+  "renewalPeriodSeconds": 2592000,
+  "leaseLifetimeSeconds": 31536000,
+  "ownerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+  "holderDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+  "renewerDid": "did:key:z6MkjS5oMpzSoPXDb7kCoRYCDRSNZBuijD8NjVntygpKxdwz",
+  "originalResource": "urn:cid:bafkr4ieo6wzrrkvitu3mmgh24iziogohcw5tlfsvkmylymmqhqvvfqdot4",
+  "originalAbility": "tinycloud.kv/get",
+  "originalToken": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJpc3MiOiJkaWQ6a2V5Ono2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyN6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMiLCJhdWQiOiJkaWQ6a2V5Ono2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTcwMDAwMDAwMCwiZXhwIjoxNzAyNTkyMDAwLCJubmMiOiJyZW5ld2FsLWxlYXNlLXZlY3Rvci1vcmlnaW5hbC12MSIsInByZiI6W10sImF0dCI6eyJ1cm46Y2lkOmJhZmtyNGllbzZ3enJya3ZpdHUzbW1naDI0aXppb2dvaGN3NXRsZnN2a215bHltbXFocXZ2ZnFkb3Q0Ijp7InRpbnljbG91ZC5rdi9nZXQiOlt7fV19fX0.aiEIMKOTJz8fCyi5u0plLyk2IJJ3xCLfzoqBsYuyJRQDlBX_HYtRnPs5mh0zaIsnIaqZsJoVwHCZDLdzRarhBg",
+  "originalCid": "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4",
+  "renewAbility": "tinycloud.delegation/renew",
+  "renewResource": "urn:cid:bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4",
+  "leaseToken": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJpc3MiOiJkaWQ6a2V5Ono2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyN6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMiLCJhdWQiOiJkaWQ6a2V5Ono2TWtqUzVvTXB6U29QWERiN2tDb1JZQ0RSU05aQnVpakQ4TmpWbnR5Z3BLeGR3eiIsIm5iZiI6MTcwMDAwMDAwMCwiZXhwIjoxNzMxNTM2MDAwLCJubmMiOiJyZW5ld2FsLWxlYXNlLXZlY3Rvci1sZWFzZS12MSIsInByZiI6W10sImF0dCI6eyJ1cm46Y2lkOmJhZmtyNGliZHR3eGhvYXVjY3d1a25tZjdjZDVtM283NHJ3ZWs3YWw0d2dzMzNlY295Z3VicG1vdXI0Ijp7InRpbnljbG91ZC5kZWxlZ2F0aW9uL3JlbmV3Ijpbe31dfX19.0M8SrJcilZD1Bdf8sFiAPoTF4o8jxke3uRA3Zsg813UXCKWsQjmI1EDOH5TBH8qYofWj4Bu4_KEVcC4Z8kx1CA",
+  "leaseCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq",
+  "firstStamp": {
+    "stamp": {
+      "domain": "tinycloud/node/renewal-stamp/v1",
+      "unsigned": {
+        "type": "TinyCloudRenewalStamp",
+        "version": 1,
+        "originalCid": "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4",
+        "leaseCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq",
+        "leaseGeneration": 1,
+        "previousStampCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq",
+        "nodeDid": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7",
+        "renewerEpoch": 1,
+        "newEnd": "2024-01-12T22:13:20Z"
+      }
+    },
+    "canonicalDagCborHex": "a266646f6d61696e781f74696e79636c6f75642f6e6f64652f72656e6577616c2d7374616d702f763168756e7369676e6564a964747970657554696e79436c6f756452656e6577616c5374616d70666e6577456e6474323032342d30312d31325432323a31333a32305a676e6f646544696478386469643a6b65793a7a364d6b7058766555796a7043446536503833724e5971415a6d6f546339716f704a364742755251526f747a337a46376776657273696f6e01686c65617365436964783b6261666b723469676e6833696f77613567797367656774756f7361363270646b77366d70767268737233756d6a65793578327a6f3466766a6771716b6f726967696e616c436964783b6261666b7234696264747778686f6175636377756b6e6d66376364356d336f37347277656b37616c34776773333365636f79677562706d6f7572346c72656e6577657245706f6368016f6c6561736547656e65726174696f6e017070726576696f75735374616d70436964783b6261666b723469676e6833696f77613567797367656774756f7361363270646b77366d70767268737233756d6a65793578327a6f3466766a677171",
+    "stampCid": "bafkr4iewc5ewhaccw5xh3cvxokvkehjvf76atyhvftq4i4eq7ayneimt3e",
+    "signerDid": "did:key:z6MkjS5oMpzSoPXDb7kCoRYCDRSNZBuijD8NjVntygpKxdwz",
+    "signerPublicKeyHex": "49fd44f3fe8930b0e89f61c51333195578deacaf22105a78f647d8c05afc7c5d",
+    "signatureHex": "763762b3c3d2e57dae2dfeda99ab71d4c286a20da085f9ea3435e972a81b1efe01e8aab34866bfd32bb970fda0fa749aa11577d62364d0becae00713d074620e"
+  },
+  "nodeIdentityDid": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7"
+}
