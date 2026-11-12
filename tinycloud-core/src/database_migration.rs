@@ -1924,7 +1924,8 @@ mod tests {
         let did = tinycloud_auth::resolver::DID_METHODS
             .generate(&jwk, "key")
             .unwrap();
-        let space = tinycloud_auth::resource::SpaceId::new(did, "preview".parse().unwrap());
+        let space =
+            tinycloud_auth::resource::SpaceId::new(did, "preview".parse().unwrap()).unwrap();
         let item = InventoryItem {
             service: "sql".into(),
             space: space.to_string(),
@@ -2457,8 +2458,9 @@ mod tests {
         let did = tinycloud_auth::resolver::DID_METHODS
             .generate(&jwk, "key")
             .unwrap();
-        let lifecycle =
-            tinycloud_auth::resource::SpaceId::new(did, "lifecycle".parse().unwrap()).to_string();
+        let lifecycle = tinycloud_auth::resource::SpaceId::new(did, "lifecycle".parse().unwrap())
+            .unwrap()
+            .to_string();
         let digest = |path: &str| format!("ok:{}", logical_name(Some(path)));
         set_fence(conn, true).await.unwrap();
         for service in ["sql", "duckdb"] {

@@ -182,7 +182,7 @@ async fn show_statement_timeout<C: ConnectionTrait>(conn: &C) -> String {
 fn test_space(name: &str) -> SpaceId {
     let jwk = JWK::generate_ed25519().unwrap();
     let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-    SpaceId::new(did, name.parse().unwrap())
+    SpaceId::new(did, name.parse().unwrap()).unwrap()
 }
 
 fn sql_service(pool: &RecoveringConnection, cache: &tempfile::TempDir) -> SqlService {

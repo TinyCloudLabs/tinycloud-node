@@ -52,7 +52,7 @@ async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
     let space_id = SpaceId::new(
         DIDBuf::from_str(&did).unwrap(),
         "default".to_string().try_into().unwrap(),
-    );
+    ).unwrap();
 
     let session_config = SessionConfig {
         abilities: HashMap::from([(

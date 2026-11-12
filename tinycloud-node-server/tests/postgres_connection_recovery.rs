@@ -110,7 +110,7 @@ impl Owner {
             .ok_or("did:key has no method-specific id")?;
         Ok(Self {
             verification_method: format!("{did}#{fragment}"),
-            space: SpaceId::new(did.parse::<DIDBuf>()?, "default".parse()?),
+            space: SpaceId::new(did.parse::<DIDBuf>()?, "default".parse()?)?,
             did,
             jwk,
         })

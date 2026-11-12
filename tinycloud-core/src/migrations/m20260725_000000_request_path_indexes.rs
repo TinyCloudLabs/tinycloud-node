@@ -314,7 +314,7 @@ mod tests {
     fn test_space_id(name: &str) -> LibSpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        LibSpaceId::new(did, name.parse().unwrap())
+        LibSpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     /// Ordered column list SQLite has physically recorded for `index_name`,

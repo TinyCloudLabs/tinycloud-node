@@ -5741,7 +5741,7 @@ mod test {
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -8869,6 +8869,7 @@ mod test {
         let capability = |did: &str| crate::util::Capability {
             resource: Resource::TinyCloud(
                 SpaceId::new(did.parse::<DIDBuf>().unwrap(), "default".parse().unwrap())
+                    .unwrap()
                     .to_resource("delegation".parse().unwrap(), None, None, None),
             ),
             ability: "tinycloud.delegation/list".to_string().try_into().unwrap(),
@@ -11323,8 +11324,8 @@ mod test {
     fn space_resource_bounds_bracket_every_resource_in_the_space() {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
         let (lower, upper) = space_resource_bounds(&foo);
 
         assert_eq!(lower, format!("{foo}/"));
@@ -11409,10 +11410,10 @@ mod test {
         // never overlap in the first place.
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
-        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap());
-        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
+        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap()).unwrap();
+        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
         // Same *name*, different controller.
         let other_foo = test_space_id("foo");
 
@@ -11596,7 +11597,8 @@ mod test {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         for i in 0..300 {
-            let space = SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap());
+            let space =
+                SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap()).unwrap();
             seed_delegation(
                 conn,
                 &format!("tc320-delegation-{i}"),
@@ -11614,7 +11616,7 @@ mod test {
         .await
         .unwrap();
 
-        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap());
+        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap()).unwrap();
         let explain = |space: Option<&SpaceId>| {
             let mut query = delegation::Entity::find()
                 .left_join(revocation::Entity)
@@ -11726,9 +11728,9 @@ mod test {
             let now = OffsetDateTime::now_utc();
             let jwk = JWK::generate_ed25519().unwrap();
             let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
-            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
 
             seed_delegation(
                 &conn,
@@ -11937,8 +11939,8 @@ mod test {
             let now = OffsetDateTime::now_utc();
             let jwk = JWK::generate_ed25519().unwrap();
             let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
             seed_delegation(
                 &conn,
                 "cl-foo-a",

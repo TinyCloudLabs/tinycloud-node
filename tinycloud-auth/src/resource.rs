@@ -28,8 +28,17 @@ impl fmt::Display for Name {
 impl TryFrom<String> for Name {
     type Error = KRIParseError;
 
-    // TODO finish this by doing validation
     fn try_from(n: String) -> Result<Self, Self::Error> {
+        let bytes = n.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 128
+            || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+            || !bytes.iter().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+        {
+            return Err(KRIParseError::InvalidName);
+        }
         Ok(Self(n))
     }
 }
@@ -37,9 +46,8 @@ impl TryFrom<String> for Name {
 impl FromStr for Name {
     type Err = KRIParseError;
 
-    // TODO finish this by doing validation
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+        Self::try_from(s.to_owned())
     }
 }
 
@@ -52,8 +60,31 @@ pub struct SpaceId {
 }
 
 impl SpaceId {
-    pub fn new(base_did: DIDBuf, name: Name) -> Self {
-        Self { base_did, name }
+    /// Canonicalize the owner DID and validate the space name and owner path component.
+    pub fn new(base_did: DIDBuf, name: Name) -> Result<Self, KRIParseError> {
+        let base_did: DIDBuf = canonicalize_did(base_did.as_str())?.try_into()?;
+        let suffix = &base_did.as_str()[4..];
+        // Colons are required by DID syntax and are valid on supported Unix hosts.
+        if suffix.is_empty()
+            || matches!(suffix, "." | "..")
+            || suffix
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+            || cfg!(windows)
+                && (suffix
+                    .chars()
+                    .any(|c| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+                    || suffix.ends_with(['.', ' ']))
+            || !matches!(
+                std::path::Path::new(suffix).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || std::path::Path::new(suffix).components().count() != 1
+        {
+            return Err(KRIParseError::IncorrectForm);
+        }
+        let name = Name::try_from(name.0)?;
+        Ok(Self { base_did, name })
     }
 
     pub fn did(&self) -> &DID {
@@ -92,9 +123,11 @@ impl SpaceId {
     }
 }
 
-impl From<(DIDBuf, Name)> for SpaceId {
-    fn from((base_did, name): (DIDBuf, Name)) -> Self {
-        Self { base_did, name }
+impl TryFrom<(DIDBuf, Name)> for SpaceId {
+    type Error = KRIParseError;
+
+    fn try_from((base_did, name): (DIDBuf, Name)) -> Result<Self, Self::Error> {
+        Self::new(base_did, name)
     }
 }
 
@@ -347,7 +380,7 @@ impl TryFrom<&UriStr> for SpaceId {
                 Some((suf, name))
             }
         }) {
-            Ok(Self::new(did_from_suffix(suf)?, Name(name.to_string())))
+            Self::new(did_from_suffix(suf)?, name.parse()?)
         } else {
             Err(KRIParseError::IncorrectForm)
         }
@@ -386,7 +419,7 @@ impl TryFrom<&UriStr> for ResourceId {
             })
         {
             Ok(
-                SpaceId::new(did_from_suffix(suf)?, Name(name.to_string())).to_resource(
+                SpaceId::new(did_from_suffix(suf)?, name.parse()?)?.to_resource(
                     Service(service.to_string()),
                     path.map(|p| Path(p.to_string())),
                     uri.query().map(|q| q.into()),

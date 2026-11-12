@@ -55,7 +55,7 @@ impl Manifest {
 
         match (doc, doc_md.deactivated) {
             (_, Some(true)) => Err(ResolutionError::Deactivated),
-            (d, _) => Ok(Some((d.into_document(), id.name().clone()).into())),
+            (d, _) => Ok(Some((d.into_document(), id.name().clone()).try_into()?)),
         }
     }
 }
@@ -72,9 +72,11 @@ pub struct BootstrapPeer {
     pub addrs: Vec<Multiaddr>,
 }
 
-impl From<(Document, Name)> for Manifest {
-    fn from((d, n): (Document, Name)) -> Self {
-        let id = SpaceId::new(d.id.clone(), n);
+impl TryFrom<(Document, Name)> for Manifest {
+    type Error = KRIParseError;
+
+    fn try_from((d, n): (Document, Name)) -> Result<Self, Self::Error> {
+        let id = SpaceId::new(d.id.clone(), n)?;
         let bootstrap_peers = d
             .service(&id.to_string())
             .and_then(|s| BootstrapPeers::try_from(s).ok())
@@ -83,7 +85,7 @@ impl From<(Document, Name)> for Manifest {
                 peers: vec![],
             });
 
-        Self {
+        Ok(Self {
             delegators: get_authorised_parties(
                 &d.id,
                 d.verification_relationships.capability_delegation,
@@ -96,12 +98,14 @@ impl From<(Document, Name)> for Manifest {
             ),
             bootstrap_peers,
             id,
-        }
+        })
     }
 }
 
 #[derive(Error, Debug)]
 pub enum ResolutionError {
+    #[error(transparent)]
+    InvalidSpace(#[from] KRIParseError),
     #[error("DID Resolution Error: {0}")]
     Resolver(#[from] tinycloud_auth::ssi::dids::resolution::Error),
     #[error("DID Deactivated")]
@@ -176,7 +180,7 @@ mod tests {
         let did = DID_METHODS.generate(&j, "pkh:eth").unwrap();
 
         println!("DID: {did:#?}");
-        let space = SpaceId::new(did, "space_name".parse().unwrap());
+        let space = SpaceId::new(did, "space_name".parse().unwrap()).unwrap();
 
         let md = Manifest::resolve(&space, &AnyDidMethod::default())
             .await

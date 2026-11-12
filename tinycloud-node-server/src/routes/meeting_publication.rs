@@ -233,7 +233,8 @@ mod tests {
                 .generate(&key, "key")
                 .unwrap(),
             "freeze-catalog".parse().unwrap(),
-        );
+        )
+        .unwrap();
         tinycloud_core::models::space::ActiveModel {
             id: Set(SpaceIdWrap(space.clone())),
         }
