@@ -10,6 +10,9 @@ use crate::identity::canonicalize_did;
 use std::{convert::TryFrom, fmt, str::FromStr};
 use thiserror::Error;
 
+/// A space name limited to lowercase ASCII matching `[a-z0-9][a-z0-9._-]{0,127}`.
+///
+/// This keeps space identifiers to one safe path component across storage backends.
 #[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, DeserializeFromStr, PartialOrd, Ord)]
 pub struct Name(String);
 
@@ -25,21 +28,38 @@ impl fmt::Display for Name {
     }
 }
 
+fn validate_name(name: &str) -> Result<(), KRIParseError> {
+    let bytes = name.as_bytes();
+    let Some(first) = bytes.first() else {
+        return Err(KRIParseError::InvalidName);
+    };
+    if bytes.len() > 128
+        || !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || bytes.iter().any(|byte| {
+            !(byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(*byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(KRIParseError::InvalidName);
+    }
+    Ok(())
+}
+
 impl TryFrom<String> for Name {
     type Error = KRIParseError;
 
-    // TODO finish this by doing validation
-    fn try_from(n: String) -> Result<Self, Self::Error> {
-        Ok(Self(n))
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        validate_name(&name)?;
+        Ok(Self(name))
     }
 }
 
 impl FromStr for Name {
     type Err = KRIParseError;
 
-    // TODO finish this by doing validation
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::try_from(name.to_owned())
     }
 }
 
@@ -347,7 +367,10 @@ impl TryFrom<&UriStr> for SpaceId {
                 Some((suf, name))
             }
         }) {
-            Ok(Self::new(did_from_suffix(suf)?, Name(name.to_string())))
+            Ok(Self::new(
+                did_from_suffix(suf)?,
+                Name::try_from(name.to_string())?,
+            ))
         } else {
             Err(KRIParseError::IncorrectForm)
         }
@@ -386,7 +409,7 @@ impl TryFrom<&UriStr> for ResourceId {
             })
         {
             Ok(
-                SpaceId::new(did_from_suffix(suf)?, Name(name.to_string())).to_resource(
+                SpaceId::new(did_from_suffix(suf)?, Name::try_from(name.to_string())?).to_resource(
                     Service(service.to_string()),
                     path.map(|p| Path(p.to_string())),
                     uri.query().map(|q| q.into()),
@@ -569,5 +592,79 @@ mod tests {
         let resource_uri: String = "tinycloud:ens:example.eth:ns0/kv/prefix#list".into();
         let res: ResourceId = resource_uri.parse().unwrap();
         assert_eq!(resource_uri, res.to_string());
+    }
+    #[test]
+    fn unsafe_space_names_are_rejected_by_all_name_entrypoints() {
+        let invalid_names = ["", ".", "..", "a/b", "a\\b", "a:b", "a%2Fb", "OpenKey"];
+
+        for name in invalid_names {
+            assert!(
+                Name::try_from(name.to_owned()).is_err(),
+                "TryFrom accepted {name:?}"
+            );
+            assert!(name.parse::<Name>().is_err(), "FromStr accepted {name:?}");
+            let serialized = serde_json::to_string(name).unwrap();
+            assert!(
+                serde_json::from_str::<Name>(&serialized).is_err(),
+                "DeserializeFromStr accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_space_names_are_rejected_by_uri_parsers() {
+        for name in ["", ".", "..", "a/b", "a%2Fb"] {
+            let space_uri = format!("tinycloud:ens:example.eth:{name}");
+            assert!(
+                space_uri.parse::<SpaceId>().is_err(),
+                "SpaceId FromStr accepted {space_uri:?}"
+            );
+            let serialized = serde_json::to_string(&space_uri).unwrap();
+            assert!(
+                serde_json::from_str::<SpaceId>(&serialized).is_err(),
+                "SpaceId DeserializeFromStr accepted {space_uri:?}"
+            );
+            if let Ok(uri) = UriStr::new(&space_uri) {
+                assert!(
+                    SpaceId::try_from(uri).is_err(),
+                    "SpaceId TryFrom<UriStr> accepted {space_uri:?}"
+                );
+            }
+        }
+
+        for name in ["", ".", "..", "a%2Fb"] {
+            let resource_uri = format!("tinycloud:ens:example.eth:{name}/kv");
+            assert!(
+                resource_uri.parse::<ResourceId>().is_err(),
+                "ResourceId FromStr accepted {resource_uri:?}"
+            );
+            let serialized = serde_json::to_string(&resource_uri).unwrap();
+            assert!(
+                serde_json::from_str::<ResourceId>(&serialized).is_err(),
+                "ResourceId DeserializeFromStr accepted {resource_uri:?}"
+            );
+            let uri = UriStr::new(&resource_uri).unwrap();
+            assert!(
+                ResourceId::try_from(uri).is_err(),
+                "ResourceId TryFrom<UriStr> accepted {resource_uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_space_name_round_trips() {
+        let name = Name::try_from("openkey".to_owned()).unwrap();
+        assert_eq!(name.to_string().parse::<Name>().unwrap(), name);
+
+        let space: SpaceId = "tinycloud:ens:example.eth:openkey".parse().unwrap();
+        let displayed = space.to_string();
+        assert_eq!(displayed.parse::<SpaceId>().unwrap(), space);
+        let serialized = serde_json::to_string(&space).unwrap();
+        assert_eq!(serde_json::from_str::<SpaceId>(&serialized).unwrap(), space);
+    }
+    #[test]
+    fn space_name_length_has_a_128_byte_limit() {
+        assert_eq!(Name::try_from("a".repeat(128)).unwrap().as_str().len(), 128);
+        assert!(Name::try_from("a".repeat(129)).is_err());
     }
 }
