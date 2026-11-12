@@ -1276,3 +1276,6 @@ mod tests {
 #[cfg(test)]
 #[path = "space_purge_s3_tests.rs"]
 mod space_purge_tests;
+
+#[path = "purge_ledger_s3.rs"]
+mod purge_ledger;
