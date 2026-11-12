@@ -70,7 +70,7 @@ const sourceGitSha = resolveSourceGitSha();
 const caps = registry.capabilities;
 
 // --- Validation (fail loud; the registry is security-critical) ---
-const URN_PATTERN = /^[a-z0-9.]+\/[A-Za-z0-9._*]+$/;
+const URN_PATTERN = /^[a-z0-9.]+\/[A-Za-z0-9._*-]+$/;
 const byUrn = new Map();
 for (const c of caps) {
   if (byUrn.has(c.urn)) throw new Error(`duplicate URN in registry: ${c.urn}`);

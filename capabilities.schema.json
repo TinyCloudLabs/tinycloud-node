@@ -18,7 +18,7 @@
         "properties": {
           "urn": {
             "type": "string",
-            "pattern": "^[a-z0-9.]+/[A-Za-z0-9._*]+$",
+            "pattern": "^[a-z0-9.]+/[A-Za-z0-9._*-]+$",
             "description": "Full capability action URN, e.g. tinycloud.kv/get."
           },
           "service": {

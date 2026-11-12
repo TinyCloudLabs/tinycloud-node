@@ -280,6 +280,7 @@ pub struct SpaceDatabase<C, B, S> {
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
     database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
+    space_purge_fence: Option<Arc<crate::space_purge_fence::SpacePurgeFence>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,6 +642,7 @@ where
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
+            space_purge_fence: None,
             named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -792,6 +794,18 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()
+    }
+
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Arc<crate::space_purge_fence::SpacePurgeFence>,
+    ) -> Self {
+        self.space_purge_fence = Some(fence);
+        self
+    }
+
+    pub fn space_purge_fence(&self) -> Option<&Arc<crate::space_purge_fence::SpacePurgeFence>> {
+        self.space_purge_fence.as_ref()
     }
 
     /// Exposes the node's capability database for projections that are

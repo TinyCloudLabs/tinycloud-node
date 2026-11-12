@@ -201,10 +201,22 @@
       "notes": "Invoked by the SDK against /invoke (SpaceService.ts create(); TinyCloud.ts lazy public-space create). The node authorizes it via the delegation chain in the invocation-verification path (not via accepted_actions), but there is NO dedicated side-effect handler — db.rs invocation match falls through (_ => {}). Real space creation happens through space/host. 409/404 the SDK sees come from the space-existence check (TxError::SpaceNotFound), not a create handler."
     },
     {
+      "urn": "tinycloud.space/retire-owner",
+      "service": "tinycloud.space",
+      "status": "active",
+      "notes": "POST /space/retire-owner accepts only direct owner-PKH proof on the bare canonical owner DID and records permanent retirement."
+    },
+    {
+      "urn": "tinycloud.space/delete",
+      "service": "tinycloud.space",
+      "status": "active",
+      "notes": "POST /space/purge and /space/purge/status require direct owner-PKH proof on one exact SpaceId/space resource; delegated grants and wildcards cannot authorize them."
+    },
+    {
       "urn": "tinycloud.space/list",
       "service": "tinycloud.space",
       "status": "active",
-      "notes": "Invoked by the SDK (SpaceService.ts listOwnedSpaces). Authorized via the delegation chain; no dedicated node side-effect handler (db.rs invocation match falls through). Owned-space discovery is served via the capabilities/read + host layers, not a space/list handler."
+      "notes": "POST /space/list enumerates owned local live and purging spaces using a direct owner-PKH invocation. Delegated and session signers cannot invoke this lifecycle route."
     },
     {
       "urn": "tinycloud.space/info",

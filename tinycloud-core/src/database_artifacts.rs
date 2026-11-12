@@ -103,6 +103,10 @@ pub struct DeltaSave {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseArtifactError {
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("database artifact storage error: {0}")]
     Db(#[from] DbErr),
     #[error("database artifact payload too large: {0} bytes")]
@@ -676,6 +680,7 @@ struct CurrentArtifact {
 
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
+    purge_fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
     conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
@@ -688,11 +693,59 @@ pub struct SeaOrmDatabaseArtifactRepository {
 impl SeaOrmDatabaseArtifactRepository {
     pub fn new(conn: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
         Self {
+            purge_fence: None,
             conn: conn.into(),
             sqlite_writer_lock: None,
             #[cfg(test)]
             race_barrier: None,
         }
+    }
+
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
+    ) -> Self {
+        self.purge_fence = fence;
+        self
+    }
+    async fn check_space_read(&self, space: &str) -> Result<(), DatabaseArtifactError> {
+        if let Some(fence) = &self.purge_fence {
+            let space = space
+                .parse()
+                .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+            fence
+                .check(&self.conn, &space)
+                .await
+                .map_err(artifact_fence_error)?;
+        }
+        Ok(())
+    }
+    async fn write_scope(
+        &self,
+        space: &str,
+        payload_len: usize,
+    ) -> Result<BulkScope, DatabaseArtifactError> {
+        use sea_orm::TransactionTrait;
+        let mut scope = if payload_len > BASE_TIMEOUT_PAYLOAD_BYTES {
+            self.conn.begin_bulk().await?
+        } else {
+            BulkScope::Pool(self.conn.clone())
+        };
+        if let Some(fence) = &self.purge_fence {
+            if let BulkScope::Pool(conn) = scope {
+                scope = BulkScope::Transaction(conn.begin().await?);
+            }
+            if let BulkScope::Transaction(tx) = &scope {
+                let space = space
+                    .parse()
+                    .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+                fence
+                    .lock_live(tx, &space)
+                    .await
+                    .map_err(artifact_fence_error)?;
+            }
+        }
+        Ok(scope)
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -723,6 +776,16 @@ impl SeaOrmDatabaseArtifactRepository {
                 barrier.wait().await;
             }
         }
+    }
+}
+
+fn artifact_fence_error(error: crate::space_purge_fence::FenceError) -> DatabaseArtifactError {
+    match error {
+        crate::space_purge_fence::FenceError::Deleted => DatabaseArtifactError::SpaceDeleted,
+        crate::space_purge_fence::FenceError::Unavailable => {
+            DatabaseArtifactError::LifecycleUnavailable
+        }
+        crate::space_purge_fence::FenceError::Database(error) => DatabaseArtifactError::Db(error),
     }
 }
 
@@ -822,6 +885,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         name: &str,
     ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
         use database_artifact::Column;
+        self.check_space_read(space).await?;
         let row = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
@@ -887,6 +951,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
+        self.check_space_read(space).await?;
         let key = ArtifactKey {
             service,
             space,
@@ -948,11 +1013,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // the pool's base statement timeout allows, so its write runs under
         // the bulk one (TC-1054). Smaller ones, like every delta, fit the
         // base timeout and pay no extra round trip.
-        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
-            self.conn.begin_bulk().await?
-        } else {
-            BulkScope::Pool(self.conn.clone())
-        };
+        let scope = self.write_scope(space, payload.len()).await?;
         // For Absent, the primary key on the create below asserts absence
         // atomically. Details: TC-2214
         let existing = if expected == ArtifactExpectation::Absent {
@@ -1151,6 +1212,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        let scope = self.write_scope(space, 0).await?;
         let existing = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
@@ -1161,7 +1223,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         .column(database_artifact::Column::CheckpointSizeBytes)
         .column(database_artifact::Column::CheckpointContentHash)
         .into_tuple::<(i64, i64, String)>()
-        .one(&self.conn)
+        .one(&scope)
         .await?
         .ok_or(DatabaseArtifactError::MissingCheckpoint)?;
 
@@ -1219,7 +1281,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .filter(database_artifact::Column::Name.eq(name))
             .filter(database_artifact::Column::Revision.eq(existing.0))
             .filter(database_artifact::Column::CheckpointContentHash.eq(existing.2.clone()))
-            .exec(&self.conn)
+            .exec(&scope)
             .await?;
         if update.rows_affected != 1 {
             return Err(DatabaseArtifactError::Backend(
@@ -1227,6 +1289,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             ));
         }
 
+        scope.commit().await?;
         Ok(DeltaSave {
             revision,
             size_bytes,

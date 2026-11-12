@@ -262,6 +262,8 @@ impl CaveatArm {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
+    #[error("space_deleted")]
+    SpaceDeleted,
     /// A delegated caveat refused the request. The text is fixed: it names the
     /// arm and nothing from the request.
     #[error("sql_caveat_violation: {}", .0.as_str())]

@@ -1,9 +1,9 @@
 //! Authenticated, identity-free records stored outside space storage prefixes.
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -101,10 +101,58 @@ impl LedgerRecord {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyConfig {
+    active_key_id: String,
+    keys: BTreeMap<String, String>,
+}
+impl Drop for KeyConfig {
+    fn drop(&mut self) {
+        for key in self.keys.values_mut() {
+            key.zeroize();
+        }
+    }
+}
+
 impl LedgerKeys {
+    /// TINYCLOUD_SPACE_TOMBSTONE_HMAC_KEY accepts a base64url key (>=32 bytes),
+    /// or a JSON key ring {active_key_id,keys:{id:base64url}} retaining old keys.
+    /// No identity-derived or generated fallback is used.
+    pub fn from_config(raw: String) -> Result<Self, LedgerError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let raw = Zeroizing::new(raw);
+        if raw.trim_start().starts_with('{') {
+            let config: KeyConfig = serde_json::from_str(&raw).map_err(|_| LedgerError)?;
+            let mut keys = BTreeMap::new();
+            for (id, key) in &config.keys {
+                keys.insert(
+                    id.clone(),
+                    Zeroizing::new(URL_SAFE_NO_PAD.decode(key).map_err(|_| LedgerError)?),
+                );
+            }
+            Self::from_keys(config.active_key_id.clone(), keys)
+        } else {
+            let key = URL_SAFE_NO_PAD
+                .decode(raw.trim())
+                .map_err(|_| LedgerError)?;
+            let id = hex::encode(Sha256::digest(&key));
+            Self::new(id.clone(), BTreeMap::from([(id, key)]))
+        }
+    }
     pub fn new(
         active_key_id: String,
         keys: BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, LedgerError> {
+        let keys: BTreeMap<_, _> = keys
+            .into_iter()
+            .map(|(id, key)| (id, Zeroizing::new(key)))
+            .collect();
+        Self::from_keys(active_key_id, keys)
+    }
+    fn from_keys(
+        active_key_id: String,
+        keys: BTreeMap<String, Zeroizing<Vec<u8>>>,
     ) -> Result<Self, LedgerError> {
         if !safe_key_id(&active_key_id)
             || !keys.contains_key(&active_key_id)
@@ -116,12 +164,10 @@ impl LedgerKeys {
         }
         Ok(Self {
             active_key_id,
-            keys: keys
-                .into_iter()
-                .map(|(id, key)| (id, Zeroizing::new(key)))
-                .collect(),
+            keys,
         })
     }
+
     pub fn nonce_hmac(
         &self,
         key_id: &str,

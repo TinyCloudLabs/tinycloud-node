@@ -3650,6 +3650,7 @@ fn json_to_sql_value(v: &serde_json::Value) -> Result<tinycloud_core::sql::SqlVa
 
 pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
     match err {
+        SqlError::SpaceDeleted => Status::Gone,
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
         SqlError::DatabaseNotFound => Status::NotFound,
@@ -4129,6 +4130,8 @@ async fn handle_duckdb_invoke(
 #[cfg(feature = "duckdb")]
 fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     match err {
+        DuckDbError::SpaceDeleted => Status::Gone,
+        DuckDbError::LifecycleUnavailable => Status::ServiceUnavailable,
         DuckDbError::DuckDb(_) => Status::BadRequest,
         DuckDbError::InvalidStatement(_) => Status::BadRequest,
         DuckDbError::SchemaError(_) => Status::BadRequest,

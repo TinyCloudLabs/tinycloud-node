@@ -122,3 +122,35 @@ fn rotation_retains_verification_of_old_records() {
     )
     .is_err());
 }
+
+#[test]
+fn persistent_key_config_is_stable_and_retains_prior_key_versions() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let encoded = URL_SAFE_NO_PAD.encode([17_u8; 32]);
+    let first = LedgerKeys::from_config(encoded.clone()).unwrap();
+    let restarted = LedgerKeys::from_config(encoded.clone()).unwrap();
+    assert_eq!(first.active_key_id(), restarted.active_key_id());
+    let digest = first
+        .target_hmac(first.active_key_id(), "space", "synthetic")
+        .unwrap();
+    let record = first
+        .sign(first.active_key_id(), "space", &digest, OP, "purging", 100)
+        .unwrap();
+    assert!(restarted
+        .verify(&record.object_key().unwrap(), &record.to_bytes().unwrap())
+        .is_ok());
+    let config = serde_json::json!({"active_key_id":"next","keys":{first.active_key_id():encoded,"next":URL_SAFE_NO_PAD.encode([18_u8;32])}});
+    let rotated = LedgerKeys::from_config(config.to_string()).unwrap();
+    assert_eq!(rotated.active_key_id(), "next");
+    assert!(rotated
+        .verify(&record.object_key().unwrap(), &record.to_bytes().unwrap())
+        .is_ok());
+    for invalid in [
+        String::new(),
+        "not a key".into(),
+        URL_SAFE_NO_PAD.encode([0_u8; 31]),
+        "{}".into(),
+    ] {
+        assert!(LedgerKeys::from_config(invalid).is_err());
+    }
+}
