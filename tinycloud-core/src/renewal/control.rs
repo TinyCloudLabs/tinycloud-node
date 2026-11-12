@@ -1,7 +1,9 @@
 //! Strict signed request binding for owner renewal controls.
+use base64::Engine as _;
 use sea_orm::ConnectionTrait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use tinycloud_auth::ipld_core::cid::Cid;
 
 const MAX_GENERATION: u64 = (1 << 53) - 1;
@@ -32,7 +34,12 @@ pub fn bind_request(
     use super::RenewalStoreError::InvalidInput;
     let request: StateRequest = serde_json::from_value(body.clone()).map_err(|_| InvalidInput)?;
     let cid: Cid = request.lease_cid.parse().map_err(|_| InvalidInput)?;
-    if request.version != 1 || cid.to_string() != request.lease_cid {
+    if request.version != 1
+        || cid.to_string() != request.lease_cid
+        || cid.codec() != 0x55
+        || cid.hash().code() != u64::from(tinycloud_auth::multihash_codetable::Code::Blake3_256)
+        || cid.hash().size() != 32
+    {
         return Err(InvalidInput);
     }
     let resources = attenuation.as_object().ok_or(InvalidInput)?;
@@ -52,7 +59,7 @@ pub fn bind_request(
         "tinycloud.delegation/status" => Operation::Read,
         "tinycloud.delegation/stop-renewal" => Operation::Stop,
         "tinycloud.delegation/enable-renewal" => Operation::Enable,
-        _ => return Err(InvalidInput),
+        _ => return Err(super::RenewalStoreError::Unauthorized),
     };
     let caveats = caveats.as_array().ok_or(InvalidInput)?;
     let [caveat] = caveats.as_slice() else {
@@ -79,6 +86,57 @@ pub fn bind_request(
         Some(generation)
     };
     Ok((request, operation, generation))
+}
+
+// Typed UCAN capability maps normalize duplicate keys. Inspect the signed
+// wire object first, preserving uniqueness at each resource/action/caveat level.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct UniqueObject<T>(BTreeMap<String, T>);
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for UniqueObject<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = UniqueObject<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object with unique keys")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, T>()? {
+                    if values.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate signed control key"));
+                    }
+                }
+                Ok(UniqueObject(values))
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    }
+}
+#[derive(Deserialize)]
+struct RawControlClaims {
+    att: UniqueObject<UniqueObject<Vec<UniqueObject<Value>>>>,
+}
+fn bind_signed_request(
+    serialized: &[u8],
+    body: &Value,
+) -> Result<(StateRequest, Operation, Option<u64>), super::RenewalStoreError> {
+    use super::RenewalStoreError::InvalidInput;
+    let token = std::str::from_utf8(serialized).map_err(|_| InvalidInput)?;
+    let parts = token.split('.').collect::<Vec<_>>();
+    let [_, claims, _] = parts.as_slice() else {
+        return Err(InvalidInput);
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims)
+        .map_err(|_| InvalidInput)?;
+    let claims: RawControlClaims = serde_json::from_slice(&bytes).map_err(|_| InvalidInput)?;
+    let attenuation = serde_json::to_value(claims.att).map_err(|_| InvalidInput)?;
+    bind_request(&attenuation, body)
 }
 
 /// A static refusal code, safe to return without exposing signed artifacts.
@@ -166,14 +224,26 @@ pub async fn execute<C: sea_orm::ConnectionTrait + sea_orm::TransactionTrait>(
     if !info.parents.is_empty() || info.invoker == identity.renewer_did {
         return Err(ControlError("unauthorized_control"));
     }
+    let nbf = payload
+        .not_before
+        .ok_or(ControlError("auth_required"))?
+        .as_seconds();
+    let exp = payload.expiration.as_seconds();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+    if nbf > now || exp <= now || exp - nbf > 60.0 {
+        return Err(ControlError("auth_required"));
+    }
     let nonce = payload.nonce.as_deref().unwrap_or_default();
     if nonce.is_empty() || nonce.len() > 256 {
         return Err(ControlError("invalid_request"));
     }
-    let attenuation =
-        serde_json::to_value(&payload.attenuation).map_err(|_| ControlError("invalid_request"))?;
     let (request, operation, generation) =
-        bind_request(&attenuation, body).map_err(|_| ControlError("invalid_request"))?;
+        bind_signed_request(admitted.invocation().serialized_bytes(), body).map_err(|error| {
+            match error {
+                super::RenewalStoreError::Unauthorized => ControlError("unauthorized_control"),
+                _ => ControlError("invalid_request"),
+            }
+        })?;
     let (_, lease) = canonical_cid(&request.lease_cid)?;
     let tx = crate::db::begin_write_transaction(conn, None).await?;
     let result = async {
