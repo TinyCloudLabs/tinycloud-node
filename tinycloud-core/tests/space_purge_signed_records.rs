@@ -859,7 +859,14 @@ async fn postgres_policy_projection_proof_keeps_expired_signed_bytes_until_polic
             delegation_cid: Set(cid.clone()),
             role: Set("policy_authority".into()),
             delegation_mode: Set("attenuated".into()),
-            artifact_json: Set(serde_json::json!({})),
+            artifact_json: Set(serde_json::json!({
+                "schema":"test-persisted-policy", "role":"policy-authority", "delegationMode":"attenuable",
+                "delegationCid":cid, "issuerDid":f.issuer,"audienceDid":f.issuer,
+                "capabilities":[{"service":"tinycloud.kv","space":B,"path":"key","actions":["tinycloud.kv/get"]}],
+                "proofCids":[], "notBefore":(now-time::Duration::hours(1)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+                "expiresAt":(now+time::Duration::hours(1)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+                "facts":{},"signature":{"suite":"fixture","value":"fixture"}
+            })),
             not_before: Set((now - time::Duration::hours(1))
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap()),
@@ -889,7 +896,7 @@ async fn postgres_policy_projection_proof_keeps_expired_signed_bytes_until_polic
     let now = OffsetDateTime::now_utc();
     models::policy_v3_registration::ActiveModel {
         policy_cid: Set(policy.clone()),
-        policy_bytes: Set(b"signed policy".to_vec()),
+        policy_bytes: Set(serde_json::to_vec(&serde_json::json!({"capabilityCeiling":[{"kind":"kv","resource":format!("{B}/kv/key"),"actions":["tinycloud.kv/get"]}]})).unwrap()),
         policy_digest_hex: Set("00".repeat(32)),
         owner_did: Set(OWNER_B.into()),
         policy_root_cid: Set(projected.clone()),
@@ -927,6 +934,17 @@ async fn postgres_policy_projection_proof_keeps_expired_signed_bytes_until_polic
     let tx = f.db.begin().await.unwrap();
     records::operation(&tx).await.unwrap();
     models::policy_v3_registration::Entity::delete_by_id(policy)
+        .exec(&tx)
+        .await
+        .unwrap();
+    models::policy_delegation::Entity::update_many()
+        .col_expr(
+            models::policy_delegation::Column::RevokedAt,
+            sea_orm::sea_query::Expr::value(
+                now.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            ),
+        )
         .exec(&tx)
         .await
         .unwrap();
@@ -991,5 +1009,213 @@ async fn postgres_control_grants_do_not_keep_a_revoked_unused_record_alive() {
         .await
         .unwrap()
         .is_none());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn postgres_native_policy_copies_follow_shared_scope_and_last_link_atomically() {
+    let Some(f) = Fixture::new(true).await else {
+        return;
+    };
+    let root = f.stored("delegation", &scopes(&[A, B]), 3600, &[]).await;
+    let session = f
+        .stored("delegation", &scopes(&[A, B]), 1800, &[root.id])
+        .await;
+    let policy = hash(b"policy-byte-copy-lifecycle").to_cid(0x55).to_string();
+    let now = OffsetDateTime::now_utc();
+    let timestamp = |ttl| {
+        (now + time::Duration::seconds(ttl))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let policy_bytes = serde_json::to_vec(&serde_json::json!({"capabilityCeiling":[
+        {"kind":"kv","resource":format!("{A}/kv/key"),"actions":["tinycloud.kv/get"]},
+        {"kind":"kv","resource":format!("{B}/kv/key"),"actions":["tinycloud.kv/get"]}
+    ]}))
+    .unwrap();
+    models::policy_v3_registration::ActiveModel {
+        policy_cid: Set(policy.clone()),
+        policy_bytes: Set(policy_bytes.clone()),
+        policy_digest_hex: Set("00".repeat(32)),
+        owner_did: Set(OWNER_A.into()),
+        policy_root_cid: Set(root.id.to_cid(0x55).to_string()),
+        enforcement_root_cid: Set(root.id.to_cid(0x55).to_string()),
+        content_source_digest_hex: Set("01".repeat(32)),
+        native_projection_hash_hex: Set("02".repeat(32)),
+        attested_enforcer_binding_bytes: Set(b"binding".to_vec()),
+        registered_at: Set(timestamp(0)),
+        expires_at: Set(timestamp(3600)),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    models::policy_v3_root::ActiveModel {
+        root_cid: Set(root.id.to_cid(0x55).to_string()),
+        policy_cid: Set(policy.clone()),
+        role: Set("policy-authority".into()),
+        authorization_bytes: Set(root.bytes.clone()),
+        status_checkpoint_bytes: Set(Some(b"checkpoint".to_vec())),
+        previous_checkpoint_digest_hex: Set(None),
+        status_sequence: Set(1),
+        admission_epoch: Set(1),
+        status_checked_at: Set(Some(timestamp(0))),
+        status_fresh_until: Set(Some(timestamp(3600))),
+        revoked_at: Set(None),
+        revocation_bytes: Set(None),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    models::policy_v3_session::ActiveModel {
+        session_cid: Set(session.id.to_cid(0x55).to_string()),
+        policy_cid: Set(policy.clone()),
+        authorization_bytes: Set(session.bytes.clone()),
+        recipient_did: Set(f.issuer.clone()),
+        claim_jti: Set("test-claim".into()),
+        claim_digest_hex: Set("03".repeat(32)),
+        vp_digest_hex: Set("04".repeat(32)),
+        state: Set("admitted".into()),
+        not_before: Set(timestamp(-60)),
+        expires_at: Set(timestamp(1800)),
+        admitted_at: Set(Some(timestamp(0))),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    let a = f.accept(A).await;
+    assert!(f.finish(&a).await);
+    assert_eq!(
+        models::policy_v3_registration::Entity::find_by_id(policy.clone())
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .policy_bytes,
+        policy_bytes
+    );
+    assert_eq!(
+        models::policy_v3_root::Entity::find()
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_bytes,
+        root.bytes
+    );
+    assert_eq!(
+        models::policy_v3_session::Entity::find()
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .authorization_bytes,
+        session.bytes
+    );
+    assert_eq!(records::count(&f.db, &a.job.purge_id).await.unwrap(), 3);
+    let b = f.accept(B).await;
+    assert!(f.finish(&b).await);
+    assert!(models::policy_v3_registration::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(models::policy_v3_root::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(models::policy_v3_session::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(delegation::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(space_purge_shared_residue::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    f.dispose().await;
+}
+
+#[tokio::test]
+async fn postgres_policy_artifact_without_legacy_row_is_discovered_and_collected() {
+    let Some(f) = Fixture::new(false).await else {
+        return;
+    };
+    let id = hash(b"pure-policy-artifact").to_cid(0x71).to_string();
+    let now = OffsetDateTime::now_utc();
+    let start = (now - time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let end = (now + time::Duration::hours(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let artifact = serde_json::json!({
+        "schema":"persisted-policy-fixture","role":"policy-authority","delegationMode":"attenuable",
+        "delegationCid":id,"issuerDid":f.issuer,"audienceDid":f.issuer,
+        "capabilities":[
+            {"service":"tinycloud.kv","space":A,"path":"key","actions":["tinycloud.kv/get"]},
+            {"service":"tinycloud.kv","space":B,"path":"key","actions":["tinycloud.kv/get"]}
+        ],"proofCids":[],"notBefore":start,"expiresAt":end,"facts":{},"signature":{"suite":"fixture","value":"unchanged"}
+    });
+    models::policy_delegation::ActiveModel {
+        delegation_cid: Set(id.clone()),
+        role: Set("policy-authority".into()),
+        delegation_mode: Set("attenuable".into()),
+        artifact_json: Set(artifact.clone()),
+        not_before: Set(start),
+        expires_at: Set(end),
+        status_checked_at: Set(now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()),
+        status_fresh_until: Set(None),
+        status_sequence: Set(0),
+        revoked_at: Set(None),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    models::policy_issuance_audit::ActiveModel {
+        issuance_id: Set("test-issuance".into()),
+        session_delegation_cid: Set(id.clone()),
+        audit_json: Set(serde_json::json!({"proof":id})),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    let a = f.accept(A).await;
+    assert!(f.finish(&a).await);
+    assert_eq!(
+        models::policy_delegation::Entity::find_by_id(id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .artifact_json,
+        artifact
+    );
+    assert_eq!(records::count(&f.db, &a.job.purge_id).await.unwrap(), 1);
+    let b = f.accept(B).await;
+    assert!(f.finish(&b).await);
+    assert!(models::policy_delegation::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(models::policy_issuance_audit::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(space_purge_shared_residue::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
     f.dispose().await;
 }

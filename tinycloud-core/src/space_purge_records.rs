@@ -22,6 +22,8 @@ use tinycloud_auth::{
     ipld_core::cid::Cid,
 };
 
+pub mod policy;
+
 const PAGE: usize = 64;
 pub const SWEEP_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 
@@ -65,7 +67,9 @@ impl Lease<'_> {
 struct Record {
     kinds: HashSet<&'static str>,
     active: bool,
+    blocked: bool,
     resources: Vec<Resource>,
+    spaces: HashSet<String>,
 }
 #[derive(Default)]
 struct Graph {
@@ -77,6 +81,7 @@ struct Graph {
     extra_children: HashMap<Hash, HashSet<Hash>>,
     control_edges: HashSet<(Hash, Hash)>,
     controls: HashMap<Hash, HashSet<Hash>>,
+    direct_policy: HashSet<Hash>,
 }
 
 fn failure(message: &str) -> DbErr {
@@ -371,13 +376,14 @@ impl Targets<'_> {
 
 async fn snapshot(
     tx: &DatabaseTransaction,
-    seeds: HashSet<Hash>,
+    mut seeds: HashSet<Hash>,
     keys: &LedgerKeys,
     removed: Option<&str>,
     encryption: Option<&ColumnEncryption>,
     lease: &mut Lease<'_>,
 ) -> Result<(Graph, HashSet<Hash>, HashSet<Hash>), DbErr> {
     let mut graph = Graph::default();
+    policy::preload(tx, &mut graph, &mut seeds, removed, lease).await?;
     for row in models::policy_edge::Entity::find().all(tx).await? {
         graph.extra(cid(&row.child_cid)?, cid(&row.parent_cid)?, false);
     }
@@ -412,6 +418,7 @@ async fn snapshot(
     }
     let candidates = graph.discover(tx, seeds, false, lease).await?;
     let relevant = graph.discover(tx, candidates.clone(), true, lease).await?;
+    graph.records.retain(|id, _| relevant.contains(id));
     let now = OffsetDateTime::now_utc();
     let mut roots = HashSet::new();
     let mut targets = Targets {
@@ -437,7 +444,8 @@ async fn snapshot(
         {
             let record = graph.records.entry(id).or_default();
             record.kinds.insert("delegation");
-            record.active |= expiry.is_none_or(|expiry| now < expiry) && !revoked.contains(&id);
+            record.blocked |= revoked.contains(&id);
+            record.active |= expiry.is_none_or(|expiry| now < expiry);
         }
         for row in invocation::Entity::find()
             .filter(invocation::Column::Id.is_in(page.iter().copied()))
@@ -515,7 +523,10 @@ async fn snapshot(
             .all(tx)
             .await?
         {
-            if graph.records.get(&id).is_some_and(|record| record.active)
+            if graph
+                .records
+                .get(&id)
+                .is_some_and(|record| record.active && !record.blocked)
                 && targets.space_live(tx, &space).await?
             {
                 roots.insert(id);
@@ -541,11 +552,14 @@ async fn snapshot(
     let mut unresolved = HashSet::new();
     for (id, record) in &graph.records {
         lease.keep(tx).await?;
-        if !record.active {
+        if !record.active || record.blocked {
             continue;
         }
         let mut known_live = false;
         let mut unknown = false;
+        for space in &record.spaces {
+            known_live |= targets.space_live(tx, space).await?;
+        }
         for resource in &record.resources {
             if resource.to_string().starts_with("urn:cid:") {
                 continue;
@@ -562,64 +576,16 @@ async fn snapshot(
             unresolved.insert(*id);
         }
     }
-    // Native projection roots remain evidence for active share registrations.
-    for (space, owner_root, enforcement_root, expiry) in models::owner_share_policy::Entity::find()
-        .select_only()
-        .columns([
-            models::owner_share_policy::Column::SpaceId,
-            models::owner_share_policy::Column::OwnerDelegationCid,
-            models::owner_share_policy::Column::EnforcementDelegationCid,
-            models::owner_share_policy::Column::ExpiresAt,
-        ])
-        .filter(models::owner_share_policy::Column::RevokedAt.is_null())
-        .into_tuple::<(String, String, String, String)>()
-        .all(tx)
-        .await?
-    {
-        lease.keep(tx).await?;
-        if OffsetDateTime::parse(&expiry, &Rfc3339).map_err(|_| failure("invalid policy expiry"))?
-            > now
-            && targets.space_live(tx, &space).await?
-        {
-            roots.extend(
-                graph
-                    .peers(tx, &[cid(&owner_root)?, cid(&enforcement_root)?])
-                    .await?,
-            );
-        }
-    }
-    for (owner, policy_root, enforcement_root, expiry) in
-        models::policy_v3_registration::Entity::find()
-            .select_only()
-            .columns([
-                models::policy_v3_registration::Column::OwnerDid,
-                models::policy_v3_registration::Column::PolicyRootCid,
-                models::policy_v3_registration::Column::EnforcementRootCid,
-                models::policy_v3_registration::Column::ExpiresAt,
-            ])
-            .into_tuple::<(String, String, String, String)>()
-            .all(tx)
-            .await?
-    {
-        lease.keep(tx).await?;
-        if OffsetDateTime::parse(&expiry, &Rfc3339).map_err(|_| failure("invalid policy expiry"))?
-            > now
-            && !targets.owner_retired(tx, &owner).await?
-        {
-            roots.extend(
-                graph
-                    .peers(tx, &[cid(&policy_root)?, cid(&enforcement_root)?])
-                    .await?,
-            );
-        }
-    }
     // Control grants are live only while their target is needed by independent
     // live evidence. Cycles of otherwise unused control grants cannot retain themselves.
     let mut needed = graph.closure(roots.clone());
     loop {
         let mut changed = false;
         for (id, targets) in &graph.controls {
-            if graph.records.get(id).is_some_and(|record| record.active)
+            if graph
+                .records
+                .get(id)
+                .is_some_and(|record| record.active && !record.blocked)
                 && !needed.is_disjoint(targets)
                 && roots.insert(*id)
             {
@@ -632,7 +598,10 @@ async fn snapshot(
         needed = graph.closure(roots.clone());
     }
     for (id, targets) in &graph.controls {
-        if graph.records.get(id).is_some_and(|record| record.active)
+        if graph
+            .records
+            .get(id)
+            .is_some_and(|record| record.active && !record.blocked)
             && !needed.contains(id)
             && targets
                 .iter()
@@ -801,6 +770,7 @@ async fn remove_records(
             .exec(tx)
             .await?;
     }
+    policy::remove(tx, deleted, lease).await?;
     // A referenced delegation and its revocation may occur in different pages.
     for page in ids.chunks(PAGE) {
         lease.keep(tx).await?;
@@ -860,9 +830,10 @@ pub(crate) async fn complete_space(
         .into_iter()
         .map(|row| row.try_get::<Hash>("", "id"))
         .collect::<Result<HashSet<_>, _>>()?;
-    let direct = seeds.clone();
+    let mut direct = seeds.clone();
     let (graph, _, deleted) =
         snapshot(tx, seeds, keys, Some(space), encryption, &mut lease).await?;
+    direct.extend(graph.direct_policy.iter().copied());
     let linked: HashSet<_> = direct
         .iter()
         .flat_map(|id| {
