@@ -2,13 +2,22 @@
 
 ## [Unreleased]
 ### Changes
-- Space identifiers validate lowercase names and canonical owner paths across constructors and parsers, rejecting unsafe filesystem components. Details: TC-2871.
-- Delegation renewal uses owner-signed, exact-CID leases and signed bounded renewal stamps. Lease revocation immediately ends renewed access.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
+
+## [1.26.0] - 2026-11-12
+
+### Changes
+
+- Add bounded node delegation renewal with owner-signed exact-CID leases, signed renewal stamps, persisted renewer identity epochs, and renewal history in delegation status. The internal scheduler renews still-live grants within signed lease and ancestor bounds; revoking the lease invalidates renewal-added time. Proofless owner-signed leases register atomically with issuer, lifetime, identity and cardinality checks. Wire contracts and known-answer vectors are pinned. Details: TC-2106 (#545, #546, #547, #554).
+- Validate canonical space identifiers consistently across construction, parsing and deserialization. Names use lowercase ASCII, and invalid owner DIDs and filesystem components are refused. Rust space/manifest construction is now fallible. Details: TC-2871 (#551).
+- Make PostgreSQL fault-injection tests recognize cached prepared-statement executions and SQL split across network reads. Details: TC-2871 (#553).
+- Document the 14-day limit for production database backup retention. Details: TC-2869 (#548).
+- Include the restored Apple Silicon release binaries from 1.25.21. Details: TC-2728 (#544).
+- Add the forward-only delegation-renewal and renewal-identity migrations. Existing node identity must be preserved across database restores; see docs/runbooks/renewal-leases.md.
 
 ## [1.25.21] - 2026-11-10
 
