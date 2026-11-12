@@ -62,7 +62,7 @@ fn owner_read_rejects_even_null_generation() {
 
 #[tokio::test]
 async fn frozen_authorizations_verify_and_retain_the_signed_caveat_shape() {
-    use tinycloud_auth::authorization::{TinyCloudDelegation, TinyCloudInvocation};
+    use tinycloud_auth::authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation};
     for vector in vectors() {
         // UCAN delegation/invocation share the existing signed encoding.
         let (decoded, _) =
@@ -70,7 +70,7 @@ async fn frozen_authorizations_verify_and_retain_the_signed_caveat_shape() {
         let TinyCloudDelegation::Ucan(ucan) = decoded else {
             panic!("UCAN vector");
         };
-        let ucan: TinyCloudInvocation = ucan;
+        let ucan: TinyCloudInvocation = *ucan;
         tinycloud_core::did_resolution::verify_ucan_signature(&ucan)
             .await
             .unwrap();
