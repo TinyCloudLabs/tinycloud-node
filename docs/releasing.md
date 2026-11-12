@@ -96,6 +96,24 @@ serves without it, so its migration never builds it on a non-empty table and
 never fails the boot over it. It logs a typed warning and keeps serving; an
 index built later is picked up by the planner with no restart.
 
+### Backup retention limit (TC-2869)
+
+No PlanetScale backup of the production database
+(`tinycloud-node-production-usw`) may be kept longer than **14 days**. TinyChat's
+consent copy tells users that backups of our database clear within 14 days of
+a deletion, and the TinyChat backend keeps its data in this database.
+
+- **Manual backups** (pre- or post-release, before a cutover, any other
+  reason): set an expiry of 14 days or less when you take the backup.
+- **Scheduled backup policies**: retention of 14 days or less.
+- **Any change to backup retention** (a new policy, a longer expiry on an
+  existing backup, a restored copy kept around) needs a check against the
+  TinyChat consent copy before it is made.
+
+Policies on 2026-11-12: "Production daily" (every 12 hours, kept 2 days),
+"Production daily, kept 7 days" (daily, kept 7 days), and "Development daily"
+(every 12 hours, kept 2 days, development branches).
+
 ### Column encryption cutover (TC-2682)
 
 Before changing stored values, stop writers and take a **fresh, consistent
