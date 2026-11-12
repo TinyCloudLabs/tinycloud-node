@@ -130,7 +130,6 @@ pub async fn fixture(url: Option<&str>, lease_owner: u8) -> Fixture {
     );
     let lease = resign(&lease, lease_owner, |c| c["nbf"] = json!(now - 1));
     let lease_id = hash(lease.as_bytes());
-    let lease_cid = lease_id.to_cid(0x55).to_string();
     let conn = db.connection();
     let backend = conn.get_database_backend();
     let lease_grantor = key_for_seed(lease_owner).1;
