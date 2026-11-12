@@ -357,7 +357,7 @@ fn now() -> DateTime<Utc> {
 fn test_space_id(name: &str) -> SpaceId {
     let jwk = JWK::generate_ed25519().unwrap();
     let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-    SpaceId::new(did, name.parse().unwrap())
+    SpaceId::new(did, name.parse().unwrap()).unwrap()
 }
 
 fn placeholder_signature(signer: &str) -> Signature {
@@ -582,7 +582,7 @@ async fn persist_runtime_grant(
         let space = SpaceId::new(
             request.policy.owner_did.parse::<DIDBuf>()?,
             SPACE_NAME.parse()?,
-        );
+        )?;
         let resource_id: ResourceId = space.to_resource(service, Some(path), None, None);
         let mut caveats = std::collections::BTreeMap::new();
         if let Some(caveat) = &capability.caveats {

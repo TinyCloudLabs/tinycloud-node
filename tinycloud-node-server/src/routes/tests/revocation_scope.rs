@@ -39,7 +39,7 @@ async fn owner_space_revoke_proof_cannot_revoke_another_space_of_same_owner() ->
     use tinycloud_core::types::SpaceIdWrap;
 
     let fixture = scoped_fixture().await?;
-    let other_space = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other_space = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other_space.clone())),
     }
@@ -105,7 +105,7 @@ async fn owner_space_revoke_proof_cannot_revoke_another_space_of_same_owner() ->
     }
     .insert(&fixture.conn)
     .await?;
-    let outside_space = SpaceId::new(outside_did.parse()?, "files".parse()?);
+    let outside_space = SpaceId::new(outside_did.parse()?, "files".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(outside_space.clone())),
     }
@@ -365,7 +365,7 @@ async fn space_control_cannot_revoke_a_grant_with_an_uncovered_space() -> Result
     use tinycloud_core::models::space as space_model;
     use tinycloud_core::types::SpaceIdWrap;
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -556,7 +556,7 @@ async fn signed_import_and_reimport_do_not_widen_control_scope() -> Result<()> {
     use tinycloud_core::types::SpaceIdWrap;
     let fixture = scoped_fixture().await?;
     let owner = fixture.space.did().to_string();
-    let other = SpaceId::new(owner.parse()?, "other".parse()?);
+    let other = SpaceId::new(owner.parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -611,7 +611,7 @@ async fn historical_out_of_scope_revocation_replay_is_denied_without_rewriting_h
     use tinycloud_auth::authorization::TinyCloudRevocation;
     use tinycloud_core::{events::Revocation, models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -732,7 +732,7 @@ async fn exact_cid_control_cannot_revoke_another_target() -> Result<()> {
 async fn status_control_preserves_the_full_granted_space() -> Result<()> {
     use tinycloud_core::{db::DelegationStatus, models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -789,7 +789,7 @@ async fn owner_signed_target_revocation_preserves_cross_space_account_control() 
     use tinycloud_core::{models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
     let owner = fixture.space.did().to_string();
-    let other = SpaceId::new(owner.parse()?, "other".parse()?);
+    let other = SpaceId::new(owner.parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
