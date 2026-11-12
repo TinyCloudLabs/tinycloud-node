@@ -251,6 +251,25 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
+/// Save only the graph portion of a proofless renewal lease. The transaction
+/// dispatcher must run locked renewal::register_lease before committing: that
+/// validates the signed original's owner, lease bounds, identity and cardinality.
+/// This path grants no generic delegation or control authority.
+pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<DelegationRegistration, Error> {
+    verify(&delegation.0.delegation).await?;
+    if !delegation.0.parents.is_empty()
+        || !crate::renewal::lease_original_from_signed(delegation)
+            .is_ok_and(|original| original.is_some())
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
+    save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+}
+
 // verify signatures and time
 async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {

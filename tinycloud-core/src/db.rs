@@ -4129,19 +4129,26 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process_with(
-                db,
-                d,
-                encryption,
-                delegated_sql_caveats,
-                named_keys,
-                renewal_identity
-                    .as_ref()
-                    .map(|(stable_node_did, renewer_did, epoch)| {
-                        (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
-                    }),
-            )
-            .await?;
+            let reg = if renewal_lease_events
+                .iter()
+                .any(|lease| lease.content_hash() == *hash)
+            {
+                delegation::save_owner_renewal_lease(db, d, encryption).await?
+            } else {
+                delegation::process_with(
+                    db,
+                    d,
+                    encryption,
+                    delegated_sql_caveats,
+                    named_keys,
+                    renewal_identity
+                        .as_ref()
+                        .map(|(stable_node_did, renewer_did, epoch)| {
+                            (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
+                        }),
+                )
+                .await?
+            };
             registered.insert(*hash, reg);
         }
     }

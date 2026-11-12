@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "renewal/registration_tests.rs"]
+mod registration_tests;
+
 use crate::hash::Hash;
 use crate::keys::StaticSecret;
 use sea_orm::sea_query::Value;
