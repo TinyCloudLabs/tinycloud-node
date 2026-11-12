@@ -38,7 +38,9 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
     Migrator::up(&conn, Some(pre_n3_steps)).await.unwrap();
     let jwk = JWK::generate_ed25519().unwrap();
     let did = DID_METHODS.generate(&jwk, "key").unwrap();
-    let space = SpaceId::new(did, "cli".parse().unwrap()).to_string();
+    let space = SpaceId::new(did, "cli".parse().unwrap())
+        .unwrap()
+        .to_string();
     let physical = root.path().join("legacy.db");
     let sqlite = rusqlite::Connection::open(&physical).unwrap();
     sqlite

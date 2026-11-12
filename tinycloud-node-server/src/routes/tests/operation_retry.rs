@@ -284,7 +284,7 @@ async fn tc2514_account_query_authorization_lookup_failure_is_retryable() -> Res
     let account = SpaceId::new(
         "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".parse()?,
         "account".parse()?,
-    );
+    )?;
     tinycloud_core::models::actor::ActiveModel {
         id: Set(account.did().to_string()),
     }

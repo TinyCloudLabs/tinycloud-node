@@ -90,7 +90,7 @@ fn space_identity(name: &str) -> Result<(JWK, String, String, SpaceId)> {
         .1
         .to_string();
     let vm = format!("{did_string}#{fragment}");
-    Ok((jwk, did_string, vm, SpaceId::new(did, name.parse()?)))
+    Ok((jwk, did_string, vm, SpaceId::new(did, name.parse()?)?))
 }
 
 /// Restart with the existing metadata database and cache. Unlike `boot_node`,

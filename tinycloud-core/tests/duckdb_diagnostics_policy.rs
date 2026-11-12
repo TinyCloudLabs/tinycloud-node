@@ -298,7 +298,8 @@ async fn with_prefixed_writes_require_authority_and_persist_query_write_targets(
             .parse()
             .unwrap(),
         "tc1304".parse().unwrap(),
-    );
+    )
+    .unwrap();
     let service = DuckDbService::new(
         directory.path().to_string_lossy().into_owned(),
         u64::MAX,
@@ -734,7 +735,8 @@ async fn restricted_invocations_fail_closed_on_unsupported_sql_shapes_without_ch
             .parse()
             .unwrap(),
         "tc1304".parse().unwrap(),
-    );
+    )
+    .unwrap();
     let service = DuckDbService::new(
         directory.path().to_string_lossy().into_owned(),
         u64::MAX,
