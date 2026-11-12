@@ -120,16 +120,31 @@ secret = "{}"
         .timeout(Duration::from_secs(5))
         .build()?;
     let base = format!("http://127.0.0.1:{port}");
+    let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
     let ready = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if client.get(&base).send().await.is_ok() {
-            break;
-        }
         if let Some(exit) = node.0.try_wait()? {
             anyhow::bail!(
                 "node exited {exit}: {}",
                 std::fs::read_to_string(dir.path().join("node.log"))?
             );
+        }
+        if let Ok(response) = client
+            .get(format!("{base}/.well-known/tinycloud/node-keys"))
+            .send()
+            .await
+        {
+            let keys: Value = response.error_for_status()?.json().await?;
+            ensure!(
+                keys["nodeDid"] == secret.node_did(),
+                "unexpected node identity"
+            );
+            ensure!(
+                keys["renewerDid"] == secret.renewal_did(),
+                "unexpected renewer identity"
+            );
+            ensure!(keys["renewerEpoch"] == 1, "unexpected renewer epoch");
+            break;
         }
         ensure!(
             tokio::time::Instant::now() < ready,
@@ -163,7 +178,6 @@ secret = "{}"
         now + 120,
     )?;
     let cid = hash(original.as_bytes()).to_cid(0x55).to_string();
-    let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
     let lease = token(
         &key,
         &secret.renewal_did(),
