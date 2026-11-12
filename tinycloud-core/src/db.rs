@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "db/status_snapshot_tests.rs"]
+mod status_snapshot_tests;
+
 use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
@@ -333,6 +337,12 @@ pub struct TransactResult {
     /// Used to return a CID even when all spaces were skipped.
     pub delegation_cids: Vec<Hash>,
 }
+
+pub type DelegationStatusSnapshot = (
+    DelegationStatus,
+    Option<i64>,
+    Vec<crate::renewal::StampRecord>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationStatus {
@@ -723,13 +733,23 @@ where
     where
         C: ConnectionTrait,
     {
-        let effective_root = crate::models::revocation::target_for_cid(&self.conn, target)
+        self.delegation_effective_expiry_on(&self.conn, target, verifier_now)
+            .await
+    }
+
+    async fn delegation_effective_expiry_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        verifier_now: i64,
+    ) -> Result<Option<i64>, crate::renewal::RenewalStoreError> {
+        let effective_root = crate::models::revocation::target_for_cid(conn, target)
             .await?
             .map_or(target, |delegation| delegation.id);
         let roots = [effective_root];
         let snapshot = match self.renewal_identity.as_ref() {
             Some(identity) => crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                &self.conn,
+                conn,
                 &roots,
                 &identity.stable_node_did,
                 &identity.renewer_did,
@@ -745,7 +765,7 @@ where
                     crate::renewal::RenewalStoreError::InvalidInput
                 }
             })?,
-            _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
+            _ => crate::auth_graph::AuthGraphSnapshot::load(conn, &roots)
                 .await
                 .map_err(|error| match error {
                     crate::models::revocation::ChainTraversalError::Db(error) => {
@@ -2344,16 +2364,9 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        // A canonical CID may name a historical stored row; the requested CID
-        // keeps its own authority scope, the stored row supplies the grant.
         let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
-        let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(delegation.id))
-            .all(&self.conn)
-            .await?;
-
         let mut roots = vec![target];
         if delegation.id != target {
             roots.push(delegation.id);
@@ -2367,8 +2380,112 @@ where
             Err(error) => return Err(error),
         };
 
-        let authorized = match revocation::control_proof_decision(
+        self.delegation_status_on(
             &self.conn,
+            target,
+            invoker,
+            proofs,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+    }
+
+    /// Read every status response field from one database snapshot.
+    pub async fn delegation_status_snapshot(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        self.delegation_status_snapshot_inner(
+            target,
+            invoker,
+            proofs,
+            verifier_now,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn delegation_status_snapshot_inner(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+        after_expiry: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // Keep chain-lock acquisition before opening the read transaction.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
+            return Ok(None);
+        };
+        let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
+        roots.extend(proofs.iter().copied().map(Hash::from));
+        let _chain_guards = match self.acquire_chain_guards(&roots).await {
+            Ok(guards) => guards,
+            Err(TxError::ChainTraversalLimitExceeded) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        let tx = match self.conn.get_database_backend() {
+            DbBackend::Postgres => {
+                self.conn
+                    .begin_with_config(
+                        Some(sea_orm::IsolationLevel::RepeatableRead),
+                        Some(sea_orm::AccessMode::ReadOnly),
+                    )
+                    .await?
+            }
+            _ => self.conn.begin().await?,
+        };
+        let Some(status) = self
+            .delegation_status_on(&tx, target, invoker, proofs, verifier_now)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let expiry = self
+            .delegation_effective_expiry_on(&tx, target, verifier_now)
+            .await?;
+        after_expiry.await;
+        let history =
+            crate::renewal::renewal_history(&tx, &target.to_cid(0x55).to_string(), invoker, proofs)
+                .await?;
+        tx.commit().await?;
+        Ok(Some((status, expiry, history)))
+    }
+
+    async fn delegation_status_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(conn, target).await? else {
+            return Ok(None);
+        };
+        let abilities = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(delegation.id))
+            .all(conn)
+            .await?;
+
+        let authorized = match revocation::control_proof_decision(
+            conn,
             invoker,
             proofs,
             revocation::ControlAction::Status,
@@ -2398,7 +2515,7 @@ where
 
         // One read joins the generic revocation table (with its CID aliases)
         // and `policy_v3_root` over the target and its whole ancestor chain.
-        match revocation::chain_revoked(&self.conn, &target, &delegation.id).await {
+        match revocation::chain_revoked(conn, &target, &delegation.id).await {
             Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -2407,9 +2524,10 @@ where
             Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
         }
 
-        let now = OffsetDateTime::now_utc();
+        let now = OffsetDateTime::from_unix_timestamp(verifier_now)
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
         let effective_expiry = self
-            .delegation_effective_expiry(target, now.unix_timestamp())
+            .delegation_effective_expiry_on(conn, target, now.unix_timestamp())
             .await?;
         match effective_expiry {
             Some(end) if now.unix_timestamp() >= end => {
