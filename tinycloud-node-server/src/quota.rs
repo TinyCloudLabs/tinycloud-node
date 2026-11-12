@@ -627,49 +627,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn billing_path_keeps_special_character_space_id_in_one_segment() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind quota listener");
-        let quota_url = format!("http://{}/billing", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept quota request");
-            let request = read_request(&mut stream).await;
-            let body = r#"{"storage_limit_bytes":500}"#;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .expect("write quota response");
-            request
-        });
-        // The public constructor permits characters that the URI parser
-        // refuses. Encoding must protect every SpaceId without changing its key.
-        let sid = SpaceId::new(
-            space(1).did().to_owned(),
-            "a/b?c#d%2F../é".parse().expect("space name"),
-        );
-        let key = sid.to_string();
-        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url));
-        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
-        let request = server.await.expect("quota server");
-        assert_eq!(
-            request.lines().next(),
-            Some("GET /billing/api/quota/tinycloud%3Apkh%3Aeip155%3A1%3A0x7BD63AA37326a64d458559F44432103e3d6eEDE9%3Aa%2Fb%3Fc%23d%252F%2E%2E%2F%C3%A9 HTTP/1.1"),
-            "the complete space key must be one encoded path segment",
-        );
-        assert_eq!(cache.remote_entry(&key).await, Some((Some(500), false)));
-        cache.set_limit(&sid, 700).await;
-        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(700)));
-        assert_eq!(cache.get_override(&sid).await, Some(700));
-    }
-
-    #[tokio::test]
     async fn billing_redirect_never_requests_target_or_forwards_bearer() {
         for same_origin in [true, false] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

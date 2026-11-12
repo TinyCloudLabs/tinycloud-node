@@ -2484,7 +2484,8 @@ mod retry_after_fairing_tests {
         };
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let space = tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap());
+        let space =
+            tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap()).unwrap();
         let cache = tempfile::TempDir::new().unwrap();
         let sql = tinycloud_core::sql::SqlService::new(
             cache.path().to_string_lossy().into_owned(),

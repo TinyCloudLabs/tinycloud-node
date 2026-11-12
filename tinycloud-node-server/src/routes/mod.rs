@@ -5082,7 +5082,7 @@ mod tests {
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     async fn test_tinycloud() -> Result<(TempDir, TinyCloud)> {
@@ -7628,7 +7628,7 @@ mod tests {
         let wallet_control_space = SpaceId::new(
             wallet_pkh.parse::<DIDBuf>()?,
             "control".parse().expect("valid space name"),
-        );
+        )?;
         abilities::ActiveModel {
             delegation: Set(wallet_child_id),
             resource: Set(Resource::TinyCloud(
@@ -7676,7 +7676,7 @@ mod tests {
         let foreign_control_space = SpaceId::new(
             unrelated_pkh.parse::<DIDBuf>()?,
             "control".parse().expect("valid space name"),
-        );
+        )?;
         for (proof_id, resource) in [
             (
                 wrong_target_session_id,
@@ -9835,7 +9835,7 @@ mod tests {
         let target_space = tinycloud_auth::resource::SpaceId::new(
             setup.space.did().to_owned(),
             "unhosted-quota".parse()?,
-        );
+        )?;
         let quota = QuotaCache::new(None, None);
         quota.set_limit(&target_space, 1024).await;
         setup.resource = target_space.clone().to_resource(
@@ -9878,7 +9878,7 @@ mod tests {
         let unhosted = tinycloud_auth::resource::SpaceId::new(
             setup.space.did().to_owned(),
             "unhosted-quota".parse()?,
-        );
+        )?;
         let quota = QuotaCache::new(None, None);
         // The hosted space has no limit, so its unauthorized response is the
         // node's pre-existing one; only the unhosted target is quota-limited.
@@ -9995,7 +9995,7 @@ mod tests {
         let target = tinycloud_auth::resource::SpaceId::new(
             setup.space.did().to_owned(),
             "toggled-quota".parse()?,
-        );
+        )?;
         let quota = QuotaCache::new(None, None);
         quota.set_limit(&target, 1024).await;
         setup.resource = target.clone().to_resource(
@@ -10363,7 +10363,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?)?;
 
         // Preinsert the hosted space so the first delegation creates an epoch.
         space_model::ActiveModel {
@@ -10527,7 +10527,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?)?;
 
         // SQL grant with a `tables` caveat, which is not a constrained-statements profile.
         let resource =
@@ -10685,7 +10685,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("no did"))?
             .parse()?;
-        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?)?;
 
         // Preinsert the hosted target space.
         space_model::ActiveModel {
@@ -11051,7 +11051,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("issuer verification method missing did"))?
             .to_string();
-        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?);
+        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?)?;
         let resource = space.to_resource(
             "kv".parse::<Service>()?,
             Some("doc".parse::<AuthPath>()?),
@@ -11269,7 +11269,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("issuer verification method missing did"))?
             .to_string();
-        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?);
+        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?)?;
         let resource = space.clone().to_resource(
             service.parse::<Service>()?,
             path.map(|p| p.parse::<AuthPath>()).transpose()?,
@@ -11754,7 +11754,7 @@ mod tests {
         .await;
         assert!(matches!(denied, Err((status, _)) if status == Status::Forbidden));
         assert!(public_context.hashes().space_hash.is_none());
-        let target = SpaceId::new(f.space.did().to_owned(), "public".parse()?);
+        let target = SpaceId::new(f.space.did().to_owned(), "public".parse()?)?;
         let _ = scope(
             public_context.clone(),
             public::public_kv_list(
@@ -14705,8 +14705,8 @@ mod tests {
         let f = KvSyncFixture::new().await?;
         // The fixture's own space is `files`; the reported shape is
         // `default` → `account`, so build both explicitly.
-        let default = SpaceId::new(f.space.did().to_owned(), "default".parse()?);
-        let account = SpaceId::new(f.space.did().to_owned(), "account".parse()?);
+        let default = SpaceId::new(f.space.did().to_owned(), "default".parse()?)?;
+        let account = SpaceId::new(f.space.did().to_owned(), "account".parse()?)?;
         for space in [&default, &account] {
             // Same owner as `f.space`, so its actor row already exists.
             use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
@@ -15034,7 +15034,8 @@ mod tests {
         let f = KvSyncFixture::new().await?;
         let b = JWK::generate_ed25519()?;
         let b_vm = tc341_verification_method(&b)?;
-        let b_space = SpaceId::new(b_vm.split('#').next().unwrap().parse()?, "foreign".parse()?);
+        let b_space =
+            SpaceId::new(b_vm.split('#').next().unwrap().parse()?, "foreign".parse()?).unwrap();
         f.host_space(&b_space).await?;
         tc825_seed(&f, "appA/connectors", "items", "granted").await?;
         let a = f.space.did().to_string();
@@ -15646,7 +15647,8 @@ mod tests {
         let f = KvSyncFixture::new().await?;
         let b = JWK::generate_ed25519()?;
         let b_vm = tc341_verification_method(&b)?;
-        let b_space = SpaceId::new(b_vm.split('#').next().unwrap().parse()?, "foreign".parse()?);
+        let b_space =
+            SpaceId::new(b_vm.split('#').next().unwrap().parse()?, "foreign".parse()?).unwrap();
         f.host_space(&b_space).await?;
         tc825_duck_seed(&f, "appA/connectors", "items", "granted").await?;
         let a = f.space.did().to_string();

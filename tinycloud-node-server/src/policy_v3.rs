@@ -9791,7 +9791,7 @@ mod tests {
         let account_address: [u8; 20] = account_digest[12..].try_into()?;
         let account_owner_did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&account_address));
         let credentials_space =
-            SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
+            SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?)?;
         let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let victim_did = did(&victim_key);
         let content_owner_did = if policy_owner != PolicyOwner::SpaceOwner {
@@ -9802,7 +9802,7 @@ mod tests {
         let content_space = SpaceId::new(
             content_owner_did.parse::<DIDBuf>()?,
             "applications".parse()?,
-        );
+        )?;
         let content_resource = content_space.clone().to_resource(
             "kv".parse()?,
             Some("shares/tc-470/document.txt".parse()?),

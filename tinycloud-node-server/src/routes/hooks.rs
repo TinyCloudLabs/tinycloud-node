@@ -1317,7 +1317,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let space_string = space.to_string();
         let hook_resource: ResourceId = space.clone().to_resource(
             "hooks".parse::<Service>()?,
@@ -1960,7 +1960,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let space_string = space.to_string();
         let hook_resource: ResourceId = space.clone().to_resource(
             "hooks".parse::<Service>()?,
@@ -2202,7 +2202,7 @@ mod tests {
         Ok(SpaceId::new(
             did_of(verification_method).parse::<DIDBuf>()?,
             "alpha".parse()?,
-        ))
+        )?)
     }
 
     /// `path == ""` is the whole service, as in the node SDK's default session
