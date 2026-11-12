@@ -122,6 +122,19 @@ impl LedgerKeys {
                 .collect(),
         })
     }
+    pub fn nonce_hmac(
+        &self,
+        key_id: &str,
+        owner: &str,
+        nonce: &str,
+    ) -> Result<Vec<u8>, LedgerError> {
+        let mut mac = self.mac(key_id)?;
+        mac.update(b"tinycloud-space-lifecycle-nonce-v1\0");
+        mac.update(owner.as_bytes());
+        mac.update(b"\0");
+        mac.update(nonce.as_bytes());
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
     pub fn active_key_id(&self) -> &str {
         &self.active_key_id
     }

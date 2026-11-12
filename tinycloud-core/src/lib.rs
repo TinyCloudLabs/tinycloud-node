@@ -54,6 +54,8 @@ pub use sea_orm;
 pub use sea_orm_migration;
 pub use sql_sizes::{SizeTrackingArtifactRepository, SqlSizes};
 
+pub mod space_purge_auth;
+pub mod space_purge_fence;
 pub mod space_purge_ledger;
 pub mod space_purge_worker;
 
