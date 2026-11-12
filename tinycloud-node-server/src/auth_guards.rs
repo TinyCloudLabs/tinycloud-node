@@ -263,6 +263,7 @@ where
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
             InvocationOutcome::EncryptionDecrypt(response) => Json(response).respond_to(request),
+            InvocationOutcome::RenewalStamp(value) => Json(value).respond_to(request),
             InvocationOutcome::SpaceInfo(json) => Json(json).respond_to(request),
         }
     }
@@ -280,6 +281,29 @@ mod tests {
         tinycloud_core::storage::memory::MemoryStore,
         tinycloud_core::keys::StaticSecret,
     >;
+    #[get("/renewal-stamp")]
+    fn renewal_stamp_response() -> InvOut<Cursor<Vec<u8>>> {
+        InvOut(InvocationOutcome::RenewalStamp(serde_json::json!({
+            "stampCid": "bafkr4iewc5ewhaccw5xh3cvxokvkehjvf76atyhvftq4i4eq7ayneimt3e"
+        })))
+    }
+
+    #[tokio::test]
+    async fn renewal_stamp_outcome_is_json() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", routes![renewal_stamp_response])).await?;
+        let response = client.get("/renewal-stamp").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.into_string().await.unwrap())?,
+            serde_json::json!({
+                "stampCid": "bafkr4iewc5ewhaccw5xh3cvxokvkehjvf76atyhvftq4i4eq7ayneimt3e"
+            })
+        );
+        Ok(())
+    }
 
     #[get("/historical/<cid>?<chain>")]
     async fn historical_delegation_response(

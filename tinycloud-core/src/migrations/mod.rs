@@ -34,6 +34,8 @@ pub mod m20261022_000000_encryption_network_key;
 pub mod m20261023_010000_kv_orphan_candidates;
 pub mod m20261026_000000_kv_write_space_value_index;
 pub mod m20261109_000000_column_encryption_format;
+pub mod m20261111_000000_delegation_renewals;
+pub mod m20261112_000000_renewal_identity;
 
 pub struct Migrator;
 
@@ -76,6 +78,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261023_010000_kv_orphan_candidates::Migration),
             Box::new(m20261026_000000_kv_write_space_value_index::Migration),
             Box::new(m20261109_000000_column_encryption_format::Migration),
+            Box::new(m20261111_000000_delegation_renewals::Migration),
+            Box::new(m20261112_000000_renewal_identity::Migration),
         ]
     }
 }

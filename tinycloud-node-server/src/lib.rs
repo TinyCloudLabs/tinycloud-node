@@ -44,6 +44,7 @@ pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
+pub mod renewal;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
@@ -761,7 +762,6 @@ pub async fn app_with_control(
     );
     // TC-359: publish the derived public halves so an operator can read the
     // invitation key a dstack-keyed node actually signs with.
-    let node_public_keys = NodePublicKeys::derive(&key_setup);
     let (column_encryption, webhook_encryption) =
         storage_keyrings(&key_setup, &tinycloud_config.column_encryption);
     let hook_runtime = HookRuntime::new(
@@ -863,6 +863,11 @@ pub async fn app_with_control(
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
     .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
+    let renewer_epoch = tinycloud
+        .renewal_identity()
+        .map(|identity| identity.epoch)
+        .ok_or_else(|| anyhow::anyhow!("node renewal identity is not initialized"))?;
+    let node_public_keys = NodePublicKeys::derive_at_epoch(&key_setup, renewer_epoch);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
@@ -1058,7 +1063,8 @@ pub async fn app_with_control(
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
     let telemetry_tinycloud = tinycloud.clone();
     let backfill_tinycloud = tinycloud.clone();
-
+    let renewal_scheduler_tinycloud = tinycloud.clone();
+    let renewal_scheduler_secret = key_setup.clone();
     let rocket = rocket::custom(config)
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
             let policy = egress_policy.clone();
@@ -1089,6 +1095,40 @@ pub async fn app_with_control(
         )
         .attach(AdHoc::config::<Config>())
         .attach(tracing_fairing)
+        .attach(AdHoc::on_liftoff("renewal-scheduler", move |rocket| {
+            let tinycloud = renewal_scheduler_tinycloud.clone();
+            let secret = renewal_scheduler_secret.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let period = renewal::SCHEDULER_INTERVAL;
+                    if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
+                        ::tracing::warn!(
+                            event = "renewal_scheduler_tick_failed",
+                            error = %error,
+                            "internal renewal scheduler pass failed"
+                        );
+                    }
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
+                                    ::tracing::warn!(
+                                        event = "renewal_scheduler_tick_failed",
+                                        error = %error,
+                                        "internal renewal scheduler pass failed"
+                                    );
+                                }
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
         .attach(AdHoc::on_liftoff(
             "invocation-replay-cleanup",
             move |rocket| {

@@ -168,7 +168,9 @@ use tokio::{
 /// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214.
 /// Quota-aware KV puts include the TC-2389 `/invoke` `authorize_admitted`
 /// check before quota/hosting lookup (`WITH RECURSIVE "proof_roots"`); its
-/// net round trip is included in the put ceilings. Fusion follow-up: TC-2426.
+/// net round trip is included in the put ceilings. Renewal identity is loaded
+/// once at node startup and reused on requests, so it adds no per-request
+/// database round trips. Fusion follow-up: TC-2426.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
     ("kv put", 43),
@@ -336,18 +338,19 @@ impl FrontendParser {
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut observed = Vec::new();
         self.buf.extend_from_slice(bytes);
         loop {
             if !self.started {
                 // Untyped startup-phase message: SSLRequest, GSSENCRequest,
                 // CancelRequest or the StartupMessage itself.
                 if self.buf.len() < 8 {
-                    return;
+                    return observed;
                 }
                 let len = be_i32(&self.buf[0..4]).max(8) as usize;
                 if self.buf.len() < len {
-                    return;
+                    return observed;
                 }
                 if be_i32(&self.buf[4..8]) == PROTOCOL_V3 {
                     self.started = true;
@@ -356,21 +359,31 @@ impl FrontendParser {
                 self.buf.drain(..len);
             } else {
                 if self.buf.len() < 5 {
-                    return;
+                    return observed;
                 }
                 let len = be_i32(&self.buf[1..5]).max(4) as usize;
                 if self.buf.len() < 1 + len {
-                    return;
+                    return observed;
                 }
                 let tag = self.buf[0];
                 let body = self.buf[5..1 + len].to_vec();
                 self.buf.drain(..1 + len);
-                self.message(tag, &body);
+                if let Some(bytes) = self.message(tag, &body) {
+                    observed.push(bytes);
+                }
             }
         }
     }
 
-    fn message(&mut self, tag: u8, body: &[u8]) {
+    fn message(&mut self, tag: u8, body: &[u8]) -> Option<Vec<u8>> {
+        // Bind parameter bytes select a request for the existing value/COMMIT
+        // cuts. Execution markers use resolved SQL, including cache hits.
+        let observed = match tag {
+            b'B' => Some(body.to_vec()),
+            b'E' => Some(self.portal.as_bytes().to_vec()),
+            b'Q' => Some(cstr(body).0.into_bytes()),
+            _ => None,
+        };
         match tag {
             b'P' => {
                 let (name, rest) = cstr(body);
@@ -403,6 +416,7 @@ impl FrontendParser {
             b'C' if body.first() == Some(&b'S') => self.cache_traffic = true,
             _ => {}
         }
+        observed
     }
 
     fn finish(&mut self) {
@@ -445,7 +459,7 @@ impl FrontendParser {
 /// Listens on an ephemeral loopback port and relays every connection to
 /// `upstream`. Client bytes are parsed before they are forwarded, so a reply
 /// from PostgreSQL implies the request that caused it is already logged.
-/// Cut the connection that forwards every one of `markers`, in order (TC-1054
+/// Cut the connection that executes/binds every one of `markers`, in order (TC-1054
 /// route tests): the server receives the last one, the node never sees a
 /// reply to it, and the connection is reset. Armed for `times` connections.
 #[derive(Clone, Default)]
@@ -468,7 +482,7 @@ impl Cut {
     }
 
     /// Advance a connection's `progress` through the armed markers over
-    /// `bytes`; whether the connection must now be cut.
+    /// a framed Bind body or resolved executed SQL; whether to cut.
     fn observe(&self, progress: &mut usize, bytes: &[u8]) -> bool {
         let mut armed = self.0.lock();
         let Some((markers, times)) = armed.as_mut() else {
@@ -490,6 +504,18 @@ impl Cut {
         }
         true
     }
+}
+
+fn observe_frontend_cut(
+    parser: &mut FrontendParser,
+    cut: &Cut,
+    progress: &mut usize,
+    bytes: &[u8],
+) -> bool {
+    parser
+        .feed(bytes)
+        .iter()
+        .any(|message| cut.observe(progress, message))
 }
 
 async fn start_proxy(upstream: (String, u16), wire: Wire, cut: Cut) -> Result<SocketAddr> {
@@ -537,8 +563,7 @@ async fn start_proxy(upstream: (String, u16), wire: Wire, cut: Cut) -> Result<So
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    parser.feed(&buf[..n]);
-                    let sever = cut.observe(&mut progress, &buf[..n]);
+                    let sever = observe_frontend_cut(&mut parser, &cut, &mut progress, &buf[..n]);
                     if sever {
                         // Before forwarding: no reply may reach the node.
                         severed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2259,4 +2284,69 @@ async fn postgres_info_reports_connection_counters() {
         .await
         .expect("drop the isolated schema");
     result.expect("postgres counters in /info");
+}
+
+#[cfg(test)]
+mod cut_regressions {
+    use super::*;
+    const FENCE: &[u8] = b"SELECT 1 FOR UPDATE OF fence";
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+    fn parser() -> FrontendParser {
+        let mut parser = FrontendParser::new(Wire::default(), 1);
+        parser.started = true;
+        parser
+    }
+    #[test]
+    fn cut_observes_cached_fence_execution() {
+        let mut parser = parser();
+        let mut parse = b"cached\0".to_vec();
+        parse.extend_from_slice(FENCE);
+        parse.extend_from_slice(&[0, 0, 0]);
+        assert!(parser.feed(&frame(b'P', &parse)).is_empty());
+        let cut = Cut::default();
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let mut progress = 0;
+        assert!(!observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &frame(b'B', b"\0cached\0")
+        ));
+        assert!(observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &frame(b'E', &[0, 0, 0, 0, 0])
+        ));
+        assert!(!cut.armed());
+    }
+    #[test]
+    fn cut_observes_fence_sql_split_across_reads() {
+        let mut parser = parser();
+        let cut = Cut::default();
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let mut progress = 0;
+        let mut query = FENCE.to_vec();
+        query.push(0);
+        let query = frame(b'Q', &query);
+        let split = query.len() - 8;
+        assert!(!observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &query[..split]
+        ));
+        assert!(observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &query[split..]
+        ));
+        assert!(!cut.armed());
+    }
 }
