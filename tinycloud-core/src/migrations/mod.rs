@@ -1,4 +1,5 @@
 mod m20261112_000000_space_purge;
+mod m20261112_020000_space_purge_shared_residue;
 use sea_orm_migration::prelude::*;
 pub mod m20230510_101010_init_tables;
 pub mod m20260218_sql_database;
@@ -78,6 +79,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000000_kv_write_space_value_index::Migration),
             Box::new(m20261109_000000_column_encryption_format::Migration),
             Box::new(m20261112_000000_space_purge::Migration),
+            Box::new(m20261112_020000_space_purge_shared_residue::Migration),
         ]
     }
 }

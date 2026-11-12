@@ -208,15 +208,45 @@ impl S3BlockStore {
         })
     }
 
-    /// Delete one bounded batch. Caller must hold the space drain fence.
-    /// An empty result verifies absence; subsequent calls always re-list.
-    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+    fn purge_prefix(space: &SpaceId) -> Result<String, S3StoreError> {
         let prefix = format!("{space}/");
         if space.to_string().contains('/') {
             return Err(
                 IoError::new(std::io::ErrorKind::InvalidInput, "invalid space path").into(),
             );
         }
+        Ok(prefix)
+    }
+
+    /// Read-only KV-byte probe; callers must separately verify other storage.
+    /// Completion callers must hold the exclusive space drain guard.
+    pub async fn space_is_empty(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+        let prefix = Self::purge_prefix(space)?;
+        let page = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        for item in page.contents() {
+            if !item.key().is_some_and(|key| key.starts_with(&prefix)) {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    "object outside space prefix",
+                )
+                .into());
+            }
+        }
+        Ok(page.contents().is_empty() && !page.is_truncated().unwrap_or(false))
+    }
+
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// An empty result verifies absence; subsequent calls always re-list.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+        let prefix = Self::purge_prefix(space)?;
         let page = self
             .client
             .list_objects_v2()
@@ -228,7 +258,7 @@ impl S3BlockStore {
             .map_err(S3Error::from)?;
         let objects = page.contents();
         if objects.is_empty() {
-            return Ok(true);
+            return Ok(!page.is_truncated().unwrap_or(false));
         }
         for object in objects {
             let key = object.key().ok_or_else(|| {
@@ -1279,3 +1309,7 @@ mod space_purge_tests;
 
 #[path = "purge_ledger_s3.rs"]
 mod purge_ledger;
+
+#[cfg(test)]
+#[path = "space_purge_probe_s3_tests.rs"]
+mod space_purge_probe_tests;
