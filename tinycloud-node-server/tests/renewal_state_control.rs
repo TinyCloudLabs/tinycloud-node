@@ -236,4 +236,65 @@ async fn owner_stop_read_enable_and_nonce_replay_are_transactional() {
         response.into_json::<Value>().await.unwrap()["code"],
         "invocation_replay"
     );
+    // Concurrent valid requests for the same generation can commit only once.
+    let body = json!({"version":1,"leaseCid":lease_cid,"expectedGeneration":3});
+    let first = token(
+        &identity.stable_node_did,
+        &format!("urn:cid:{lease_cid}"),
+        "tinycloud.delegation/stop-renewal",
+        Some(3),
+        "race-first",
+        now + 50,
+    );
+    let second = token(
+        &identity.stable_node_did,
+        &format!("urn:cid:{lease_cid}"),
+        "tinycloud.delegation/stop-renewal",
+        Some(3),
+        "race-second",
+        now + 50,
+    );
+    let a = client
+        .post("/delegation/renewal/state")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", first.clone()))
+        .json(&body);
+    let b = client
+        .post("/delegation/renewal/state")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", second.clone()))
+        .json(&body);
+    let (a, b) = tokio::join!(a.dispatch(), b.dispatch());
+    let statuses = [a.status(), b.status()];
+    assert_eq!(statuses.iter().filter(|s| **s == Status::Ok).count(), 1);
+    assert_eq!(
+        statuses.iter().filter(|s| **s == Status::Conflict).count(),
+        1
+    );
+    // Losing CAS must roll back its nonce reservation: it can sign a valid enable.
+    let loser = if statuses[0] == Status::Conflict {
+        "race-first"
+    } else {
+        "race-second"
+    };
+    let enable = token(
+        &identity.stable_node_did,
+        &format!("urn:cid:{lease_cid}"),
+        "tinycloud.delegation/enable-renewal",
+        Some(4),
+        loser,
+        now + 50,
+    );
+    let response = client
+        .post("/delegation/renewal/state")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", enable))
+        .json(&json!({"version":1,"leaseCid":lease_cid,"expectedGeneration":4}))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        response.into_json::<Value>().await.unwrap()["generation"],
+        5
+    );
 }
