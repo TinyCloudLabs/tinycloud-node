@@ -484,6 +484,8 @@ pub struct RetireRequest {
 #[derive(Serialize, Deserialize)]
 pub struct RetireResponse {
     pub version: u8,
+    #[serde(rename = "hostId")]
+    pub host_id: String,
     pub state: String,
 }
 
@@ -642,6 +644,7 @@ pub async fn retire_owner(
         },
         Json(RetireResponse {
             version: 1,
+            host_id: runtime.host_id.clone(),
             state: "retired".into(),
         }),
     ))
@@ -663,15 +666,18 @@ pub struct StatusRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PurgeResponse {
     pub version: u8,
+    #[serde(rename = "hostId")]
+    pub host_id: String,
     pub purge_id: String,
     pub state: String,
     pub accepted_at: String,
     pub updated_at: String,
 }
-fn purge_response(job: &space_purge_job::Model) -> Result<PurgeResponse, ApiError> {
+fn purge_response(host_id: &str, job: &space_purge_job::Model) -> Result<PurgeResponse, ApiError> {
     use time::format_description::well_known::Rfc3339;
     Ok(PurgeResponse {
         version: 1,
+        host_id: host_id.into(),
         purge_id: job.purge_id.clone(),
         state: if job.phase == "complete" {
             "complete"
@@ -753,7 +759,7 @@ pub async fn purge_space(
         runtime
             .bind_operation(&tx, &proof, "purge", &job.purge_id)
             .await?;
-        let response = purge_response(&job)?;
+        let response = purge_response(&runtime.host_id, &job)?;
         tx.commit().await.map_err(unavailable)?;
         return Ok(Custom(Status::Ok, Json(response)));
     }
@@ -825,7 +831,7 @@ pub async fn purge_space(
     runtime
         .bind_operation(&tx, &proof, "purge", &job.purge_id)
         .await?;
-    let response = purge_response(&job)?;
+    let response = purge_response(&runtime.host_id, &job)?;
     tx.commit().await.map_err(unavailable)?;
     ledger_commit.committed = true;
     runtime.work_requested.notify_one();
@@ -865,7 +871,9 @@ pub async fn purge_status(
         .await
         .map_err(unavailable)?;
     let response = match job {
-        Some(job) if runtime.job_matches(&job, &space)? => Some(purge_response(&job)?),
+        Some(job) if runtime.job_matches(&job, &space)? => {
+            Some(purge_response(&runtime.host_id, &job)?)
+        }
         _ => None,
     };
     tx.commit().await.map_err(unavailable)?;

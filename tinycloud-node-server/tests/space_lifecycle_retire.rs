@@ -128,7 +128,7 @@ async fn retirement_is_owner_only_durable_idempotent_and_replay_safe() {
     assert_eq!(response.status(), Status::Accepted);
     assert_eq!(
         response.into_json::<serde_json::Value>().await.unwrap(),
-        serde_json::json!({"version":1,"state":"retired"})
+        serde_json::json!({"version":1,"hostId":"host-test","state":"retired"})
     );
     let space = format!("tinycloud:{}:future-space", &owner[4..])
         .parse()
@@ -160,7 +160,7 @@ async fn retirement_is_owner_only_durable_idempotent_and_replay_safe() {
     assert_eq!(retry.status(), Status::Ok);
     assert_eq!(
         retry.into_json::<serde_json::Value>().await.unwrap(),
-        serde_json::json!({"version":1,"state":"retired"})
+        serde_json::json!({"version":1,"hostId":"host-test","state":"retired"})
     );
     let (other_key, other) = new_owner();
     let conflict = client

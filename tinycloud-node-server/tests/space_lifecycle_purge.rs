@@ -116,6 +116,7 @@ async fn purge_enqueue_is_idempotent_bound_to_target_and_status_uses_inline_owne
     assert_eq!(response.status(), Status::Accepted);
     let accepted = response.into_json::<PurgeResponse>().await.unwrap();
     assert_eq!(accepted.state, "purging");
+    assert_eq!(accepted.host_id, "host-test");
     uuid::Uuid::parse_str(&accepted.purge_id).unwrap();
     assert!(matches!(
         fence.check(&db, &target.parse().unwrap()).await,
@@ -298,6 +299,7 @@ async fn purge_enqueue_is_idempotent_bound_to_target_and_status_uses_inline_owne
     assert_eq!(response.status(), Status::Ok);
     let payload = response.into_json::<serde_json::Value>().await.unwrap();
     assert_eq!(payload["state"], "complete");
+    assert_eq!(payload["hostId"], "host-test");
     assert!(!payload.to_string().contains("tinycloud:"));
     assert!(!payload.to_string().contains(&owner));
 }
