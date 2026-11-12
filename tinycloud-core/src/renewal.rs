@@ -1,3 +1,5 @@
+pub mod control;
+
 #[cfg(test)]
 #[path = "renewal/registration_tests.rs"]
 mod registration_tests;
@@ -963,7 +965,7 @@ async fn register_lease_at<C: ConnectionTrait>(
                     ],
                 )).await?;
             }
-        } else if old_state == "active" {
+        } else if matches!(old_state.as_str(), "active" | "stopped") {
             return Err(RenewalStoreError::LeaseUnavailable);
         } else if old_state != "expired" {
             return Err(RenewalStoreError::InvalidInput);

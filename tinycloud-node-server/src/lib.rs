@@ -272,7 +272,7 @@ use routes::{
     node_keys::{node_keys, NodePublicKeys},
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    revoke, signed_kv_get,
+    renewal_state_control, revoke, signed_kv_get,
     util_routes::*,
     version,
 };
@@ -646,6 +646,7 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         delegate,
         delegation_query,
         delegation_status,
+        renewal_state_control,
         revoke,
         create_signed_kv_url,
         signed_kv_get,

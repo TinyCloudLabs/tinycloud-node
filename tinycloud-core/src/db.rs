@@ -789,6 +789,37 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
     }
 }
 impl<C, B, K> SpaceDatabase<C, B, K> {
+    /// Apply owner renewal controls with the node's column-decryption context.
+    pub async fn renewal_state_control(
+        &self,
+        admitted: &crate::AdmittedInvocation,
+        body: &serde_json::Value,
+        replay: crate::models::invocation_replay::Model,
+    ) -> Result<crate::renewal::control::StateReceipt, crate::renewal::control::ControlError>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let identity =
+            self.renewal_identity
+                .as_ref()
+                .ok_or(crate::renewal::control::ControlError(
+                    "renewal_state_unavailable",
+                ))?;
+        crate::renewal::control::execute(
+            &self.conn,
+            admitted,
+            body,
+            replay,
+            identity,
+            self.encryption.as_ref(),
+        )
+        .await
+    }
+
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()
