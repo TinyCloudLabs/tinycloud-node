@@ -218,18 +218,24 @@ impl KeyBackend for BarrierKeyBackend {
         self.inner.kind()
     }
 
-    fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
+    fn generate(&self, network_id: &str) -> Result<GeneratedKey, KeyBackendError> {
         tokio::task::block_in_place(|| self.generate_barrier.wait())?;
-        self.inner.generate()
+        self.inner.generate(network_id)
     }
 
     fn unwrap(
         &self,
         sealed_private_key: &[u8],
+        expected_public_key: &[u8],
         wrapped_key: &[u8],
         context: &KeyWrapContext<'_>,
     ) -> Result<Vec<u8>, KeyBackendError> {
-        self.inner.unwrap(sealed_private_key, wrapped_key, context)
+        self.inner.unwrap(
+            sealed_private_key,
+            expected_public_key,
+            wrapped_key,
+            context,
+        )
     }
 
     fn rewrap(
@@ -246,8 +252,11 @@ impl KeyBackend for BarrierKeyBackend {
     fn open_network_secret(
         &self,
         sealed_private_key: &[u8],
+        network_id: &str,
+        expected_public_key: &[u8],
     ) -> Result<X25519StaticSecret, KeyBackendError> {
-        self.inner.open_network_secret(sealed_private_key)
+        self.inner
+            .open_network_secret(sealed_private_key, network_id, expected_public_key)
     }
 
     fn derive_named_public_key(
@@ -272,12 +281,21 @@ impl KeyBackend for BarrierKeyBackend {
             .unwrap_named(network_secret, canonical_urn, seed, wrapped_key, context)
     }
 
-    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
-        self.inner.generate_seed()
+    fn generate_seed(
+        &self,
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+        self.inner.generate_seed(network_id, key_path)
     }
 
-    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
-        self.inner.open_seed(sealed_seed)
+    fn open_seed(
+        &self,
+        sealed_seed: &[u8],
+        network_id: &str,
+        key_path: &str,
+    ) -> Result<KeySeed, KeyBackendError> {
+        self.inner.open_seed(sealed_seed, network_id, key_path)
     }
 }
 
@@ -2038,9 +2056,11 @@ async fn app_key_is_deletable_seeded_and_differs_from_the_deterministic_derivati
 
     let row = key_row(&db, "apps/foo/x").await;
     let sealed = row.sealed_seed.expect("a deletable key stores a seed");
-    assert_eq!(sealed[0], 0x01, "sealed with the column key");
+    assert_eq!(sealed[0], 0x02, "sealed with the storage keyring");
     let backend = LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32]));
-    assert!(backend.open_seed(&sealed).is_ok());
+    assert!(backend
+        .open_seed(&sealed, &network_id().to_string(), "apps/foo/x")
+        .is_ok());
 
     // The same URN derived without the seed is a different key.
     let network_row =
@@ -2050,7 +2070,11 @@ async fn app_key_is_deletable_seeded_and_differs_from_the_deterministic_derivati
             .unwrap()
             .unwrap();
     let network_secret = backend
-        .open_network_secret(network_row.sealed_private_key.as_deref().unwrap())
+        .open_network_secret(
+            network_row.sealed_private_key.as_deref().unwrap(),
+            &network_row.network_id,
+            &network_row.public_key,
+        )
         .unwrap();
     let unseeded = backend
         .derive_named_public_key(&network_secret, &canonical_key_urn(&loc), None)
@@ -3011,4 +3035,74 @@ async fn native_decrypt_checks_wrap_context_and_outer_algorithm() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn serving_derivation_refuses_mismatched_network_public_key() {
+    let (db, svc) = service_with_network().await;
+    use crate::models::encryption_network;
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(network_id().to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.public_key = Set(vec![0u8; 32]);
+    row.update(&db).await.unwrap();
+    let loc = KeyLocation::new(&network_id(), "docs/row-binding").unwrap();
+    assert!(svc.public_key(&loc).await.is_err());
+    assert!(svc.create_key(&loc, false).await.is_err());
+}
+
+#[tokio::test]
+async fn serving_named_unwrap_refuses_seed_transplant() {
+    let (db, svc) = service_with_network().await;
+    let first = KeyLocation::new(&network_id(), "apps/app/first").unwrap();
+    let second = KeyLocation::new(&network_id(), "apps/app/second").unwrap();
+    let created = svc.create_key(&first, true).await.unwrap();
+    svc.create_key(&second, true).await.unwrap();
+    let seed = key_row(&db, first.path()).await.sealed_seed;
+    let mut target: encryption_network_key::ActiveModel = key_row(&db, second.path()).await.into();
+    target.sealed_seed = Set(seed);
+    target.update(&db).await.unwrap();
+    let wrapped = wrap_to_public_key(&created.public_encryption_key, &[42; 32]).unwrap();
+    assert!(matches!(
+        svc.unwrap_named_key(&second, &wrapped, 1).await,
+        Err(EncryptionServiceError::CorruptKeyRow)
+    ));
+}
+
+#[tokio::test]
+async fn cond_legacy_network_returns_clear_migration_required() {
+    let (db, svc) = service_with_network().await;
+    use crate::models::encryption_network;
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(network_id().to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.sealed_private_key = Set(Some(
+        ColumnEncryption::new([0xAB; 32]).encrypt_legacy(&[42; 32]),
+    ));
+    row.update(&db).await.unwrap();
+    let loc = KeyLocation::new(&network_id(), "docs/migration").unwrap();
+    let err = svc.public_key(&loc).await.unwrap_err();
+    assert!(err.to_string().starts_with("migration_required:"));
+}
+
+#[tokio::test]
+async fn cond_legacy_seed_returns_clear_migration_required() {
+    let (db, svc) = service_with_network().await;
+    let loc = KeyLocation::new(&network_id(), "apps/app/migration").unwrap();
+    svc.create_key(&loc, true).await.unwrap();
+    let mut row: encryption_network_key::ActiveModel = key_row(&db, loc.path()).await.into();
+    row.sealed_seed = Set(Some(
+        ColumnEncryption::new([0xAB; 32]).encrypt_legacy(&[43; 32]),
+    ));
+    row.update(&db).await.unwrap();
+    let err = svc.unwrap_named_key(&loc, &[0; 64], 1).await.unwrap_err();
+    assert!(err.to_string().starts_with("migration_required:"));
 }

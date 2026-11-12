@@ -309,7 +309,8 @@ impl EncryptionService {
 
         self.check_key_caps(tx, network, loc).await?;
 
-        let (network_secret, seed, sealed_seed) = self.open_secret_and_new_seed(&net, kind)?;
+        let (network_secret, seed, sealed_seed) =
+            self.open_secret_and_new_seed(&net, kind, loc.path())?;
         let public = self.backend.derive_named_public_key(
             &network_secret,
             &canonical_key_urn(loc),
@@ -343,16 +344,19 @@ impl EncryptionService {
         &self,
         net: &encryption_network::Model,
         kind: KeyKind,
+        key_path: &str,
     ) -> Result<NetworkSecretAndSeed, EncryptionServiceError> {
         let sealed = net
             .sealed_private_key
             .as_deref()
             .ok_or(KeyBackendError::SealedKeyMissing)?;
-        let network_secret = self.backend.open_network_secret(sealed)?;
+        let network_secret =
+            self.backend
+                .open_network_secret(sealed, &net.network_id, &net.public_key)?;
         match kind {
             KeyKind::Deterministic => Ok((network_secret, None, None)),
             KeyKind::Deletable => {
-                let (seed, sealed_seed) = self.backend.generate_seed()?;
+                let (seed, sealed_seed) = self.backend.generate_seed(&net.network_id, key_path)?;
                 Ok((network_secret, Some(seed), Some(sealed_seed)))
             }
         }
@@ -401,7 +405,7 @@ impl EncryptionService {
         row: encryption_network_key::Model,
     ) -> Result<CreateStep, EncryptionServiceError> {
         let (network_secret, seed, sealed_seed) =
-            self.open_secret_and_new_seed(net, KeyKind::Deletable)?;
+            self.open_secret_and_new_seed(net, KeyKind::Deletable, loc.path())?;
         let public = self.backend.derive_named_public_key(
             &network_secret,
             &canonical_key_urn(loc),
@@ -551,7 +555,9 @@ impl EncryptionService {
             .sealed_private_key
             .as_deref()
             .ok_or(KeyBackendError::SealedKeyMissing)?;
-        let network_secret = self.backend.open_network_secret(sealed)?;
+        let network_secret =
+            self.backend
+                .open_network_secret(sealed, &net.network_id, &net.public_key)?;
         let public =
             self.backend
                 .derive_named_public_key(&network_secret, &canonical_key_urn(loc), None)?;
@@ -595,7 +601,9 @@ impl EncryptionService {
             .sealed_private_key
             .as_deref()
             .ok_or(KeyBackendError::SealedKeyMissing)?;
-        let network_secret = self.backend.open_network_secret(sealed)?;
+        let network_secret =
+            self.backend
+                .open_network_secret(sealed, &net.network_id, &net.public_key)?;
         let seed = match kind {
             KeyKind::Deterministic => None,
             KeyKind::Deletable => {
@@ -605,11 +613,24 @@ impl EncryptionService {
                     .ok_or(EncryptionServiceError::CorruptKeyRow)?;
                 Some(
                     self.backend
-                        .open_seed(sealed_seed)
-                        .map_err(|_| EncryptionServiceError::CorruptKeyRow)?,
+                        .open_seed(sealed_seed, &row.network_id, &row.key_path)
+                        .map_err(|err| match err {
+                            KeyBackendError::MigrationRequired => {
+                                EncryptionServiceError::MigrationRequired
+                            }
+                            _ => EncryptionServiceError::CorruptKeyRow,
+                        })?,
                 )
             }
         };
+        let derived = self.backend.derive_named_public_key(
+            &network_secret,
+            &canonical_key_urn(loc),
+            seed.as_ref(),
+        )?;
+        if derived != row.public_key {
+            return Err(EncryptionServiceError::CorruptKeyRow);
+        }
         let network_urn = network.to_string();
         let context = KeyWrapContext {
             purpose: KeyWrapPurpose::NetworkKey,

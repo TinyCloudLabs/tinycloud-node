@@ -595,6 +595,35 @@ where
         secrets: K,
         encryption: Option<ColumnEncryption>,
     ) -> Result<Self, DbErr> {
+        Self::new_with_ring_options(conn, storage, secrets, encryption, None, None).await
+    }
+
+    /// Boot with all three serving storage rings validated in the same transaction.
+    pub async fn new_with_storage_rings(
+        conn: C,
+        storage: B,
+        secrets: K,
+        rings: crate::reencrypt::Rings,
+    ) -> Result<Self, DbErr> {
+        Self::new_with_ring_options(
+            conn,
+            storage,
+            secrets,
+            Some(rings.columns),
+            Some(rings.webhooks),
+            Some(rings.seals),
+        )
+        .await
+    }
+
+    async fn new_with_ring_options(
+        conn: C,
+        storage: B,
+        secrets: K,
+        encryption: Option<ColumnEncryption>,
+        webhooks: Option<ColumnEncryption>,
+        seals: Option<ColumnEncryption>,
+    ) -> Result<Self, DbErr> {
         let pool: RecoveringConnection = conn.clone().into();
         // sea-orm-migration's schema manager accepts only the raw sea-orm
         // connection. Migrations run once at boot, before any request.
@@ -604,6 +633,9 @@ where
             tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
                 .await?;
         }
+        crate::reencrypt::check_writer(&tx, encryption.as_ref(), webhooks.as_ref(), seals.as_ref())
+            .await
+            .map_err(|_| DbErr::Custom("storage generation fence".into()))?;
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)

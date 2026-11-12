@@ -25,6 +25,7 @@ pub const FORMAT_V2: i16 = 2;
 pub enum EncryptionPurpose {
     Columns,
     Webhooks,
+    NetworkSeals,
 }
 
 /// Stable database identity; PK components are raw database bytes in PK order.
@@ -109,29 +110,64 @@ impl ColumnEncryption {
     /// Derive a purpose-specific v2 writer from storage root material, retaining
     /// a separately supplied old key for v1 reads.
     pub fn for_purpose(root: [u8; 32], legacy_key: [u8; 32], purpose: EncryptionPurpose) -> Self {
-        let root = Zeroizing::new(root);
+        Self::for_roots(1, [(1, root)], legacy_key, purpose).expect("one root")
+    }
+
+    /// Build purpose rings for an explicitly injected set of root generations.
+    /// Existing serving generation is 1; callers retain its exact root source.
+    pub fn for_roots(
+        write_kid: u8,
+        roots: impl IntoIterator<Item = (u8, [u8; 32])>,
+        legacy_key: [u8; 32],
+        purpose: EncryptionPurpose,
+    ) -> Result<Self, EncryptionError> {
         let legacy_key = Zeroizing::new(legacy_key);
         let info: &[u8] = match purpose {
             EncryptionPurpose::Columns => b"tinycloud/columns",
             EncryptionPurpose::Webhooks => b"tinycloud/hooks/webhook-secrets",
+            EncryptionPurpose::NetworkSeals => b"tinycloud/encryption/network-seal",
         };
-        let mut derived = Zeroizing::new([0u8; 32]);
-        Hkdf::<Sha256>::new(Some(b"tinycloud/column-encryption/v2"), root.as_ref())
-            .expand(info, derived.as_mut())
-            .expect("32-byte HKDF output");
-        Self {
-            write_kid: 1,
+        let mut keys = BTreeMap::new();
+        for (kid, root) in roots {
+            let root = Zeroizing::new(root);
+            let mut derived = Zeroizing::new([0u8; 32]);
+            Hkdf::<Sha256>::new(Some(b"tinycloud/column-encryption/v2"), root.as_ref())
+                .expand(info, derived.as_mut())
+                .expect("32-byte HKDF output");
+            if keys
+                .insert(
+                    kid,
+                    Aes256Gcm::new_from_slice(derived.as_ref()).expect("32 bytes"),
+                )
+                .is_some()
+            {
+                return Err(EncryptionError::DuplicateKey(kid));
+            }
+        }
+        if matches!(purpose, EncryptionPurpose::NetworkSeals) {
+            // Serving seals originally use this unmodified source as generation 0.
+            // Keep v2 seals written before activation, as well as v1 seals, readable.
+            if keys
+                .insert(
+                    0,
+                    Aes256Gcm::new_from_slice(legacy_key.as_ref()).expect("32 bytes"),
+                )
+                .is_some()
+            {
+                return Err(EncryptionError::DuplicateKey(0));
+            }
+        }
+        if !keys.contains_key(&write_kid) {
+            return Err(EncryptionError::MissingKey(write_kid));
+        }
+        Ok(Self {
+            write_kid,
             keys: Arc::new(ReadKeys {
-                v2: BTreeMap::from([(
-                    1,
-                    Aes256Gcm::new_from_slice(derived.as_ref()).expect("valid 32-byte key"),
-                )]),
-                legacy_v1: Some(
-                    Aes256Gcm::new_from_slice(legacy_key.as_ref()).expect("valid 32-byte key"),
-                ),
+                v2: keys,
+                legacy_v1: Some(Aes256Gcm::new_from_slice(legacy_key.as_ref()).expect("32 bytes")),
             }),
             strict: false,
-        }
+        })
     }
 
     /// Require authenticated envelopes even in the recorded legacy namespace.
@@ -178,6 +214,13 @@ impl ColumnEncryption {
 
     pub fn has_key(&self, kid: u8) -> bool {
         self.keys.v2.contains_key(&kid)
+    }
+
+    /// Internal capability check; reports generations without exposing material.
+    pub(crate) fn has_exact_read_generations(&self, kids: &[u8], legacy: bool) -> bool {
+        self.keys.v2.len() == kids.len()
+            && kids.iter().all(|kid| self.has_key(*kid))
+            && (self.keys.legacy_v1.is_some() || self.keys.v2.contains_key(&0)) == legacy
     }
 
     /// Select a different writer while retaining every read key and read policy.
@@ -259,11 +302,22 @@ impl ColumnEncryption {
         data: &[u8],
         binding: RowBinding<'_>,
     ) -> Result<Vec<u8>, EncryptionError> {
-        let kid = match data.first().copied() {
-            Some(VERSION_LEGACY) => return self.decrypt_legacy(data),
-            Some(VERSION_KEYRING) => *data.get(1).ok_or(EncryptionError::TooShort)?,
-            _ => return Err(EncryptionError::UnsupportedVersion),
-        };
+        if data.first().copied() == Some(VERSION_LEGACY) {
+            return self.decrypt_legacy(data);
+        }
+        self.decrypt_v2(data, binding)
+    }
+
+    /// Decode only authenticated, row-bound v2 storage envelopes.
+    pub fn decrypt_v2(
+        &self,
+        data: &[u8],
+        binding: RowBinding<'_>,
+    ) -> Result<Vec<u8>, EncryptionError> {
+        if data.first().copied() != Some(VERSION_KEYRING) {
+            return Err(EncryptionError::UnsupportedVersion);
+        }
+        let kid = *data.get(1).ok_or(EncryptionError::TooShort)?;
         let aad = binding.aad(kid);
         self.open(data, kid, 2, &aad)
     }
@@ -377,6 +431,31 @@ mod tests {
     fn keyring() -> ColumnEncryption {
         ColumnEncryption::with_keys(1, [(0, [0; 32]), (1, std::array::from_fn(|i| i as u8))])
             .unwrap()
+    }
+
+    #[test]
+    fn second_root_keeps_purpose_and_legacy_reads() {
+        for purpose in [EncryptionPurpose::Columns, EncryptionPurpose::Webhooks] {
+            let old = ColumnEncryption::for_purpose([8; 32], [7; 32], purpose);
+            let new =
+                ColumnEncryption::for_roots(2, [(1, [8; 32]), (2, [9; 32])], [7; 32], purpose)
+                    .unwrap();
+            let bytes = old.encrypt(b"stored", binding());
+            assert_eq!(
+                new.decrypt_recorded(&bytes, binding(), FORMAT_V2).unwrap(),
+                b"stored"
+            );
+            let legacy = ColumnEncryption::new([7; 32]).encrypt_legacy(b"legacy");
+            assert_eq!(
+                new.decrypt_recorded(&legacy, binding(), FORMAT_LEGACY)
+                    .unwrap(),
+                b"legacy"
+            );
+            assert_eq!(&new.encrypt(b"new", binding())[..2], &[2, 2]);
+            assert!(old
+                .decrypt(&new.encrypt(b"new", binding()), binding())
+                .is_err());
+        }
     }
 
     fn binding() -> RowBinding<'static> {
