@@ -70,3 +70,51 @@ async fn purge_retries_after_io_failure_and_relists_late_objects() {
     assert!(!store.purge_space_batch(&space).await.unwrap());
     assert!(store.purge_space_batch(&space).await.unwrap());
 }
+
+#[tokio::test]
+async fn ledger_is_append_only_survives_boot_and_space_purge() {
+    use crate::storage::purge_ledger::PurgeLedgerStore;
+    let root = tempfile::tempdir().unwrap();
+    let store = FileSystemStore::new(root.path().to_owned()).await.unwrap();
+    let key = "_purge-ledger/owners/test-key/opaque-hmac";
+    assert_eq!(store.read_purge_record(key).await.unwrap(), None);
+    store
+        .append_purge_record(key, b"authenticated-protocol-bytes")
+        .await
+        .unwrap();
+    store
+        .append_purge_record(key, b"authenticated-protocol-bytes")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .append_purge_record(key, b"different")
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::AlreadyExists
+    );
+    for invalid in [
+        "outside/key",
+        "_purge-ledger/../escape",
+        "_purge-ledger//key",
+        "_purge-ledger/%2f/key",
+    ] {
+        assert!(store
+            .append_purge_record(invalid, b"invalid")
+            .await
+            .is_err());
+    }
+    drop(store);
+    let store = FileSystemStore::new(root.path().to_owned()).await.unwrap();
+    let space: SpaceId = "tinycloud:key:test:purge".parse().unwrap();
+    assert!(store.purge_space_batch(&space).await.unwrap());
+    assert_eq!(
+        store.list_purge_records().await.unwrap(),
+        vec![key.to_owned()]
+    );
+    assert_eq!(
+        store.read_purge_record(key).await.unwrap().unwrap(),
+        b"authenticated-protocol-bytes"
+    );
+}

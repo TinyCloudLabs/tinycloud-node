@@ -532,6 +532,9 @@ async fn store_sizes<P: AsRef<Path>>(
                     entry.metadata().await?.is_dir(),
                     entry.file_name().into_string(),
                 ) {
+                    if suffix == "_purge-ledger" {
+                        return Ok((acc, stages));
+                    }
                     let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                     let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
                         IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
@@ -1807,3 +1810,6 @@ mod test {
 #[cfg(test)]
 #[path = "space_purge_fs_tests.rs"]
 mod space_purge_tests;
+
+#[path = "purge_ledger_fs.rs"]
+mod purge_ledger;
