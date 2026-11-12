@@ -114,6 +114,16 @@ async fn exercise(url: Option<&str>) {
     assert_eq!(f.snapshot().await["generation"], 1);
     assert_eq!(register(&f, lease.clone()).await.0, Status::Ok);
     assert_eq!(f.snapshot().await["generation"], 1);
+    let lease_cid = tinycloud_core::hash::hash(lease.as_bytes())
+        .to_cid(0x55)
+        .to_string();
+    let child = resign(&lease, 0x11, |c| {
+        c["prf"] = json!([lease_cid]);
+        c["nnc"] = json!("generic-child");
+        c["att"] =
+            json!({format!("urn:cid:{}",f.original_cid):{"tinycloud.delegation/status":[{}]}});
+    });
+    assert_eq!(register(&f, child).await.0, Status::Unauthorized);
     let second = resign(&lease, 0x11, |c| c["nnc"] = json!("second-live-lease"));
     assert_eq!(register(&f, second).await.0, Status::Unauthorized);
     assert_eq!(f.snapshot().await["generation"], 1);

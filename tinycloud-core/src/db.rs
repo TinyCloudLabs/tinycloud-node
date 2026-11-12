@@ -4114,7 +4114,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     for (_, event) in &event_hashes {
         if let Event::Delegation(lease) = event {
             if crate::renewal::lease_original_from_signed(lease)?.is_some() {
-                if renewal_identity.is_none() {
+                if renewal_identity.is_none() || renewal_seed.is_none() {
                     return Err(crate::renewal::RenewalStoreError::LeaseUnavailable.into());
                 }
                 renewal_lease_events.push(lease.as_ref());
