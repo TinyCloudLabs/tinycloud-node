@@ -525,15 +525,15 @@ async fn store_sizes<P: AsRef<Path>>(
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         // for every entry in the store dir
         .try_fold(
-            (HashMap::new(), HashMap::new()),
-            |(mut acc, mut stages), entry| async move {
+            (HashMap::new(), HashMap::new(), 0_u64),
+            |(mut acc, mut stages, mut skipped), entry| async move {
                 // if its a directory and the suffix is a valid string
                 if let (true, Ok(ref suffix)) = (
                     entry.metadata().await?.is_dir(),
                     entry.file_name().into_string(),
                 ) {
                     if suffix == "_purge-ledger" {
-                        return Ok((acc, stages));
+                        return Ok((acc, stages, skipped));
                     }
                     let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                     let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
@@ -548,19 +548,34 @@ async fn store_sizes<P: AsRef<Path>>(
                             entry.file_name().into_string(),
                         ) {
                             // get the space ID from suffix and name
-                            let space =
-                                SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?)
-                                    .map_err(IoError::other)?;
+                            let name = match tinycloud_auth::resource::Name::try_from(name) {
+                                Ok(name) => name,
+                                Err(_) => {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            };
+                            let space = SpaceId::new(did.clone(), name).map_err(IoError::other)?;
                             let (size, space_stages) = space_size(&entry.path()).await?;
                             acc.insert(space, size);
                             stages.extend(space_stages);
                         }
                     }
                 };
-                Ok((acc, stages))
+                Ok((acc, stages, skipped))
             },
         )
         .await
+        .map(|(sizes, stages, skipped)| {
+            // Storage operators need the count, never the directory identities.
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped_space_directories = skipped,
+                    "skipped invalid space directories while measuring storage"
+                );
+            }
+            (sizes, stages)
+        })
 }
 
 async fn space_size<P: AsRef<Path>>(path: &P) -> Result<(u64, HashMap<PathBuf, u64>), IoError> {
