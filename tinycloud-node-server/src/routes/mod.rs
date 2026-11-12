@@ -693,7 +693,7 @@ pub async fn delegation_status(
         )
         .await
         .map_err(|error| match error {
-            TxError::Renewal(tinycloud_core::renewal::RenewalStoreError::Unauthorized) => {
+            TxError::RenewalHistoryUnauthorized => {
                 (Status::Forbidden, "Renewal history unavailable".to_string())
             }
             _ => (Status::ServiceUnavailable, "Status unavailable".to_string()),

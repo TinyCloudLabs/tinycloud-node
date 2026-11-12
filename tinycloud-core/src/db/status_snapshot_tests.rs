@@ -58,7 +58,9 @@ async fn exercise(conn: sea_orm::DatabaseConnection) {
     let owner_key = JWK::generate_ed25519().unwrap();
     let (owner, _) = method(&owner_key);
     let (holder, _) = method(&JWK::generate_ed25519().unwrap());
-    let space = SpaceId::new(owner.parse().unwrap(), "snapshot".parse().unwrap());
+    let space: SpaceId = format!("tinycloud:{}:snapshot", owner.strip_prefix("did:").unwrap())
+        .parse()
+        .unwrap();
     let resource = space
         .to_resource(
             "kv".parse().unwrap(),

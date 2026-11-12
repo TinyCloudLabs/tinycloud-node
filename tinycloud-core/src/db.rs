@@ -369,6 +369,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     InvalidRevocation(#[from] revocation::RevocationError),
     #[error(transparent)]
     Renewal(#[from] crate::renewal::RenewalStoreError),
+    #[error("renewal history is not authorized")]
+    RenewalHistoryUnauthorized,
     #[error("Epoch Hashing Err: {0}")]
     EpochHashingErr(#[from] HashError),
     #[error(transparent)]
@@ -2458,7 +2460,13 @@ where
         after_expiry.await;
         let history =
             crate::renewal::renewal_history(&tx, &target.to_cid(0x55).to_string(), invoker, proofs)
-                .await?;
+                .await
+                .map_err(|error| match error {
+                    crate::renewal::RenewalStoreError::Unauthorized => {
+                        TxError::RenewalHistoryUnauthorized
+                    }
+                    error => TxError::Renewal(error),
+                })?;
         tx.commit().await?;
         Ok(Some((status, expiry, history)))
     }
