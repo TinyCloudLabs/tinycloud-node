@@ -1,0 +1,31 @@
+name: renewal scheduler
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  scheduler:
+    name: renewal scheduler (SQLite + PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+    env:
+      TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      CARGO_TARGET_DIR: target/renewal-scheduler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: . -> target/renewal-scheduler
+          shared-key: renewal-scheduler-1.97.1
+      - run: cargo test --locked -p tinycloud-node --features renewal-test-clock --test renewal_scheduler_e2e -- --nocapture

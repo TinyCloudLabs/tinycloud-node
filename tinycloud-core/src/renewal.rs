@@ -2,6 +2,21 @@
 #[path = "renewal/registration_tests.rs"]
 mod registration_tests;
 
+/// Renewal verifier time. The optional file clock is only compiled into harness builds.
+pub fn verifier_now() -> time::OffsetDateTime {
+    #[cfg(feature = "renewal-test-clock")]
+    if let Some(path) = std::env::var_os("TINYCLOUD_RENEWAL_TEST_CLOCK") {
+        let seconds = std::fs::read_to_string(path)
+            .expect("read renewal test clock")
+            .trim()
+            .parse::<i64>()
+            .expect("renewal test clock is Unix seconds");
+        return time::OffsetDateTime::from_unix_timestamp(seconds)
+            .expect("renewal test clock timestamp is representable");
+    }
+    time::OffsetDateTime::now_utc()
+}
+
 use crate::hash::Hash;
 use crate::keys::StaticSecret;
 use sea_orm::sea_query::Value;
@@ -438,13 +453,7 @@ pub async fn lease_for_original<C: ConnectionTrait>(
     original_cid: &str,
     identity: &RenewalNodeIdentity,
 ) -> Result<Option<LeaseRecord>, RenewalStoreError> {
-    lease_for_original_at(
-        db,
-        original_cid,
-        OffsetDateTime::now_utc().unix_timestamp(),
-        identity,
-    )
-    .await
+    lease_for_original_at(db, original_cid, verifier_now().unix_timestamp(), identity).await
 }
 
 async fn lease_for_original_at<C: ConnectionTrait>(
@@ -502,7 +511,7 @@ pub async fn active_leases_for_current_epoch<C: ConnectionTrait>(
     identity: &RenewalNodeIdentity,
 ) -> Result<Vec<LeaseRecord>, RenewalStoreError> {
     let backend = db.get_database_backend();
-    let verifier_now = OffsetDateTime::now_utc().unix_timestamp();
+    let verifier_now = verifier_now().unix_timestamp();
     let now = db_datetime(verifier_now)?;
     let epoch = i64::try_from(identity.epoch).map_err(|_| RenewalStoreError::InvalidInput)?;
     let rows = db
@@ -541,7 +550,7 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
         invocation,
         original_cid,
         identity,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verifier_now().unix_timestamp(),
     )
     .await
 }
@@ -755,7 +764,7 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
         renewer_epoch,
         stable_node_did,
         encryption,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verifier_now().unix_timestamp(),
     )
     .await
 }
@@ -999,7 +1008,7 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
         request,
         secret,
         identity,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verifier_now().unix_timestamp(),
     )
     .await
 }

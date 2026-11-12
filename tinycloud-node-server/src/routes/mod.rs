@@ -689,7 +689,7 @@ pub async fn delegation_status(
             target,
             &auth.invoker,
             &auth.parents,
-            time::OffsetDateTime::now_utc().unix_timestamp(),
+            tinycloud_core::renewal::verifier_now().unix_timestamp(),
         )
         .await
         .map_err(|error| match error {
