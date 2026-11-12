@@ -16,6 +16,16 @@ pub async fn complete_purge(
     keys: &LedgerKeys,
     job: &ClaimedPurge,
 ) -> Result<bool, Error> {
+    complete_purge_with_encryption(db, store, keys, job, None).await
+}
+
+pub async fn complete_purge_with_encryption(
+    db: &DatabaseConnection,
+    store: &impl PurgeLedgerStore,
+    keys: &LedgerKeys,
+    job: &ClaimedPurge,
+    encryption: Option<&tinycloud_core::encryption::ColumnEncryption>,
+) -> Result<bool, Error> {
     if job.phase != "objects" {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -45,13 +55,28 @@ pub async fn complete_purge(
         .map_err(Error::other)?;
     let path = record.object_key().map_err(Error::other)?;
     let bytes = record.to_bytes().map_err(Error::other)?;
-    let published: LedgerRecord = match store.append_purge_record(&path, &bytes).await {
+    let append = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        store.append_purge_record(&path, &bytes),
+    )
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "purge ledger publication timed out"))?;
+    let published: LedgerRecord = match append {
         Ok(()) => record,
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let existing = store
-                .read_purge_record(&path)
-                .await?
-                .ok_or_else(|| Error::other("missing completion ledger record"))?;
+            if !space_purge_worker::renew(db, job)
+                .await
+                .map_err(Error::other)?
+            {
+                return Ok(false);
+            }
+            let existing = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                store.read_purge_record(&path),
+            )
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "purge ledger read timed out"))??
+            .ok_or_else(|| Error::other("missing completion ledger record"))?;
             let existing = keys.verify(&path, &existing).map_err(Error::other)?;
             if existing.kind != record.kind
                 || existing.state != record.state
@@ -65,7 +90,13 @@ pub async fn complete_purge(
         }
         Err(error) => return Err(error),
     };
-    space_purge_worker::complete(db, job, keys, &published)
+    if !space_purge_worker::renew(db, job)
+        .await
+        .map_err(Error::other)?
+    {
+        return Ok(false);
+    }
+    space_purge_worker::complete_with_encryption(db, job, keys, &published, encryption)
         .await
         .map_err(Error::other)
 }

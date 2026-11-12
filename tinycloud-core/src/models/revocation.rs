@@ -765,6 +765,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
         }
     };
 
+    crate::space_purge_records::operation(db).await?;
     let hash: Hash = hash(&serialization);
     let requested = Hash::from(r.revoked);
     let delegation = target_for_cid(db, requested)
@@ -812,6 +813,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
         .await?;
     }
 
+    crate::space_purge_records::request_for_records(db, &[delegation.id]).await?;
     Ok(hash)
 }
 

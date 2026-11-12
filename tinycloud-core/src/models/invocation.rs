@@ -761,6 +761,7 @@ async fn save<C: ConnectionTrait>(
     parameters: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
+    crate::space_purge_records::operation(db).await?;
     // Hash is always computed on plaintext (before encryption)
     let hash = crate::hash::hash(&serialization);
     let issued_at = time.unwrap_or_else(OffsetDateTime::now_utc);

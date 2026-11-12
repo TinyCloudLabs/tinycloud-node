@@ -137,6 +137,16 @@ pub async fn complete(
     keys: &crate::space_purge_ledger::LedgerKeys,
     record: &crate::space_purge_ledger::LedgerRecord,
 ) -> Result<bool, DbErr> {
+    complete_with_encryption(db, job, keys, record, None).await
+}
+
+pub async fn complete_with_encryption(
+    db: &sea_orm::DatabaseConnection,
+    job: &ClaimedPurge,
+    keys: &crate::space_purge_ledger::LedgerKeys,
+    record: &crate::space_purge_ledger::LedgerRecord,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<bool, DbErr> {
     use sea_orm::TransactionTrait;
     postgres(db)?;
     let invalid = || DbErr::Custom("invalid completion ledger record".into());
@@ -150,6 +160,7 @@ pub async fn complete(
         return Err(invalid());
     }
     let tx = db.begin().await?;
+    crate::space_purge_records::lock(&tx).await?;
     let current =
         crate::models::space_purge_job::Model::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -172,6 +183,15 @@ pub async fn complete(
     {
         return Err(invalid());
     }
+    if !renew(&tx, job).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let space = current.space.as_deref().ok_or_else(invalid)?;
+    if space != job.space {
+        return Err(invalid());
+    }
+    let retained = crate::space_purge_records::complete_space(&tx, job, keys, encryption).await?;
     let completed_at =
         OffsetDateTime::from_unix_timestamp(record.timestamp).map_err(|_| invalid())?;
     let inserted = tx
@@ -218,5 +238,6 @@ pub async fn complete(
         return Ok(false);
     }
     tx.commit().await?;
+    retained.emit();
     Ok(true)
 }
