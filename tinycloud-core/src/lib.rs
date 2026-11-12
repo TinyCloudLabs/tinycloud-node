@@ -62,3 +62,5 @@ pub mod space_purge_worker;
 mod space_purge_cache;
 
 pub mod space_purge_database;
+
+pub mod space_purge_records;

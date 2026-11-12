@@ -1069,6 +1069,7 @@ async fn save<C: ConnectionTrait>(
     serialization: Vec<u8>,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
+    crate::space_purge_records::operation(db).await?;
     // Hash is always computed on plaintext (before encryption)
     let hash: Hash = crate::hash::hash(&serialization);
 
