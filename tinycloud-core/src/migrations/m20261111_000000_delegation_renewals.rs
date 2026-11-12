@@ -1,0 +1,180 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[derive(DeriveIden)]
+enum RenewalLease {
+    Table,
+    OriginalCanonical,
+    LeaseCid,
+    State,
+    Generation,
+    Grantor,
+    RenewerDid,
+    RenewerEpoch,
+    LeaseExpiry,
+    OriginalExpiry,
+    AudiencePublicKey,
+    PeriodSeconds,
+}
+
+#[derive(DeriveIden)]
+enum RenewalStamp {
+    Table,
+    Cid,
+    OriginalCanonical,
+    LeaseCid,
+    Generation,
+    PreviousStampCid,
+    RenewerEpoch,
+    NewEnd,
+    SignedBytes,
+    Signature,
+    ReplayHash,
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(RenewalLease::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(RenewalLease::OriginalCanonical)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RenewalLease::LeaseCid).binary().not_null())
+                    .col(ColumnDef::new(RenewalLease::State).string().not_null())
+                    .col(
+                        ColumnDef::new(RenewalLease::Generation)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RenewalLease::Grantor).string().not_null())
+                    .col(ColumnDef::new(RenewalLease::RenewerDid).string().not_null())
+                    .col(
+                        ColumnDef::new(RenewalLease::RenewerEpoch)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalLease::LeaseExpiry)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalLease::OriginalExpiry)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalLease::PeriodSeconds)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalLease::AudiencePublicKey)
+                            .binary()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(RenewalLease::OriginalCanonical)
+                            .col(RenewalLease::LeaseCid),
+                    )
+                    .index(
+                        Index::create()
+                            .unique()
+                            .name("uq_renewal_lease_cid")
+                            .col(RenewalLease::LeaseCid),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(RenewalStamp::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(RenewalStamp::Cid).binary().primary_key())
+                    .col(
+                        ColumnDef::new(RenewalStamp::OriginalCanonical)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RenewalStamp::LeaseCid).binary().not_null())
+                    .col(
+                        ColumnDef::new(RenewalStamp::Generation)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalStamp::PreviousStampCid)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalStamp::RenewerEpoch)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalStamp::NewEnd)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RenewalStamp::SignedBytes)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RenewalStamp::Signature).binary().not_null())
+                    .col(ColumnDef::new(RenewalStamp::ReplayHash).binary().not_null())
+                    .index(
+                        Index::create()
+                            .unique()
+                            .name("uq_renewal_stamp_original_previous")
+                            .col(RenewalStamp::OriginalCanonical)
+                            .col(RenewalStamp::PreviousStampCid),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(RenewalStamp::Table, RenewalStamp::LeaseCid)
+                            .to(RenewalLease::Table, RenewalLease::LeaseCid),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_renewal_stamp_lease_previous")
+                    .table(RenewalStamp::Table)
+                    .col(RenewalStamp::LeaseCid)
+                    .col(RenewalStamp::PreviousStampCid)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_renewal_stamp_lease_previous")
+                    .table(RenewalStamp::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(RenewalStamp::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(RenewalLease::Table).to_owned())
+            .await
+    }
+}

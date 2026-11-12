@@ -168,7 +168,9 @@ use tokio::{
 /// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214.
 /// Quota-aware KV puts include the TC-2389 `/invoke` `authorize_admitted`
 /// check before quota/hosting lookup (`WITH RECURSIVE "proof_roots"`); its
-/// net round trip is included in the put ceilings. Fusion follow-up: TC-2426.
+/// net round trip is included in the put ceilings. Renewal identity is loaded
+/// once at node startup and reused on requests, so it adds no per-request
+/// database round trips. Fusion follow-up: TC-2426.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
     ("kv put", 43),

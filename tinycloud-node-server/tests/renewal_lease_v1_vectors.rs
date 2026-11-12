@@ -21,6 +21,7 @@ use tinycloud_auth::{
 use tinycloud_core::{
     hash::hash,
     keys::{public_key_to_did_key, Keypair, StaticSecret},
+    renewal::{period_seconds as runtime_period_seconds, OriginalFormat},
 };
 
 const OWNER_SEED: [u8; 32] = [0x11; 32];
@@ -149,6 +150,17 @@ fn renewal_lease_v1_pins_real_owner_signed_ucan_and_exact_original_cid() {
         .as_seconds();
     let original_expiration = original_payload.expiration.as_seconds();
     let period_seconds = original_expiration - original_not_before;
+    assert_eq!(
+        runtime_period_seconds(
+            original_expiration as i64,
+            Some(original_not_before as i64),
+            None,
+            OriginalFormat::Ucan,
+        )
+        .unwrap(),
+        period_seconds as i64,
+        "the runtime period is derived from the owner's signed original claims",
+    );
     assert_eq!(period_seconds, 2_592_000.0);
 
     let TinyCloudDelegation::Ucan(lease_ucan) =
@@ -267,4 +279,31 @@ fn renewal_lease_v1_pins_real_owner_signed_ucan_and_exact_original_cid() {
         vector, fixture,
         "pin the complete signed UCAN and stamp vectors"
     );
+}
+#[test]
+fn runtime_signer_reproduces_the_frozen_linked_first_stamp() {
+    assert_eq!(RENEWER_CONTEXT, b"tinycloud/node/renewer/v1");
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/renewal-lease-v1.json"))
+        .expect("renewal lease fixture parses");
+    let secret = StaticSecret::new(NODE_STATIC_SECRET.to_vec()).expect("fixed test secret");
+    let signer = tinycloud_core::renewal::RenewalSigner::from_seed(
+        secret.derive_key(RENEWER_CONTEXT),
+        secret.node_did(),
+        1,
+    );
+    let stamp = &fixture["firstStamp"];
+    let unsigned = &stamp["stamp"]["unsigned"];
+    let (bytes, signature, cid) = signer
+        .sign_stamp(
+            fixture["originalCid"].as_str().unwrap(),
+            fixture["leaseCid"].as_str().unwrap(),
+            unsigned["leaseGeneration"].as_u64().unwrap(),
+            unsigned["previousStampCid"].as_str().unwrap(),
+            unsigned["newEnd"].as_str().unwrap(),
+        )
+        .expect("runtime stamp encoding succeeds");
+
+    assert_eq!(hex::encode(&bytes), stamp["canonicalDagCborHex"]);
+    assert_eq!(cid, stamp["stampCid"]);
+    assert_eq!(hex::encode(&signature), stamp["signatureHex"]);
 }

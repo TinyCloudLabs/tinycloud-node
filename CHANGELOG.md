@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Delegation renewal uses owner-signed, exact-CID leases and signed bounded renewal stamps. Lease revocation immediately ends renewed access.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.

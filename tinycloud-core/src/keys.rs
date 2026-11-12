@@ -39,6 +39,16 @@ pub trait Secrets {
     async fn get_peer_id(&self, space: &SpaceId) -> Result<PeerId, Self::Error> {
         Ok(self.get_pubkey(space).await?.to_peer_id())
     }
+    /// Optional dedicated renewal signing seed. Implementations that do not
+    /// expose a node identity default to no renewal capability.
+    fn renewal_seed(&self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Stable node identity embedded in renewal stamps. Separate from the
+    /// dedicated renewal signing identity returned by `renewal_seed`.
+    fn renewal_node_did(&self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -89,6 +99,17 @@ impl StaticSecret {
         let secret = SecretKey::try_from_bytes(derived).expect("32 bytes");
         EdKP::from(secret).into()
     }
+    /// Dedicated signing identity for renewal stamps; intentionally distinct
+    /// from the node's storage-generation and node identity key contexts.
+    pub fn renewal_keypair(&self) -> Keypair {
+        let derived = self.derive_key(b"tinycloud/node/renewer/v1");
+        let secret = SecretKey::try_from_bytes(derived).expect("32 bytes");
+        EdKP::from(secret).into()
+    }
+
+    pub fn renewal_did(&self) -> String {
+        public_key_to_did_key(self.renewal_keypair().public())
+    }
 
     /// Derive the public half of the node's Share invitation signing key.
     pub fn share_invitation_public_key(&self) -> [u8; 32] {
@@ -114,6 +135,12 @@ impl Secrets for StaticSecret {
     async fn save_keypair(&self, _space: &SpaceId) -> Result<(), Self::Error> {
         Ok(())
     }
+    fn renewal_seed(&self) -> Option<[u8; 32]> {
+        Some(self.derive_key(b"tinycloud/node/renewer/v1"))
+    }
+    fn renewal_node_did(&self) -> Option<String> {
+        Some(self.node_did())
+    }
 }
 
 #[async_trait]
@@ -123,5 +150,19 @@ impl SecretsSetup for StaticSecret {
     type Output = Self;
     async fn setup(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
         Ok(self.clone())
+    }
+}
+#[cfg(test)]
+mod renewal_identity_tests {
+    use super::{Secrets, StaticSecret};
+
+    #[test]
+    fn stable_node_identity_is_distinct_from_renewal_identity() {
+        let secret = StaticSecret::new(vec![7; 32]).unwrap();
+        let stable_node_did = secret.renewal_node_did().unwrap();
+        let renewer_did = secret.renewal_did();
+
+        assert_eq!(stable_node_did, secret.node_did());
+        assert_ne!(stable_node_did, renewer_did);
     }
 }

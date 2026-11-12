@@ -585,6 +585,17 @@ pub struct DelegationStatusRequest {
 }
 
 #[derive(Serialize)]
+pub struct RenewalStampHistory {
+    pub cid: String,
+    pub lease_cid: String,
+    pub generation: u64,
+    pub previous_stamp_cid: String,
+    pub new_end: i64,
+    pub signed_bytes: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
 pub struct DelegationStatusResponse {
     pub cid: String,
     pub status: &'static str,
@@ -592,10 +603,17 @@ pub struct DelegationStatusResponse {
     pub active: bool,
     pub revoked: bool,
     pub expired: bool,
+    pub effective_expiry: Option<i64>,
+    pub renewal_history: Vec<RenewalStampHistory>,
 }
 
 impl DelegationStatusResponse {
-    fn from_status(cid: String, status: DelegationStatus) -> Self {
+    fn from_status(
+        cid: String,
+        status: DelegationStatus,
+        effective_expiry: Option<i64>,
+        renewal_history: Vec<RenewalStampHistory>,
+    ) -> Self {
         let status_name = match status {
             DelegationStatus::Active => "active",
             DelegationStatus::Revoked => "revoked",
@@ -609,6 +627,8 @@ impl DelegationStatusResponse {
             active: status == DelegationStatus::Active,
             revoked: status == DelegationStatus::Revoked,
             expired: status == DelegationStatus::Expired,
+            effective_expiry,
+            renewal_history,
         }
     }
 
@@ -620,6 +640,8 @@ impl DelegationStatusResponse {
             active: false,
             revoked: false,
             expired: false,
+            effective_expiry: None,
+            renewal_history: Vec::new(),
         }
     }
 }
@@ -667,10 +689,48 @@ pub async fn delegation_status(
         .await
         .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
     {
-        Some(status) => Ok(Custom(
-            Status::Ok,
-            Json(DelegationStatusResponse::from_status(request.cid, status)),
-        )),
+        Some(status) => {
+            let effective_expiry = tinycloud
+                .delegation_effective_expiry(
+                    target,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .await
+                .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?;
+            let history = tinycloud_core::renewal::renewal_history(
+                tinycloud.connection(),
+                &request.cid,
+                &auth.invoker,
+                &auth.parents,
+            )
+            .await
+            .map_err(|error| match error {
+                tinycloud_core::renewal::RenewalStoreError::Unauthorized => {
+                    (Status::Forbidden, "Renewal history unavailable".to_string())
+                }
+                _ => (Status::ServiceUnavailable, "Status unavailable".to_string()),
+            })?
+            .into_iter()
+            .map(|stamp| RenewalStampHistory {
+                cid: stamp.cid,
+                lease_cid: stamp.lease_cid,
+                generation: stamp.generation,
+                previous_stamp_cid: stamp.previous_stamp_cid,
+                new_end: stamp.new_end,
+                signed_bytes: encode_config(stamp.signed_bytes, URL_SAFE_NO_PAD),
+                signature: encode_config(stamp.signature, URL_SAFE_NO_PAD),
+            })
+            .collect();
+            Ok(Custom(
+                Status::Ok,
+                Json(DelegationStatusResponse::from_status(
+                    request.cid,
+                    status,
+                    effective_expiry,
+                    history,
+                )),
+            ))
+        }
         None => Ok(Custom(
             Status::NotFound,
             Json(DelegationStatusResponse::not_found(request.cid)),
@@ -1210,6 +1270,47 @@ fn kv_sync_target(
             "tinycloud.kv/sync requires a KV resource without query or fragment".to_string(),
         )),
     }
+}
+
+/// Returns the original CID for the exact one-capability renewal control
+/// invocation, or rejects malformed renewal capability sets.
+fn renewal_target(
+    capabilities: &[Capability],
+) -> Result<Option<tinycloud_auth::authorization::Cid>, (Status, String)> {
+    let Some(capability) = capabilities
+        .iter()
+        .find(|capability| capability.ability.as_ref().as_ref() == "tinycloud.delegation/renew")
+    else {
+        return Ok(None);
+    };
+    if capabilities.len() != 1 {
+        return Err((
+            Status::Forbidden,
+            "Renewal invocation must contain exactly one capability".to_string(),
+        ));
+    }
+    let Resource::Other(resource) = &capability.resource else {
+        return Err((
+            Status::Forbidden,
+            "Renewal invocation must target an original CID".to_string(),
+        ));
+    };
+    let Some(cid_text) = resource.as_str().strip_prefix("urn:cid:") else {
+        return Err((
+            Status::Forbidden,
+            "Renewal invocation must target an original CID".to_string(),
+        ));
+    };
+    let cid: tinycloud_auth::authorization::Cid = cid_text
+        .parse()
+        .map_err(|_| (Status::BadRequest, "Invalid renewal CID".to_string()))?;
+    if cid.to_string() != cid_text {
+        return Err((
+            Status::BadRequest,
+            "Renewal CID must be canonical".to_string(),
+        ));
+    }
+    Ok(Some(cid))
 }
 
 /// Decode a `kv/sync` request's headers into its options. The ordinary KV
@@ -1885,6 +1986,14 @@ async fn invoke_impl(
                 Status::Forbidden,
                 tinycloud_core::models::delegation::DelegationError::NamedKeysUnavailable
                     .to_string(),
+            )
+                .into());
+        }
+
+        if renewal_target(&admitted.invocation().0.capabilities)?.is_some() {
+            return Err((
+                Status::Forbidden,
+                "Renewal is managed by the node scheduler".to_owned(),
             )
                 .into());
         }
@@ -5028,6 +5137,51 @@ mod tests {
         }
     }
 
+    fn renewal_capability(resource: &str) -> Capability {
+        Capability {
+            resource: Resource::Other(resource.parse().unwrap()),
+            ability: Ability::try_from("tinycloud.delegation/renew".to_string()).unwrap(),
+            caveats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn renewal_target_requires_one_canonical_cid_control_capability() {
+        let canonical_cid = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
+        let canonical = renewal_capability(&format!("urn:cid:{canonical_cid}"));
+        assert_eq!(
+            renewal_target(&[canonical]).unwrap().unwrap().to_string(),
+            canonical_cid
+        );
+        let malformed = renewal_capability("urn:cid:not-a-cid");
+        assert_eq!(
+            renewal_target(std::slice::from_ref(&malformed))
+                .unwrap_err()
+                .0,
+            Status::BadRequest
+        );
+        assert_eq!(
+            renewal_target(&[malformed.clone(), malformed])
+                .unwrap_err()
+                .0,
+            Status::Forbidden
+        );
+        assert_eq!(
+            renewal_target(&[renewal_capability("https://example.test/delegation")])
+                .unwrap_err()
+                .0,
+            Status::Forbidden
+        );
+        assert!(renewal_target(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn non_renewal_invocations_keep_generic_dispatch() {
+        let mut capability = renewal_capability("urn:cid:not-a-cid");
+        capability.ability = Ability::try_from("tinycloud.delegation/status".to_string()).unwrap();
+        assert!(renewal_target(&[capability]).unwrap().is_none());
+    }
+
     /// TC-732 addendum: a list cursor is bound to one listed prefix, so a
     /// request carrying one alongside two `kv/list` capabilities is refused
     /// instead of applying the cursor to both lists.
@@ -7771,6 +7925,11 @@ mod tests {
         .dispatch()
         .await;
         assert_eq!(response.status(), Status::Forbidden);
+        assert!(!response
+            .into_string()
+            .await
+            .unwrap_or_default()
+            .contains("renewal_history"));
 
         let response = request(
             &child_cid,
@@ -7782,6 +7941,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "active");
         assert_eq!(body["active"], true);
+        assert_eq!(body["renewal_history"], serde_json::json!([]));
 
         let wallet_child_cid = wallet_child_id.to_cid(0x55).to_string();
         let response = request(
@@ -7800,6 +7960,23 @@ mod tests {
         assert_eq!(response.status(), Status::Ok);
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "active");
+        let parsed_wallet_cid: AuthCid = wallet_child_cid.parse()?;
+        let alternate_wallet_cid =
+            AuthCid::new_v1(0x70, parsed_wallet_cid.hash().to_owned()).to_string();
+        let response = request(
+            &alternate_wallet_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &alternate_wallet_cid,
+                "wallet-session-status-alias",
+                vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
 
         let missing_session_id = tinycloud_core::hash::hash(b"missing-session-proof");
         for (label, proofs) in [
@@ -7976,7 +8153,30 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "expired");
         assert_eq!(body["expired"], true);
+        assert_eq!(body["effective_expiry"], 1);
 
+        let noncanonical_expired_cid = format!(
+            "z{}",
+            bs58::encode(expired_id.to_cid(0x55).to_bytes()).into_string()
+        );
+        assert_ne!(noncanonical_expired_cid, expired_cid);
+        let response = request(
+            &noncanonical_expired_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &noncanonical_expired_cid,
+                "expired-base58",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "expired");
+        assert_eq!(body["effective_expiry"], 1);
+        assert_eq!(body["renewal_history"], serde_json::json!([]));
         let direct_cid = direct_id.to_cid(0x55).to_string();
         let response = request(
             &direct_cid,
@@ -10885,6 +11085,49 @@ mod tests {
         Ok(tinycloud_core::models::invocation_replay::Entity::find()
             .count(conn)
             .await?)
+    }
+
+    #[tokio::test]
+    async fn external_invoke_cannot_trigger_a_renewal_stamp() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_auth::authorization::{make_invocation_from_uris, InvocationOptions};
+
+        let (_tempdirs, rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let client = Client::tracked(rocket).await?;
+        let signer = JWK::generate_ed25519()?;
+        let verification_method = tc341_verification_method(&signer)?;
+        let original = tinycloud_core::hash::hash(b"external-renewal-original");
+        let original_cid = original.to_cid(0x55).to_string();
+        let lease = tinycloud_core::hash::hash(b"external-renewal-lease");
+        let lease_cid = lease.to_cid(0x55);
+        let invocation = make_invocation_from_uris(
+            [(
+                format!("urn:cid:{original_cid}").parse()?,
+                ["tinycloud.delegation/renew".parse::<UcanAbility>()?],
+            )],
+            &lease_cid,
+            &signer,
+            &verification_method,
+            (time::OffsetDateTime::now_utc().unix_timestamp() + 300) as f64,
+            InvocationOptions {
+                nonce: Some("urn:uuid:external-renewal-must-not-run".to_string()),
+                proof: Some(vec![lease_cid]),
+                ..Default::default()
+            },
+        )?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", invocation.encode()?))
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(tc341_replay_row_count(&replay_conn).await?, 0);
+        Ok(())
     }
 
     #[tokio::test]
