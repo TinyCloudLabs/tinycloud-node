@@ -898,3 +898,143 @@ async fn ambiguous_historical_live_leases_refuse_without_partial_stop() {
         assert_eq!(row.try_get::<i64>("", "generation").unwrap(), 1);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_enable_receipt_cannot_outlive_a_competing_revocation() {
+    use tinycloud_core::sea_orm::{Database, DatabaseBackend, TransactionTrait};
+    let Some(url) =
+        common::postgres_test_url("postgres_enable_receipt_cannot_outlive_a_competing_revocation")
+    else {
+        return;
+    };
+    let admin = Database::connect(&url).await.unwrap();
+    for (index, target) in ["original", "lease"].into_iter().enumerate() {
+        let schema = format!(
+            "renewal_receipt_{}_{}_{}",
+            std::process::id(),
+            index,
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .unwrap();
+        let mut shared = reqwest::Url::parse(&url).unwrap();
+        shared
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let shared = shared.to_string();
+        let f = fixture(Some(&shared), 0x11).await;
+        assert_eq!(
+            f.request(
+                Some(f.auth("stop-renewal", Some(1), "stop-before-race")),
+                &f.body(Some(1))
+            )
+            .await
+            .0,
+            Status::Ok
+        );
+        let conn = f.db().connection();
+        let target_id = if target == "original" {
+            f.original_id
+        } else {
+            f.lease_id
+        };
+        let tx = conn.begin().await.unwrap();
+        // The real revocation INSERT's FK must wait for this target row;
+        // owner control only reads the signed graph and can commit meanwhile.
+        tx.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM delegation WHERE id=$1 FOR UPDATE",
+            [Vec::<u8>::from(target_id).into()],
+        ))
+        .await
+        .unwrap();
+        let pid = tx
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i32>("", "pid")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let revoke_path = dir.path().join("revoke.json");
+        let enable_path = dir.path().join("enable.json");
+        let revoke = child(&f, &shared, &format!("revoke-{target}"), 2, &revoke_path);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let row=conn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "SELECT count(*) AS n FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))",[pid.into()])).await.unwrap().unwrap();
+            if row.try_get::<i64>("", "n").unwrap() > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "revocation did not wait on the target FK"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let enable = child(&f, &shared, "enable-renewal", 2, &enable_path);
+        let receipt = result(enable, &enable_path).await;
+        assert_eq!(receipt["status"], 200, "{receipt}");
+        assert_eq!(receipt["body"]["generation"], 3);
+        tx.commit().await.unwrap();
+        let revoked = result(revoke, &revoke_path).await;
+        assert_eq!(revoked["status"], 200, "{revoked}");
+        let target_cid = if target == "original" {
+            &f.original_cid
+        } else {
+            &f.lease_cid
+        };
+        let auth = resign(&f.auth("status", None, "authoritative-status"), 0x11, |c| {
+            c["att"] = json!({format!("urn:cid:{target_cid}"):{"tinycloud.delegation/status":[{}]}})
+        });
+        let response = f
+            .client
+            .post("/delegation/status")
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new("Authorization", auth))
+            .json(&json!({"cid":target_cid}))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let status = response.into_json::<Value>().await.unwrap();
+        assert_eq!(status["revoked"], true);
+        assert_eq!(status["active"], false);
+        if target == "lease" {
+            assert_eq!(
+                f.db()
+                    .delegation_effective_expiry(f.original_id, f.now)
+                    .await
+                    .unwrap(),
+                Some(f.now + 3600)
+            );
+        }
+        let before = f.snapshot().await;
+        let refused = f
+            .request(
+                Some(f.auth("stop-renewal", Some(3), "after-winning-revoke")),
+                &f.body(Some(3)),
+            )
+            .await;
+        assert_eq!(refused.0, Status::Conflict);
+        assert_eq!(f.snapshot().await, before);
+        conn.sea_orm_connection()
+            .get_postgres_connection_pool()
+            .close()
+            .await;
+        admin
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .unwrap();
+    }
+}
