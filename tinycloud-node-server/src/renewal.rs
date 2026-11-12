@@ -185,8 +185,6 @@ mod scheduler_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_logs_expected_skips_and_failures_with_only_lease_cid() {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let captured = CapturedLog::default();
         let _subscriber = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
