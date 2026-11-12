@@ -59,3 +59,6 @@ pub mod space_purge_auth;
 pub mod space_purge_fence;
 pub mod space_purge_ledger;
 pub mod space_purge_worker;
+mod space_purge_cache;
+pub mod space_purge_database;
+

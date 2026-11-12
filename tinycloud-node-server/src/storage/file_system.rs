@@ -85,9 +85,7 @@ impl FileSystemStore {
         })
     }
 
-    /// Delete one bounded batch. Caller must hold the space drain fence.
-    /// Re-list from the beginning after every batch, including after restart.
-    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, IoError> {
+    async fn purge_directory(&self, space: &SpaceId) -> Result<Option<PathBuf>, IoError> {
         let suffix = space.suffix();
         let name = space.name().as_str();
         for component in [suffix, name] {
@@ -102,7 +100,7 @@ impl FileSystemStore {
         }
         let owner_directory = self.path.join(suffix);
         match tokio::fs::symlink_metadata(&owner_directory).await {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
                 return Err(IoError::new(
@@ -114,7 +112,7 @@ impl FileSystemStore {
         }
         let directory = owner_directory.join(name);
         match tokio::fs::symlink_metadata(&directory).await {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
             Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
                 return Err(IoError::new(
@@ -124,6 +122,28 @@ impl FileSystemStore {
             }
             Ok(_) => {}
         }
+        Ok(Some(directory))
+    }
+
+    /// Read-only KV-byte probe; callers must separately verify other storage.
+    /// Completion callers must hold the exclusive space drain guard.
+    pub async fn space_is_empty(&self, space: &SpaceId) -> Result<bool, IoError> {
+        let Some(directory) = self.purge_directory(space).await? else {
+            return Ok(true);
+        };
+        Ok(tokio::fs::read_dir(directory)
+            .await?
+            .next_entry()
+            .await?
+            .is_none())
+    }
+
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// Re-list from the beginning after every batch, including after restart.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, IoError> {
+        let Some(directory) = self.purge_directory(space).await? else {
+            return Ok(true);
+        };
         let mut entries = tokio::fs::read_dir(&directory).await?;
         let mut removed = false;
         for _ in 0..256 {
@@ -1829,3 +1849,7 @@ mod space_purge_tests;
 
 #[path = "purge_ledger_fs.rs"]
 mod purge_ledger;
+
+#[cfg(test)]
+#[path = "space_purge_probe_fs_tests.rs"]
+mod space_purge_probe_tests;

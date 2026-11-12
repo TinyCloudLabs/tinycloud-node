@@ -27,6 +27,23 @@ pub async fn claim(
     conn: &impl ConnectionTrait,
     lease_token: &str,
 ) -> Result<Option<ClaimedPurge>, DbErr> {
+    claim_id(conn, lease_token, None).await
+}
+
+/// Acquire a specific accepted job using the same durable lease protocol.
+pub async fn claim_specific(
+    conn: &impl ConnectionTrait,
+    lease_token: &str,
+    purge_id: &str,
+) -> Result<Option<ClaimedPurge>, DbErr> {
+    claim_id(conn, lease_token, Some(purge_id)).await
+}
+
+async fn claim_id(
+    conn: &impl ConnectionTrait,
+    lease_token: &str,
+    purge_id: Option<&str>,
+) -> Result<Option<ClaimedPurge>, DbErr> {
     postgres(conn)?;
     uuid::Uuid::parse_str(lease_token)
         .map_err(|_| DbErr::Custom("invalid purge lease token".into()))?;
@@ -35,11 +52,11 @@ pub async fn claim(
         "UPDATE space_purge_job SET lease_token=$1, lease_until=clock_timestamp()+INTERVAL '60 seconds',
             updated_at=clock_timestamp(), attempt_count=attempt_count+1
          WHERE purge_id=(SELECT purge_id FROM space_purge_job
-            WHERE phase<>'complete' AND next_attempt_at<=clock_timestamp()
+            WHERE phase<>'complete' AND ($2::TEXT IS NULL OR purge_id=$2) AND next_attempt_at<=clock_timestamp()
             AND (lease_until IS NULL OR lease_until<=clock_timestamp())
             ORDER BY next_attempt_at, purge_id FOR UPDATE SKIP LOCKED LIMIT 1)
          RETURNING purge_id, space, phase, fence_generation, accepted_at, lease_token",
-        [lease_token.into()],
+        [lease_token.into(),purge_id.map(str::to_owned).into()],
     )).one(conn).await
 }
 
