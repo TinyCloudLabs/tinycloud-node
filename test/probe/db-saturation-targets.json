@@ -11,7 +11,8 @@
     "min_breach_points": 13,
     "pool": {
       "metric": "planetscale_primary_postgres_connection_state",
-      "series_labels": { "state": "active" },
+      "series_labels": {},
+      "series_label": "active",
       "op": "gte",
       "threshold": 15
     }

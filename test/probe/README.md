@@ -210,7 +210,8 @@ sends one Better Stack heartbeat decision per target.
   `planetscale_primary_pods_cpu_util_percentages` are above `cpu_pct` (85).
   Points newer than 90 s are ignored for ingestion lag.
 - **Pool:** same counting on the target's `pool` rule. The shipped target pins
-  direct Postgres, port 5432: active connections >= 15
+  direct Postgres, port 5432: the series whose top-level `label` is `active`
+  (`series_label`; `series_labels` still matches the `labels` map) with value >= 15
   (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null` is a config fault. A
   PgBouncer port (6432) would use `planetscale_pgbouncer_pools_client` waiting clients > 0.
 - **Outcomes:** breach or config fault -> `/fail` with numeric counts. Healthy
