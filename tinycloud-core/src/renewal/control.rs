@@ -289,7 +289,7 @@ pub async fn execute<C: sea_orm::ConnectionTrait + sea_orm::TransactionTrait>(
         if let Err(error) = tx.execute(Statement::from_sql_and_values(backend,
             "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
             [SqlValue::Bytes(Some(Box::new(Vec::<u8>::from(replay.content_hash)))),
-             SqlValue::TimeDateTime(Some(Box::new(super::db_datetime(replay.expires_at.unix_timestamp())?)))])).await {
+             SqlValue::TimeDateTimeWithTimeZone(Some(Box::new(replay.expires_at)))])).await {
             return Err(if super::is_unique_violation(&error) { ControlError("invocation_replay") } else { error.into() });
         }
         if operation != Operation::Read {

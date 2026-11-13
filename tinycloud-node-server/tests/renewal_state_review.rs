@@ -176,3 +176,28 @@ async fn restart_preserves_state_nonce_receipts_and_every_stamp_field() {
     assert_eq!(stamps(&f).await, original_stamps);
     drop(_dir);
 }
+
+#[tokio::test]
+async fn cleanup_retains_live_control_nonce_reservations() {
+    let f = fixture(None, 0x11).await;
+    let stop = f.auth("stop-renewal", Some(1), "cleanup-replay");
+    assert_eq!(
+        f.request(Some(stop.clone()), &f.body(Some(1))).await.0,
+        Status::Ok
+    );
+    let before = f.snapshot().await;
+    let cache =
+        tinycloud::invocation_replay::InvocationReplayCache::new(f.db().connection().clone());
+    assert_eq!(
+        cache
+            .cleanup(time::OffsetDateTime::now_utc(), 60)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(f.snapshot().await, before);
+    let replay = f.request(Some(stop), &f.body(Some(1))).await;
+    assert_eq!(replay.0, Status::Conflict);
+    assert_eq!(replay.1["code"], "invocation_replay");
+    assert_eq!(f.snapshot().await, before);
+}
