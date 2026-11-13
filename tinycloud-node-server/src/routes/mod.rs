@@ -2888,43 +2888,18 @@ async fn read_json_body_limited(
     }
 }
 
-/// Classify a SQL request as write-class for the storage quota gate.
-///
-/// Write-class = `!is_read_only` from `classify_sql`, gating DML + DDL
-/// uniformly. The answer does not depend on the caller's abilities (TC-1581):
-/// a statement the caller may not run is still a write, so a denial is never
-/// read as "not a write". Only a statement that does not parse is treated as
-/// non-write here (never masked as 402): `sql_service.execute` re-validates
-/// and surfaces the true error.
-/// `ExecuteStatement` resolves the named statement from the SAME caveats
-/// the execution path uses (chain caveat first, invocation facts as
-/// fallback) and classifies its SQL: on the facts fallback the statement
-/// body is invoker-controlled, so it must be parsed, never assumed
-/// read-only. An unresolvable name is non-write (execution fails with
-/// "statement not found" before any storage grows). `Export` is a read.
+/// Classify a SQL request as write-class for the storage quota gate; see
+/// [`SqlRequest::is_write`]. A statement that does not parse is non-write
+/// here (never masked as 402): `sql_service.execute` re-validates and
+/// surfaces the true error. `caveats` must be the SAME caveats the execution
+/// path uses (chain caveat first, invocation facts as fallback).
 /// `_ability` is not consulted; it keeps the signature of the duckdb twin.
 fn sql_request_is_write(
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     _ability: &str,
 ) -> bool {
-    let is_write_sql = |sql: &str| {
-        tinycloud_core::sql::parser::classify_sql(sql)
-            .map(|class| !class.is_read_only)
-            .unwrap_or(false)
-    };
-    match request {
-        SqlRequest::Query { sql, .. } => is_write_sql(sql),
-        SqlRequest::Execute { sql, schema, .. } => {
-            schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
-        }
-        SqlRequest::Batch { statements } => statements.iter().any(|s| is_write_sql(&s.sql)),
-        SqlRequest::ExecuteStatement { name, .. } => caveats
-            .as_ref()
-            .and_then(|c| c.find_statement(name))
-            .is_some_and(|stmt| is_write_sql(&stmt.sql)),
-        SqlRequest::Export => false,
-    }
+    request.is_write(caveats.as_ref())
 }
 
 #[allow(clippy::too_many_arguments)]

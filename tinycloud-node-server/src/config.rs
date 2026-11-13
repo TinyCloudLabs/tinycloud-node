@@ -1653,6 +1653,14 @@ pub struct SqlStorageConfig {
     /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
     #[serde(default)]
     pub ddl_requires_schema: DdlPolicy,
+    /// The largest SQL or DuckDB artifact payload the node saves in one
+    /// statement (TC-2961). A larger whole checkpoint is refused before it is
+    /// sent (`507 sql_database_size_limit`): it travels as one parameter, and
+    /// the server needs a multiple of it in memory, so one tenant's database
+    /// could take down the shared primary. On by default, 64 MiB; 0 turns it
+    /// off, for local tests only.
+    #[serde(default = "default_sql_max_artifact_write_bytes")]
+    pub max_artifact_write_bytes: ByteUnit,
 }
 
 fn default_sql_max_database_bytes() -> ByteUnit {
@@ -1661,6 +1669,10 @@ fn default_sql_max_database_bytes() -> ByteUnit {
 
 fn default_sql_min_free_bytes() -> ByteUnit {
     ByteUnit::Byte(0)
+}
+
+fn default_sql_max_artifact_write_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_WRITE_BYTES)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1717,6 +1729,7 @@ impl Default for SqlStorageConfig {
             max_database_bytes: default_sql_max_database_bytes(),
             min_free_bytes: default_sql_min_free_bytes(),
             ddl_requires_schema: DdlPolicy::default(),
+            max_artifact_write_bytes: default_sql_max_artifact_write_bytes(),
         }
     }
 }

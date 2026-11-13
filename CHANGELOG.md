@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Changes
 - PostgreSQL: a request cancelled at its deadline while its database transaction is starting no longer leaves the pooled connection inside an open transaction, where the next request's acknowledged writes could be lost. The transaction is rolled back and the connection reused; as a backstop, any connection still inside a transaction when it is released is closed instead of pooled. Details: TC-2954.
+- SQL: a database checkpoint larger than 64 MiB is no longer saved in one statement; the write answers `507 sql_database_size_limit` and nothing is applied (`storage.sql.max_artifact_write_bytes`, env `TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_WRITE_BYTES`; `0` off, for local tests only). After a whole-checkpoint save fails or is refused, that database's writes are refused without reloading it for 30 s, doubling per further failure up to 15 min. Databases already over 64 MiB cannot persist writes until artifacts are stored in bounded parts (TC-2917). Details: TC-2961.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.

@@ -107,6 +107,10 @@ pub enum DatabaseArtifactError {
     Db(#[from] DbErr),
     #[error("database artifact payload too large: {0} bytes")]
     PayloadTooLarge(u64),
+    /// A payload larger than the repository's single-statement write limit
+    /// (TC-2961). Refused before any statement; nothing was written.
+    #[error("database artifact payload of {bytes} bytes exceeds the {limit}-byte write limit")]
+    WriteLimitExceeded { bytes: u64, limit: u64 },
     #[error("database artifact backend error: {0}")]
     Backend(String),
     #[error("database artifact checkpoint is missing")]
@@ -667,6 +671,13 @@ pub const ARTIFACT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// How many times [`read_artifact`] restarts a read whose row changed.
 pub const ARTIFACT_READ_RETRIES: usize = 2;
 
+/// The default largest payload one artifact save sends in a single statement
+/// (TC-2961). A whole checkpoint travels as one `bytea` parameter, and the
+/// server needs a multiple of it in memory; one tenant's large database must
+/// not be able to take down the shared primary. Larger saves are refused
+/// until artifacts are stored in bounded parts (TC-2917).
+pub const DEFAULT_MAX_ARTIFACT_WRITE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The stored metadata a full checkpoint save is checked against.
 struct CurrentArtifact {
     revision: i64,
@@ -678,6 +689,8 @@ struct CurrentArtifact {
 pub struct SeaOrmDatabaseArtifactRepository {
     conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// The largest payload a save sends; 0 = no limit (local tests only).
+    max_write_bytes: u64,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
@@ -690,6 +703,7 @@ impl SeaOrmDatabaseArtifactRepository {
         Self {
             conn: conn.into(),
             sqlite_writer_lock: None,
+            max_write_bytes: DEFAULT_MAX_ARTIFACT_WRITE_BYTES,
             #[cfg(test)]
             race_barrier: None,
         }
@@ -703,6 +717,24 @@ impl SeaOrmDatabaseArtifactRepository {
     ) -> Self {
         self.sqlite_writer_lock = lock;
         self
+    }
+
+    /// Refuse saves larger than `max_write_bytes` (TC-2961); 0 turns the
+    /// limit off, for local tests only.
+    pub fn with_max_write_bytes(mut self, max_write_bytes: u64) -> Self {
+        self.max_write_bytes = max_write_bytes;
+        self
+    }
+
+    fn check_write(&self, bytes: usize) -> Result<(), DatabaseArtifactError> {
+        let bytes = bytes as u64;
+        if self.max_write_bytes != 0 && bytes > self.max_write_bytes {
+            return Err(DatabaseArtifactError::WriteLimitExceeded {
+                bytes,
+                limit: self.max_write_bytes,
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -933,6 +965,8 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+        // TC-2961: before the writer lock, the hash and any statement.
+        self.check_write(payload.len())?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1147,6 +1181,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
+        self.check_write(payload.len())?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1467,6 +1502,77 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.revision, 1);
         assert_eq!(loaded.payload, vec![1; 4096]);
+    }
+
+    /// TC-2961: a payload over the write limit is refused before anything is
+    /// written, full checkpoint or WAL delta; one at the limit is saved; the
+    /// node's default limit is on.
+    #[tokio::test]
+    async fn a_payload_over_the_write_limit_is_refused_and_nothing_is_written() {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        assert_eq!(
+            SeaOrmDatabaseArtifactRepository::new(conn.clone()).max_write_bytes,
+            DEFAULT_MAX_ARTIFACT_WRITE_BYTES
+        );
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn).with_max_write_bytes(4096);
+        let refused = |result: Result<_, DatabaseArtifactError>| {
+            matches!(
+                result,
+                Err(DatabaseArtifactError::WriteLimitExceeded {
+                    bytes: 4097,
+                    limit: 4096
+                })
+            )
+        };
+
+        let over = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 4097],
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(refused(over.map(drop)), "the checkpoint is over the limit");
+        assert!(repo
+            .load_meta("sql", "space", "main")
+            .await
+            .unwrap()
+            .is_none());
+
+        let saved = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 4096],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let delta = repo
+            .save_delta(
+                "sql",
+                "space",
+                "main",
+                vec![2; 4097],
+                ArtifactExpectation::Derived {
+                    revision: saved.revision,
+                    checkpoint_content_hash: saved.checkpoint_content_hash,
+                },
+            )
+            .await;
+        assert!(refused(delta.map(drop)), "the delta is over the limit");
+        let meta = repo
+            .load_meta("sql", "space", "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((meta.revision, meta.delta_size_bytes), (1, 0));
     }
 
     #[tokio::test]
