@@ -399,6 +399,30 @@ impl ImmutableReadStore for S3BlockStore {
         result
     }
 
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(space, id, generation))
+            .send()
+            .await
+        {
+            Ok(object) => Ok(object
+                .content_length()
+                .and_then(|length| u64::try_from(length).ok())),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+                Ok(None)
+            }
+            Err(e) => Err(S3Error::from(e).into()),
+        }
+    }
+
     async fn read_range(
         &self,
         space: &SpaceId,

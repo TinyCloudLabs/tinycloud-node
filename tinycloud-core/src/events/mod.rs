@@ -58,6 +58,8 @@ pub(crate) enum Operation {
         value: Hash,
         generation: i64,
         metadata: Metadata,
+        /// The value's size in bytes. Not part of the epoch's operation hash.
+        size: i64,
     },
     KvDelete {
         space: SpaceId,
@@ -75,12 +77,14 @@ impl Operation {
                 value,
                 generation,
                 metadata,
+                size,
             } => VersionedOperation::KvWrite {
                 space,
                 key,
                 value,
                 generation,
                 metadata,
+                size,
                 seq,
                 epoch,
                 epoch_seq,
@@ -116,6 +120,7 @@ pub(crate) enum VersionedOperation {
         value: Hash,
         generation: i64,
         metadata: Metadata,
+        size: i64,
         seq: i64,
         epoch: Hash,
         epoch_seq: i64,

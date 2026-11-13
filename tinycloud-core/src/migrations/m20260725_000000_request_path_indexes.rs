@@ -548,6 +548,7 @@ mod tests {
                 // The column is omitted; it defaults to zero.
                 generation: sea_orm::ActiveValue::NotSet,
                 metadata: Set(Metadata(BTreeMap::new())),
+                size: sea_orm::ActiveValue::NotSet,
             }
             .insert(db)
             .await?;

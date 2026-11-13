@@ -844,6 +844,7 @@ async fn save<C: ConnectionTrait>(
                 value,
                 generation,
                 metadata,
+                size,
                 space,
                 seq,
                 epoch,
@@ -856,6 +857,7 @@ async fn save<C: ConnectionTrait>(
                     generation: *generation,
                     space: space.clone().into(),
                     metadata: metadata.clone(),
+                    size: Some(*size),
                     seq: *seq,
                     epoch: *epoch,
                     epoch_seq: *epoch_seq,
@@ -997,6 +999,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
         value: write.value,
         generation: write.generation,
         metadata: write.metadata,
+        size: write.size,
         deleted: false,
     };
     let mut conflict = OnConflict::columns([current_kv::Column::Space, current_kv::Column::Key]);
@@ -1012,6 +1015,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
             (current_kv::Column::Generation, "generation"),
             (current_kv::Column::Value, "value"),
             (current_kv::Column::Metadata, "metadata"),
+            (current_kv::Column::Size, "size"),
             (current_kv::Column::Deleted, "deleted"),
             (current_kv::Column::EpochSeq, "epoch_seq"),
             (current_kv::Column::Epoch, "epoch"),
@@ -1034,6 +1038,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
                 current_kv::Column::Value,
                 current_kv::Column::Generation,
                 current_kv::Column::Metadata,
+                current_kv::Column::Size,
                 current_kv::Column::Deleted,
             ])
             .action_cond_where(incoming_supersedes(
@@ -1293,6 +1298,7 @@ mod tests {
                 "label".to_string(),
                 label.to_string(),
             )])),
+            size: None,
         }
     }
 

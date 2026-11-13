@@ -1490,6 +1490,8 @@ fn kv_invoke_options_for_capabilities_with_cursor(
             }
         })
         .transpose()?;
+    let list_entries = take_metadata_header(&mut headers.0, "x-tinycloud-list-entries")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
     let list_cursor = take_metadata_header(&mut headers.0, "x-tinycloud-cursor")
         .map(|value| {
             // A list cursor is bound to one listed prefix, but the database
@@ -1531,6 +1533,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         max_response_bytes,
         list_limit,
         list_cursor,
+        list_entries,
         kv_sync: None,
         replay: None,
     })
@@ -2476,7 +2479,7 @@ async fn invoke_impl(
                     if let InvocationOutcome::KvSync(page) = outcome {
                         page.node_did = Some(encryption.node_did().to_string());
                     }
-                    if let InvocationOutcome::KvList(paths, truncated, next_cursor) = outcome {
+                    if let InvocationOutcome::KvList(paths, truncated, next_cursor, _) = outcome {
                         *next_cursor = if *truncated {
                             match (cursor_limit, cursor_target.as_ref(), paths.last()) {
                                 (Some(limit), Some((space, prefix)), Some(last)) => encode_kv_cursor(&cursor_key, &invocation_info.invoker, space, prefix, limit, last).ok(),
@@ -2558,7 +2561,7 @@ async fn invoke_impl(
                                 | (false, InvocationOutcome::KvMetadata(None)) => None,
                                 (
                                     false,
-                                    InvocationOutcome::KvMetadata(Some((metadata, hash))),
+                                    InvocationOutcome::KvMetadata(Some((metadata, hash, _))),
                                 ) => Some(KvBatchReadValue {
                                     metadata,
                                     hash,
@@ -14052,6 +14055,7 @@ mod tests {
                 value: Set(tinycloud_core::hash::hash(b"foreign secret")),
                 generation: Set(0),
                 metadata: Set(Metadata(Default::default())),
+                size: Set(None),
                 deleted: Set(false),
             }
             .insert(&fixture.conn)

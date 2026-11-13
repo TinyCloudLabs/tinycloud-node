@@ -425,6 +425,19 @@ impl ImmutableReadStore for FileSystemStore {
         result
     }
 
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        match metadata(self.get_path(space, id, generation)).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn read_range(
         &self,
         space: &SpaceId,

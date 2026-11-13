@@ -317,7 +317,7 @@ pub async fn list(
         .map_err(|error| error.to_string())?;
     assert_eq!(outcomes.len(), 1, "kv/list must actually execute");
     match outcomes.into_iter().next().unwrap() {
-        InvocationOutcome::KvList(keys, truncated, cursor) => {
+        InvocationOutcome::KvList(keys, truncated, cursor, _) => {
             assert!(!truncated);
             assert!(cursor.is_none());
             Ok(keys.into_iter().map(|key| key.to_string()).collect())

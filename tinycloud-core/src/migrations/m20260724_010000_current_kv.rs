@@ -241,10 +241,12 @@ mod tests {
             value: hash(format!("value-{label}").as_bytes()),
             generation: 0,
             metadata: Metadata(BTreeMap::from([("label".to_string(), label.to_string())])),
+            size: None,
         };
         let mut legacy = kv_write::ActiveModel::from(write.clone());
         // The column is omitted here; a fresh table defaults it to zero.
         legacy.generation = sea_orm::ActiveValue::NotSet;
+        legacy.size = sea_orm::ActiveValue::NotSet;
         legacy.insert(db).await.unwrap();
         write
     }
