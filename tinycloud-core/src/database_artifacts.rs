@@ -978,17 +978,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
 
-        // A checkpoint larger than a WAL delta may take longer to upload than
-        // the pool's base statement timeout allows, so its write runs under
-        // the bulk one (TC-1054). Smaller ones, like every delta, fit the
-        // base timeout and pay no extra round trip.
-        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
-            self.conn.begin_bulk().await?
-        } else {
-            BulkScope::Pool(self.conn.clone())
-        };
         // For Absent, the primary key on the create below asserts absence
-        // atomically. Details: TC-2214
+        // atomically. Details: TC-2214. The read runs on the pool, outside the
+        // bulk transaction: the CAS on the write below needs no transaction,
+        // so no lock or snapshot is held while the payload uploads (TC-2954).
         let existing = if expected == ArtifactExpectation::Absent {
             None
         } else {
@@ -1004,7 +997,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .column(database_artifact::Column::SizeBytes)
             .column(database_artifact::Column::CheckpointContentHash)
             .into_tuple::<(i64, i64, String)>()
-            .one(&scope)
+            .one(&self.conn)
             .await?
             .map(
                 |(revision, size_bytes, checkpoint_content_hash)| CurrentArtifact {
@@ -1047,6 +1040,15 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         #[cfg(test)]
         self.wait_at_race_barrier().await;
 
+        // A checkpoint larger than a WAL delta may take longer to upload than
+        // the pool's base statement timeout allows, so its write runs under
+        // the bulk one (TC-1054). Smaller ones, like every delta, fit the
+        // base timeout and pay no extra round trip.
+        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
+            self.conn.begin_bulk().await?
+        } else {
+            BulkScope::Pool(self.conn.clone())
+        };
         match existing.as_ref() {
             Some(existing) => {
                 // Compare-and-swap on the (revision, checkpoint) this save read.
