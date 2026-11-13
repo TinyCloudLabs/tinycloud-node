@@ -913,7 +913,7 @@ impl AuthGraphSnapshot {
                     };
                     let state: String = row.try_get("", "lease_state")?;
                     let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
-                    if state != "active"
+                    if !matches!(state.as_str(), "active" | "stopped")
                         || lease_expiry.unix_timestamp() <= verifier_now
                         || row.try_get::<bool>("", "lease_revoked")?
                         || row.try_get::<String>("", "renewer_did")? != renewer_did
@@ -999,7 +999,7 @@ impl AuthGraphSnapshot {
         for (node, leases) in grouped {
             let active: Vec<_> = leases
                 .values()
-                .filter(|rows| rows[0].state == "active")
+                .filter(|rows| matches!(rows[0].state.as_str(), "active" | "stopped"))
                 .collect();
             if active.len() == 1 {
                 candidate_map.insert(node, active[0].clone());
