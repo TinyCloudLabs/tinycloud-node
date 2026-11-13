@@ -457,27 +457,7 @@ impl DatabaseAuthorityStore {
         cid: &str,
         now: OffsetDateTime,
     ) -> Result<(), AuthorityError> {
-        let mut stack = vec![(cid.to_owned(), false, 0usize)];
-        let mut ancestry = HashMap::new();
-        while let Some((current, ancestor, depth)) = stack.pop() {
-            if depth > MAX_ANCESTRY_DEPTH || ancestry.contains_key(&current) {
-                return Err(AuthorityError::AncestryTooDeep);
-            }
-            let row = delegation_row(transaction, &current, true).await?;
-            let verified = ensure_live_model(&row, now, ancestor)?;
-            let edges = edges_on(transaction, &current).await?;
-            validate_persisted_edges(&verified, &edges)?;
-            ancestry.insert(current.clone(), verified);
-            stack.extend(
-                edges
-                    .into_iter()
-                    .rev()
-                    .map(|edge| (edge.parent_cid, true, depth + 1)),
-            );
-        }
-        let mut locked_artifacts = HashMap::new();
-        locked_artifacts.extend(ancestry);
-        validate_locked_ancestry(transaction, cid, &locked_artifacts).await
+        validate_transaction_authority(transaction, cid, now).await
     }
 
     async fn persist_root_atomic(
@@ -1178,4 +1158,33 @@ fn db_time(value: OffsetDateTime) -> Result<String, AuthorityError> {
 
 fn db_time_parse(value: &str) -> Result<OffsetDateTime, AuthorityError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| AuthorityError::AuthorityStateUnavailable)
+}
+
+/// Reuse the normal authority validator inside a composing transaction.
+pub(crate) async fn validate_transaction_authority(
+    transaction: &DatabaseTransaction,
+    cid: &str,
+    now: OffsetDateTime,
+) -> Result<(), AuthorityError> {
+    let mut stack = vec![(cid.to_owned(), false, 0usize)];
+    let mut ancestry = HashMap::new();
+    while let Some((current, ancestor, depth)) = stack.pop() {
+        if depth > MAX_ANCESTRY_DEPTH || ancestry.contains_key(&current) {
+            return Err(AuthorityError::AncestryTooDeep);
+        }
+        let row = delegation_row(transaction, &current, true).await?;
+        let verified = ensure_live_model(&row, now, ancestor)?;
+        let edges = edges_on(transaction, &current).await?;
+        validate_persisted_edges(&verified, &edges)?;
+        ancestry.insert(current.clone(), verified);
+        stack.extend(
+            edges
+                .into_iter()
+                .rev()
+                .map(|edge| (edge.parent_cid, true, depth + 1)),
+        );
+    }
+    let mut locked_artifacts = HashMap::new();
+    locked_artifacts.extend(ancestry);
+    validate_locked_ancestry(transaction, cid, &locked_artifacts).await
 }

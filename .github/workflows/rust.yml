@@ -225,7 +225,7 @@ jobs:
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 15
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix
 
     # A hung PostgreSQL test holds row locks until its step is killed by the
     # timeout above. This dumps the sessions and what blocks them, so the

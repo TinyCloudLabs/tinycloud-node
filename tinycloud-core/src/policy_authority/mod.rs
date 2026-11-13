@@ -8,6 +8,7 @@
 mod database;
 mod verifier;
 
+pub(crate) use database::validate_transaction_authority;
 pub use database::{DatabaseAuthorityKernel, DatabaseAuthorityStore};
 pub use verifier::{AuthorityArtifactVerifier, ConfiguredNodeRootSigner, NodeRootSigner};
 

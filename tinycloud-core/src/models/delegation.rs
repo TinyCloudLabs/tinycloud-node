@@ -805,7 +805,7 @@ async fn validate_with<C: ConnectionTrait>(
     }
 }
 
-fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
+pub(crate) fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
     let TinyCloudDelegation::Ucan(ucan) = delegation else {
         return false;
     };
@@ -1325,25 +1325,7 @@ async fn save<C: ConnectionTrait>(
 }
 
 async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
-    match actor::Entity::insert_many(actors.iter().map(|a| {
-        actor::ActiveModel::from(actor::Model {
-            id: ToString::to_string(a),
-        })
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
-    Ok(())
+    crate::space_purge_records::operation_actors(db, actors).await
 }
 
 #[cfg(test)]
