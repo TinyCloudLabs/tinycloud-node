@@ -46,7 +46,11 @@ END $$;
         Ok(())
     }
 
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Other backends never changed storage and have nothing to undo.
+        if manager.get_database_backend() != DbBackend::Postgres {
+            return Ok(());
+        }
         Err(DbErr::Migration(
             "TC-2917 storage migration is forward-only".into(),
         ))
