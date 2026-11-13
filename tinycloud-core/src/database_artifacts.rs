@@ -220,6 +220,11 @@ pub trait ArtifactSink: Send {
     fn size_hint(&mut self, _part: ArtifactPart, _bytes: u64) {}
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
+    /// Whether the sink holds the whole artifact in memory. Such a read of a
+    /// large artifact waits for a large-transfer slot in either layout.
+    fn buffers_in_memory(&self) -> bool {
+        false
+    }
 }
 
 /// The most [`MemorySink`] allocates ahead of the bytes it is given.
@@ -247,6 +252,10 @@ impl ArtifactSink for MemorySink {
             self.wal = Some(Vec::new());
         }
         Ok(())
+    }
+
+    fn buffers_in_memory(&self) -> bool {
+        true
     }
 
     fn size_hint(&mut self, part: ArtifactPart, bytes: u64) {

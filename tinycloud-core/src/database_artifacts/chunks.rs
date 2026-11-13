@@ -357,6 +357,19 @@ FROM ready ON CONFLICT DO NOTHING"#
         {
             return Ok(false);
         }
+        // Parts stream in bounded statements, so the single-row read cap does
+        // not apply. A sink that keeps the whole artifact in memory still
+        // holds it all at once, like a single-row read (TC-2961).
+        let _large = if sink.buffers_in_memory() {
+            let total = u64::try_from(
+                meta.checkpoint_size_bytes
+                    .saturating_add(meta.delta_size_bytes),
+            )
+            .unwrap_or(0);
+            self.large_transfer_permit(total).await
+        } else {
+            None
+        };
         let row=self.conn.query_one(statement(
             "SELECT checkpoint_part_id,delta_part_id,revision,checkpoint_content_hash,layout_generation FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3",
             vec![service.into(),space.into(),name.into()],
@@ -1712,5 +1725,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved.size_bytes, CHUNK_BYTES as i64 + 1);
+    }
+
+    /// Counts the bytes a read delivers without holding them.
+    #[derive(Default)]
+    struct CountingSink {
+        bytes: u64,
+    }
+
+    #[async_trait]
+    impl ArtifactSink for CountingSink {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            self.bytes = 0;
+            Ok(())
+        }
+        async fn begin_part(&mut self, _part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            self.bytes += bytes.len() as u64;
+            Ok(())
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_read_is_not_held_to_the_single_row_read_cap() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_read_is_not_held_to_the_single_row_read_cap",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:read-cap";
+        let over = DEFAULT_MAX_ARTIFACT_READ_BYTES as usize + 1;
+        // Seed a single-row artifact over the default read cap with the write
+        // cap off, as an older node could have stored it.
+        SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_max_write_bytes(0)
+            .save(
+                "sql",
+                space,
+                "legacy",
+                vec![3; over],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 2 * over as u64,
+                account_bytes: 4 * over as u64,
+            }),
+        );
+        repo.save_snapshot(
+            "sql",
+            space,
+            "parts",
+            snapshot(&vec![4; over]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+        let mut parts = CountingSink::default();
+        read_artifact(&repo, "sql", space, "parts", &mut parts)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parts.bytes, over as u64);
+
+        let legacy =
+            read_artifact(&repo, "sql", space, "legacy", &mut CountingSink::default()).await;
+        assert!(
+            matches!(legacy, Err(DatabaseArtifactError::ReadLimitExceeded { .. })),
+            "{legacy:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_in_memory_read_waits_for_a_large_transfer_slot() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_in_memory_read_waits_for_a_large_transfer_slot",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:permit";
+        let size = BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 2 * size as u64,
+                account_bytes: 4 * size as u64,
+            }),
+        );
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&vec![5; size]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let held: Vec<_> = (0..MAX_CONCURRENT_LARGE_TRANSFERS)
+            .map(|_| repo.large_transfers.try_acquire().unwrap())
+            .collect();
+
+        // A streaming sink holds no more than a statement's bytes: no slot.
+        let mut streamed = CountingSink::default();
+        read_artifact(&repo, "sql", space, "main", &mut streamed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(streamed.bytes, size as u64);
+
+        // A sink holding the whole artifact waits until a slot frees.
+        let waiting = {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                let mut sink = MemorySink::default();
+                read_artifact(&repo, "sql", space, "main", &mut sink)
+                    .await
+                    .map(|_| sink.checkpoint.len())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an in-memory read took no transfer slot"
+        );
+        drop(held);
+        assert_eq!(waiting.await.unwrap().unwrap(), size);
     }
 }

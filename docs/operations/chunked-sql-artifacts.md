@@ -5,6 +5,13 @@ Each payload statement carries at most 1 MiB. A metadata-only compare-and-swap
 publishes a sealed part; successful writes retain the existing durability and
 lineage semantics. Hydration verifies the part CID before publishing its cache.
 
+A database stored in parts is not held to the single-row read limit
+(`storage.sql.max_artifact_read_bytes`, TC-2961): each statement reads at most
+1 MiB, hydration stages the parts in files beside the cache, and the artifact
+and account capacities bound its size. A read that keeps the whole database in
+memory (a DuckDB export) still waits for one of the node's large-transfer slots
+when it exceeds 8 MiB.
+
 The switch is off by default. Set explicit capacities before enabling:
 
 ```toml
