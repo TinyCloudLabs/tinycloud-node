@@ -109,6 +109,8 @@ pub enum DatabaseArtifactError {
     Db(DbErr),
     #[error("artifact storage limit reached")]
     StorageLimit,
+    #[error("database artifact replacement is in progress")]
+    ReplacementBusy,
     #[error("database artifact payload too large: {0} bytes")]
     PayloadTooLarge(u64),
     /// A payload larger than the repository's single-statement write limit
@@ -145,7 +147,18 @@ pub enum DatabaseArtifactError {
 
 impl From<DbErr> for DatabaseArtifactError {
     fn from(error: DbErr) -> Self {
-        if error.to_string().contains("TC2917_QUOTA") {
+        use sea_orm::error::{RuntimeErr, SqlxError};
+        let replacement_busy = match &error {
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(error)))
+            | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(error)))
+            | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(error))) => {
+                error.code().as_deref() == Some("TC001") && error.message() == "TC2917_BUSY"
+            }
+            _ => false,
+        };
+        if replacement_busy {
+            Self::ReplacementBusy
+        } else if error.to_string().contains("TC2917_QUOTA") {
             Self::StorageLimit
         } else if error.to_string().contains("TC2917_LAYOUT") {
             Self::StaleLineage
@@ -783,7 +796,7 @@ pub struct SeaOrmDatabaseArtifactRepository {
     #[cfg(test)]
     race_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
-    chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    pub(crate) chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     chunk_reclaim_paused: bool,
 }

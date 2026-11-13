@@ -551,11 +551,20 @@ impl DuckDbService {
         {
             if expected != ArtifactExpectation::Absent {
                 if let Some(wal) = handle.wal_snapshot(MAX_WAL_DELTA_BYTES as u64).await? {
-                    let saved = self
+                    let saved = match self
                         .artifact_repository
                         .save_wal_snapshot("duckdb", &key.0, db_name, wal, expected)
                         .await
-                        .map_err(artifact_error_to_duckdb)?;
+                    {
+                        Ok(saved) => saved,
+                        Err(
+                            DatabaseArtifactError::MissingCheckpoint
+                            | DatabaseArtifactError::IncrementalPersistenceUnsupported,
+                        ) => {
+                            return self.checkpoint(space, db_name, handle, false).await;
+                        }
+                        Err(error) => return Err(artifact_error_to_duckdb(error)),
+                    };
                     self.lineage.insert(
                         key,
                         ArtifactExpectation::Derived {
@@ -746,9 +755,11 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
 /// The artifact size limits answer 507, as for SQL (TC-2961).
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
     match err {
-        DatabaseArtifactError::WriteLimitExceeded { .. } => DuckDbError::DatabaseSizeLimit,
+        DatabaseArtifactError::StorageLimit | DatabaseArtifactError::WriteLimitExceeded { .. } => {
+            DuckDbError::DatabaseSizeLimit
+        }
         DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
-        DatabaseArtifactError::StorageLimit => DuckDbError::StorageWouldGrow,
+        DatabaseArtifactError::ReplacementBusy => DuckDbError::Unavailable,
         err => DuckDbError::Internal(err.to_string()),
     }
 }
@@ -1729,7 +1740,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(outcome, Err(DuckDbError::StorageWouldGrow)),
+            matches!(outcome, Err(DuckDbError::DatabaseSizeLimit)),
             "{outcome:?}"
         );
         assert!(repo
@@ -1823,5 +1834,108 @@ mod tests {
             assert!(!duckdb_wal_path(&path).exists());
             assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         }
+    }
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_legacy_wal_falls_back_to_snapshot() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_legacy_wal_falls_back_to_snapshot",
+        )
+        .await
+        else {
+            return;
+        };
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let third = TempDir::new().unwrap();
+        let space = test_space_id("legacy-duckdb-parts");
+        let legacy = Arc::new(SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()));
+        let source = file_service(&first, legacy);
+        source
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        source
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 4 * 1024 * 1024,
+                    account_bytes: 16 * 1024 * 1024,
+                },
+            )),
+        );
+        let service = file_service(&second, repo.clone());
+        for id in [2, 3] {
+            service
+                .execute(
+                    &space,
+                    "main",
+                    DuckDbRequest::Execute {
+                        schema: None,
+                        sql: format!("INSERT INTO items VALUES ({id})"),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let meta = repo
+                .load_meta("duckdb", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.storage_mode, "checkpoint-parts-v1");
+            assert_eq!(meta.revision, id);
+            assert_eq!(meta.has_delta(), id == 3);
+        }
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        let reopened = file_service(&third, repo);
+        let result = reopened
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Query {
+                    sql: "SELECT id FROM items ORDER BY id".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/read".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let DuckDbResponse::Query(query) = result.response else {
+            panic!("query required");
+        };
+        assert_eq!(
+            query.rows,
+            vec![
+                vec![DuckDbValue::Integer(1)],
+                vec![DuckDbValue::Integer(2)],
+                vec![DuckDbValue::Integer(3)]
+            ]
+        );
+        reopened
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
     }
 }
