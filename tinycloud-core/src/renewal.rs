@@ -909,11 +909,18 @@ async fn register_lease_at<C: ConnectionTrait>(
         ],
     )).await?;
     if let Some(row) = existing {
+        // Renewal metadata is stored at whole-second precision.
         let same = row.try_get::<String>("", "grantor")? == lease.delegator
             && row.try_get::<String>("", "renewer_did")? == renewer_did
             && row.try_get::<i64>("", "renewer_epoch")? == renewer_epoch as i64
-            && row.try_get::<OffsetDateTime>("", "lease_expiry")? == lease_expiry
-            && row.try_get::<OffsetDateTime>("", "original_expiry")? == original_expiry
+            && row
+                .try_get::<OffsetDateTime>("", "lease_expiry")?
+                .unix_timestamp()
+                == lease_expiry.unix_timestamp()
+            && row
+                .try_get::<OffsetDateTime>("", "original_expiry")?
+                .unix_timestamp()
+                == original_expiry.unix_timestamp()
             && row.try_get::<i64>("", "period_seconds")? == period
             && row.try_get::<Vec<u8>>("", "audience_public_key")? == audience_public_key;
         return if same {
@@ -1109,8 +1116,17 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         now,
     )
     .await?;
-    if snapshot.delegation(&original).and_then(|row| row.expiry) != Some(original_expiry)
-        || snapshot.delegation(&lease).and_then(|row| row.expiry) != Some(lease_expiry)
+    // Compare with the precision stored by register_lease_at; caps remain floored.
+    if snapshot
+        .delegation(&original)
+        .and_then(|row| row.expiry)
+        .map(|expiry| expiry.unix_timestamp())
+        != Some(original_expiry.unix_timestamp())
+        || snapshot
+            .delegation(&lease)
+            .and_then(|row| row.expiry)
+            .map(|expiry| expiry.unix_timestamp())
+            != Some(lease_expiry.unix_timestamp())
     {
         return Err(RenewalStoreError::InvalidInput);
     }
