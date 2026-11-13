@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "db/status_snapshot_tests.rs"]
+mod status_snapshot_tests;
+
 use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
@@ -266,6 +270,7 @@ pub struct SpaceDatabase<C, B, S> {
     candidate_conn: RecoveringConnection,
     storage: B,
     secrets: S,
+    renewal_identity: Option<crate::renewal::RenewalNodeIdentity>,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
     delegated_sql_caveats: bool,
@@ -333,6 +338,12 @@ pub struct TransactResult {
     pub delegation_cids: Vec<Hash>,
 }
 
+pub type DelegationStatusSnapshot = (
+    DelegationStatus,
+    Option<i64>,
+    Vec<crate::renewal::StampRecord>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationStatus {
     Active,
@@ -356,6 +367,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     InvalidInvocation(#[from] invocation::InvocationError),
     #[error(transparent)]
     InvalidRevocation(#[from] revocation::RevocationError),
+    #[error(transparent)]
+    Renewal(#[from] crate::renewal::RenewalStoreError),
+    #[error("renewal history is not authorized")]
+    RenewalHistoryUnauthorized,
     #[error("Epoch Hashing Err: {0}")]
     EpochHashingErr(#[from] HashError),
     #[error(transparent)]
@@ -472,10 +487,60 @@ where
     }
 }
 
+/// Build the invocation graph with this node's identity-bound renewal view.
+/// Callers pass one verifier time and the connection used for authorization.
+async fn invocation_authorization_graph<C: ConnectionTrait>(
+    conn: &C,
+    roots: &[Hash],
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    now: OffsetDateTime,
+) -> Result<crate::auth_graph::AuthGraphSnapshot, invocation::Error> {
+    let result = match identity {
+        Some(identity) => {
+            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                conn,
+                roots,
+                &identity.stable_node_did,
+                &identity.renewer_did,
+                identity.epoch,
+                now.unix_timestamp(),
+            )
+            .await
+        }
+        None => crate::auth_graph::AuthGraphSnapshot::load(conn, roots).await,
+    };
+    result.map_err(|error| match error {
+        crate::auth_graph::ChainTraversalError::Db(error) => invocation::Error::Db(error),
+        crate::auth_graph::ChainTraversalError::LimitExceeded => {
+            invocation::InvocationError::ChainTraversalLimitExceeded.into()
+        }
+    })
+}
+
+/// Preserve signature verification before loading a public caller's graph.
+async fn verify_invocation_authorization<C: ConnectionTrait>(
+    conn: &C,
+    invocation: &crate::util::InvocationInfo,
+    now: OffsetDateTime,
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    delegated_sql_caveats: bool,
+) -> Result<(), invocation::Error> {
+    invocation::verify_invocation(&invocation.invocation).await?;
+    let roots = invocation
+        .parents
+        .iter()
+        .copied()
+        .map(Hash::from)
+        .collect::<Vec<_>>();
+    let graph = invocation_authorization_graph(conn, &roots, identity, now).await?;
+    invocation::authorize_admitted(conn, invocation, now, Some(&graph), delegated_sql_caveats).await
+}
+
 /// Reject unauthorized or unhosted mutations before any content upload.
 /// The commit transaction repeats authorization after the sequence lock.
 /// `check_hosted` is false only where the caller's registration statement
 /// checks that every space exists itself.
+#[allow(clippy::too_many_arguments)]
 async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Secrets>(
     conn: &C,
     invocation: &Invocation,
@@ -483,24 +548,40 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     now: OffsetDateTime,
     spaces: &[SpaceId],
     delegated_sql_caveats: bool,
+    renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     check_hosted: bool,
 ) -> Result<(), TxError<B, K>> {
     match mode {
         InvokeMode::Admitted => {
-            invocation::authorize_admitted(conn, &invocation.0, now, None, delegated_sql_caveats)
+            let roots = invocation
+                .0
+                .parents
+                .iter()
+                .copied()
+                .map(Hash::from)
+                .collect::<Vec<_>>();
+            let graph = invocation_authorization_graph(conn, &roots, renewal_identity, now)
                 .await
                 .map_err(TxError::<B, K>::from)?;
-        }
-        InvokeMode::Public => {
-            invocation::verify_and_authorize_with_setting(
+            invocation::authorize_admitted(
                 conn,
                 &invocation.0,
                 now,
+                Some(&graph),
                 delegated_sql_caveats,
             )
             .await
             .map_err(TxError::<B, K>::from)?;
         }
+        InvokeMode::Public => verify_invocation_authorization(
+            conn,
+            &invocation.0,
+            now,
+            renewal_identity,
+            delegated_sql_caveats,
+        )
+        .await
+        .map_err(TxError::<B, K>::from)?,
         InvokeMode::Internal | InvokeMode::MeetingPublication => {}
     }
     if check_hosted {
@@ -582,7 +663,10 @@ where
 {
     /// Open an unencrypted delegation database and complete historical CID
     /// indexing before accepting requests.
-    pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr> {
+    pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr>
+    where
+        K: Secrets,
+    {
         Self::new_with_encryption(conn, storage, secrets, None).await
     }
 
@@ -594,7 +678,10 @@ where
         storage: B,
         secrets: K,
         encryption: Option<ColumnEncryption>,
-    ) -> Result<Self, DbErr> {
+    ) -> Result<Self, DbErr>
+    where
+        K: Secrets,
+    {
         let pool: RecoveringConnection = conn.clone().into();
         // sea-orm-migration's schema manager accepts only the raw sea-orm
         // connection. Migrations run once at boot, before any request.
@@ -606,6 +693,20 @@ where
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
+        let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
+            (Some(seed), Some(stable_node_did)) => {
+                let (renewer_did, epoch, _) =
+                    crate::renewal::initialize_renewal_identity(&pool, seed)
+                        .await
+                        .map_err(|error| DbErr::Custom(error.to_string()))?;
+                Some(crate::renewal::RenewalNodeIdentity {
+                    stable_node_did,
+                    renewer_did,
+                    epoch,
+                })
+            }
+            _ => None,
+        };
         let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
         let read_audit = ReadAuditPipeline::start(pool.clone(), writer_lock.clone());
@@ -614,6 +715,7 @@ where
             conn,
             storage,
             secrets,
+            renewal_identity,
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
@@ -690,6 +792,60 @@ where
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
         self.secrets.stage_keypair(space_id).await.map(get_did_key)
     }
+    /// Returns the authorization graph's current effective end for a delegation.
+    pub async fn delegation_effective_expiry(
+        &self,
+        target: Hash,
+        verifier_now: i64,
+    ) -> Result<Option<i64>, crate::renewal::RenewalStoreError>
+    where
+        C: ConnectionTrait,
+    {
+        self.delegation_effective_expiry_on(&self.conn, target, verifier_now)
+            .await
+    }
+
+    async fn delegation_effective_expiry_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        verifier_now: i64,
+    ) -> Result<Option<i64>, crate::renewal::RenewalStoreError> {
+        let effective_root = crate::models::revocation::target_for_cid(conn, target)
+            .await?
+            .map_or(target, |delegation| delegation.id);
+        let roots = [effective_root];
+        let snapshot = match self.renewal_identity.as_ref() {
+            Some(identity) => crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                conn,
+                &roots,
+                &identity.stable_node_did,
+                &identity.renewer_did,
+                identity.epoch,
+                verifier_now,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::models::revocation::ChainTraversalError::Db(error) => {
+                    crate::renewal::RenewalStoreError::Db(error)
+                }
+                crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                    crate::renewal::RenewalStoreError::InvalidInput
+                }
+            })?,
+            _ => crate::auth_graph::AuthGraphSnapshot::load(conn, &roots)
+                .await
+                .map_err(|error| match error {
+                    crate::models::revocation::ChainTraversalError::Db(error) => {
+                        crate::renewal::RenewalStoreError::Db(error)
+                    }
+                    crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                        crate::renewal::RenewalStoreError::InvalidInput
+                    }
+                })?,
+        };
+        Ok(snapshot.effective_expiry(&effective_root))
+    }
 }
 
 impl<C, B> SpaceDatabase<C, B, StaticSecret> {
@@ -705,9 +861,58 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
     pub fn kv_sync_cursor_key(&self) -> [u8; 32] {
         self.secrets.derive_key(b"tinycloud/kv/sync-cursor/v1")
     }
+    /// Issue a renewal stamp using this database's configured node secret.
+    pub async fn issue_renewal_stamp(
+        &self,
+        request: crate::renewal::StampIssue,
+    ) -> Result<crate::renewal::StampRecord, crate::renewal::RenewalStoreError>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let identity = self
+            .renewal_identity
+            .as_ref()
+            .ok_or(crate::renewal::RenewalStoreError::IdentityEpoch)?;
+        crate::renewal::issue_stamp(&self.conn, request, &self.secrets, identity).await
+    }
 }
-
 impl<C, B, K> SpaceDatabase<C, B, K> {
+    /// Apply owner renewal controls with the node's column-decryption context.
+    pub async fn renewal_state_control(
+        &self,
+        admitted: &crate::AdmittedInvocation,
+        body: &serde_json::Value,
+        replay: crate::models::invocation_replay::Model,
+    ) -> Result<crate::renewal::control::StateReceipt, crate::renewal::control::ControlError>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let identity =
+            self.renewal_identity
+                .as_ref()
+                .ok_or(crate::renewal::control::ControlError(
+                    "renewal_state_unavailable",
+                ))?;
+        crate::renewal::control::execute(
+            &self.conn,
+            admitted,
+            body,
+            replay,
+            identity,
+            self.encryption.as_ref(),
+        )
+        .await
+    }
+
+    /// Persisted renewal identity captured during database startup.
+    pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
+        self.renewal_identity.as_ref()
+    }
+
     /// Exposes the node's capability database for projections that are
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
@@ -878,11 +1083,25 @@ where
         &self,
         invocation: &crate::util::InvocationInfo,
         now: OffsetDateTime,
-    ) -> Result<(), crate::models::invocation::Error> {
-        invocation::verify_and_authorize_with_setting(
+    ) -> Result<(), crate::models::invocation::Error>
+    where
+        K: Secrets,
+    {
+        if self.secrets.renewal_seed().is_some_and(|seed| {
+            crate::renewal::renewal_identity_from_seed(seed).0 == invocation.invoker
+        }) {
+            return Err(
+                crate::models::invocation::InvocationError::UnauthorizedInvoker(
+                    invocation.invoker.clone(),
+                )
+                .into(),
+            );
+        }
+        verify_invocation_authorization(
             &self.conn,
             invocation,
             now,
+            self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
         )
         .await
@@ -896,12 +1115,35 @@ where
         &self,
         invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
-    ) -> Result<(), crate::models::invocation::Error> {
+    ) -> Result<(), crate::models::invocation::Error>
+    where
+        K: Secrets,
+    {
+        let invocation_info = &invocation.invocation().0;
+        if self.secrets.renewal_seed().is_some_and(|seed| {
+            crate::renewal::renewal_identity_from_seed(seed).0 == invocation_info.invoker
+        }) {
+            return Err(
+                crate::models::invocation::InvocationError::UnauthorizedInvoker(
+                    invocation_info.invoker.clone(),
+                )
+                .into(),
+            );
+        }
+        let roots = invocation_info
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect::<Vec<_>>();
+        let graph =
+            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
+                .await?;
         invocation::authorize_admitted(
             &self.conn,
-            &invocation.invocation().0,
+            invocation_info,
             now,
-            None,
+            Some(&graph),
             self.delegated_sql_caveats,
         )
         .await
@@ -1013,10 +1255,11 @@ where
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
-        invocation::verify_and_authorize_with_setting(
+        verify_invocation_authorization(
             &self.conn,
             invocation,
             now,
+            self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
         )
         .await
@@ -1866,6 +2109,7 @@ where
             &tx,
             &self.storage,
             &self.secrets,
+            self.renewal_identity.as_ref(),
             events,
             self.encryption.as_ref(),
             None,
@@ -2066,6 +2310,14 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
+        if self.secrets.renewal_seed().is_some_and(|seed| {
+            crate::renewal::renewal_identity_from_seed(seed).0 == delegation.0.delegator
+        }) {
+            return Err(TxError::InvalidDelegation(
+                delegation::DelegationError::UnauthorizedDelegator(delegation.0.delegator.clone()),
+            ));
+        }
+        let renewal_lease = crate::renewal::lease_original_from_signed(&delegation)?.is_some();
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
@@ -2094,14 +2346,14 @@ where
             .one(&self.conn)
             .await
         {
-            Ok(Some(_)) => {
+            Ok(Some(_)) if !renewal_lease => {
                 // The content-addressed row authenticates these exact signed bytes.
                 for space in delegation.0.spaces() {
                     crate::request_telemetry::observe_space(space);
                 }
                 return Ok(already_registered_result(retained_hash));
             }
-            Ok(None) => {}
+            Ok(Some(_)) | Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
         match self
@@ -2134,6 +2386,19 @@ where
         &self,
         delegations: Vec<Delegation>,
     ) -> Result<TransactResult, TxError<B, K>> {
+        if let Some(seed) = self.secrets.renewal_seed() {
+            let renewer_did = crate::renewal::renewal_identity_from_seed(seed).0;
+            if let Some(delegation) = delegations
+                .iter()
+                .find(|item| item.0.delegator == renewer_did)
+            {
+                return Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(
+                        delegation.0.delegator.clone(),
+                    ),
+                ));
+            }
+        }
         self.transact(
             delegations
                 .into_iter()
@@ -2151,10 +2416,24 @@ where
         tx: &DatabaseTransaction,
         delegations: Vec<Delegation>,
     ) -> Result<TransactResult, TxError<B, K>> {
+        if let Some(seed) = self.secrets.renewal_seed() {
+            let renewer_did = crate::renewal::renewal_identity_from_seed(seed).0;
+            if let Some(delegation) = delegations
+                .iter()
+                .find(|item| item.0.delegator == renewer_did)
+            {
+                return Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(
+                        delegation.0.delegator.clone(),
+                    ),
+                ));
+            }
+        }
         transact(
             tx,
             &self.storage,
             &self.secrets,
+            self.renewal_identity.as_ref(),
             delegations
                 .into_iter()
                 .map(|delegation| Event::Delegation(Box::new(delegation)))
@@ -2188,20 +2467,16 @@ where
         target: Hash,
         invoker: &str,
         proofs: &[tinycloud_auth::authorization::Cid],
-    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>>
+    where
+        K: Secrets,
+    {
         if proofs.len() > 1 {
             return Ok(None);
         }
-        // A canonical CID may name a historical stored row; the requested CID
-        // keeps its own authority scope, the stored row supplies the grant.
         let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
-        let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(delegation.id))
-            .all(&self.conn)
-            .await?;
-
         let mut roots = vec![target];
         if delegation.id != target {
             roots.push(delegation.id);
@@ -2215,8 +2490,118 @@ where
             Err(error) => return Err(error),
         };
 
-        let authorized = match revocation::control_proof_decision(
+        self.delegation_status_on(
             &self.conn,
+            target,
+            invoker,
+            proofs,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+    }
+
+    /// Read every status response field from one database snapshot.
+    pub async fn delegation_status_snapshot(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        self.delegation_status_snapshot_inner(
+            target,
+            invoker,
+            proofs,
+            verifier_now,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn delegation_status_snapshot_inner(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+        after_expiry: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // Keep chain-lock acquisition before opening the read transaction.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
+            return Ok(None);
+        };
+        let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
+        roots.extend(proofs.iter().copied().map(Hash::from));
+        let _chain_guards = match self.acquire_chain_guards(&roots).await {
+            Ok(guards) => guards,
+            Err(TxError::ChainTraversalLimitExceeded) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        let tx = match self.conn.get_database_backend() {
+            DbBackend::Postgres => {
+                self.conn
+                    .begin_with_config(
+                        Some(sea_orm::IsolationLevel::RepeatableRead),
+                        Some(sea_orm::AccessMode::ReadOnly),
+                    )
+                    .await?
+            }
+            _ => self.conn.begin().await?,
+        };
+        let Some(status) = self
+            .delegation_status_on(&tx, target, invoker, proofs, verifier_now)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let expiry = self
+            .delegation_effective_expiry_on(&tx, target, verifier_now)
+            .await?;
+        after_expiry.await;
+        let history =
+            crate::renewal::renewal_history(&tx, &target.to_cid(0x55).to_string(), invoker, proofs)
+                .await
+                .map_err(|error| match error {
+                    crate::renewal::RenewalStoreError::Unauthorized => {
+                        TxError::RenewalHistoryUnauthorized
+                    }
+                    error => TxError::Renewal(error),
+                })?;
+        tx.commit().await?;
+        Ok(Some((status, expiry, history)))
+    }
+
+    async fn delegation_status_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(conn, target).await? else {
+            return Ok(None);
+        };
+        let abilities = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(delegation.id))
+            .all(conn)
+            .await?;
+
+        let authorized = match revocation::control_proof_decision(
+            conn,
             invoker,
             proofs,
             revocation::ControlAction::Status,
@@ -2246,7 +2631,7 @@ where
 
         // One read joins the generic revocation table (with its CID aliases)
         // and `policy_v3_root` over the target and its whole ancestor chain.
-        match revocation::chain_revoked(&self.conn, &target, &delegation.id).await {
+        match revocation::chain_revoked(conn, &target, &delegation.id).await {
             Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -2255,13 +2640,17 @@ where
             Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
         }
 
-        let now = OffsetDateTime::now_utc();
-        if delegation
-            .expiry
-            .map(|expiry| now >= expiry)
-            .unwrap_or(false)
-        {
-            return Ok(Some(DelegationStatus::Expired));
+        let now = OffsetDateTime::from_unix_timestamp(verifier_now)
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+        let effective_expiry = self
+            .delegation_effective_expiry_on(conn, target, now.unix_timestamp())
+            .await?;
+        match effective_expiry {
+            Some(end) if now.unix_timestamp() >= end => {
+                return Ok(Some(DelegationStatus::Expired));
+            }
+            Some(_) => {}
+            None => return Ok(Some(DelegationStatus::Unavailable)),
         }
         if delegation
             .not_before
@@ -2366,6 +2755,14 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        if self.secrets.renewal_seed().is_some_and(|seed| {
+            crate::renewal::renewal_identity_from_seed(seed).0 == invocation.0.invoker
+        }) {
+            return Err(TxError::InvalidInvocation(
+                invocation::InvocationError::UnauthorizedInvoker(invocation.0.invoker),
+            )
+            .into());
+        }
         // TC-732: a `kv/sync` invocation must be exactly one capability on a
         // KV resource (the root resource is the whole-space feed); anything
         // else is rejected before any work.
@@ -2764,7 +3161,21 @@ where
             // recorded as a failure; it is disarmed to `ok` right before commit.
             let tx_body_timer =
                 crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-            let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
+            let auth_graph_result = match self.renewal_identity.as_ref() {
+                Some(identity) => {
+                    crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                        &tx,
+                        &roots,
+                        &identity.stable_node_did,
+                        &identity.renewer_did,
+                        identity.epoch,
+                        now.unix_timestamp(),
+                    )
+                    .await
+                }
+                None => crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await,
+            };
+            let auth_graph = match auth_graph_result {
                 Ok(graph) => graph,
                 Err(error) => {
                     crate::telemetry::observe_stage(
@@ -2841,6 +3252,7 @@ where
                 &tx,
                 &self.storage,
                 &self.secrets,
+                self.renewal_identity.as_ref(),
                 vec![event],
                 self.encryption.as_ref(),
                 Some(&auth_graph),
@@ -2928,6 +3340,7 @@ where
             now,
             spaces,
             self.delegated_sql_caveats,
+            self.renewal_identity.as_ref(),
             !claim_checks_hosting,
         )
         .await?;
@@ -3127,65 +3540,44 @@ where
         S::Writable: 'static + Unpin,
     {
         let now = OffsetDateTime::now_utc();
-        // TC-732: a `kv/sync` read loads one authorization snapshot (proofs
-        // plus any presented retention grant) and uses it both to authorize
-        // and to attest the authority window, so the two cannot disagree.
-        let sync_graph = match sync_target.as_ref() {
-            Some(_) => {
-                let mut roots: Vec<Hash> = invocation
-                    .0
-                    .parents
-                    .iter()
-                    .copied()
-                    .map(Hash::from)
-                    .collect();
-                roots.extend(
-                    options
-                        .kv_sync
-                        .as_ref()
-                        .and_then(|sync| sync.retention_grant),
-                );
-                Some(
-                    crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
-                        .await
-                        .map_err(|error| match error {
-                            revocation::ChainTraversalError::Db(error) => {
-                                TxError::<B, K>::Db(error)
-                            }
-                            revocation::ChainTraversalError::LimitExceeded => {
-                                TxError::ChainTraversalLimitExceeded
-                            }
-                        })?,
-                )
-            }
-            None => None,
-        };
-        // TC-409: an admitted invocation already had its signature verified
-        // once at the admission boundary; only re-check authorization and
-        // signed-time validity here rather than verifying the signature a
-        // second time.
-        match mode {
-            InvokeMode::Admitted => invocation::authorize_admitted(
-                &self.conn,
-                &invocation.0,
-                now,
-                sync_graph.as_ref(),
-                self.delegated_sql_caveats,
-            )
-            .await
-            .map_err(TxError::<B, K>::from)?,
-            InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
-                invocation::verify_and_authorize_with_graph(
-                    &self.conn,
-                    &invocation.0,
-                    now,
-                    sync_graph.as_ref(),
-                    self.delegated_sql_caveats,
-                )
+        if mode != InvokeMode::Admitted {
+            invocation::verify_invocation(&invocation.0.invocation)
                 .await
-                .map_err(TxError::<B, K>::from)?
-            }
-        };
+                .map_err(TxError::<B, K>::from)?;
+        }
+
+        // Every read uses the same identity-aware graph for authorization.
+        // Sync additionally includes its retention grant in that snapshot.
+        let mut roots = invocation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect::<Vec<_>>();
+        if sync_target.is_some() {
+            roots.extend(
+                options
+                    .kv_sync
+                    .as_ref()
+                    .and_then(|sync| sync.retention_grant),
+            );
+        }
+        let auth_graph =
+            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        // The admitted path keeps its single signature verification at admission;
+        // public envelopes were verified above. Both re-check time and authority.
+        invocation::authorize_admitted(
+            &self.conn,
+            &invocation.0,
+            now,
+            Some(&auth_graph),
+            self.delegated_sql_caveats,
+        )
+        .await
+        .map_err(TxError::<B, K>::from)?;
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
         if !requested_spaces.is_empty() {
@@ -3198,8 +3590,9 @@ where
             }
         }
 
-        let sync_outcome = match (sync_target, sync_graph.as_ref()) {
-            (Some((space, prefix, resource)), Some(graph)) => {
+        let sync_outcome = match sync_target {
+            Some((space, prefix, resource)) => {
+                let graph = &auth_graph;
                 let request =
                     options
                         .kv_sync
@@ -3717,6 +4110,8 @@ pub enum InvocationOutcome<R> {
     EncryptionDecrypt(crate::encryption_network::DecryptResponseBody),
     /// `tinycloud.space/info`: the space's storage usage, rendered by the node.
     SpaceInfo(serde_json::Value),
+    /// Renewal stamp response returned by the normal invocation response path.
+    RenewalStamp(serde_json::Value),
 }
 
 #[derive(Debug)]
@@ -3891,6 +4286,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
     secrets: &K,
+    node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
@@ -3913,6 +4309,25 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let event_spaces = event_spaces(db, &event_hashes).await?;
     crate::kv_sync::lock_space_sequences_not_held(db, event_spaces.keys(), sequence_locks_held)
         .await?;
+    let renewal_seed = secrets.renewal_seed();
+    let renewal_identity = node_identity.map(|identity| {
+        (
+            &identity.stable_node_did,
+            &identity.renewer_did,
+            identity.epoch,
+        )
+    });
+    let mut renewal_lease_events = Vec::new();
+    for (_, event) in &event_hashes {
+        if let Event::Delegation(lease) = event {
+            if crate::renewal::lease_original_from_signed(lease)?.is_some() {
+                if renewal_identity.is_none() || renewal_seed.is_none() {
+                    return Err(crate::renewal::RenewalStoreError::LeaseUnavailable.into());
+                }
+                renewal_lease_events.push(lease.as_ref());
+            }
+        }
+    }
 
     // ── Atomic delegation registration ──────────────────────────────────────
     // Register all delegations inside this transaction before any epoch rows
@@ -3921,10 +4336,42 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg =
-                delegation::process_with(db, d, encryption, delegated_sql_caveats, named_keys)
-                    .await?;
+            let reg = if renewal_lease_events
+                .iter()
+                .any(|lease| lease.content_hash() == *hash)
+            {
+                delegation::save_owner_renewal_lease(db, d, encryption).await?
+            } else {
+                delegation::process_with(
+                    db,
+                    d,
+                    encryption,
+                    delegated_sql_caveats,
+                    named_keys,
+                    renewal_identity
+                        .as_ref()
+                        .map(|(stable_node_did, renewer_did, epoch)| {
+                            (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
+                        }),
+                )
+                .await?
+            };
             registered.insert(*hash, reg);
+        }
+    }
+    if let (Some(seed), Some((stable_node_did, _, renewer_epoch))) =
+        (renewal_seed, renewal_identity.as_ref())
+    {
+        for lease in renewal_lease_events {
+            crate::renewal::register_lease(
+                db,
+                lease,
+                seed,
+                *renewer_epoch,
+                stable_node_did,
+                encryption,
+            )
+            .await?;
         }
     }
 
@@ -5741,12 +6188,42 @@ mod test {
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+    #[tokio::test]
+    async fn renewal_identity_is_rejected_by_generic_authorization() {
+        let secret = StaticSecret::new([0u8; 32].to_vec()).unwrap();
+        let db = SpaceDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap(),
+            MemoryStore::default(),
+            secret.clone(),
+        )
+        .await
+        .unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+        ))
+        .unwrap();
+        let token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
+            fixture["originalToken"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut invocation = crate::util::InvocationInfo::try_from(token).unwrap();
+        invocation.invoker = secret.renewal_did();
+        assert!(matches!(
+            db.authorize_invocation(&invocation, OffsetDateTime::now_utc())
+                .await,
+            Err(invocation::Error::InvalidInvocation(
+                invocation::InvocationError::UnauthorizedInvoker(_)
+            ))
+        ));
     }
 
     /// A file-backed WAL pool with the given busy timeout and size; the first
@@ -8869,6 +9346,7 @@ mod test {
         let capability = |did: &str| crate::util::Capability {
             resource: Resource::TinyCloud(
                 SpaceId::new(did.parse::<DIDBuf>().unwrap(), "default".parse().unwrap())
+                    .unwrap()
                     .to_resource("delegation".parse().unwrap(), None, None, None),
             ),
             ability: "tinycloud.delegation/list".to_string().try_into().unwrap(),
@@ -11323,8 +11801,8 @@ mod test {
     fn space_resource_bounds_bracket_every_resource_in_the_space() {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
         let (lower, upper) = space_resource_bounds(&foo);
 
         assert_eq!(lower, format!("{foo}/"));
@@ -11409,10 +11887,10 @@ mod test {
         // never overlap in the first place.
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
-        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap());
-        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
+        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap()).unwrap();
+        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
         // Same *name*, different controller.
         let other_foo = test_space_id("foo");
 
@@ -11596,7 +12074,8 @@ mod test {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         for i in 0..300 {
-            let space = SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap());
+            let space =
+                SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap()).unwrap();
             seed_delegation(
                 conn,
                 &format!("tc320-delegation-{i}"),
@@ -11614,7 +12093,7 @@ mod test {
         .await
         .unwrap();
 
-        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap());
+        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap()).unwrap();
         let explain = |space: Option<&SpaceId>| {
             let mut query = delegation::Entity::find()
                 .left_join(revocation::Entity)
@@ -11726,9 +12205,9 @@ mod test {
             let now = OffsetDateTime::now_utc();
             let jwk = JWK::generate_ed25519().unwrap();
             let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
-            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap()).unwrap();
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
 
             seed_delegation(
                 &conn,
@@ -11937,8 +12416,8 @@ mod test {
             let now = OffsetDateTime::now_utc();
             let jwk = JWK::generate_ed25519().unwrap();
             let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
-            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap()).unwrap();
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap()).unwrap();
             seed_delegation(
                 &conn,
                 "cl-foo-a",

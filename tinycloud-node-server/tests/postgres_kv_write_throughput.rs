@@ -128,7 +128,7 @@ impl Owner {
             .map(|(_, fragment)| fragment.to_owned())
             .ok_or("did:key has no method-specific id")?;
         let verification_method = format!("{did}#{fragment}");
-        let space = SpaceId::new(did.parse::<DIDBuf>()?, "default".parse()?);
+        let space = SpaceId::new(did.parse::<DIDBuf>()?, "default".parse()?)?;
         Ok(Self {
             jwk,
             verification_method,

@@ -185,7 +185,7 @@ mod tests {
                     let did = tinycloud_auth::resolver::DID_METHODS
                         .generate(&jwk, "key")
                         .unwrap();
-                    SpaceId::new(did, "default".parse().unwrap())
+                    SpaceId::new(did, "default".parse().unwrap()).unwrap()
                 })
                 .collect::<Vec<_>>();
             spaces.sort_by_key(|space| space.to_string());

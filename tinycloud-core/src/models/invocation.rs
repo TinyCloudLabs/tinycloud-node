@@ -508,8 +508,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     let Some(ancestor) = graph.delegation(&chain_id) else {
                         return Err(InvocationError::MissingParents.into());
                     };
-                    if ancestor
-                        .expiry
+                    let effective_expiry = graph
+                        .effective_expiry(&chain_id)
+                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .or(ancestor.expiry);
+                    if effective_expiry
                         .map(|expiry| chain_now >= expiry)
                         .unwrap_or(false)
                         || ancestor
@@ -535,7 +538,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
             let parents: Vec<_> = parents
                 .into_iter()
                 .filter(|(p, _)| {
-                    p.expiry.map(|pexp| now < pexp).unwrap_or(true)
+                    let effective_expiry = graph
+                        .effective_expiry(&p.id)
+                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .or(p.expiry);
+                    effective_expiry.map(|pexp| now < pexp).unwrap_or(true)
                         && p.not_before.map(|pnbf| now >= pnbf).unwrap_or(true)
                 })
                 .collect();
@@ -1231,7 +1238,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     #[test]

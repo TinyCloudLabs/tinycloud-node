@@ -579,7 +579,8 @@ async fn store_sizes<P: AsRef<Path>>(
                         ) {
                             // get the space ID from suffix and name
                             let space =
-                                SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?);
+                                SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?)
+                                    .map_err(IoError::other)?;
                             let (size, space_stages) = space_size(&entry.path()).await?;
                             acc.insert(space, size);
                             stages.extend(space_stages);

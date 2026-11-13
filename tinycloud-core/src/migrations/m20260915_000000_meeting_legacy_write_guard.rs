@@ -59,7 +59,8 @@ mod tests {
                 .generate(&JWK::generate_ed25519().unwrap(), "key")
                 .unwrap(),
             "legacy-freeze-rollback".parse().unwrap(),
-        );
+        )
+        .unwrap();
 
         for (frozen, generation) in [(true, 1), (false, 2)] {
             let tx = db.begin().await.unwrap();

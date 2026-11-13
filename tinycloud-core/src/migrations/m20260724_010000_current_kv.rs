@@ -258,7 +258,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        let space_id = SpaceId::new(did, "migration".parse().unwrap());
+        let space_id = SpaceId::new(did, "migration".parse().unwrap()).unwrap();
         actor::ActiveModel {
             id: Set("did:key:migration".to_string()),
         }
@@ -375,7 +375,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        let space_id = SpaceId::new(did, "migration".parse().unwrap());
+        let space_id = SpaceId::new(did, "migration".parse().unwrap()).unwrap();
         actor::ActiveModel {
             id: Set("did:key:migration".to_string()),
         }

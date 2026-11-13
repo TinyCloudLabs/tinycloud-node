@@ -640,7 +640,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let resource: ResourceId = space.clone().to_resource(
             "kv".parse::<Service>()?,
             Some(kv_path.parse::<Path>()?),
@@ -679,7 +679,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let resources = caps
             .iter()
             .map(|(service, path, ability)| {
@@ -754,7 +754,7 @@ mod tests {
         validate_signed_kv_ticket(&ticket).unwrap();
         assert!(context.hashes().account_hash.is_some());
         assert!(context.hashes().space_hash.is_some());
-        let other = SpaceId::new(space.did().to_owned(), "other".parse().unwrap());
+        let other = SpaceId::new(space.did().to_owned(), "other".parse().unwrap()).unwrap();
         ticket.space_id = other.to_string();
         validate_signed_kv_ticket(&ticket).unwrap();
         assert!(context.hashes().account_hash.is_some());

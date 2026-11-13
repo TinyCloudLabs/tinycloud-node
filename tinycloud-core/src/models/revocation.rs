@@ -3,12 +3,12 @@ use crate::encryption_network::NetworkId;
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::types::Resource;
-use sea_orm::Condition;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, Expr, JoinType, OnConflict, Query, SimpleExpr, UnionType},
     ConnectionTrait, FromQueryResult, QueryOrder, QuerySelect,
 };
+use sea_orm::{Condition, Statement};
 use std::collections::HashSet;
 use time::OffsetDateTime;
 use tinycloud_auth::{
@@ -207,6 +207,7 @@ pub async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Res
         .is_some())
 }
 
+#[cfg(test)]
 pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
     db: &C,
     start: &Hash,
@@ -375,13 +376,14 @@ pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
 pub(crate) enum ControlAction {
     Revoke,
     Status,
+    Renew,
 }
-
 impl ControlAction {
     fn ability(self) -> &'static str {
         match self {
             Self::Revoke => "tinycloud.delegation/revoke",
             Self::Status => "tinycloud.delegation/status",
+            Self::Renew => "tinycloud.delegation/renew",
         }
     }
 
@@ -529,6 +531,25 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     action: ControlAction,
     target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
+    control_proof_decision_at(
+        db,
+        signer,
+        proofs,
+        action,
+        target,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
+pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+    action: ControlAction,
+    target: &Hash,
+    now: OffsetDateTime,
+) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
         return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
     }
@@ -536,8 +557,19 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         return Ok(ControlProofDecision::Denied);
     }
 
-    let now = OffsetDateTime::now_utc();
     let proof_id = Hash::from(proofs[0]);
+    let renewal_lease_proof = db
+        .query_one(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
+            [sea_orm::sea_query::Value::Bytes(Some(Box::new(
+                proof_id.as_ref().to_vec(),
+            )))],
+        ))
+        .await?;
+    if renewal_lease_proof.is_some() && action != ControlAction::Renew {
+        return Ok(ControlProofDecision::Denied);
+    }
     let Some(parent) = delegation::Entity::find_by_id(proof_id).one(db).await? else {
         return Ok(ControlProofDecision::Denied);
     };
@@ -1233,6 +1265,72 @@ mod tests {
         insert_revocation_of(&db, hash(b"revocation-of-ancestor"), ancestor).await;
 
         assert!(!revoker_may_revoke(&db, target, "did:key:session", proof).await);
+    }
+
+    #[tokio::test]
+    async fn renewal_lease_is_scoped_to_the_renew_action() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:renewer", "did:key:holder"] {
+            insert_actor(&db, did).await;
+        }
+        let original = hash(b"renewal-original");
+        let lease = hash(b"renewal-lease");
+        let original_cid = original.to_cid(0x55).to_string();
+        let lease_cid = lease.to_cid(0x55).to_string();
+        insert_delegation_between(&db, original, "did:key:owner", "did:key:holder").await;
+        insert_delegation_between(&db, lease, "did:key:owner", "did:key:renewer").await;
+        insert_ability(
+            &db,
+            lease,
+            &format!("urn:cid:{original_cid}"),
+            "tinycloud.delegation/renew",
+        )
+        .await;
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:owner','did:key:renewer',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2592000,$3)",
+            [
+                sea_orm::Value::Bytes(Some(Box::new(original.as_ref().to_vec()))),
+                sea_orm::Value::Bytes(Some(Box::new(lease.as_ref().to_vec()))),
+                sea_orm::Value::Bytes(Some(Box::new(vec![7; 32]))),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        let target = delegation::Entity::find_by_id(original)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision = control_proof_decision(
+            &db,
+            "did:key:renewer",
+            &[lease_cid.parse().unwrap()],
+            ControlAction::Renew,
+            &original,
+        )
+        .await
+        .unwrap();
+        let ControlProofDecision::Scoped(control) = decision else {
+            panic!("renewal lease must provide its direct Renew authority");
+        };
+        assert!(control.directly_authorizes_cid(&original, &target));
+
+        for action in [ControlAction::Revoke, ControlAction::Status] {
+            let decision = control_proof_decision(
+                &db,
+                "did:key:renewer",
+                &[lease_cid.parse().unwrap()],
+                action,
+                &original,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(decision, ControlProofDecision::Denied));
+        }
     }
 
     async fn insert_ability<C: ConnectionTrait>(

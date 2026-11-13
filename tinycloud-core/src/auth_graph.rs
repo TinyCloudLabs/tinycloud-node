@@ -211,10 +211,10 @@ async fn load_closure<C: ConnectionTrait>(
 /// Each branch projects the same columns, with a distinct slot for each
 /// underlying SQL type. In particular, JSON and text never share a UNION
 /// slot, and the legacy model decoders still parse every field in Rust.
-fn snapshot_branch(kind: i32, fields: [SimpleExpr; 13]) -> SelectStatement {
+fn snapshot_branch<const N: usize>(kind: i32, fields: [SimpleExpr; N]) -> SelectStatement {
     let mut query = Query::select();
     query.expr_as(Expr::val(kind), Alias::new("kind"));
-    for (name, expr) in [
+    let names = [
         "node",
         "parent",
         "delegator",
@@ -228,11 +228,69 @@ fn snapshot_branch(kind: i32, fields: [SimpleExpr; 13]) -> SelectStatement {
         "resource",
         "ability",
         "caveats",
-    ]
-    .into_iter()
-    .zip(fields)
-    {
-        query.expr_as(expr, Alias::new(name));
+        "renewal_original",
+        "lease_cid",
+        "lease_state",
+        "lease_generation",
+        "renewer_did",
+        "renewer_epoch",
+        "lease_expiry",
+        "lease_original_expiry",
+        "lease_period",
+        "audience_key",
+        "stamp_cid",
+        "previous_stamp_cid",
+        "stamp_epoch",
+        "stamp_end",
+        "signed_bytes",
+        "signature",
+        "lease_revoked",
+        "stamp_generation",
+    ];
+    for (name, expr) in names.iter().zip(fields) {
+        query.expr_as(expr, Alias::new(*name));
+    }
+    if N == 13 {
+        let null = || Expr::cust("NULL");
+        let extra: [SimpleExpr; 18] = if kind == 4 {
+            [
+                Expr::col((
+                    Alias::new("renewal_lease"),
+                    Alias::new("original_canonical"),
+                ))
+                .into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("lease_cid"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("state"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("generation"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("renewer_did"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("renewer_epoch"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("lease_expiry"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("original_expiry"))).into(),
+                Expr::col((Alias::new("renewal_lease"), Alias::new("period_seconds"))).into(),
+                Expr::col((
+                    Alias::new("renewal_lease"),
+                    Alias::new("audience_public_key"),
+                ))
+                .into(),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("cid"))).into(),
+                Expr::col((
+                    Alias::new("renewal_stamp"),
+                    Alias::new("previous_stamp_cid"),
+                ))
+                .into(),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("renewer_epoch"))).into(),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("new_end"))).into(),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("signed_bytes"))).into(),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("signature"))).into(),
+                Expr::cust("FALSE"),
+                Expr::col((Alias::new("renewal_stamp"), Alias::new("generation"))).into(),
+            ]
+        } else {
+            std::array::from_fn(|_| null())
+        };
+        for (name, expr) in names.iter().skip(13).zip(extra) {
+            query.expr_as(expr, Alias::new(*name));
+        }
     }
     query
 }
@@ -397,6 +455,8 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .from(delegation::Entity)
         .from(parent_delegations::Entity)
         .from(abilities::Entity)
+        .from(Alias::new("renewal_lease"))
+        .from(Alias::new("renewal_stamp"))
         .and_where(Expr::val(1).eq(0));
     let mut edge_rows = snapshot_branch(
         0,
@@ -502,7 +562,8 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             JoinType::InnerJoin,
             delegation_cid_alias::Entity,
             source.clone(),
-            Expr::col((source.clone(), delegation_cid_alias::Column::Id)).equals((lookup_name, id)),
+            Expr::col((source.clone(), delegation_cid_alias::Column::Id))
+                .equals((lookup_name.clone(), id.clone())),
         )
         .join_as(
             JoinType::InnerJoin,
@@ -519,6 +580,81 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         )
         .and_where(within_budget());
     query.union(UnionType::All, aliased_revocations);
+    let lease = Alias::new("renewal_lease");
+    let stamp = Alias::new("renewal_stamp");
+    let original_alias = Alias::new("renewal_original_alias");
+    let renewal_revoked = Expr::cust(format!(
+        "EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN revocation r ON r.revoked = c.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN delegation_cid_alias a ON a.id = c.id JOIN delegation_cid_alias other ON other.canonical = a.canonical JOIN revocation r ON r.revoked = other.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN parent_delegation p ON p.child = c.id WHERE c.depth = {MAX_CHAIN_TRAVERSAL_NODES})"
+    ));
+    let mut renewal_rows = snapshot_branch(
+        5,
+        [
+            node(lookup_name.clone()),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            Expr::col((lease.clone(), Alias::new("original_canonical"))).into(),
+            Expr::col((lease.clone(), Alias::new("lease_cid"))).into(),
+            Expr::col((lease.clone(), Alias::new("state"))).into(),
+            Expr::col((lease.clone(), Alias::new("generation"))).into(),
+            Expr::col((lease.clone(), Alias::new("renewer_did"))).into(),
+            Expr::col((lease.clone(), Alias::new("renewer_epoch"))).into(),
+            Expr::col((lease.clone(), Alias::new("lease_expiry"))).into(),
+            Expr::col((lease.clone(), Alias::new("original_expiry"))).into(),
+            Expr::col((lease.clone(), Alias::new("period_seconds"))).into(),
+            Expr::col((lease.clone(), Alias::new("audience_public_key"))).into(),
+            Expr::col((stamp.clone(), Alias::new("cid"))).into(),
+            Expr::col((stamp.clone(), Alias::new("previous_stamp_cid"))).into(),
+            Expr::col((stamp.clone(), Alias::new("renewer_epoch"))).into(),
+            Expr::col((stamp.clone(), Alias::new("new_end"))).into(),
+            Expr::col((stamp.clone(), Alias::new("signed_bytes"))).into(),
+            Expr::col((stamp.clone(), Alias::new("signature"))).into(),
+            renewal_revoked,
+            Expr::col((stamp.clone(), Alias::new("generation"))).into(),
+        ],
+    );
+    renewal_rows
+        .from(lease.clone())
+        .join(
+            JoinType::InnerJoin,
+            stamp.clone(),
+            Expr::col((stamp.clone(), Alias::new("original_canonical")))
+                .equals((lease.clone(), Alias::new("original_canonical")))
+                .and(
+                    Expr::col((stamp.clone(), Alias::new("lease_cid")))
+                        .equals((lease.clone(), Alias::new("lease_cid"))),
+                ),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            delegation_cid_alias::Entity,
+            original_alias.clone(),
+            Expr::col((
+                original_alias.clone(),
+                delegation_cid_alias::Column::Canonical,
+            ))
+            .equals((lease.clone(), Alias::new("original_canonical"))),
+        )
+        .join(
+            JoinType::InnerJoin,
+            lookup_name.clone(),
+            Expr::col((original_alias, delegation_cid_alias::Column::Id))
+                .equals((lookup_name.clone(), id.clone())),
+        )
+        .and_where(within_budget())
+        .and_where(Expr::cust(
+            "renewal_lease.lease_cid = renewal_stamp.lease_cid",
+        ));
+    query.union(UnionType::All, renewal_rows);
     query.with(
         WithClause::new()
             .recursive(true)
@@ -544,12 +680,136 @@ fn sort_abilities(abilities: &mut HashMap<Hash, Vec<abilities::Model>>) {
         });
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone)]
+struct RenewalCandidate {
+    node: Hash,
+    original: String,
+    state: String,
+    lease: String,
+    stamp: String,
+    previous: String,
+    generation: u64,
+    end: i64,
+    signed_bytes: Vec<u8>,
+    signature: Vec<u8>,
+    did: String,
+    epoch: u64,
+    audience: [u8; 32],
+    now: i64,
+    period: i64,
+    lease_expiry: i64,
+    original_expiry: i64,
+}
+fn cap_effective_end(signed_end: i64, renewed_end: Option<i64>, ancestor_ends: &[i64]) -> i64 {
+    let own_end = renewed_end.map_or(signed_end, |end| signed_end.max(end));
+    ancestor_ends
+        .iter()
+        .copied()
+        .min()
+        .map_or(own_end, |cap| own_end.min(cap))
+}
+fn resolve_effective_end(
+    id: Hash,
+    parents: &HashMap<Hash, Vec<Hash>>,
+    delegations: &HashMap<Hash, delegation::Model>,
+    candidates: &HashMap<Hash, Vec<RenewalCandidate>>,
+    revoked: &HashSet<Hash>,
+    resolved: &mut HashMap<Hash, i64>,
+    visiting: &mut HashSet<Hash>,
+) -> Option<i64> {
+    if let Some(end) = resolved.get(&id) {
+        return Some(*end);
+    }
+    if revoked.contains(&id) {
+        visiting.remove(&id);
+        return None;
+    }
+    let result = (|| {
+        let signed_end = delegations
+            .get(&id)?
+            .expiry
+            .map_or(i64::MAX, |expiry| expiry.unix_timestamp());
+        let mut ancestor_ends = Vec::new();
+        for parent in parents.get(&id).into_iter().flatten() {
+            ancestor_ends.push(resolve_effective_end(
+                *parent,
+                parents,
+                delegations,
+                candidates,
+                revoked,
+                resolved,
+                visiting,
+            )?);
+        }
+        let mut renewed_end = None;
+        if let Some(rows) = candidates.get(&id) {
+            let mut expected_previous = rows.first()?.lease.clone();
+            let mut used = HashSet::new();
+            loop {
+                let matching = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| candidate.previous == expected_previous)
+                    .collect::<Vec<_>>();
+                if matching.is_empty() {
+                    break;
+                }
+                if matching.len() != 1 {
+                    return None;
+                }
+                let (index, candidate) = matching[0];
+                let latest_allowed = candidate.now.checked_add(candidate.period)?;
+                let stamp_verifier_now = candidate.end.checked_sub(1)?;
+                if candidate.original_expiry != signed_end
+                    || candidate.end > latest_allowed
+                    || used.contains(&index)
+                    || crate::renewal::verify_snapshot_stamp(
+                        crate::renewal::SnapshotStampVerification {
+                            signed_bytes: &candidate.signed_bytes,
+                            signature_bytes: &candidate.signature,
+                            expected_stamp_cid: &candidate.stamp,
+                            expected_original_cid: &candidate.original,
+                            expected_lease_cid: &candidate.lease,
+                            generation: candidate.generation,
+                            previous_stamp_cid: &candidate.previous,
+                            new_end: candidate.end,
+                            node_did: &candidate.did,
+                            renewer_epoch: candidate.epoch,
+                            audience_public_key: &candidate.audience,
+                            verifier_now: stamp_verifier_now,
+                            period: candidate.period,
+                            lease_expiry: candidate.lease_expiry,
+                            ancestor_ends: &ancestor_ends,
+                        },
+                    )
+                    .is_err()
+                {
+                    return None;
+                }
+                used.insert(index);
+                expected_previous = candidate.stamp.clone();
+                renewed_end =
+                    Some(renewed_end.map_or(candidate.end, |end: i64| end.max(candidate.end)));
+            }
+            if used.len() != rows.len() {
+                return None;
+            }
+        }
+        Some(cap_effective_end(signed_end, renewed_end, &ancestor_ends))
+    })();
+    visiting.remove(&id);
+    if let Some(end) = result {
+        resolved.insert(id, end);
+    }
+    result
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthGraphSnapshot {
     parents: HashMap<Hash, Vec<Hash>>,
     delegations: HashMap<Hash, delegation::Model>,
     abilities: HashMap<Hash, Vec<abilities::Model>>,
     revoked: HashSet<Hash>,
+    renewal_effective_ends: HashMap<Hash, i64>,
 }
 
 impl AuthGraphSnapshot {
@@ -559,8 +819,31 @@ impl AuthGraphSnapshot {
         db: &C,
         roots: &[Hash],
     ) -> Result<Self, ChainTraversalError> {
+        Self::load_inner(db, roots, None).await
+    }
+
+    pub(crate) async fn load_with_renewal_identity<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        stable_node_did: &str,
+        renewer_did: &str,
+        epoch: u64,
+        verifier_now: i64,
+    ) -> Result<Self, ChainTraversalError> {
+        Self::load_inner(
+            db,
+            roots,
+            Some((stable_node_did, renewer_did, epoch, verifier_now)),
+        )
+        .await
+    }
+
+    async fn load_inner<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        identity: Option<(&str, &str, u64, i64)>,
+    ) -> Result<Self, ChainTraversalError> {
         let mut nodes = roots.to_vec();
-        nodes.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         nodes.dedup();
         if nodes.len() > MAX_CHAIN_TRAVERSAL_NODES {
             return Err(ChainTraversalError::LimitExceeded);
@@ -571,6 +854,7 @@ impl AuthGraphSnapshot {
                 delegations: HashMap::new(),
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
+                renewal_effective_ends: HashMap::new(),
             });
         }
 
@@ -581,6 +865,7 @@ impl AuthGraphSnapshot {
         let mut delegations = HashMap::new();
         let mut abilities: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         let mut revoked = HashSet::new();
+        let mut renewal_candidates = Vec::new();
         let mut edge_count = 0;
         for row in rows {
             let node: Hash = row.try_get("", "node")?;
@@ -622,6 +907,63 @@ impl AuthGraphSnapshot {
                 3 => {
                     revoked.insert(node);
                 }
+                5 => {
+                    let Some((stable_node_did, renewer_did, epoch, verifier_now)) = identity else {
+                        continue;
+                    };
+                    let state: String = row.try_get("", "lease_state")?;
+                    let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
+                    if !matches!(state.as_str(), "active" | "stopped")
+                        || lease_expiry.unix_timestamp() <= verifier_now
+                        || row.try_get::<bool>("", "lease_revoked")?
+                        || row.try_get::<String>("", "renewer_did")? != renewer_did
+                    {
+                        continue;
+                    }
+                    let renewer_epoch: i64 = row.try_get("", "renewer_epoch")?;
+                    let stamp_epoch: i64 = row.try_get("", "stamp_epoch")?;
+                    let stamp_generation: i64 = row.try_get("", "stamp_generation")?;
+                    let period: i64 = row.try_get("", "lease_period")?;
+                    if renewer_epoch as u64 != epoch
+                        || stamp_epoch as u64 != epoch
+                        || stamp_generation < 0
+                        || period <= 0
+                    {
+                        continue;
+                    }
+                    let cid = |name: &str| -> Result<String, ChainTraversalError> {
+                        Ok(Hash::try_from(row.try_get::<Vec<u8>>("", name)?)
+                            .map_err(DbErr::from)?
+                            .to_cid(0x55)
+                            .to_string())
+                    };
+                    let audience: Vec<u8> = row.try_get("", "audience_key")?;
+                    let Ok(audience): Result<[u8; 32], _> = audience.try_into() else {
+                        continue;
+                    };
+                    let end: time::OffsetDateTime = row.try_get("", "stamp_end")?;
+                    let original_expiry: time::OffsetDateTime =
+                        row.try_get("", "lease_original_expiry")?;
+                    renewal_candidates.push(RenewalCandidate {
+                        node,
+                        state,
+                        original: cid("renewal_original")?,
+                        lease: cid("lease_cid")?,
+                        stamp: cid("stamp_cid")?,
+                        previous: cid("previous_stamp_cid")?,
+                        generation: stamp_generation as u64,
+                        end: end.unix_timestamp(),
+                        signed_bytes: row.try_get("", "signed_bytes")?,
+                        signature: row.try_get("", "signature")?,
+                        did: stable_node_did.to_owned(),
+                        epoch,
+                        audience,
+                        now: verifier_now,
+                        period,
+                        lease_expiry: lease_expiry.unix_timestamp(),
+                        original_expiry: original_expiry.unix_timestamp(),
+                    });
+                }
                 _ => return Err(DbErr::Type("unknown authorization graph row".into()).into()),
             }
         }
@@ -644,12 +986,48 @@ impl AuthGraphSnapshot {
             }
         }
 
+        let mut grouped: HashMap<Hash, HashMap<String, Vec<RenewalCandidate>>> = HashMap::new();
+        for candidate in renewal_candidates {
+            grouped
+                .entry(candidate.node)
+                .or_default()
+                .entry(candidate.lease.clone())
+                .or_default()
+                .push(candidate);
+        }
+        let mut candidate_map: HashMap<Hash, Vec<RenewalCandidate>> = HashMap::new();
+        for (node, leases) in grouped {
+            let active: Vec<_> = leases
+                .values()
+                .filter(|rows| matches!(rows[0].state.as_str(), "active" | "stopped"))
+                .collect();
+            if active.len() == 1 {
+                candidate_map.insert(node, active[0].clone());
+            }
+        }
+        let mut renewal_effective_ends = HashMap::new();
+        let mut resolving = HashSet::new();
+        for id in nodes.iter().copied() {
+            let _ = resolve_effective_end(
+                id,
+                &parents,
+                &delegations,
+                &candidate_map,
+                &revoked,
+                &mut renewal_effective_ends,
+                &mut resolving,
+            );
+        }
         Ok(Self {
             parents,
             delegations,
             abilities,
             revoked,
+            renewal_effective_ends,
         })
+    }
+    pub(crate) fn effective_expiry(&self, id: &Hash) -> Option<i64> {
+        self.renewal_effective_ends.get(id).copied()
     }
 
     pub(crate) fn delegation(&self, id: &Hash) -> Option<&delegation::Model> {
@@ -753,6 +1131,11 @@ impl AuthGraphSnapshot {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn renewal_extension_can_exceed_signed_expiry_but_not_ancestor_end() {
+        assert_eq!(cap_effective_end(100, Some(200), &[250]), 200);
+        assert_eq!(cap_effective_end(100, Some(200), &[150]), 150);
+    }
     use super::*;
     use crate::hash::hash;
     use crate::migrations::Migrator;
@@ -760,7 +1143,7 @@ mod tests {
     use crate::types::{Caveats, Facts};
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection,
-        DbBackend, EntityTrait, QueryFilter, Statement,
+        DbBackend, EntityTrait, QueryFilter, Statement, Value,
     };
     use sea_orm_migration::MigratorTrait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -786,6 +1169,277 @@ mod tests {
         (db, counter)
     }
 
+    fn db_datetime(unix: i64) -> time::PrimitiveDateTime {
+        let utc = OffsetDateTime::from_unix_timestamp(unix)
+            .unwrap()
+            .to_offset(time::UtcOffset::UTC);
+        utc.date().with_time(utc.time())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_snapshot_renewal(
+        db: &DatabaseConnection,
+        original: Hash,
+        lease: Hash,
+        ancestor: Hash,
+        original_end: i64,
+        ancestor_end: i64,
+        now: i64,
+        broken_predecessor: bool,
+    ) -> (String, String, u64) {
+        let backend = DbBackend::Sqlite;
+        let (renewer_did, epoch, audience) = crate::renewal::renewal_identity_from_seed([7; 32]);
+        let stable_node_did = "did:key:stable-node".to_owned();
+        let signer =
+            crate::renewal::RenewalSigner::from_seed([7; 32], stable_node_did.clone(), epoch);
+        for (id, expiry) in [
+            (original, original_end),
+            (lease, now + 5_000),
+            (ancestor, ancestor_end),
+        ] {
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO delegation (id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization, serialization_format) VALUES ($1,'did:key:actor','did:key:actor',$2,NULL,NULL,NULL,$3,0)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(id)))),
+                    Value::TimeDateTime(Some(Box::new(db_datetime(expiry)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(id)))),
+                ],
+            )).await.unwrap();
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1,$1,FALSE)",
+                [Value::Bytes(Some(Box::new(Vec::<u8>::from(id))))],
+            ))
+            .await
+            .unwrap();
+        }
+        for child in [original, lease] {
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO parent_delegation (parent, child) VALUES ($1,$2)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(ancestor)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(child)))),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:actor',$3,$4,$5,$6,5000,$7)",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                Value::String(Some(Box::new(renewer_did.clone()))),
+                Value::BigInt(Some(epoch as i64)),
+                Value::TimeDateTime(Some(Box::new(db_datetime(now + 5_000)))),
+                Value::TimeDateTime(Some(Box::new(db_datetime(original_end)))),
+                Value::Bytes(Some(Box::new(audience.to_vec()))),
+            ],
+        )).await.unwrap();
+        let original_cid = original.to_cid(0x55).to_string();
+        let lease_cid = lease.to_cid(0x55).to_string();
+        let mut previous = if broken_predecessor {
+            hash(b"orphan-predecessor")
+        } else {
+            lease
+        };
+        for end in [now + 1_100, now + 1_200] {
+            let end_text = OffsetDateTime::from_unix_timestamp(end)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let (bytes, signature, _) = signer
+                .sign_stamp(
+                    &original_cid,
+                    &lease_cid,
+                    1,
+                    &previous.to_cid(0x55).to_string(),
+                    &end_text,
+                )
+                .unwrap();
+            let stamp_hash = hash(&bytes);
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(stamp_hash)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(previous)))),
+                    Value::BigInt(Some(epoch as i64)),
+                    Value::TimeDateTime(Some(Box::new(db_datetime(end)))),
+                    Value::Bytes(Some(Box::new(bytes.clone()))),
+                    Value::Bytes(Some(Box::new(signature))),
+                    Value::Bytes(Some(Box::new(hash(&bytes).as_ref().to_vec()))),
+                ],
+            )).await.unwrap();
+            previous = stamp_hash;
+        }
+        (stable_node_did, renewer_did, epoch)
+    }
+    #[tokio::test]
+    async fn snapshot_verifies_stamp_history_caps_expiry_and_fails_closed() {
+        let (db, counter) = counted_database().await;
+        let original = hash(b"snapshot-renewal-original");
+        let lease = hash(b"snapshot-renewal-lease");
+        let ancestor = hash(b"snapshot-renewal-ancestor");
+        let (stable_did, renewer_did, epoch) =
+            insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
+                .await;
+        assert_ne!(stable_did, renewer_did);
+        let before = counter.load(Ordering::SeqCst);
+        let snapshot = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        // The predecessor ends at 2_100, before verifier time 2_150.
+        assert_eq!(counter.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(snapshot.effective_expiry(&original), Some(2_200));
+        assert!(snapshot.effective_expiry(&original).unwrap() > 2_000);
+        assert!(snapshot.effective_expiry(&original).unwrap() <= 2_250);
+
+        let wrong_epoch = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch.wrapping_add(1),
+            2_150,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_epoch.effective_expiry(&original), Some(2_000));
+
+        revocation::ActiveModel {
+            id: Set(hash(b"snapshot-renewal-revoke")),
+            revoker: Set("did:key:actor".to_owned()),
+            revoked: Set(lease),
+            serialization: Set(vec![1]),
+            revoked_at: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let revoked = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        assert_eq!(revoked.effective_expiry(&original), Some(2_000));
+
+        let (orphan_db, _) = counted_database().await;
+        let original = hash(b"snapshot-renewal-orphan-original");
+        let lease = hash(b"snapshot-renewal-orphan-lease");
+        let ancestor = hash(b"snapshot-renewal-orphan-ancestor");
+        let (stable_did, renewer_did, epoch) = insert_snapshot_renewal(
+            &orphan_db, original, lease, ancestor, 2_000, 2_250, 1_000, true,
+        )
+        .await;
+        let orphan = AuthGraphSnapshot::load_with_renewal_identity(
+            &orphan_db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        assert_eq!(orphan.effective_expiry(&original), None);
+    }
+
+    #[tokio::test]
+    async fn invocation_accepts_active_renewal_after_original_signed_expiry() {
+        let (db, _) = counted_database().await;
+        let original = hash(b"snapshot-invocation-renewed-original");
+        let lease = hash(b"snapshot-invocation-renewed-lease");
+        let ancestor = hash(b"snapshot-invocation-renewed-ancestor");
+        let holder = "did:key:renewed-holder";
+        let (stable_did, renewer_did, epoch) =
+            insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
+                .await;
+        actor::ActiveModel {
+            id: Set(holder.to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation SET delegatee = $1 WHERE id = $2",
+            [
+                Value::String(Some(Box::new(holder.to_owned()))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+            ],
+        ))
+        .await
+        .unwrap();
+        for id in [original, ancestor] {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO ability (delegation, resource, ability, caveats) VALUES ($1,$2,$3,$4)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(id)))),
+                    Value::String(Some(Box::new("tinycloud:key:actor:files/kv".to_owned()))),
+                    Value::String(Some(Box::new("tinycloud.kv/get".to_owned()))),
+                    Value::Json(Some(Box::new(serde_json::json!({})))),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        let capability = crate::util::Capability {
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
+            ability: "tinycloud.kv/get".to_owned().try_into().unwrap(),
+            caveats: Caveats::default(),
+        };
+        let signed_only_graph = AuthGraphSnapshot::load(&db, &[original]).await.unwrap();
+        assert!(crate::models::invocation::authorize_holder_with_graph(
+            &db,
+            holder,
+            std::slice::from_ref(&capability),
+            &[original.to_cid(0x55)],
+            OffsetDateTime::from_unix_timestamp(2_150).unwrap(),
+            &signed_only_graph,
+        )
+        .await
+        .is_err());
+
+        let graph = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        crate::models::invocation::authorize_holder_with_graph(
+            &db,
+            holder,
+            &[capability],
+            &[original.to_cid(0x55)],
+            OffsetDateTime::from_unix_timestamp(2_150).unwrap(),
+            &graph,
+        )
+        .await
+        .unwrap();
+    }
     // Frozen pre-batch implementation used only to compare complete snapshots.
     async fn load_sequential<C: ConnectionTrait>(
         db: &C,
@@ -798,6 +1452,7 @@ mod tests {
                 delegations: HashMap::new(),
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
+                renewal_effective_ends: HashMap::new(),
             });
         }
         let delegations = delegation::Entity::find()
@@ -830,17 +1485,24 @@ mod tests {
             delegations,
             abilities: ability_rows,
             revoked,
+            renewal_effective_ends: HashMap::new(),
         })
     }
 
+    fn assert_snapshot_matches_legacy(actual: &AuthGraphSnapshot, expected: &AuthGraphSnapshot) {
+        let mut actual = (*actual).clone();
+        actual.renewal_effective_ends.clear();
+        assert_eq!(actual, *expected);
+    }
     #[tokio::test]
     async fn snapshot_load_is_one_round_trip_and_matches_sequential() {
         let (db, counter) = counted_database().await;
+
         let ids = insert_chain(&db, "one-trip", 2).await;
         let expected = load_sequential(&db, &[ids[0]]).await.unwrap();
         let before = counter.load(Ordering::SeqCst);
         let actual = AuthGraphSnapshot::load(&db, &[ids[0]]).await.unwrap();
-        assert_eq!(actual, expected);
+        assert_snapshot_matches_legacy(&actual, &expected);
         assert_eq!(counter.load(Ordering::SeqCst) - before, 1);
     }
 
@@ -922,7 +1584,7 @@ mod tests {
         ] {
             let before = load_sequential(db, &roots).await.unwrap();
             let after = AuthGraphSnapshot::load(db, &roots).await.unwrap();
-            assert_eq!(after, before, "roots {roots:?}");
+            assert_snapshot_matches_legacy(&after, &before);
         }
         assert_eq!(
             AuthGraphSnapshot::load(db, &[]).await.unwrap(),
@@ -1044,7 +1706,7 @@ mod tests {
             snapshot.delegation(ids.last().unwrap()).is_some(),
             "the 64th node must not be silently truncated"
         );
-        assert_eq!(snapshot, load_sequential(db, &[ids[0]]).await.unwrap());
+        assert_snapshot_matches_legacy(&snapshot, &load_sequential(db, &[ids[0]]).await.unwrap());
     }
 
     async fn insert_alias(db: &DatabaseConnection, id: Hash, canonical: Hash) {
@@ -1093,7 +1755,7 @@ mod tests {
             snapshot.first_revoked_ancestor(&ids[0]),
             Some(ids[1].to_cid(0x55).to_string())
         );
-        assert_eq!(snapshot, load_sequential(db, &[ids[0]]).await.unwrap());
+        assert_snapshot_matches_legacy(&snapshot, &load_sequential(db, &[ids[0]]).await.unwrap());
         let cited = AuthGraphSnapshot::load(db, &[ids[1]]).await.unwrap();
         assert!(cited.is_revoked(&ids[1]));
         assert!(!cited.is_revoked(&ids[2]));
@@ -1186,7 +1848,7 @@ mod tests {
                 let context = format!("{backend} seed {seed} roots {roots:?}");
                 let batched = AuthGraphSnapshot::load(db, &roots).await.unwrap();
                 let sequential = load_sequential(db, &roots).await.unwrap();
-                assert_eq!(batched, sequential, "{context}");
+                assert_snapshot_matches_legacy(&batched, &sequential);
                 for root in &roots {
                     let revoked = revocation::is_revoked(db, root).await.unwrap();
                     assert_eq!(batched.is_revoked(root), revoked, "{context}");

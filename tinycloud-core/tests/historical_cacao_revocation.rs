@@ -412,12 +412,34 @@ async fn unstored_canonical_status_resolves_historical_grant() {
     let (_directory, path) = copy_database(&fixture);
     let db = open(&path).await;
     assert_eq!(
+        db.delegation_effective_expiry(hash_from_cid(&canonical), 0)
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap(),
+        Some(4_102_444_800),
+    );
+    assert_eq!(
         db.delegation_status(hash_from_cid(&canonical), &fixture.issuer, &[])
             .await
             .map_err(|error| error.to_string())
             .unwrap(),
         Some(tinycloud_core::db::DelegationStatus::Active),
     );
+    for cid in [&canonical, &fixture.rows[0].raw_cid] {
+        assert!(db
+            .delegation_status_snapshot(
+                hash_from_cid(cid),
+                &fixture.issuer,
+                &[],
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
 }
 
 #[tokio::test]

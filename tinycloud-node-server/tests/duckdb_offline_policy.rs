@@ -172,7 +172,8 @@ fn fixed_size_arrays_survive_guarded_reopen_and_copy() {
                     .parse()
                     .unwrap(),
                 "arrays".parse().unwrap(),
-            );
+            )
+            .unwrap();
             service
                 .import_db(&space, "arrays", &std::fs::read(&path).unwrap())
                 .await

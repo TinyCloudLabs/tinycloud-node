@@ -451,7 +451,7 @@ impl Harness {
         let content_space = SpaceId::new(
             space_owner.did().parse::<DIDBuf>()?,
             "applications".parse()?,
-        );
+        )?;
         let content_resource = content_space.clone().to_resource(
             "kv".parse()?,
             Some("shares/tc-1423/document.txt".parse()?),

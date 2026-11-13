@@ -84,3 +84,45 @@ fn renewal_stamp_v1_matches_pinned_bytes_cid_and_signature() {
         "DAG-CBOR re-encoding is byte-identical"
     );
 }
+#[test]
+fn runtime_signer_reproduces_the_frozen_stamp_vector() {
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/renewal-stamp-v1.json"))
+        .expect("renewal vector JSON parses");
+    assert_eq!(
+        tinycloud_core::renewal::STAMP_DOMAIN,
+        "tinycloud/node/renewal-stamp/v1"
+    );
+    assert_eq!(
+        tinycloud_core::renewal::RENEWER_KEY_CONTEXT,
+        b"tinycloud/node/renewer/v1"
+    );
+
+    let master_secret = decode_hex(&fixture["testOnlyMasterSecretHex"]);
+    let node_secret = StaticSecret::new(master_secret).expect("32-byte test seed");
+    let signer = tinycloud_core::renewal::RenewalSigner::from_seed(
+        node_secret.derive_key(tinycloud_core::renewal::RENEWER_KEY_CONTEXT),
+        node_secret.node_did(),
+        fixture["stamp"]["unsigned"]["renewerEpoch"]
+            .as_u64()
+            .unwrap(),
+    );
+    let original_cid = raw_blake3_cid(&dag_cbor(&fixture["originalArtifact"]));
+    let lease_cid = raw_blake3_cid(&dag_cbor(&fixture["leaseArtifact"]));
+    let (bytes, signature, cid) = signer
+        .sign_stamp(
+            &original_cid,
+            &lease_cid,
+            fixture["stamp"]["unsigned"]["leaseGeneration"]
+                .as_u64()
+                .unwrap(),
+            fixture["stamp"]["unsigned"]["previousStampCid"]
+                .as_str()
+                .unwrap(),
+            fixture["stamp"]["unsigned"]["newEnd"].as_str().unwrap(),
+        )
+        .expect("runtime stamp encoding succeeds");
+
+    assert_eq!(hex::encode(bytes), fixture["canonicalDagCborHex"]);
+    assert_eq!(cid, fixture["stampCid"]);
+    assert_eq!(hex::encode(signature), fixture["signatureHex"]);
+}

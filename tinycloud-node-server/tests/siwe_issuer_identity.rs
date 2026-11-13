@@ -44,7 +44,7 @@ impl Wallet {
         Ok(Self {
             key,
             address,
-            space: SpaceId::new(did.parse()?, "issuer-case".parse()?),
+            space: SpaceId::new(did.parse()?, "issuer-case".parse()?)?,
         })
     }
 
@@ -620,7 +620,7 @@ async fn historical_alias_targets_cannot_widen_a_space_scoped_revoke_control() -
     let wallet = Wallet {
         key,
         address,
-        space: SpaceId::new(did.parse()?, "scope-control".parse()?),
+        space: SpaceId::new(did.parse()?, "scope-control".parse()?)?,
     };
     bootstrap(&client, &wallet).await?;
     let control = wallet.session_for("delegation", "tinycloud.delegation/revoke")?;
@@ -821,7 +821,7 @@ async fn status_signed_invocation_cannot_revoke_but_revoke_signed_invocation_can
     let wallet = Wallet {
         key,
         address,
-        space: SpaceId::new(owner.parse()?, "single-v0".parse()?),
+        space: SpaceId::new(owner.parse()?, "single-v0".parse()?)?,
     };
     let now = time::OffsetDateTime::now_utc();
     let prepared = prepare_session(SessionConfig {
@@ -999,7 +999,7 @@ async fn canonical_cid_revocations_are_sequenced_like_raw_ones() -> Result<()> {
     let wallet = Wallet {
         key,
         address,
-        space: SpaceId::new(owner.parse()?, "single-v0".parse()?),
+        space: SpaceId::new(owner.parse()?, "single-v0".parse()?)?,
     };
 
     for grant_path in [false, true] {

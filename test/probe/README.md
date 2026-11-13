@@ -210,7 +210,8 @@ sends one Better Stack heartbeat decision per target.
   `planetscale_primary_pods_cpu_util_percentages` are above `cpu_pct` (85).
   Points newer than 90 s are ignored for ingestion lag.
 - **Pool:** same counting on the target's `pool` rule. The shipped target pins
-  direct Postgres, port 5432: active connections >= 15
+  direct Postgres, port 5432: the series whose top-level `label` is `active`
+  (`series_label`; `series_labels` still matches the `labels` map) with value >= 15
   (`TINYCLOUD_DATABASE__MAX_CONNECTIONS`). `pool: null` is a config fault. A
   PgBouncer port (6432) would use `planetscale_pgbouncer_pools_client` waiting clients > 0.
 - **Outcomes:** breach or config fault -> `/fail` with numeric counts. Healthy
@@ -218,10 +219,10 @@ sends one Better Stack heartbeat decision per target.
   no series, or not exactly one production branch) or transient API error
   (429, 5xx, timeout) -> no call, so the missed-heartbeat alert fires.
 - **Secrets:** each target reads the env names in its `token_secret` and
-  `heartbeat_secret`. A target whose secrets are unset is skipped. The token is
+  `heartbeat_secret`. A target with either secret unset fails the run with `::error::` (TC-2912), so a missing secret cannot silently disable monitoring. The token is
   a PlanetScale service token (`ID:TOKEN`) with `read_branch` on all branches of that database.
 
 Proof runs (default branch only): `gh workflow run db-saturation-probe.yml -f threshold_pct=1`
 should send `/fail`; a run with no inputs should send a ping.
 
-Local: `npm run probe:db` (skips when secrets are unset). Tests: `npm test`.
+Local: `npm run probe:db` (exits 1 when a target's secrets are unset). Tests: `npm test`.
