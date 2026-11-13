@@ -221,10 +221,9 @@ pub trait ArtifactSink: Send {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
     /// Whether the sink holds the whole artifact in memory. Such a read of a
-    /// large artifact waits for a large-transfer slot in either layout.
-    fn buffers_in_memory(&self) -> bool {
-        false
-    }
+    /// large artifact waits for a large-transfer slot in either layout. There
+    /// is no default: a sink that wraps another forwards the inner answer.
+    fn buffers_in_memory(&self) -> bool;
 }
 
 /// The most [`MemorySink`] allocates ahead of the bytes it is given.
@@ -501,6 +500,10 @@ pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
 
 #[async_trait]
 impl ArtifactSink for CacheFileSink {
+    fn buffers_in_memory(&self) -> bool {
+        false
+    }
+
     async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
         self.discard();
         Ok(())
@@ -1832,6 +1835,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for GatedSink {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             Ok(())
         }
@@ -2602,6 +2608,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for RaceSink<'_> {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             self.attempts += 1;
             self.disturbed_this_attempt = false;
@@ -2702,6 +2711,9 @@ mod tests {
         struct DeltaRace<'a>(RaceSink<'a>, bool);
         #[async_trait]
         impl ArtifactSink for DeltaRace<'_> {
+            fn buffers_in_memory(&self) -> bool {
+                false
+            }
             async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
                 self.0.reset().await
             }
@@ -2805,6 +2817,9 @@ mod tests {
         );
         #[async_trait]
         impl ArtifactSink for Overtaken<'_> {
+            fn buffers_in_memory(&self) -> bool {
+                false
+            }
             async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
                 self.0.reset().await
             }

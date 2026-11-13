@@ -1735,6 +1735,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for CountingSink {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             self.bytes = 0;
             Ok(())
@@ -1838,10 +1841,14 @@ mod tests {
 
         // A streaming sink holds no more than a statement's bytes: no slot.
         let mut streamed = CountingSink::default();
-        read_artifact(&repo, "sql", space, "main", &mut streamed)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_artifact(&repo, "sql", space, "main", &mut streamed),
+        )
+        .await
+        .expect("a streaming read waited for a transfer slot")
+        .unwrap()
+        .unwrap();
         assert_eq!(streamed.bytes, size as u64);
 
         // A sink holding the whole artifact waits until a slot frees.
@@ -1861,5 +1868,96 @@ mod tests {
         );
         drop(held);
         assert_eq!(waiting.await.unwrap().unwrap(), size);
+    }
+
+    /// A row that reads as parts but turns out legacy falls back without
+    /// holding a parts slot, and the legacy read keeps its own cap and slot.
+    #[tokio::test]
+    async fn postgres_chunked_fallback_to_legacy_holds_no_parts_slot() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_fallback_to_legacy_holds_no_parts_slot",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:fallback";
+        let size = BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        repo.save(
+            "sql",
+            space,
+            "fb",
+            vec![7; size],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        // The metadata says parts while the row holds a single payload: the
+        // state a read sees when a parts row is replaced by a legacy one
+        // between its metadata and row reads.
+        fixture
+            .conn
+            .execute_unprepared(
+                "UPDATE database_artifact SET storage_mode = 'checkpoint-parts-v1' \
+                 WHERE name = 'fb'",
+            )
+            .await
+            .unwrap();
+
+        // One slot free: an in-memory fallback completes, which it could not
+        // if the parts slot were still held when the legacy read takes its own.
+        let held: Vec<_> = (0..MAX_CONCURRENT_LARGE_TRANSFERS - 1)
+            .map(|_| repo.large_transfers.try_acquire().unwrap())
+            .collect();
+        let mut sink = MemorySink::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_artifact(&repo, "sql", space, "fb", &mut sink),
+        )
+        .await
+        .expect("the fallback held the parts slot into the legacy read")
+        .unwrap()
+        .unwrap();
+        assert_eq!(sink.checkpoint.len(), size);
+        assert_eq!(repo.large_transfers.available_permits(), 1);
+        drop(held);
+
+        // No slot free: even a streaming fallback waits for the legacy slot.
+        let held: Vec<_> = (0..MAX_CONCURRENT_LARGE_TRANSFERS)
+            .map(|_| repo.large_transfers.try_acquire().unwrap())
+            .collect();
+        let waiting = {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                let mut sink = CountingSink::default();
+                read_artifact(&repo, "sql", space, "fb", &mut sink)
+                    .await
+                    .map(|_| sink.bytes)
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the legacy fallback took no slot");
+        drop(held);
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), waiting)
+            .await
+            .expect("the fallback did not finish once a slot freed");
+        assert_eq!(read.unwrap().unwrap(), size as u64);
+
+        // The single-row read cap still applies to the fallback.
+        let capped = repo.clone().with_max_read_bytes(size as u64 - 1);
+        let refused =
+            read_artifact(&capped, "sql", space, "fb", &mut CountingSink::default()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseArtifactError::ReadLimitExceeded { .. })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            repo.large_transfers.available_permits(),
+            MAX_CONCURRENT_LARGE_TRANSFERS
+        );
     }
 }
