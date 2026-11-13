@@ -267,3 +267,182 @@ fn export_rust_signed_interop_fixture() {
     }
     std::fs::write(output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
 }
+
+async fn consumption(db: &tinycloud_core::sea_orm::DatabaseConnection) {
+    use tinycloud_core::{
+        migrations::Migrator,
+        models::resource_review_consumption as used,
+        resource_review::{consume, ReviewUse},
+        sea_orm::{EntityTrait, PaginatorTrait, TransactionTrait},
+        sea_orm_migration::MigratorTrait,
+    };
+    Migrator::up(db, None).await.unwrap();
+    let writer = SigningKey::from_bytes(&[7; 32]);
+    let operator = SigningKey::from_bytes(&[8; 32]);
+    let verifier = verifier(&writer, &operator);
+    let owner = "a".repeat(64);
+    let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
+    let hosts = BTreeSet::from(["host-test".into()]);
+    let expected = ReviewExpectation {
+        host_id: "host-test",
+        owner_hmac: &owner,
+        target: &target,
+        authoritative_hosts: &hosts,
+    };
+    let raw = signed(
+        payload(&owner, &target),
+        &writer,
+        b"tinycloud-resource-review-decision-v1\0",
+    );
+    let proof = verifier.verify_decision(&raw, &[], &expected, 150).unwrap();
+    let id = "00000000-0000-4000-8000-000000000099";
+    let now = time::OffsetDateTime::from_unix_timestamp(150).unwrap();
+    let tx = db.begin().await.unwrap();
+    assert_eq!(
+        consume(&tx, &proof, id, now).await.unwrap(),
+        ReviewUse::Fresh
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(used::Entity::find().count(db).await.unwrap(), 0);
+    let tx = db.begin().await.unwrap();
+    assert_eq!(
+        consume(&tx, &proof, id, now).await.unwrap(),
+        ReviewUse::Fresh
+    );
+    tx.commit().await.unwrap();
+    let tx = db.begin().await.unwrap();
+    assert_eq!(
+        consume(&tx, &proof, id, now).await.unwrap(),
+        ReviewUse::OriginalPurge
+    );
+    assert!(
+        consume(&tx, &proof, "00000000-0000-4000-8000-000000000098", now)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(used::Entity::find().count(db).await.unwrap(), 1);
+    let tx = db.begin().await.unwrap();
+    assert!(consume(
+        &tx,
+        &proof,
+        id,
+        time::OffsetDateTime::from_unix_timestamp(200).unwrap()
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+}
+#[tokio::test]
+async fn sqlite_review_consumption_is_atomic_and_bound_to_original_purge() {
+    consumption(
+        &tinycloud_core::sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .unwrap(),
+    )
+    .await;
+}
+#[tokio::test]
+async fn postgres_review_consumption_is_atomic_and_bound_to_original_purge() {
+    use tinycloud_core::sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DbBackend, Statement,
+    };
+    if std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").as_deref() != Ok("1")
+        && std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+    {
+        return;
+    }
+    let url = std::env::var("TINYCLOUD_TEST_POSTGRES_URL").expect("isolated PostgreSQL URL");
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!(
+        "review_consume_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = Database::connect(options).await.unwrap();
+    consumption(&db).await;
+    db.close().await.unwrap();
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn rotation_retains_audit_keys_without_granting_old_keys_new_authority() {
+    let old = SigningKey::from_bytes(&[7; 32]);
+    let current = SigningKey::from_bytes(&[10; 32]);
+    let operator = SigningKey::from_bytes(&[8; 32]);
+    let verifier = ReviewVerifier::with_history(
+        BTreeMap::from([
+            (
+                ("openkey".into(), "key-1".into()),
+                old.verifying_key().to_bytes(),
+            ),
+            (
+                ("openkey".into(), "key-2".into()),
+                current.verifying_key().to_bytes(),
+            ),
+        ]),
+        BTreeMap::from([("openkey".into(), "key-2".into())]),
+        BTreeMap::from([(
+            ("operator".into(), "key-1".into()),
+            operator.verifying_key().to_bytes(),
+        )]),
+        BTreeSet::new(),
+    )
+    .unwrap();
+    let owner = "a".repeat(64);
+    let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
+    let hosts = BTreeSet::from(["host-test".into()]);
+    let expected = ReviewExpectation {
+        host_id: "host-test",
+        owner_hmac: &owner,
+        target: &target,
+        authoritative_hosts: &hosts,
+    };
+    let old_proof = signed(
+        payload(&owner, &target),
+        &old,
+        b"tinycloud-resource-review-decision-v1\0",
+    );
+    assert!(verifier.verify_retained_signature(&old_proof).is_ok());
+    assert!(verifier
+        .verify_decision(&old_proof, &[], &expected, 150)
+        .is_err());
+    let mut newer = payload(&owner, &target);
+    newer[2] = json!("key-2");
+    assert!(verifier
+        .verify_decision(
+            &signed(newer, &current, b"tinycloud-resource-review-decision-v1\0"),
+            &[],
+            &expected,
+            150
+        )
+        .is_ok());
+    let removed = ReviewVerifier::new(
+        BTreeMap::from([(
+            ("openkey".into(), "key-2".into()),
+            current.verifying_key().to_bytes(),
+        )]),
+        BTreeMap::from([(
+            ("operator".into(), "key-1".into()),
+            operator.verifying_key().to_bytes(),
+        )]),
+        BTreeSet::new(),
+    )
+    .unwrap();
+    assert!(removed.verify_retained_signature(&old_proof).is_err());
+}

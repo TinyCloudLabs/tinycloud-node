@@ -10,7 +10,7 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use time::OffsetDateTime;
 use tinycloud_auth::{identity::canonicalize_did, resource::SpaceId};
@@ -23,7 +23,7 @@ use tinycloud_core::{
         ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, PaginatorTrait,
         QueryFilter, TransactionTrait,
     },
-    space_purge_auth::{verify_owner, OwnerProof, OwnerProofError},
+    space_purge_auth::{verify_owner_for_host, OwnerProof, OwnerProofError},
     space_purge_fence::SpacePurgeFence,
     space_purge_ledger::LedgerKeys,
     util::InvocationInfo,
@@ -64,6 +64,20 @@ impl<'r> rocket::response::Responder<'r, 'static> for ApiError {
 fn error(status: Status, code: &'static str) -> ApiError {
     ApiError { status, code }
 }
+/// Register only under the lifecycle route prefixes; ordinary data errors keep
+/// their existing status/body/header behavior.
+#[rocket::catch(default)]
+pub fn lifecycle_error(status: Status, _request: &Request<'_>) -> ApiError {
+    match status.code {
+        400 | 415 | 422 => error(Status::BadRequest, "invalid_request"),
+        401 => error(status, "authentication_failed"),
+        404 => error(status, "not_found"),
+        429 => error(status, "rate_limited"),
+        500..=599 => error(Status::ServiceUnavailable, "unavailable_retryable"),
+        _ => error(status, "invalid_request"),
+    }
+}
+
 fn unavailable<E>(_: E) -> ApiError {
     error(Status::ServiceUnavailable, "unavailable_retryable")
 }
@@ -71,6 +85,7 @@ fn proof_error(err: OwnerProofError) -> ApiError {
     match err {
         OwnerProofError::NotOwner => error(Status::NotFound, "not_found"),
         OwnerProofError::Invalid => error(Status::Unauthorized, "authentication_failed"),
+        OwnerProofError::HostMismatch => error(Status::BadRequest, "host_mismatch"),
     }
 }
 
@@ -94,10 +109,61 @@ pub struct LifecycleRuntime {
     ledger: Arc<dyn PurgeLedgerStore>,
     pub fence: Arc<SpacePurgeFence>,
     host_id: String,
+    clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    storage_layout: Option<PurgeStorageLayout>,
+    listing_rates: Arc<Mutex<std::collections::HashMap<Vec<u8>, ListingRateBucket>>>,
     ledger_verified: Arc<AtomicBool>,
     pub(crate) reconcile_requested: Arc<tokio::sync::Notify>,
     pub(crate) work_requested: Arc<tokio::sync::Notify>,
 }
+/// Explicit configured backends; there is no inferred filesystem fallback.
+#[derive(Clone, Copy)]
+pub struct PurgeStorageLayout {
+    kv: crate::storage::purge_reconcile::PrefixStoreKind,
+    sql: crate::storage::purge_reconcile::PrefixStoreKind,
+    duckdb: bool,
+}
+impl PurgeStorageLayout {
+    pub fn new(
+        kv: crate::storage::purge_reconcile::PrefixStoreKind,
+        sql: crate::storage::purge_reconcile::PrefixStoreKind,
+        duckdb: bool,
+    ) -> Result<Self, &'static str> {
+        use crate::storage::purge_reconcile::PrefixStoreKind::*;
+        if !matches!(kv, KvFileSystem | KvS3) || !matches!(sql, SqlFileSystem | SqlS3) {
+            return Err("invalid purge storage layout");
+        }
+        Ok(Self { kv, sql, duckdb })
+    }
+    fn prefixes(
+        self,
+        space: &SpaceId,
+    ) -> Vec<(crate::storage::purge_reconcile::PrefixStoreKind, String)> {
+        use crate::storage::purge_reconcile::PrefixStoreKind::*;
+        let kv = if self.kv == KvFileSystem {
+            format!("{}/{}/", space.suffix(), space.name())
+        } else {
+            format!("{space}/")
+        };
+        let sql = crate::storage::sql_object::purge::SqlPhysicalPrefix::for_space(space)
+            .as_str()
+            .to_owned();
+        let mut prefixes = vec![
+            (self.kv, kv),
+            (self.sql, sql),
+            (SqliteCache, format!("{space}/")),
+        ];
+        if self.duckdb {
+            prefixes.push((DuckDbCache, format!("{space}/")));
+        }
+        prefixes
+    }
+}
+struct ListingRateBucket {
+    window: i64,
+    count: u16,
+}
+
 impl LifecycleRuntime {
     /// An existing independent ledger cannot be bypassed by removing config.
     /// The caller must reconcile the returned runtime before serving requests.
@@ -168,10 +234,49 @@ impl LifecycleRuntime {
             keys,
             ledger,
             host_id,
+            clock: Arc::new(OffsetDateTime::now_utc),
+            storage_layout: None,
+            listing_rates: Arc::new(Mutex::new(std::collections::HashMap::new())),
             ledger_verified: Arc::new(AtomicBool::new(false)),
             reconcile_requested: Arc::new(tokio::sync::Notify::new()),
             work_requested: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+    /// Supply a trusted clock; HTTP requests cannot select or override it.
+    /// The default constructor always uses system UTC.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+    pub fn with_storage_layout(mut self, layout: PurgeStorageLayout) -> Self {
+        self.storage_layout = Some(layout);
+        self
+    }
+    fn now(&self) -> OffsetDateTime {
+        (self.clock)()
+    }
+    fn listing_slot(&self, owner: &str) -> Result<(), ApiError> {
+        let owner = self
+            .keys
+            .target_hmac(self.keys.active_key_id(), "owner", owner)
+            .map_err(unavailable)?;
+        let window = self.now().unix_timestamp().div_euclid(60);
+        let mut rates = self
+            .listing_rates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rates.retain(|_, bucket| bucket.window >= window - 1);
+        let bucket = rates
+            .entry(owner)
+            .or_insert(ListingRateBucket { window, count: 0 });
+        if bucket.window != window {
+            *bucket = ListingRateBucket { window, count: 0 };
+        }
+        if bucket.count >= 1200 {
+            return Err(error(Status::TooManyRequests, "rate_limited"));
+        }
+        bucket.count += 1;
+        Ok(())
     }
     fn owner_hmacs(&self, owner: &str) -> Result<Vec<Vec<u8>>, ApiError> {
         self.keys
@@ -193,12 +298,15 @@ impl LifecycleRuntime {
         if !self.ledger_verified.load(Ordering::Acquire) {
             return Err(unavailable(()));
         }
-        let now = OffsetDateTime::now_utc();
         let tx = self.conn.begin().await.map_err(unavailable)?;
         self.fence
             .lock_owner(&tx, &proof.owner_did)
             .await
             .map_err(unavailable)?;
+        let now = self.now();
+        if proof.expires_at <= now.unix_timestamp() {
+            return Err(error(Status::Unauthorized, "authentication_failed"));
+        }
         space_purge_nonce::Entity::delete_many()
             .filter(space_purge_nonce::Column::ExpiresAt.lt(now - time::Duration::seconds(30)))
             .exec(&tx)
@@ -231,6 +339,12 @@ impl LifecycleRuntime {
         .insert(&tx)
         .await
         .map_err(unavailable)?;
+        // Listings retain only nonce replay state; their cursor and request
+        // key never create a durable pagination/idempotency record.
+        if matches!(kind, "list" | "resource-list") {
+            self.listing_slot(&proof.owner_did)?;
+            return Ok(tx);
+        }
         let owner_hmacs = self.owner_hmacs(&proof.owner_did)?;
         let targets: Vec<_> = self
             .keys
@@ -360,13 +474,14 @@ pub async fn list_my_spaces(
     }
     let owner = canonicalize_did(&body.owner_did)
         .map_err(|_| error(Status::BadRequest, "invalid_request"))?;
-    let proof = verify_owner(
+    let proof = verify_owner_for_host(
         &auth.0 .0.invocation,
         "tinycloud.space/list",
         &owner,
         &owner,
         &key.0,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        &runtime.host_id,
+        runtime.now().unix_timestamp(),
     )
     .await
     .map_err(proof_error)?;
@@ -555,6 +670,8 @@ impl LifecycleRuntime {
                     || existing.key_id != record.key_id
                     || existing.target_hmac != record.target_hmac
                     || existing.state != record.state
+                    || existing.version != record.version
+                    || existing.prefixes != record.prefixes
                 {
                     return Err(unavailable(()));
                 }
@@ -597,13 +714,14 @@ pub async fn retire_owner(
     }
     let owner = canonicalize_did(&body.owner_did)
         .map_err(|_| error(Status::BadRequest, "invalid_request"))?;
-    let proof = verify_owner(
+    let proof = verify_owner_for_host(
         &auth.0 .0.invocation,
         "tinycloud.space/retire-owner",
         &owner,
         &owner,
         &key.0,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        &runtime.host_id,
+        runtime.now().unix_timestamp(),
     )
     .await
     .map_err(proof_error)?;
@@ -631,7 +749,7 @@ pub async fn retire_owner(
                 .target_hmac(runtime.keys.active_key_id(), "owner", &owner)
                 .map_err(unavailable)?,
             proof.idempotency_key.clone(),
-            OffsetDateTime::now_utc().unix_timestamp(),
+            runtime.now().unix_timestamp(),
         ),
     };
     let candidate = runtime
@@ -650,6 +768,15 @@ pub async fn retire_owner(
         committed: false,
     };
     let record = runtime.publish_acceptance(&candidate).await?;
+    tinycloud_core::space_purge_ledger_copy::retain(
+        &tx,
+        &runtime.keys,
+        &record.object_key().map_err(unavailable)?,
+        &record.to_bytes().map_err(unavailable)?,
+        runtime.now(),
+    )
+    .await
+    .map_err(unavailable)?;
     if existing.is_some() && record.operation_id != operation_id {
         return Err(unavailable(()));
     }
@@ -778,13 +905,14 @@ pub async fn purge_space(
     }
     let space = request_space(&body.space_id)?;
     let canonical = space.to_string();
-    let proof = verify_owner(
+    let proof = verify_owner_for_host(
         &auth.0 .0.invocation,
         "tinycloud.space/delete",
         &format!("{canonical}/space"),
         space.did().as_str(),
         &key.0,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        &runtime.host_id,
+        runtime.now().unix_timestamp(),
     )
     .await
     .map_err(proof_error)?;
@@ -812,10 +940,7 @@ pub async fn purge_space(
         .filter(
             space_purge_job::Column::OwnerHmac.is_in(runtime.owner_hmacs(space.did().as_str())?),
         )
-        .filter(
-            space_purge_job::Column::AcceptedAt
-                .gt(OffsetDateTime::now_utc() - time::Duration::minutes(1)),
-        )
+        .filter(space_purge_job::Column::AcceptedAt.gt(runtime.now() - time::Duration::minutes(1)))
         .count(&tx)
         .await
         .map_err(unavailable)?;
@@ -835,20 +960,44 @@ pub async fn purge_space(
             &digest,
             &proof.idempotency_key,
             "purging",
-            OffsetDateTime::now_utc().unix_timestamp(),
+            runtime.now().unix_timestamp(),
         )
+        .map_err(unavailable)?;
+    let layout = runtime.storage_layout.ok_or_else(|| unavailable(()))?;
+    let prefixes = layout
+        .prefixes(&space)
+        .into_iter()
+        .map(|(kind, prefix)| {
+            runtime
+                .keys
+                .prefix_hmac(key_id, kind.as_str(), &prefix)
+                .map_err(unavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let candidate = runtime
+        .keys
+        .with_prefixes(candidate, prefixes)
         .map_err(unavailable)?;
     let mut ledger_commit = LedgerCommitGuard {
         runtime,
         committed: false,
     };
     let record = runtime.publish_acceptance(&candidate).await?;
+    tinycloud_core::space_purge_ledger_copy::retain(
+        &tx,
+        &runtime.keys,
+        &record.object_key().map_err(unavailable)?,
+        &record.to_bytes().map_err(unavailable)?,
+        runtime.now(),
+    )
+    .await
+    .map_err(unavailable)?;
     let generation = runtime
         .fence
         .fence_hmac(&tx, "space", &record.key_id, &digest)
         .await
         .map_err(unavailable)?;
-    let now = OffsetDateTime::now_utc();
+    let now = runtime.now();
     let job = space_purge_job::ActiveModel {
         purge_id: Set(record.operation_id.clone()),
         space: Set(Some(canonical)),
@@ -897,13 +1046,14 @@ pub async fn purge_status(
     let id = uuid::Uuid::parse_str(&body.purge_id)
         .map_err(|_| error(Status::BadRequest, "invalid_request"))?
         .to_string();
-    let proof = verify_owner(
+    let proof = verify_owner_for_host(
         &auth.0 .0.invocation,
         "tinycloud.space/delete",
         &format!("{space}/space"),
         space.did().as_str(),
         &key.0,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        &runtime.host_id,
+        runtime.now().unix_timestamp(),
     )
     .await
     .map_err(proof_error)?;

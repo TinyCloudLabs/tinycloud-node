@@ -33,10 +33,13 @@ pub struct SpaceProbe {
     pub fenced: bool,
 }
 
-pub struct SpaceOperation {
+struct SpaceReadScope {
     _admission: OwnedRwLockReadGuard<()>,
-    _guard: OwnedRwLockReadGuard<()>,
-    _owner: OwnedRwLockReadGuard<()>,
+    _owners: Vec<OwnedRwLockReadGuard<()>>,
+    _spaces: Vec<OwnedRwLockReadGuard<()>>,
+}
+pub struct SpaceOperation {
+    _scope: Arc<SpaceReadScope>,
     space: SpaceId,
     generation: i64,
 }
@@ -165,27 +168,59 @@ impl SpacePurgeFence {
             fenced: row.try_get("", "fenced")?,
         })
     }
-    /// Called only after the request's signature and authority have verified.
+    /// Signature verification precedes admission; this lifetime does not grant
+    /// authority. The caller still evaluates the grant before accessing data.
     pub async fn admit<C: ConnectionTrait>(
         &self,
         conn: &C,
         space: &SpaceId,
     ) -> Result<SpaceOperation, FenceError> {
-        self.check(conn, space).await?;
+        self.admit_many(conn, std::slice::from_ref(space))
+            .await?
+            .pop()
+            .ok_or(FenceError::Unavailable)
+    }
+    /// Acquire each owner/global lock once, avoiding read-after-writer queue
+    /// deadlocks in an invocation spanning multiple spaces of the same owner.
+    pub async fn admit_many<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        requested: &[SpaceId],
+    ) -> Result<Vec<SpaceOperation>, FenceError> {
+        let spaces: std::collections::BTreeSet<_> = requested.iter().cloned().collect();
+        if spaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        for space in &spaces {
+            self.check(conn, space).await?;
+        }
         let admission = self.operations.clone().read_owned().await;
-        let owner = self
-            .lock(format!("owner:{}", space.did()))
-            .read_owned()
-            .await;
-        let guard = self.lock(format!("space:{space}")).read_owned().await;
-        self.check(conn, space).await?;
-        Ok(SpaceOperation {
+        let owners: std::collections::BTreeSet<_> =
+            spaces.iter().map(|space| space.did().to_string()).collect();
+        let mut owner_guards = Vec::new();
+        for owner in owners {
+            owner_guards.push(self.lock(format!("owner:{owner}")).read_owned().await);
+        }
+        let mut space_guards = Vec::new();
+        for space in &spaces {
+            space_guards.push(self.lock(format!("space:{space}")).read_owned().await);
+        }
+        for space in &spaces {
+            self.check(conn, space).await?;
+        }
+        let scope = Arc::new(SpaceReadScope {
             _admission: admission,
-            _guard: guard,
-            _owner: owner,
-            space: space.clone(),
-            generation: 0,
-        })
+            _owners: owner_guards,
+            _spaces: space_guards,
+        });
+        Ok(spaces
+            .into_iter()
+            .map(|space| SpaceOperation {
+                _scope: scope.clone(),
+                space,
+                generation: 0,
+            })
+            .collect())
     }
     /// Called by bootstrap/reconciliation after the independent ledger has verified.
     pub fn set_serving_ready(&self, ready: bool) {
@@ -413,6 +448,14 @@ impl SpacePurgeFence {
         let guard = self.operations.clone().read_owned().await;
         self.drain_with_permit(conn, space, PurgePermit::Operation { _guard: guard })
             .await
+    }
+    pub fn validate_restore_drain(&self, restore: &RestoreDrain) -> Result<(), FenceError> {
+        if self.serving_ready.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&restore.barrier.gate, &self.operations)
+        {
+            return Err(FenceError::Unavailable);
+        }
+        Ok(())
     }
     pub async fn drain_during_restore<C: ConnectionTrait>(
         &self,

@@ -29,11 +29,11 @@ fn accepted(
     keys: &LedgerKeys,
     kind: PrefixStoreKind,
 ) -> (LedgerRecord, SqlPhysicalPrefix, SqlPhysicalPrefix) {
-    // A valid uppercase name reaches SQL's irreversible hash encoding. The
+    // A valid dot-heavy lowercase name reaches SQL's hashed encoding. The
     // repair caller receives only opaque ledger evidence and physical prefixes.
-    let nonce = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
-    let original_name = format!("{}{nonce}", "A".repeat(96));
-    let neighbor_name = format!("{}{nonce}", "B".repeat(96));
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let original_name = format!("a{}{nonce}", ".".repeat(95));
+    let neighbor_name = format!("b{}{nonce}", ".".repeat(95));
     let original: SpaceId = format!(
         "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:{original_name}"
     )

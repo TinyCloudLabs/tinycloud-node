@@ -40,9 +40,11 @@ struct DecisionPayload(
     Vec<HostRow>,
     i64,
 );
-#[derive(Deserialize)]
+/// Typed HTTP carrier: deriving this directly rejects duplicate fields before
+/// any intermediary JSON value can discard them. It is not verified authority.
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DecisionEnvelope {
+pub struct DecisionProof {
     payload: DecisionPayload,
     signature: String,
 }
@@ -63,10 +65,16 @@ struct RevocationEnvelope {
     payload: RevocationPayload,
     signature: String,
 }
+impl DecisionProof {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ReviewError> {
+        serde_json::to_vec(self).map_err(|_| ReviewError)
+    }
+}
 
 pub struct ReviewVerifier {
-    /// Exactly the current key per writer; old keys are not new authority.
+    /// Retained public keys; only the explicitly current key is new authority.
     writers: BTreeMap<(String, String), VerifyingKey>,
+    current_keys: BTreeMap<String, String>,
     operators: BTreeMap<(String, String), VerifyingKey>,
     revoked: BTreeSet<(String, String)>,
 }
@@ -81,6 +89,8 @@ pub struct VerifiedDecision {
     decision_id: String,
     job_id: String,
     canonical_payload: Vec<u8>,
+    authenticated_body: Vec<u8>,
+    expires_at: i64,
 }
 impl VerifiedDecision {
     pub fn decision_id(&self) -> &str {
@@ -91,6 +101,9 @@ impl VerifiedDecision {
     }
     pub fn canonical_payload(&self) -> &[u8] {
         &self.canonical_payload
+    }
+    pub fn authenticated_body(&self) -> &[u8] {
+        &self.authenticated_body
     }
 }
 fn name(s: &str) -> bool {
@@ -142,6 +155,20 @@ impl ReviewVerifier {
         operators: BTreeMap<(String, String), [u8; 32]>,
         revoked: BTreeSet<(String, String)>,
     ) -> Result<Self, ReviewError> {
+        let mut current = BTreeMap::new();
+        for (writer, key) in writers.keys() {
+            if current.insert(writer.clone(), key.clone()).is_some() {
+                return Err(ReviewError);
+            }
+        }
+        Self::with_history(writers, current, operators, revoked)
+    }
+    pub fn with_history(
+        writers: BTreeMap<(String, String), [u8; 32]>,
+        current_keys: BTreeMap<String, String>,
+        operators: BTreeMap<(String, String), [u8; 32]>,
+        revoked: BTreeSet<(String, String)>,
+    ) -> Result<Self, ReviewError> {
         fn keys(
             raw: BTreeMap<(String, String), [u8; 32]>,
         ) -> Result<BTreeMap<(String, String), VerifyingKey>, ReviewError> {
@@ -167,15 +194,44 @@ impl ReviewVerifier {
         {
             return Err(ReviewError);
         }
-        let mut seen = BTreeSet::new();
-        if writers.keys().any(|(writer, _)| !seen.insert(writer)) {
+        let writer_ids: BTreeSet<_> = writers.keys().map(|(writer, _)| writer.as_str()).collect();
+        if current_keys.len() != writer_ids.len()
+            || current_keys
+                .iter()
+                .any(|(writer, key)| !writers.contains_key(&(writer.clone(), key.clone())))
+        {
             return Err(ReviewError);
         }
         Ok(Self {
             writers,
+            current_keys,
             operators,
             revoked,
         })
+    }
+    /// Audit signature verification with retained historical public keys.
+    /// Returns no acceptance authority; current-key, revocation, binding and
+    /// expiry checks are mandatory through verify_decision before any action.
+    pub fn verify_retained_signature(&self, raw: &[u8]) -> Result<(), ReviewError> {
+        if raw.len() > 1_048_576 {
+            return Err(ReviewError);
+        }
+        let envelope: DecisionProof = serde_json::from_slice(raw).map_err(|_| ReviewError)?;
+        let p = &envelope.payload;
+        if p.0 != 1 || !name(&p.1) || !name(&p.2) || !uuid(&p.3) || !uuid(&p.4) {
+            return Err(ReviewError);
+        }
+        let key = self
+            .writers
+            .get(&(p.1.clone(), p.2.clone()))
+            .ok_or(ReviewError)?;
+        verify(
+            key,
+            b"tinycloud-resource-review-decision-v1\0",
+            p,
+            &envelope.signature,
+        )?;
+        Ok(())
     }
     /// `revocation_records` must come from a complete, current protected-ledger
     /// enumeration in this acceptance/check sequence; I/O failure is not empty.
@@ -189,7 +245,7 @@ impl ReviewVerifier {
         if raw.len() > 1_048_576 || now < 0 {
             return Err(ReviewError);
         }
-        let envelope: DecisionEnvelope = serde_json::from_slice(raw).map_err(|_| ReviewError)?;
+        let envelope: DecisionProof = serde_json::from_slice(raw).map_err(|_| ReviewError)?;
         let p = &envelope.payload;
         if p.0 != 1
             || !name(&p.1)
@@ -215,7 +271,7 @@ impl ReviewVerifier {
             return Err(ReviewError);
         }
         let writer = (p.1.clone(), p.2.clone());
-        if self.revoked.contains(&writer) {
+        if self.revoked.contains(&writer) || self.current_keys.get(&p.1) != Some(&p.2) {
             return Err(ReviewError);
         }
         for raw in revocation_records {
@@ -311,6 +367,67 @@ impl ReviewVerifier {
             decision_id: p.3.clone(),
             job_id: p.4.clone(),
             canonical_payload: bytes,
+            authenticated_body: raw.to_vec(),
+            expires_at: p.14,
         })
     }
+}
+
+/// Consume in the SAME acceptance transaction as the fence, job and signed
+/// ledger-copy row. A matching original purge can resume but never spend twice.
+pub async fn consume(
+    tx: &crate::sea_orm::DatabaseTransaction,
+    proof: &VerifiedDecision,
+    purge_id: &str,
+    now: time::OffsetDateTime,
+) -> Result<ReviewUse, crate::sea_orm::DbErr> {
+    use crate::sea_orm::sea_query::OnConflict;
+    use crate::{
+        models::resource_review_consumption as used,
+        sea_orm::{ActiveValue::Set, EntityTrait},
+    };
+    if !uuid(purge_id) || now.unix_timestamp() >= proof.expires_at {
+        return Err(crate::sea_orm::DbErr::Custom(
+            "invalid review consumption".into(),
+        ));
+    }
+    let result = used::Entity::insert(used::ActiveModel {
+        decision_id: Set(proof.decision_id.clone()),
+        purge_id: Set(purge_id.into()),
+        authenticated_body: Set(proof.authenticated_body.clone()),
+        consumed_at: Set(now),
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .do_nothing()
+    .exec(tx)
+    .await?;
+    let row = used::Entity::find_by_id(&proof.decision_id)
+        .one(tx)
+        .await?
+        .ok_or_else(|| crate::sea_orm::DbErr::Custom("conflicting review consumption".into()))?;
+    // Compare canonical parsed payloads so carrier whitespace cannot rebind a
+    // decision. Stored bytes remain signed evidence for subsequent rechecking.
+    let stored: DecisionProof = serde_json::from_slice(&row.authenticated_body)
+        .map_err(|_| crate::sea_orm::DbErr::Custom("invalid stored review evidence".into()))?;
+    let current: DecisionProof = serde_json::from_slice(&proof.authenticated_body)
+        .map_err(|_| crate::sea_orm::DbErr::Custom("invalid review evidence".into()))?;
+    if row.purge_id != purge_id
+        || stored.signature != current.signature
+        || canonical(&stored.payload)
+            .map_err(|_| crate::sea_orm::DbErr::Custom("invalid stored review evidence".into()))?
+            != proof.canonical_payload
+    {
+        return Err(crate::sea_orm::DbErr::Custom(
+            "review decision already consumed".into(),
+        ));
+    }
+    Ok(match result {
+        crate::sea_orm::TryInsertResult::Inserted(_) => ReviewUse::Fresh,
+        _ => ReviewUse::OriginalPurge,
+    })
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewUse {
+    Fresh,
+    OriginalPurge,
 }

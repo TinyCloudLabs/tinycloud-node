@@ -11,6 +11,8 @@ pub enum OwnerProofError {
     Invalid,
     #[error("not found")]
     NotOwner,
+    #[error("host mismatch")]
+    HostMismatch,
 }
 
 pub struct OwnerProof {
@@ -33,6 +35,59 @@ pub async fn verify_owner(
     verify_ucan_signature(invocation)
         .await
         .map_err(|_| OwnerProofError::Invalid)?;
+    owner_fields(
+        invocation,
+        action,
+        exact_resource,
+        expected_owner,
+        idempotency_header,
+        now,
+    )
+}
+
+/// Signature-bound host routing is checked before owner, nonce or state lookup.
+pub async fn verify_owner_for_host(
+    invocation: &TinyCloudInvocation,
+    action: &str,
+    exact_resource: &str,
+    expected_owner: &str,
+    idempotency_header: &str,
+    expected_host: &str,
+    now: i64,
+) -> Result<OwnerProof, OwnerProofError> {
+    verify_ucan_signature(invocation)
+        .await
+        .map_err(|_| OwnerProofError::Invalid)?;
+    let mut hosts = invocation
+        .payload()
+        .facts
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| fact.get("hostId"));
+    if hosts.next().and_then(serde_json::Value::as_str) != Some(expected_host)
+        || hosts.next().is_some()
+    {
+        return Err(OwnerProofError::HostMismatch);
+    }
+    owner_fields(
+        invocation,
+        action,
+        exact_resource,
+        expected_owner,
+        idempotency_header,
+        now,
+    )
+}
+
+fn owner_fields(
+    invocation: &TinyCloudInvocation,
+    action: &str,
+    exact_resource: &str,
+    expected_owner: &str,
+    idempotency_header: &str,
+    now: i64,
+) -> Result<OwnerProof, OwnerProofError> {
     let payload = invocation.payload();
     let parsed_owner: tinycloud_auth::ssi::dids::DIDBuf = expected_owner
         .parse()
@@ -87,12 +142,17 @@ pub async fn verify_owner(
         || if resource.as_str().starts_with("did:") {
             canonicalize_did(resource.as_str()).map_err(|_| OwnerProofError::Invalid)?
                 != exact_resource
-        } else {
+        } else if resource.as_str().starts_with("tinycloud:") {
             resource
                 .as_str()
                 .parse::<tinycloud_auth::resource::ResourceId>()
                 .map_err(|_| OwnerProofError::Invalid)?
                 .to_string()
+                != exact_resource
+        } else {
+            crate::resource_purge_fence::ResourceTarget::parse(resource.as_str())
+                .map_err(|_| OwnerProofError::Invalid)?
+                .as_str()
                 != exact_resource
         }
         || ability.as_ref() != action

@@ -48,7 +48,9 @@ fn signed(key: &JWK, owner: &str, space: &str, id: &str) -> String {
         InvocationOptions {
             not_before: Some(now),
             nonce: Some(uuid::Uuid::new_v4().to_string()),
-            facts: Some(vec![serde_json::json!({"idempotency_key":id})]),
+            facts: Some(vec![
+                serde_json::json!({"idempotency_key":id,"hostId":"host-test"}),
+            ]),
             proof: Some(vec![]),
         },
     )
@@ -80,7 +82,15 @@ async fn purge_enqueue_is_idempotent_bound_to_target_and_status_uses_inline_owne
         store.clone(),
         "host-test".into(),
     )
-    .unwrap();
+    .unwrap()
+    .with_storage_layout(
+        tinycloud::space_lifecycle::PurgeStorageLayout::new(
+            tinycloud::storage::purge_reconcile::PrefixStoreKind::KvFileSystem,
+            tinycloud::storage::purge_reconcile::PrefixStoreKind::SqlFileSystem,
+            false,
+        )
+        .unwrap(),
+    );
     runtime.verify_ledger().await.unwrap();
     runtime.fence.set_serving_ready(true);
     let fence = runtime.fence.clone();

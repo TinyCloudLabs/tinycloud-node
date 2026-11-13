@@ -119,6 +119,7 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook", "test-util"]
 
 [dev-dependencies]
+serde_jcs = "0.1"
 # Parse production Rust items in the DID resolver source guard (tests only).
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"

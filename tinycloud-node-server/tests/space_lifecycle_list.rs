@@ -46,7 +46,9 @@ fn signed(key: &JWK, signer: &str, target: &str) -> (String, String) {
         InvocationOptions {
             not_before: Some(now),
             nonce: Some(uuid::Uuid::new_v4().to_string()),
-            facts: Some(vec![serde_json::json!({"idempotency_key":id})]),
+            facts: Some(vec![
+                serde_json::json!({"idempotency_key":id,"hostId":"host-test"}),
+            ]),
             proof: Some(vec![]),
         },
     )

@@ -45,13 +45,14 @@ pub async fn list_my_resources(
     }
     let owner = canonicalize_did(&body.owner_did)
         .map_err(|_| error(Status::BadRequest, "invalid_request"))?;
-    let proof = verify_owner(
+    let proof = verify_owner_for_host(
         &auth.0 .0.invocation,
         "tinycloud.resource/list",
         &owner,
         &owner,
         &key.0,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        &runtime.host_id,
+        runtime.now().unix_timestamp(),
     )
     .await
     .map_err(proof_error)?;
