@@ -144,6 +144,23 @@ impl Default for SqlWaitBounds {
     }
 }
 
+/// The first back-off after a whole-checkpoint save fails (TC-2961).
+const CHECKPOINT_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest back-off: each further failure doubles it up to this.
+const CHECKPOINT_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// A database whose last whole-checkpoint save failed or was refused
+/// (TC-2961). Its writes are refused until `until` without reloading it, so a
+/// client retrying cannot drive hydrate, write, save, fail in a loop.
+#[derive(Clone, Copy)]
+struct CheckpointBackoff {
+    failures: u32,
+    until: Instant,
+    /// The save was refused by the artifact write limit (507), rather than
+    /// failed (503).
+    refused: bool,
+}
+
 #[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
@@ -164,6 +181,10 @@ pub struct SqlService {
     bounds: SqlWaitBounds,
     durability: DurabilityPolicy,
     ddl_policy: DdlPolicy,
+    /// See [`CheckpointBackoff`]; kept across `discard_local_state`.
+    checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
+    /// The first back-off and its cap.
+    checkpoint_backoff_bounds: (Duration, Duration),
 }
 
 impl SqlService {
@@ -183,6 +204,8 @@ impl SqlService {
             bounds: SqlWaitBounds::default(),
             durability: DurabilityPolicy::default(),
             ddl_policy: DdlPolicy::default(),
+            checkpoint_backoff: Arc::new(DashMap::new()),
+            checkpoint_backoff_bounds: (CHECKPOINT_BACKOFF, CHECKPOINT_BACKOFF_MAX),
         }
     }
 
@@ -202,6 +225,14 @@ impl SqlService {
 
     pub fn with_wait_bounds(mut self, bounds: SqlWaitBounds) -> Self {
         self.bounds = bounds;
+        self
+    }
+
+    /// The checkpoint back-off (TC-2961): `first` after a failed or refused
+    /// whole-checkpoint save, doubling per further failure up to `max`. The
+    /// node keeps the defaults (30 s, 15 min); only tests lower them.
+    pub fn with_checkpoint_backoff(mut self, first: Duration, max: Duration) -> Self {
+        self.checkpoint_backoff_bounds = (first, max);
         self
     }
 
@@ -366,6 +397,12 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        // TC-2961: before hydration, so a backed-off database is not reloaded.
+        if request.is_write(caveats.as_ref()) {
+            if let Some(error) = self.checkpoint_backoff_error(&key) {
+                return Err(error);
+            }
+        }
         // Whatever the request still holds of the disk budget is released once
         // its outcome is known: after the durable save, or its failure.
         let _reservation = ReservationGuard::new(
@@ -913,6 +950,46 @@ impl SqlService {
         }
     }
 
+    /// The error a write to `key` gets while its checkpoint back-off lasts
+    /// (TC-2961): the refusal or failure its last whole-checkpoint save met.
+    fn checkpoint_backoff_error(&self, key: &(String, String)) -> Option<SqlError> {
+        let backoff = *self.checkpoint_backoff.get(key)?;
+        (Instant::now() < backoff.until).then_some(if backoff.refused {
+            SqlError::DatabaseSizeLimit
+        } else {
+            SqlError::Unavailable
+        })
+    }
+
+    /// Start or lengthen `key`'s back-off after its whole-checkpoint save met
+    /// `error`: the first back-off, doubled per further failure up to the cap.
+    fn back_off_checkpoint(&self, key: &(String, String), error: &SqlError) {
+        let (first, max) = self.checkpoint_backoff_bounds;
+        let failures = self
+            .checkpoint_backoff
+            .get(key)
+            .map_or(0, |backoff| backoff.failures)
+            .saturating_add(1);
+        let factor = 1_u32.checked_shl(failures - 1).unwrap_or(u32::MAX);
+        let delay = first.saturating_mul(factor).min(max);
+        let refused = matches!(error, SqlError::DatabaseSizeLimit);
+        self.checkpoint_backoff.insert(
+            key.clone(),
+            CheckpointBackoff {
+                failures,
+                until: Instant::now() + delay,
+                refused,
+            },
+        );
+        tracing::warn!(
+            service = "sql",
+            failures,
+            refused,
+            retry_after_ms = delay.as_millis() as u64,
+            "Database checkpoint save failed; refusing its writes until the back-off ends"
+        );
+    }
+
     async fn persist_write(
         &self,
         space: &SpaceId,
@@ -988,7 +1065,7 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        let saved = self
+        let saved = match self
             .bounded(
                 (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
@@ -1001,8 +1078,25 @@ impl SqlService {
                     expected,
                 ),
             )
-            .await?
-            .map_err(request_artifact_error(space, db_name))?;
+            .await
+        {
+            Ok(Ok(saved)) => saved,
+            Ok(Err(error)) => {
+                // A stale actor's lineage conflict is recovered by the
+                // re-hydration the caller forces; it is not a save that failed.
+                let lineage_conflict = matches!(error, DatabaseArtifactError::StaleLineage);
+                let error = request_artifact_error(space, db_name)(error);
+                if !lineage_conflict {
+                    self.back_off_checkpoint(&key, &error);
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                self.back_off_checkpoint(&key, &error);
+                return Err(error);
+            }
+        };
+        self.checkpoint_backoff.remove(&key);
         self.lineage.insert(
             key,
             ArtifactExpectation::Derived {
@@ -1120,6 +1214,16 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
                 "Database artifact kept changing while it was read"
             );
             SqlError::Unavailable
+        }
+        DatabaseArtifactError::WriteLimitExceeded { bytes, limit } => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_write_limit",
+                bytes,
+                limit,
+                "Database checkpoint exceeds the artifact write limit; not saved"
+            );
+            SqlError::DatabaseSizeLimit
         }
         err => SqlError::Internal(err.to_string()),
     }
@@ -2939,6 +3043,65 @@ mod tests {
         );
     }
 
+    /// TC-2961: a checkpoint over the artifact write limit answers 507 and is
+    /// never sent; the database's writes are then refused without reloading
+    /// it until a back-off ends, and each further refusal doubles the back-off.
+    #[tokio::test]
+    async fn a_refused_checkpoint_backs_off_writes_without_reloading() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cache = TempDir::new().unwrap();
+        let mut service = SqlService::new(
+            cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(CountingArtifactRepository {
+                inner: Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_write_bytes(1)),
+                loads: loads.clone(),
+            }),
+        );
+        let first = Duration::from_millis(300);
+        service.checkpoint_backoff_bounds = (first, Duration::from_secs(10));
+        let space = test_space_id("sql-checkpoint-backoff");
+        let write = || {
+            service.execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v)".to_string()]),
+                    sql: "INSERT INTO items VALUES (1)".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+            )
+        };
+        let refused = |result: Result<SqlExecutionResult, SqlError>| {
+            matches!(result, Err(SqlError::DatabaseSizeLimit))
+        };
+
+        assert!(refused(write().await), "the checkpoint is over the limit");
+        assert_eq!(loads.load(Ordering::Relaxed), 1, "one hydration");
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 1, "backed off: not reloaded");
+
+        tokio::time::sleep(first + Duration::from_millis(50)).await;
+        assert!(
+            refused(write().await),
+            "tried again once the back-off ended"
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        // The second back-off is twice the first.
+        tokio::time::sleep(first + Duration::from_millis(50)).await;
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 2, "still backed off");
+        tokio::time::sleep(first).await;
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 3);
+    }
+
     /// Fails the next `failures` repository calls with `error`, then
     /// delegates.
     struct FlakyArtifactRepository {
@@ -3183,11 +3346,13 @@ mod tests {
             });
             let cache = TempDir::new().unwrap();
             let space = test_space_id("sql-transient");
-            let service = SqlService::new(
+            let mut service = SqlService::new(
                 cache.path().to_string_lossy().into_owned(),
                 u64::MAX,
                 repo.clone(),
             );
+            // Back-off off here: the TC-2961 back-off is covered by its own test.
+            service.checkpoint_backoff_bounds = (Duration::ZERO, Duration::ZERO);
             // The bound is above every bounded wait on this path (lock 30 s,
             // hydration 30 s, transfer 45 s), so a slow-but-bounded stall
             // surfaces as a typed `Busy(stage)` naming the stage; only an

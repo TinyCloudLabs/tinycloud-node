@@ -35,6 +35,39 @@ pub enum SqlRequest {
     Export,
 }
 
+impl SqlRequest {
+    /// Whether this request is write-class: `!is_read_only` from
+    /// [`classify_sql`](super::parser::classify_sql), DML and DDL alike.
+    ///
+    /// The answer does not depend on the caller's abilities (TC-1581): a
+    /// statement the caller may not run is still a write, so a denial is never
+    /// read as "not a write". Only a statement that does not parse is treated
+    /// as non-write; execution re-validates it and surfaces the true error.
+    /// `ExecuteStatement` resolves the named statement from the same caveats
+    /// execution uses and classifies its SQL: on the invocation-facts fallback
+    /// the body is invoker-controlled, so it is parsed, never assumed
+    /// read-only. An unresolvable name is non-write (execution fails with
+    /// "statement not found" before any storage grows). `Export` is a read.
+    pub fn is_write(&self, caveats: Option<&super::SqlCaveats>) -> bool {
+        let is_write_sql = |sql: &str| {
+            super::parser::classify_sql(sql)
+                .map(|class| !class.is_read_only)
+                .unwrap_or(false)
+        };
+        match self {
+            SqlRequest::Query { sql, .. } => is_write_sql(sql),
+            SqlRequest::Execute { sql, schema, .. } => {
+                schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
+            }
+            SqlRequest::Batch { statements } => statements.iter().any(|s| is_write_sql(&s.sql)),
+            SqlRequest::ExecuteStatement { name, .. } => caveats
+                .and_then(|c| c.find_statement(name))
+                .is_some_and(|stmt| is_write_sql(&stmt.sql)),
+            SqlRequest::Export => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlStatement {
     pub sql: String,
@@ -307,7 +340,10 @@ pub enum SqlError {
     )]
     OutcomeUnknown,
     /// The write would take the database past its size cap. Rolled back before
-    /// COMMIT; nothing was applied (TC-1491).
+    /// COMMIT; nothing was applied (TC-1491). Also the answer when the
+    /// database's whole checkpoint exceeds the single-statement artifact
+    /// write limit: the local change is discarded, Postgres never saw it
+    /// (TC-2961).
     #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
     DatabaseSizeLimit,
     /// The node's disk cannot hold the write's worst-case growth next to the

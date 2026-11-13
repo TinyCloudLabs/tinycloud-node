@@ -453,7 +453,9 @@ async fn postgres_sql_statement_timeout_is_retryable_and_releases_the_lock() {
     .await;
     tinycloud_core::db::migrate(&conn).await.unwrap();
     let cache = tempfile::TempDir::new().unwrap();
-    let service = sql_service(&conn, &cache);
+    // Back-off off here: the TC-2961 back-off is covered by its own test.
+    let service =
+        sql_service(&conn, &cache).with_checkpoint_backoff(Duration::ZERO, Duration::ZERO);
     let space = test_space("sqllock");
     write(&service, &space, "a", 1024).await.unwrap();
     write(&service, &space, "b", 1024).await.unwrap();
