@@ -978,7 +978,10 @@ impl SqlService {
             .saturating_add(1);
         let factor = 1_u32.checked_shl(failures - 1).unwrap_or(u32::MAX);
         let delay = first.saturating_mul(factor).min(max);
-        let refused = matches!(error, SqlError::DatabaseSizeLimit);
+        let refused = matches!(
+            error,
+            SqlError::DatabaseSizeLimit | SqlError::StorageWouldGrow
+        );
         self.checkpoint_backoff.insert(
             key.clone(),
             CheckpointBackoff {
@@ -1027,7 +1030,7 @@ impl SqlService {
                     return Err(SqlError::StorageWouldGrow);
                 }
             }
-            let saved = self
+            let saved = match self
                 .bounded(
                     (space, db_name),
                     || SqlBusyStage::ArtifactTransfer,
@@ -1035,8 +1038,23 @@ impl SqlService {
                     self.artifact_repository
                         .save_snapshot("sql", &key.0, db_name, snapshot, expected),
                 )
-                .await?
-                .map_err(request_artifact_error(space, db_name))?;
+                .await
+            {
+                Ok(Ok(saved)) => saved,
+                Ok(Err(error)) => {
+                    let lineage_conflict = matches!(error, DatabaseArtifactError::StaleLineage);
+                    let error = request_artifact_error(space, db_name)(error);
+                    if !lineage_conflict {
+                        self.back_off_checkpoint(&key, &error);
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.back_off_checkpoint(&key, &error);
+                    return Err(error);
+                }
+            };
+            self.checkpoint_backoff.remove(&key);
             self.lineage.insert(
                 key,
                 ArtifactExpectation::Derived {
@@ -2918,6 +2936,61 @@ mod tests {
             .discard_local_state(&(space.to_string(), "main".into()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_refusal_preserves_backoff() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_refusal_preserves_backoff",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+                .with_chunk_limits(Some(crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                }))
+                .with_max_write_bytes(1),
+        );
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("chunk-backoff");
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+        for _ in 0..2 {
+            let outcome = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE items(value TEXT)".into()]),
+                        sql: "INSERT INTO items VALUES ('not saved')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                )
+                .await;
+            assert!(
+                matches!(outcome, Err(SqlError::DatabaseSizeLimit)),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                service
+                    .checkpoint_backoff
+                    .get(&(space.to_string(), "main".into()))
+                    .unwrap()
+                    .failures,
+                1,
+                "immediate retry must not perform another failed checkpoint"
+            );
+        }
+        assert!(repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

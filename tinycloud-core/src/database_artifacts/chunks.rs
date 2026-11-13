@@ -108,9 +108,9 @@ impl SeaOrmDatabaseArtifactRepository {
                 ))
                 .await?
                 .ok_or(DatabaseArtifactError::ArtifactChanged)?;
-            if !row.try_get::<bool>("", "progress")? {
-                break;
-            }
+            // Another collector can finish the selected part first. A fresh
+            // candidate query must still reach the rest of this bounded pass.
+            let _progress = row.try_get::<bool>("", "progress")?;
         }
         Ok(())
     }
@@ -145,6 +145,7 @@ impl SeaOrmDatabaseArtifactRepository {
         {
             return Err(DatabaseArtifactError::StorageLimit);
         }
+        self.check_write(size.min(CHUNK_BYTES as u64) as usize)?;
         let space_id: SpaceId = space
             .parse()
             .map_err(|_| DatabaseArtifactError::Backend("invalid artifact space".into()))?;
@@ -1658,5 +1659,58 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_honours_single_statement_cap() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_honours_single_statement_cap",
+        )
+        .await
+        else {
+            return;
+        };
+        let space =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:statement-cap";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 4 * CHUNK_BYTES as u64,
+                account_bytes: 8 * CHUNK_BYTES as u64,
+            }),
+        );
+        let refused = repo
+            .clone()
+            .with_max_write_bytes(4096)
+            .save_snapshot(
+                "sql",
+                space,
+                "refused",
+                snapshot(&vec![1; 4097]),
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(DatabaseArtifactError::WriteLimitExceeded {
+                    bytes: 4097,
+                    limit: 4096
+                })
+            ),
+            "{refused:?}"
+        );
+        // The complete artifact may exceed the statement cap: each bounded
+        // chunk must obey it, as well as the separate artifact/account limits.
+        let saved = repo
+            .with_max_write_bytes(CHUNK_BYTES as u64)
+            .save_snapshot(
+                "sql",
+                space,
+                "streamed",
+                snapshot(&vec![2; CHUNK_BYTES + 1]),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.size_bytes, CHUNK_BYTES as i64 + 1);
     }
 }

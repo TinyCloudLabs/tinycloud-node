@@ -1005,16 +1005,26 @@ pub async fn app_with_control(
         tc_bench_health,
     ]);
     let raw_artifact_repository = node_artifact_repository(&tinycloud)
-        .with_max_write_bytes(tinycloud_config.storage.sql.max_artifact_write_bytes.as_u64())
-        .with_max_read_bytes(tinycloud_config.storage.sql.max_artifact_read_bytes.as_u64())
-        .with_chunk_limits(
-        tinycloud_config.storage.sql.chunked_artifacts.then_some(
+        .with_max_write_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_write_bytes
+                .as_u64(),
+        )
+        .with_max_read_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_read_bytes
+                .as_u64(),
+        )
+        .with_chunk_limits(tinycloud_config.storage.sql.chunked_artifacts.then_some(
             tinycloud_core::database_artifacts::chunks::ChunkLimits {
                 artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
                 account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
             },
-        ),
-    );
+        ));
     raw_artifact_repository.configure_chunked_storage().await?;
     let artifact_collector = raw_artifact_repository
         .chunk_storage_active()
