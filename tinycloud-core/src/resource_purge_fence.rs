@@ -16,6 +16,8 @@ pub struct ResourceTarget {
 }
 impl ResourceTarget {
     pub fn parse(raw: &str) -> Result<Self, ResourceTargetError> {
+        raw.parse::<crate::types::Resource>()
+            .map_err(|_| ResourceTargetError)?;
         let parsed = key_id::parse(raw).map_err(|_| ResourceTargetError)?;
         let owner = parsed.owner_did().to_owned();
         let network = match &parsed {
@@ -49,6 +51,7 @@ impl ResourceTarget {
     }
 }
 pub struct ResourceOperation {
+    pub(crate) _admission: OwnedRwLockReadGuard<()>,
     pub(crate) _owner: OwnedRwLockReadGuard<()>,
     pub(crate) _resource: OwnedRwLockReadGuard<()>,
     pub(crate) target: ResourceTarget,
@@ -60,6 +63,7 @@ impl ResourceOperation {
 }
 /// Constructed only after the durable fence is present and owner work drains.
 pub struct ResourcePurgeDrain {
+    pub(crate) _admission: crate::space_purge_fence::PurgePermit,
     pub(crate) _owner: OwnedRwLockWriteGuard<()>,
     pub(crate) _resource: OwnedRwLockWriteGuard<()>,
     pub(crate) target: ResourceTarget,

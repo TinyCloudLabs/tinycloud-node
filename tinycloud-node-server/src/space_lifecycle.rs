@@ -390,6 +390,7 @@ pub async fn list_my_spaces(
             Ok(raw)
         })
         .transpose()?;
+    let _admission = runtime.fence.lifecycle_operation().await;
     let tx = runtime
         .management_transaction(&proof, "list", "owner", &owner)
         .await?;
@@ -606,6 +607,7 @@ pub async fn retire_owner(
     )
     .await
     .map_err(proof_error)?;
+    let _admission = runtime.fence.lifecycle_operation().await;
     let _owner_drain = runtime.fence.retirement_drain(&owner).await;
     let tx = runtime
         .management_transaction(&proof, "retire-owner", "owner", &owner)
@@ -786,6 +788,7 @@ pub async fn purge_space(
     )
     .await
     .map_err(proof_error)?;
+    let _admission = runtime.fence.lifecycle_operation().await;
     let tx = runtime
         .management_transaction(&proof, "purge", "space", &canonical)
         .await?;
@@ -904,6 +907,7 @@ pub async fn purge_status(
     )
     .await
     .map_err(proof_error)?;
+    let _admission = runtime.fence.lifecycle_operation().await;
     let tx = runtime
         .management_transaction(&proof, "status", "space", &space.to_string())
         .await?;
@@ -924,4 +928,6 @@ pub async fn purge_status(
         .ok_or_else(|| error(Status::NotFound, "not_found"))
 }
 
+pub mod leases;
+pub mod reconcile;
 pub mod resources;

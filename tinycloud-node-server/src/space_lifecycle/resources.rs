@@ -1,8 +1,8 @@
 //! Owner lifecycle resource inventory. Routes remain unmounted until reconciliation is wired.
 use super::*;
 use tinycloud_core::{
-    encryption_network::key_id::{self, EncryptionResource},
     models::{encryption_network, encryption_network_key, resource_purge_job},
+    resource_purge_fence::ResourceTarget,
     sea_orm::sea_query::JoinType,
 };
 
@@ -24,11 +24,9 @@ pub struct ResourceListResponse {
     pub last_page: bool,
 }
 fn exact_resource(raw: &str, owner: &str) -> Result<(), ApiError> {
-    let parsed = key_id::parse(raw).map_err(|_| error(Status::BadRequest, "invalid_request"))?;
-    if matches!(parsed, EncryptionResource::KeyPrefix(_))
-        || parsed.owner_did() != owner
-        || parsed.to_string() != raw
-    {
+    let parsed =
+        ResourceTarget::parse(raw).map_err(|_| error(Status::BadRequest, "invalid_request"))?;
+    if parsed.owner_did() != owner || parsed.as_str() != raw {
         return Err(error(Status::BadRequest, "invalid_request"));
     }
     Ok(())
@@ -73,6 +71,7 @@ pub async fn list_my_resources(
             Ok(raw)
         })
         .transpose()?;
+    let _admission = runtime.fence.lifecycle_operation().await;
     let tx = runtime
         .management_transaction(&proof, "resource-list", "owner", &owner)
         .await?;
