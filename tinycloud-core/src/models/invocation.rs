@@ -554,6 +554,28 @@ async fn validate_capabilities<C: ConnectionTrait>(
             // are NOT trusted on their own — they are only authorized when
             // the persisted chain ability row already has a matching or
             // stricter caveat.
+            let mut terminal_cids = std::collections::HashSet::new();
+            if dependant_caps.iter().any(|cap| matches!(&cap.resource,
+                Resource::TinyCloud(resource) if matches!(resource.service().as_str(), "sql" | "duckdb"))) {
+                for id in root_ids.iter().flat_map(|id| graph.chain_ids_from(id)) {
+                    if graph.is_parentless(&id) && graph.delegation(&id).is_some_and(|row| {
+                        dependant_caps.iter().any(|cap| !is_root_authority(cap, &row.delegator))
+                    }) {
+                        terminal_cids.insert(id.to_cid(0x55).to_string());
+                    }
+                }
+            }
+            let registered_policy_roots = if terminal_cids.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                policy_v3_root::Entity::find()
+                    .filter(policy_v3_root::Column::RootCid.is_in(terminal_cids))
+                    .all(db)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.root_cid)
+                    .collect::<std::collections::HashSet<_>>()
+            };
             for c in &dependant_caps {
                 // TC-119: ability containment is registry-aware. A parent
                 // ability supports the invoked ability when it is equal OR a
@@ -648,7 +670,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     let valid_chain = graph.has_covering_chain(
                         parents.iter().map(|(parent, _)| parent.id),
                         covers,
-                        |row| is_root_authority(c, &row.delegator),
+                        |row| {
+                            is_root_authority(c, &row.delegator)
+                                || registered_policy_roots
+                                    .contains(&row.id.to_cid(0x55).to_string())
+                        },
                     );
                     if !valid_chain {
                         return Err(InvocationError::UnauthorizedAction(
@@ -1743,6 +1769,188 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn signed_invocations_require_registered_policy_terminals() {
+        use crate::events::{Delegation, SerializedEvent, TinyCloudDelegation};
+        use tinycloud_auth::{
+            ssi::{claims::jwt::NumericDate, jwk::Algorithm, ucan::Payload},
+            ucan_capabilities_object::Capabilities,
+        };
+        fn identity() -> (JWK, String) {
+            let key = JWK::generate_ed25519().unwrap();
+            let did = DID_METHODS.generate(&key, "key").unwrap().to_string();
+            (key, did)
+        }
+        fn token(
+            (key, issuer): (&JWK, &str),
+            audience: &str,
+            resource: &str,
+            ability: &str,
+            proof: Vec<tinycloud_auth::ipld_core::cid::Cid>,
+            facts: Option<Vec<serde_json::Value>>,
+            now: i64,
+        ) -> String {
+            let mut caps = Capabilities::<serde_json::Value>::new();
+            caps.with_action(
+                resource.parse().unwrap(),
+                ability.parse().unwrap(),
+                [BTreeMap::new()],
+            );
+            Payload {
+                issuer: issuer.parse().unwrap(),
+                audience: audience.parse().unwrap(),
+                expiration: NumericDate::try_from_seconds((now + 300) as f64).unwrap(),
+                not_before: Some(NumericDate::try_from_seconds((now - 1) as f64).unwrap()),
+                nonce: None,
+                facts,
+                proof,
+                attenuation: caps,
+            }
+            .sign(Algorithm::EdDSA, key)
+            .unwrap()
+            .encode()
+            .unwrap()
+        }
+        for service in ["sql", "duckdb"] {
+            let db = Database::connect("sqlite::memory:").await.unwrap();
+            Migrator::up(&db, None).await.unwrap();
+            let (owner_key, owner) = identity();
+            let (holder_key, holder) = identity();
+            let (child_key, child) = identity();
+            let space = SpaceId::new(owner.parse().unwrap(), "files".parse().unwrap()).unwrap();
+            let resource = format!("{space}/{service}/db");
+            let ability = format!("tinycloud.{service}/read");
+            let now = OffsetDateTime::now_utc();
+            let invoke = |key: &JWK, issuer: &str, parents: Vec<_>| {
+                let encoded = token(
+                    (key, issuer),
+                    &owner,
+                    &resource,
+                    &ability,
+                    parents,
+                    None,
+                    now.unix_timestamp(),
+                );
+                util::InvocationInfo::try_from(TinyCloudInvocation::decode(&encoded).unwrap())
+                    .unwrap()
+            };
+            assert!(
+                verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![]), now)
+                    .await
+                    .is_err()
+            );
+            let ordinary = token(
+                (&holder_key, &holder),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                None,
+                now.unix_timestamp(),
+            );
+            let ordinary = Delegation::from_header_ser::<TinyCloudDelegation>(&ordinary).unwrap();
+            assert!(delegation::process(&db, &ordinary, None).await.is_err());
+            let grant = token(
+                (&owner_key, &owner),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                None,
+                now.unix_timestamp(),
+            );
+            let grant = Delegation::from_header_ser::<TinyCloudDelegation>(&grant).unwrap();
+            let grant_cid = grant.content_hash().to_cid(0x55);
+            assert!(
+                verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+                    .await
+                    .is_err()
+            );
+            delegation::process(&db, &grant, None).await.unwrap();
+            verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+                .await
+                .unwrap();
+            let child_grant = token(
+                (&holder_key, &holder),
+                &child,
+                &resource,
+                &ability,
+                vec![grant_cid],
+                None,
+                now.unix_timestamp(),
+            );
+            let child_grant =
+                Delegation::from_header_ser::<TinyCloudDelegation>(&child_grant).unwrap();
+            delegation::process(&db, &child_grant, None).await.unwrap();
+            verify_and_authorize(
+                &db,
+                &invoke(
+                    &child_key,
+                    &child,
+                    vec![child_grant.content_hash().to_cid(0x55)],
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+            let facts = serde_json::json!({
+                "role": "policy-authority", "mode": "policy-source", "ownerDid": holder,
+                "policyId": "test-policy", "policyDigestHex": "test-digest", "policyCid": "test-policy-cid",
+                "contentSourceDigestHex": "test-source", "capabilityCeilingHashHex": "test-ceiling",
+                "nativeProjectionHashHex": "test-projection", "nodeAudience": owner,
+            });
+            let root = token(
+                (&holder_key, &holder),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                Some(vec![facts]),
+                now.unix_timestamp(),
+            );
+            let root = SerializedEvent::<util::DelegationInfo>::from_header_ser::<
+                TinyCloudDelegation,
+            >(&root)
+            .unwrap();
+            assert!(root.0.parents.is_empty());
+            assert!(!is_root_authority(
+                &root.0.capabilities[0],
+                &root.0.delegator
+            ));
+            delegation::process(&db, &root, None).await.unwrap();
+            let root_cid = root.content_hash().to_cid(0x55);
+            let invocation = invoke(&holder_key, &holder, vec![root_cid]);
+            assert!(matches!(
+                verify_and_authorize(&db, &invocation, now).await,
+                Err(Error::InvalidInvocation(
+                    InvocationError::UnauthorizedAction(_, _)
+                ))
+            ));
+            // The holder has a valid owner grant before this registry fixture is inserted.
+            authorize_holder(&db, &holder, &root.0.capabilities, &[grant_cid], now)
+                .await
+                .unwrap();
+            policy_v3_root::ActiveModel {
+                root_cid: Set(root_cid.to_string()),
+                policy_cid: Set("test-policy-cid".into()),
+                role: Set("policy-authority".into()),
+                authorization_bytes: Set(vec![]),
+                status_checkpoint_bytes: Set(None),
+                previous_checkpoint_digest_hex: Set(None),
+                status_sequence: Set(1),
+                admission_epoch: Set(0),
+                status_checked_at: Set(None),
+                status_fresh_until: Set(None),
+                revoked_at: Set(None),
+                revocation_bytes: Set(None),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            verify_and_authorize(&db, &invocation, now).await.unwrap();
+        }
+    }
+
     fn tables_caveat() -> Caveats {
         Caveats(BTreeMap::from([(
             "tables".to_string(),
@@ -1760,7 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_invocation_with_unsupported_caveat_is_refused() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.sql/read", Caveats::default()).await;
         let capability = caveat_capability(resource, "tinycloud.sql/read", tables_caveat());
@@ -1784,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn stored_unsupported_sql_row_does_not_cover_invocation() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.sql/read", mixed_sql_caveat()).await;
         let capability = caveat_capability(
@@ -1812,7 +2020,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_constrained_profile_grant_authorizes_invocation() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let caveats = make_sql_constrained_caveat("get", "SELECT 1");
         let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", caveats.clone()).await;
         crate::models::invocation::authorize_holder(
@@ -1836,7 +2044,7 @@ mod tests {
         own: Caveats,
         setting: bool,
     ) -> Result<(), Error> {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         crate::models::invocation::authorize_holder_with_setting(
             db,
             "did:key:alias",
@@ -1863,7 +2071,7 @@ mod tests {
     /// as any non-profile caveat is.
     #[tokio::test]
     async fn stored_delegated_form_covers_an_invocation_only_with_the_setting_on() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let stored = delegated_form_caveat(serde_json::json!({"tables": ["a"]}));
         let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
         holder_under(&db, parent, Caveats::default(), true)
@@ -1909,7 +2117,7 @@ mod tests {
     /// imposes nothing; with it off it is refused.
     #[tokio::test]
     async fn stored_grant_of_only_empty_entries_covers_any_invocation_only_with_the_setting_on() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let stored = Caveats(BTreeMap::from([
             ("0".to_string(), serde_json::json!({})),
             ("1".to_string(), serde_json::json!({})),
@@ -1929,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn duckdb_invocation_with_caveat_is_refused() {
-        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let resource = "tinycloud:key:owner:files/duckdb/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
         let capability = caveat_capability(resource, "tinycloud.duckdb/read", tables_caveat());
@@ -1953,7 +2161,7 @@ mod tests {
 
     #[tokio::test]
     async fn duckdb_empty_caveat_grant_authorizes_invocation() {
-        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let resource = "tinycloud:key:owner:files/duckdb/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
         crate::models::invocation::authorize_holder(
