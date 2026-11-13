@@ -1140,7 +1140,7 @@ pub async fn app_with_control(
                         loop {
                             tokio::select! {
                                 _=interval.tick()=> {
-                                    if collector.reap_unused_parts(2048).await.is_err() {
+                                    if !matches!(tokio::time::timeout(Duration::from_secs(1), collector.reap_unused_parts(128)).await, Ok(Ok(()))) {
                                         ::tracing::warn!(event="artifact_part_collection_failed", "Artifact part collection deferred");
                                     }
                                 },

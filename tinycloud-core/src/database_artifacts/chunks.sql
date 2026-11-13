@@ -27,13 +27,14 @@ CREATE TABLE artifact_part (
     chunk_count integer NOT NULL CHECK(chunk_count>=0),
     replacement_credit bigint NOT NULL DEFAULT 0 CHECK(replacement_credit>=0),
     replacing boolean NOT NULL DEFAULT false, replaces_part_id text,
-    state text NOT NULL DEFAULT 'uploading'  CHECK(state IN ('uploading','sealed','deleting')),
+    state text NOT NULL DEFAULT 'uploading'  CHECK(state IN ('uploading','sealed','published','deleting')),
     lease_until timestamptz NOT NULL DEFAULT clock_timestamp()+interval '120 seconds',
     PRIMARY KEY(service,space,name,part_id),
     FOREIGN KEY(service,space,name,replaces_part_id) REFERENCES artifact_part(service,space,name,part_id)
 );
 CREATE UNIQUE INDEX artifact_part_replacement ON artifact_part(service,space,name) WHERE replacing;
-CREATE INDEX artifact_part_reap ON artifact_part(state,lease_until);
+CREATE INDEX artifact_part_reap ON artifact_part(lease_until) WHERE state<>'published';
+CREATE INDEX artifact_part_reap_owner ON artifact_part(owner,lease_until) WHERE state<>'published';
 CREATE TABLE artifact_chunk (
     service text NOT NULL, space text NOT NULL, name text NOT NULL,
     part_id text NOT NULL, ordinal integer NOT NULL CHECK(ordinal>=0),
@@ -156,7 +157,7 @@ ALTER TABLE database_artifact DISABLE TRIGGER artifact_metadata_guard;
 -- reservations, legacy writers and pointer publication. 'deleting' is a fence:
 -- time determines eligibility, never permission to resume or publish a part.
 CREATE FUNCTION artifact_reap_one(p_service text,p_space text,p_name text,p_id text,
- abort_upload boolean DEFAULT false) RETURNS boolean LANGUAGE plpgsql AS $$
+ abort_upload boolean DEFAULT false) RETURNS boolean LANGUAGE plpgsql SET lock_timeout='50ms' AS $$
 DECLARE p artifact_part%ROWTYPE; next_ordinal integer; child_credit bigint;
 BEGIN
  SELECT * INTO p FROM artifact_part WHERE service=p_service AND space=p_space AND name=p_name AND part_id=p_id;
@@ -168,7 +169,7 @@ BEGIN
    AND d.space=p.space AND d.name=p.name AND
    (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) THEN RETURN false; END IF;
  IF NOT abort_upload AND p.state<>'deleting' AND p.lease_until>clock_timestamp() THEN RETURN false; END IF;
- UPDATE artifact_part SET state='deleting' WHERE service=p.service AND space=p.space AND name=p.name AND part_id=p.part_id;
+ UPDATE artifact_part SET state='deleting',lease_until=clock_timestamp() WHERE service=p.service AND space=p.space AND name=p.name AND part_id=p.part_id;
  SELECT ordinal INTO next_ordinal FROM artifact_chunk WHERE service=p.service AND space=p.space
    AND name=p.name AND part_id=p.part_id ORDER BY ordinal LIMIT 1;
  IF FOUND THEN DELETE FROM artifact_chunk WHERE service=p.service AND space=p.space
@@ -191,7 +192,7 @@ BEGIN
  IF TG_OP='DELETE' THEN
    SELECT COALESCE(sum(replacement_credit),0) INTO released FROM artifact_part
      WHERE service=OLD.service AND space=OLD.space AND name=OLD.name;
-   UPDATE artifact_part SET state='deleting',replacement_credit=0,replacing=false,replaces_part_id=NULL
+   UPDATE artifact_part SET state='deleting',lease_until=clock_timestamp(),replacement_credit=0,replacing=false,replaces_part_id=NULL
      WHERE service=OLD.service AND space=OLD.space AND name=OLD.name;
    IF released>0 THEN UPDATE artifact_account SET credit_bytes=credit_bytes-released
      WHERE owner=artifact_owner(OLD.space); END IF;
@@ -199,7 +200,7 @@ BEGIN
  END IF;
  IF OLD.checkpoint_part_id IS DISTINCT FROM NEW.checkpoint_part_id THEN
    IF OLD.checkpoint_part_id IS NOT NULL THEN
-     UPDATE artifact_part SET state='deleting' WHERE service=OLD.service AND space=OLD.space
+     UPDATE artifact_part SET state='deleting',lease_until=clock_timestamp() WHERE service=OLD.service AND space=OLD.space
        AND name=OLD.name AND part_id=OLD.checkpoint_part_id;
    ELSE
      SELECT replacement_credit INTO released FROM artifact_part WHERE service=NEW.service
@@ -236,8 +237,9 @@ BEGIN
  -- Pending shrinkage never creates spare quota for another database: the
  -- ledger credits only overlapping bytes, not the shrink's eventual saving.
  UPDATE artifact_account SET reserved_bytes=reserved_bytes+p_size,credit_bytes=credit_bytes+credit
- WHERE owner=p_owner AND legacy_bytes+reserved_bytes-credit_bytes
-   -CASE WHEN existing THEN base.size_bytes ELSE 0 END+p_size<=cap;
+ WHERE owner=p_owner AND ((existing AND p_size<=base.size_bytes) OR
+   legacy_bytes+reserved_bytes-credit_bytes
+   -CASE WHEN existing THEN base.size_bytes ELSE 0 END+p_size<=cap);
  IF NOT FOUND THEN RETURN false; END IF;
  INSERT INTO artifact_part(service,space,name,part_id,owner,size_bytes,chunk_count,
    replacement_credit,replacing,replaces_part_id)
@@ -245,3 +247,19 @@ BEGIN
    CASE WHEN existing THEN base.checkpoint_part_id ELSE NULL END);
  RETURN true;
 END $$;
+
+CREATE FUNCTION artifact_metadata_publish() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.checkpoint_part_id IS NOT NULL THEN
+   UPDATE artifact_part SET state='published',lease_until='infinity'::timestamptz
+    WHERE service=NEW.service AND space=NEW.space AND name=NEW.name
+      AND part_id=NEW.checkpoint_part_id AND state='sealed';
+   IF NOT EXISTS(SELECT 1 FROM artifact_part WHERE service=NEW.service AND space=NEW.space
+      AND name=NEW.name AND part_id=NEW.checkpoint_part_id AND state='published') THEN
+     RAISE EXCEPTION 'TC2917_LAYOUT: unpublished part';
+   END IF;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER artifact_metadata_publish AFTER INSERT OR UPDATE ON database_artifact
+ FOR EACH ROW EXECUTE FUNCTION artifact_metadata_publish();

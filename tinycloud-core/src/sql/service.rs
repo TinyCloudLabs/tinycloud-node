@@ -2780,6 +2780,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(before, reopened.export(&space, "main").await.unwrap());
+        repo.reap_unused_parts(64).await.unwrap();
         let current_meta = repo
             .load_meta("sql", &space.to_string(), "main")
             .await

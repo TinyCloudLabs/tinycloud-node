@@ -85,3 +85,12 @@ replacement credit is released atomically with publication. Admission evaluates
 account usage minus the current database size plus its proposed replacement.
 Thus a full account can shrink, cannot grow above its quota, and cannot reuse
 the same database's credit for a second simultaneous replacement.
+
+Published parts have a distinct state and infinite lease, and are excluded from
+both global and owner-local reclamation indexes. Inline cleanup is best effort,
+scoped to the uploading owner, at most 16 steps and 100 ms per pass; its errors
+do not fail the save. Background passes are limited to 128 steps and one second
+per 10-second tick. GC lock acquisition waits at most 50 ms per statement.
+An owner already above its quota can replace a database with an equal or
+smaller image; that exception admits no growth and does not free pending shrink
+capacity for other databases.
