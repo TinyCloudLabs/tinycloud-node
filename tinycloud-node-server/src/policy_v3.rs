@@ -12242,3 +12242,7 @@ mod unbound_source_tests;
 #[cfg(test)]
 #[path = "policy_v3/share_key_record_tests.rs"]
 mod share_key_record_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/policy_root_proof_tests.rs"]
+mod policy_root_proof_tests;
