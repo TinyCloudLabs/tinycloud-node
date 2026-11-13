@@ -154,3 +154,37 @@ fn persistent_key_config_is_stable_and_retains_prior_key_versions() {
         assert!(LedgerKeys::from_config(invalid).is_err());
     }
 }
+
+#[test]
+fn resource_records_are_domain_and_path_separated_from_space_records() {
+    let keys = LedgerKeys::new(
+        "test".into(),
+        BTreeMap::from([("test".into(), vec![13; 32])]),
+    )
+    .unwrap();
+    let target = "urn:tinycloud:encryption:did:pkh:eip155:1:0x1111111111111111111111111111111111111111:default";
+    let digest = keys.target_hmac("test", "resource", target).unwrap();
+    assert_ne!(digest, keys.target_hmac("test", "space", target).unwrap());
+    let record = keys
+        .sign(
+            "test",
+            "resource",
+            &digest,
+            &uuid::Uuid::new_v4().to_string(),
+            "purging",
+            1,
+        )
+        .unwrap();
+    let path = record.object_key().unwrap();
+    assert!(path.starts_with("_purge-ledger/resources/"));
+    assert_eq!(
+        keys.verify(&path, &record.to_bytes().unwrap()).unwrap(),
+        record
+    );
+    assert!(keys
+        .verify(
+            &path.replace("/resources/", "/spaces/"),
+            &record.to_bytes().unwrap()
+        )
+        .is_err());
+}

@@ -258,7 +258,7 @@ impl SpacePurgeFence {
         key_id: &str,
         digest: &[u8],
     ) -> Result<i64, FenceError> {
-        if !matches!(kind, "owner" | "space")
+        if !matches!(kind, "owner" | "space" | "resource")
             || digest.len() != 32
             || !self.keys.key_ids().any(|id| id == key_id)
         {
@@ -327,6 +327,114 @@ impl SpacePurgeFence {
             _owner_shared: owner_shared,
             _owner_exclusive: owner_exclusive,
             space: space.clone(),
+        })
+    }
+}
+
+impl SpacePurgeFence {
+    async fn check_resource_state<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        resource: &crate::resource_purge_fence::ResourceTarget,
+    ) -> Result<(), FenceError> {
+        for (kind, target) in resource.targets() {
+            for key_id in self.keys.key_ids() {
+                let digest = self
+                    .keys
+                    .target_hmac(key_id, kind, target)
+                    .map_err(|_| FenceError::Unavailable)?;
+                if state::Entity::find_by_id((kind.to_owned(), digest, key_id.to_owned()))
+                    .one(conn)
+                    .await?
+                    .is_some_and(|row| row.fenced || row.generation != 0)
+                {
+                    return Err(FenceError::Deleted);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn check_resource<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        resource: &crate::resource_purge_fence::ResourceTarget,
+    ) -> Result<(), FenceError> {
+        if !self.serving_ready.load(Ordering::Acquire) {
+            return Err(FenceError::Unavailable);
+        }
+        self.check_resource_state(conn, resource).await
+    }
+    pub async fn admit_resource<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        resource: &crate::resource_purge_fence::ResourceTarget,
+    ) -> Result<crate::resource_purge_fence::ResourceOperation, FenceError> {
+        self.check_resource(conn, resource).await?;
+        let owner = self
+            .lock(format!("owner:{}", resource.owner_did()))
+            .read_owned()
+            .await;
+        let guard = self
+            .lock(format!("resource:{}", resource.as_str()))
+            .read_owned()
+            .await;
+        self.check_resource(conn, resource).await?;
+        Ok(crate::resource_purge_fence::ResourceOperation {
+            _owner: owner,
+            _resource: guard,
+            target: resource.clone(),
+        })
+    }
+    pub async fn recheck_resource(
+        &self,
+        tx: &DatabaseTransaction,
+        operation: &crate::resource_purge_fence::ResourceOperation,
+    ) -> Result<(), FenceError> {
+        if !self.serving_ready.load(Ordering::Acquire) {
+            return Err(FenceError::Unavailable);
+        }
+        for (kind, target) in operation.target.targets() {
+            self.ensure(tx, kind, target).await?;
+            for key_id in self.keys.key_ids() {
+                let digest = self
+                    .keys
+                    .target_hmac(key_id, kind, target)
+                    .map_err(|_| FenceError::Unavailable)?;
+                if state::Entity::find_by_id((kind.to_owned(), digest, key_id.to_owned()))
+                    .lock_shared()
+                    .one(tx)
+                    .await?
+                    .is_some_and(|row| row.fenced || row.generation != 0)
+                {
+                    return Err(FenceError::Deleted);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn drain_resource<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        resource: &crate::resource_purge_fence::ResourceTarget,
+    ) -> Result<crate::resource_purge_fence::ResourcePurgeDrain, FenceError> {
+        if !matches!(
+            self.check_resource_state(conn, resource).await,
+            Err(FenceError::Deleted)
+        ) {
+            return Err(FenceError::Unavailable);
+        }
+        let owner = self
+            .lock(format!("owner:{}", resource.owner_did()))
+            .write_owned()
+            .await;
+        let guard = self
+            .lock(format!("resource:{}", resource.as_str()))
+            .write_owned()
+            .await;
+        Ok(crate::resource_purge_fence::ResourcePurgeDrain {
+            _owner: owner,
+            _resource: guard,
+            target: resource.clone(),
         })
     }
 }

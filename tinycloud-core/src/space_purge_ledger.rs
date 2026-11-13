@@ -75,7 +75,7 @@ impl LedgerRecord {
             || uuid::Uuid::parse_str(&self.operation_id).is_err()
             || !matches!(
                 (self.kind.as_str(), self.state.as_str()),
-                ("owner", "retired") | ("space", "purging" | "complete")
+                ("owner", "retired") | ("space" | "resource", "purging" | "complete")
             )
         {
             return Err(LedgerError);
@@ -91,8 +91,15 @@ impl LedgerRecord {
             ))
         } else {
             Ok(format!(
-                "_purge-ledger/spaces/{}/{}/{}",
-                self.key_id, self.target_hmac, self.state
+                "_purge-ledger/{}/{}/{}/{}",
+                if self.kind == "resource" {
+                    "resources"
+                } else {
+                    "spaces"
+                },
+                self.key_id,
+                self.target_hmac,
+                self.state
             ))
         }
     }
@@ -202,6 +209,7 @@ impl LedgerKeys {
         match kind {
             "owner" => mac.update(b"tinycloud-owner-tombstone-v1\0"),
             "space" => mac.update(b"tinycloud-space-tombstone-v1\0"),
+            "resource" => mac.update(b"tinycloud-resource-tombstone-v1\0"),
             _ => return Err(LedgerError),
         }
         mac.update(canonical_target.as_bytes());
