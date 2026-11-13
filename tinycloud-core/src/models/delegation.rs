@@ -222,12 +222,16 @@ pub(crate) async fn process<C: ConnectionTrait>(
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    process_with(db, delegation, encryption, false, true, None).await
+    process_with(db, delegation, encryption, false, true, None, false).await
 }
 
 /// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
 /// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
-/// `named_keys` a capability on a key or key prefix is refused.
+/// `named_keys` a capability on a key or key prefix is refused. With
+/// `signature_verified` the caller checked these exact signed bytes with
+/// [`check_signature`] before its transaction (TC-2986); only the time
+/// window is checked here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_with<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
@@ -235,8 +239,12 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     delegated_sql_caveats: bool,
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
+    signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
-    verify(&delegation.0.delegation).await?;
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
@@ -259,8 +267,12 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
+    signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
-    verify(&delegation.0.delegation).await?;
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
     if !delegation.0.parents.is_empty()
         || !crate::renewal::lease_original_from_signed(delegation)
             .is_ok_and(|original| original.is_some())
@@ -270,10 +282,11 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
-// verify signatures and time
-async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+/// Check a delegation's signature: CPU, or a DID resolution when network
+/// methods are on. Runs before any lock (TC-2986).
+pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
-        TinyCloudDelegation::Ucan(ref ucan) => {
+        TinyCloudDelegation::Ucan(ucan) => {
             verify_ucan_signature(ucan)
                 .await
                 .map_err(|error| match error {
@@ -285,21 +298,28 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
                         DelegationError::InvalidSignature
                     }
                 })?;
-            ucan.payload()
-                .validate_time(None)
-                .map_err(|_| DelegationError::InvalidTime)?;
         }
-        TinyCloudDelegation::Cacao(ref cacao) => {
+        TinyCloudDelegation::Cacao(cacao) => {
             cacao
                 .verify()
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
-            if !cacao.payload().valid_now() {
-                return Err(DelegationError::InvalidTime.into());
-            }
         }
     };
     Ok(())
+}
+
+/// Check that a delegation is within its signed time window now.
+fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+    let valid = match delegation {
+        TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_ok(),
+        TinyCloudDelegation::Cacao(cacao) => cacao.payload().valid_now(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DelegationError::InvalidTime.into())
+    }
 }
 
 // TC-1791: refusal reason for a SQL or DuckDB capability whose caveats are

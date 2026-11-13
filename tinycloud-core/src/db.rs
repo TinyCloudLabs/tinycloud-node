@@ -1,4 +1,7 @@
 #[cfg(test)]
+#[path = "db/signature_before_locks_tests.rs"]
+mod signature_before_locks_tests;
+#[cfg(test)]
 #[path = "db/status_snapshot_tests.rs"]
 mod status_snapshot_tests;
 
@@ -2104,6 +2107,17 @@ where
     }
 
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
+        self.transact_verified(events, &PreVerified::default())
+            .await
+    }
+
+    /// As [`Self::transact`], with the signatures `verified` holds already
+    /// checked (TC-2986).
+    async fn transact_verified(
+        &self,
+        events: Vec<Event>,
+        verified: &PreVerified,
+    ) -> Result<TransactResult, TxError<B, K>> {
         let spaces = sequence_spaces(&self.conn, &events).await?;
         let _sequence_guards = self.acquire_space_sequence_guards(&spaces).await;
         let _writer = match &self.writer_lock {
@@ -2113,7 +2127,7 @@ where
         let tx = self.begin_graph_transaction().await?;
         // `transact` takes the database-side sequence lock itself, first.
 
-        let result = transact(
+        let result = transact_verified(
             &tx,
             &self.storage,
             &self.secrets,
@@ -2124,6 +2138,7 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            verified,
         )
         .await?;
 
@@ -2291,6 +2306,10 @@ where
             ));
         }
         let renewal_lease = crate::renewal::lease_original_from_signed(&delegation)?.is_some();
+        // TC-2986: the signature is checked before any lock, so a forged or
+        // slow one never holds the guards or the spaces' write order.
+        let verified =
+            PreVerified::delegation(&self.conn, &delegation, self.encryption.as_ref()).await?;
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
@@ -2330,7 +2349,7 @@ where
             Err(e) => return Err(TxError::Db(e)),
         }
         match self
-            .transact(vec![Event::Delegation(Box::new(delegation))])
+            .transact_verified(vec![Event::Delegation(Box::new(delegation))], &verified)
             .await
         {
             Err(TxError::EpochInsert(epoch_err)) => {
@@ -2421,6 +2440,8 @@ where
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
+        // TC-2986: the signature is checked before any lock.
+        let verified = PreVerified::revocation(&revocation).await?;
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
         let revocation_start = Instant::now();
@@ -2431,7 +2452,7 @@ where
             revocation_start.elapsed(),
         );
         let _chain_guards = chain_guards?;
-        self.transact(vec![Event::Revocation(Box::new(revocation))])
+        self.transact_verified(vec![Event::Revocation(Box::new(revocation))], &verified)
             .await
     }
 
@@ -4293,6 +4314,45 @@ async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> R
         .unwrap_or(target))
 }
 
+/// Content hashes of signed delegations and revocations whose signatures
+/// were checked before their transaction opened (TC-2986). Inside it,
+/// [`transact_verified`] checks only their time window, so a slow or forged
+/// signature never runs under a space lock. A hash names exact signed bytes,
+/// so a check cannot carry over to other bytes.
+#[derive(Default)]
+pub(crate) struct PreVerified(HashSet<Hash>);
+
+impl PreVerified {
+    pub(crate) fn contains(&self, hash: &Hash) -> bool {
+        self.0.contains(hash)
+    }
+
+    /// Check `delegation`'s signature on `db`, outside any transaction; for a
+    /// renewal lease, also the signature of the original it renews.
+    pub(crate) async fn delegation<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+        db: &C,
+        delegation: &Delegation,
+        encryption: Option<&ColumnEncryption>,
+    ) -> Result<Self, TxError<S, K>> {
+        delegation::check_signature(&delegation.0.delegation).await?;
+        let mut checked = HashSet::from([delegation.content_hash()]);
+        if crate::renewal::lease_original_from_signed(delegation)?.is_some() {
+            checked.insert(
+                crate::renewal::preverify_lease_original(db, delegation, encryption).await?,
+            );
+        }
+        Ok(Self(checked))
+    }
+
+    /// Check `revocation`'s signature, outside any transaction.
+    pub(crate) async fn revocation<S: StorageSetup, K: Secrets>(
+        revocation: &Revocation,
+    ) -> Result<Self, TxError<S, K>> {
+        revocation::check_signature(&revocation.0.revocation).await?;
+        Ok(Self(HashSet::from([crate::hash::hash(&revocation.1)])))
+    }
+}
+
 async fn event_spaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
@@ -4388,6 +4448,39 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     delegated_sql_caveats: bool,
     named_keys: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
+    transact_verified(
+        db,
+        store_setup,
+        secrets,
+        node_identity,
+        events,
+        encryption,
+        auth_graph,
+        sequence_locks_held,
+        delegated_sql_caveats,
+        named_keys,
+        &PreVerified::default(),
+    )
+    .await
+}
+
+/// As [`transact`]. The signatures `verified` holds were checked before the
+/// transaction (TC-2986); inside it, those events have only their time
+/// window checked.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+    db: &C,
+    store_setup: &S,
+    secrets: &K,
+    node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    events: Vec<Event>,
+    encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    sequence_locks_held: &[SpaceId],
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    verified: &PreVerified,
+) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
         .into_iter()
@@ -4434,7 +4527,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .iter()
                 .any(|lease| lease.content_hash() == *hash)
             {
-                delegation::save_owner_renewal_lease(db, d, encryption).await?
+                delegation::save_owner_renewal_lease(db, d, encryption, verified.contains(hash))
+                    .await?
             } else {
                 delegation::process_with(
                     db,
@@ -4447,6 +4541,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                         .map(|(stable_node_did, renewer_did, epoch)| {
                             (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
                         }),
+                    verified.contains(hash),
                 )
                 .await?
             };
@@ -4464,6 +4559,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 *renewer_epoch,
                 stable_node_did,
                 encryption,
+                verified,
             )
             .await?;
         }
@@ -4833,7 +4929,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     .await?;
                 }
                 Event::Revocation(r) => {
-                    revocation::process(db, *r).await?;
+                    revocation::process_with(db, *r, verified.contains(&hash)).await?;
                     for (space, (_, _, _, hashes)) in &space_order {
                         if hashes.contains_key(&hash) {
                             crate::request_telemetry::observe_space(space);
@@ -4909,7 +5005,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     .await?;
                 }
                 Event::Revocation(r) => {
-                    revocation::process(db, *r).await?;
+                    revocation::process_with(db, *r, verified.contains(&hash)).await?;
                 }
             };
         }
