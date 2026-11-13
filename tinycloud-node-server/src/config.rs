@@ -1661,6 +1661,12 @@ pub struct SqlStorageConfig {
     /// off, for local tests only.
     #[serde(default = "default_sql_max_artifact_write_bytes")]
     pub max_artifact_write_bytes: ByteUnit,
+    /// The largest stored SQL or DuckDB checkpoint or WAL delta the node
+    /// loads (TC-2961). A larger database is refused before any of it is
+    /// read (`507 sql_database_size_limit`) instead of being loaded whole.
+    /// On by default, 64 MiB; 0 turns it off.
+    #[serde(default = "default_sql_max_artifact_read_bytes")]
+    pub max_artifact_read_bytes: ByteUnit,
 }
 
 fn default_sql_max_database_bytes() -> ByteUnit {
@@ -1673,6 +1679,10 @@ fn default_sql_min_free_bytes() -> ByteUnit {
 
 fn default_sql_max_artifact_write_bytes() -> ByteUnit {
     ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_WRITE_BYTES)
+}
+
+fn default_sql_max_artifact_read_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_READ_BYTES)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1730,6 +1740,7 @@ impl Default for SqlStorageConfig {
             min_free_bytes: default_sql_min_free_bytes(),
             ddl_requires_schema: DdlPolicy::default(),
             max_artifact_write_bytes: default_sql_max_artifact_write_bytes(),
+            max_artifact_read_bytes: default_sql_max_artifact_read_bytes(),
         }
     }
 }

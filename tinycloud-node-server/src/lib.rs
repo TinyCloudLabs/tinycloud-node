@@ -971,13 +971,21 @@ pub async fn app_with_control(
     let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
         Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(
-                node_artifact_repository(&tinycloud).with_max_write_bytes(
-                    tinycloud_config
-                        .storage
-                        .sql
-                        .max_artifact_write_bytes
-                        .as_u64(),
-                ),
+                node_artifact_repository(&tinycloud)
+                    .with_max_write_bytes(
+                        tinycloud_config
+                            .storage
+                            .sql
+                            .max_artifact_write_bytes
+                            .as_u64(),
+                    )
+                    .with_max_read_bytes(
+                        tinycloud_config
+                            .storage
+                            .sql
+                            .max_artifact_read_bytes
+                            .as_u64(),
+                    ),
             ),
             sql_sizes.clone(),
         ));

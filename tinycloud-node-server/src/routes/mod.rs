@@ -3661,7 +3661,9 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         // 507, not 413: the SQL client reads 413 as `SQL_RESPONSE_TOO_LARGE`
         // and the KV and quota clients as an exhausted storage plan, and
         // TC-1012's 413 is the request body cap. Neither is true here.
-        SqlError::DatabaseSizeLimit | SqlError::DiskHeadroom => Status::new(507),
+        SqlError::DatabaseSizeLimit | SqlError::DatabaseTooLargeToLoad | SqlError::DiskHeadroom => {
+            Status::new(507)
+        }
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation | SqlError::CaveatViolation(_) => Status::Forbidden,

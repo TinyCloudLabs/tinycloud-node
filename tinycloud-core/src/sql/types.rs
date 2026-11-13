@@ -346,6 +346,11 @@ pub enum SqlError {
     /// (TC-2961).
     #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
     DatabaseSizeLimit,
+    /// The database is larger than the node loads (TC-2961): its stored
+    /// checkpoint or WAL delta exceeds the artifact read limit, so it was
+    /// not loaded and nothing ran.
+    #[error("sql_database_size_limit: the database is larger than this node loads; no change was applied")]
+    DatabaseTooLargeToLoad,
     /// The node's disk cannot hold the write's worst-case growth next to the
     /// writes already in flight. Rolled back before COMMIT; nothing was
     /// applied, and a later retry may succeed (TC-1491).

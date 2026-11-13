@@ -52,6 +52,8 @@ enum HydrationOutcome {
     Unavailable(&'static str),
     Failed(String),
     TimedOut,
+    /// The stored database exceeds the artifact read limit (TC-2961).
+    TooLarge,
 }
 
 const PHASE_LOADING: u8 = 0;
@@ -729,6 +731,7 @@ impl SqlService {
                     return Err(SqlError::Unavailable);
                 }
                 HydrationOutcome::Failed(message) => return Err(SqlError::Internal(message)),
+                HydrationOutcome::TooLarge => return Err(SqlError::DatabaseTooLargeToLoad),
                 HydrationOutcome::TimedOut => {
                     log_busy(
                         SqlBusyStage::ArtifactTransfer,
@@ -1225,6 +1228,14 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
             );
             SqlError::DatabaseSizeLimit
         }
+        DatabaseArtifactError::ReadLimitExceeded { .. } => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_read_limit",
+                "Database exceeds the artifact read limit; not loaded"
+            );
+            SqlError::DatabaseTooLargeToLoad
+        }
         err => SqlError::Internal(err.to_string()),
     }
 }
@@ -1254,6 +1265,7 @@ fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
         SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
+        SqlError::DatabaseTooLargeToLoad => HydrationOutcome::TooLarge,
         error => HydrationOutcome::Failed(error.to_string()),
     }
 }
@@ -3100,6 +3112,66 @@ mod tests {
         tokio::time::sleep(first).await;
         assert!(refused(write().await));
         assert_eq!(loads.load(Ordering::Relaxed), 3);
+    }
+
+    /// TC-2961: a database stored over the artifact read limit is not
+    /// loaded; a read and a write to it both answer the 507 size limit, not
+    /// an internal error.
+    #[tokio::test]
+    async fn a_database_over_the_read_limit_answers_the_size_limit() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let space = test_space_id("sql-read-limit");
+        let insert = || SqlRequest::Execute {
+            schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v)".to_string()]),
+            sql: "INSERT INTO items VALUES (1)".to_string(),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let writer_cache = TempDir::new().unwrap();
+        let writer = SqlService::new(
+            writer_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+        );
+        writer
+            .execute(&space, "main", insert(), None, admin())
+            .await
+            .unwrap();
+
+        let reader_cache = TempDir::new().unwrap();
+        let reader = SqlService::new(
+            reader_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_read_bytes(1)),
+        );
+        let read = reader
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT count(*) FROM items".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await;
+        assert!(
+            matches!(read, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{read:?}"
+        );
+        let written = reader
+            .execute(&space, "main", insert(), None, admin())
+            .await;
+        assert!(
+            matches!(written, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{written:?}"
+        );
     }
 
     /// Fails the next `failures` repository calls with `error`, then
