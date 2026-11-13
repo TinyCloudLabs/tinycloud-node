@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.1](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.1) - 2026-11-13
+
+### Other
+
+- Merge pull request #555 from TinyCloudLabs/feat/renewal-scheduler-harness
+- Merge remote-tracking branch 'origin/main' into feat/renewal-scheduler-harness
+- *(TC-2872)* verify scheduler history as the original holder
+- *(TC-2872)* verify synthetic node discovery before registration
+- *(TC-2872)* exercise renewal scheduler through loopback HTTP
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
