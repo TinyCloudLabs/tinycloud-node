@@ -56,13 +56,51 @@ async fn postgres_completion_resumes_after_ledger_publication_and_clears_identit
     let target = keys.target_hmac("test", "space", space).unwrap();
     let purge_id = uuid::Uuid::new_v4().to_string();
     let now = OffsetDateTime::now_utc();
+    let accepted_at = OffsetDateTime::from_unix_timestamp(now.unix_timestamp() - 600).unwrap();
+    let identity: tinycloud_auth::resource::SpaceId = space.parse().unwrap();
+    let accepted = keys
+        .with_prefixes(
+            keys.sign(
+                "test",
+                "space",
+                &target,
+                &purge_id,
+                "purging",
+                accepted_at.unix_timestamp(),
+            )
+            .unwrap(),
+            vec![keys
+                .prefix_hmac(
+                    "test",
+                    "kv-filesystem",
+                    &format!("{}/{}/", identity.suffix(), identity.name()),
+                )
+                .unwrap()],
+        )
+        .unwrap();
+    let accepted_path = accepted.object_key().unwrap();
+    let accepted_body = accepted.to_bytes().unwrap();
+    store
+        .append_purge_record(&accepted_path, &accepted_body)
+        .await
+        .unwrap();
+    tinycloud_core::space_purge_ledger_copy::retain(
+        &db,
+        &keys,
+        &accepted_path,
+        &accepted_body,
+        now,
+    )
+    .await
+    .unwrap();
+
     space_purge_job::ActiveModel {
         purge_id: Set(purge_id.clone()),
         space: Set(Some(space.into())),
         tombstone_hmac: Set(target.clone()),
         hmac_key_id: Set("test".into()),
         owner_hmac: Set(vec![8; 32]),
-        accepted_at: Set(now),
+        accepted_at: Set(accepted_at),
         phase: Set("objects".into()),
         fence_generation: Set(1),
         updated_at: Set(now),
@@ -106,14 +144,7 @@ async fn postgres_completion_resumes_after_ledger_publication_and_clears_identit
     // Simulate a successful external write followed by process death before DB commit.
     let previous_timestamp = now.unix_timestamp() - 10;
     let record = keys
-        .sign(
-            "test",
-            "space",
-            &target,
-            &purge_id,
-            "complete",
-            previous_timestamp,
-        )
+        .completion_from_acceptance(accepted, previous_timestamp)
         .unwrap();
     let path = record.object_key().unwrap();
     store

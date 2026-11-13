@@ -101,6 +101,28 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
             time::OffsetDateTime::now_utc().unix_timestamp() - 600,
         )
         .unwrap();
+    let accepted = keys
+        .with_prefixes(
+            accepted,
+            vec![
+                keys.prefix_hmac(
+                    "test",
+                    "kv-filesystem",
+                    &format!("{}/{}/", a.suffix(), a.name()),
+                )
+                .unwrap(),
+                keys.prefix_hmac(
+                    "test",
+                    "sql-filesystem",
+                    SqlPhysicalPrefix::for_space(&a).as_str(),
+                )
+                .unwrap(),
+                keys.prefix_hmac("test", "sqlite-cache", &format!("{a}/"))
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+    let accepted_at = time::OffsetDateTime::from_unix_timestamp(accepted.timestamp).unwrap();
     if let Either::B(store) = &blocks {
         store
             .append_purge_record(
@@ -116,8 +138,17 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
         .await
         .unwrap();
     tx.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO space_purge_job(purge_id,space,tombstone_hmac,hmac_key_id,owner_hmac,accepted_at,phase,fence_generation,updated_at,next_attempt_at,attempt_count) VALUES($1,$2,$3,'test',$5,clock_timestamp()-INTERVAL '10 minutes','drain',$4,clock_timestamp(),clock_timestamp(),0)",
-        [purge_id.clone().into(),a.to_string().into(),digest.clone().into(),generation.into(),owner_digest.into()])).await.unwrap();
+        "INSERT INTO space_purge_job(purge_id,space,tombstone_hmac,hmac_key_id,owner_hmac,accepted_at,phase,fence_generation,updated_at,next_attempt_at,attempt_count) VALUES($1,$2,$3,'test',$5,$6,'drain',$4,clock_timestamp(),clock_timestamp(),0)",
+        [purge_id.clone().into(),a.to_string().into(),digest.clone().into(),generation.into(),owner_digest.into(),accepted_at.into()])).await.unwrap();
+    tinycloud_core::space_purge_ledger_copy::retain(
+        &tx,
+        &keys,
+        &accepted.object_key().unwrap(),
+        &accepted.to_bytes().unwrap(),
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     db.execute(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO kv_orphan_attempt(space,value,attempt_id,generation,created_at) VALUES($1,$2,'in-flight',1,clock_timestamp())",[a.to_string().into(),vec![1u8;32].into()])).await.unwrap();
     let drain = fence.drain(&db, &a).await.unwrap();

@@ -191,6 +191,14 @@ pub async fn complete_with_encryption(
     if space != job.space {
         return Err(invalid());
     }
+    crate::space_purge_ledger_copy::retain(
+        &tx,
+        keys,
+        &record.object_key().map_err(|_| invalid())?,
+        &record.to_bytes().map_err(|_| invalid())?,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
     let retained = crate::space_purge_records::complete_space(&tx, job, keys, encryption).await?;
     crate::space_purge_database::delete_verified_empty_inventory(&tx, job).await?;
     let completed_at =
