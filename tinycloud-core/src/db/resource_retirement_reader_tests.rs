@@ -119,7 +119,8 @@ impl Fixture {
         assert_eq!(did(&node), secret.node_did());
         let service = SpaceDatabase::new(conn, MemoryStore::default(), secret)
             .await
-            .unwrap();
+            .unwrap()
+            .with_named_keys(true);
         let owner = JWK::generate_ed25519().unwrap();
         let recipient = JWK::generate_ed25519().unwrap();
         let network = format!("urn:tinycloud:encryption:{}:default", did(&owner));
