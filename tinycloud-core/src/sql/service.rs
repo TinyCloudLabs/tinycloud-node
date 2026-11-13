@@ -1071,8 +1071,8 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        let saved = match self
-            .bounded(
+        let (saved, transfer_started) =
+            crate::database_artifacts::track_transfer_start(self.bounded(
                 (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
@@ -1083,9 +1083,9 @@ impl SqlService {
                     payload,
                     expected,
                 ),
-            )
-            .await
-        {
+            ))
+            .await;
+        let saved = match saved {
             Ok(Ok(saved)) => saved,
             Ok(Err(error)) => {
                 // A stale actor's lineage conflict is recovered by the
@@ -1098,7 +1098,11 @@ impl SqlService {
                 return Err(error);
             }
             Err(error) => {
-                self.back_off_checkpoint(&key, &error);
+                // TC-2961: a save cut while still queued for its large-transfer
+                // slot sent nothing; it is busy, not a failed checkpoint.
+                if transfer_started {
+                    self.back_off_checkpoint(&key, &error);
+                }
                 return Err(error);
             }
         };
@@ -3175,6 +3179,129 @@ mod tests {
             matches!(written, Err(SqlError::DatabaseTooLargeToLoad)),
             "{written:?}"
         );
+    }
+
+    /// Holds every load at its first part until the gate opens.
+    struct StalledSink {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl ArtifactSink for StalledSink {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn begin_part(
+            &mut self,
+            part: crate::database_artifacts::ArtifactPart,
+        ) -> Result<(), DatabaseArtifactError> {
+            if part == crate::database_artifacts::ArtifactPart::Checkpoint {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                drop(self.gate.acquire().await.unwrap());
+            }
+            Ok(())
+        }
+        async fn write(&mut self, _bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+    }
+
+    /// TC-2961 (Bobbie's F1): another tenant's two large loads hold both
+    /// large-transfer permits. This tenant's large checkpoint save queues for
+    /// a permit past `artifact_transfer`, sends nothing and is answered busy.
+    /// That is not a failed checkpoint: once the permits are free, its next
+    /// write goes through, with no back-off.
+    #[tokio::test]
+    async fn a_save_still_queued_for_a_permit_starts_no_back_off() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(db);
+        let large = crate::database_artifacts::BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        for name in ["h1", "h2"] {
+            repo.save(
+                "sql",
+                "other-tenant",
+                name,
+                vec![1; large],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let holders: Vec<_> = ["h1", "h2"]
+            .into_iter()
+            .map(|name| {
+                let repo = repo.clone();
+                let mut sink = StalledSink {
+                    entered: entered.clone(),
+                    gate: gate.clone(),
+                };
+                tokio::spawn(async move {
+                    let meta = repo
+                        .load_meta("sql", "other-tenant", name)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    repo.read_chunks("sql", "other-tenant", name, &meta, &mut sink)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holders start");
+
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(repo.clone()),
+        )
+        .with_wait_bounds(SqlWaitBounds {
+            artifact_transfer: Duration::from_millis(500),
+            ..SqlWaitBounds::default()
+        });
+        let space = test_space_id("queued-save");
+        let write = |table: &str, value: &str| SqlRequest::Execute {
+            schema: Some(vec![format!("CREATE TABLE IF NOT EXISTS {table} (v)")]),
+            sql: format!("INSERT INTO {table} VALUES ({value})"),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let queued = service
+            .execute(
+                &space,
+                "main",
+                write("b", "zeroblob(9437184)"),
+                None,
+                admin(),
+            )
+            .await;
+        assert!(
+            matches!(queued, Err(SqlError::Busy(SqlBusyStage::ArtifactTransfer))),
+            "{queued:?}"
+        );
+
+        gate.add_permits(1);
+        for holder in holders {
+            holder.await.unwrap().unwrap();
+        }
+        let next = service
+            .execute(&space, "main", write("s", "1"), None, admin())
+            .await;
+        assert!(next.is_ok(), "no back-off: {next:?}");
     }
 
     /// Fails the next `failures` repository calls with `error`, then

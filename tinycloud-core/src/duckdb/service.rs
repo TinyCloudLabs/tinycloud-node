@@ -661,8 +661,13 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
 
 /// `DuckDbError` has no retryable-unavailable variant (adding one would reach
 /// every route mapping), so an exhausted `ArtifactChanged` stays `Internal`.
+/// The artifact size limits answer 507, as for SQL (TC-2961).
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
-    DuckDbError::Internal(err.to_string())
+    match err {
+        DatabaseArtifactError::WriteLimitExceeded { .. } => DuckDbError::DatabaseSizeLimit,
+        DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
+        err => DuckDbError::Internal(err.to_string()),
+    }
 }
 
 #[cfg(test)]

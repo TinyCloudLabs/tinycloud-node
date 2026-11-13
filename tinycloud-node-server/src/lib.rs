@@ -595,6 +595,11 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
     resolved.database.validate().map_err(anyhow::Error::msg)?;
     resolved
+        .storage
+        .sql
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    resolved
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;

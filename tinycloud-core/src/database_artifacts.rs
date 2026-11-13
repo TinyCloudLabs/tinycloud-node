@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::{Expr, Func},
@@ -692,6 +694,21 @@ pub const DEFAULT_MAX_ARTIFACT_READ_BYTES: u64 = 64 * 1024 * 1024;
 /// on the shared primary. Further ones wait, holding no database connection.
 pub const MAX_CONCURRENT_LARGE_TRANSFERS: usize = 2;
 
+tokio::task_local! {
+    /// Set once a save has its large-transfer slot (or needs none); see
+    /// [`track_transfer_start`].
+    static TRANSFER_STARTED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Run `transfer` and report whether a save inside it got past its wait for
+/// a large-transfer slot (TC-2961). A save cut while still queued for a slot
+/// sent nothing: it is busy, not a failed checkpoint.
+pub async fn track_transfer_start<F: Future>(transfer: F) -> (F::Output, bool) {
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output = TRANSFER_STARTED.scope(started.clone(), transfer).await;
+    (output, started.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// The stored metadata a full checkpoint save is checked against.
 struct CurrentArtifact {
     revision: i64,
@@ -1031,6 +1048,9 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         self.check_write(payload.len())?;
         // Before the writer lock: a waiting save holds nothing else.
         let _large = self.large_transfer_permit(payload.len() as u64).await;
+        let _ = TRANSFER_STARTED.try_with(|started| {
+            started.store(true, std::sync::atomic::Ordering::Release);
+        });
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1821,6 +1841,263 @@ mod tests {
             reader.await.unwrap().unwrap();
         }
         assert_eq!(entered.load(Ordering::SeqCst), 4);
+    }
+
+    /// The node's statement timeouts: a large save opens a real bulk
+    /// transaction on PostgreSQL (TC-1054).
+    fn node_statement_timeouts() -> crate::db_pool::StatementTimeouts {
+        crate::db_pool::StatementTimeouts {
+            mode: crate::db_pool::StatementTimeoutMode::Local,
+            base: std::time::Duration::from_secs(30),
+            bulk: std::time::Duration::from_secs(120),
+        }
+    }
+
+    /// TC-2961: two large saves stalled mid-upload (their CAS UPDATE blocked
+    /// on a row lock another session holds) keep both permits until they
+    /// finish, so a third large load waits; both permits come back after.
+    #[tokio::test]
+    async fn postgres_large_saves_hold_their_permits_through_the_upload() {
+        use sea_orm::{QueryFilter, QuerySelect, TransactionTrait};
+        use std::{
+            sync::{atomic::Ordering, Arc},
+            time::Duration,
+        };
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_large_saves_hold_their_permits_through_the_upload",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = crate::db_pool::RecoveringConnection::new(fixture.connect(4).await)
+            .with_statement_timeouts(node_statement_timeouts());
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+        let large = BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        let mut bases = Vec::new();
+        for name in ["s1", "s2", "r"] {
+            let saved = repo
+                .save(
+                    "sql",
+                    "t",
+                    name,
+                    vec![1; large],
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+            bases.push((name, saved.revision, saved.checkpoint_content_hash));
+        }
+        let competitor = fixture.connect(1).await;
+        let tx = competitor.begin().await.unwrap();
+        database_artifact::Entity::find()
+            .filter(database_artifact::Column::Name.is_in(["s1", "s2"]))
+            .select_only()
+            .column(database_artifact::Column::Name)
+            .lock_exclusive()
+            .into_tuple::<String>()
+            .all(&tx)
+            .await
+            .unwrap();
+        let savers: Vec<_> = bases[..2]
+            .iter()
+            .cloned()
+            .map(|(name, revision, checkpoint_content_hash)| {
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    repo.save(
+                        "sql",
+                        "t",
+                        name,
+                        vec![2; large],
+                        ArtifactExpectation::Derived {
+                            revision,
+                            checkpoint_content_hash,
+                        },
+                    )
+                    .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            savers.iter().all(|saver| !saver.is_finished()),
+            "both saves are stalled in their UPDATE"
+        );
+        assert_eq!(
+            repo.large_transfers.available_permits(),
+            0,
+            "stalled uploads still hold their permits"
+        );
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let repo = repo.clone();
+            let mut sink = GatedSink {
+                entered: entered.clone(),
+                gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            };
+            tokio::spawn(async move {
+                let meta = repo.load_meta("sql", "t", "r").await.unwrap().unwrap();
+                repo.read_chunks("sql", "t", "r", &meta, &mut sink).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            0,
+            "a third large load waits"
+        );
+        tx.rollback().await.unwrap();
+        for saver in savers {
+            tokio::time::timeout(Duration::from_secs(20), saver)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo.large_transfers.available_permits(), 2);
+    }
+
+    /// TC-2961: with both permits held by stalled large loads, a large save
+    /// waits, and while it waits a small save on the same ONE-connection
+    /// pool still runs: the waiter pins no pooled connection and no bulk
+    /// transaction.
+    #[tokio::test]
+    async fn postgres_a_large_save_waiting_for_a_permit_holds_no_connection() {
+        use std::{
+            sync::{atomic::Ordering, Arc},
+            time::Duration,
+        };
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_a_large_save_waiting_for_a_permit_holds_no_connection",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = crate::db_pool::RecoveringConnection::new(fixture.connect(1).await)
+            .with_statement_timeouts(node_statement_timeouts());
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+        let large = BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        for name in ["h1", "h2"] {
+            repo.save(
+                "sql",
+                "other",
+                name,
+                vec![1; large],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let holders: Vec<_> = ["h1", "h2"]
+            .into_iter()
+            .map(|name| {
+                let repo = repo.clone();
+                let mut sink = GatedSink {
+                    entered: entered.clone(),
+                    gate: gate.clone(),
+                };
+                tokio::spawn(async move {
+                    let meta = repo.load_meta("sql", "other", name).await.unwrap().unwrap();
+                    repo.read_chunks("sql", "other", name, &meta, &mut sink)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holders start");
+        assert_eq!(repo.large_transfers.available_permits(), 0);
+
+        let saver = {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                repo.save(
+                    "sql",
+                    "victim",
+                    "big",
+                    vec![2; large],
+                    ArtifactExpectation::Absent,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!saver.is_finished(), "the third large transfer waits");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            repo.save(
+                "sql",
+                "victim",
+                "small",
+                vec![3; 16],
+                ArtifactExpectation::Absent,
+            ),
+        )
+        .await
+        .expect("a waiting large save does not pin the only pooled connection")
+        .unwrap();
+
+        gate.add_permits(1);
+        for holder in holders {
+            holder.await.unwrap().unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(20), saver)
+            .await
+            .expect("the waiting save runs once a permit frees")
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo.large_transfers.available_permits(), 2);
+    }
+
+    /// TC-2961: both limits compare the same stored bytes. A checkpoint
+    /// exactly at the write limit is readable under an equal read limit; a
+    /// read limit below it refuses it (startup refuses that configuration);
+    /// a read limit of 0 is off.
+    #[tokio::test]
+    async fn the_read_and_write_limits_compare_the_same_stored_bytes() {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn)
+            .with_max_write_bytes(4096)
+            .with_max_read_bytes(4096);
+        repo.save("sql", "s", "at", vec![1; 4096], ArtifactExpectation::Absent)
+            .await
+            .unwrap();
+        let meta = repo.load_meta("sql", "s", "at").await.unwrap().unwrap();
+        assert_eq!(meta.checkpoint_size_bytes, 4096);
+        let mut sink = MemorySink::default();
+        repo.read_chunks("sql", "s", "at", &meta, &mut sink)
+            .await
+            .unwrap();
+
+        let lower = repo.clone().with_max_read_bytes(4095);
+        let mut sink = MemorySink::default();
+        assert!(matches!(
+            lower.read_chunks("sql", "s", "at", &meta, &mut sink).await,
+            Err(DatabaseArtifactError::ReadLimitExceeded { .. })
+        ));
+
+        let off = repo.clone().with_max_read_bytes(0);
+        let mut sink = MemorySink::default();
+        off.read_chunks("sql", "s", "at", &meta, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sink.checkpoint.len(), 4096);
     }
 
     #[tokio::test]

@@ -1664,7 +1664,8 @@ pub struct SqlStorageConfig {
     /// The largest stored SQL or DuckDB checkpoint or WAL delta the node
     /// loads (TC-2961). A larger database is refused before any of it is
     /// read (`507 sql_database_size_limit`) instead of being loaded whole.
-    /// On by default, 64 MiB; 0 turns it off.
+    /// On by default, 64 MiB; 0 turns it off. Otherwise `validate` refuses
+    /// it below `max_artifact_write_bytes`, or with that off.
     #[serde(default = "default_sql_max_artifact_read_bytes")]
     pub max_artifact_read_bytes: ByteUnit,
 }
@@ -1723,6 +1724,19 @@ impl SqlStorageConfig {
             artifact_transfer: Duration::from_millis(self.artifact_transfer_timeout_ms),
             hydration_max: Duration::from_millis(self.hydration_max_ms),
         }
+    }
+
+    /// Refuse an artifact read limit below the write limit (TC-2961): the
+    /// databases between the two would be saved, then refused on every load.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let read = self.max_artifact_read_bytes.as_u64();
+        let write = self.max_artifact_write_bytes.as_u64();
+        if read != 0 && (write == 0 || read < write) {
+            return Err(
+                "storage.sql.max_artifact_read_bytes must be 0 (off) or at least storage.sql.max_artifact_write_bytes (and that must not be 0)",
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2390,6 +2404,31 @@ mod tests {
                 crate::resolve_runtime_config(&config).is_ok(),
                 ok,
                 "{timeout_ms}"
+            );
+        }
+    }
+
+    /// TC-2961: a read limit below the write limit would make databases
+    /// between the two writable and then unloadable, so the node refuses to
+    /// start with it. 0 turns the read limit off.
+    #[test]
+    fn startup_refuses_an_artifact_read_limit_below_the_write_limit() {
+        let mib = |n: u64| ByteUnit::Byte(n * 1024 * 1024);
+        for (write, read, ok) in [
+            (mib(64), mib(64), true),
+            (mib(64), mib(128), true),
+            (mib(64), ByteUnit::Byte(0), true),
+            (ByteUnit::Byte(0), ByteUnit::Byte(0), true),
+            (mib(64), ByteUnit::Byte(64 * 1024 * 1024 - 1), false),
+            (ByteUnit::Byte(0), mib(64), false),
+        ] {
+            let mut config = Config::default();
+            config.storage.sql.max_artifact_write_bytes = write;
+            config.storage.sql.max_artifact_read_bytes = read;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "write {write:?} read {read:?}"
             );
         }
     }
