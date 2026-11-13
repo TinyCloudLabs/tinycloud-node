@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.4](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.4) - 2026-11-13
+
+### Fixed
+
+- *(TC-2958)* delivery authorization runs the policy gate
+- *(TC-2958)* match policy roots by their canonical identity
+- *(TC-2958)* policy roots never authorize beside other proofs
+- refuse SQL checkpoints over 64 MiB and back off failed checkpoint saves (TC-2961)
+
+### Other
+
+- Merge pull request #581 from TinyCloudLabs/feat/tc-2958-enforcer-conditions
+- turn the TC-2961 back-off off in the TC-1054 pool statement-timeout test
+- *(TC-2958)* sessions by any CID encoding; delivery holds sessions to their conditions
+- *(TC-2958)* cite registered roots by codec aliases; cover every decrypt path
+- *(TC-2958)* policy roots cited with other proofs
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
