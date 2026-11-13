@@ -54,7 +54,8 @@ const request = {
  * Only node_request carries N2 correlation fields (request_id, request_id_replaced, account_hash,
  * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only. The node's 5xx
  * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code. The
- * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window.
+ * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window. The
+ * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
@@ -70,6 +71,10 @@ export const representativeEvents = Object.freeze({
   errorsDropped: Object.freeze({
     level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: SHIPPER_EVENT_CODES[0],
     class: longest(schema.fields.class.values), dropped: schema.fields.dropped.max, window_s: schema.fields.window_s.max,
+  }),
+  storageHeadroom: Object.freeze({
+    level: 'info', ts: common.ts, event: 'node_storage_headroom', svc: 'api',
+    store: longest(schema.fields.store.values), free_bytes: schema.fields.free_bytes.max,
   }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),
 });
@@ -111,6 +116,9 @@ export function calculateBudget({
   const requestPairBytes = eventBytes.node + eventBytes.ingress;
   const requestBytes30Days = requestsPerMinute * requestPairBytes * MINUTES_30_DAYS;
   const diagnosticReserveBytes30Days = (diagnosticEventsPerMinute * eventBytes.diagnostic + gateEventsPerMinute * eventBytes.gate) * MINUTES_30_DAYS;
+  // TC-2917: a fixed rate, one event per store every 5 minutes, whatever the traffic; reported on its own.
+  const headroomEventsPerMinute = schema.fields.store.values.length / 5;
+  const headroomBytes30Days = headroomEventsPerMinute * eventBytes.storageHeadroom * MINUTES_30_DAYS;
   const sustainableRequestsPerMinute = allocationBytes / (requestPairBytes * MINUTES_30_DAYS);
   const cappedClasses = Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute, representative }]) => [name, {
     capPerMinute, eventBytes: eventBytes[representative], bytes30Days: capPerMinute * eventBytes[representative] * MINUTES_30_DAYS,
@@ -128,7 +136,7 @@ export function calculateBudget({
     sustainableRequestsPerMinute,
     sustainableWholeRequestsPerMinute: Math.floor(sustainableRequestsPerMinute),
     withinRequestAllocation: requestBytes30Days <= allocationBytes,
-    diagnosticEventsPerMinute, gateEventsPerMinute,
+    diagnosticEventsPerMinute, gateEventsPerMinute, headroomEventsPerMinute, headroomBytes30Days,
     cappedWindowSeconds: CAP_WINDOW_SECONDS, cappedClasses,
     cappedEventBytes30Days, droppedCountBytes30Days, cappedReserveBytes30Days,
     cappedAllocationBytes: CAPPED_ALLOCATION_BYTES,
