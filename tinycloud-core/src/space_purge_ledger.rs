@@ -29,7 +29,17 @@ pub struct LedgerRecord {
     pub state: String,
     /// Unix seconds; this is signed metadata, not a replay-protection mechanism.
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<PrefixHmac>,
     pub mac: String,
+}
+
+/// Store-relative physical namespace. Absolute deployment roots are never signed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixHmac {
+    pub store_kind: String,
+    pub prefix_hmac: String,
 }
 
 #[derive(Serialize)]
@@ -41,6 +51,8 @@ struct SignedFields<'a> {
     operation_id: &'a str,
     state: &'a str,
     timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefixes: Option<&'a [PrefixHmac]>,
 }
 
 fn safe_key_id(value: &str) -> bool {
@@ -49,6 +61,19 @@ fn safe_key_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn valid_store_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "kv-filesystem" | "kv-s3" | "sql-filesystem" | "sql-s3" | "sqlite-cache" | "duckdb-cache"
+    )
+}
+fn hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl LedgerRecord {
@@ -61,10 +86,17 @@ impl LedgerRecord {
             operation_id: &self.operation_id,
             state: &self.state,
             timestamp: self.timestamp,
+            prefixes: (self.version == 2).then_some(self.prefixes.as_slice()),
         }
     }
     fn validate(&self) -> Result<(), LedgerError> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
+            || (self.version == 1 && !self.prefixes.is_empty())
+            || (self.kind == "owner" && !self.prefixes.is_empty())
+            || self.prefixes.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.prefixes.iter().any(|prefix| {
+                !valid_store_kind(&prefix.store_kind) || !hex_digest(&prefix.prefix_hmac)
+            })
             || !safe_key_id(&self.key_id)
             || self.timestamp < 0
             || self.target_hmac.len() != 64
@@ -178,7 +210,7 @@ impl LedgerKeys {
         state: &str,
         timestamp: i64,
     ) -> Result<LedgerRecord, LedgerError> {
-        let mut record = LedgerRecord {
+        let record = LedgerRecord {
             version: 1,
             key_id: key_id.into(),
             kind: kind.into(),
@@ -186,14 +218,81 @@ impl LedgerKeys {
             operation_id: operation_id.into(),
             state: state.into(),
             timestamp,
+            prefixes: Vec::new(),
             mac: String::new(),
         };
+        self.authenticate(record)
+    }
+    fn authenticate(&self, mut record: LedgerRecord) -> Result<LedgerRecord, LedgerError> {
         record.validate()?;
-        let mut mac = self.mac(key_id)?;
-        mac.update(b"tinycloud-space-purge-ledger-v1\0");
+        let mut mac = self.mac(&record.key_id)?;
+        mac.update(if record.version == 2 {
+            b"tinycloud-space-purge-ledger-v2\0"
+        } else {
+            b"tinycloud-space-purge-ledger-v1\0"
+        });
         mac.update(&serde_json::to_vec(&record.fields()).map_err(|_| LedgerError)?);
         record.mac = hex::encode(mac.finalize().into_bytes());
         Ok(record)
+    }
+    /// Sign the complete authenticated acceptance prefix inventory. Completion
+    /// callers must copy this inventory from verified acceptance, never re-list.
+    pub fn with_prefixes(
+        &self,
+        mut record: LedgerRecord,
+        mut prefixes: Vec<PrefixHmac>,
+    ) -> Result<LedgerRecord, LedgerError> {
+        self.verify(&record.object_key()?, &record.to_bytes()?)?;
+        prefixes.sort();
+        prefixes.dedup();
+        record.version = 2;
+        record.prefixes = prefixes;
+        self.authenticate(record)
+    }
+    /// Preserve the authenticated acceptance inventory across terminal retries.
+    pub fn completion_from_acceptance(
+        &self,
+        mut acceptance: LedgerRecord,
+        timestamp: i64,
+    ) -> Result<LedgerRecord, LedgerError> {
+        self.verify(&acceptance.object_key()?, &acceptance.to_bytes()?)?;
+        if acceptance.version != 2
+            || acceptance.kind != "space"
+            || acceptance.state != "purging"
+            || timestamp < acceptance.timestamp
+        {
+            return Err(LedgerError);
+        }
+        acceptance.state = "complete".into();
+        acceptance.timestamp = timestamp;
+        self.authenticate(acceptance)
+    }
+    pub fn prefix_hmac(
+        &self,
+        key_id: &str,
+        store_kind: &str,
+        prefix: &str,
+    ) -> Result<PrefixHmac, LedgerError> {
+        if !valid_store_kind(store_kind)
+            || prefix.is_empty()
+            || prefix.starts_with('/')
+            || !prefix.ends_with('/')
+            || prefix.starts_with("_purge-ledger/")
+            || prefix.split('/').any(|part| part == "." || part == "..")
+            || prefix.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(LedgerError);
+        }
+        let mut mac = self.mac(key_id)?;
+        mac.update(b"tinycloud-physical-purge-prefix-v1\0");
+        mac.update(&(store_kind.len() as u64).to_be_bytes());
+        mac.update(store_kind.as_bytes());
+        mac.update(&(prefix.len() as u64).to_be_bytes());
+        mac.update(prefix.as_bytes());
+        Ok(PrefixHmac {
+            store_kind: store_kind.into(),
+            prefix_hmac: hex::encode(mac.finalize().into_bytes()),
+        })
     }
     /// The object key is authenticated by matching it to the verified fields.
     pub fn verify(&self, object_key: &str, body: &[u8]) -> Result<LedgerRecord, LedgerError> {
@@ -203,7 +302,11 @@ impl LedgerKeys {
         }
         let signature = hex::decode(&record.mac).map_err(|_| LedgerError)?;
         let mut mac = self.mac(&record.key_id)?;
-        mac.update(b"tinycloud-space-purge-ledger-v1\0");
+        mac.update(if record.version == 2 {
+            b"tinycloud-space-purge-ledger-v2\0"
+        } else {
+            b"tinycloud-space-purge-ledger-v1\0"
+        });
         mac.update(&serde_json::to_vec(&record.fields()).map_err(|_| LedgerError)?);
         mac.verify_slice(&signature).map_err(|_| LedgerError)?;
         Ok(record)
