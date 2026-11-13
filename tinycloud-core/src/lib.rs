@@ -66,3 +66,5 @@ pub mod space_purge_records;
 pub mod space_purge_worker;
 
 pub mod space_purge_ledger_copy;
+
+pub mod space_purge_prefix_repair;
