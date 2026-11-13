@@ -1,7 +1,8 @@
 //! TC-2958: a registered policy root is never invocation authority, cited
-//! alone or beside other proofs. Reading the content, describing the
-//! policy's key and authorizing a delivery all need ordinary authority or a
-//! session minted under the policy's conditions.
+//! alone or beside other proofs, by whichever encoding of its CID. Reading the
+//! content, describing or decrypting under the policy's key and authorizing a
+//! delivery all need ordinary authority or a session minted under the
+//! policy's conditions.
 
 use super::test_harness::*;
 use super::*;
@@ -90,9 +91,15 @@ async fn enforcer_own_root(h: &Harness) -> anyhow::Result<Cid> {
 }
 
 /// Every proof list that cites a registered root: alone, and beside the
-/// enforcer's own root in either order.
-fn root_proofs(root: Cid, own: Cid) -> [Vec<Cid>; 3] {
-    [vec![root], vec![root, own], vec![own, root]]
+/// enforcer's own root in either order; each by the root's stored CID and by
+/// the same multihash under another codec (dag-cbor), which names the same
+/// delegation.
+fn root_proofs(root: Cid, own: Cid) -> Vec<Vec<Cid>> {
+    let alias = Cid::new_v1(0x71, *root.hash());
+    [root, alias]
+        .into_iter()
+        .flat_map(|root| [vec![root], vec![root, own], vec![own, root]])
+        .collect()
 }
 
 /// `/invoke` refuses a read citing either registered root, alone or beside
@@ -136,59 +143,249 @@ async fn policy_roots_authorize_no_read(backend: Backend) -> anyhow::Result<()> 
 }
 on_both_backends!(policy_roots_authorize_no_read);
 
-/// The authenticated key describe refuses the enforcement root, which
-/// carries the decrypt on the policy's key, alone or beside another proof.
-async fn the_enforcement_root_describes_no_key(backend: Backend) -> anyhow::Result<()> {
-    let ledger = tempfile::tempdir()?;
-    let Some(mut h) = Harness::new_with(
-        backend,
-        Shape::KeySession,
-        "the_enforcement_root_describes_no_key",
-        |config| {
+/// A registered policy over the content whose source is a share key on the
+/// owner's `default` network: the named key `share/tc-2958`, or the network
+/// itself. The holder has a minted session.
+struct KeyShare {
+    h: Harness,
+    network: tinycloud_core::encryption_network::NetworkId,
+    key_path: Option<&'static str>,
+    /// The decrypt resource: the key's URN, or the network's.
+    resource: String,
+    policy: Registered,
+    session: Cid,
+    own: Cid,
+    /// The wrapped key the registration's source binds.
+    wrapped: Vec<u8>,
+    public_key: Vec<u8>,
+    _ledger: tempfile::TempDir,
+}
+
+impl KeyShare {
+    async fn new(
+        backend: Backend,
+        key_path: Option<&'static str>,
+        test: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        use tinycloud_core::encryption_network::{
+            backend::wrap_to_public_key, canonical::canonical_hash,
+        };
+        let ledger = tempfile::tempdir()?;
+        let Some(mut h) = Harness::new_with(backend, Shape::KeySession, test, |config| {
             config.encryption_network.named_keys_v1 = true;
             config.encryption_network.deletion_ledger_path =
                 Some(ledger.path().join("deletion-ledger.jsonl"));
-        },
+        })
+        .await?
+        else {
+            return Ok(None);
+        };
+        h.network = format!("urn:tinycloud:encryption:{}:default", h.space_owner.did());
+        let service = h
+            .client
+            .rocket()
+            .state::<EncryptionService>()
+            .expect("EncryptionService is managed");
+        let network = service
+            .create_one_of_one_network(CreateNetworkRequest {
+                name: "default".into(),
+                owner_did: h.space_owner.did().into(),
+                threshold: Threshold::one_of_one(),
+            })
+            .await?;
+        // A named source is the share key `share/<shareId>`, which the
+        // registration records; the publisher encrypts to its public key.
+        let public_key = match key_path {
+            Some(path) => {
+                service
+                    .public_key(&KeyLocation::new(&network.network_id, path)?)
+                    .await?
+                    .public_encryption_key
+            }
+            None => network.public_encryption_key,
+        };
+        let network = network.network_id;
+        let wrapped = wrap_to_public_key(&public_key, &[0xCD; 32])?;
+        let resource = match key_path {
+            Some(path) => format!("{}/{path}", h.network),
+            None => h.network.clone(),
+        };
+        let mut grants = h.owner_grants();
+        grants[2].0 = resource.clone();
+        h.grant_owner_with(&grants, Window::until(now() + Duration::days(2)))
+            .await?;
+        // A named source binds the raw wrapped bytes; a network source binds
+        // the signed wire form.
+        let digest = match key_path {
+            Some(_) => hex::encode(Sha256::digest(&wrapped)),
+            None => canonical_hash(&json!(base64::encode(&wrapped))),
+        };
+        let (status, body, policy) = h
+            .register_with(policy_window(), |policy| {
+                policy["contentSource"]["shareId"] = json!("tc-2958");
+                policy["contentSource"]["encryptedSymmetricKeyDigestHex"] = json!(digest);
+                if let Some(path) = key_path {
+                    policy["contentSource"]["encryptionKeyPath"] = json!(path);
+                }
+                policy["capabilityCeiling"][1]["resource"] = json!(resource);
+            })
+            .await?;
+        anyhow::ensure!(status == Status::Ok, "register: {status} {body}");
+        let session = session_cid(&h.mint_ok(&policy).await?)?;
+        let own = enforcer_own_root(&h).await?;
+        Ok(Some(Self {
+            h,
+            network,
+            key_path,
+            resource,
+            policy,
+            session,
+            own,
+            wrapped,
+            public_key,
+            _ledger: ledger,
+        }))
+    }
+
+    /// A decrypt request for `wrapped` and the invocation fact that binds it.
+    fn decrypt_request(&self, wrapped: &[u8]) -> (Value, Value) {
+        use tinycloud_core::encryption_network::{
+            canonical::canonical_hash, types::ALG_X25519_AES256GCM, DECRYPT_REQUEST_TYPE,
+        };
+        let wrapped = json!(base64::encode(wrapped));
+        let receiver = json!(base64::encode(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(
+                rand::rngs::OsRng
+            ))
+            .as_bytes()
+        ));
+        let mut body = json!({
+            "type": DECRYPT_REQUEST_TYPE,
+            "targetNode": self.h.node_did(),
+            "networkId": self.h.network,
+            "alg": ALG_X25519_AES256GCM,
+            "keyVersion": 1,
+            "encryptedSymmetricKeyHash": canonical_hash(&wrapped),
+            "encryptedSymmetricKey": wrapped,
+            "receiverPublicKeyHash": canonical_hash(&receiver),
+            "receiverPublicKey": receiver,
+        });
+        if let Some(path) = self.key_path {
+            body["keyPath"] = json!(path);
+        }
+        let mut fact = body.clone();
+        let object = fact.as_object_mut().expect("object");
+        object.remove("encryptedSymmetricKey");
+        object.remove("receiverPublicKey");
+        fact["bodyHash"] = json!(canonical_hash(&body));
+        (body, fact)
+    }
+
+    /// A wrapped key other than the one the registration's source binds.
+    fn other_wrapped(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(
+            tinycloud_core::encryption_network::backend::wrap_to_public_key(
+                &self.public_key,
+                &[0xEE; 32],
+            )?,
+        )
+    }
+
+    /// `signer` asks `route` to decrypt `wrapped`, citing `proofs`.
+    async fn decrypt(
+        &self,
+        route: &str,
+        signer: &Signer,
+        proofs: &[Cid],
+        wrapped: &[u8],
+    ) -> anyhow::Result<(Status, String)> {
+        let (body, fact) = self.decrypt_request(wrapped);
+        let authorization = invocation(
+            signer,
+            &self.h.node_did(),
+            grant(&self.resource, "tinycloud.encryption/decrypt")?,
+            proofs,
+            vec![fact, Value::Null],
+        )?;
+        let response = self
+            .h
+            .client
+            .post(route)
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", authorization))
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+
+    /// The routes a decrypt of this source is served on: `/invoke`, and for a
+    /// network source the network's own decrypt route.
+    fn decrypt_routes(&self) -> Vec<String> {
+        let mut routes = vec!["/invoke".to_owned()];
+        if self.key_path.is_none() {
+            routes.push(format!("/encryption/networks/{}/decrypt", self.network));
+        }
+        routes
+    }
+
+    /// On every decrypt route, the enforcement root is refused in every
+    /// citing form, whether or not the request matches the registered
+    /// source; the holder's session, cited by its stored CID or by a codec
+    /// alias, is still held to the registered source.
+    async fn assert_decrypts(&self) -> anyhow::Result<()> {
+        let root: Cid = self.policy.enforcement_root_cid.parse()?;
+        let other = self.other_wrapped()?;
+        for route in self.decrypt_routes() {
+            for proofs in root_proofs(root, self.own) {
+                for wrapped in [&self.wrapped, &other] {
+                    assert_eq!(
+                        self.decrypt(&route, &self.h.enforcer, &proofs, wrapped)
+                            .await?,
+                        (Status::Forbidden, ROOT_REFUSED.to_owned()),
+                        "{route} {proofs:?}"
+                    );
+                }
+            }
+            for session in [self.session, Cid::new_v1(0x71, *self.session.hash())] {
+                assert_eq!(
+                    self.decrypt(&route, &self.h.holder, &[session], &other)
+                        .await?,
+                    (
+                        Status::Forbidden,
+                        "policy-decrypt-content-source-mismatch".to_owned()
+                    ),
+                    "{route} {session}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A named share key: the enforcement root, cited in any form, neither
+/// describes the key nor decrypts under it.
+async fn the_enforcement_root_neither_describes_nor_decrypts_a_named_key(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(share) = KeyShare::new(
+        backend,
+        Some(KEY_PATH),
+        "the_enforcement_root_neither_describes_nor_decrypts_a_named_key",
     )
     .await?
     else {
         return Ok(());
     };
-    h.network = format!("urn:tinycloud:encryption:{}:default", h.space_owner.did());
-    let service = h
-        .client
-        .rocket()
-        .state::<EncryptionService>()
-        .expect("EncryptionService is managed");
-    let network = service
-        .create_one_of_one_network(CreateNetworkRequest {
-            name: "default".into(),
-            owner_did: h.space_owner.did().into(),
-            threshold: Threshold::one_of_one(),
-        })
-        .await?
-        .network_id;
-    // The registration records the share key `share/<shareId>` its source names.
-    let leaf = format!("{}/{KEY_PATH}", h.network);
-    let mut grants = h.owner_grants();
-    grants[2].0 = leaf.clone();
-    h.grant_owner_with(&grants, Window::until(now() + Duration::days(2)))
-        .await?;
-    let (status, body, policy) = h
-        .register_with(policy_window(), |policy| {
-            policy["contentSource"]["shareId"] = json!("tc-2958");
-            policy["contentSource"]["encryptionKeyPath"] = json!(KEY_PATH);
-            policy["capabilityCeiling"][1]["resource"] = json!(leaf);
-        })
-        .await?;
-    anyhow::ensure!(status == Status::Ok, "register: {status} {body}");
-    let own = enforcer_own_root(&h).await?;
+    let h = &share.h;
     let node = h.node_did();
-    for proofs in root_proofs(policy.enforcement_root_cid.parse()?, own) {
+    let network = &share.network;
+    for proofs in root_proofs(share.policy.enforcement_root_cid.parse()?, share.own) {
         let authorization = invocation(
             &h.enforcer,
             &node,
-            grant(&leaf, "tinycloud.encryption/decrypt")?,
+            grant(&share.resource, "tinycloud.encryption/decrypt")?,
             &proofs,
             vec![json!({
                 "type": KEY_DESCRIBE_TYPE,
@@ -211,9 +408,27 @@ async fn the_enforcement_root_describes_no_key(backend: Backend) -> anyhow::Resu
             "{proofs:?}"
         );
     }
-    Ok(())
+    share.assert_decrypts().await
 }
-on_both_backends!(the_enforcement_root_describes_no_key);
+on_both_backends!(the_enforcement_root_neither_describes_nor_decrypts_a_named_key);
+
+/// A network source: the enforcement root, cited in any form, decrypts
+/// nothing on `/invoke` or on the network's decrypt route.
+async fn the_enforcement_root_decrypts_nothing_on_the_network(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(share) = KeyShare::new(
+        backend,
+        None,
+        "the_enforcement_root_decrypts_nothing_on_the_network",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    share.assert_decrypts().await
+}
+on_both_backends!(the_enforcement_root_decrypts_nothing_on_the_network);
 
 async fn authorize_delivery_with(
     client: &Client,
