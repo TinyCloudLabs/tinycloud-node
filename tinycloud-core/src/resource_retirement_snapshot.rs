@@ -72,11 +72,10 @@ impl PreparedSnapshot {
         // Re-parse and authenticate at write time too, rather than trusting a
         // data wrapper merely because it was constructed earlier.
         let target = ResourceTarget::parse(
-            &serde_json::from_slice::<serde_json::Value>(self.row.snapshot_body.as_bytes())
+            serde_json::from_slice::<serde_json::Value>(self.row.snapshot_body.as_bytes())
                 .map_err(|_| refused())?[0]
                 .as_str()
-                .ok_or_else(refused)?
-                .to_owned(),
+                .ok_or_else(refused)?,
         )
         .map_err(|_| refused())?;
         let snapshot =
