@@ -870,6 +870,8 @@ const TC2192_KEY_PATH: &str = "share/tc-2192";
 enum SourceDigest {
     RawWrappedBytes,
     LegacyWire,
+    WrongRawWrappedBytes,
+    WrongLegacyWire,
     Missing,
 }
 
@@ -935,6 +937,7 @@ impl ShareDecrypt {
         } else {
             network.public_encryption_key
         };
+        let wrong_wrapped = wrap_to_public_key(&public_key, &[0xEF; 32])?;
         let wrapped = wrap_to_public_key(&public_key, &[0xCD; 32])?;
         let leaf = match key_path {
             Some(path) => format!("{}/{path}", h.network),
@@ -955,6 +958,12 @@ impl ShareDecrypt {
                     SourceDigest::RawWrappedBytes => Some(hex::encode(Sha256::digest(&wrapped))),
                     SourceDigest::LegacyWire => {
                         Some(canonical_hash(&json!(base64::encode(&wrapped))))
+                    }
+                    SourceDigest::WrongRawWrappedBytes => {
+                        Some(hex::encode(Sha256::digest(&wrong_wrapped)))
+                    }
+                    SourceDigest::WrongLegacyWire => {
+                        Some(canonical_hash(&json!(base64::encode(&wrong_wrapped))))
                     }
                     SourceDigest::Missing => None,
                 };
@@ -1126,6 +1135,33 @@ async fn tc2192_legacy_immutable_source_without_digest_remains_compatible() -> a
         .invoke(&share.leaf(), &share.body(), None, Value::Null)
         .await?;
     assert_eq!(status, Status::Ok, "{response}");
+    Ok(())
+}
+#[tokio::test]
+async fn tc2192_path_scoped_share_decrypt_accepts_legacy_wire_digest() -> anyhow::Result<()> {
+    let share = ShareDecrypt::with_source_digest(
+        Some(TC2192_KEY_PATH),
+        "immutable",
+        SourceDigest::LegacyWire,
+    )
+    .await?;
+    assert_registered_source_binding(share, "/invoke").await
+}
+
+#[tokio::test]
+async fn tc2192_path_scoped_share_decrypt_rejects_wrong_digest_conventions() -> anyhow::Result<()> {
+    for digest in [
+        SourceDigest::WrongRawWrappedBytes,
+        SourceDigest::WrongLegacyWire,
+    ] {
+        let share =
+            ShareDecrypt::with_source_digest(Some(TC2192_KEY_PATH), "immutable", digest).await?;
+        let (status, response) = share
+            .invoke(&share.leaf(), &share.body(), None, Value::Null)
+            .await?;
+        assert_eq!(status, Status::Forbidden, "{response}");
+        assert_eq!(response, "policy-decrypt-content-source-mismatch");
+    }
     Ok(())
 }
 

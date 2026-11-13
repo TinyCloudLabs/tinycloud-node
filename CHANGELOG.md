@@ -89,6 +89,8 @@
 - Internal, not reachable over HTTP: `tinycloud-threshold` bounds raw combine inputs (TC-2219, #491), gains a genesis DKG over owner-closed rounds with its test vector (TC-2220, #492; no route, no `/info` feature, and `tinycloud-node` does not depend on the crate), and its certificate-core vectors have a checker (TC-2223, #489).
 - CI only: the workspace test job is split and the PR Docker build caches its cargo mounts (#495).
 
+- Existing path-scoped shares continue to open across wrapped-key digest encodings. Details: TC-2192
+
 ## [1.25.14] - 2026-10-29
 
 ### Changes
