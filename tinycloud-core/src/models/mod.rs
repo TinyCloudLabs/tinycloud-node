@@ -58,3 +58,6 @@ pub mod space_purge_shared_residue;
 
 pub mod resource_purge_job;
 pub mod resource_purge_tombstone;
+
+pub mod space_purge_ledger_copy;
+pub mod space_purge_prefix_repair;
