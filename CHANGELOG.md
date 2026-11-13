@@ -2,11 +2,33 @@
 
 ## [Unreleased]
 ### Changes
+- PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
+
+## [1.26.3] - 2026-11-13
+
+### Changes
+
+- PostgreSQL `database_artifact.payload` and `delta_payload` use `EXTERNAL` storage, so repeated 4 MiB artifact reads no longer decompress a growing prefix of the value. The forward-only migration `m20261113_000000_database_artifact_external` takes its lock with a 500 ms timeout, retried three times; under lock contention it defers with an operator warning instead of failing boot. Existing compressed rows are unchanged; the operator re-toast script and README are `scripts/tc2917-retoast-artifact.sql` and `scripts/tc2917-README.md`. Details: TC-2917 (#571).
+- Probe-only changes since 1.26.2 (#568, #570: `test/probe` and the DB Saturation Probe workflow) do not ship in the image.
+
+## [1.26.2] - 2026-11-13
+
+### Changes
+
+- Honor verified renewal stamps when authorizing ordinary reads, mutation preupload, public invocation checks and account delegation queries. A live admitted renewal can extend access beyond the original signed expiry without changing its scope; lease expiry, revocation, ancestor bounds and identity checks remain authoritative. Details: TC-2872 (#565).
+
+## [1.26.1] - 2026-11-13
+
+### Changes
+
+- Read delegation status, effective expiry, renewal history and the status authorization decision from one database snapshot. Details: TC-2872 (#556).
+- Return an original delegation's signed renewal chain to its authorised holder, while keeping lease access unchanged and filtering every stamp by its signed original CID. Details: TC-2872 (#559).
+- Admit scheduler renewals for SIWE delegations with fractional-second expiry timestamps. Issuance and repeated lease registration compare renewal metadata at whole-second precision; stamps remain capped at the earlier floored lease end. Details: TC-2872 (#561).
 
 ## [1.26.0] - 2026-11-12
 

@@ -339,6 +339,9 @@ jobs:
             FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
+          case "$FEATURES" in
+            *renewal-test-clock*) echo "::error::renewal-test-clock is forbidden in container builds"; exit 1 ;;
+          esac
           {
             echo "cargo_features=${FEATURES}"
             echo "image_suffix=${IMAGE_SUFFIX}"
@@ -439,6 +442,9 @@ jobs:
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
             SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
+          case "$FEATURES" in
+            *renewal-test-clock*) echo "::error::renewal-test-clock is forbidden in container builds"; exit 1 ;;
+          esac
           {
             echo "cargo_features=${FEATURES}"
             echo "image_suffix=${IMAGE_SUFFIX}"

@@ -15,7 +15,13 @@ use tinycloud_core::{
 };
 
 use std::future::Future;
-pub(crate) const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) fn scheduler_interval() -> std::time::Duration {
+    #[cfg(feature = "renewal-test-clock")]
+    if std::env::var_os("TINYCLOUD_RENEWAL_TEST_CLOCK").is_some() {
+        return std::time::Duration::from_millis(25);
+    }
+    std::time::Duration::from_secs(300)
+}
 const INVOCATION_LIFETIME_SECONDS: i64 = 300;
 
 fn due_for_renewal(now: i64, end: i64, period_seconds: u64) -> bool {
@@ -77,7 +83,7 @@ pub(crate) async fn scheduler_tick(
     tinycloud: &crate::TinyCloud,
     secret: &StaticSecret,
 ) -> Result<()> {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let now = renewal::verifier_now().unix_timestamp();
     let conn = tinycloud.connection();
     let identity = tinycloud
         .renewal_identity()
