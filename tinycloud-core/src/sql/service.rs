@@ -394,7 +394,7 @@ impl SqlService {
             Ok(result) => result,
             Err(error) => {
                 if (growth == GrowthPolicy::Forbid
-                    && self.expectation(&key) == ArtifactExpectation::Absent)
+                    && self.expectation(&key).await? == ArtifactExpectation::Absent)
                     // The disk failed the commit: its WAL is not to be trusted
                     // (Postgres never saw the write), so start over from it.
                     || matches!(error, SqlError::CommitFailed)
@@ -407,7 +407,7 @@ impl SqlService {
 
         if !result.write_targets.is_empty() {
             if growth == GrowthPolicy::Forbid
-                && self.expectation(&key) == ArtifactExpectation::Absent
+                && self.expectation(&key).await? == ArtifactExpectation::Absent
             {
                 // The actor's guard admitted no new pages. Serializing this
                 // empty database would nevertheless create a charged header.
@@ -883,12 +883,16 @@ impl SqlService {
     }
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), SqlError> {
-        if let Some((_, handle)) = self.databases.remove(key) {
+        // The actor and its lineage leave together: both entries are dropped
+        // before shutdown is awaited, so a failing shutdown cannot leave a
+        // lineage without an actor (or an actor without a lineage).
+        let handle = self.databases.remove(key).map(|(_, handle)| handle);
+        self.lineage.remove(key);
+        if let Some(handle) = handle {
             // Wait for the connection to close before unlinking its cache:
             // an exit-time flush must not race the next durable hydration.
             handle.shutdown().await?;
         }
-        self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
             .join(format!("{}.db", key.1));
@@ -899,18 +903,20 @@ impl SqlService {
     ///
     /// Every actor is created by `handle`, which records this during hydration,
     /// so a live actor always has an entry. A missing one means the actor
-    /// outlived its record and there is nothing to assert against.
-    fn expectation(&self, key: &(String, String)) -> ArtifactExpectation {
-        match self.lineage.get(key).map(|entry| entry.clone()) {
-            Some(expectation) => expectation,
-            None => {
-                tracing::warn!(
-                    service = "sql",
-                    "No recorded artifact lineage for a live database; saving without a lineage assertion"
-                );
-                ArtifactExpectation::Any
-            }
+    /// outlived its record: its state cannot be asserted against the durable
+    /// artifact, so it is discarded and the request fails.
+    async fn expectation(&self, key: &(String, String)) -> Result<ArtifactExpectation, SqlError> {
+        if let Some(expectation) = self.lineage.get(key).map(|entry| entry.clone()) {
+            return Ok(expectation);
         }
+        tracing::error!(
+            service = "sql",
+            "No recorded artifact lineage for a live database; discarding the actor"
+        );
+        self.discard_local_state(key).await?;
+        Err(SqlError::Internal(
+            "Database lineage missing for live actor".into(),
+        ))
     }
 
     async fn persist_write(
@@ -921,7 +927,7 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
-        let expected = self.expectation(&key);
+        let expected = self.expectation(&key).await?;
 
         // Repeated DELETE/UPDATE/DROP operations can append WAL frames without
         // adding a database page. Full spaces replace checkpoint + WAL, but
@@ -1232,6 +1238,59 @@ mod tests {
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         Arc::new(SeaOrmDatabaseArtifactRepository::new(db))
+    }
+
+    #[tokio::test]
+    async fn tc2612_failed_shutdown_still_removes_actor_and_lineage() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-shutdown-failure");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        let handle = service.handle(&space, "a").await.unwrap();
+        assert!(service.lineage.contains_key(&key));
+        // Kill the actor, then re-register its dead handle so shutdown fails.
+        handle.shutdown().await.unwrap();
+        service.databases.insert(key.clone(), handle);
+
+        let result = service.discard_local_state(&key).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn tc2612_missing_lineage_is_an_error_and_discards_the_actor() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-missing-lineage");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        service.handle(&space, "a").await.unwrap();
+        service.lineage.remove(&key);
+
+        let result = service
+            .execute_without_growth(
+                &space,
+                "a",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE t (id INTEGER)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await;
+        assert!(matches!(result, Err(SqlError::Internal(_))), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
     }
 
     #[tokio::test]
