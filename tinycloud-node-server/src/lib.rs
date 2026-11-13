@@ -1101,7 +1101,7 @@ pub async fn app_with_control(
             let shutdown = rocket.shutdown();
             Box::pin(async move {
                 tokio::spawn(async move {
-                    let period = renewal::SCHEDULER_INTERVAL;
+                    let period = renewal::scheduler_interval();
                     if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
                         ::tracing::warn!(
                             event = "renewal_scheduler_tick_failed",
