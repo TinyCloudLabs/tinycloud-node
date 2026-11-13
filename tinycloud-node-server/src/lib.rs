@@ -609,6 +609,20 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
+    if resolved.storage.sql.chunked_artifacts {
+        anyhow::ensure!(
+            resolved.storage.database().starts_with("postgres"),
+            "chunked artifacts require PostgreSQL"
+        );
+        anyhow::ensure!(
+            resolved.storage.sql.chunked_artifact_max_bytes > 0
+                && resolved.storage.sql.chunked_account_max_bytes > 0
+                && resolved.storage.sql.chunked_artifact_max_bytes <= i64::MAX as u64
+                && resolved.storage.sql.chunked_account_max_bytes <= i64::MAX as u64,
+            "chunked artifacts require explicit positive capacities within int64"
+        );
+    }
+
     resolved
         .sql_store
         .validate_for_database(resolved.storage.database())
@@ -1007,7 +1021,13 @@ pub async fn app_with_control(
                             .sql
                             .max_artifact_read_bytes
                             .as_u64(),
-                    ),
+                    )
+                    .with_chunk_limits(tinycloud_config.storage.sql.chunked_artifacts.then_some(
+                        tinycloud_core::database_artifacts::chunks::ChunkLimits {
+                            artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
+                            account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
+                        },
+                    )),
             ),
             sql_sizes.clone(),
         ));

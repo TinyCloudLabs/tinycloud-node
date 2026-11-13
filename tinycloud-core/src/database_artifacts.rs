@@ -1,4 +1,5 @@
 use std::future::Future;
+pub mod chunks;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -106,6 +107,8 @@ pub struct DeltaSave {
 pub enum DatabaseArtifactError {
     #[error("database artifact storage error: {0}")]
     Db(#[from] DbErr),
+    #[error("artifact storage limit reached")]
+    StorageLimit,
     #[error("database artifact payload too large: {0} bytes")]
     PayloadTooLarge(u64),
     /// A payload larger than the repository's single-statement write limit
@@ -637,6 +640,21 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError>;
 
+    fn chunked_checkpoints(&self) -> bool {
+        false
+    }
+
+    async fn save_snapshot(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _snapshot: tempfile::NamedTempFile,
+        _expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -724,6 +742,7 @@ pub struct SeaOrmDatabaseArtifactRepository {
     /// Permits for transfers over [`BASE_TIMEOUT_PAYLOAD_BYTES`]; shared by
     /// every clone of this repository.
     large_transfers: std::sync::Arc<tokio::sync::Semaphore>,
+    chunk_limits: Option<chunks::ChunkLimits>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
@@ -741,9 +760,15 @@ impl SeaOrmDatabaseArtifactRepository {
             large_transfers: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_LARGE_TRANSFERS,
             )),
+            chunk_limits: None,
             #[cfg(test)]
             race_barrier: None,
         }
+    }
+
+    pub fn with_chunk_limits(mut self, limits: Option<chunks::ChunkLimits>) -> Self {
+        self.chunk_limits = limits;
+        self
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -976,6 +1001,14 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
+        // Parts stream in bounded statements: the whole-artifact read cap and
+        // the large-transfer permit below are for the single-row layout.
+        if self
+            .read_chunk_layout(service, space, name, meta, sink)
+            .await?
+        {
+            return Ok(());
+        }
         // TC-2961: refuse an oversized database before any slice is read.
         if self.max_read_bytes != 0 {
             for (part, bytes) in [
@@ -1033,6 +1066,22 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         Ok(())
     }
 
+    fn chunked_checkpoints(&self) -> bool {
+        self.chunk_limits.is_some()
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.write_chunk_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -1048,6 +1097,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let _ = TRANSFER_STARTED.try_with(|started| {
             started.store(true, std::sync::atomic::Ordering::Release);
         });
+        self.ensure_legacy_write(service, space, name).await?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1256,6 +1306,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         self.check_write(payload.len())?;
+        self.ensure_legacy_write(service, space, name).await?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
