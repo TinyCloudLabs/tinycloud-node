@@ -155,6 +155,7 @@ async fn identity_without_renewal_seed_refuses_before_saving_any_lease_graph() {
         &[],
         false,
         false,
+        None,
     )
     .await;
     assert!(matches!(
