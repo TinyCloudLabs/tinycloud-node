@@ -22,6 +22,8 @@ use tinycloud_auth::{
     ipld_core::cid::Cid,
 };
 
+#[cfg(test)]
+mod operation_actor_tests;
 pub mod policy;
 
 const PAGE: usize = 64;
@@ -41,6 +43,50 @@ pub async fn operation<C: ConnectionTrait>(db: &C) -> Result<(), DbErr> {
     if db.get_database_backend() == DatabaseBackend::Postgres {
         db.execute_unprepared("SELECT pg_advisory_xact_lock_shared(1413698384,2871)")
             .await?;
+    }
+    Ok(())
+}
+
+/// The first signed-record write already ensures its actor FK prerequisites.
+/// Materializing the lock CTE makes it a prerequisite of that same INSERT,
+/// preserving the round-trip budget and ordering before any graph mutation.
+pub(crate) async fn operation_actors<C: ConnectionTrait>(
+    db: &C,
+    actors: &[&str],
+) -> Result<(), DbErr> {
+    if actors.is_empty() {
+        return operation(db).await;
+    }
+    if db.get_database_backend() == DatabaseBackend::Postgres {
+        let placeholders = (1..=actors.len())
+            .map(|index| format!("(${index})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql=format!("WITH purge_guard AS MATERIALIZED (SELECT pg_advisory_xact_lock_shared(1413698384,2871))
+            INSERT INTO actor(id) SELECT actors.id FROM purge_guard CROSS JOIN (VALUES {placeholders}) AS actors(id) ON CONFLICT(id) DO NOTHING");
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            actors.iter().map(|actor| (*actor).into()),
+        ))
+        .await?;
+    } else {
+        match models::actor::Entity::insert_many(actors.iter().map(|actor| {
+            models::actor::ActiveModel {
+                id: Set((*actor).into()),
+            }
+        }))
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(models::actor::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        {
+            Ok(_) | Err(DbErr::RecordNotInserted) => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
