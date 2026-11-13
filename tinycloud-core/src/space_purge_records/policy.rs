@@ -45,6 +45,45 @@ pub fn native_policy_targets(bytes: &[u8]) -> Result<Vec<PolicyTarget>, DbErr> {
         .collect()
 }
 
+/// Inventory persisted signed authority independently of registration/index rows.
+/// This parses targets only; it does not grant authority or verify signatures.
+pub fn inventory_authorization_targets(bytes: &[u8]) -> Result<Vec<PolicyTarget>, DbErr> {
+    use tinycloud_auth::authorization::TinyCloudDelegation;
+    let delegation = TinyCloudDelegation::from_bytes(bytes)
+        .map_err(|_| failure("invalid persisted authorization"))?;
+    if matches!(&delegation, TinyCloudDelegation::Ucan(_)) {
+        std::str::from_utf8(bytes)
+            .map_err(|_| failure("invalid persisted authorization encoding"))?;
+    }
+    let info = crate::util::DelegationInfo::try_from(delegation)
+        .map_err(|_| failure("invalid persisted authorization capabilities"))?;
+    info.capabilities
+        .into_iter()
+        .map(|cap| {
+            let text = cap.resource.to_string();
+            if let Some(space) = cap.resource.space() {
+                return Ok(PolicyTarget::Space(space.to_string()));
+            }
+            // Resource conversion otherwise preserves unknown URIs. A malformed
+            // TinyCloud resource must never masquerade as a non-space target.
+            if text
+                .get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tinycloud:"))
+            {
+                return Err(failure("invalid persisted authorization space"));
+            }
+            if text
+                .get(.."urn:tinycloud:encryption:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("urn:tinycloud:encryption:"))
+            {
+                crate::encryption_network::key_id::parse(&text)
+                    .map_err(|_| failure("invalid persisted authorization resource"))?;
+            }
+            Ok(PolicyTarget::Resource(cap.resource))
+        })
+        .collect()
+}
+
 fn unexpired(expiry: &str) -> Result<bool, DbErr> {
     Ok(
         OffsetDateTime::parse(expiry, &Rfc3339).map_err(|_| failure("invalid policy expiry"))?
