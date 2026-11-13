@@ -802,25 +802,23 @@ async fn register_lease_at<C: ConnectionTrait>(
     .await
 }
 
-/// Check a renewal lease's signature and its stored original's on `db`, before
-/// the lease's transaction (TC-2986). Returns the content hashes checked: the
-/// lease's, and the original's when it is stored and matches its address.
-pub(crate) async fn preverify_lease<C: ConnectionTrait>(
+/// Check the stored original a renewal lease renews, on `db`, before the
+/// lease's transaction (TC-2986): it must be stored, match its address and
+/// verify, as the transaction requires. Returns its content hash. The
+/// lease's own signature is checked by the caller.
+pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
     db: &C,
     lease_event: &crate::events::Delegation,
     encryption: Option<&crate::encryption::ColumnEncryption>,
-) -> Result<Vec<Hash>, RenewalStoreError> {
-    let lease_bytes = lease_event.serialized_bytes();
-    verify_signed_signature(&signed_delegation_info(lease_bytes)?).await?;
-    let mut checked = vec![crate::hash::hash(lease_bytes)];
+) -> Result<Hash, RenewalStoreError> {
     let original_cid =
         lease_original_from_signed(lease_event)?.ok_or(RenewalStoreError::Unauthorized)?;
     let (_, original) = canonical_cid(&original_cid)?;
-    if let Some((original_bytes, _)) = stored_original(db, original, encryption).await? {
-        verify_signed_signature(&signed_delegation_info(&original_bytes)?).await?;
-        checked.push(original);
-    }
-    Ok(checked)
+    let (original_bytes, _) = stored_original(db, original, encryption)
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    verify_signed_signature(&signed_delegation_info(&original_bytes)?).await?;
+    Ok(original)
 }
 
 /// The stored original delegation `original` addresses, decrypted and checked

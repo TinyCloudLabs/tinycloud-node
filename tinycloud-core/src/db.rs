@@ -4334,12 +4334,14 @@ impl PreVerified {
         delegation: &Delegation,
         encryption: Option<&ColumnEncryption>,
     ) -> Result<Self, TxError<S, K>> {
-        if crate::renewal::lease_original_from_signed(delegation)?.is_some() {
-            let checked = crate::renewal::preverify_lease(db, delegation, encryption).await?;
-            return Ok(Self(checked.into_iter().collect()));
-        }
         delegation::check_signature(&delegation.0.delegation).await?;
-        Ok(Self(HashSet::from([delegation.content_hash()])))
+        let mut checked = HashSet::from([delegation.content_hash()]);
+        if crate::renewal::lease_original_from_signed(delegation)?.is_some() {
+            checked.insert(
+                crate::renewal::preverify_lease_original(db, delegation, encryption).await?,
+            );
+        }
+        Ok(Self(checked))
     }
 
     /// Check `revocation`'s signature, outside any transaction.
