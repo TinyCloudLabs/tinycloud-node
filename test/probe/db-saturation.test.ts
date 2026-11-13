@@ -23,7 +23,7 @@ const POOL_METRIC = "planetscale_pgbouncer_pools_client";
 const base: Target = {
   label: "node-db",
   org: "tinycloudlabs",
-  database: "tinycloud-node-production",
+  database: "tinycloud-node-production-usw",
   token_secret: "PLANETSCALE_METRICS_TOKEN_NODE_DB",
   heartbeat_secret: "BETTERSTACK_HEARTBEAT_URL_NODE_DB",
   cpu_pct: 85,
@@ -172,7 +172,7 @@ test("metrics requests go only to the branch metrics endpoint", () => {
 });
 
 test("branch list requests go to the database's branches endpoint", () => {
-  assert.ok(new URL(branchesUrl(base)).pathname.endsWith("/databases/tinycloud-node-production/branches"));
+  assert.ok(new URL(branchesUrl(base)).pathname.endsWith("/databases/tinycloud-node-production-usw/branches"));
 });
 
 test("branch list asks for 100 per page so the production branch is not paged out", () => {
