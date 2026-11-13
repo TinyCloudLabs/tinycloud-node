@@ -2,8 +2,9 @@
 //! coverage and authenticate accepted storage prefixes before scheduling it.
 use crate::{
     storage::{
-        purge_completion::complete_purge_with_encryption,
+        purge_completion::{complete_purge_with_encryption, verified_acceptance},
         purge_ledger::PurgeLedgerStore,
+        purge_reconcile::{PrefixStoreKind, VerifiedPurgePrefix},
         sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore, S3SqlObjectStore},
     },
     BlockStores,
@@ -12,7 +13,7 @@ use tinycloud_core::{
     encryption::ColumnEncryption,
     sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait},
     space_purge_fence::PurgeDrain,
-    space_purge_ledger::LedgerKeys,
+    space_purge_ledger::{LedgerKeys, LedgerRecord},
     space_purge_worker::{self, ClaimedPurge},
     sql::SqlService,
     storage::either::Either,
@@ -42,6 +43,8 @@ pub enum PurgeExecutionError {
     Binding,
     #[error("purge lease lost")]
     LeaseLost,
+    #[error("purge prefix inventory unavailable")]
+    PrefixInventory,
     #[error("purge SQL storage unavailable")]
     SqlStorageUnavailable,
 }
@@ -70,6 +73,12 @@ impl SpacePurgeExecutor<'_> {
         if !space_purge_worker::renew(self.db, job).await? {
             return Ok(PhaseOutcome::LeaseLost);
         }
+        let accepted = match self.blocks {
+            Either::A(store) => verified_acceptance(self.db, store, self.keys, job).await,
+            Either::B(store) => verified_acceptance(self.db, store, self.keys, job).await,
+        }
+        .map_err(|_| PurgeExecutionError::PrefixInventory)?;
+        self.verify_inventory(&accepted, drain.space())?;
         if !grace_ready(self.db, job).await? {
             return Ok(PhaseOutcome::Deferred);
         }
@@ -118,6 +127,54 @@ impl SpacePurgeExecutor<'_> {
             "objects" => self.objects(job, drain).await,
             _ => Err(PurgeExecutionError::Binding),
         }
+    }
+    fn verify_inventory(
+        &self,
+        accepted: &LedgerRecord,
+        space: &tinycloud_auth::resource::SpaceId,
+    ) -> Result<(), PurgeExecutionError> {
+        let kv = match self.blocks {
+            Either::A(_) => (PrefixStoreKind::KvS3, format!("{space}/")),
+            Either::B(_) => (
+                PrefixStoreKind::KvFileSystem,
+                format!("{}/{}/", space.suffix(), space.name()),
+            ),
+        };
+        let sql_prefix = SqlPhysicalPrefix::for_space(space).as_str().to_owned();
+        let sql = match &self.sql_objects {
+            Some(SqlPurgeStore::S3(_)) => (PrefixStoreKind::SqlS3, sql_prefix),
+            Some(SqlPurgeStore::FileSystem(_)) => (PrefixStoreKind::SqlFileSystem, sql_prefix),
+            None => return Err(PurgeExecutionError::SqlStorageUnavailable),
+        };
+        let mut prefixes = vec![kv, sql, (PrefixStoreKind::SqliteCache, format!("{space}/"))];
+        #[cfg(feature = "duckdb")]
+        if self.duckdb.is_some() {
+            prefixes.push((PrefixStoreKind::DuckDbCache, format!("{space}/")));
+        }
+        let path = accepted
+            .object_key()
+            .map_err(|_| PurgeExecutionError::PrefixInventory)?;
+        let body = accepted
+            .to_bytes()
+            .map_err(|_| PurgeExecutionError::PrefixInventory)?;
+        let mut expected = Vec::new();
+        for (kind, prefix) in prefixes.drain(..) {
+            VerifiedPurgePrefix::verify_candidate(self.keys, &path, &body, kind, &prefix)
+                .map_err(|_| PurgeExecutionError::PrefixInventory)?;
+            expected.push(
+                self.keys
+                    .prefix_hmac(&accepted.key_id, kind.as_str(), &prefix)
+                    .map_err(|_| PurgeExecutionError::PrefixInventory)?,
+            );
+        }
+        expected.sort();
+        expected.dedup();
+        // A signed prefix for a disabled or unavailable backend must also be
+        // checked, never silently skipped while terminal progress is claimed.
+        if expected != accepted.prefixes {
+            return Err(PurgeExecutionError::PrefixInventory);
+        }
+        Ok(())
     }
     async fn keep_lease<T>(
         &self,
