@@ -1,4 +1,8 @@
 mod space_purge;
+#[cfg(test)]
+#[path = "db/status_snapshot_tests.rs"]
+mod status_snapshot_tests;
+
 use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
@@ -336,6 +340,12 @@ pub struct TransactResult {
     pub delegation_cids: Vec<Hash>,
 }
 
+pub type DelegationStatusSnapshot = (
+    DelegationStatus,
+    Option<i64>,
+    Vec<crate::renewal::StampRecord>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationStatus {
     Active,
@@ -361,6 +371,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     InvalidRevocation(#[from] revocation::RevocationError),
     #[error(transparent)]
     Renewal(#[from] crate::renewal::RenewalStoreError),
+    #[error("renewal history is not authorized")]
+    RenewalHistoryUnauthorized,
     #[error("Epoch Hashing Err: {0}")]
     EpochHashingErr(#[from] HashError),
     #[error(transparent)]
@@ -481,6 +493,55 @@ where
     }
 }
 
+/// Build the invocation graph with this node's identity-bound renewal view.
+/// Callers pass one verifier time and the connection used for authorization.
+async fn invocation_authorization_graph<C: ConnectionTrait>(
+    conn: &C,
+    roots: &[Hash],
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    now: OffsetDateTime,
+) -> Result<crate::auth_graph::AuthGraphSnapshot, invocation::Error> {
+    let result = match identity {
+        Some(identity) => {
+            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                conn,
+                roots,
+                &identity.stable_node_did,
+                &identity.renewer_did,
+                identity.epoch,
+                now.unix_timestamp(),
+            )
+            .await
+        }
+        None => crate::auth_graph::AuthGraphSnapshot::load(conn, roots).await,
+    };
+    result.map_err(|error| match error {
+        crate::auth_graph::ChainTraversalError::Db(error) => invocation::Error::Db(error),
+        crate::auth_graph::ChainTraversalError::LimitExceeded => {
+            invocation::InvocationError::ChainTraversalLimitExceeded.into()
+        }
+    })
+}
+
+/// Preserve signature verification before loading a public caller's graph.
+async fn verify_invocation_authorization<C: ConnectionTrait>(
+    conn: &C,
+    invocation: &crate::util::InvocationInfo,
+    now: OffsetDateTime,
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    delegated_sql_caveats: bool,
+) -> Result<(), invocation::Error> {
+    invocation::verify_invocation(&invocation.invocation).await?;
+    let roots = invocation
+        .parents
+        .iter()
+        .copied()
+        .map(Hash::from)
+        .collect::<Vec<_>>();
+    let graph = invocation_authorization_graph(conn, &roots, identity, now).await?;
+    invocation::authorize_admitted(conn, invocation, now, Some(&graph), delegated_sql_caveats).await
+}
+
 /// Reject unauthorized or unhosted mutations before any content upload.
 /// The commit transaction repeats authorization after the sequence lock.
 /// `check_hosted` is false only where the caller's registration statement
@@ -493,26 +554,42 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     now: OffsetDateTime,
     spaces: &[SpaceId],
     delegated_sql_caveats: bool,
+    renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     check_hosted: bool,
     fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
 ) -> Result<(), TxError<B, K>> {
     let (mode, lifecycle) = space_purge::probe::<B, K, _>(conn, fence, &invocation.0, mode).await?;
     match mode {
         InvokeMode::Admitted => {
-            invocation::authorize_admitted(conn, &invocation.0, now, None, delegated_sql_caveats)
+            let roots = invocation
+                .0
+                .parents
+                .iter()
+                .copied()
+                .map(Hash::from)
+                .collect::<Vec<_>>();
+            let graph = invocation_authorization_graph(conn, &roots, renewal_identity, now)
                 .await
                 .map_err(TxError::<B, K>::from)?;
-        }
-        InvokeMode::Public => {
-            invocation::verify_and_authorize_with_setting(
+            invocation::authorize_admitted(
                 conn,
                 &invocation.0,
                 now,
+                Some(&graph),
                 delegated_sql_caveats,
             )
             .await
             .map_err(TxError::<B, K>::from)?;
         }
+        InvokeMode::Public => verify_invocation_authorization(
+            conn,
+            &invocation.0,
+            now,
+            renewal_identity,
+            delegated_sql_caveats,
+        )
+        .await
+        .map_err(TxError::<B, K>::from)?,
         InvokeMode::Internal | InvokeMode::MeetingPublication => {}
     }
     space_purge::refuse_absent::<B, K>(&lifecycle)?;
@@ -734,13 +811,23 @@ where
     where
         C: ConnectionTrait,
     {
-        let effective_root = crate::models::revocation::target_for_cid(&self.conn, target)
+        self.delegation_effective_expiry_on(&self.conn, target, verifier_now)
+            .await
+    }
+
+    async fn delegation_effective_expiry_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        verifier_now: i64,
+    ) -> Result<Option<i64>, crate::renewal::RenewalStoreError> {
+        let effective_root = crate::models::revocation::target_for_cid(conn, target)
             .await?
             .map_or(target, |delegation| delegation.id);
         let roots = [effective_root];
         let snapshot = match self.renewal_identity.as_ref() {
             Some(identity) => crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                &self.conn,
+                conn,
                 &roots,
                 &identity.stable_node_did,
                 &identity.renewer_did,
@@ -756,7 +843,7 @@ where
                     crate::renewal::RenewalStoreError::InvalidInput
                 }
             })?,
-            _ => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
+            _ => crate::auth_graph::AuthGraphSnapshot::load(conn, &roots)
                 .await
                 .map_err(|error| match error {
                     crate::models::revocation::ChainTraversalError::Db(error) => {
@@ -1001,10 +1088,11 @@ where
                 .into(),
             );
         }
-        invocation::verify_and_authorize_with_setting(
+        verify_invocation_authorization(
             &self.conn,
             invocation,
             now,
+            self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
         )
         .await
@@ -1033,11 +1121,20 @@ where
                 .into(),
             );
         }
+        let roots = invocation_info
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect::<Vec<_>>();
+        let graph =
+            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
+                .await?;
         invocation::authorize_admitted(
             &self.conn,
             invocation_info,
             now,
-            None,
+            Some(&graph),
             self.delegated_sql_caveats,
         )
         .await
@@ -1149,10 +1246,11 @@ where
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
         let now = OffsetDateTime::now_utc();
-        invocation::verify_and_authorize_with_setting(
+        verify_invocation_authorization(
             &self.conn,
             invocation,
             now,
+            self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
         )
         .await
@@ -2379,16 +2477,9 @@ where
         if proofs.len() > 1 {
             return Ok(None);
         }
-        // A canonical CID may name a historical stored row; the requested CID
-        // keeps its own authority scope, the stored row supplies the grant.
         let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
             return Ok(None);
         };
-        let abilities = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(delegation.id))
-            .all(&self.conn)
-            .await?;
-
         let mut roots = vec![target];
         if delegation.id != target {
             roots.push(delegation.id);
@@ -2402,8 +2493,118 @@ where
             Err(error) => return Err(error),
         };
 
-        let authorized = match revocation::control_proof_decision(
+        self.delegation_status_on(
             &self.conn,
+            target,
+            invoker,
+            proofs,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+    }
+
+    /// Read every status response field from one database snapshot.
+    pub async fn delegation_status_snapshot(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        self.delegation_status_snapshot_inner(
+            target,
+            invoker,
+            proofs,
+            verifier_now,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn delegation_status_snapshot_inner(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+        after_expiry: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<Option<DelegationStatusSnapshot>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // Keep chain-lock acquisition before opening the read transaction.
+        let Some(delegation) = revocation::target_for_cid(&self.conn, target).await? else {
+            return Ok(None);
+        };
+        let mut roots = vec![target];
+        if delegation.id != target {
+            roots.push(delegation.id);
+        }
+        roots.extend(proofs.iter().copied().map(Hash::from));
+        let _chain_guards = match self.acquire_chain_guards(&roots).await {
+            Ok(guards) => guards,
+            Err(TxError::ChainTraversalLimitExceeded) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        let tx = match self.conn.get_database_backend() {
+            DbBackend::Postgres => {
+                self.conn
+                    .begin_with_config(
+                        Some(sea_orm::IsolationLevel::RepeatableRead),
+                        Some(sea_orm::AccessMode::ReadOnly),
+                    )
+                    .await?
+            }
+            _ => self.conn.begin().await?,
+        };
+        let Some(status) = self
+            .delegation_status_on(&tx, target, invoker, proofs, verifier_now)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let expiry = self
+            .delegation_effective_expiry_on(&tx, target, verifier_now)
+            .await?;
+        after_expiry.await;
+        let history =
+            crate::renewal::renewal_history(&tx, &target.to_cid(0x55).to_string(), invoker, proofs)
+                .await
+                .map_err(|error| match error {
+                    crate::renewal::RenewalStoreError::Unauthorized => {
+                        TxError::RenewalHistoryUnauthorized
+                    }
+                    error => TxError::Renewal(error),
+                })?;
+        tx.commit().await?;
+        Ok(Some((status, expiry, history)))
+    }
+
+    async fn delegation_status_on<D: ConnectionTrait>(
+        &self,
+        conn: &D,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+        verifier_now: i64,
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        // A canonical CID may name a historical stored row; the requested CID
+        // keeps its own authority scope, the stored row supplies the grant.
+        let Some(delegation) = revocation::target_for_cid(conn, target).await? else {
+            return Ok(None);
+        };
+        let abilities = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(delegation.id))
+            .all(conn)
+            .await?;
+
+        let authorized = match revocation::control_proof_decision(
+            conn,
             invoker,
             proofs,
             revocation::ControlAction::Status,
@@ -2433,7 +2634,7 @@ where
 
         // One read joins the generic revocation table (with its CID aliases)
         // and `policy_v3_root` over the target and its whole ancestor chain.
-        match revocation::chain_revoked(&self.conn, &target, &delegation.id).await {
+        match revocation::chain_revoked(conn, &target, &delegation.id).await {
             Ok(true) => return Ok(Some(DelegationStatus::Revoked)),
             Ok(false) => {}
             Err(revocation::ChainTraversalError::LimitExceeded) => {
@@ -2442,9 +2643,10 @@ where
             Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
         }
 
-        let now = OffsetDateTime::now_utc();
+        let now = OffsetDateTime::from_unix_timestamp(verifier_now)
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
         let effective_expiry = self
-            .delegation_effective_expiry(target, now.unix_timestamp())
+            .delegation_effective_expiry_on(conn, target, now.unix_timestamp())
             .await?;
         match effective_expiry {
             Some(end) if now.unix_timestamp() >= end => {
@@ -3142,6 +3344,7 @@ where
             now,
             spaces,
             self.delegated_sql_caveats,
+            self.renewal_identity.as_ref(),
             !claim_checks_hosting,
             self.space_purge_fence.as_deref(),
         )
@@ -3358,73 +3561,44 @@ where
         )
         .await?;
         let now = OffsetDateTime::now_utc();
-        // TC-732: a `kv/sync` read loads one authorization snapshot (proofs
-        // plus any presented retention grant) and uses it both to authorize
-        // and to attest the authority window, so the two cannot disagree.
-        let sync_graph = match sync_target.as_ref() {
-            Some(_) => {
-                let mut roots: Vec<Hash> = invocation
-                    .0
-                    .parents
-                    .iter()
-                    .copied()
-                    .map(Hash::from)
-                    .collect();
-                roots.extend(
-                    options
-                        .kv_sync
-                        .as_ref()
-                        .and_then(|sync| sync.retention_grant),
-                );
-                let graph_result = match self.renewal_identity.as_ref() {
-                    Some(identity) => {
-                        crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                            &self.conn,
-                            &roots,
-                            &identity.stable_node_did,
-                            &identity.renewer_did,
-                            identity.epoch,
-                            now.unix_timestamp(),
-                        )
-                        .await
-                    }
-                    None => crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots).await,
-                };
-                Some(graph_result.map_err(|error| match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::<B, K>::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                })?)
-            }
-            None => None,
-        };
-        // TC-409: an admitted invocation already had its signature verified
-        // once at the admission boundary; only re-check authorization and
-        // signed-time validity here rather than verifying the signature a
-        // second time.
-        match mode {
-            InvokeMode::Admitted => invocation::authorize_admitted(
-                &self.conn,
-                &invocation.0,
-                now,
-                sync_graph.as_ref(),
-                self.delegated_sql_caveats,
-            )
-            .await
-            .map_err(TxError::<B, K>::from)?,
-            InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
-                invocation::verify_and_authorize_with_graph(
-                    &self.conn,
-                    &invocation.0,
-                    now,
-                    sync_graph.as_ref(),
-                    self.delegated_sql_caveats,
-                )
+        if mode != InvokeMode::Admitted {
+            invocation::verify_invocation(&invocation.0.invocation)
                 .await
-                .map_err(TxError::<B, K>::from)?
-            }
-        };
+                .map_err(TxError::<B, K>::from)?;
+        }
+
+        // Every read uses the same identity-aware graph for authorization.
+        // Sync additionally includes its retention grant in that snapshot.
+        let mut roots = invocation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect::<Vec<_>>();
+        if sync_target.is_some() {
+            roots.extend(
+                options
+                    .kv_sync
+                    .as_ref()
+                    .and_then(|sync| sync.retention_grant),
+            );
+        }
+        let auth_graph =
+            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        // The admitted path keeps its single signature verification at admission;
+        // public envelopes were verified above. Both re-check time and authority.
+        invocation::authorize_admitted(
+            &self.conn,
+            &invocation.0,
+            now,
+            Some(&auth_graph),
+            self.delegated_sql_caveats,
+        )
+        .await
+        .map_err(TxError::<B, K>::from)?;
 
         space_purge::refuse_absent::<B, K>(&lifecycle)?;
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
@@ -3438,8 +3612,9 @@ where
             }
         }
 
-        let sync_outcome = match (sync_target, sync_graph.as_ref()) {
-            (Some((space, prefix, resource)), Some(graph)) => {
+        let sync_outcome = match sync_target {
+            Some((space, prefix, resource)) => {
+                let graph = &auth_graph;
                 let request =
                     options
                         .kv_sync
@@ -4169,7 +4344,7 @@ pub(crate) async fn transact<S: StorageSetup, K: Secrets>(
     for (_, event) in &event_hashes {
         if let Event::Delegation(lease) = event {
             if crate::renewal::lease_original_from_signed(lease)?.is_some() {
-                if renewal_identity.is_none() {
+                if renewal_identity.is_none() || renewal_seed.is_none() {
                     return Err(crate::renewal::RenewalStoreError::LeaseUnavailable.into());
                 }
                 renewal_lease_events.push(lease.as_ref());
@@ -4184,19 +4359,26 @@ pub(crate) async fn transact<S: StorageSetup, K: Secrets>(
     let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
     for (hash, event) in &event_hashes {
         if let Event::Delegation(d) = event {
-            let reg = delegation::process_with(
-                db,
-                d,
-                encryption,
-                delegated_sql_caveats,
-                named_keys,
-                renewal_identity
-                    .as_ref()
-                    .map(|(stable_node_did, renewer_did, epoch)| {
-                        (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
-                    }),
-            )
-            .await?;
+            let reg = if renewal_lease_events
+                .iter()
+                .any(|lease| lease.content_hash() == *hash)
+            {
+                delegation::save_owner_renewal_lease(db, d, encryption).await?
+            } else {
+                delegation::process_with(
+                    db,
+                    d,
+                    encryption,
+                    delegated_sql_caveats,
+                    named_keys,
+                    renewal_identity
+                        .as_ref()
+                        .map(|(stable_node_did, renewer_did, epoch)| {
+                            (stable_node_did.as_str(), renewer_did.as_str(), *epoch)
+                        }),
+                )
+                .await?
+            };
             space_purge::lock_delegation::<S, K>(db, fence, d).await?;
             registered.insert(*hash, reg);
         }
