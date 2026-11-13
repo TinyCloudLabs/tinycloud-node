@@ -249,8 +249,8 @@ test("pool series_label matches the top-level label, as the usw branch reports c
   assert.equal(breach.status, "breach");
   assert.match(breach.detail, /pool>=15 \[active\] 15\/15/);
   // idle at 15 must not count: only the "active" series is read.
-  const idleHigh = parseSeries({ series: [series[0], body("active", 3), body("idle", 99)].map((x) => ("metric" in x ? x : x)) });
-  assert.equal(evaluateTarget(rule, idleHigh, NOW).status, "ok");
+  const idleHigh = parseSeries({ series: [body("active", 3), body("idle", 99)] });
+  assert.equal(evaluateTarget(rule, [idleCpu, ...idleHigh], NOW).status, "ok");
   // A label that no series carries is "no series" (unknown), never a silent pass.
   const missing = { ...rule, pool: { ...rule.pool, series_label: "waiting" } };
   assert.equal(evaluateTarget(missing, series, NOW).status, "unknown");
