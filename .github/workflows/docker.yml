@@ -764,11 +764,12 @@ jobs:
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
-          # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes and the TC-2917
-          # storage-headroom event in the Vector config
-          # (raw 5419a6fb…; d703d69b… before TC-2917, 298ea356… before TC-2346, 192dfb7e… before TC-1777),
-          # its single node digest normalized to 64 zeros.
-          n0_template_hash = '90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51'
+          # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes, the TC-2917
+          # storage-headroom event and the TC-3006 codes (canonical schema; chain_guard_slow_wait, http_5xx and
+          # the TC-2954/2961/3027 warning codes) in the Vector config
+          # (raw 7ee085c6…; 5419a6fb… before TC-3006, d703d69b… before TC-2917, 298ea356… before TC-2346,
+          # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
+          n0_template_hash = 'efad41d56df187a7e0ddd1a13f3c4a3c436ad7c0ff141acd32c06e28f9c92a34'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
