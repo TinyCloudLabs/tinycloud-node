@@ -376,8 +376,7 @@ pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
     .await
 }
 
-/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
-#[cfg(test)]
+/// `authorize_holder` checks against the caller's same transaction snapshot.
 pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     db: &C,
     holder: &str,

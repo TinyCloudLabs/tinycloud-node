@@ -4,6 +4,9 @@ use crate::{hash::Hash, resource_purge_fence::ResourceTarget};
 use std::collections::BTreeSet;
 use tinycloud_auth::ipld_core::cid::Cid;
 
+pub(crate) mod collector;
+pub use collector::collect_target_dependencies;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum DependencyIdentity {
     Grant(Hash),
