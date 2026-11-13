@@ -4338,7 +4338,7 @@ impl PreVerified {
             let checked = crate::renewal::preverify_lease(db, delegation, encryption).await?;
             return Ok(Self(checked.into_iter().collect()));
         }
-        delegation::verify_signature(&delegation.0.delegation).await?;
+        delegation::check_signature(&delegation.0.delegation).await?;
         Ok(Self(HashSet::from([delegation.content_hash()])))
     }
 
@@ -4346,7 +4346,7 @@ impl PreVerified {
     pub(crate) async fn revocation<S: StorageSetup, K: Secrets>(
         revocation: &Revocation,
     ) -> Result<Self, TxError<S, K>> {
-        revocation::verify_signature(&revocation.0.revocation).await?;
+        revocation::check_signature(&revocation.0.revocation).await?;
         Ok(Self(HashSet::from([crate::hash::hash(&revocation.1)])))
     }
 }

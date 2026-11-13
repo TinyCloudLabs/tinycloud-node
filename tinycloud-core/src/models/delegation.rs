@@ -229,7 +229,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
 /// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
 /// `named_keys` a capability on a key or key prefix is refused. With
 /// `signature_verified` the caller checked these exact signed bytes with
-/// [`verify_signature`] before its transaction (TC-2986); only the time
+/// [`check_signature`] before its transaction (TC-2986); only the time
 /// window is checked here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_with<C: ConnectionTrait>(
@@ -242,7 +242,7 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
     if !signature_verified {
-        verify_signature(&delegation.0.delegation).await?;
+        check_signature(&delegation.0.delegation).await?;
     }
     verify_time(&delegation.0.delegation)?;
     for space in delegation.0.spaces() {
@@ -270,7 +270,7 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
     signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
     if !signature_verified {
-        verify_signature(&delegation.0.delegation).await?;
+        check_signature(&delegation.0.delegation).await?;
     }
     verify_time(&delegation.0.delegation)?;
     if !delegation.0.parents.is_empty()
@@ -284,7 +284,7 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
 
 /// Check a delegation's signature: CPU, or a DID resolution when network
 /// methods are on. Runs before any lock (TC-2986).
-pub(crate) async fn verify_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ucan) => {
             verify_ucan_signature(ucan)

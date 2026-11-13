@@ -735,7 +735,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
 }
 
 /// As [`process`]. With `signature_verified` the caller checked these exact
-/// signed bytes with [`verify_signature`] before its transaction (TC-2986);
+/// signed bytes with [`check_signature`] before its transaction (TC-2986);
 /// only the time window is checked here.
 pub(crate) async fn process_with<C: ConnectionTrait>(
     db: &C,
@@ -751,7 +751,7 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     // active_cutoff loop can rely on a single endpoint regardless of
     // whether the Grant Issuer signs with SIWE or did:key.
     if !signature_verified {
-        verify_signature(&r.revocation).await?;
+        check_signature(&r.revocation).await?;
     }
     let in_window = match &r.revocation {
         TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
@@ -813,7 +813,7 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
 
 /// Check a revocation's signature: CPU, or a DID resolution when network
 /// methods are on. Runs before any lock (TC-2986).
-pub(crate) async fn verify_signature(revocation: &TinyCloudRevocation) -> Result<(), Error> {
+pub(crate) async fn check_signature(revocation: &TinyCloudRevocation) -> Result<(), Error> {
     match revocation {
         TinyCloudRevocation::Cacao(c) => {
             c.verify()
