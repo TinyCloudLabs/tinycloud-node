@@ -1425,3 +1425,7 @@ mod tests {
         assert!(!revoker_may_revoke(&db, target, OTHER_DID, proof).await);
     }
 }
+
+#[cfg(test)]
+#[path = "invocation_terminal_tests.rs"]
+mod invocation_terminal_tests;
