@@ -1328,8 +1328,10 @@ async fn status_authorized<C: ConnectionTrait>(
     )
 }
 
-/// Read-only, non-authoritative history guarded by per-delegation status rules.
-pub async fn renewal_history<C: ConnectionTrait>(
+/// Read-only, non-authoritative history guarded by original status rights.
+/// Call only inside the status snapshot after evaluating the original's status
+/// decision, including its revocation state, on the same connection.
+pub(crate) async fn renewal_history<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
     invoker: &str,
