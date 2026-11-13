@@ -21,6 +21,7 @@ jobs:
     env:
       TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
       CARGO_TARGET_DIR: target/renewal-scheduler
+      TINYCLOUD_HISTORY_SDK_FIXTURE_DIR: ${{ runner.temp }}/scheduler-holder-history
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -29,3 +30,9 @@ jobs:
           workspaces: . -> target/renewal-scheduler
           shared-key: renewal-scheduler-1.97.1
       - run: cargo test --locked -p tinycloud-node --features renewal-test-clock --test renewal_scheduler_e2e -- --nocapture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: renewal-scheduler-history-sdk
+          path: ${{ runner.temp }}/scheduler-holder-history
+          if-no-files-found: ignore

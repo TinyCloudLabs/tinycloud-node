@@ -58,7 +58,7 @@ mv "$CLOCK_FILE.next" "$CLOCK_FILE"
 ```
 
 Register while the original is live, advance to half-life and poll normal
-owner-authorized status until a signed stamp appears, then advance past original
+holder-authorized status until a signed stamp appears, then advance past original
 expiry while staying before its admitted end. Scheduler admission refuses a
 lapsed original: jumping straight past expiry cannot revive it. Keep ordinary
 HTTP authentication envelopes valid under wall time too; this narrow seam does
@@ -74,3 +74,9 @@ authority and perform its ordinary read.
 The consistent status projection is supplied by PR #556, commit
 `fefa533e239a50db961799b15860abd27036754d`. This harness PR is stacked on
 that branch so its own diff contains only test support.
+
+Holder-visible signed history is supplied by PR #559, commit
+`372736a3654d4d15963a5f528acaf692bb64085b`; this harness is stacked there.
+Status reads use the original holder's proofless signature. CI exports only
+public synthetic stamp fixtures as `renewal-scheduler-history-sdk` for the SDK
+verifier, at a captured time after the original signed expiry.

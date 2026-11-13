@@ -157,8 +157,9 @@ secret = "{}"
         .generate(&key, "key")
         .context("owner DID")?
         .to_string();
+    let holder_key = JWK::generate_ed25519()?;
     let holder = DID_METHODS
-        .generate(&JWK::generate_ed25519()?, "key")
+        .generate(&holder_key, "key")
         .context("holder DID")?
         .to_string();
     let space: SpaceId = format!(
@@ -186,6 +187,7 @@ secret = "{}"
         now - 1,
         now + 240,
     )?;
+    let lease_cid = hash(lease.as_bytes()).to_cid(0x55).to_string();
     for signed in [original, lease] {
         let response = client
             .post(format!("{base}/delegate"))
@@ -198,8 +200,8 @@ secret = "{}"
     }
     let status = || async {
         let auth = token(
-            &key,
-            &owner,
+            &holder_key,
+            &secret.node_did(),
             &format!("urn:cid:{cid}"),
             "tinycloud.delegation/status",
             now - 1,
@@ -297,6 +299,30 @@ secret = "{}"
         capped["effective_expiry"] == now + 240,
         "lease did not cap stamp: {capped}"
     );
+    ensure!(
+        capped["status"] == "active",
+        "holder authority is not active: {capped}"
+    );
+    if let Some(directory) = std::env::var_os("TINYCLOUD_HISTORY_SDK_FIXTURE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory)?;
+        let fixture = json!({
+            "input": {"originalCid": cid, "leaseCid": lease_cid, "leaseExpiresAt": now + 240,
+                "now": now + 150, "history": capped["renewal_history"],
+                "nodeIdentity": {"nodeDid": secret.node_did(), "renewerDid": secret.renewal_did(),
+                    "renewerPublicKey": base64::encode_config(public, base64::URL_SAFE_NO_PAD), "renewerEpoch": 1}},
+            "originalSignedExpiry": now + 120, "expectedExpiry": capped["effective_expiry"]
+        });
+        let backend = if database.is_some() {
+            "postgres"
+        } else {
+            "sqlite"
+        };
+        std::fs::write(
+            directory.join(format!("{backend}.json")),
+            serde_json::to_vec_pretty(&fixture)?,
+        )?;
+    }
     advance(&clock, now + 241)?;
     // Give the running scheduler another interval after the lease boundary.
     tokio::time::sleep(Duration::from_millis(75)).await;
