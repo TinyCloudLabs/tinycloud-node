@@ -32,6 +32,25 @@ fn invocation(
     proofs: &[Cid],
     facts: Vec<Value>,
 ) -> anyhow::Result<String> {
+    invocation_lasting(
+        signer,
+        audience,
+        attenuation,
+        proofs,
+        facts,
+        Duration::seconds(30),
+    )
+}
+
+/// As [`invocation`], valid for `lifetime`.
+fn invocation_lasting(
+    signer: &Signer,
+    audience: &str,
+    attenuation: Capabilities<Value>,
+    proofs: &[Cid],
+    facts: Vec<Value>,
+    lifetime: Duration,
+) -> anyhow::Result<String> {
     let Signer::Key { jwk, vm, .. } = signer else {
         anyhow::bail!("invocations are signed by keys");
     };
@@ -40,9 +59,7 @@ fn invocation(
         issuer: vm.parse()?,
         audience: audience.parse()?,
         not_before: Some(NumericDate::try_from_seconds(at.unix_timestamp() as f64)?),
-        expiration: NumericDate::try_from_seconds(
-            (at + Duration::seconds(30)).unix_timestamp() as f64
-        )?,
+        expiration: NumericDate::try_from_seconds((at + lifetime).unix_timestamp() as f64)?,
         nonce: Some(unique("tc2958invoke")),
         facts: Some(facts),
         proof: proofs.to_vec(),
@@ -76,13 +93,13 @@ fn policy_read(h: &Harness) -> anyhow::Result<Capabilities<Value>> {
     )?)
 }
 
-/// A root the enforcer issues to itself on a space of its own, which the
-/// node admits like any owner's root.
-async fn enforcer_own_root(h: &Harness) -> anyhow::Result<Cid> {
-    let space = SpaceId::new(h.enforcer.did().parse::<DIDBuf>()?, "own".parse()?)?;
+/// A root `signer` issues to itself on a space of its own, which the node
+/// admits like any owner's root.
+async fn own_root(h: &Harness, signer: &Signer) -> anyhow::Result<Cid> {
+    let space = SpaceId::new(signer.did().parse::<DIDBuf>()?, "own".parse()?)?;
     let resource = space.to_resource("kv".parse()?, Some("x".parse()?), None, None);
-    let delegation = h.enforcer.delegate(
-        h.enforcer.did(),
+    let delegation = signer.delegate(
+        signer.did(),
         &[(resource.to_string(), "tinycloud.kv/get")],
         policy_window(),
         &[],
@@ -90,13 +107,17 @@ async fn enforcer_own_root(h: &Harness) -> anyhow::Result<Cid> {
     Ok(h.import(delegation).await?.parse()?)
 }
 
+/// The same multihash under another codec (dag-cbor): another encoding of the
+/// CID of the same delegation.
+fn alias(cid: Cid) -> Cid {
+    Cid::new_v1(0x71, *cid.hash())
+}
+
 /// Every proof list that cites a registered root: alone, and beside the
 /// enforcer's own root in either order; each by the root's stored CID and by
-/// the same multihash under another codec (dag-cbor), which names the same
-/// delegation.
+/// an alias of it.
 fn root_proofs(root: Cid, own: Cid) -> Vec<Vec<Cid>> {
-    let alias = Cid::new_v1(0x71, *root.hash());
-    [root, alias]
+    [root, alias(root)]
         .into_iter()
         .flat_map(|root| [vec![root], vec![root, own], vec![own, root]])
         .collect()
@@ -112,7 +133,7 @@ async fn policy_roots_authorize_no_read(backend: Backend) -> anyhow::Result<()> 
     };
     h.grant_owner(policy_window()).await?;
     let policy = h.register_ok(policy_window()).await?;
-    let own = enforcer_own_root(&h).await?;
+    let own = own_root(&h, &h.enforcer).await?;
     for root in [&policy.enforcement_root_cid, &policy.policy_root_cid] {
         for proofs in root_proofs(root.parse()?, own) {
             let response = h
@@ -155,6 +176,8 @@ struct KeyShare {
     policy: Registered,
     session: Cid,
     own: Cid,
+    /// A root the holder issues to itself.
+    holder_own: Cid,
     /// The wrapped key the registration's source binds.
     wrapped: Vec<u8>,
     public_key: Vec<u8>,
@@ -232,7 +255,8 @@ impl KeyShare {
             .await?;
         anyhow::ensure!(status == Status::Ok, "register: {status} {body}");
         let session = session_cid(&h.mint_ok(&policy).await?)?;
-        let own = enforcer_own_root(&h).await?;
+        let own = own_root(&h, &h.enforcer).await?;
+        let holder_own = own_root(&h, &h.holder).await?;
         Ok(Some(Self {
             h,
             network,
@@ -241,6 +265,7 @@ impl KeyShare {
             policy,
             session,
             own,
+            holder_own,
             wrapped,
             public_key,
             _ledger: ledger,
@@ -330,11 +355,25 @@ impl KeyShare {
         routes
     }
 
+    /// Every proof list that cites the holder's session: alone, and beside a
+    /// root the holder issued itself in either order; each by the session's
+    /// stored CID and by an alias of it.
+    fn session_proofs(&self) -> Vec<Vec<Cid>> {
+        [self.session, alias(self.session)]
+            .into_iter()
+            .flat_map(|session| {
+                [
+                    vec![session],
+                    vec![session, self.holder_own],
+                    vec![self.holder_own, session],
+                ]
+            })
+            .collect()
+    }
+
     /// On every decrypt route, the enforcement root is refused in every
-    /// citing form, whether or not the request matches the registered
-    /// source; the holder's session, cited by its stored CID or by a codec
-    /// alias, is still held to the registered source.
-    async fn assert_decrypts(&self) -> anyhow::Result<()> {
+    /// citing form, whether or not the request matches the registered source.
+    async fn assert_root_decrypts(&self) -> anyhow::Result<()> {
         let root: Cid = self.policy.enforcement_root_cid.parse()?;
         let other = self.other_wrapped()?;
         for route in self.decrypt_routes() {
@@ -348,21 +387,90 @@ impl KeyShare {
                     );
                 }
             }
-            for session in [self.session, Cid::new_v1(0x71, *self.session.hash())] {
-                assert_eq!(
-                    self.decrypt(&route, &self.h.holder, &[session], &other)
-                        .await?,
+        }
+        Ok(())
+    }
+
+    /// On every decrypt route, the holder's session, by any encoding of its
+    /// CID, is held to the registered source and refused beside another proof.
+    async fn assert_session_decrypts(&self) -> anyhow::Result<()> {
+        let other = self.other_wrapped()?;
+        for route in self.decrypt_routes() {
+            for proofs in self.session_proofs() {
+                let (wrappings, expected) = if proofs.len() == 1 {
+                    (vec![&other], "policy-decrypt-content-source-mismatch")
+                } else {
                     (
-                        Status::Forbidden,
-                        "policy-decrypt-content-source-mismatch".to_owned()
-                    ),
-                    "{route} {session}"
-                );
+                        vec![&self.wrapped, &other],
+                        "policy-session-requires-one-immediate-parent",
+                    )
+                };
+                for wrapped in wrappings {
+                    assert_eq!(
+                        self.decrypt(&route, &self.h.holder, &proofs, wrapped)
+                            .await?,
+                        (Status::Forbidden, expected.to_owned()),
+                        "{route} {proofs:?}"
+                    );
+                }
             }
         }
         Ok(())
     }
 }
+
+/// The holder's session holds its conditions by any encoding of its CID, for
+/// a network source and a named key: on `/invoke`, a read whose invocation
+/// outlives the policy limit is refused, and so is a read citing the session
+/// beside another proof; every decrypt route holds it to the registered
+/// source.
+async fn a_session_holds_its_conditions_by_any_cid_encoding(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    for key_path in [None, Some(KEY_PATH)] {
+        let Some(share) = KeyShare::new(
+            backend,
+            key_path,
+            "a_session_holds_its_conditions_by_any_cid_encoding",
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let h = &share.h;
+        for proofs in share.session_proofs() {
+            let (lifetime, expected) = if proofs.len() == 1 {
+                (90, "policy-invocation-lifetime-too-long")
+            } else {
+                (30, "policy-session-requires-one-immediate-parent")
+            };
+            let authorization = invocation_lasting(
+                &h.holder,
+                h.holder.did(),
+                policy_read(h)?,
+                &proofs,
+                vec![],
+                Duration::seconds(lifetime),
+            )?;
+            let response = h
+                .client
+                .post("/invoke")
+                .header(Header::new("Authorization", authorization))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(
+                (status, body.as_str()),
+                (Status::Forbidden, expected),
+                "{key_path:?} {proofs:?}"
+            );
+        }
+        share.assert_session_decrypts().await?;
+    }
+    Ok(())
+}
+on_both_backends!(a_session_holds_its_conditions_by_any_cid_encoding);
 
 /// A named share key: the enforcement root, cited in any form, neither
 /// describes the key nor decrypts under it.
@@ -408,7 +516,7 @@ async fn the_enforcement_root_neither_describes_nor_decrypts_a_named_key(
             "{proofs:?}"
         );
     }
-    share.assert_decrypts().await
+    share.assert_root_decrypts().await
 }
 on_both_backends!(the_enforcement_root_neither_describes_nor_decrypts_a_named_key);
 
@@ -426,117 +534,136 @@ async fn the_enforcement_root_decrypts_nothing_on_the_network(
     else {
         return Ok(());
     };
-    share.assert_decrypts().await
+    share.assert_root_decrypts().await
 }
 on_both_backends!(the_enforcement_root_decrypts_nothing_on_the_network);
 
-async fn authorize_delivery_with(
-    client: &Client,
-    authorization: String,
-    body: String,
-) -> (Status, String) {
-    let response = client
-        .post("/policy/v3/deliveries/authorize")
-        .header(ContentType::JSON)
-        .header(Header::new("Authorization", authorization))
-        .body(body)
-        .dispatch()
-        .await;
-    let status = response.status();
-    (status, response.into_string().await.unwrap_or_default())
+/// The delivery route served on the Harness's database and runtime. The
+/// production app reads share records from the links API; here the record
+/// is held in memory.
+struct Delivery {
+    h: Harness,
+    client: Client,
+    links: Arc<crate::delivery_link::test_support::StubLinks>,
+    owner_grant: Cid,
+    policy: Registered,
+    next_jti: std::sync::atomic::AtomicU8,
 }
 
-/// A delivery authorization refuses the enforcement root, alone or beside
-/// another proof, before the share record is read; the policy owner's own
-/// read grant is authorized for the same share.
-async fn delivery_authorization_refuses_the_enforcement_root(
-    backend: Backend,
-) -> anyhow::Result<()> {
-    use crate::delivery_link::test_support::{b64, build, millis, StubLinks, LINK_ID, ORIGIN};
-    let Some(h) = Harness::new(
-        backend,
-        Shape::KeySession,
-        "delivery_authorization_refuses_the_enforcement_root",
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    let owner_grant: Cid = h.grant_owner(policy_window()).await?.parse()?;
-    let policy = h.register_ok(policy_window()).await?;
-    let own = enforcer_own_root(&h).await?;
+impl Delivery {
+    async fn new(backend: Backend, test: &str) -> anyhow::Result<Option<Self>> {
+        use crate::delivery_link::test_support::{b64, StubLinks, ORIGIN};
+        let Some(h) = Harness::new(backend, Shape::KeySession, test).await? else {
+            return Ok(None);
+        };
+        let owner_grant: Cid = h.grant_owner(policy_window()).await?.parse()?;
+        let policy = h.register_ok(policy_window()).await?;
+        let app = h.client.rocket();
+        let runtime = app
+            .state::<PolicyV3Runtime>()
+            .expect("policy runtime")
+            .clone();
+        let tinycloud = app.state::<crate::TinyCloud>().expect("TinyCloud").clone();
+        let invitation_public_key = b64(&runtime.signer.share_invitation_public_key());
+        let links = Arc::new(StubLinks::default());
+        let runtime = runtime.with_delivery(
+            &ShareEmailConfig {
+                enabled: true,
+                target_origin: "https://node.example".into(),
+                return_origin: ORIGIN.into(),
+                email_origin: Some("https://witness.credentials.org".into()),
+                invitation_public_key: Some(invitation_public_key),
+                links_fetch_per_invoker_per_minute: 100,
+                links_fetch_global_per_minute: 100,
+                ..ShareEmailConfig::default()
+            },
+            links.clone(),
+        )?;
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![authorize_delivery])
+                .manage(runtime)
+                .manage(tinycloud),
+        )
+        .await?;
+        Ok(Some(Self {
+            h,
+            client,
+            links,
+            owner_grant,
+            policy,
+            next_jti: std::sync::atomic::AtomicU8::new(1),
+        }))
+    }
 
-    // The production app reads share records from the links API; this app
-    // serves the delivery route on the same database and runtime, with the
-    // record held in memory.
-    let runtime = h
-        .client
-        .rocket()
-        .state::<PolicyV3Runtime>()
-        .expect("policy runtime")
-        .clone();
-    let registration = policy_v3_registration::Entity::find_by_id(policy.policy_cid.clone())
-        .one(&runtime.conn)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("registration row"))?;
-    let invitation_public_key = b64(&runtime.signer.share_invitation_public_key());
-    let links = Arc::new(StubLinks::default());
-    let runtime = runtime.with_delivery(
-        &ShareEmailConfig {
-            enabled: true,
-            target_origin: "https://node.example".into(),
-            return_origin: ORIGIN.into(),
-            email_origin: Some("https://witness.credentials.org".into()),
-            invitation_public_key: Some(invitation_public_key),
-            links_fetch_per_invoker_per_minute: 100,
-            links_fetch_global_per_minute: 100,
-            ..ShareEmailConfig::default()
-        },
-        links.clone(),
-    )?;
-    let client = Client::tracked(
-        rocket::build()
-            .mount("/", rocket::routes![authorize_delivery])
-            .manage(runtime),
-    )
-    .await?;
+    /// Publish the owner-signed share record for `policy` and return its
+    /// short link.
+    async fn share_link(&self, policy: &Registered) -> anyhow::Result<String> {
+        use crate::delivery_link::test_support::{b64, build, millis, LINK_ID};
+        let registration = policy_v3_registration::Entity::find_by_id(policy.policy_cid.clone())
+            .one(
+                &self
+                    .h
+                    .client
+                    .rocket()
+                    .state::<PolicyV3Runtime>()
+                    .expect("policy runtime")
+                    .conn,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("registration row"))?;
+        let policy_value: Value = serde_json::from_slice(&registration.policy_bytes)?;
+        let binding: Value = serde_json::from_slice(&registration.attested_enforcer_binding_bytes)?;
+        let mut envelope = json!({
+            "version": 3,
+            "recipientMatcher": {"kind": "exactEmail", "value": "alice@example.test"},
+            "actions": ["read"],
+            "target": {"origin": "https://node.example", "nodeAudience": binding["nodeAudience"]},
+            "policy": policy_value,
+            "policyCid": registration.policy_cid,
+            "policyRoot": {"cid": registration.policy_root_cid},
+            "enforcementRoot": {"cid": registration.enforcement_root_cid},
+            "attestedEnforcerBinding": binding,
+            "contentSource": policy_value["contentSource"],
+            "contentSourceDigestHex": registration.content_source_digest_hex,
+            "expiry": registration.expires_at,
+            "display": {"filename": "document.txt"},
+        });
+        let Signer::Key { keypair, .. } = &self.h.owner else {
+            unreachable!()
+        };
+        let mut preimage = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+        preimage.extend_from_slice(&canonical_json_value(&envelope));
+        envelope["signature"] = json!({
+            "algorithm": "Ed25519",
+            "signerDid": self.h.owner.did(),
+            "value": b64(&keypair.sign(&Sha256::digest(preimage))),
+        });
+        let link = build(
+            &canonical_json_value(&envelope),
+            keypair,
+            &millis(OffsetDateTime::now_utc() + Duration::hours(1)),
+        );
+        self.links.put(LINK_ID, &link);
+        Ok(link.href)
+    }
 
-    let policy_value: Value = serde_json::from_slice(&registration.policy_bytes)?;
-    let binding: Value = serde_json::from_slice(&registration.attested_enforcer_binding_bytes)?;
-    let mut envelope = json!({
-        "version": 3,
-        "recipientMatcher": {"kind": "exactEmail", "value": "alice@example.test"},
-        "actions": ["read"],
-        "target": {"origin": "https://node.example", "nodeAudience": binding["nodeAudience"]},
-        "policy": policy_value,
-        "policyCid": registration.policy_cid,
-        "policyRoot": {"cid": registration.policy_root_cid},
-        "enforcementRoot": {"cid": registration.enforcement_root_cid},
-        "attestedEnforcerBinding": binding,
-        "contentSource": policy_value["contentSource"],
-        "contentSourceDigestHex": registration.content_source_digest_hex,
-        "expiry": registration.expires_at,
-        "display": {"filename": "document.txt"},
-    });
-    let Signer::Key { keypair, .. } = &h.owner else {
-        unreachable!()
-    };
-    let mut preimage = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
-    preimage.extend_from_slice(&canonical_json_value(&envelope));
-    envelope["signature"] = json!({
-        "algorithm": "Ed25519",
-        "signerDid": h.owner.did(),
-        "value": b64(&keypair.sign(&Sha256::digest(preimage))),
-    });
-    let link = build(
-        &canonical_json_value(&envelope),
-        keypair,
-        &millis(OffsetDateTime::now_utc() + Duration::hours(1)),
-    );
-    links.put(LINK_ID, &link);
-    let request = |jti: u8| -> anyhow::Result<String> {
+    /// `signer` asks for a delivery of the share at `link` with a `kv/get`
+    /// on the content, citing `proofs`, in an invocation valid for `lifetime`.
+    async fn authorize(
+        &self,
+        signer: &Signer,
+        attenuation: Capabilities<Value>,
+        proofs: &[Cid],
+        lifetime: Duration,
+        link: &str,
+    ) -> anyhow::Result<(Status, String)> {
+        use crate::delivery_link::test_support::{b64, millis};
+        let jti = self
+            .next_jti
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut request = DeliveryAuthorizationRequest {
-            share_url: link.href.clone(),
+            share_url: link.to_owned(),
             recipient_email: "alice@example.test".into(),
             document_name: "document.txt".into(),
             jti: b64(&[jti; 16]),
@@ -545,37 +672,136 @@ async fn delivery_authorization_refuses_the_enforcement_root(
         };
         request.request_body_digest = delivery_request_digest(&request)
             .map_err(|_| anyhow::anyhow!("delivery request digest"))?;
-        Ok(serde_json::to_string(&request)?)
-    };
+        let authorization =
+            invocation_lasting(signer, signer.did(), attenuation, proofs, vec![], lifetime)?;
+        let response = self
+            .client
+            .post("/policy/v3/deliveries/authorize")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", authorization))
+            .body(serde_json::to_string(&request)?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        Ok((status, response.into_string().await.unwrap_or_default()))
+    }
+}
 
-    for (jti, proofs) in (1u8..).zip(root_proofs(policy.enforcement_root_cid.parse()?, own)) {
-        let authorization = invocation(
-            &h.enforcer,
-            h.enforcer.did(),
-            policy_read(&h)?,
-            &proofs,
-            vec![],
-        )?;
+const DELIVERY_REFUSED: &str = "delivery-authorization-invalid";
+
+/// A delivery authorization refuses the enforcement root, alone or beside
+/// another proof and by any encoding of its CID, before the share record is
+/// read; the policy owner's own read grant is authorized for the same share.
+async fn delivery_authorization_refuses_the_enforcement_root(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(d) = Delivery::new(
+        backend,
+        "delivery_authorization_refuses_the_enforcement_root",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let h = &d.h;
+    let link = d.share_link(&d.policy).await?;
+    let own = own_root(h, &h.enforcer).await?;
+    for proofs in root_proofs(d.policy.enforcement_root_cid.parse()?, own) {
         assert_eq!(
-            authorize_delivery_with(&client, authorization, request(jti)?).await,
-            (
-                Status::Forbidden,
-                "delivery-authorization-invalid".to_owned()
-            ),
+            d.authorize(
+                &h.enforcer,
+                policy_read(h)?,
+                &proofs,
+                Duration::seconds(30),
+                &link
+            )
+            .await?,
+            (Status::Forbidden, DELIVERY_REFUSED.to_owned()),
             "{proofs:?}"
         );
     }
-    assert_eq!(links.fetch_count(), 0);
+    assert_eq!(d.links.fetch_count(), 0);
 
-    let authorization = invocation(
-        &h.owner,
-        h.owner.did(),
-        grant(&h.content_resource.to_string(), "tinycloud.kv/get")?,
-        &[owner_grant],
-        vec![],
-    )?;
-    let (status, body) = authorize_delivery_with(&client, authorization, request(9)?).await;
+    let (status, body) = d
+        .authorize(
+            &h.owner,
+            grant(&h.content_resource.to_string(), "tinycloud.kv/get")?,
+            &[d.owner_grant],
+            Duration::seconds(30),
+            &link,
+        )
+        .await?;
     assert_eq!(status, Status::Ok, "{body}");
     Ok(())
 }
 on_both_backends!(delivery_authorization_refuses_the_enforcement_root);
+
+/// A delivery authorization holds the holder's session, by any encoding of
+/// its CID, to its policy's conditions: within them it is authorized; an
+/// invocation outliving the policy limit, the session beside another proof,
+/// a share under another policy, or a revoked policy is refused.
+async fn delivery_holds_a_session_to_its_conditions(backend: Backend) -> anyhow::Result<()> {
+    let Some(d) = Delivery::new(backend, "delivery_holds_a_session_to_its_conditions").await?
+    else {
+        return Ok(());
+    };
+    let h = &d.h;
+    let session = session_cid(&h.mint_ok(&d.policy).await?)?;
+    let holder_own = own_root(h, &h.holder).await?;
+    let link = d.share_link(&d.policy).await?;
+    let short = Duration::seconds(30);
+    for session in [session, alias(session)] {
+        let (status, body) = d
+            .authorize(&h.holder, policy_read(h)?, &[session], short, &link)
+            .await?;
+        assert_eq!(status, Status::Ok, "{session}: {body}");
+        let refused = (Status::Forbidden, DELIVERY_REFUSED.to_owned());
+        assert_eq!(
+            d.authorize(
+                &h.holder,
+                policy_read(h)?,
+                &[session],
+                Duration::seconds(90),
+                &link
+            )
+            .await?,
+            refused,
+            "lifetime {session}"
+        );
+        for proofs in [vec![session, holder_own], vec![holder_own, session]] {
+            assert_eq!(
+                d.authorize(&h.holder, policy_read(h)?, &proofs, short, &link)
+                    .await?,
+                refused,
+                "{proofs:?}"
+            );
+        }
+    }
+
+    // The same content shared under another policy.
+    let other = h.register_ok(policy_window()).await?;
+    let other_link = d.share_link(&other).await?;
+    for session in [session, alias(session)] {
+        assert_eq!(
+            d.authorize(&h.holder, policy_read(h)?, &[session], short, &other_link)
+                .await?,
+            (Status::Forbidden, DELIVERY_REFUSED.to_owned()),
+            "other policy {session}"
+        );
+    }
+
+    // The space owner revokes the session's policy root.
+    d.share_link(&d.policy).await?;
+    h.revoke(&h.space_owner, &d.policy.policy_root_cid).await?;
+    for session in [session, alias(session)] {
+        let (status, body) = d
+            .authorize(&h.holder, policy_read(h)?, &[session], short, &link)
+            .await?;
+        assert!(
+            [Status::Unauthorized, Status::Forbidden].contains(&status) && body == DELIVERY_REFUSED,
+            "revoked {session}: {status} {body}"
+        );
+    }
+    Ok(())
+}
+on_both_backends!(delivery_holds_a_session_to_its_conditions);
