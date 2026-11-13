@@ -370,6 +370,7 @@ fn child_grant(
     device_did: &str,
     space: &SpaceId,
     parent: tinycloud_core::hash::Hash,
+    parent_expiration: tinycloud_auth::ssi::claims::jwt::NumericDate,
 ) -> Result<String> {
     use tinycloud_auth::{
         authorization::{HeaderEncode, TinyCloudDelegation},
@@ -387,7 +388,7 @@ fn child_grant(
             issuer: issuer_vm.parse::<DIDURLBuf>()?,
             audience: device_did.parse()?,
             not_before: None,
-            expiration: test_invocation_expiration(),
+            expiration: parent_expiration,
             nonce: Some(uuid::Uuid::new_v4().to_string()),
             facts: None,
             proof: vec![parent.to_cid(0x55)],
@@ -442,6 +443,11 @@ async fn fenced_delegate_matches_genuine_revoked_chain_without_storing_metadata(
     let device_vm = tc341_verification_method(&device)?;
     let device_did = device_vm.split('#').next().unwrap();
     let root = signed_grant(&owner_key, &owner, device_did, &space)?;
+    let tinycloud_auth::authorization::TinyCloudDelegation::Ucan(parent_ucan) = &root.0.delegation
+    else {
+        anyhow::bail!("expected UCAN fixture");
+    };
+    let parent_expiration = parent_ucan.payload().expiration;
     let parent = root.content_hash();
     let owner_header = tinycloud_auth::authorization::HeaderEncode::encode(&root.0.delegation)?;
     let (_c_dirs, c, c_db, c_fence) = privacy_world(&space, false, keys.clone()).await?;
@@ -490,7 +496,14 @@ async fn fenced_delegate_matches_genuine_revoked_chain_without_storing_metadata(
     }
     .insert(&b_db)
     .await?;
-    let header = child_grant(&device, &device_vm, device_did, &space, parent)?;
+    let header = child_grant(
+        &device,
+        &device_vm,
+        device_did,
+        &space,
+        parent,
+        parent_expiration,
+    )?;
     let before = metadata_counts(&a_db).await?;
     let a = Client::tracked(a).await?;
     let b = Client::tracked(b).await?;
