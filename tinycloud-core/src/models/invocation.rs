@@ -555,14 +555,15 @@ async fn validate_capabilities<C: ConnectionTrait>(
             // the persisted chain ability row already has a matching or
             // stricter caveat.
             let mut terminal_cids = std::collections::HashSet::new();
-            if dependant_caps.iter().any(|cap| matches!(&cap.resource,
-                Resource::TinyCloud(resource) if matches!(resource.service().as_str(), "sql" | "duckdb"))) {
-                for id in root_ids.iter().flat_map(|id| graph.chain_ids_from(id)) {
-                    if graph.is_parentless(&id) && graph.delegation(&id).is_some_and(|row| {
-                        dependant_caps.iter().any(|cap| !is_root_authority(cap, &row.delegator))
-                    }) {
-                        terminal_cids.insert(id.to_cid(0x55).to_string());
-                    }
+            for id in root_ids.iter().flat_map(|id| graph.chain_ids_from(id)) {
+                if graph.is_parentless(&id)
+                    && graph.delegation(&id).is_some_and(|row| {
+                        dependant_caps
+                            .iter()
+                            .any(|cap| !is_root_authority(cap, &row.delegator))
+                    })
+                {
+                    terminal_cids.insert(id.to_cid(0x55).to_string());
                 }
             }
             let registered_policy_roots = if terminal_cids.is_empty() {
@@ -628,63 +629,51 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     return Err(InvocationError::CaveatsNotContained(reason).into());
                 }
 
-                // A pre-N2 SQL/DuckDB child may have been stored under the
-                // old descendant rule. At least one cited proof chain must
-                // contain this invocation at every ancestor up to the space
-                // owner; an owner-issued delegation is the authority
-                // boundary, as at registration. Do not require unrelated
-                // parallel proofs to cover it, and do not combine a valid
-                // ancestor from one proof with caveats from another proof.
-                if matches!(
-                    &c.resource,
-                    Resource::TinyCloud(resource)
-                        if matches!(resource.service().as_str(), "sql" | "duckdb")
+                // Every delegated invocation needs one covering chain ending
+                // at the resource owner or a live registered policy root.
+                // TC-1791: the invocation's own SQL/DuckDB caveats must be
+                // accepted, and a stored row whose caveats are not accepted
+                // does not cover the invocation.
+                if let Some(reason) = crate::models::delegation::unsupported_sql_caveat(
+                    c.ability.as_ref().as_ref(),
+                    &c.caveats,
                 ) {
-                    // TC-1791: the invocation's own SQL/DuckDB caveats must be
-                    // accepted, and a stored row whose caveats are not accepted
-                    // does not cover the invocation.
-                    if let Some(reason) = crate::models::delegation::unsupported_sql_caveat(
-                        c.ability.as_ref().as_ref(),
-                        &c.caveats,
-                    ) {
-                        return Err(InvocationError::UnsupportedCaveat(reason).into());
-                    }
-                    let covers = |ability: &abilities::Model| {
-                        c.resource.extends(&ability.resource)
-                            && crate::policy_capability::ability_matches(
-                                ability.ability.as_ref().as_ref(),
-                                c.ability.as_ref().as_ref(),
-                            )
-                            && ability_caveats_contain_child(
-                                c.ability.as_ref().as_ref(),
-                                &ability.caveats,
-                                &c.caveats,
-                                delegated_sql_caveats,
-                            )
-                            .is_ok()
-                            && crate::models::delegation::unsupported_stored_sql_caveat(
-                                ability.ability.as_ref().as_ref(),
-                                &ability.caveats,
-                                delegated_sql_caveats,
-                            )
-                            .is_none()
-                    };
-                    let valid_chain = graph.has_covering_chain(
-                        parents.iter().map(|(parent, _)| parent.id),
-                        covers,
-                        |row| {
-                            is_root_authority(c, &row.delegator)
-                                || registered_policy_roots
-                                    .contains(&row.id.to_cid(0x55).to_string())
-                        },
-                    );
-                    if !valid_chain {
-                        return Err(InvocationError::UnauthorizedAction(
-                            Box::new(c.resource.clone()),
-                            c.ability.clone(),
+                    return Err(InvocationError::UnsupportedCaveat(reason).into());
+                }
+                let covers = |ability: &abilities::Model| {
+                    c.resource.extends(&ability.resource)
+                        && crate::policy_capability::ability_matches(
+                            ability.ability.as_ref().as_ref(),
+                            c.ability.as_ref().as_ref(),
                         )
-                        .into());
-                    }
+                        && ability_caveats_contain_child(
+                            c.ability.as_ref().as_ref(),
+                            &ability.caveats,
+                            &c.caveats,
+                            delegated_sql_caveats,
+                        )
+                        .is_ok()
+                        && crate::models::delegation::unsupported_stored_sql_caveat(
+                            ability.ability.as_ref().as_ref(),
+                            &ability.caveats,
+                            delegated_sql_caveats,
+                        )
+                        .is_none()
+                };
+                let valid_chain = graph.has_covering_chain(
+                    parents.iter().map(|(parent, _)| parent.id),
+                    covers,
+                    |row| {
+                        is_root_authority(c, &row.delegator)
+                            || registered_policy_roots.contains(&row.id.to_cid(0x55).to_string())
+                    },
+                );
+                if !valid_chain {
+                    return Err(InvocationError::UnauthorizedAction(
+                        Box::new(c.resource.clone()),
+                        c.ability.clone(),
+                    )
+                    .into());
                 }
             }
             Ok(())
@@ -1831,13 +1820,53 @@ mod tests {
             .encode()
             .unwrap()
         }
-        for service in ["sql", "duckdb"] {
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        };
+        let registry_queries = Arc::new(AtomicUsize::new(0));
+        let registry_nanos = Arc::new(AtomicU64::new(0));
+        let (queries, nanos) = (registry_queries.clone(), registry_nanos.clone());
+        let mut measured_db = db.clone();
+        measured_db.set_metric_callback(move |info| {
+            if info.statement.sql.starts_with("SELECT")
+                && info.statement.sql.contains("\"policy_v3_root\"")
+            {
+                queries.fetch_add(1, Ordering::Relaxed);
+                nanos.fetch_add(info.elapsed.as_nanos() as u64, Ordering::Relaxed);
+            }
+        });
+        let db = &measured_db;
+        for (service, action) in [
+            ("sql", "read"),
+            ("duckdb", "read"),
+            ("kv", "get"),
+            ("kv", "put"),
+            ("kv", "del"),
+            ("kv", "delete"),
+            ("kv", "list"),
+            ("kv", "metadata"),
+            ("capabilities", "read"),
+            ("encryption", "decrypt"),
+            ("encryption", "key.create"),
+        ] {
             let (owner_key, owner) = identity();
             let (holder_key, holder) = identity();
             let (child_key, child) = identity();
             let space = SpaceId::new(owner.parse().unwrap(), "files".parse().unwrap()).unwrap();
-            let resource = format!("{space}/{service}/db");
-            let ability = format!("tinycloud.{service}/read");
+            let resource = if service == "encryption" {
+                format!("urn:tinycloud:encryption:{owner}:default/docs/key")
+            } else {
+                format!(
+                    "{space}/{service}/{}",
+                    if service == "capabilities" {
+                        "all"
+                    } else {
+                        "db"
+                    }
+                )
+            };
+            let ability = format!("tinycloud.{service}/{action}");
             let now = OffsetDateTime::now_utc();
             let invoke = |key: &JWK, issuer: &str, parents: Vec<_>| {
                 let encoded = token(
@@ -1966,6 +1995,40 @@ mod tests {
             .await
             .unwrap();
             verify_and_authorize(db, &invocation, now).await.unwrap();
+            let batch = (0..100)
+                .map(|index| {
+                    let mut capability = root.0.capabilities[0].clone();
+                    if service == "kv" {
+                        capability.resource = format!("{resource}/key{index}").parse().unwrap();
+                    }
+                    capability
+                })
+                .collect::<Vec<_>>();
+            let before = registry_queries.load(Ordering::Relaxed);
+            authorize_holder(db, &holder, &batch, &[grant_cid], now)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry_queries.load(Ordering::Relaxed),
+                before,
+                "owner-only chain must not look up registry"
+            );
+            let before = registry_queries.load(Ordering::Relaxed);
+            let nanos_before = registry_nanos.load(Ordering::Relaxed);
+            authorize_holder(db, &holder, &batch, &[root_cid], now)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry_queries.load(Ordering::Relaxed) - before,
+                1,
+                "batch must look up registry once"
+            );
+            eprintln!(
+                "{:?} {ability}: registry lookups owner=0, registered batch100=1, elapsed={}ns",
+                db.get_database_backend(),
+                registry_nanos.load(Ordering::Relaxed) - nanos_before
+            );
+
             for (revoked_at, revocation_bytes) in [
                 (Some("2026-01-01T00:00:00Z".to_owned()), None),
                 (None, Some(vec![1_u8])),
