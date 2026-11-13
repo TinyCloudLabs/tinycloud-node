@@ -676,6 +676,18 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
     }
 
+    /// Persist an owned cumulative WAL against the caller's exact checkpoint.
+    async fn save_wal_snapshot(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _snapshot: tempfile::NamedTempFile,
+        _expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -1123,6 +1135,18 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         expected: ArtifactExpectation,
     ) -> Result<ArtifactMeta, DatabaseArtifactError> {
         self.write_chunk_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
+    async fn save_wal_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.write_chunk_file(service, space, name, snapshot, expected, ArtifactPart::Wal)
             .await
     }
 

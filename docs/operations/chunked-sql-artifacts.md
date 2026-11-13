@@ -1,6 +1,6 @@
 # Opt-in SQL checkpoint parts
 
-The first TC-2917 slice stores SQL checkpoints as immutable PostgreSQL parts.
+Opt-in SQL persistence stores checkpoints and cumulative WAL as immutable PostgreSQL parts.
 Each payload statement carries at most 1 MiB. A metadata-only compare-and-swap
 publishes a sealed part; successful writes retain the existing durability and
 lineage semantics. Hydration verifies the part CID before publishing its cache.
@@ -26,8 +26,12 @@ by this slice. The account capacity is charged to the space owner, across its
 spaces, including legacy live artifacts, staged uploads and retained parts.
 Reservations are atomic per owner. Quota refusal uses the SQL storage refusal.
 
-This slice publishes a full checkpoint for each SQL mutation. WAL parts,
-conversion of existing artifacts follow separately.
+After a checkpoint, file-backed SQL mutations can publish an owned cumulative WAL
+smaller than 8 MiB without rewriting the checkpoint. Larger WALs and writes
+forbidden from growing use a fresh checkpoint. In-memory databases use
+checkpoints. Both kinds of part use the same 1 MiB statement limit, and the
+artifact ceiling covers checkpoint plus WAL together. Conversion of existing
+artifacts follows separately.
 Aborted and superseded parts enter a fenced deleting state; reclamation deletes
 at most one payload chunk per statement and releases its charge only after all
 bytes are gone. A periodic collector recovers uploads whose 120-second lease
@@ -40,7 +44,7 @@ convert published parts back to legacy blobs. Current readers understand both
 layouts; legacy persistence refuses a database already using parts.
 
 Do not enable for prolonged operation until the approved ceiling load acceptance and
-remaining migration/WAL slices are complete. On each test release, report
+remaining conversion and DuckDB slices are complete. On each test release, report
 reserved, staged and retained bytes from the following metadata-only inventory:
 
 ```sql
@@ -101,3 +105,16 @@ per 10-second tick. GC lock acquisition waits at most 50 ms per statement.
 An owner already above its quota can replace a database with an equal or
 smaller image; that exception admits no growth and does not free pending shrink
 capacity for other databases.
+
+A WAL publication checks the exact durable revision and checkpoint CID. It
+replaces only the WAL pointer and logical CID, advancing the layout generation;
+the checkpoint pointer and bytes remain unchanged. Readers verify each part CID
+and the combined logical CID, then recheck both pointers and the generation
+before publishing the cache. A full checkpoint retires both previous parts.
+Each retired part releases its charge and associated overlap credit only after
+its final chunk is removed, so a partially collected pair stays accounted.
+
+Roll out WAL-capable readers to every instance before enabling the switch.
+Checkpoint-only part readers fail closed on WAL layouts. Schema changes are
+forward-only; switching the feature off keeps existing layouts readable and
+writable by the current binary, and does not downgrade their format.
