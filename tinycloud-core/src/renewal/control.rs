@@ -81,7 +81,7 @@ pub fn bind_request(
             .filter(|generation| *generation <= MAX_GENERATION)
             .ok_or(InvalidInput)?;
         if request.expected_generation != Some(generation) {
-            return Err(InvalidInput);
+            return Err(super::RenewalStoreError::Unauthorized);
         }
         Some(generation)
     };

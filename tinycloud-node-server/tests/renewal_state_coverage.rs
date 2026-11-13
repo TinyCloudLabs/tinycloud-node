@@ -111,8 +111,8 @@ async fn refusal_profiles_leave_state_stamps_and_nonce_reservations_unchanged() 
     cases.push((
         Some(stop.clone()),
         wrong_body,
-        Status::BadRequest,
-        "invalid_request",
+        Status::Forbidden,
+        "unauthorized_control",
     ));
     let mut extra = body.clone();
     extra["state"] = json!("active");
