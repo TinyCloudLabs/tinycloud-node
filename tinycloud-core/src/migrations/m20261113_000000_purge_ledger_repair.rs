@@ -23,19 +23,9 @@ impl MigrationTrait for Migration {
         manager
             .create_table(repair.if_not_exists().to_owned())
             .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .if_not_exists()
-                    .name("space_purge_prefix_repair_exact")
-                    .table(space_purge_prefix_repair::Entity)
-                    .col(space_purge_prefix_repair::Column::ObjectKey)
-                    .col(space_purge_prefix_repair::Column::StoreKind)
-                    .col(space_purge_prefix_repair::Column::PrefixHmac)
-                    .unique()
-                    .to_owned(),
-            )
-            .await?;
+        // Only pending repairs conflict: a newly observed restored prefix gets
+        // a NEW repair job, never a downgrade of an earlier completed repair.
+        manager.get_connection().execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS space_purge_prefix_repair_exact ON space_purge_prefix_repair (object_key,store_kind,prefix_hmac) WHERE phase='pending'").await?;
         Ok(())
     }
     async fn down(&self, _: &SchemaManager) -> Result<(), DbErr> {
