@@ -3226,7 +3226,7 @@ pub(crate) mod tests {
         let counter = locks.clone();
         let mut conn = conn.clone();
         conn.set_metric_callback(move |info| {
-            if info.statement.sql.contains("pg_advisory_xact_lock") {
+            if info.statement.sql.contains("pg_advisory_xact_lock(") {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         });

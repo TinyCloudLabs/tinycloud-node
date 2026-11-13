@@ -56,9 +56,9 @@ pub use sql_sizes::{SizeTrackingArtifactRepository, SqlSizes};
 
 pub mod resource_purge_fence;
 pub mod space_purge_auth;
-pub mod space_purge_fence;
-pub mod space_purge_ledger;
 mod space_purge_cache;
 pub mod space_purge_database;
+pub mod space_purge_fence;
+pub mod space_purge_ledger;
 pub mod space_purge_records;
 pub mod space_purge_worker;
