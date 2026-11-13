@@ -79,6 +79,7 @@ k256 = "0.13"
 # material on drop.
 hkdf = "0.12"
 hmac = "0.12"
+subtle = "2.6"
 zeroize = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 ryu-js = "0.2.2"

@@ -14,6 +14,50 @@ fn refused() -> DbErr {
     DbErr::Custom("retirement snapshot unavailable or unverifiable".into())
 }
 
+fn same_manifest(
+    left: &RetirementSnapshotCommitment,
+    right: &RetirementSnapshotCommitment,
+) -> bool {
+    fn digest_matches(left: &str, right: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        let (mut left_bytes, mut right_bytes) = ([0u8; 32], [0u8; 32]);
+        if hex::decode_to_slice(left, &mut left_bytes).is_err()
+            || hex::decode_to_slice(right, &mut right_bytes).is_err()
+        {
+            return false;
+        }
+        bool::from(left_bytes.ct_eq(&right_bytes))
+    }
+    digest_matches(&left.snapshot_hmac, &right.snapshot_hmac)
+        & digest_matches(&left.target_hmac, &right.target_hmac)
+        & digest_matches(&left.network_hmac, &right.network_hmac)
+}
+fn has_manifest(record: &LedgerRecord, expected: &RetirementSnapshotCommitment) -> bool {
+    record
+        .retirement_snapshots
+        .iter()
+        .fold(false, |found, candidate| {
+            same_manifest(candidate, expected) | found
+        })
+}
+
+fn same_row(left: &stored::Model, right: &stored::Model) -> bool {
+    use subtle::ConstantTimeEq;
+    let commitments_match = left.snapshot_commitment.len() == 32
+        && right.snapshot_commitment.len() == 32
+        && bool::from(
+            left.snapshot_commitment
+                .as_slice()
+                .ct_eq(right.snapshot_commitment.as_slice()),
+        );
+    commitments_match
+        && left.retirement_id == right.retirement_id
+        && left.hmac_key_id == right.hmac_key_id
+        && left.target_hmac == right.target_hmac
+        && left.network_hmac == right.network_hmac
+        && left.snapshot_body == right.snapshot_body
+}
+
 pub struct AuthenticatedRetirementSnapshot {
     snapshot: ResourceDependencySnapshot,
     retirement_id: String,
@@ -65,12 +109,16 @@ impl PreparedSnapshot {
             || verified.state != "retired"
             || verified.operation_id != self.row.retirement_id
             || verified.key_id != self.row.hmac_key_id
-            || !verified.retirement_snapshots.contains(&self.manifest)
+            || !has_manifest(&verified, &self.manifest)
         {
             return Err(refused());
         }
         // Re-parse and authenticate at write time too, rather than trusting a
         // data wrapper merely because it was constructed earlier.
+        crate::resource_purge_dependencies::check_snapshot_budget(
+            self.row.snapshot_body.as_bytes(),
+        )
+        .map_err(|_| refused())?;
         let target = ResourceTarget::parse(
             serde_json::from_slice::<serde_json::Value>(self.row.snapshot_body.as_bytes())
                 .map_err(|_| refused())?[0]
@@ -82,8 +130,8 @@ impl PreparedSnapshot {
             ResourceDependencySnapshot::from_db_bytes(&target, self.row.snapshot_body.as_bytes())
                 .map_err(|_| refused())?;
         let rebuilt = prepare(keys, &verified.key_id, &verified.operation_id, &snapshot)?;
-        if self.row != rebuilt.row
-            || self.manifest != rebuilt.manifest
+        if !same_row(&self.row, &rebuilt.row)
+            || !same_manifest(&self.manifest, &rebuilt.manifest)
             || hex::encode(
                 keys.target_hmac(&verified.key_id, "owner", target.owner_did())
                     .map_err(|_| refused())?,
@@ -97,7 +145,7 @@ impl PreparedSnapshot {
             self.row.target_hmac.clone(),
         );
         if let Some(existing) = stored::Entity::find_by_id(id).one(tx).await? {
-            if existing != self.row {
+            if !same_row(&existing, &self.row) {
                 return Err(refused());
             }
             return Ok(());
@@ -189,6 +237,12 @@ pub async fn load_authenticated(
         .one(conn)
         .await?
         .ok_or_else(refused)?;
+    // Owner retirement fences are permanent and have no expiry or reopen transition.
+    // Generation is only a positive fence marker, not an acceptance version:
+    // fence_hmac preserves max(generation, 1), and no reader authority depends
+    // on its magnitude. The immutable retirement UUID/time and ledger manifest
+    // bind this acceptance; changing one positive generation to another grants
+    // no permission and cannot bypass a resource fence.
     if retirement.retirement_id != verified.operation_id
         || retirement.accepted_at.unix_timestamp() != verified.timestamp
         || !state.fenced
@@ -210,7 +264,7 @@ pub async fn load_authenticated(
     let snapshot = ResourceDependencySnapshot::from_db_bytes(target, row.snapshot_body.as_bytes())
         .map_err(|_| refused())?;
     let expected = prepare(keys, &verified.key_id, &verified.operation_id, &snapshot)?;
-    if row != expected.row || !verified.retirement_snapshots.contains(&expected.manifest) {
+    if !same_row(&row, &expected.row) || !has_manifest(&verified, &expected.manifest) {
         return Err(refused());
     }
     Ok(AuthenticatedRetirementSnapshot {

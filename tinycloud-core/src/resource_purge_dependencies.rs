@@ -4,6 +4,42 @@ use crate::{hash::Hash, resource_purge_fence::ResourceTarget};
 use std::collections::BTreeSet;
 use tinycloud_auth::ipld_core::cid::Cid;
 
+pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+pub const MAX_SNAPSHOT_IDENTITIES: usize = 4096;
+pub const MAX_SNAPSHOT_STRING_BYTES: usize = 4096;
+
+/// Bound allocation before JSON parsing, including escaped string input.
+pub(crate) fn check_snapshot_budget(bytes: &[u8]) -> Result<(), DependencySnapshotError> {
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(DependencySnapshotError);
+    }
+    let (mut quoted, mut escaped, mut length, mut arrays) = (false, false, 0usize, 0usize);
+    for &byte in bytes {
+        if quoted {
+            length += 1;
+            if length > MAX_SNAPSHOT_STRING_BYTES {
+                return Err(DependencySnapshotError);
+            }
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+            length = 0;
+        } else if byte == b'[' {
+            arrays += 1;
+            if arrays > MAX_SNAPSHOT_IDENTITIES + 2 {
+                return Err(DependencySnapshotError);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum DependencyIdentity {
     Grant(Hash),
@@ -122,18 +158,51 @@ impl ResourceDependencySnapshot {
 
     /// Stable tagged canonical identities, suitable only for protected DB rows.
     pub fn to_db_bytes(&self) -> Result<Vec<u8>, DependencySnapshotError> {
+        if self.identities.len() > MAX_SNAPSHOT_IDENTITIES {
+            return Err(DependencySnapshotError);
+        }
+        // Bound strings and a conservative JSON escape expansion before cloning
+        // identities or allocating the encoded buffer.
+        let mut estimated = self
+            .target
+            .as_str()
+            .len()
+            .checked_mul(6)
+            .ok_or(DependencySnapshotError)?;
+        if self.target.as_str().len() >= MAX_SNAPSHOT_STRING_BYTES {
+            return Err(DependencySnapshotError);
+        }
+        for identity in &self.identities {
+            let length = match identity {
+                DependencyIdentity::Member(did) => did.len(),
+                _ => 128,
+            };
+            if length >= MAX_SNAPSHOT_STRING_BYTES {
+                return Err(DependencySnapshotError);
+            }
+            estimated = estimated
+                .checked_add(length.checked_mul(6).ok_or(DependencySnapshotError)? + 32)
+                .ok_or(DependencySnapshotError)?;
+            if estimated > MAX_SNAPSHOT_BYTES {
+                return Err(DependencySnapshotError);
+            }
+        }
         let rows: Vec<_> = self
             .identities
             .iter()
             .map(DependencyIdentity::tagged)
             .collect();
-        serde_json::to_vec(&(self.target.as_str(), rows)).map_err(|_| DependencySnapshotError)
+        let bytes = serde_json::to_vec(&(self.target.as_str(), rows))
+            .map_err(|_| DependencySnapshotError)?;
+        check_snapshot_budget(&bytes)?;
+        Ok(bytes)
     }
     /// Require exact canonical order/encoding; this is not MAC verification.
     pub fn from_db_bytes(
         target: &ResourceTarget,
         bytes: &[u8],
     ) -> Result<Self, DependencySnapshotError> {
+        check_snapshot_budget(bytes)?;
         let (raw_target, rows): (String, Vec<(String, String)>) =
             serde_json::from_slice(bytes).map_err(|_| DependencySnapshotError)?;
         if raw_target != target.as_str() {
@@ -174,6 +243,10 @@ impl ResourceDependencySnapshot {
         target: ResourceTarget,
         identities: Vec<DependencyIdentity>,
     ) -> Result<Self, DependencySnapshotError> {
+        if identities.len() > MAX_SNAPSHOT_IDENTITIES
+            || target.as_str().len() >= MAX_SNAPSHOT_STRING_BYTES
+            || identities.iter().any(|identity| matches!(identity, DependencyIdentity::Member(did) if did.len() >= MAX_SNAPSHOT_STRING_BYTES))
+        { return Err(DependencySnapshotError); }
         let rows: BTreeSet<_> = identities.iter().map(DependencyIdentity::tagged).collect();
         let identities = rows
             .into_iter()

@@ -105,7 +105,9 @@ impl LedgerRecord {
         }
     }
     fn validate(&self) -> Result<(), LedgerError> {
-        if !matches!(self.version, 1..=3)
+        if self.retirement_snapshots.len() > 4096
+            || self.prefixes.len() > 4096
+            || !matches!(self.version, 1..=3)
             || (self.version == 3 && (self.kind != "owner" || !self.prefixes.is_empty()))
             || (self.version != 3 && !self.retirement_snapshots.is_empty())
             || self
@@ -162,6 +164,30 @@ impl LedgerRecord {
         }
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, LedgerError> {
+        if self.retirement_snapshots.len() > 4096
+            || self.prefixes.len() > 4096
+            || [
+                &self.key_id,
+                &self.kind,
+                &self.target_hmac,
+                &self.operation_id,
+                &self.state,
+            ]
+            .iter()
+            .any(|value| value.len() > 4096)
+            || self.retirement_snapshots.iter().any(|row| {
+                [&row.target_hmac, &row.network_hmac, &row.snapshot_hmac]
+                    .iter()
+                    .any(|value| value.len() > 64)
+            })
+            || self
+                .prefixes
+                .iter()
+                .any(|row| row.store_kind.len() > 64 || row.prefix_hmac.len() > 64)
+            || self.mac.len() > 64
+        {
+            return Err(LedgerError);
+        }
         serde_json::to_vec(self).map_err(|_| LedgerError)
     }
 }
@@ -347,6 +373,8 @@ impl LedgerKeys {
         retirement_id: &str,
         canonical_body: &[u8],
     ) -> Result<Vec<u8>, LedgerError> {
+        crate::resource_purge_dependencies::check_snapshot_budget(canonical_body)
+            .map_err(|_| LedgerError)?;
         let retirement = uuid::Uuid::parse_str(retirement_id).map_err(|_| LedgerError)?;
         if retirement.to_string() != retirement_id {
             return Err(LedgerError);
@@ -407,6 +435,9 @@ impl LedgerKeys {
     }
     /// The object key is authenticated by matching it to the verified fields.
     pub fn verify(&self, object_key: &str, body: &[u8]) -> Result<LedgerRecord, LedgerError> {
+        if body.len() > 4 * 1024 * 1024 {
+            return Err(LedgerError);
+        }
         let record: LedgerRecord = serde_json::from_slice(body).map_err(|_| LedgerError)?;
         if record.object_key()? != object_key {
             return Err(LedgerError);

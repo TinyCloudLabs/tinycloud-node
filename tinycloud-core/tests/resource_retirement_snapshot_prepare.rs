@@ -52,3 +52,33 @@ fn prepared_manifest_binds_exact_target_parent_network_and_retirement() {
     )
     .is_err());
 }
+
+#[test]
+fn primitive_admission_refuses_oversized_strings_counts_and_bodies() {
+    let keys = LedgerKeys::new(
+        "test".into(),
+        BTreeMap::from([("test".into(), vec![7; 32])]),
+    )
+    .unwrap();
+    let raw = "urn:tinycloud:encryption:did:pkh:eip155:1:0x1111111111111111111111111111111111111111:default";
+    let target = ResourceTarget::parse(raw).unwrap();
+    let retirement = "00000000-0000-4000-8000-000000000001";
+    let huge = serde_json::to_vec(&(raw, vec![("member", "x".repeat(2 * 1024 * 1024))])).unwrap();
+    assert!(ResourceDependencySnapshot::from_db_bytes(&target, &huge).is_err());
+    assert!(keys
+        .retirement_snapshot_hmac("test", retirement, &huge)
+        .is_err());
+    let long = serde_json::to_vec(&(raw, vec![("member", "x".repeat(4097))])).unwrap();
+    assert!(ResourceDependencySnapshot::from_db_bytes(&target, &long).is_err());
+    assert!(keys
+        .retirement_snapshot_hmac("test", retirement, &long)
+        .is_err());
+    let many = serde_json::to_vec(&(raw, vec![("member", "did:key:a"); 4097])).unwrap();
+    assert!(ResourceDependencySnapshot::from_db_bytes(&target, &many).is_err());
+    assert!(keys
+        .retirement_snapshot_hmac("test", retirement, &many)
+        .is_err());
+    assert!(keys
+        .verify("unused", &vec![b' '; 4 * 1024 * 1024 + 1])
+        .is_err());
+}
