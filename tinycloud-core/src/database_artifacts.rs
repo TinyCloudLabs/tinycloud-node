@@ -1831,13 +1831,12 @@ mod tests {
         assert_eq!(entered.load(Ordering::SeqCst), 4);
     }
 
-    /// The node's statement timeouts: a large save opens a real bulk
-    /// transaction on PostgreSQL (TC-1054).
+    /// The node's statement timeouts (TC-1054), as a save on PostgreSQL runs
+    /// under them.
     fn node_statement_timeouts() -> crate::db_pool::StatementTimeouts {
         crate::db_pool::StatementTimeouts {
             mode: crate::db_pool::StatementTimeoutMode::Local,
             base: std::time::Duration::from_secs(30),
-            bulk: std::time::Duration::from_secs(120),
         }
     }
 
