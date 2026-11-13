@@ -4,6 +4,7 @@
 //! result formatting, native connection open/close and filesystem work do not.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use dashmap::DashMap;
 use sqlparser::ast::Statement;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::hash::Blake3Hasher;
 use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
@@ -36,6 +38,11 @@ enum DbMessage {
         response_tx: oneshot::Sender<Result<Vec<u8>, DuckDbError>>,
     },
     Wal {
+        response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
+    },
+    WalForCheckpoint {
+        checkpoint_size: u64,
+        checkpoint_hash: String,
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
     },
     Shutdown {
@@ -107,6 +114,30 @@ impl DatabaseHandle {
             .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
     }
 
+    /// Copy a WAL only when its local main file still matches the durable
+    /// checkpoint. Both operations run under the same actor fence.
+    pub async fn wal_for_checkpoint(
+        &self,
+        checkpoint_size: u64,
+        checkpoint_hash: String,
+    ) -> Result<Option<Vec<u8>>, DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::WalForCheckpoint {
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                },
+            ))
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".into()))?
+    }
+
     /// Stop the actor and close its database before the cache is discarded.
     pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -175,7 +206,8 @@ pub fn spawn_actor(
                                     e
                                 ))));
                             }
-                            DbMessage::Wal { response_tx } => {
+                            DbMessage::Wal { response_tx }
+                            | DbMessage::WalForCheckpoint { response_tx, .. } => {
                                 let _ = response_tx.send(Err(DuckDbError::Internal(format!(
                                     "Failed to open: {}",
                                     e
@@ -257,6 +289,19 @@ pub fn spawn_actor(
                     let result = handle_wal(&mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::WalForCheckpoint {
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                } => {
+                    let result = handle_wal_for_checkpoint(
+                        &mode,
+                        &file_path,
+                        checkpoint_size,
+                        &checkpoint_hash,
+                    );
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Shutdown { response_tx } => {
                     shutdown = Some(response_tx);
                     break;
@@ -282,6 +327,44 @@ pub fn spawn_actor(
     });
 
     DatabaseHandle { id, tx }
+}
+
+fn handle_wal_for_checkpoint(
+    mode: &StorageMode,
+    file_path: &Path,
+    checkpoint_size: u64,
+    checkpoint_hash: &str,
+) -> Result<Option<Vec<u8>>, DuckDbError> {
+    if !matches!(mode, StorageMode::File(_)) {
+        return Ok(None);
+    }
+    let mut file =
+        std::fs::File::open(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    if file
+        .metadata()
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
+        .len()
+        != checkpoint_size
+    {
+        return Ok(None);
+    }
+    // DuckDB can place new blocks in the main file while recording only their
+    // references in the WAL. Such a WAL cannot replay on the older checkpoint.
+    let mut hasher = Blake3Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hasher.finalize().to_cid(0x55).to_string() != checkpoint_hash {
+        return Ok(None);
+    }
+    handle_wal(mode, file_path)
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, DuckDbError> {
