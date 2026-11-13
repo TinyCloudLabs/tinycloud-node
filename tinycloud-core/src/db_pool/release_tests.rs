@@ -3,7 +3,11 @@
 //! that transaction: acknowledged, then lost when it ends without a commit.
 
 use sea_orm::sqlx::{self, postgres::PgPoolOptions, Executor, PgPool};
+use sea_orm::TransactionTrait;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::request_cancel::{run_with_deadline, DeadlineExceeded};
 use crate::test_support::PostgresTestSchema;
@@ -103,6 +107,94 @@ async fn postgres_a_deadline_during_begin_returns_the_connection_outside_a_trans
     })
     .await;
     assert_eq!(cut.err(), Some(DeadlineExceeded));
+
+    assert_eq!(
+        next_borrower_writes(&pool, admin).await,
+        NextBorrower {
+            pid,
+            state: "idle".into(),
+            write_survived: true,
+        }
+    );
+}
+
+/// A TCP proxy to `upstream` that delays each server-to-client chunk by
+/// `delay_ms` while it is non-zero, as a slow database link does. Returns its
+/// port.
+async fn delaying_proxy(upstream: (String, u16), delay_ms: Arc<AtomicU64>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = tokio::net::TcpStream::connect((upstream.0.as_str(), upstream.1))
+                .await
+                .unwrap();
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut server_read, mut server_write) = server.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+            });
+            let delay_ms = Arc::clone(&delay_ms);
+            tokio::spawn(async move {
+                let mut buf = vec![0; 64 * 1024];
+                while let Ok(n @ 1..) = server_read.read(&mut buf).await {
+                    let delay = delay_ms.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    if client_write.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// The node's own path: a SeaORM transaction whose `BEGIN` reply is still on
+/// a slow link when the request deadline cuts it. The connection goes back
+/// to the pool outside any transaction and the next borrower's write stays.
+#[tokio::test]
+async fn postgres_a_deadline_during_a_sea_orm_begin_returns_the_connection_outside_a_transaction() {
+    let Some(fixture) = PostgresTestSchema::new(
+        "postgres_a_deadline_during_a_sea_orm_begin_returns_the_connection_outside_a_transaction",
+    )
+    .await
+    else {
+        return;
+    };
+    let admin = fixture.conn.get_postgres_connection_pool();
+    let direct = single_connection_pool(&fixture).await;
+    let options = direct.connect_options().as_ref().clone();
+    direct.close().await;
+    let delay_ms = Arc::new(AtomicU64::new(0));
+    let port = delaying_proxy(
+        (options.get_host().to_owned(), options.get_port()),
+        Arc::clone(&delay_ms),
+    )
+    .await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .connect_with(options.host("127.0.0.1").port(port))
+        .await
+        .unwrap();
+    let pid = backend_pid(&pool).await;
+    let db = sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+    // Only once the connection is back in the pool, so the deadline cuts the
+    // BEGIN and not the acquire waiting for the release ping.
+    while pool.num_idle() == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    delay_ms.store(300, Ordering::SeqCst);
+    let cut = run_with_deadline(Some(Duration::from_millis(100)), async {
+        db.begin().await.map(drop)
+    })
+    .await;
+    assert_eq!(cut.err(), Some(DeadlineExceeded));
+    delay_ms.store(0, Ordering::SeqCst);
 
     assert_eq!(
         next_borrower_writes(&pool, admin).await,

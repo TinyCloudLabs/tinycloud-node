@@ -3075,7 +3075,13 @@ where
             // never hold a transaction, pool connection, sequence or writer
             // lock during upload.
             let protected = !legacy_spaces.is_empty();
-            let _legacy_sqlite_sequence = if protected && self.writer_lock.is_some() {
+            // Protected writes take the sequence guards before BEGIN on every
+            // backend (TC-2954). Taken after BEGIN, as PostgreSQL once did, a
+            // protected writer queued for them while pinning its pooled
+            // connection, behind ordinary writers that hold them and need a
+            // connection for their own BEGIN. Same-space ordinary writers now
+            // wait out the protected upload, holding no connection.
+            let _legacy_sequence = if protected {
                 self.acquire_space_sequence_guards(&sequence_spaces).await
             } else {
                 Vec::new()
@@ -3102,10 +3108,10 @@ where
                 )
                 .await?;
             }
-            // PG sequence guards are taken after upload. SQLite takes them
-            // before its writer mutex and BEGIN. The protected SQLite writer
-            // already holds both guards above.
-            let _sequence_guards = if protected && self.writer_lock.is_some() {
+            // Ordinary writes take the sequence guards only now, after upload
+            // (SQLite: before its writer mutex and BEGIN). A protected writer
+            // already holds them.
+            let _sequence_guards = if protected {
                 Vec::new()
             } else {
                 self.acquire_space_sequence_guards(&sequence_spaces).await
@@ -7320,6 +7326,88 @@ mod test {
         assert!(frozen);
         assert!(storage.inner.contains(&space, &hash, 0).await.unwrap());
         assert_eq!(reader.kv_get(&space, &path).await.unwrap().unwrap().1, hash);
+    }
+
+    /// TC-2954: a protected legacy writer queues for its space's sequence
+    /// guard before BEGIN, so waiting behind a same-space writer pins no
+    /// pooled connection; that writer needs one for its own BEGIN.
+    #[tokio::test]
+    async fn postgres_legacy_writer_queues_for_the_sequence_guard_without_a_connection() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_legacy_writer_queues_for_the_sequence_guard_without_a_connection",
+        )
+        .await
+        else {
+            return;
+        };
+        let storage = LegacyPausedStore::default();
+        let db = SpaceDatabase::new(
+            schema.conn.clone(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("pg-legacy-guard-before-begin");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/queued"
+            .parse()
+            .unwrap();
+        let pool = schema.conn.get_postgres_connection_pool();
+        let in_use = || pool.size() as usize - pool.num_idle();
+        // Setup's connections go back to the pool on spawned tasks.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while in_use() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("setup returns its connections");
+        // A same-space writer holds the guard; the upload itself never pauses.
+        let guard = db
+            .acquire_space_sequence_guards(std::slice::from_ref(&space))
+            .await;
+        storage.release.notify_one();
+        let writer_db = db.clone();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"queued legacy write").await.unwrap();
+            writer_db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        // Long enough for the writer to register, and, were it to begin before
+        // queueing, to begin and upload too.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!writer.is_finished(), "the writer waits for the guard");
+        assert_eq!(
+            in_use(),
+            0,
+            "a writer queued for the sequence guard holds no pooled connection"
+        );
+        drop(guard);
+        let hash = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.kv_get(&space, &path).await.unwrap().unwrap().1, hash);
     }
 
     #[tokio::test]

@@ -142,8 +142,9 @@ released with a transaction open.
 - `src/pool/connection.rs`, `Floating::return_to_pool`: after a successful
   release ping, a connection whose `in_server_transaction_block()` is true is
   closed (graceful, bounded by `CLOSE_ON_DROP_TIMEOUT`) instead of released.
-  Closing the session makes the server roll the transaction back. The pool opens
-  a replacement on the next acquire.
+  Closing the session makes the server roll the transaction back, and a
+  `warn!` ("closing a pooled connection released inside a transaction")
+  records each such leak. The pool opens a replacement on the next acquire.
 
 ### Re-applying on a vendor bump
 

@@ -3661,7 +3661,9 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         // 507, not 413: the SQL client reads 413 as `SQL_RESPONSE_TOO_LARGE`
         // and the KV and quota clients as an exhausted storage plan, and
         // TC-1012's 413 is the request body cap. Neither is true here.
-        SqlError::DatabaseSizeLimit | SqlError::DiskHeadroom => Status::new(507),
+        SqlError::DatabaseSizeLimit | SqlError::DatabaseTooLargeToLoad | SqlError::DiskHeadroom => {
+            Status::new(507)
+        }
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation | SqlError::CaveatViolation(_) => Status::Forbidden,
@@ -4141,6 +4143,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ResponseTooLarge(..) => Status::new(413),
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
+        DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => Status::new(507),
         DuckDbError::IngestError(_) => Status::InternalServerError,
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
@@ -8377,6 +8380,26 @@ mod tests {
         assert!(SqlError::CommitFailed
             .to_string()
             .starts_with("sql_commit_failed:"));
+    }
+
+    /// TC-2961: a database too large to load answers 507 with the size-limit
+    /// code, for SQL and DuckDB alike, never 500.
+    #[test]
+    fn a_database_too_large_to_load_is_507() {
+        assert_eq!(
+            sql_error_to_status(&SqlError::DatabaseTooLargeToLoad),
+            Status::new(507)
+        );
+        let body = SqlError::DatabaseTooLargeToLoad.to_string();
+        assert!(body.starts_with("sql_database_size_limit:"), "{body}");
+        #[cfg(feature = "duckdb")]
+        for error in [
+            DuckDbError::DatabaseSizeLimit,
+            DuckDbError::DatabaseTooLargeToLoad,
+        ] {
+            assert_eq!(duckdb_error_to_status(&error), Status::new(507));
+            assert!(error.to_string().starts_with("sql_database_size_limit:"));
+        }
     }
 
     #[tokio::test]

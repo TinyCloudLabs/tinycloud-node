@@ -52,6 +52,8 @@ enum HydrationOutcome {
     Unavailable(&'static str),
     Failed(String),
     TimedOut,
+    /// The stored database exceeds the artifact read limit (TC-2961).
+    TooLarge,
 }
 
 const PHASE_LOADING: u8 = 0;
@@ -230,7 +232,10 @@ impl SqlService {
 
     /// The checkpoint back-off (TC-2961): `first` after a failed or refused
     /// whole-checkpoint save, doubling per further failure up to `max`. The
-    /// node keeps the defaults (30 s, 15 min); only tests lower them.
+    /// node keeps the defaults (30 s, 15 min); only tests lower them. Public
+    /// only for the node-server tests: wiring it to node config is a
+    /// behaviour change that needs review, since a zero back-off brings back
+    /// the reload-and-retry loop TC-2961 removed.
     pub fn with_checkpoint_backoff(mut self, first: Duration, max: Duration) -> Self {
         self.checkpoint_backoff_bounds = (first, max);
         self
@@ -729,6 +734,7 @@ impl SqlService {
                     return Err(SqlError::Unavailable);
                 }
                 HydrationOutcome::Failed(message) => return Err(SqlError::Internal(message)),
+                HydrationOutcome::TooLarge => return Err(SqlError::DatabaseTooLargeToLoad),
                 HydrationOutcome::TimedOut => {
                     log_busy(
                         SqlBusyStage::ArtifactTransfer,
@@ -1065,8 +1071,8 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        let saved = match self
-            .bounded(
+        let (saved, transfer_started) =
+            crate::database_artifacts::track_transfer_start(self.bounded(
                 (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
@@ -1077,9 +1083,9 @@ impl SqlService {
                     payload,
                     expected,
                 ),
-            )
-            .await
-        {
+            ))
+            .await;
+        let saved = match saved {
             Ok(Ok(saved)) => saved,
             Ok(Err(error)) => {
                 // A stale actor's lineage conflict is recovered by the
@@ -1092,7 +1098,11 @@ impl SqlService {
                 return Err(error);
             }
             Err(error) => {
-                self.back_off_checkpoint(&key, &error);
+                // TC-2961: a save cut while still queued for its large-transfer
+                // slot sent nothing; it is busy, not a failed checkpoint.
+                if transfer_started {
+                    self.back_off_checkpoint(&key, &error);
+                }
                 return Err(error);
             }
         };
@@ -1225,6 +1235,14 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
             );
             SqlError::DatabaseSizeLimit
         }
+        DatabaseArtifactError::ReadLimitExceeded { .. } => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_read_limit",
+                "Database exceeds the artifact read limit; not loaded"
+            );
+            SqlError::DatabaseTooLargeToLoad
+        }
         err => SqlError::Internal(err.to_string()),
     }
 }
@@ -1254,6 +1272,7 @@ fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
         SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
+        SqlError::DatabaseTooLargeToLoad => HydrationOutcome::TooLarge,
         error => HydrationOutcome::Failed(error.to_string()),
     }
 }
@@ -3100,6 +3119,189 @@ mod tests {
         tokio::time::sleep(first).await;
         assert!(refused(write().await));
         assert_eq!(loads.load(Ordering::Relaxed), 3);
+    }
+
+    /// TC-2961: a database stored over the artifact read limit is not
+    /// loaded; a read and a write to it both answer the 507 size limit, not
+    /// an internal error.
+    #[tokio::test]
+    async fn a_database_over_the_read_limit_answers_the_size_limit() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let space = test_space_id("sql-read-limit");
+        let insert = || SqlRequest::Execute {
+            schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v)".to_string()]),
+            sql: "INSERT INTO items VALUES (1)".to_string(),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let writer_cache = TempDir::new().unwrap();
+        let writer = SqlService::new(
+            writer_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+        );
+        writer
+            .execute(&space, "main", insert(), None, admin())
+            .await
+            .unwrap();
+
+        let reader_cache = TempDir::new().unwrap();
+        let reader = SqlService::new(
+            reader_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_read_bytes(1)),
+        );
+        let read = reader
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT count(*) FROM items".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await;
+        assert!(
+            matches!(read, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{read:?}"
+        );
+        let written = reader
+            .execute(&space, "main", insert(), None, admin())
+            .await;
+        assert!(
+            matches!(written, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{written:?}"
+        );
+    }
+
+    /// Holds every load at its first part until the gate opens.
+    struct StalledSink {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl ArtifactSink for StalledSink {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn begin_part(
+            &mut self,
+            part: crate::database_artifacts::ArtifactPart,
+        ) -> Result<(), DatabaseArtifactError> {
+            if part == crate::database_artifacts::ArtifactPart::Checkpoint {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                drop(self.gate.acquire().await.unwrap());
+            }
+            Ok(())
+        }
+        async fn write(&mut self, _bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+    }
+
+    /// TC-2961 (Bobbie's F1): another tenant's two large loads hold both
+    /// large-transfer permits. This tenant's large checkpoint save queues for
+    /// a permit past `artifact_transfer`, sends nothing and is answered busy.
+    /// That is not a failed checkpoint: once the permits are free, its next
+    /// write goes through, with no back-off.
+    #[tokio::test]
+    async fn a_save_still_queued_for_a_permit_starts_no_back_off() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(db);
+        let large = crate::database_artifacts::BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        for name in ["h1", "h2"] {
+            repo.save(
+                "sql",
+                "other-tenant",
+                name,
+                vec![1; large],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let holders: Vec<_> = ["h1", "h2"]
+            .into_iter()
+            .map(|name| {
+                let repo = repo.clone();
+                let mut sink = StalledSink {
+                    entered: entered.clone(),
+                    gate: gate.clone(),
+                };
+                tokio::spawn(async move {
+                    let meta = repo
+                        .load_meta("sql", "other-tenant", name)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    repo.read_chunks("sql", "other-tenant", name, &meta, &mut sink)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holders start");
+
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(repo.clone()),
+        )
+        .with_wait_bounds(SqlWaitBounds {
+            artifact_transfer: Duration::from_millis(500),
+            ..SqlWaitBounds::default()
+        });
+        let space = test_space_id("queued-save");
+        let write = |table: &str, value: &str| SqlRequest::Execute {
+            schema: Some(vec![format!("CREATE TABLE IF NOT EXISTS {table} (v)")]),
+            sql: format!("INSERT INTO {table} VALUES ({value})"),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let queued = service
+            .execute(
+                &space,
+                "main",
+                write("b", "zeroblob(9437184)"),
+                None,
+                admin(),
+            )
+            .await;
+        assert!(
+            matches!(queued, Err(SqlError::Busy(SqlBusyStage::ArtifactTransfer))),
+            "{queued:?}"
+        );
+
+        gate.add_permits(1);
+        for holder in holders {
+            holder.await.unwrap().unwrap();
+        }
+        let next = service
+            .execute(&space, "main", write("s", "1"), None, admin())
+            .await;
+        assert!(next.is_ok(), "no back-off: {next:?}");
     }
 
     /// Fails the next `failures` repository calls with `error`, then
