@@ -384,6 +384,22 @@ impl PolicyV3Runtime {
         Ok(())
     }
 
+    /// Sibling roots are stored in the ordinary graph only so S0 can have
+    /// normal proof edges. Neither root is invocation authority, cited alone
+    /// or beside other proofs: a registered policy's conditions hold only
+    /// through a session minted from both roots.
+    pub(crate) async fn refuse_policy_root_proofs(
+        &self,
+        parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    ) -> Result<(), AuthorizationError> {
+        for parent in parents {
+            if self.is_registered_policy_root(&parent.to_string()).await? {
+                return Err("policy-root-cannot-authorize-invocation".into());
+            }
+        }
+        Ok(())
+    }
+
     /// Authorize a policy-session invocation against its registered policy.
     /// Decrypt callers must supply the request body before any key release.
     pub async fn authorize_invocation(
@@ -393,12 +409,18 @@ impl PolicyV3Runtime {
         decrypt_body: Option<&Value>,
         now: OffsetDateTime,
     ) -> Result<bool, AuthorizationError> {
+        // Reject before ordinary fallback: D_enforce's audience is the
+        // enforcer, so an enforcer-signed invocation would otherwise collapse AND.
+        self.refuse_policy_root_proofs(&invocation.parents).await?;
         if invocation.parents.len() != 1 {
             for parent in invocation.parents.iter().copied() {
                 let loaded = match tinycloud.load_signed_delegation(parent).await {
                     Ok(parent) => parent,
                     Err(error) if error.is::<tinycloud_core::sea_orm::DbErr>() => {
                         return Err(error)
+                    }
+                    Err(_) if self.is_policy_protected_parent(parent).await? => {
+                        return Err("policy-session-invalid".into());
                     }
                     Err(_) => None,
                 };
@@ -420,16 +442,6 @@ impl PolicyV3Runtime {
         let Some((immediate_row, immediate)) = loaded else {
             return Ok(false);
         };
-        // Sibling roots are stored in the ordinary graph only so S0 can have
-        // normal proof edges. Neither root is invocation authority by itself.
-        // Reject before ordinary fallback: D_enforce's audience is the node,
-        // so an enforcer-signed invocation would otherwise collapse AND.
-        if self
-            .is_registered_policy_root(&invocation.parents[0].to_string())
-            .await?
-        {
-            return Err("policy-root-cannot-authorize-invocation".into());
-        }
         if !is_policy_session(&immediate.0) {
             return Ok(false);
         }
@@ -1557,6 +1569,20 @@ async fn authorize_delivery_inner(
             "delivery-authorization-invalid",
         ),
     })?;
+    runtime
+        .refuse_policy_root_proofs(&invocation.0 .0.parents)
+        .await
+        .map_err(|error| {
+            if error.is::<tinycloud_core::sea_orm::DbErr>() {
+                authorization_failure(error)
+            } else {
+                refuse(
+                    "policy_root_proof",
+                    Status::Forbidden,
+                    "delivery-authorization-invalid",
+                )
+            }
+        })?;
     let request = request.0;
     let invalid =
         |reason: &'static str| refuse(reason, Status::BadRequest, "delivery-authorization-invalid");
