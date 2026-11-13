@@ -205,6 +205,6 @@ async fn owner_list_pages_live_and_purging_spaces_and_preserves_privacy_after_re
     assert_eq!(refusals[0], refusals[1]);
     assert_eq!(
         refusals[0],
-        serde_json::json!({"error":{"code":"not_found"}})
+        serde_json::json!({"hostId":"host-test","error":{"code":"not_found"}})
     );
 }

@@ -33,19 +33,36 @@ use tinycloud_core::{
 #[derive(Debug, Serialize)]
 pub struct ErrorEnvelope {
     error: ErrorCode,
+    #[serde(rename = "hostId", skip_serializing_if = "Option::is_none")]
+    host_id: Option<String>,
 }
 #[derive(Debug, Serialize)]
 struct ErrorCode {
     code: &'static str,
 }
-type ApiError = Custom<Json<ErrorEnvelope>>;
+#[derive(Debug)]
+pub struct ApiError {
+    status: Status,
+    code: &'static str,
+}
+impl<'r> rocket::response::Responder<'r, 'static> for ApiError {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let host_id = request
+            .rocket()
+            .state::<LifecycleRuntime>()
+            .map(|runtime| runtime.host_id.clone());
+        Custom(
+            self.status,
+            Json(ErrorEnvelope {
+                error: ErrorCode { code: self.code },
+                host_id,
+            }),
+        )
+        .respond_to(request)
+    }
+}
 fn error(status: Status, code: &'static str) -> ApiError {
-    Custom(
-        status,
-        Json(ErrorEnvelope {
-            error: ErrorCode { code },
-        }),
-    )
+    ApiError { status, code }
 }
 fn unavailable<E>(_: E) -> ApiError {
     error(Status::ServiceUnavailable, "unavailable_retryable")
@@ -93,7 +110,29 @@ impl LifecycleRuntime {
         let invalid = || std::io::Error::other("space lifecycle configuration unavailable");
         match (host_id, tombstone_key) {
             (None, None) => {
-                if !ledger.list_purge_records().await?.is_empty() {
+                if !ledger.list_purge_records().await?.is_empty()
+                    || tinycloud_core::models::space_purge_fence::Entity::find()
+                        .filter(tinycloud_core::models::space_purge_fence::Column::Fenced.eq(true))
+                        .one(&conn)
+                        .await
+                        .map_err(|_| invalid())?
+                        .is_some()
+                    || space_retirement::Entity::find()
+                        .one(&conn)
+                        .await
+                        .map_err(|_| invalid())?
+                        .is_some()
+                    || space_purge_job::Entity::find()
+                        .one(&conn)
+                        .await
+                        .map_err(|_| invalid())?
+                        .is_some()
+                    || tinycloud_core::models::resource_purge_job::Entity::find()
+                        .one(&conn)
+                        .await
+                        .map_err(|_| invalid())?
+                        .is_some()
+                {
                     return Err(invalid());
                 }
                 Ok(None)
@@ -633,6 +672,9 @@ pub async fn retire_owner(
     runtime
         .bind_operation(&tx, &proof, "retire-owner", &record.operation_id)
         .await?;
+    tinycloud_core::space_purge_records::request_all(&tx)
+        .await
+        .map_err(unavailable)?;
     tx.commit().await.map_err(unavailable)?;
     ledger_commit.committed = true;
     runtime.work_requested.notify_one();
@@ -881,3 +923,5 @@ pub async fn purge_status(
         .map(Json)
         .ok_or_else(|| error(Status::NotFound, "not_found"))
 }
+
+pub mod resources;

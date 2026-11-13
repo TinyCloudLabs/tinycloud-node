@@ -4,8 +4,11 @@ use tinycloud::{
     storage::{file_system::FileSystemConfig, purge_ledger::PurgeLedgerStore},
 };
 use tinycloud_core::{
-    migrations::Migrator, sea_orm::Database, sea_orm_migration::MigratorTrait,
-    space_purge_ledger::LedgerKeys, storage::StorageConfig,
+    migrations::Migrator,
+    sea_orm::{Database, TransactionTrait},
+    sea_orm_migration::MigratorTrait,
+    space_purge_ledger::LedgerKeys,
+    storage::StorageConfig,
 };
 
 #[tokio::test]
@@ -75,7 +78,25 @@ async fn lifecycle_requires_stable_host_and_independent_key_and_cannot_disable_e
         .append_purge_record(&record.object_key().unwrap(), &record.to_bytes().unwrap())
         .await
         .unwrap();
-    assert!(LifecycleRuntime::from_settings(conn, store, None, None)
+    assert!(
+        LifecycleRuntime::from_settings(conn.clone(), store, None, None)
+            .await
+            .is_err()
+    );
+    // Removing configuration and pointing at an empty ledger cannot bypass
+    // a fence that is still present in the database.
+    let empty = tempfile::tempdir().unwrap();
+    let empty_store = Arc::new(FileSystemConfig::new(empty.path()).open().await.unwrap());
+    let fence = tinycloud_core::space_purge_fence::SpacePurgeFence::new(Arc::new(keys));
+    let tx = conn.begin().await.unwrap();
+    fence
+        .fence_hmac(&tx, "owner", record.key_id.as_str(), &owner_hmac)
         .await
-        .is_err());
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        LifecycleRuntime::from_settings(conn, empty_store, None, None)
+            .await
+            .is_err()
+    );
 }

@@ -219,6 +219,24 @@
       "notes": "POST /space/list enumerates owned local live and purging spaces using a direct owner-PKH invocation. Delegated and session signers cannot invoke this lifecycle route."
     },
     {
+      "urn": "tinycloud.resource/list",
+      "service": "tinycloud.resource",
+      "status": "active",
+      "notes": "Direct-owner lifecycle management of exact encryption resources."
+    },
+    {
+      "urn": "tinycloud.resource/dependencies",
+      "service": "tinycloud.resource",
+      "status": "active",
+      "notes": "Direct-owner lifecycle management of exact encryption resources."
+    },
+    {
+      "urn": "tinycloud.resource/delete",
+      "service": "tinycloud.resource",
+      "status": "active",
+      "notes": "Direct-owner lifecycle management of exact encryption resources."
+    },
+    {
       "urn": "tinycloud.space/info",
       "service": "tinycloud.space",
       "status": "active",
