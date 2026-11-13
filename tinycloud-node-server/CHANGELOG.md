@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.2](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.2) - 2026-11-13
+
+### Other
+
+- update Cargo.toml dependencies
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
