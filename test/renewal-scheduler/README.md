@@ -72,8 +72,7 @@ from this status test; the SDK scenario must independently verify admitted
 authority and perform its ordinary read.
 
 The consistent status projection is supplied by PR #556, commit
-`fefa533e239a50db961799b15860abd27036754d`. This harness PR is stacked on
-that branch so its own diff contains only test support.
+`fefa533e239a50db961799b15860abd27036754d`.
 
 Holder-visible signed history is supplied by PR #559, commit
 `372736a3654d4d15963a5f528acaf692bb64085b`; this harness is stacked there.
