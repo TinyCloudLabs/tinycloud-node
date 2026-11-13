@@ -2233,57 +2233,22 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519()
-            .map_err(|_| TxStoreError::MissingInput)?;
-        let mut verification_method = tinycloud_auth::resolver::DID_METHODS
-            .generate(&jwk, "key")
-            .map_err(|_| TxStoreError::MissingInput)?
-            .to_string();
-        let fragment = verification_method
-            .rsplit_once(':')
-            .map(|(_, fragment)| fragment.to_owned())
-            .ok_or(TxStoreError::MissingInput)?;
-        verification_method.push('#');
-        verification_method.push_str(&fragment);
         let resource = space.clone().to_resource(
             "kv".parse().map_err(|_| TxStoreError::MissingInput)?,
             Some(path.clone()),
             None,
             None,
         );
-        let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-            0x55,
-            tinycloud_auth::multihash_codetable::Code::Blake3_256
-                .digest(b"tinycloud/native-share-internal-delegation"),
-        );
-        let invocation = make_invocation(
-            vec![(
-                resource,
-                vec![(if stage.is_some() {
-                    "tinycloud.kv/put"
-                } else {
-                    "tinycloud.kv/del"
-                })
-                .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
-                .map_err(|_| TxStoreError::MissingInput)?],
-            )],
-            &delegation,
-            &jwk,
-            &verification_method,
-            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
-            InvocationOptions {
-                proof: Some(Vec::new()),
-                ..InvocationOptions::default()
-            },
-        )
-        .map_err(|_| TxStoreError::MissingInput)?;
-        let info = crate::util::InvocationInfo::try_from(invocation.clone())
-            .map_err(|_| TxStoreError::MissingInput)?;
-        let serialized = invocation
-            .encode()
-            .map_err(|_| TxStoreError::MissingInput)?
-            .into_bytes();
-        let invocation = crate::events::SerializedEvent(info, serialized);
+        let ability = if stage.is_some() {
+            "tinycloud.kv/put"
+        } else {
+            "tinycloud.kv/del"
+        };
+        let invocation = internal_invocation(vec![(
+            resource,
+            vec![ability.parse().map_err(|_| TxStoreError::MissingInput)?],
+        )])
+        .ok_or(TxStoreError::MissingInput)?;
         let mut inputs = HashMap::new();
         if let Some(stage) = stage {
             inputs.insert((space.clone(), path.clone()), (metadata, stage));
@@ -2864,7 +2829,7 @@ where
                 .invoke_read_only::<S>(invocation, options, mode, sync_target)
                 .await;
         }
-        let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
+        let kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
         let mut write_hashes = HashMap::new();
@@ -3016,6 +2981,23 @@ where
                 *generation = blobs[index].2;
             }
         }
+        let caps = invocation.0.capabilities.clone();
+        let invoker = invocation.0.invoker.clone();
+        // Extract capabilities read params from UCAN facts field
+        // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
+        let caps_read_params: Option<CapabilitiesReadParams> = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("capabilitiesReadParams"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                })
+            });
         // Keep the write-only transaction future off caller/test thread stacks:
         // its auth graph and commit state grew beyond the default debug stack.
         // Read-only invocations return above without this allocation.
@@ -3231,23 +3213,6 @@ where
                     deleted_hashes.insert(key.clone(), entry.value);
                 }
             }
-            let caps = invocation.0.capabilities.clone();
-            let invoker = invocation.0.invoker.clone();
-            // Extract capabilities read params from UCAN facts field
-            // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
-            let caps_read_params: Option<CapabilitiesReadParams> = invocation
-                .0
-                .invocation
-                .payload()
-                .facts
-                .as_ref()
-                .and_then(|facts| {
-                    facts.iter().find_map(|fact| {
-                        fact.as_object()
-                            .and_then(|obj| obj.get("capabilitiesReadParams"))
-                            .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    })
-                });
             //  verify and commit invocation and kv operations
             let event = match mode {
                 InvokeMode::Internal | InvokeMode::MeetingPublication => {
@@ -3271,16 +3236,8 @@ where
             )
             .await?;
 
-            let results = self
-                .invocation_side_effects::<S>(
-                    &tx,
-                    &caps,
-                    &invoker,
-                    &options,
-                    &write_hashes,
-                    &deleted_hashes,
-                    caps_read_params.as_ref(),
-                )
+            let pending = self
+                .invocation_side_effects::<S>(&tx, &caps, &write_hashes, &deleted_hashes)
                 .await?;
             if !blobs.is_empty() {
                 crate::kv_orphans::finish_candidates(&tx, &blobs, &attempt_id).await?;
@@ -3292,7 +3249,7 @@ where
             tx_body_timer.observe_ok();
             // commit tx if all side effects worked
             tx.commit().await?;
-            Ok((commit, results))
+            Ok((commit, pending))
         })
         .await;
         if result.is_err() && !blobs.is_empty() {
@@ -3309,7 +3266,14 @@ where
                 );
             }
         }
-        result
+        let (commit, pending) = result?;
+        // TC-2986: the reads run after COMMIT, holding no transaction and no
+        // write lock; the shared chain guards stay, as on the read-only path.
+        drop(kv_object_guards);
+        let outcomes = self
+            .answer_after_commit::<S>(pending, &invoker, &options, caps_read_params.as_ref())
+            .await?;
+        Ok((commit, outcomes))
     }
 
     /// Pre-upload authorization and candidate registration (TC-735), before
@@ -3406,20 +3370,20 @@ where
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "KV upload timed out"))?
     }
 
-    /// Perform and record the invocation's side effects inside the KV
-    /// transaction, after `transact`. Separate from the commit future for the
-    /// same stack reason as [`Self::persist_registered_blobs`].
-    #[allow(clippy::too_many_arguments)]
+    /// Decide the invocation's outcomes inside the KV transaction, after
+    /// `transact` (TC-2986). Only what the write itself determines, and
+    /// bounded row reads, run here: `kv/put` and `kv/del` outcomes,
+    /// `kv/metadata`, and the live row a `kv/get` names (so it reads its own
+    /// write). The block read, `kv/list` and `capabilities/read` are left
+    /// for [`Self::answer_after_commit`]. Separate from the commit future for
+    /// the same stack reason as [`Self::persist_registered_blobs`].
     async fn invocation_side_effects<S>(
         &self,
         tx: &DatabaseTransaction,
         caps: &[crate::util::Capability],
-        invoker: &str,
-        options: &KvInvokeOptions,
         write_hashes: &HashMap<(SpaceId, Path), Hash>,
         deleted_hashes: &HashMap<(SpaceId, Path), Hash>,
-        caps_read_params: Option<&CapabilitiesReadParams>,
-    ) -> Result<Vec<InvocationOutcome<B::Readable>>, TxStoreError<B, S, K>>
+    ) -> Result<Vec<PendingOutcome<B::Readable>>, TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
         S: ImmutableStaging,
@@ -3439,95 +3403,136 @@ where
             })
         }) {
             match cap {
-                (space, "kv", "tinycloud.kv/get", path) => {
-                    let data =
-                        get_kv(tx, &self.storage, space, path)
-                            .await
-                            .map_err(|e| match e {
-                                EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                EitherError::B(e) => TxStoreError::StoreRead(e),
-                            })?;
-                    if let (Some(limit), Some((_, _, content))) =
-                        (options.max_response_bytes, data.as_ref())
-                    {
-                        if content.len() > limit {
-                            return Err(TxStoreError::KvResponseTooLarge {
-                                size: content.len(),
-                                limit,
-                            });
-                        }
-                    }
-                    results.push(InvocationOutcome::KvRead(data));
-                }
+                (space, "kv", "tinycloud.kv/get", path) => results.push(PendingOutcome::KvRead(
+                    space.clone(),
+                    get_kv_entity(tx, space, path).await?,
+                )),
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    let (list, truncated) = list_bounded_after(
-                        tx,
-                        space,
-                        path,
-                        options.list_limit,
-                        options.list_cursor.as_ref(),
-                    )
-                    .await?;
-                    results.push(InvocationOutcome::KvList(list, truncated, None))
+                    results.push(PendingOutcome::KvList(space.clone(), path.clone()))
                 }
                 (space, "kv", "tinycloud.kv/del", path) => {
                     // KV deletion is logical. Blobs are content-addressed and may be
                     // shared by live sibling keys or retained version history.
-                    results.push(InvocationOutcome::KvDelete(
+                    results.push(PendingOutcome::Done(InvocationOutcome::KvDelete(
                         deleted_hashes.get(&(space.clone(), path.clone())).copied(),
-                    ))
+                    )))
                 }
                 (space, "kv", "tinycloud.kv/put", path) => {
                     let hash = write_hashes
                         .get(&(space.clone(), path.clone()))
                         .copied()
                         .expect("staged KV writes have a content hash");
-                    results.push(InvocationOutcome::KvWrite(hash));
+                    results.push(PendingOutcome::Done(InvocationOutcome::KvWrite(hash)));
                 }
-                (space, "kv", "tinycloud.kv/metadata", path) => results.push(
+                (space, "kv", "tinycloud.kv/metadata", path) => results.push(PendingOutcome::Done(
                     InvocationOutcome::KvMetadata(metadata_with_hash(tx, space, path).await?),
-                ),
+                )),
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
-                    match caps_read_params {
-                        None => {
-                            // Backward compatible: no params means return all valid delegations
-                            results.push(InvocationOutcome::OpenSessions(
-                                get_valid_delegations(tx, space, self.encryption.as_ref()).await?,
-                            ))
-                        }
-                        Some(CapabilitiesReadParams::List { filters }) => {
-                            // List with optional filters
-                            results.push(InvocationOutcome::OpenSessions(
-                                get_filtered_delegations(
-                                    tx,
-                                    space,
-                                    invoker,
-                                    filters.as_ref(),
-                                    self.encryption.as_ref(),
-                                )
-                                .await?,
-                            ))
-                        }
-                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
-                            // Get the delegation chain for a specific delegation
-                            results.push(InvocationOutcome::DelegationChain(
-                                get_delegation_chain(
-                                    tx,
-                                    space,
-                                    delegation_cid,
-                                    self.encryption.as_ref(),
-                                )
-                                .await?,
-                            ))
-                        }
-                    }
+                    results.push(PendingOutcome::CapabilitiesRead(space.clone()))
                 }
                 _ => {}
             };
         }
         Ok(results)
+    }
+
+    /// Answer the reads [`Self::invocation_side_effects`] left pending, after
+    /// COMMIT, on the pool (TC-2986): the block store read of a `kv/get` (no
+    /// timeout on S3), `kv/list` and `capabilities/read` (unbounded in the
+    /// space's size) hold no transaction, row lock or write guard. They see
+    /// the committed state, this invocation's write included. A failure here
+    /// comes after the write committed.
+    async fn answer_after_commit<S>(
+        &self,
+        pending: Vec<PendingOutcome<B::Readable>>,
+        invoker: &str,
+        options: &KvInvokeOptions,
+        caps_read_params: Option<&CapabilitiesReadParams>,
+    ) -> Result<Vec<InvocationOutcome<B::Readable>>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let mut results = Vec::with_capacity(pending.len());
+        for outcome in pending {
+            results.push(match outcome {
+                PendingOutcome::Done(outcome) => outcome,
+                PendingOutcome::KvRead(space, entry) => {
+                    let data = match entry {
+                        Some(entry) => read_kv_entity(&self.storage, &space, entry)
+                            .await
+                            .map_err(TxStoreError::StoreRead)?,
+                        None => None,
+                    };
+                    if let Some((size, limit)) = oversized_kv_response(options, data.as_ref()) {
+                        return Err(TxStoreError::KvResponseTooLarge { size, limit });
+                    }
+                    InvocationOutcome::KvRead(data)
+                }
+                PendingOutcome::KvList(space, path) => {
+                    let (list, truncated) = list_bounded_after(
+                        &self.conn,
+                        &space,
+                        &path,
+                        options.list_limit,
+                        options.list_cursor.as_ref(),
+                    )
+                    .await?;
+                    InvocationOutcome::KvList(list, truncated, None)
+                }
+                PendingOutcome::CapabilitiesRead(space) => {
+                    self.capabilities_outcome::<S>(&space, invoker, caps_read_params)
+                        .await?
+                }
+            });
+        }
+        Ok(results)
+    }
+
+    /// The `tinycloud.capabilities/read` answer for `space`, read on the pool.
+    async fn capabilities_outcome<S>(
+        &self,
+        space: &SpaceId,
+        invoker: &str,
+        params: Option<&CapabilitiesReadParams>,
+    ) -> Result<InvocationOutcome<B::Readable>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        Ok(match params {
+            // Backward compatible: no params means return all valid delegations
+            None => InvocationOutcome::OpenSessions(
+                get_valid_delegations(&self.conn, space, self.encryption.as_ref()).await?,
+            ),
+            // List with optional filters
+            Some(CapabilitiesReadParams::List { filters }) => InvocationOutcome::OpenSessions(
+                get_filtered_delegations(
+                    &self.conn,
+                    space,
+                    invoker,
+                    filters.as_ref(),
+                    self.encryption.as_ref(),
+                )
+                .await?,
+            ),
+            // Get the delegation chain for a specific delegation
+            Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                InvocationOutcome::DelegationChain(
+                    get_delegation_chain(
+                        &self.conn,
+                        space,
+                        delegation_cid,
+                        self.encryption.as_ref(),
+                    )
+                    .await?,
+                )
+            }
+        })
     }
 
     /// Execute a successful non-mutating invocation without entering the
@@ -3705,15 +3710,8 @@ where
                             .map_err(TxStoreError::StoreRead)?,
                         None => None,
                     };
-                    if let (Some(limit), Some((_, _, content))) =
-                        (options.max_response_bytes, data.as_ref())
-                    {
-                        if content.len() > limit {
-                            return Err(TxStoreError::KvResponseTooLarge {
-                                size: content.len(),
-                                limit,
-                            });
-                        }
+                    if let Some((size, limit)) = oversized_kv_response(&options, data.as_ref()) {
+                        return Err(TxStoreError::KvResponseTooLarge { size, limit });
                     }
                     results.push(InvocationOutcome::KvRead(data));
                 }
@@ -3739,35 +3737,14 @@ where
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
-                    let outcome = match &caps_read_params {
-                        None => {
-                            get_valid_delegations(&self.conn, space, self.encryption.as_ref())
-                                .await?
-                        }
-                        Some(CapabilitiesReadParams::List { filters }) => {
-                            get_filtered_delegations(
-                                &self.conn,
-                                space,
-                                &invocation.0.invoker,
-                                filters.as_ref(),
-                                self.encryption.as_ref(),
-                            )
-                            .await?
-                        }
-                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
-                            results.push(InvocationOutcome::DelegationChain(
-                                get_delegation_chain(
-                                    &self.conn,
-                                    space,
-                                    delegation_cid,
-                                    self.encryption.as_ref(),
-                                )
-                                .await?,
-                            ));
-                            continue;
-                        }
-                    };
-                    results.push(InvocationOutcome::OpenSessions(outcome));
+                    results.push(
+                        self.capabilities_outcome::<S>(
+                            space,
+                            &invocation.0.invoker,
+                            caps_read_params.as_ref(),
+                        )
+                        .await?,
+                    );
                 }
                 _ => {}
             }
@@ -3793,6 +3770,48 @@ where
             results,
         ))
     }
+}
+
+/// A node-internal invocation of `capabilities`, signed by a throwaway key
+/// with no proof. Only [`InvokeMode::Internal`] and
+/// [`InvokeMode::MeetingPublication`] accept it: their authorization is the
+/// trusted caller's, not the invocation's.
+fn internal_invocation(
+    capabilities: Vec<(
+        tinycloud_auth::resource::ResourceId,
+        Vec<tinycloud_auth::ucan_capabilities_object::Ability>,
+    )>,
+) -> Option<Invocation> {
+    let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519().ok()?;
+    let mut verification_method = tinycloud_auth::resolver::DID_METHODS
+        .generate(&jwk, "key")
+        .ok()?
+        .to_string();
+    let fragment = verification_method
+        .rsplit_once(':')
+        .map(|(_, fragment)| fragment.to_owned())?;
+    verification_method.push('#');
+    verification_method.push_str(&fragment);
+    let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+        0x55,
+        tinycloud_auth::multihash_codetable::Code::Blake3_256
+            .digest(b"tinycloud/native-share-internal-delegation"),
+    );
+    let invocation = make_invocation(
+        capabilities,
+        &delegation,
+        &jwk,
+        &verification_method,
+        (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+        InvocationOptions {
+            proof: Some(Vec::new()),
+            ..InvocationOptions::default()
+        },
+    )
+    .ok()?;
+    let info = crate::util::InvocationInfo::try_from(invocation.clone()).ok()?;
+    let serialized = invocation.encode().ok()?.into_bytes();
+    Some(crate::events::SerializedEvent(info, serialized))
 }
 
 /// The `(space, prefix, resource)` a `tinycloud.kv/sync` invocation reads.
@@ -4094,6 +4113,29 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
         }
         _ => false,
     }
+}
+
+/// The `(size, limit)` of a `kv/get` answer larger than the caller's
+/// `x-tinycloud-max-response-bytes`, if it is.
+fn oversized_kv_response<R>(
+    options: &KvInvokeOptions,
+    data: Option<&(Metadata, Hash, Content<R>)>,
+) -> Option<(u64, u64)> {
+    let limit = options.max_response_bytes?;
+    let size = data?.2.len();
+    (size > limit).then_some((size, limit))
+}
+
+/// An outcome of an invocation that writes, as decided inside its KV
+/// transaction (TC-2986): complete, or a read that
+/// [`SpaceDatabase::answer_after_commit`] runs after COMMIT.
+enum PendingOutcome<R> {
+    Done(InvocationOutcome<R>),
+    /// A `kv/get`: the live row, resolved inside the transaction so the
+    /// read sees this invocation's own write; its block is read after.
+    KvRead(SpaceId, Option<current_kv::Model>),
+    KvList(SpaceId, Path),
+    CapabilitiesRead(SpaceId),
 }
 
 #[derive(Debug)]
@@ -7140,6 +7182,230 @@ mod test {
                 .await,
             Err(TxStoreError::LegacyMeetingFrozen)
         ));
+    }
+
+    /// A memory store whose block reads wait for `release` while `pause` is
+    /// set, announcing each paused read on `reading`.
+    #[derive(Clone, Default)]
+    struct ReadPausedStore {
+        inner: MemoryStore,
+        pause: Arc<std::sync::atomic::AtomicBool>,
+        reading: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl StorageSetup for ReadPausedStore {
+        type Error = std::io::Error;
+        async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
+            self.inner.create(space).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableReadStore for ReadPausedStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<bool, Self::Error> {
+            self.inner.contains(space, hash, generation).await
+        }
+        async fn read(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+            if self.pause.load(std::sync::atomic::Ordering::SeqCst) {
+                self.reading.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.read(space, hash, generation).await
+        }
+        async fn read_range(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+            range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            self.inner.read_range(space, hash, generation, range).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableWriteStore<crate::storage::memory::MemoryStaging> for ReadPausedStore {
+        type Error = std::io::Error;
+        async fn persist(
+            &self,
+            space: &SpaceId,
+            stage: HashBuffer<Vec<u8>>,
+            generation: i64,
+        ) -> Result<Hash, Self::Error> {
+            self.inner.persist(space, stage, generation).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableDeleteStore for ReadPausedStore {
+        type Error = std::io::Error;
+        async fn remove(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<Option<()>, Self::Error> {
+            self.inner.remove(space, hash, generation).await
+        }
+        async fn cleanup_stages(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            generation: i64,
+        ) -> Result<(), Self::Error> {
+            self.inner.cleanup_stages(space, hash, generation).await
+        }
+    }
+
+    /// TC-2986: in an invocation that writes, the reads (`kv/get`'s block
+    /// read, `kv/list`, `capabilities/read`) run after COMMIT. While the
+    /// `kv/get` waits on the store, the invocation holds no transaction or
+    /// write lock: another write to the same space completes. The reads see
+    /// the committed state, this invocation's own write included.
+    #[tokio::test]
+    async fn a_writing_invocation_reads_after_commit_holding_no_write_lock() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reads.sqlite").display()
+        );
+        let storage = ReadPausedStore::default();
+        let db = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("reads-after-commit");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let put = |db: SpaceDatabase<_, ReadPausedStore, StaticSecret>,
+                   key: &'static str,
+                   body: &'static [u8]| {
+            let space = space.clone();
+            async move {
+                let mut stage = HashBuffer::new(Vec::new());
+                stage.write_all(body).await.unwrap();
+                db.invoke_internal_kv_put::<MemoryStaging>(
+                    space,
+                    key.parse().unwrap(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        };
+        put(db.clone(), "docs/b", b"seeded").await.unwrap();
+
+        let resource = |service: &str, path: &str| {
+            space.clone().to_resource(
+                service.parse().unwrap(),
+                Some(path.parse().unwrap()),
+                None,
+                None,
+            )
+        };
+        let ability = |name: &str| vec![name.parse().unwrap()];
+        let invocation = internal_invocation(vec![
+            (resource("kv", "docs/a"), ability("tinycloud.kv/put")),
+            (resource("kv", "docs/b"), ability("tinycloud.kv/get")),
+            (resource("kv", "docs"), ability("tinycloud.kv/list")),
+            (
+                resource("capabilities", "all"),
+                ability("tinycloud.capabilities/read"),
+            ),
+        ])
+        .unwrap();
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"written").await.unwrap();
+        let inputs = HashMap::from([(
+            (space.clone(), "docs/a".parse().unwrap()),
+            (Metadata(Default::default()), stage),
+        )]);
+
+        storage
+            .pause
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mixed_db = db.clone();
+        let mixed = tokio::spawn(async move {
+            mixed_db
+                .invoke_with_options_mode::<MemoryStaging>(
+                    invocation,
+                    inputs,
+                    KvInvokeOptions::default(),
+                    InvokeMode::Internal,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.reading.notified(),
+        )
+        .await
+        .expect("the kv/get reads the store");
+        // The store read is paused; another write to the same space goes
+        // through, so the mixed invocation holds no write lock or transaction.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            put(db.clone(), "docs/c", b"concurrent"),
+        )
+        .await
+        .expect("a same-space write is not blocked by the paused read")
+        .unwrap();
+        storage
+            .pause
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        storage.release.notify_one();
+
+        let (_, outcomes) = tokio::time::timeout(std::time::Duration::from_secs(10), mixed)
+            .await
+            .unwrap()
+            .unwrap()
+            .map_err(|error| error.to_string())
+            .unwrap();
+        // Outcomes follow the signed capabilities' order, not this list's.
+        assert_eq!(outcomes.len(), 4);
+        let (mut written, mut read, mut listed, mut sessions) = (false, false, false, false);
+        for outcome in outcomes {
+            match outcome {
+                InvocationOutcome::KvWrite(_) => written = true,
+                InvocationOutcome::KvRead(Some((_, _, mut content))) => {
+                    let mut body = Vec::new();
+                    content.read_to_end(&mut body).await.unwrap();
+                    assert_eq!(body, b"seeded");
+                    read = true;
+                }
+                InvocationOutcome::KvList(keys, false, _) => {
+                    let keys = keys.iter().map(Path::as_str).collect::<Vec<_>>();
+                    assert!(keys.contains(&"docs/a"), "its own write: {keys:?}");
+                    assert!(keys.contains(&"docs/b"), "{keys:?}");
+                    listed = true;
+                }
+                InvocationOutcome::OpenSessions(_) => sessions = true,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert!(written && read && listed && sessions);
     }
 
     #[tokio::test]
