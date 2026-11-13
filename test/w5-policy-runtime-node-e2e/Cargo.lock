@@ -8447,6 +8447,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_ipld_dagcbor 0.3.0",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "sha3",

@@ -1,3 +1,4 @@
+mod space_purge;
 #[cfg(test)]
 #[path = "db/status_snapshot_tests.rs"]
 mod status_snapshot_tests;
@@ -284,6 +285,7 @@ pub struct SpaceDatabase<C, B, S> {
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
     database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
+    space_purge_fence: Option<Arc<crate::space_purge_fence::SpacePurgeFence>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +383,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Secrets(K::Error),
     #[error("Space not found")]
     SpaceNotFound,
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("epoch insert failed: {0}")]
     EpochInsert(DbErr),
     #[error("Invalid delegation CID: {0}")]
@@ -550,7 +556,9 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     delegated_sql_caveats: bool,
     renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     check_hosted: bool,
+    fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
 ) -> Result<(), TxError<B, K>> {
+    let (mode, lifecycle) = space_purge::probe::<B, K, _>(conn, fence, &invocation.0, mode).await?;
     match mode {
         InvokeMode::Admitted => {
             let roots = invocation
@@ -584,7 +592,8 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
         .map_err(TxError::<B, K>::from)?,
         InvokeMode::Internal | InvokeMode::MeetingPublication => {}
     }
-    if check_hosted {
+    space_purge::refuse_absent::<B, K>(&lifecycle)?;
+    if check_hosted && lifecycle.is_none() {
         let hosted = space::Entity::find()
             .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
             .count(conn)
@@ -719,6 +728,7 @@ where
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
+            space_purge_fence: None,
             named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -880,6 +890,18 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()
+    }
+
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Arc<crate::space_purge_fence::SpacePurgeFence>,
+    ) -> Self {
+        self.space_purge_fence = Some(fence);
+        self
+    }
+
+    pub fn space_purge_fence(&self) -> Option<&Arc<crate::space_purge_fence::SpacePurgeFence>> {
+        self.space_purge_fence.as_ref()
     }
 
     /// Exposes the node's capability database for projections that are
@@ -2085,6 +2107,7 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            self.space_purge_fence.as_deref(),
         )
         .await?;
 
@@ -2316,6 +2339,16 @@ where
             .await
         {
             Ok(Some(_)) if !renewal_lease => {
+                if self.space_purge_fence.is_some() {
+                    let tx = self.begin_graph_transaction().await?;
+                    space_purge::lock_delegation::<B, K>(
+                        &tx,
+                        self.space_purge_fence.as_deref(),
+                        &delegation,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                }
                 // The content-addressed row authenticates these exact signed bytes.
                 for space in delegation.0.spaces() {
                     crate::request_telemetry::observe_space(space);
@@ -2412,6 +2445,7 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            self.space_purge_fence.as_deref(),
         )
         .await
     }
@@ -3229,6 +3263,7 @@ where
                 &sequence_spaces,
                 self.delegated_sql_caveats,
                 self.named_keys,
+                self.space_purge_fence.as_deref(),
             )
             .await?;
 
@@ -3311,8 +3346,18 @@ where
             self.delegated_sql_caveats,
             self.renewal_identity.as_ref(),
             !claim_checks_hosting,
+            self.space_purge_fence.as_deref(),
         )
         .await?;
+        for space in spaces {
+            space_purge::lock_live::<B, K>(
+                &tx,
+                self.space_purge_fence.as_deref(),
+                space,
+                &invocation.0.invoker,
+            )
+            .await?;
+        }
         let generations = if blobs.is_empty() {
             Vec::new()
         } else {
@@ -3508,6 +3553,13 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        let (mode, lifecycle) = space_purge::probe::<B, K, _>(
+            &self.conn,
+            self.space_purge_fence.as_deref(),
+            &invocation.0,
+            mode,
+        )
+        .await?;
         let now = OffsetDateTime::now_utc();
         if mode != InvokeMode::Admitted {
             invocation::verify_invocation(&invocation.0.invocation)
@@ -3548,8 +3600,9 @@ where
         .await
         .map_err(TxError::<B, K>::from)?;
 
+        space_purge::refuse_absent::<B, K>(&lifecycle)?;
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
-        if !requested_spaces.is_empty() {
+        if lifecycle.is_none() && !requested_spaces.is_empty() {
             let hosted = space::Entity::find()
                 .filter(space::Column::Id.is_in(requested_spaces.iter().cloned().map(SpaceIdWrap)))
                 .count(&self.conn)
@@ -4251,8 +4304,8 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 /// already taken on `db` (this same transaction) with
 /// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
-    db: &C,
+pub(crate) async fn transact<S: StorageSetup, K: Secrets>(
+    db: &DatabaseTransaction,
     store_setup: &S,
     secrets: &K,
     node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
@@ -4262,6 +4315,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     sequence_locks_held: &[SpaceId],
     delegated_sql_caveats: bool,
     named_keys: bool,
+    fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -4325,6 +4379,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 )
                 .await?
             };
+            space_purge::lock_delegation::<S, K>(db, fence, d).await?;
             registered.insert(*hash, reg);
         }
     }
@@ -4644,6 +4699,23 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 
         let mut delegation_cids = Vec::new();
         for (hash, event) in event_hashes {
+            let fence_targets = match &event {
+                Event::Invocation(i, _)
+                | Event::InternalInvocation(i, _)
+                | Event::AdmittedInvocation(i, _) => Some((
+                    i.0.spaces().cloned().collect::<Vec<_>>(),
+                    i.0.invoker.clone(),
+                )),
+                Event::Revocation(r) => Some((
+                    space_order
+                        .iter()
+                        .filter(|(_, (_, _, _, hashes))| hashes.contains_key(&hash))
+                        .map(|(space, _)| space.clone())
+                        .collect(),
+                    r.0.revoker.clone(),
+                )),
+                Event::Delegation(_) => None,
+            };
             match event {
                 Event::Delegation(_) => {
                     // Already registered atomically before epoch construction.
@@ -4716,6 +4788,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     }
                 }
             };
+            if let Some((spaces, actor)) = fence_targets {
+                for space in &spaces {
+                    space_purge::lock_live::<S, K>(db, fence, space, &actor).await?;
+                }
+            }
         }
 
         for space in new_spaces {

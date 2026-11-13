@@ -662,7 +662,11 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
 /// `DuckDbError` has no retryable-unavailable variant (adding one would reach
 /// every route mapping), so an exhausted `ArtifactChanged` stays `Internal`.
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
-    DuckDbError::Internal(err.to_string())
+    match err {
+        DatabaseArtifactError::SpaceDeleted => DuckDbError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => DuckDbError::LifecycleUnavailable,
+        err => DuckDbError::Internal(err.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1404,3 +1408,5 @@ mod tests {
         }
     }
 }
+
+mod space_purge;

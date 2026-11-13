@@ -1163,6 +1163,9 @@ pub async fn app_with_control(
         .attach(AdHoc::on_liftoff("kv-orphan-cleanup", move |rocket| {
             let conn = orphan_conn.clone();
             let store = orphan_store.clone();
+            let purge_fence = rocket
+                .state::<TinyCloud>()
+                .and_then(|db| db.space_purge_fence().cloned());
             let shutdown = rocket.shutdown();
             Box::pin(async move {
                 tokio::spawn(async move {
@@ -1172,9 +1175,15 @@ pub async fn app_with_control(
                         tokio::select! {
                             _ = interval.tick() => {
                                 let result = tokio::select! {
-                                    result = tinycloud_core::kv_orphans::drain_candidates_for_interval(
-                                        &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
-                                    ) => result,
+                                    result = async {
+                                        let _collector = match &purge_fence {
+                                            Some(fence) => Some(fence.collector_operation().await),
+                                            None => None,
+                                        };
+                                        tinycloud_core::kv_orphans::drain_candidates_for_interval(
+                                            &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
+                                        ).await
+                                    } => result,
                                     _ = &mut shutdown => break,
                                 };
                                 if let Err(error) = result {
@@ -2817,3 +2826,6 @@ mod no_transform_fairing_tests {
         }
     }
 }
+
+pub mod space_lifecycle;
+pub mod space_purge_executor;

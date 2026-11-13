@@ -33,6 +33,7 @@ async-std = [
 ]
 
 [dependencies]
+serde_jcs = "0.1"
 dashmap = "5.5"
 blake3 = "1"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

@@ -264,6 +264,7 @@ where
 #[derive(Debug)]
 pub enum InvokeError {
     Text(Status, String),
+    Deleted(&'static str),
     Storage(StorageRejection),
     /// A `401` whose JSON body is `{"code": <code>, "error": <message>}`; the
     /// message is the unchanged human text of the refusal.
@@ -292,6 +293,11 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
     fn respond_to(self, request: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
         match self {
             Self::Text(status, message) => (status, message).respond_to(request),
+            Self::Deleted(code) => (
+                Status::Gone,
+                Json(serde_json::json!({"error":{"code":code}})),
+            )
+                .respond_to(request),
             Self::Storage(rejection) => rejection.respond_to(request),
             Self::Revoked(code, message) => (
                 Status::Unauthorized,
@@ -813,9 +819,21 @@ pub async fn delegate(
         )
         .await;
         let res = res
-            .map_err(|e| match e.revocation_code() {
-                Some(code) => InvokeError::Revoked(code, e.to_string()),
-                None => delegation_failure(&e, write_may_have_applied).into(),
+            .map_err(|e| {
+                if matches!(e, TxError::SpaceDeleted) {
+                    return InvokeError::Deleted("space_deleted");
+                }
+                if matches!(e, TxError::LifecycleUnavailable) {
+                    return (
+                        Status::ServiceUnavailable,
+                        "Space lifecycle unavailable".into(),
+                    )
+                        .into();
+                }
+                match e.revocation_code() {
+                    Some(code) => InvokeError::Revoked(code, e.to_string()),
+                    None => delegation_failure(&e, write_may_have_applied).into(),
+                }
             })
             .and_then(|result: TransactResult| {
                 let TransactResult {
@@ -925,6 +943,7 @@ pub async fn invoke(
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
+    purge_leases: crate::space_lifecycle::leases::PurgeLeases,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     with_invoke_deadline(
         config,
@@ -943,6 +962,7 @@ pub async fn invoke(
             sql_service,
             duckdb_service,
             hook_runtime,
+            purge_leases,
         )),
     )
     .await
@@ -965,6 +985,7 @@ pub async fn invoke(
     encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
+    purge_leases: crate::space_lifecycle::leases::PurgeLeases,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     with_invoke_deadline(
         config,
@@ -983,6 +1004,7 @@ pub async fn invoke(
             sql_service,
             (),
             hook_runtime,
+            purge_leases,
         )),
     )
     .await
@@ -1895,6 +1917,50 @@ fn classify_invocation_time_rejection(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn prepare_space_purge_leases(
+    tinycloud: &TinyCloud,
+    invocation: &AdmittedInvocation,
+    leases: &crate::space_lifecycle::leases::PurgeLeases,
+) -> Result<(), InvokeError> {
+    let Some(fence) = tinycloud.space_purge_fence() else {
+        return Ok(());
+    };
+    let mut live = Vec::new();
+    for space in invocation.invocation().0.spaces() {
+        let state = fence
+            .probe(tinycloud.connection(), space)
+            .await
+            .map_err(|_| {
+                (
+                    Status::ServiceUnavailable,
+                    "Space lifecycle unavailable".to_string(),
+                )
+            })?;
+        if state.exists && !state.fenced {
+            live.push(space.clone());
+        }
+    }
+    match fence.admit_many(tinycloud.connection(), &live).await {
+        Ok(operations) => {
+            for operation in operations {
+                leases.hold_space(operation);
+            }
+        }
+        // Core loads the same state before grant evaluation and routes a
+        // fenced target through its absent-space path; never reveal it here.
+        Err(tinycloud_core::space_purge_fence::FenceError::Deleted) => {}
+        Err(_) => {
+            return Err((
+                Status::ServiceUnavailable,
+                "Space lifecycle unavailable".into(),
+            )
+                .into())
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
@@ -1912,6 +1978,7 @@ async fn invoke_impl(
         '_,
     >,
     hook_runtime: &State<HookRuntime>,
+    purge_leases: crate::space_lifecycle::leases::PurgeLeases,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
@@ -1993,6 +2060,8 @@ async fn invoke_impl(
         // shape before any specialized dispatch so mixed invocations fail
         // before another capability runs.
         kv_sync_target(&admitted.invocation().0.capabilities)?;
+
+        prepare_space_purge_leases(tinycloud, &admitted, &purge_leases).await?;
 
         let decrypt_network = admitted
             .invocation()
@@ -2554,6 +2623,7 @@ async fn invoke_impl(
                 }
             }
             Err(e) => {
+                if let Some(refusal) = purge_refusal(&e) { return Err(refusal); }
                 // Invalid-time observability: the core error is a unit variant
                 // that the catch-all maps to 401, so classify the reason here
                 // (server-side) from the signed window before mapping.
@@ -3640,6 +3710,7 @@ fn json_to_sql_value(v: &serde_json::Value) -> Result<tinycloud_core::sql::SqlVa
 
 pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
     match err {
+        SqlError::SpaceDeleted => Status::Gone,
         SqlError::Sqlite(_) => Status::BadRequest,
         SqlError::PermissionDenied(_) => Status::Forbidden,
         SqlError::DatabaseNotFound => Status::NotFound,
@@ -4119,6 +4190,8 @@ async fn handle_duckdb_invoke(
 #[cfg(feature = "duckdb")]
 fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     match err {
+        DuckDbError::SpaceDeleted => Status::Gone,
+        DuckDbError::LifecycleUnavailable => Status::ServiceUnavailable,
         DuckDbError::DuckDb(_) => Status::BadRequest,
         DuckDbError::InvalidStatement(_) => Status::BadRequest,
         DuckDbError::SchemaError(_) => Status::BadRequest,
@@ -4463,6 +4536,9 @@ async fn verify_auth(
         // Authorization records only the invocation; the operation it
         // authorizes has not run, so a database failure here is retryable.
         .map_err(|e| {
+            if let Some(refusal) = purge_refusal(&e) {
+                return refusal;
+            }
             if let Some(code) = e.revocation_code() {
                 return InvokeError::Revoked(code, e.to_string());
             }
@@ -4520,11 +4596,30 @@ async fn verify_auth_admitted(
 
 /// [`authorization_failure`], with a revocation refusal carrying its stable
 /// code (TC-2381).
+fn purge_refusal(
+    error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+) -> Option<InvokeError> {
+    match error {
+        TxStoreError::Tx(TxError::SpaceDeleted) => Some(InvokeError::Deleted("space_deleted")),
+        TxStoreError::Tx(TxError::LifecycleUnavailable) => Some(
+            (
+                Status::ServiceUnavailable,
+                "Space lifecycle unavailable".into(),
+            )
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
 fn authorization_refusal(
     span: &'static str,
     error: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
     write_may_have_applied: bool,
 ) -> InvokeError {
+    if let Some(refusal) = purge_refusal(error) {
+        return refusal;
+    }
     match error.revocation_code() {
         Some(code) => InvokeError::Revoked(code, error.to_string()),
         None => authorization_failure(span, error, write_may_have_applied).into(),
@@ -4564,6 +4659,7 @@ mod tests {
     mod operation_retry;
     mod revocation_codes;
     mod revocation_scope;
+    mod space_purge_privacy;
 
     use super::*;
     use crate::{

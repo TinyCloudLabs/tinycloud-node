@@ -1,3 +1,8 @@
+mod purge_completion;
+mod purge_inventory;
+#[cfg(test)]
+mod space_purge_finalize_tests;
+
 #[cfg(test)]
 use super::TestPause;
 use super::{size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
@@ -83,6 +88,86 @@ impl FileSystemStore {
             #[cfg(test)]
             after_stage_unlink: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn purge_directory(&self, space: &SpaceId) -> Result<Option<PathBuf>, IoError> {
+        let suffix = space.suffix();
+        let name = space.name().as_str();
+        for component in [suffix, name] {
+            if component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.contains('/')
+                || component.contains('\\')
+            {
+                return Err(IoError::new(ErrorKind::InvalidInput, "invalid space path"));
+            }
+        }
+        let owner_directory = self.path.join(suffix);
+        match tokio::fs::symlink_metadata(&owner_directory).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "invalid owner directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        let directory = owner_directory.join(name);
+        match tokio::fs::symlink_metadata(&directory).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "invalid space directory",
+                ));
+            }
+            Ok(_) => {}
+        }
+        Ok(Some(directory))
+    }
+
+    /// Read-only KV-byte probe; callers must separately verify other storage.
+    /// Completion callers must hold the exclusive space drain guard.
+    pub async fn space_is_empty(&self, space: &SpaceId) -> Result<bool, IoError> {
+        let Some(directory) = self.purge_directory(space).await? else {
+            return Ok(true);
+        };
+        Ok(tokio::fs::read_dir(directory)
+            .await?
+            .next_entry()
+            .await?
+            .is_none())
+    }
+
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// Re-list from the beginning after every batch, including after restart.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, IoError> {
+        let Some(directory) = self.purge_directory(space).await? else {
+            return self.finish_empty_space(space).await;
+        };
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        let mut removed = false;
+        for _ in 0..256 {
+            let Some(entry) = entries.next_entry().await? else {
+                break;
+            };
+            // Never follow links or recursively traverse unexpected directories.
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == ErrorKind::NotFound => removed = true,
+                Err(error) => return Err(error),
+            }
+        }
+        drop(entries);
+        if removed {
+            Ok(false)
+        } else {
+            self.finish_empty_space(space).await
+        }
     }
 
     fn get_path(&self, space: &SpaceId, mh: &Hash, generation: i64) -> PathBuf {
@@ -470,13 +555,16 @@ async fn store_sizes<P: AsRef<Path>>(
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         // for every entry in the store dir
         .try_fold(
-            (HashMap::new(), HashMap::new()),
-            |(mut acc, mut stages), entry| async move {
+            (HashMap::new(), HashMap::new(), 0_u64),
+            |(mut acc, mut stages, mut skipped), entry| async move {
                 // if its a directory and the suffix is a valid string
                 if let (true, Ok(ref suffix)) = (
                     entry.metadata().await?.is_dir(),
                     entry.file_name().into_string(),
                 ) {
+                    if suffix == "_purge-ledger" {
+                        return Ok((acc, stages, skipped));
+                    }
                     let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                     let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
                         IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
@@ -490,19 +578,34 @@ async fn store_sizes<P: AsRef<Path>>(
                             entry.file_name().into_string(),
                         ) {
                             // get the space ID from suffix and name
-                            let space =
-                                SpaceId::new(did.clone(), name.try_into().map_err(IoError::other)?)
-                                    .map_err(IoError::other)?;
+                            let name = match tinycloud_auth::resource::Name::try_from(name) {
+                                Ok(name) => name,
+                                Err(_) => {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            };
+                            let space = SpaceId::new(did.clone(), name).map_err(IoError::other)?;
                             let (size, space_stages) = space_size(&entry.path()).await?;
                             acc.insert(space, size);
                             stages.extend(space_stages);
                         }
                     }
                 };
-                Ok((acc, stages))
+                Ok((acc, stages, skipped))
             },
         )
         .await
+        .map(|(sizes, stages, skipped)| {
+            // Storage operators need the count, never the directory identities.
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped_space_directories = skipped,
+                    "skipped invalid space directories while measuring storage"
+                );
+            }
+            (sizes, stages)
+        })
 }
 
 async fn space_size<P: AsRef<Path>>(path: &P) -> Result<(u64, HashMap<PathBuf, u64>), IoError> {
@@ -1749,3 +1852,14 @@ mod test {
         assert_eq!(store.total_size(&space).await.unwrap(), Some(0));
     }
 }
+
+#[cfg(test)]
+#[path = "space_purge_fs_tests.rs"]
+mod space_purge_tests;
+
+#[path = "purge_ledger_fs.rs"]
+mod purge_ledger;
+
+#[cfg(test)]
+#[path = "space_purge_probe_fs_tests.rs"]
+mod space_purge_probe_tests;

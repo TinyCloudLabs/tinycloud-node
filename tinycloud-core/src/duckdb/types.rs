@@ -449,6 +449,10 @@ pub struct ExportResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DuckDbError {
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("DuckDB error: {0}")]
     DuckDb(String),
     #[error("Permission denied: {0}")]
