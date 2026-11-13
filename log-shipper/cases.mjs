@@ -130,6 +130,25 @@ export const vectorTests = [
   // TC-2346: the node's operation-retry warnings (target tinycloud_core::db_pool). Like every classified diagnostic they ship the code and the count only; operation, error_class and the timings stay in the node's own log.
   ...[['retrying operation after a lost database connection', 'db_operation_retried'], ['not retrying operation: its first run took longer than the retry window to fail', 'db_operation_retry_skipped_slow']].map(([message, code]) => check(`operation retry warning maps to ${code} with only the fixed diagnostic keys`, envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::db_pool', fields: { message, operation: 'delegate', error_class: 'io', elapsed_ms: 10001, retry_window_ms: 10000, sql: canary } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1 && .level == "warn" && keys(.) == ["event", "event_code", "event_count", "level", "svc", "ts"]`)),
   ...['retrying operation after a lost database connection: x', 'Retrying operation after a lost database connection', 'not retrying operation'].map(message => check(`operation retry warning near-miss "${message}" stays unclassified`, envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::db_pool', fields: { message, operation: 'delegate', error_class: 'io' } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1')),
+  // TC-2954, TC-2961, TC-3027, TC-3006: the pooled-connection backstop (vendored sqlx-core, target tinycloud_core::db_pool),
+  // the SQL artifact read limit and checkpoint back-off (tinycloud_core::sql::service), the KV head size probe, the
+  // chain-guard slow wait (tinycloud::chain_guard) and the every-5xx line (tinycloud::request). Code and count only:
+  // sizes, delays, kinds, routes, statuses, errors and identifiers stay in the node's own log.
+  ...[
+    ['closing a pooled connection released inside a transaction', 'db_pool_closed_in_transaction', 'tinycloud_core::db_pool', {}],
+    ['Database exceeds the artifact read limit; not loaded', 'sql_database_too_large_to_load', 'tinycloud_core::sql::service', { service: 'sql', error_class: 'artifact_read_limit', bytes: 300666880, limit_bytes: 67108864 }],
+    ['Database checkpoint save failed; refusing its writes until the back-off ends', 'sql_checkpoint_save_backoff', 'tinycloud_core::sql::service', { service: 'sql', retry_after_ms: 30000 }],
+    ['kv head size probe failed; size omitted', 'kv_head_size_probe_failed', 'tinycloud::routes', { error: canary }],
+    ['chain guard wait exceeded the slow-wait threshold', 'chain_guard_slow_wait', 'tinycloud::chain_guard', { event: 'chain_guard_slow_wait', kind: 'exclusive', elapsed_ms: 612, guards: 3, suppressed: 0 }],
+    ['request answered with a 5xx', 'http_5xx', 'tinycloud::request', { error_class: 'http_5xx', status: 503, route: '/invoke', classified: true }],
+  ].map(([message, code, target, fields]) => check(`${code} warning maps to its code with only the fixed diagnostic keys`, envelope({ timestamp, level: 'WARN', target, fields: { message, ...fields, space: canary, db_name: canary } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1 && .level == "warn" && keys(.) == ["event", "event_code", "event_count", "level", "svc", "ts"]`)),
+  ...[
+    ['closing a pooled connection released inside a transaction', 'sqlx_core::pool::connection'],
+    ['closing a pooled connection released inside a transaction: x', 'tinycloud_core::db_pool'],
+    ['Database exceeds the artifact read limit', 'tinycloud_core::sql::service'],
+    ['database checkpoint save failed; refusing its writes until the back-off ends', 'tinycloud_core::sql::service'],
+    ['kv head size probe failed', 'tinycloud::routes'],
+  ].map(([message, target]) => check(`near-miss "${message}" on ${target} stays unclassified`, envelope({ timestamp, level: 'WARN', target, fields: { message } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1')),
   check('node 5xx diagnostic ships exactly its eight fields as an individual event', envelope(dbFailure()), `.event == "node_warning" && .svc == "api" && .level == "warn" && .event_code == "db_failure_5xx" && .status == 503 && .code == "sql_busy" && .service == "sql" && .route == "/invoke" && .elapsed_ms == 30001 && .failure_kind == "lock_wait" && .write_may_have_applied == false && .db_hash == "${goodHash}" && !exists(.event_count) && ${keysAre(dbShipped)}`),
   check('node 5xx diagnostic without a database ships without db_hash', envelope(dbFailure({ db_hash: undefined, status: 500, code: 'internal', service: 'other', failure_kind: 'other' })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "internal" && .service == "other" && .failure_kind == "other" && ${keysAre(dbShipped.filter(key => key !== 'db_hash'))}`),
   check('node 5xx diagnostic with an unknown outcome ships the write flag', envelope(dbFailure({ status: 500, code: 'outcome_unknown', write_may_have_applied: true })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "outcome_unknown" && .write_may_have_applied == true && ${keysAre(dbShipped)}`),
