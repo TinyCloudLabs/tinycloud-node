@@ -206,11 +206,12 @@ lazy_static! {
         &["store"]
     )
     .unwrap();
-    /// Writes refused because the disk was short of the configured headroom.
-    /// The label is the engine (`sql`).
+    /// Requests answered `507 sql_disk_headroom` (any SQL request whose error
+    /// maps to it: writes, and exports or queries that hit a full disk). The
+    /// label is the engine (`sql`).
     pub static ref DISK_HEADROOM_REFUSALS: IntCounterVec = register_int_counter_vec!(
         "tinycloud_disk_headroom_refusals_total",
-        "Writes refused for disk headroom, by engine.",
+        "Requests refused for disk headroom, by engine.",
         &["engine"]
     )
     .unwrap();

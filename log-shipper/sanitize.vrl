@@ -46,14 +46,15 @@ if label == "tinycloud-node" {
   }
   # TC-2917: the node's periodic disk headroom line (one per local store) ships as an individual
   # info event. Exactly the message plus `store` (a declared store) and `free_bytes` (a bounded
-  # integer); anything else leaves headroom null, and the info line is then dropped below.
+  # integer in whole 64 MiB steps, as the node rounds it); anything else leaves headroom null, and
+  # the info line is then dropped below.
   headroom = null
-  if target == "tinycloud::storage" && level == "info" && msg == "storage headroom" && length(f) == 3 {
+  if target == "tinycloud::disk_headroom" && level == "info" && msg == "storage headroom" && length(f) == 3 {
     h_store = string(f.store) ?? ""
     h_free = f.free_bytes
     if includes(__STORAGE_STORES__, h_store) && is_integer(h_free) {
       h_free = int!(h_free)
-      if h_free >= 0 && h_free <= 9007199254740991 {
+      if h_free >= 0 && h_free <= 9007199254740991 && mod(h_free, 67108864) == 0 {
         headroom = {"event": "node_storage_headroom", "svc": "api", "level": "info", "store": h_store, "free_bytes": h_free}
       }
     }

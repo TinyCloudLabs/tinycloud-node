@@ -118,7 +118,7 @@ if reason != "" {
     level = downcase(string(parsed.level) ?? "")
     if label == "tinycloud-node" && !includes(["warn", "error"], level) && target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") {
       . = {"reason": "unknown_target"}
-    } else if label == "tinycloud-node" && !includes(["warn", "error"], level) && !((target == "tinycloud::request" || target == "tinycloud::storage") && level == "info") {
+    } else if label == "tinycloud-node" && !includes(["warn", "error"], level) && !((target == "tinycloud::request" || target == "tinycloud::disk_headroom") && level == "info") {
       . = {"reason": "filtered_level"}
     } else { . = {"label": label, "parsed": parsed} }
   }

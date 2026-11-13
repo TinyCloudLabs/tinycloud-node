@@ -1689,18 +1689,28 @@ fn local_stores(storage: &config::Storage) -> Vec<(&'static str, PathBuf)> {
     stores
 }
 
-/// One `statvfs` per store: the free bytes go to the gauge and to one
-/// `storage headroom` event per store, which the log sidecar ships with only
-/// these two fields. A store that cannot be read is skipped.
+/// The granularity of the free bytes in the shipped headroom event: exact
+/// values every 5 minutes would let a quiet node's write volume be inferred
+/// by whoever reads the logs; 64 MiB steps still show headroom.
+const STORAGE_HEADROOM_STEP_BYTES: u64 = 64 << 20;
+
+/// The log target of the headroom event. It is not a module path, so no other
+/// line in the node can carry it by accident.
+const STORAGE_HEADROOM_TARGET: &str = "tinycloud::disk_headroom";
+
+/// One `statvfs` per store: the exact free bytes go to the gauge, and one
+/// `storage headroom` event per store carries them rounded down to
+/// [`STORAGE_HEADROOM_STEP_BYTES`]; the log sidecar ships it with only these
+/// two fields. A store that cannot be read is skipped.
 fn report_storage_headroom(stores: &[(&'static str, PathBuf)]) {
     use tinycloud_core::sql::durability::{FreeSpace, StatvfsFreeSpace};
     for (store, path) in stores {
         if let Ok(free_bytes) = StatvfsFreeSpace.free_bytes(path) {
             crate::prometheus::set_storage_free_bytes(store, free_bytes);
             ::tracing::info!(
-                target: "tinycloud::storage",
+                target: STORAGE_HEADROOM_TARGET,
                 store = *store,
-                free_bytes,
+                free_bytes = free_bytes - free_bytes % STORAGE_HEADROOM_STEP_BYTES,
                 "storage headroom"
             );
         }
