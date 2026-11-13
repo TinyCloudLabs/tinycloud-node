@@ -1,3 +1,5 @@
+mod purge_inventory;
+
 #[cfg(test)]
 use super::TestPause;
 use super::{size::SpaceSizes, BlobGenerationKey, BlobOperationLocks};
