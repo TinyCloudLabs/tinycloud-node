@@ -540,6 +540,7 @@ async fn verify_invocation_authorization<C: ConnectionTrait>(
 /// The commit transaction repeats authorization after the sequence lock.
 /// `check_hosted` is false only where the caller's registration statement
 /// checks that every space exists itself.
+#[allow(clippy::too_many_arguments)]
 async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Secrets>(
     conn: &C,
     invocation: &Invocation,
