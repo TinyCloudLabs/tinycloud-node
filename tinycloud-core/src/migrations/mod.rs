@@ -1,3 +1,4 @@
+mod m20261113_000000_purge_ledger_repair;
 mod m20261112_000000_space_purge;
 mod m20261112_010000_space_purge_fences;
 mod m20261112_020000_space_purge_shared_residue;
@@ -88,6 +89,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261112_030000_resource_purge::Migration),
             Box::new(m20261111_000000_delegation_renewals::Migration),
             Box::new(m20261112_000000_renewal_identity::Migration),
+            Box::new(m20261113_000000_purge_ledger_repair::Migration),
         ]
     }
 }
