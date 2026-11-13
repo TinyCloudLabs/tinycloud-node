@@ -1344,8 +1344,10 @@ async fn status_authorized<C: ConnectionTrait>(
     )
 }
 
-/// Read-only, non-authoritative history guarded by per-delegation status rules.
-pub async fn renewal_history<C: ConnectionTrait>(
+/// Read-only, non-authoritative history guarded by original status rights.
+/// Call only inside the status snapshot after evaluating the original's status
+/// decision, including its revocation state, on the same connection.
+pub(crate) async fn renewal_history<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
     invoker: &str,
@@ -1357,6 +1359,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
     if !status_authorized(db, invoker, proofs, original_id).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
+    let canonical_original_cid = original_id.to_cid(0x55).to_string();
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
         "SELECT s.cid, s.lease_cid, s.generation, s.previous_stamp_cid, s.new_end, s.signed_bytes, s.signature FROM renewal_stamp s WHERE s.original_canonical = $1 ORDER BY s.lease_cid, s.generation",
@@ -1367,7 +1370,14 @@ pub async fn renewal_history<C: ConnectionTrait>(
         let cid = Hash::try_from(row.try_get::<Vec<u8>>("", "cid")?).map_err(DbErr::from)?;
         let lease =
             Hash::try_from(row.try_get::<Vec<u8>>("", "lease_cid")?).map_err(DbErr::from)?;
-        if !status_authorized(db, invoker, proofs, lease).await? {
+        // The enclosing status snapshot authorizes the original, including
+        // its revocation state. Lease-party rights do not gate its stamps.
+        let signed_bytes: Vec<u8> = row.try_get("", "signed_bytes")?;
+        let Ok(signed) = serde_ipld_dagcbor::from_slice::<CanonicalRenewalStamp<'_>>(&signed_bytes)
+        else {
+            continue;
+        };
+        if signed.unsigned.original_cid != canonical_original_cid {
             continue;
         }
         let previous = Hash::try_from(row.try_get::<Vec<u8>>("", "previous_stamp_cid")?)
@@ -1379,7 +1389,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
             new_end: new_end.unix_timestamp(),
             previous_stamp_cid: previous.to_cid(0x55).to_string(),
             generation: row.try_get::<i64>("", "generation")? as u64,
-            signed_bytes: row.try_get("", "signed_bytes")?,
+            signed_bytes,
             signature: row.try_get("", "signature")?,
         });
     }
