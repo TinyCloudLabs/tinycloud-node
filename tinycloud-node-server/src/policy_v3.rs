@@ -255,7 +255,7 @@ impl PolicyV3Runtime {
         else {
             return Err("policy-session-registration-missing".into());
         };
-        let proofs: Vec<String> = event.0.parents.iter().map(ToString::to_string).collect();
+        let proofs: Vec<String> = event.0.parents.iter().copied().map(stored_cid).collect();
         if proofs
             != [
                 registration.policy_root_cid.clone(),
@@ -482,7 +482,7 @@ impl PolicyV3Runtime {
             .one(&self.conn)
             .await?
             .ok_or("policy-registration-missing")?;
-        let proof_cids: Vec<String> = session.0.parents.iter().map(ToString::to_string).collect();
+        let proof_cids: Vec<String> = session.0.parents.iter().copied().map(stored_cid).collect();
         if proof_cids
             != [
                 registration.policy_root_cid.clone(),
@@ -662,7 +662,8 @@ impl PolicyV3Runtime {
                     .0
                     .parents
                     .iter()
-                    .map(ToString::to_string)
+                    .copied()
+                    .map(stored_cid)
                     .collect::<Vec<_>>();
                 if proofs
                     != [
@@ -761,7 +762,8 @@ impl PolicyV3Runtime {
             .0
             .parents
             .iter()
-            .map(ToString::to_string)
+            .copied()
+            .map(stored_cid)
             .collect::<Vec<_>>();
         stored_parents.sort();
         signed_parents.sort();
@@ -1520,10 +1522,11 @@ fn build_delivery_authorization_receipt(
 pub async fn authorize_delivery(
     request: DeliveryBody,
     runtime: &State<PolicyV3Runtime>,
+    tinycloud: &State<crate::TinyCloud>,
     invocation: AuthHeaderGetter<InvocationInfo>,
 ) -> Result<Json<Value>, DeliveryFailure> {
     let mut retry_after = None;
-    authorize_delivery_inner(request, runtime, invocation, &mut retry_after)
+    authorize_delivery_inner(request, runtime, tinycloud, invocation, &mut retry_after)
         .await
         .map_err(|(status, body)| DeliveryFailure {
             status,
@@ -1555,6 +1558,7 @@ fn refuse_db(reason: &'static str, error: impl std::fmt::Display) -> (Status, St
 async fn authorize_delivery_inner(
     request: DeliveryBody,
     runtime: &PolicyV3Runtime,
+    tinycloud: &crate::TinyCloud,
     invocation: AuthHeaderGetter<InvocationInfo>,
     retry_after: &mut Option<u64>,
 ) -> Result<Json<Value>, (Status, String)> {
@@ -1579,20 +1583,37 @@ async fn authorize_delivery_inner(
             "delivery-authorization-invalid",
         ),
     })?;
-    runtime
-        .refuse_policy_root_proofs(&invocation.0 .0.parents)
+    // The same policy gate as `/invoke`: a registered root never authorizes,
+    // and a policy session holds every condition of its policy.
+    let invocation_refused = |error: AuthorizationError| {
+        if error.is::<tinycloud_core::sea_orm::DbErr>() {
+            authorization_failure(error)
+        } else {
+            refuse(
+                "policy_invocation_refused",
+                Status::Forbidden,
+                "delivery-authorization-invalid",
+            )
+        }
+    };
+    let session_policy_cid = if runtime
+        .authorize_invocation(tinycloud, &invocation.0 .0, None, OffsetDateTime::now_utc())
         .await
-        .map_err(|error| {
-            if error.is::<tinycloud_core::sea_orm::DbErr>() {
-                authorization_failure(error)
-            } else {
-                refuse(
-                    "policy_root_proof",
-                    Status::Forbidden,
-                    "delivery-authorization-invalid",
-                )
-            }
-        })?;
+        .map_err(invocation_refused)?
+    {
+        let (_, session) = tinycloud
+            .load_signed_delegation(invocation.0 .0.parents[0])
+            .await
+            .map_err(invocation_refused)?
+            .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?;
+        Some(
+            fact(&session.0.delegation, "policyCid")
+                .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let request = request.0;
     let invalid =
         |reason: &'static str| refuse(reason, Status::BadRequest, "delivery-authorization-invalid");
@@ -1684,6 +1705,14 @@ async fn authorize_delivery_inner(
                 "delivery-authorization-invalid",
             )
         })?;
+    // A policy session delivers only a share under its own policy.
+    if session_policy_cid.is_some_and(|cid| cid != registration.policy_cid) {
+        return Err(refuse(
+            "policy_session_other_policy",
+            Status::Forbidden,
+            "delivery-authorization-invalid",
+        ));
+    }
     // The link cannot outlive the share, and one key issued the record, signed
     // the envelope and owns the registration.
     let share_expires = parse_time(&registration.expires_at).map_err(|_| {
