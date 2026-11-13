@@ -31,6 +31,8 @@ pub struct LedgerRecord {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefixes: Vec<PrefixHmac>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retirement_snapshots: Vec<RetirementSnapshotCommitment>,
     pub mac: String,
 }
 
@@ -40,6 +42,15 @@ pub struct LedgerRecord {
 pub struct PrefixHmac {
     pub store_kind: String,
     pub prefix_hmac: String,
+}
+
+/// Identity-free commitment to one target's local retirement provenance.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct RetirementSnapshotCommitment {
+    pub target_hmac: String,
+    pub network_hmac: String,
+    pub snapshot_hmac: String,
 }
 
 #[derive(Serialize)]
@@ -53,6 +64,8 @@ struct SignedFields<'a> {
     timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     prefixes: Option<&'a [PrefixHmac]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retirement_snapshots: Option<&'a [RetirementSnapshotCommitment]>,
 }
 
 fn safe_key_id(value: &str) -> bool {
@@ -87,10 +100,23 @@ impl LedgerRecord {
             state: &self.state,
             timestamp: self.timestamp,
             prefixes: (self.version == 2).then_some(self.prefixes.as_slice()),
+            retirement_snapshots: (self.version == 3)
+                .then_some(self.retirement_snapshots.as_slice()),
         }
     }
     fn validate(&self) -> Result<(), LedgerError> {
-        if !matches!(self.version, 1 | 2)
+        if !matches!(self.version, 1..=3)
+            || (self.version == 3 && (self.kind != "owner" || !self.prefixes.is_empty()))
+            || (self.version != 3 && !self.retirement_snapshots.is_empty())
+            || self
+                .retirement_snapshots
+                .windows(2)
+                .any(|pair| pair[0].target_hmac >= pair[1].target_hmac)
+            || self.retirement_snapshots.iter().any(|row| {
+                !hex_digest(&row.target_hmac)
+                    || !hex_digest(&row.network_hmac)
+                    || !hex_digest(&row.snapshot_hmac)
+            })
             || (self.version == 1 && !self.prefixes.is_empty())
             || (self.kind == "owner" && !self.prefixes.is_empty())
             || self.prefixes.windows(2).any(|pair| pair[0] >= pair[1])
@@ -265,6 +291,7 @@ impl LedgerKeys {
             state: state.into(),
             timestamp,
             prefixes: Vec::new(),
+            retirement_snapshots: Vec::new(),
             mac: String::new(),
         };
         self.authenticate(record)
@@ -272,10 +299,10 @@ impl LedgerKeys {
     fn authenticate(&self, mut record: LedgerRecord) -> Result<LedgerRecord, LedgerError> {
         record.validate()?;
         let mut mac = self.mac(&record.key_id)?;
-        mac.update(if record.version == 2 {
-            b"tinycloud-space-purge-ledger-v2\0"
-        } else {
-            b"tinycloud-space-purge-ledger-v1\0"
+        mac.update(match record.version {
+            3 => b"tinycloud-owner-retirement-ledger-v3\0".as_slice(),
+            2 => b"tinycloud-space-purge-ledger-v2\0".as_slice(),
+            _ => b"tinycloud-space-purge-ledger-v1\0".as_slice(),
         });
         mac.update(&serde_json::to_vec(&record.fields()).map_err(|_| LedgerError)?);
         record.mac = hex::encode(mac.finalize().into_bytes());
@@ -295,6 +322,44 @@ impl LedgerKeys {
         record.prefixes = prefixes;
         self.authenticate(record)
     }
+    /// Upgrade an authenticated retirement with its complete target snapshot manifest.
+    /// An empty authenticated manifest means the inventory was checked and empty.
+    pub fn with_retirement_snapshots(
+        &self,
+        mut record: LedgerRecord,
+        mut snapshots: Vec<RetirementSnapshotCommitment>,
+    ) -> Result<LedgerRecord, LedgerError> {
+        self.verify(&record.object_key()?, &record.to_bytes()?)?;
+        if record.kind != "owner" || record.state != "retired" {
+            return Err(LedgerError);
+        }
+        snapshots.sort_by(|left, right| left.target_hmac.cmp(&right.target_hmac));
+        record.version = 3;
+        record.retirement_snapshots = snapshots;
+        self.authenticate(record)
+    }
+
+    /// The body must first pass the strict target-bound snapshot decoder.
+    /// Including the retirement UUID prevents moving provenance to another retirement.
+    pub fn retirement_snapshot_hmac(
+        &self,
+        key_id: &str,
+        retirement_id: &str,
+        canonical_body: &[u8],
+    ) -> Result<Vec<u8>, LedgerError> {
+        let retirement = uuid::Uuid::parse_str(retirement_id).map_err(|_| LedgerError)?;
+        if retirement.to_string() != retirement_id {
+            return Err(LedgerError);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(canonical_body).map_err(|_| LedgerError)?;
+        let payload = serde_jcs::to_vec(&(1, retirement_id, body)).map_err(|_| LedgerError)?;
+        let mut mac = self.mac(key_id)?;
+        mac.update(b"tinycloud-retirement-outside-snapshot-v1\0");
+        mac.update(&payload);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
     /// Preserve the authenticated acceptance inventory across terminal retries.
     pub fn completion_from_acceptance(
         &self,
@@ -348,10 +413,10 @@ impl LedgerKeys {
         }
         let signature = hex::decode(&record.mac).map_err(|_| LedgerError)?;
         let mut mac = self.mac(&record.key_id)?;
-        mac.update(if record.version == 2 {
-            b"tinycloud-space-purge-ledger-v2\0"
-        } else {
-            b"tinycloud-space-purge-ledger-v1\0"
+        mac.update(match record.version {
+            3 => b"tinycloud-owner-retirement-ledger-v3\0".as_slice(),
+            2 => b"tinycloud-space-purge-ledger-v2\0".as_slice(),
+            _ => b"tinycloud-space-purge-ledger-v1\0".as_slice(),
         });
         mac.update(&serde_json::to_vec(&record.fields()).map_err(|_| LedgerError)?);
         mac.verify_slice(&signature).map_err(|_| LedgerError)?;

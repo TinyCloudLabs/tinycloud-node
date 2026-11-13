@@ -299,6 +299,13 @@ impl LifecycleRuntime {
             return Err(unavailable(()));
         }
         let tx = self.conn.begin().await.map_err(unavailable)?;
+        // Signed metadata writers take the graph lock before owner rows.
+        // Retirement must use that order too when capturing its snapshot.
+        if kind == "retire-owner" {
+            tinycloud_core::space_purge_records::lock(&tx)
+                .await
+                .map_err(unavailable)?;
+        }
         self.fence
             .lock_owner(&tx, &proof.owner_did)
             .await

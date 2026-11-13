@@ -63,3 +63,5 @@ pub mod space_purge_ledger_copy;
 pub mod space_purge_prefix_repair;
 
 pub mod resource_review_consumption;
+
+pub mod resource_retirement_snapshot;
