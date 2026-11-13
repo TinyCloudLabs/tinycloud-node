@@ -522,7 +522,7 @@ impl DuckDbService {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
 
-        let wal = if expected != ArtifactExpectation::Absent {
+        let (wal, expected) = if expected != ArtifactExpectation::Absent {
             match self
                 .artifact_repository
                 .load_meta("duckdb", &key.0, db_name)
@@ -530,17 +530,28 @@ impl DuckDbService {
                 .map_err(artifact_error_to_duckdb)?
             {
                 Some(meta) if meta.checkpoint_size_bytes >= 0 => {
-                    handle
+                    // With no recorded lineage, still attach the WAL only to
+                    // the checkpoint it was just verified against.
+                    let bound = if expected == ArtifactExpectation::Any {
+                        ArtifactExpectation::Derived {
+                            revision: meta.revision,
+                            checkpoint_content_hash: meta.checkpoint_content_hash.clone(),
+                        }
+                    } else {
+                        expected
+                    };
+                    let wal = handle
                         .wal_for_checkpoint(
                             meta.checkpoint_size_bytes as u64,
                             meta.checkpoint_content_hash,
                         )
-                        .await?
+                        .await?;
+                    (wal, bound)
                 }
-                _ => None,
+                _ => (None, expected),
             }
         } else {
-            None
+            (None, expected)
         };
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
@@ -1575,6 +1586,192 @@ mod tests {
         assert_eq!(
             verified, wal,
             "failed identity checks must not checkpoint or truncate the WAL"
+        );
+        service.discard_local_state(&key).await.unwrap();
+    }
+
+    /// Repeated small writes to a file-backed database keep riding on the
+    /// same durable checkpoint: each one saves a WAL, none a full checkpoint.
+    #[tokio::test]
+    async fn duckdb_repeated_small_writes_stay_on_the_wal_path() {
+        let repo = artifact_repository().await;
+        let source_cache = TempDir::new().unwrap();
+        let file_cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-wal-repeat");
+        async fn write(service: &DuckDbService, space: &SpaceId, sql: &str) {
+            service
+                .execute(
+                    space,
+                    "analytics",
+                    DuckDbRequest::Execute {
+                        schema: None,
+                        sql: sql.to_string(),
+                        params: Vec::new(),
+                    },
+                    None,
+                    "tinycloud.duckdb/write".to_string(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let source = service(&source_cache, repo.clone());
+        write(
+            &source,
+            &space,
+            "CREATE TABLE events (id INTEGER, name VARCHAR)",
+        )
+        .await;
+        write(
+            &source,
+            &space,
+            "INSERT INTO events VALUES (0, repeat('x', 1000000))",
+        )
+        .await;
+        let base = repo
+            .load_meta("duckdb", &space.to_string(), "analytics")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let service = file_service(&file_cache, repo.clone());
+        for (n, sql) in [
+            "INSERT INTO events VALUES (1, 'one')",
+            "INSERT INTO events VALUES (2, 'two')",
+            "INSERT INTO events VALUES (3, 'three')",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write(&service, &space, sql).await;
+            let artifact = repo
+                .read_all("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(artifact.storage_mode, "checkpoint+wal", "write {n}");
+            assert_eq!(
+                artifact.checkpoint_content_hash, base.checkpoint_content_hash,
+                "write {n} took a full checkpoint"
+            );
+        }
+        service
+            .discard_local_state(&(space.to_string(), "analytics".to_string()))
+            .await
+            .unwrap();
+    }
+
+    /// A write that reuses freed blocks can leave the main file at the same
+    /// length while changing its contents. It must not ride on the old
+    /// checkpoint: every step recovers in a fresh cache with the exact rows.
+    #[tokio::test]
+    async fn duckdb_same_length_rewrite_of_freed_blocks_recovers_exact_rows() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-reuse-same-length");
+        let key = (space.to_string(), "main".to_string());
+        let service = file_service(&cache, repo.clone());
+        let run = |schema: Option<Vec<String>>, sql: String| {
+            let service = &service;
+            let space = &space;
+            async move {
+                service
+                    .execute(
+                        space,
+                        "main",
+                        DuckDbRequest::Execute {
+                            schema,
+                            sql,
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.duckdb/admin".into(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        run(
+            Some(vec![
+                "CREATE TABLE t1(id BIGINT, body VARCHAR)".into(),
+                "CREATE TABLE t2(id BIGINT, body VARCHAR)".into(),
+            ]),
+            "INSERT INTO t2 VALUES (0, 'seed')".into(),
+        )
+        .await;
+        service.discard_local_state(&key).await.unwrap();
+        let path = service.cache_path(&space, "main");
+        let mut expected = 1i64;
+        let mut same_length_steps = 0;
+        let steps: Vec<(Option<Vec<String>>, &str, i64)> = vec![
+            (
+                None,
+                "INSERT INTO t1 SELECT i, md5(i::VARCHAR) FROM range(300000) t(i)",
+                0,
+            ),
+            (
+                Some(vec!["DROP TABLE t1".into()]),
+                "INSERT INTO t2 SELECT 10000000+i, md5(i::VARCHAR) FROM range(300000) t(i)",
+                300000,
+            ),
+            (
+                None,
+                "INSERT INTO t2 SELECT 20000000+i, md5(i::VARCHAR) FROM range(250000) t(i)",
+                250000,
+            ),
+            (
+                None,
+                "INSERT INTO t2 SELECT 30000000+i, md5(i::VARCHAR) FROM range(250000) t(i)",
+                250000,
+            ),
+        ];
+        for (n, (schema, sql, rows)) in steps.into_iter().enumerate() {
+            let length_before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            run(schema, sql.into()).await;
+            expected += rows;
+            if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == length_before {
+                same_length_steps += 1;
+            }
+            // A fresh cache hydrates from the durable artifact alone. The
+            // check reads every row's content; count(*) alone is answered
+            // from metadata.
+            let fresh = TempDir::new().unwrap();
+            let reader = file_service(&fresh, repo.clone());
+            let got = reader
+                .execute(
+                    &space,
+                    "main",
+                    DuckDbRequest::Query {
+                        sql: "SELECT count(*), sum(CASE WHEN id=0 OR body=md5((id%10000000)::VARCHAR) \
+                              THEN 1 ELSE 0 END)::BIGINT FROM t2"
+                            .into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await;
+            let _ = reader.discard_local_state(&key).await;
+            let DuckDbResponse::Query(rows) = got
+                .unwrap_or_else(|error| panic!("step {n} not recoverable: {error:?}"))
+                .response
+            else {
+                panic!("step {n}: not a query response");
+            };
+            assert_eq!(
+                rows.rows,
+                vec![vec![
+                    DuckDbValue::Integer(expected),
+                    DuckDbValue::Integer(expected)
+                ]],
+                "step {n}"
+            );
+        }
+        assert!(
+            same_length_steps > 0,
+            "no step reused freed blocks at the same file length; the case is not exercised"
         );
         service.discard_local_state(&key).await.unwrap();
     }
