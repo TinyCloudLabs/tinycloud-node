@@ -115,7 +115,9 @@ pub async fn record_and_consume(
     // while an operator published a kill switch. Expiry is checked again too.
     let now = clock();
     let proof = verify_current(ledger, verifier, raw, expected, now.unix_timestamp()).await?;
-    resource_review::consume(tx, &proof, purge_id, now)
+    // The final fresh ledger read may itself cross expiry. Never consume using
+    // the timestamp sampled before that awaited I/O.
+    resource_review::consume(tx, &proof, purge_id, clock())
         .await
         .map_err(|_| Error::other("review decision already consumed or unavailable"))
 }

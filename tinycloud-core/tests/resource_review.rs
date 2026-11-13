@@ -65,6 +65,7 @@ fn verifies_canonical_unicode_and_rejects_changed_target_snapshot_or_expiry() {
     let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
     let hosts = BTreeSet::from(["host-test".into()]);
     let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
         host_id: "host-test",
         owner_hmac: &owner,
         target: &target,
@@ -127,6 +128,7 @@ fn revocation_requires_separate_operator_and_fails_closed() {
     let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
     let hosts = BTreeSet::from(["host-test".into()]);
     let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
         host_id: "host-test",
         owner_hmac: &owner,
         target: &target,
@@ -204,6 +206,7 @@ fn verifies_typescript_jcs_and_ed25519_public_fixture() {
         let target: TargetRow = serde_json::from_value(payload[13][0][4][0].clone()).unwrap();
         let hosts = BTreeSet::from([payload[5].as_str().unwrap().into()]);
         let expected = ReviewExpectation {
+            job_id: payload[4].as_str().unwrap(),
             host_id: payload[5].as_str().unwrap(),
             owner_hmac: payload[6].as_str().unwrap(),
             target: &target,
@@ -237,10 +240,11 @@ fn verifies_typescript_jcs_and_ed25519_public_fixture() {
 }
 
 #[test]
-#[ignore = "manual public interoperability fixture export"]
 fn export_rust_signed_interop_fixture() {
-    let output =
-        std::env::var("TC2871_INTEROP_OUTPUT").expect("explicit public fixture destination");
+    let temporary = tempfile::tempdir().unwrap();
+    let output = std::env::var_os("TC2871_INTEROP_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| temporary.path().join("public-rust-fixture.json"));
     let mut fixture: Value =
         serde_json::from_str(include_str!("fixtures/resource-review-typescript-jcs.json")).unwrap();
     let key = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
@@ -265,7 +269,23 @@ fn export_rust_signed_interop_fixture() {
         vector["snapshotJcs"] =
             json!(String::from_utf8(serde_jcs::to_vec(&json!([1, payload[13]])).unwrap()).unwrap());
     }
-    std::fs::write(output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+    std::fs::write(&output, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+    let reopened: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    for vector in reopened["vectors"].as_array().unwrap() {
+        let bytes = serde_jcs::to_vec(&vector["proof"]["payload"]).unwrap();
+        assert_eq!(bytes, vector["payloadJcs"].as_str().unwrap().as_bytes());
+        let mut message = b"tinycloud-resource-review-decision-v1\0".to_vec();
+        message.extend(bytes);
+        let signature = URL_SAFE_NO_PAD
+            .decode(vector["proof"]["signature"].as_str().unwrap())
+            .unwrap();
+        key.verifying_key()
+            .verify_strict(
+                &message,
+                &ed25519_dalek::Signature::from_slice(&signature).unwrap(),
+            )
+            .unwrap();
+    }
 }
 
 async fn consumption(db: &tinycloud_core::sea_orm::DatabaseConnection) {
@@ -284,6 +304,7 @@ async fn consumption(db: &tinycloud_core::sea_orm::DatabaseConnection) {
     let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
     let hosts = BTreeSet::from(["host-test".into()]);
     let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
         host_id: "host-test",
         owner_hmac: &owner,
         target: &target,
@@ -370,6 +391,7 @@ async fn postgres_review_consumption_is_atomic_and_bound_to_original_purge() {
     options.set_schema_search_path(schema.clone());
     let db = Database::connect(options).await.unwrap();
     consumption(&db).await;
+    concurrent_acceptors(&db).await;
     db.close().await.unwrap();
     admin
         .execute(Statement::from_string(
@@ -408,6 +430,7 @@ fn rotation_retains_audit_keys_without_granting_old_keys_new_authority() {
     let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
     let hosts = BTreeSet::from(["host-test".into()]);
     let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
         host_id: "host-test",
         owner_hmac: &owner,
         target: &target,
@@ -445,4 +468,149 @@ fn rotation_retains_audit_keys_without_granting_old_keys_new_authority() {
     )
     .unwrap();
     assert!(removed.verify_retained_signature(&old_proof).is_err());
+}
+
+#[test]
+fn job_binding_and_strict_carrier_and_signature_are_required() {
+    let writer = SigningKey::from_bytes(&[7; 32]);
+    let operator = SigningKey::from_bytes(&[8; 32]);
+    let verifier = verifier(&writer, &operator);
+    let owner = "a".repeat(64);
+    let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
+    let hosts = BTreeSet::from(["host-test".into()]);
+    let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
+        host_id: "host-test",
+        owner_hmac: &owner,
+        target: &target,
+        authoritative_hosts: &hosts,
+    };
+    let raw = signed(
+        payload(&owner, &target),
+        &writer,
+        b"tinycloud-resource-review-decision-v1\0",
+    );
+    let other_job = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000003",
+        ..expected
+    };
+    assert!(verifier
+        .verify_decision(&raw, &[], &other_job, 150)
+        .is_err());
+    assert!(verifier.verify_decision(&raw, &[], &expected, 150).is_ok());
+    let carrier: Value = serde_json::from_slice(&raw).unwrap();
+    let duplicate = format!(
+        "{{\"payload\":{},\"signature\":{},\"signature\":{}}}",
+        carrier["payload"], carrier["signature"], carrier["signature"]
+    );
+    assert!(verifier
+        .verify_decision(duplicate.as_bytes(), &[], &expected, 150)
+        .is_err());
+    let mut unknown = carrier.clone();
+    unknown["extra"] = json!(true);
+    assert!(verifier
+        .verify_decision(&serde_json::to_vec(&unknown).unwrap(), &[], &expected, 150)
+        .is_err());
+    let mut noncanonical = carrier.clone();
+    noncanonical["signature"] = json!(format!("{}=", carrier["signature"].as_str().unwrap()));
+    assert!(verifier
+        .verify_decision(
+            &serde_json::to_vec(&noncanonical).unwrap(),
+            &[],
+            &expected,
+            150
+        )
+        .is_err());
+    let mut signature = URL_SAFE_NO_PAD
+        .decode(carrier["signature"].as_str().unwrap())
+        .unwrap();
+    signature[63] |= 0x80;
+    let mut malleable = carrier;
+    malleable["signature"] = json!(URL_SAFE_NO_PAD.encode(signature));
+    assert!(verifier
+        .verify_decision(
+            &serde_json::to_vec(&malleable).unwrap(),
+            &[],
+            &expected,
+            150
+        )
+        .is_err());
+}
+
+async fn concurrent_acceptors(db: &tinycloud_core::sea_orm::DatabaseConnection) {
+    use tinycloud_core::{
+        migrations::Migrator,
+        resource_review::{consume, ReviewUse},
+        sea_orm::{EntityTrait, TransactionTrait},
+        sea_orm_migration::MigratorTrait,
+    };
+    Migrator::up(db, None).await.unwrap();
+    let writer = SigningKey::from_bytes(&[7; 32]);
+    let operator = SigningKey::from_bytes(&[8; 32]);
+    let verifier = verifier(&writer, &operator);
+    let owner = "a".repeat(64);
+    let target = TargetRow("b".repeat(64), 1, "c".repeat(64), "fp-1".into());
+    let hosts = BTreeSet::from(["host-test".into()]);
+    let expected = ReviewExpectation {
+        job_id: "00000000-0000-4000-8000-000000000002",
+        host_id: "host-test",
+        owner_hmac: &owner,
+        target: &target,
+        authoritative_hosts: &hosts,
+    };
+    let mut p = payload(&owner, &target);
+    p[3] = json!(uuid::Uuid::new_v4().to_string());
+    let raw = signed(p, &writer, b"tinycloud-resource-review-decision-v1\0");
+    let a = verifier.verify_decision(&raw, &[], &expected, 150).unwrap();
+    let b = verifier.verify_decision(&raw, &[], &expected, 150).unwrap();
+    let barrier = tokio::sync::Barrier::new(2);
+    let barrier = &barrier;
+    let attempt = |proof, purge: &'static str| async move {
+        let tx = db.begin().await.unwrap();
+        barrier.wait().await;
+        let result = consume(
+            &tx,
+            proof,
+            purge,
+            time::OffsetDateTime::from_unix_timestamp(150).unwrap(),
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    };
+    let (a, b) = tokio::join!(
+        attempt(&a, "00000000-0000-4000-8000-000000000071"),
+        attempt(&b, "00000000-0000-4000-8000-000000000072")
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert_eq!(a.or(b).unwrap(), ReviewUse::Fresh);
+    let proof = verifier.verify_decision(&raw, &[], &expected, 150).unwrap();
+    let stored = tinycloud_core::models::resource_review_consumption::Entity::find_by_id(
+        proof.decision_id(),
+    )
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert!([
+        "00000000-0000-4000-8000-000000000071",
+        "00000000-0000-4000-8000-000000000072"
+    ]
+    .contains(&stored.purge_id.as_str()));
+}
+#[tokio::test]
+async fn sqlite_two_concurrent_acceptors_cannot_spend_one_decision_for_different_purges() {
+    use tinycloud_core::sea_orm::{ConnectOptions, Database};
+    let directory = tempfile::tempdir().unwrap();
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("review.db").display()
+    ));
+    options.max_connections(2);
+    let db = Database::connect(options).await.unwrap();
+    concurrent_acceptors(&db).await;
 }

@@ -79,6 +79,7 @@ pub struct ReviewVerifier {
     revoked: BTreeSet<(String, String)>,
 }
 pub struct ReviewExpectation<'a> {
+    pub job_id: &'a str,
     pub host_id: &'a str,
     pub owner_hmac: &'a str,
     pub target: &'a TargetRow,
@@ -252,6 +253,7 @@ impl ReviewVerifier {
             || !name(&p.2)
             || !uuid(&p.3)
             || !uuid(&p.4)
+            || p.4 != expected.job_id
             || p.5 != expected.host_id
             || p.6 != expected.owner_hmac
             || p.7 != expected.target.0
