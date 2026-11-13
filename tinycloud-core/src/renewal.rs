@@ -1045,7 +1045,9 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
                 "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
                 [
                     Value::Bytes(Some(Box::new(Vec::<u8>::from(request.replay_hash)))),
-                    Value::TimeDateTime(Some(Box::new(db_datetime(request.replay_expires_at)?))),
+                    Value::TimeDateTimeWithTimeZone(Some(Box::new(unix_time(
+                        request.replay_expires_at,
+                    )?))),
                 ],
             ))
             .await
