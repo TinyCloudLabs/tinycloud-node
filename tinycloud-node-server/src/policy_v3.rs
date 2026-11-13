@@ -9753,7 +9753,15 @@ mod tests {
         };
         request.request_body_digest = delivery_request_digest(&request)
             .map_err(|_| anyhow::anyhow!("refusal request digest"))?;
-        request.request_body_digest.replace_range(..1, "_");
+        // Always a different first character: the digest covers a
+        // time-dependent `expiresAt`, so 1 run in 64 it already starts
+        // with `_`, and writing `_` over it would leave it valid.
+        let tampered = if request.request_body_digest.starts_with('_') {
+            "A"
+        } else {
+            "_"
+        };
+        request.request_body_digest.replace_range(..1, tampered);
         let before = mark();
         let (status, body) = ctx
             .post("tc2047-digest", serde_json::to_string(&request)?)
