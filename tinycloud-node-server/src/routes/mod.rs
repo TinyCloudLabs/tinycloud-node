@@ -685,42 +685,32 @@ pub async fn delegation_status(
         .map_err(|_| (Status::BadRequest, "Invalid delegation CID".to_string()))?;
     let target = tinycloud_core::hash::Hash::from(cid);
     match tinycloud
-        .delegation_status(target, &auth.invoker, &auth.parents)
+        .delegation_status_snapshot(
+            target,
+            &auth.invoker,
+            &auth.parents,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
         .await
-        .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
-    {
-        Some(status) => {
-            let effective_expiry = tinycloud
-                .delegation_effective_expiry(
-                    target,
-                    time::OffsetDateTime::now_utc().unix_timestamp(),
-                )
-                .await
-                .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?;
-            let history = tinycloud_core::renewal::renewal_history(
-                tinycloud.connection(),
-                &request.cid,
-                &auth.invoker,
-                &auth.parents,
-            )
-            .await
-            .map_err(|error| match error {
-                tinycloud_core::renewal::RenewalStoreError::Unauthorized => {
-                    (Status::Forbidden, "Renewal history unavailable".to_string())
-                }
-                _ => (Status::ServiceUnavailable, "Status unavailable".to_string()),
-            })?
-            .into_iter()
-            .map(|stamp| RenewalStampHistory {
-                cid: stamp.cid,
-                lease_cid: stamp.lease_cid,
-                generation: stamp.generation,
-                previous_stamp_cid: stamp.previous_stamp_cid,
-                new_end: stamp.new_end,
-                signed_bytes: encode_config(stamp.signed_bytes, URL_SAFE_NO_PAD),
-                signature: encode_config(stamp.signature, URL_SAFE_NO_PAD),
-            })
-            .collect();
+        .map_err(|error| match error {
+            TxError::RenewalHistoryUnauthorized => {
+                (Status::Forbidden, "Renewal history unavailable".to_string())
+            }
+            _ => (Status::ServiceUnavailable, "Status unavailable".to_string()),
+        })? {
+        Some((status, effective_expiry, history)) => {
+            let history = history
+                .into_iter()
+                .map(|stamp| RenewalStampHistory {
+                    cid: stamp.cid,
+                    lease_cid: stamp.lease_cid,
+                    generation: stamp.generation,
+                    previous_stamp_cid: stamp.previous_stamp_cid,
+                    new_end: stamp.new_end,
+                    signed_bytes: encode_config(stamp.signed_bytes, URL_SAFE_NO_PAD),
+                    signature: encode_config(stamp.signature, URL_SAFE_NO_PAD),
+                })
+                .collect();
             Ok(Custom(
                 Status::Ok,
                 Json(DelegationStatusResponse::from_status(
