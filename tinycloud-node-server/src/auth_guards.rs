@@ -124,8 +124,10 @@ impl<'r> Responder<'r, 'static> for KvListResponse {
                     .map(|(path, details)| KvListEntry {
                         key: path.to_string(),
                         size: details.size,
+                        // Whole seconds, as in a head's `Last-Modified`.
                         updated_at: details
                             .modified
+                            .and_then(|modified| modified.replace_nanosecond(0).ok())
                             .and_then(|modified| modified.format(&Rfc3339).ok()),
                     })
                     .collect::<Vec<_>>(),

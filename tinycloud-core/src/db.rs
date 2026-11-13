@@ -3491,14 +3491,9 @@ where
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     let metadata = match get_kv_entity(tx, space, path).await? {
-                        Some(entry) if lone_capability => Some(
-                            kv_metadata_details(tx, &self.storage, space, entry)
-                                .await
-                                .map_err(|e| match e {
-                                    EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                    EitherError::B(e) => TxStoreError::StoreRead(e),
-                                })?,
-                        ),
+                        Some(entry) if lone_capability => {
+                            Some(kv_metadata_details(tx, &self.storage, space, entry).await?)
+                        }
                         Some(entry) => {
                             Some((entry.metadata, entry.value, KvValueDetails::default()))
                         }
@@ -3758,12 +3753,7 @@ where
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     let metadata = match kv_lookup.entity(&self.conn, space, path).await? {
                         Some(entry) if lone_capability => Some(
-                            kv_metadata_details(&self.conn, &self.storage, space, entry)
-                                .await
-                                .map_err(|e| match e {
-                                    EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                    EitherError::B(e) => TxStoreError::StoreRead(e),
-                                })?,
+                            kv_metadata_details(&self.conn, &self.storage, space, entry).await?,
                         ),
                         Some(entry) => {
                             Some((entry.metadata, entry.value, KvValueDetails::default()))
@@ -5156,23 +5146,26 @@ async fn read_kv_entity<B: ImmutableReadStore>(
 
 /// A live row's metadata with the value's size and modified time (TC-2492).
 /// A row written before sizes were recorded reports the stored object's
-/// length only when the store can probe it without reading the object.
+/// length only when the store can probe it without reading the object; a
+/// probe that fails leaves the size unknown rather than failing the head.
 async fn kv_metadata_details<C: ConnectionTrait, B: ImmutableReadStore>(
     db: &C,
     store: &B,
     space_id: &SpaceId,
     entry: current_kv::Model,
-) -> Result<(Metadata, Hash, KvValueDetails), EitherError<DbErr, B::Error>> {
+) -> Result<(Metadata, Hash, KvValueDetails), DbErr> {
     let size = match entry.size {
         Some(size) => u64::try_from(size).ok(),
-        None => store
-            .size(space_id, &entry.value, entry.generation)
-            .await
-            .map_err(EitherError::B)?,
+        None => match store.size(space_id, &entry.value, entry.generation).await {
+            Ok(size) => size,
+            Err(error) => {
+                tracing::warn!(%error, "kv head size probe failed; size omitted");
+                None
+            }
+        },
     };
     let modified = invocation_issued_at(db, &[entry.invocation])
-        .await
-        .map_err(EitherError::A)?
+        .await?
         .remove(&entry.invocation);
     Ok((
         entry.metadata,

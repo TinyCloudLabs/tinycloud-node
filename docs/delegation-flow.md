@@ -92,9 +92,9 @@ Actions follow the `{namespace}.{service}/{action}` format:
 |---------|-------------|
 | `tinycloud.kv/get` | Read KV entries |
 | `tinycloud.kv/put` | Write KV entries |
-| `tinycloud.kv/list` | List KV entries |
+| `tinycloud.kv/list` | List KV entries under a prefix. With `x-tinycloud-list-entries: true`, the holder also gets each live value's exact byte size and write time (`updatedAt`, whole seconds by the node's clock). Any holder of a list grant can ask for this, including share-link list recipients; the grantor can't turn it off. It doesn't reveal writer DIDs, other versions, deleted values or keys outside the prefix (TC-2492) |
 | `tinycloud.kv/del` | Delete KV entries |
-| `tinycloud.kv/metadata` | Read KV metadata |
+| `tinycloud.kv/metadata` | Read KV metadata. A head also returns the value's byte size (`x-tinycloud-content-length`) and write time (`Last-Modified`) (TC-2492) |
 | `tinycloud.kv/sync` | Read the ordered change feed (key, ETag, deleted, metadata) under a KV prefix through `/invoke`; must be the invocation's only capability. Never implied by `*` or default session actions; grant it explicitly (TC-732) |
 | `tinycloud.kv/retain` | Never invoked. A delegation carrying it is named in `x-tinycloud-retention-grant` on a `kv/sync` request so the node attests `authority.retainUntil`; never implied (TC-732) |
 | `tinycloud.capabilities/read` | Read user capabilities |

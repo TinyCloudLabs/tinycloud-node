@@ -270,6 +270,14 @@ where
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         (**self).read(space, id, generation).await
     }
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        (**self).size(space, id, generation).await
+    }
     async fn read_range(
         &self,
         space: &SpaceId,
