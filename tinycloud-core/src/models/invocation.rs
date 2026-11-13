@@ -2008,6 +2008,21 @@ mod tests {
                     InvocationError::UnauthorizedAction(_, _)
                 ))
             ));
+            db.execute_unprepared(
+                "ALTER TABLE policy_v3_root RENAME TO policy_v3_root_unavailable",
+            )
+            .await
+            .unwrap();
+            let result = verify_and_authorize(db, &invocation, now).await;
+            db.execute_unprepared(
+                "ALTER TABLE policy_v3_root_unavailable RENAME TO policy_v3_root",
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Err(Error::Db(_))),
+                "registry query failure must refuse: {result:?}"
+            );
         }
     }
 
