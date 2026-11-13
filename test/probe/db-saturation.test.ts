@@ -226,3 +226,38 @@ test("missingSecrets names every unset or blank secret of a target", () => {
   assert.deepEqual(missingSecrets(t, { [t.token_secret]: "", [t.heartbeat_secret]: "https://x" }), [t.token_secret]);
   assert.deepEqual(missingSecrets(t, { [t.token_secret]: "id:tok", [t.heartbeat_secret]: "https://x" }), []);
 });
+
+test("pool series_label matches the top-level label, as the usw branch reports connection state", () => {
+  // Shape from the usw production branch: state lives in `label`, `labels` is empty.
+  const body = (label: string, value: number) => ({
+    metric: POOL_METRIC,
+    type: "TimeSeries",
+    label,
+    labels: {},
+    points: points(Array(15).fill(value)),
+  });
+  const series = parseSeries({
+    series: [
+      { metric: CPU_METRIC, type: "TimeSeries", label: "Primary CPU usage", labels: {}, points: points(Array(15).fill(10)) },
+      body("active", 15),
+      body("idle", 2),
+    ],
+  });
+  assert.equal(series[1].label, "active");
+  const rule = { ...base, pool: { metric: POOL_METRIC, series_labels: {}, series_label: "active", op: "gte" as const, threshold: 15 } };
+  const breach = evaluateTarget(rule, series, NOW);
+  assert.equal(breach.status, "breach");
+  assert.match(breach.detail, /pool>=15 \[active\] 15\/15/);
+  // idle at 15 must not count: only the "active" series is read.
+  const idleHigh = parseSeries({ series: [body("active", 3), body("idle", 99)] });
+  assert.equal(evaluateTarget(rule, [idleCpu, ...idleHigh], NOW).status, "ok");
+  // A label that no series carries is "no series" (unknown), never a silent pass.
+  const missing = { ...rule, pool: { ...rule.pool, series_label: "waiting" } };
+  assert.equal(evaluateTarget(missing, series, NOW).status, "unknown");
+});
+
+test("loadTargets accepts pool.series_label and rejects a blank one", () => {
+  const withLabel = { ...base, pool: { metric: POOL_METRIC, series_labels: {}, series_label: "active", op: "gte", threshold: 15 } };
+  assert.equal(loadTargets([withLabel])[0].pool?.series_label, "active");
+  assert.throws(() => loadTargets([{ ...withLabel, pool: { ...withLabel.pool, series_label: " " } }]), ConfigFault);
+});
