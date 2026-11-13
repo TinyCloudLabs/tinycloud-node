@@ -120,3 +120,34 @@ Re-apply the two hunks above to the new `pool/connection.rs` (the ping in
 `read_audit::tests::tc2035_a_stalled_connection_is_closed_and_its_pool_slot_freed`
 in `tinycloud-core`, which uses a listener that never answers after startup. Drop
 this patch when upstream bounds the release ping.
+
+## No pooled connection inside a transaction (TC-2954)
+
+### Why
+
+The release ping (`Sync`, then wait for `ReadyForQuery`) records the server's
+transaction status but accepts any status, so a session still inside a
+transaction could go back to the idle queue. The next borrower's autocommit
+statements then run inside that transaction: acknowledged, and lost when it
+ends without a commit. The cause seen in practice, a request deadline dropping
+a future while its BEGIN is in flight, is fixed in the paired `sqlx-postgres`
+patch (upstream #4394); this is the backstop for any other way a session can be
+released with a transaction open.
+
+### The delta
+
+- `src/connection.rs`: a hidden `Connection::in_server_transaction_block` with a
+  default of `false`. `sqlx-postgres` overrides it (status not idle); the other
+  drivers, and `AnyConnection`, keep the default.
+- `src/pool/connection.rs`, `Floating::return_to_pool`: after a successful
+  release ping, a connection whose `in_server_transaction_block()` is true is
+  closed (graceful, bounded by `CLOSE_ON_DROP_TIMEOUT`) instead of released.
+  Closing the session makes the server roll the transaction back. The pool opens
+  a replacement on the next acquire.
+
+### Re-applying on a vendor bump
+
+Re-apply both hunks. The regressions are `db_pool::release_tests` in
+`tinycloud-core`: `postgres_a_connection_released_inside_a_transaction_is_closed`
+for this backstop. Drop it if upstream refuses to pool a connection whose
+server status is not idle.

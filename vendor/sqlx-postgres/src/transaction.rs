@@ -34,11 +34,19 @@ impl TransactionManager for PgTransactionManager {
             let _query_timer = sqlx_core::request_telemetry::QueryTimer::new();
             let rollback = Rollback::new(conn);
             rollback.conn.queue_simple_query(&statement)?;
+            // TC-2954 (upstream sqlx #4394): claim the depth before the round
+            // trip, not after. `start_rollback`, which this guard and
+            // `Transaction`'s drop guard call, is a no-op at depth zero, so a
+            // future cancelled during the await below would otherwise leave
+            // the server in a transaction with nothing queued to end it, and
+            // the pool would hand that connection to the next borrower.
+            // Unwound just below if the BEGIN did not take.
+            rollback.conn.inner.transaction_depth += 1;
             rollback.conn.wait_until_ready().await?;
             if !rollback.conn.in_transaction() {
+                rollback.conn.inner.transaction_depth -= 1;
                 return Err(Error::BeginFailed);
             }
-            rollback.conn.inner.transaction_depth += 1;
             rollback.defuse();
 
             Ok(())

@@ -160,6 +160,15 @@ pub trait Connection: Send {
     #[doc(hidden)]
     fn should_flush(&self) -> bool;
 
+    /// Whether the server's last readiness report placed this session inside a
+    /// transaction block, open or failed, whatever SQLx's own depth count says.
+    /// The pool closes such a connection on release instead of reusing it
+    /// (TinyCloud TC-2954). Drivers that do not track this report `false`.
+    #[doc(hidden)]
+    fn in_server_transaction_block(&self) -> bool {
+        false
+    }
+
     /// Establish a new database connection.
     ///
     /// A value of [`Options`][Self::Options] is parsed from the provided connection string. This parsing
