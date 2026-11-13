@@ -545,12 +545,32 @@ impl DuckDbService {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
 
+        let checkpoint = if expected != ArtifactExpectation::Absent {
+            self.artifact_repository
+                .load_meta("duckdb", &key.0, db_name)
+                .await
+                .map_err(artifact_error_to_duckdb)?
+        } else {
+            None
+        };
+
         if self
             .artifact_repository
             .chunked_checkpoints("duckdb", &key.0, db_name)
         {
-            if expected != ArtifactExpectation::Absent {
-                if let Some(wal) = handle.wal_snapshot(MAX_WAL_DELTA_BYTES as u64).await? {
+            if let Some(meta) = &checkpoint {
+                let wal = if meta.checkpoint_size_bytes >= 0 {
+                    handle
+                        .wal_snapshot_for_checkpoint(
+                            MAX_WAL_DELTA_BYTES as u64,
+                            meta.checkpoint_size_bytes as u64,
+                            meta.checkpoint_content_hash.clone(),
+                        )
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(wal) = wal {
                     let saved = match self
                         .artifact_repository
                         .save_wal_snapshot("duckdb", &key.0, db_name, wal, expected)
@@ -578,25 +598,16 @@ impl DuckDbService {
             return self.checkpoint(space, db_name, handle, false).await;
         }
 
-        let wal = if expected != ArtifactExpectation::Absent {
-            match self
-                .artifact_repository
-                .load_meta("duckdb", &key.0, db_name)
-                .await
-                .map_err(artifact_error_to_duckdb)?
-            {
-                Some(meta) if meta.checkpoint_size_bytes >= 0 => {
-                    handle
-                        .wal_for_checkpoint(
-                            meta.checkpoint_size_bytes as u64,
-                            meta.checkpoint_content_hash,
-                        )
-                        .await?
-                }
-                _ => None,
+        let wal = match checkpoint {
+            Some(meta) if meta.checkpoint_size_bytes >= 0 => {
+                handle
+                    .wal_for_checkpoint(
+                        meta.checkpoint_size_bytes as u64,
+                        meta.checkpoint_content_hash,
+                    )
+                    .await?
             }
-        } else {
-            None
+            _ => None,
         };
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
@@ -2106,5 +2117,91 @@ mod tests {
             "failed identity checks must not checkpoint or truncate the WAL"
         );
         service.discard_local_state(&key).await.unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_large_insert_recovers_owned_checkpoint() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_large_insert_recovers_owned_checkpoint",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 64 * 1024 * 1024,
+                    account_bytes: 256 * 1024 * 1024,
+                },
+            )),
+        );
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("large-file-write-recovery");
+        let key = (space.to_string(), "main".to_string());
+        let service = file_service(&cache, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id BIGINT, body VARCHAR)".into()]),
+                    sql: "INSERT INTO items VALUES (0, 'seed')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Hydration guarantees a file-backed actor, including when the native
+        // size estimate keeps a newly-created database in memory.
+        service.discard_local_state(&key).await.unwrap();
+        let mut expected_count = 1i64;
+        let mut expected_sum = 0i64;
+        for (round, rows) in [(1i64, 5i64), (2, 300_000), (3, 5)] {
+            service.execute(&space,"main",DuckDbRequest::Execute {
+                schema:None,
+                sql:format!("INSERT INTO items SELECT {round}*1000000+i, md5(i::VARCHAR) FROM range({rows}) t(i)"),
+                params:vec![],
+            },None,"tinycloud.duckdb/write".into(),false).await.unwrap();
+            expected_count += rows;
+            expected_sum += round * 1_000_000 * rows + rows * (rows - 1) / 2;
+            let fresh = TempDir::new().unwrap();
+            let reader = file_service(&fresh, repo.clone());
+            let recovered=reader.execute(&space,"main",DuckDbRequest::Query {
+                sql:"SELECT count(*),sum(id)::BIGINT,sum(CASE WHEN id=0 OR body=md5((id%1000000)::VARCHAR) THEN 1 ELSE 0 END)::BIGINT FROM items".into(),
+                params:vec![],
+            },None,"tinycloud.duckdb/read".into(),false).await;
+            let _ = reader.discard_local_state(&key).await;
+            let recovered = match recovered {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = service.discard_local_state(&key).await;
+                    panic!("acknowledged round {round} must recover from a fresh cache: {error:?}");
+                }
+            };
+            let DuckDbResponse::Query(query) = recovered.response else {
+                panic!("query required");
+            };
+            assert_eq!(
+                query.rows,
+                vec![vec![
+                    DuckDbValue::Integer(expected_count),
+                    DuckDbValue::Integer(expected_sum),
+                    DuckDbValue::Integer(expected_count)
+                ]]
+            );
+        }
+        service.discard_local_state(&key).await.unwrap();
+        let bytes = service.export(&space, "main").await.unwrap();
+        let export_dir = TempDir::new().unwrap();
+        let path = export_dir.path().join("recovered.duckdb");
+        std::fs::write(&path, bytes).unwrap();
+        let conn = storage::open_connection(Some(&path), "128MB").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, expected_count);
     }
 }
