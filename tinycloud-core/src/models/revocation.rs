@@ -726,9 +726,21 @@ pub enum RevocationError {
     MissingParents,
 }
 
+#[cfg(test)]
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     revocation: Revocation,
+) -> Result<Hash, Error> {
+    process_with(db, revocation, false).await
+}
+
+/// As [`process`]. With `signature_verified` the caller checked these exact
+/// signed bytes with [`verify_signature`] before its transaction (TC-2986);
+/// only the time window is checked here.
+pub(crate) async fn process_with<C: ConnectionTrait>(
+    db: &C,
+    revocation: Revocation,
+    signature_verified: bool,
 ) -> Result<Hash, Error> {
     let (r, serialization) = (revocation.0, revocation.1);
 
@@ -738,32 +750,16 @@ pub(crate) async fn process<C: ConnectionTrait>(
     // revocations. The route accepts either suite so the Policy Engine
     // active_cutoff loop can rely on a single endpoint regardless of
     // whether the Grant Issuer signs with SIWE or did:key.
-    match &r.revocation {
-        TinyCloudRevocation::Cacao(c) => {
-            c.verify()
-                .await
-                .map_err(|_| RevocationError::InvalidSignature)?;
-            if !c.payload().valid_at(&t) {
-                return Err(RevocationError::InvalidTime.into());
-            };
-        }
-        TinyCloudRevocation::Ucan(u) => {
-            verify_ucan_signature(u)
-                .await
-                .map_err(|error| match error {
-                    UcanVerifyError::MethodDisabled { method } => {
-                        RevocationError::UnsupportedDidMethod(method)
-                    }
-                    UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
-                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
-                        RevocationError::InvalidSignature
-                    }
-                })?;
-            u.payload()
-                .validate_time(None)
-                .map_err(|_| RevocationError::InvalidTime)?;
-        }
+    if !signature_verified {
+        verify_signature(&r.revocation).await?;
+    }
+    let in_window = match &r.revocation {
+        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
+        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
     };
+    if !in_window {
+        return Err(RevocationError::InvalidTime.into());
+    }
 
     let hash: Hash = hash(&serialization);
     let requested = Hash::from(r.revoked);
@@ -813,6 +809,32 @@ pub(crate) async fn process<C: ConnectionTrait>(
     }
 
     Ok(hash)
+}
+
+/// Check a revocation's signature: CPU, or a DID resolution when network
+/// methods are on. Runs before any lock (TC-2986).
+pub(crate) async fn verify_signature(revocation: &TinyCloudRevocation) -> Result<(), Error> {
+    match revocation {
+        TinyCloudRevocation::Cacao(c) => {
+            c.verify()
+                .await
+                .map_err(|_| RevocationError::InvalidSignature)?;
+        }
+        TinyCloudRevocation::Ucan(u) => {
+            verify_ucan_signature(u)
+                .await
+                .map_err(|error| match error {
+                    UcanVerifyError::MethodDisabled { method } => {
+                        RevocationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
+                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
+                        RevocationError::InvalidSignature
+                    }
+                })?;
+        }
+    }
+    Ok(())
 }
 
 /// W1 (audit P0 finding 5): authorize the revoker.
