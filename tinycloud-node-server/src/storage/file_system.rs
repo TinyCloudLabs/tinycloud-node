@@ -1,4 +1,7 @@
+mod purge_completion;
 mod purge_inventory;
+#[cfg(test)]
+mod space_purge_finalize_tests;
 
 #[cfg(test)]
 use super::TestPause;
@@ -144,7 +147,7 @@ impl FileSystemStore {
     /// Re-list from the beginning after every batch, including after restart.
     pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, IoError> {
         let Some(directory) = self.purge_directory(space).await? else {
-            return Ok(true);
+            return self.finish_empty_space(space).await;
         };
         let mut entries = tokio::fs::read_dir(&directory).await?;
         let mut removed = false;
@@ -159,7 +162,12 @@ impl FileSystemStore {
                 Err(error) => return Err(error),
             }
         }
-        Ok(!removed)
+        drop(entries);
+        if removed {
+            Ok(false)
+        } else {
+            self.finish_empty_space(space).await
+        }
     }
 
     fn get_path(&self, space: &SpaceId, mh: &Hash, generation: i64) -> PathBuf {
