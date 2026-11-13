@@ -3384,6 +3384,10 @@ where
     /// write). The block read, `kv/list` and `capabilities/read` are left
     /// for [`Self::answer_after_commit`]. Separate from the commit future for
     /// the same stack reason as [`Self::persist_registered_blobs`].
+    ///
+    /// Keep in step with [`kv_mixes_writes_and_reads`]: a capability that
+    /// answers an outcome here must be one it counts as a read, or `/invoke`
+    /// would let a write mixed with it through.
     async fn invocation_side_effects<S>(
         &self,
         tx: &DatabaseTransaction,
@@ -3853,7 +3857,9 @@ pub fn kv_mutation_keys(invocation: &Invocation) -> Vec<(SpaceId, Path)> {
 /// answer: `kv/get`, `kv/list`, `kv/metadata`, or `capabilities/read` on
 /// `all`, the capabilities [`SpaceDatabase::invocation_side_effects`] answers.
 /// Such an invocation answers more than one outcome, which `/invoke` cannot
-/// return, so the route refuses it before any work (TC-2986).
+/// return, so the route refuses it before any work (TC-2986). Keep in step
+/// with `invocation_side_effects`: a read capability it starts answering
+/// must be counted here too.
 pub fn kv_mixes_writes_and_reads(invocation: &Invocation) -> bool {
     let (mut writes, mut reads) = (false, false);
     for cap in &invocation.0.capabilities {
