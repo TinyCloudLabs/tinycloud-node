@@ -6195,6 +6195,167 @@ mod test {
     async fn basic() {
         let _db = get_db().await.unwrap();
     }
+
+    /// TC-2492: a put records its value's size, and head and list report it
+    /// with the writing invocation's issue time. A row from before sizes were
+    /// recorded reports the stored length on head only through a cheap store
+    /// probe, and no size in a list.
+    async fn assert_kv_value_details(
+        db: &SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>,
+        name: &str,
+    ) {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let space = test_space_id(name);
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let path: Path = "docs/report.txt".parse().unwrap();
+        let value = b"twenty-one bytes long";
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(value).await.unwrap();
+        db.invoke_internal_kv_put::<MemoryStaging>(
+            space.clone(),
+            path.clone(),
+            Metadata(Default::default()),
+            stage,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+
+        let row = get_kv_entity(&db.conn, &space, &path)
+            .await
+            .unwrap()
+            .expect("the put is live");
+        assert_eq!(
+            row.size,
+            Some(value.len() as i64),
+            "the put records its size"
+        );
+        let issued_at = invocation::Entity::find_by_id(row.invocation)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("the writing invocation is stored")
+            .issued_at;
+        let recorded = KvValueDetails {
+            size: Some(value.len() as u64),
+            modified: Some(issued_at),
+        };
+        let missing: Path = "docs/missing.txt".parse().unwrap();
+
+        let (_, _, details) = kv_metadata_details(&db.conn, &db.storage, &space, row)
+            .await
+            .unwrap();
+        assert_eq!(details, recorded);
+        assert_eq!(
+            kv_list_details(&db.conn, &space, &[path.clone(), missing.clone()])
+                .await
+                .unwrap(),
+            vec![recorded.clone(), KvValueDetails::default()]
+        );
+
+        // A row written before sizes were recorded.
+        current_kv::Entity::update_many()
+            .col_expr(current_kv::Column::Size, Expr::value(Option::<i64>::None))
+            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        let legacy = get_kv_entity(&db.conn, &space, &path)
+            .await
+            .unwrap()
+            .expect("the put is live");
+        assert_eq!(legacy.size, None);
+        let (_, _, details) = kv_metadata_details(&db.conn, &db.storage, &space, legacy.clone())
+            .await
+            .unwrap();
+        assert_eq!(details, recorded, "head probes the stored length");
+        let unknown_size = KvValueDetails {
+            size: None,
+            modified: Some(issued_at),
+        };
+        let (_, _, details) = kv_metadata_details(&db.conn, &NoSizeProbeStore, &space, legacy)
+            .await
+            .unwrap();
+        assert_eq!(
+            details, unknown_size,
+            "without a cheap probe, head reports no size and reads nothing"
+        );
+        assert_eq!(
+            kv_list_details(&db.conn, &space, &[path, missing])
+                .await
+                .unwrap(),
+            vec![unknown_size, KvValueDetails::default()],
+            "list reports no size rather than probing each value"
+        );
+    }
+
+    /// A store with no cheap size probe whose object reads fail the test.
+    struct NoSizeProbeStore;
+
+    #[async_trait::async_trait]
+    impl ImmutableReadStore for NoSizeProbeStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<bool, Self::Error> {
+            panic!("a head must not touch the stored object")
+        }
+        async fn read(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+            panic!("a head must not read the stored object")
+        }
+        async fn read_range(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+            _range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            panic!("a head must not read the stored object")
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_value_details_report_size_and_modified_time() {
+        let db = get_db().await.unwrap();
+        assert_kv_value_details(&db, "sqlite-kv-value-details").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_value_details_report_size_and_modified_time() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_value_details_report_size_and_modified_time",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = SpaceDatabase::new(
+            schema.conn.clone(),
+            MemoryStore::default(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_kv_value_details(&db, "pg-kv-value-details").await;
+    }
+
     #[tokio::test]
     async fn renewal_identity_is_rejected_by_generic_authorization() {
         let secret = StaticSecret::new([0u8; 32].to_vec()).unwrap();

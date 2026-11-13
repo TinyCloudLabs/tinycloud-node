@@ -769,6 +769,27 @@ mod test {
     use super::*;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// TC-2492: the size probe stats the stored object and reports a
+    /// missing one as unknown.
+    #[tokio::test]
+    async fn size_probe_reports_the_stored_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemConfig::new(dir.path()).open().await.unwrap();
+        let space: SpaceId = "tinycloud:key:test:size-probe".parse().unwrap();
+        store.create(&space).await.unwrap();
+        let data = b"twenty-one bytes long".to_vec();
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(&data).await.unwrap();
+        let hash = ImmutableWriteStore::<memory::MemoryStaging>::persist(&store, &space, stage, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.size(&space, &hash, 0).await.unwrap(),
+            Some(data.len() as u64)
+        );
+        assert_eq!(store.size(&space, &hash, 1).await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn memory_publish_is_atomic_for_concurrent_same_hash_paths() {
         let dir = tempfile::tempdir().unwrap();
