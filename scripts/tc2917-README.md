@@ -21,6 +21,10 @@ ALTER TABLE database_artifact
 COMMIT;
 ```
 
+Immediately after rollout, query the catalog below for `payload` and
+`delta_payload`; if either is not `attstorage = 'e'`, schedule the quiet-window
+operator DDL above, since a deferred migration is not retried automatically.
+
 Verify both catalog rows have `attstorage = 'e'` before re-toast:
 
 ```sql
