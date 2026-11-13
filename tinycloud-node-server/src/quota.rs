@@ -210,6 +210,18 @@ fn should_spawn_refresh(
         || (!stale && fetched_at_elapsed >= FRESH_TTL)
 }
 
+/// Invalidation generation per space key; absent means generation 0.
+type Generations = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+
+fn generation_of(generations: &Generations, key: &str) -> u64 {
+    generations
+        .lock()
+        .expect("quota generations lock")
+        .get(key)
+        .copied()
+        .unwrap_or(0)
+}
+
 pub struct QuotaCache {
     /// Admin-set overrides (`PUT /admin/quota/<space>`). Checked before the
     /// quota service and never expired. NOTE: these are in-memory only and
@@ -218,6 +230,9 @@ pub struct QuotaCache {
     overrides: Arc<RwLock<HashMap<String, u64>>>,
     /// Values learned from the quota service, with freshness metadata.
     remote: Arc<RwLock<HashMap<String, RemoteEntry>>>,
+    /// Per-space invalidation generation, bumped by `remove_limit`. A fetch
+    /// captures it when it starts and its result is discarded if it changed.
+    generations: Generations,
     /// Spaces with a background refresh currently in flight (dedupe guard).
     inflight: Arc<RwLock<HashSet<String>>>,
     default_limit: Option<ByteUnit>,
@@ -242,6 +257,7 @@ impl QuotaCache {
         Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
             remote: Arc::new(RwLock::new(HashMap::new())),
+            generations: Generations::default(),
             inflight: Arc::new(RwLock::new(HashSet::new())),
             default_limit,
             quota_url,
@@ -351,6 +367,7 @@ impl QuotaCache {
     /// Fetch the limit from the quota service and record the outcome
     /// (success or negative entry) in the remote cache.
     async fn fetch_and_record(&self, key: &str) -> Option<u64> {
+        let generation = generation_of(&self.generations, key);
         let fetched = fetch_remote(
             self.client.as_ref()?,
             self.quota_url.as_deref()?,
@@ -360,7 +377,7 @@ impl QuotaCache {
         )
         .await;
         let limit = fetched.as_ref().map(|q| q.limit_bytes);
-        record_fetch(&self.remote, key, fetched).await;
+        record_fetch(&self.remote, &self.generations, key, generation, fetched).await;
         limit
     }
 
@@ -377,6 +394,8 @@ impl QuotaCache {
             }
         }
         let remote = self.remote.clone();
+        let generations = self.generations.clone();
+        let generation = generation_of(&generations, &key);
         let inflight = self.inflight.clone();
         let secret = self.service_secret.clone();
         // Correlate the deferred HTTP fetch without retaining the request's DB
@@ -384,7 +403,7 @@ impl QuotaCache {
         let request_id = self.propagated_request_id();
         tokio::spawn(async move {
             let fetched = fetch_remote(&client, &url, secret.as_deref(), &key, request_id).await;
-            record_fetch(&remote, &key, fetched).await;
+            record_fetch(&remote, &generations, &key, generation, fetched).await;
             inflight.write().await.remove(&key);
         });
     }
@@ -403,6 +422,14 @@ impl QuotaCache {
         let key = space_id.to_string();
         let had_override = self.overrides.write().await.remove(&key).is_some();
         let mut remote = self.remote.write().await;
+        // Bumped under the remote write lock so `record_fetch` observes the
+        // new generation before it can install an older fetch's result.
+        *self
+            .generations
+            .lock()
+            .expect("quota generations lock")
+            .entry(key.clone())
+            .or_insert(0) += 1;
         let had_remote = match remote.get_mut(&key) {
             Some(entry) => {
                 entry.stale = true;
@@ -523,12 +550,21 @@ async fn fetch_remote(
 /// Record a fetch outcome. A failure never erases a previously known limit:
 /// the old value stays (marked refreshed-at-now, still stale) so writes keep
 /// using the last-known limit rather than snapping to the env default.
+///
+/// `generation` is the invalidation generation captured when the fetch
+/// started; if `remove_limit` has run since, the outcome is discarded so the
+/// invalidation's stale mark survives and the next read refetches.
 async fn record_fetch(
     remote: &Arc<RwLock<HashMap<String, RemoteEntry>>>,
+    generations: &Generations,
     key: &str,
+    generation: u64,
     fetched: Option<RemoteQuota>,
 ) {
     let mut guard = remote.write().await;
+    if generation_of(generations, key) != generation {
+        return;
+    }
     let entry = match fetched {
         Some(quota) => RemoteEntry {
             quota: Some(quota),
@@ -765,7 +801,7 @@ mod test {
         let sid = space(1);
         let key = sid.to_string();
         cache.seed_remote(&key, Some(500), false).await;
-        record_fetch(&cache.remote, &key, None).await;
+        record_fetch(&cache.remote, &cache.generations, &key, 0, None).await;
 
         assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
         assert!(
@@ -879,7 +915,7 @@ mod test {
         let key = sid.to_string();
         cache.seed_remote(&key, Some(500), false).await;
         // Simulate a refresh failing after a value was known.
-        record_fetch(&cache.remote, &key, None).await;
+        record_fetch(&cache.remote, &cache.generations, &key, 0, None).await;
         assert_eq!(cache.remote_entry(&key).await, Some((Some(500), true)));
         assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
     }
@@ -896,6 +932,72 @@ mod test {
         assert_eq!(cache.remote_entry(&key).await, Some((Some(500), true)));
         // Nothing left to remove except the (kept) stale remote entry.
         assert!(cache.remove_limit(&sid).await);
+    }
+
+    #[tokio::test]
+    async fn limit_removal_during_inflight_fetch_discards_late_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let quota_url = format!("http://{}", listener.local_addr().expect("address"));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept quota request");
+            let _ = read_request(&mut stream).await;
+            accepted_tx.send(()).ok();
+            release_rx.await.ok();
+            let body = r#"{"storage_limit_bytes":500}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+            stream.shutdown().await.ok();
+        });
+
+        let cache = Arc::new(QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url)));
+        let sid = space(1);
+        let key = sid.to_string();
+        cache.seed_remote(&key, Some(300), true).await;
+
+        let refreshing = cache.clone();
+        let refresh_key = key.clone();
+        let fetch = tokio::spawn(async move { refreshing.fetch_and_record(&refresh_key).await });
+        accepted_rx.await.expect("fetch reached the server");
+
+        // Invalidate while the fetch is pending, then let the fetch finish.
+        assert!(cache.remove_limit(&sid).await);
+        release_tx.send(()).ok();
+        fetch.await.expect("fetch task");
+        server.await.expect("server task");
+
+        // The late 500 must not replace the entry or clear its stale mark.
+        assert_eq!(cache.remote_entry(&key).await, Some((Some(300), true)));
+    }
+
+    #[tokio::test]
+    async fn fetch_started_after_removal_is_recorded() {
+        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(DEAD_URL.into()));
+        let sid = space(1);
+        let key = sid.to_string();
+        cache.seed_remote(&key, Some(300), false).await;
+        cache.remove_limit(&sid).await;
+        let generation = generation_of(&cache.generations, &key);
+        let quota = RemoteQuota {
+            limit_bytes: 700,
+            account: None,
+        };
+        record_fetch(
+            &cache.remote,
+            &cache.generations,
+            &key,
+            generation,
+            Some(quota),
+        )
+        .await;
+        assert_eq!(cache.remote_entry(&key).await, Some((Some(700), false)));
     }
 
     #[tokio::test]
