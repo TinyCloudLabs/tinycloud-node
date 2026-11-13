@@ -1945,15 +1945,6 @@ pub struct DatabaseConfig {
     /// Zero disables it.
     #[serde(default = "default_database_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
-    /// `statement_timeout`, in milliseconds, for the statements on a whole
-    /// SQL or DuckDB artifact that may be larger than a WAL delta (hydration
-    /// loads and checkpoint saves over 8 MiB, or of unknown size): the
-    /// server's work on a ~100 MiB value (detoasting and decompressing it on
-    /// load; compressing, TOASTing and WAL-logging it on save) can outlast
-    /// the base limit. PostgreSQL does not cancel a statement while it is
-    /// writing a row to the client, so the download itself is not limited.
-    #[serde(default = "default_database_bulk_statement_timeout_ms")]
-    pub bulk_statement_timeout_ms: u64,
     /// PostgreSQL `idle_in_transaction_session_timeout`, in milliseconds, set
     /// once on every pooled connection (TC-2954): the server ends a session
     /// that sits idle inside a transaction this long, so a leaked or stalled
@@ -2028,17 +2019,12 @@ fn default_database_statement_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_database_bulk_statement_timeout_ms() -> u64 {
-    120_000
-}
-
 fn default_database_idle_in_transaction_timeout_ms() -> u64 {
     300_000
 }
 
 /// PostgreSQL's largest millisecond timeout setting (`INT_MAX`).
 const POSTGRES_MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
-
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
 }
@@ -2072,7 +2058,6 @@ impl Default for DatabaseConfig {
             max_lifetime_secs: default_database_max_lifetime_secs(),
             statement_timeout_mode: StatementTimeoutMode::default(),
             statement_timeout_ms: default_database_statement_timeout_ms(),
-            bulk_statement_timeout_ms: default_database_bulk_statement_timeout_ms(),
             idle_in_transaction_timeout_ms: default_database_idle_in_transaction_timeout_ms(),
             tcp_keepalive: true,
             tcp_keepalive_idle_secs: default_database_tcp_keepalive_idle_secs(),
@@ -2122,10 +2107,6 @@ impl DatabaseConfig {
                 self.statement_timeout_ms,
                 "database.statement_timeout_ms must be at most 2147483647",
             ),
-            (
-                self.bulk_statement_timeout_ms,
-                "database.bulk_statement_timeout_ms must be at most 2147483647",
-            ),
         ] {
             if value > POSTGRES_MAX_TIMEOUT_MS {
                 return Err(error);
@@ -2153,7 +2134,6 @@ impl DatabaseConfig {
         StatementTimeouts {
             mode: self.statement_timeout_mode,
             base: Duration::from_millis(self.statement_timeout_ms),
-            bulk: Duration::from_millis(self.bulk_statement_timeout_ms),
         }
     }
 
@@ -2438,19 +2418,10 @@ mod tests {
     /// stopped.
     #[test]
     fn startup_rejects_a_statement_timeout_postgres_cannot_hold() {
-        for (base, bulk, ok) in [
-            (2_147_483_647, 2_147_483_647, true),
-            (2_147_483_648, 120_000, false),
-            (30_000, 2_147_483_648, false),
-        ] {
+        for (base, ok) in [(2_147_483_647, true), (2_147_483_648, false)] {
             let mut config = Config::default();
             config.database.statement_timeout_ms = base;
-            config.database.bulk_statement_timeout_ms = bulk;
-            assert_eq!(
-                crate::resolve_runtime_config(&config).is_ok(),
-                ok,
-                "{base} {bulk}"
-            );
+            assert_eq!(crate::resolve_runtime_config(&config).is_ok(), ok, "{base}");
         }
     }
 

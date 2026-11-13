@@ -10,7 +10,6 @@ use sea_orm::{
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    db_pool::BulkScope,
     hash::{hash, Blake3Hasher},
     models::database_artifact,
 };
@@ -659,14 +658,12 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     }
 }
 
-/// The largest artifact payload written under the pool's base statement
-/// timeout; a larger checkpoint is written in a
-/// [`RecoveringConnection::begin_bulk`] scope (TC-1054). It matches the SQL
-/// service's WAL delta bound (8 MiB): the server's work on an 8 MiB value
-/// (compression, TOAST, WAL) takes well under a second, far inside the 30 s
-/// default.
-///
-/// [`RecoveringConnection::begin_bulk`]: crate::db_pool::RecoveringConnection::begin_bulk
+/// The largest artifact payload a read moves in one part statement, and the
+/// WAL delta bound of the SQL service (8 MiB): the server's work on an 8 MiB
+/// value (compression, TOAST, WAL) takes well under a second, far inside the
+/// 30 s base statement timeout. A whole checkpoint larger than this is saved
+/// as one autocommit statement under the same timeout, up to the write limit
+/// (TC-2961).
 pub const BASE_TIMEOUT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// The slice size of a streamed artifact read. Two slices fit well inside
@@ -1062,10 +1059,12 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
 
+        // One autocommit statement per step, never a transaction (TC-2961): a
+        // transaction held open while a whole checkpoint uploads pins a pooled
+        // connection and its row lock for the whole transfer. The metadata
+        // read is its own statement; the write below re-checks what it read.
         // For Absent, the primary key on the create below asserts absence
-        // atomically. Details: TC-2214. The read runs on the pool, outside the
-        // bulk transaction: the CAS on the write below needs no transaction,
-        // so no lock or snapshot is held while the payload uploads (TC-2954).
+        // atomically. Details: TC-2214
         let existing = if expected == ArtifactExpectation::Absent {
             None
         } else {
@@ -1124,15 +1123,6 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         #[cfg(test)]
         self.wait_at_race_barrier().await;
 
-        // A checkpoint larger than a WAL delta may take longer to upload than
-        // the pool's base statement timeout allows, so its write runs under
-        // the bulk one (TC-1054). Smaller ones, like every delta, fit the
-        // base timeout and pay no extra round trip.
-        let scope = if payload.len() > BASE_TIMEOUT_PAYLOAD_BYTES {
-            self.conn.begin_bulk().await?
-        } else {
-            BulkScope::Pool(self.conn.clone())
-        };
         match existing.as_ref() {
             Some(existing) => {
                 // Compare-and-swap on the (revision, checkpoint) this save read.
@@ -1198,7 +1188,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::CheckpointContentHash
                             .eq(existing.checkpoint_content_hash.clone()),
                     )
-                    .exec(&scope)
+                    .exec(&self.conn)
                     .await?;
                 if update.rows_affected != 1 {
                     return Err(DatabaseArtifactError::Backend(
@@ -1225,7 +1215,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
                 }
-                .insert(&scope)
+                .insert(&self.conn)
                 .await
                 .map_err(|error| {
                     // For this table the composite primary key is the only unique
@@ -1241,8 +1231,6 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 })?;
             }
         }
-
-        scope.commit().await?;
 
         Ok(DatabaseArtifact {
             payload,

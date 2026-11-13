@@ -468,9 +468,8 @@ pub fn postgres_connections_opened() -> u64 {
 ///   seconds instead of hanging for up to ~15 min. A connect whose options
 ///   cannot be set fails;
 /// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
-///   statement stuck on a live connection fails server-side. Migrations and
-///   whole-artifact transfers scope their own limits
-///   ([`tinycloud_core::db::migrate`], [`RecoveringConnection::begin_bulk`]).
+///   statement stuck on a live connection fails server-side. Migrations
+///   lift it for their own transaction ([`tinycloud_core::db::migrate`]).
 ///
 /// sea-orm's `Database::connect` cannot install these hooks, so the pool is
 /// built here with the same connect options it would have applied: the URL,
@@ -551,7 +550,6 @@ pub async fn postgres_pool_with_recovery(
     ::tracing::info!(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
-        bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
         idle_in_transaction_timeout_ms,
         retry_window_ms = database.retry_window_ms,
         tcp_keepalive = keepalive.is_some(),
