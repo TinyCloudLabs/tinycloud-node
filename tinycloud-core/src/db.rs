@@ -2409,6 +2409,18 @@ where
         tx: &DatabaseTransaction,
         delegations: Vec<Delegation>,
     ) -> Result<TransactResult, TxError<B, K>> {
+        self.delegate_batch_in_transaction_verified(tx, delegations, &PreVerified::default())
+            .await
+    }
+
+    /// As [`Self::delegate_batch_in_transaction`], with the signatures
+    /// `verified` holds checked before `tx` opened (TC-2986).
+    pub async fn delegate_batch_in_transaction_verified(
+        &self,
+        tx: &DatabaseTransaction,
+        delegations: Vec<Delegation>,
+        verified: &PreVerified,
+    ) -> Result<TransactResult, TxError<B, K>> {
         if let Some(seed) = self.secrets.renewal_seed() {
             let renewer_did = crate::renewal::renewal_identity_from_seed(seed).0;
             if let Some(delegation) = delegations
@@ -2422,7 +2434,7 @@ where
                 ));
             }
         }
-        transact(
+        transact_verified(
             tx,
             &self.storage,
             &self.secrets,
@@ -2436,8 +2448,18 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            verified,
         )
         .await
+    }
+
+    /// Check `delegation`'s signature outside any transaction (TC-2986), for
+    /// [`Self::delegate_batch_in_transaction_verified`].
+    pub async fn preverify_delegation(
+        &self,
+        delegation: &Delegation,
+    ) -> Result<PreVerified, TxError<B, K>> {
+        PreVerified::delegation(&self.conn, delegation, self.encryption.as_ref()).await
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -4321,11 +4343,17 @@ async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> R
 /// signature never runs under a space lock. A hash names exact signed bytes,
 /// so a check cannot carry over to other bytes.
 #[derive(Default)]
-pub(crate) struct PreVerified(HashSet<Hash>);
+pub struct PreVerified(HashSet<Hash>);
 
 impl PreVerified {
     pub(crate) fn contains(&self, hash: &Hash) -> bool {
         self.0.contains(hash)
+    }
+
+    /// Both sets of checked signatures.
+    pub fn union(mut self, other: PreVerified) -> Self {
+        self.0.extend(other.0);
+        self
     }
 
     /// Check `delegation`'s signature on `db`, outside any transaction; for a

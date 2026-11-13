@@ -1008,6 +1008,45 @@ async fn validate_persisted_root(
     policy_cid: &str,
     node_did: &str,
 ) -> Result<(), &'static str> {
+    let event = persisted_root_projection(root, root_cid, policy_cid, node_did)?;
+    verify_signed_delegation(&event.0.delegation)
+        .await
+        .map_err(|_| "policy-root-signature-invalid")?;
+    for space in event.0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
+    Ok(())
+}
+
+/// [`validate_persisted_root`] for a root whose signature was verified before
+/// the caller's transaction (TC-2986): everything but the signature, which
+/// `root_cid` binds to those same bytes, plus the time window.
+fn validate_verified_persisted_root(
+    root: &policy_v3_root::Model,
+    root_cid: &str,
+    policy_cid: &str,
+    node_did: &str,
+) -> Result<(), &'static str> {
+    let event = persisted_root_projection(root, root_cid, policy_cid, node_did)?;
+    let TinyCloudDelegation::Ucan(ucan) = &event.0.delegation else {
+        return Err("policy-root-signature-invalid");
+    };
+    ucan.payload()
+        .validate_time(None)
+        .map_err(|_| "policy-root-signature-invalid")?;
+    for space in event.0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
+    Ok(())
+}
+
+/// The stored root, checked against its CID, policy, node and role.
+fn persisted_root_projection(
+    root: &policy_v3_root::Model,
+    root_cid: &str,
+    policy_cid: &str,
+    node_did: &str,
+) -> Result<tinycloud_core::events::Delegation, &'static str> {
     let encoded =
         std::str::from_utf8(&root.authorization_bytes).map_err(|_| "policy-root-invalid")?;
     let event = decode_delegation(encoded).map_err(|_| "policy-root-invalid")?;
@@ -1029,13 +1068,7 @@ async fn validate_persisted_root(
     if fact(&event.0.delegation, "role") != Some(expected_role) {
         return Err("policy-root-role-invalid");
     }
-    verify_signed_delegation(&event.0.delegation)
-        .await
-        .map_err(|_| "policy-root-signature-invalid")?;
-    for space in event.0.spaces() {
-        tinycloud_core::request_telemetry::observe_space(space);
-    }
-    Ok(())
+    Ok(event)
 }
 
 /// Observe only content-addressed root bytes already authenticated by durable
@@ -2126,17 +2159,18 @@ pub async fn register_policy(
     }
     let (policy_root_cid, policy_root) = decode_root(&request.policy_root)?;
     let (enforcement_root_cid, enforcement_root) = decode_root(&request.enforcement_root)?;
-    verify_signed_delegation(&policy_root.0.delegation)
-        .await
-        .map_err(|_| (Status::Forbidden, "policy-root-signature-invalid".into()))?;
-    verify_signed_delegation(&enforcement_root.0.delegation)
-        .await
-        .map_err(|_| {
-            (
-                Status::Forbidden,
-                "enforcement-root-signature-invalid".into(),
+    // TC-2986: verified once, before any lock; the registration's
+    // transaction does not verify them again.
+    let verified = preverify_root(tinycloud, &policy_root, "policy-root-signature-invalid")
+        .await?
+        .union(
+            preverify_root(
+                tinycloud,
+                &enforcement_root,
+                "enforcement-root-signature-invalid",
             )
-        })?;
+            .await?,
+        );
     if !is_policy_root(&policy_root.0.delegation) || !is_policy_root(&enforcement_root.0.delegation)
     {
         return Err((Status::Forbidden, "root-fact-schema-invalid".into()));
@@ -2283,7 +2317,7 @@ pub async fn register_policy(
             enforcement_status,
         ),
     ];
-    let written = register_policy_writes(
+    let written = register_policy_writes_verified(
         &txn,
         tinycloud,
         &sequence_spaces,
@@ -2291,6 +2325,7 @@ pub async fn register_policy(
         registration,
         &request.policy_cid,
         roots,
+        &verified,
     )
     .await;
     // The owner was shown above to hold decrypt on this exact key, so the
@@ -2318,6 +2353,7 @@ pub async fn register_policy(
 
 /// The writes of `register_policy`, inside the transaction its caller opened.
 /// The caller commits when this returns `Ok` and rolls back on `Err`.
+#[cfg(test)]
 async fn register_policy_writes(
     txn: &DatabaseTransaction,
     tinycloud: &crate::TinyCloud,
@@ -2327,13 +2363,39 @@ async fn register_policy_writes(
     policy_cid: &str,
     roots: [(String, &'static str, Vec<u8>, Vec<u8>); 2],
 ) -> Result<(), (Status, String)> {
+    register_policy_writes_verified(
+        txn,
+        tinycloud,
+        sequence_spaces,
+        root_delegations,
+        registration,
+        policy_cid,
+        roots,
+        &tinycloud_core::db::PreVerified::default(),
+    )
+    .await
+}
+
+/// As `register_policy_writes`, with the roots' signatures in `verified`
+/// checked before `txn` opened (TC-2986).
+#[allow(clippy::too_many_arguments)]
+async fn register_policy_writes_verified(
+    txn: &DatabaseTransaction,
+    tinycloud: &crate::TinyCloud,
+    sequence_spaces: &[SpaceId],
+    root_delegations: Vec<Delegation>,
+    registration: policy_v3_registration::ActiveModel,
+    policy_cid: &str,
+    roots: [(String, &'static str, Vec<u8>, Vec<u8>); 2],
+    verified: &tinycloud_core::db::PreVerified,
+) -> Result<(), (Status, String)> {
     tinycloud_core::kv_sync::lock_space_sequences(txn, sequence_spaces)
         .await
         .map_err(db_error)?;
     // The normal graph rows, abilities, and signed-byte projections share one
     // SQL transaction. A failure in either side leaves no partial authority.
     tinycloud
-        .delegate_batch_in_transaction(txn, root_delegations)
+        .delegate_batch_in_transaction_verified(txn, root_delegations, verified)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     registration
@@ -2849,6 +2911,11 @@ pub async fn mint(
     // TC-732: per-space sequence locks before the row locks below; see
     // `register_policy`.
     let sequence_spaces = event.0.spaces().cloned().collect::<Vec<_>>();
+    // TC-2986: the node-signed session is verified before the locks below.
+    let verified = tinycloud
+        .preverify_delegation(&event)
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;
@@ -2890,7 +2957,7 @@ pub async fn mint(
             .await
             .map_err(db_error)?
             .ok_or((Status::Conflict, "policy-registration-changed".into()))?;
-    let locked_policy = validate_registration_projection(&locked_registration)?;
+    validate_registration_projection(&locked_registration)?;
     if locked_registration.policy_bytes != registration.policy_bytes
         || locked_registration.policy_root_cid != registration.policy_root_cid
         || locked_registration.enforcement_root_cid != registration.enforcement_root_cid
@@ -2899,7 +2966,6 @@ pub async fn mint(
     {
         return Err((Status::Conflict, "policy-registration-changed".into()));
     }
-    let mut locked_root_events = Vec::with_capacity(2);
     for root_cid in [
         &registration.policy_root_cid,
         &registration.enforcement_root_cid,
@@ -2910,17 +2976,19 @@ pub async fn mint(
             .await
             .map_err(db_error)?
             .ok_or((Status::Forbidden, "policy-root-missing".into()))?;
-        validate_persisted_root(&root, root_cid, &registration.policy_cid, &runtime.node_did)
-            .await
-            .map_err(|error| (Status::Forbidden, error.into()))?;
+        // TC-2986: `authorize_roots` verified this CID's signature before
+        // BEGIN, and the CID binds the bytes; only the projection, time
+        // window and liveness are checked under the locks.
+        validate_verified_persisted_root(
+            &root,
+            root_cid,
+            &registration.policy_cid,
+            &runtime.node_did,
+        )
+        .map_err(|error| (Status::Forbidden, error.into()))?;
         validate_root_liveness(&txn, &root, root_cid, &runtime.node_did, now, true)
             .await
             .map_err(authorization_failure)?;
-        let current_event = decode_delegation(
-            std::str::from_utf8(&root.authorization_bytes)
-                .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?,
-        )?;
-        locked_root_events.push(current_event);
         if root.revoked_at.is_some()
             || root.revocation_bytes.is_some()
             || root
@@ -2948,95 +3016,12 @@ pub async fn mint(
             return Err((Status::Conflict, "policy-root-state-changed".into()));
         }
     }
-    let locked_claim_context = ClaimPresentationContext {
-        challenge_id: &request.challenge_id,
-        nonce: &request.nonce,
-        policy_cid: &request.policy_cid,
-        owner_did: fact(&locked_root_events[0].0.delegation, "ownerDid")
-            .ok_or((Status::Forbidden, "policy-owner-missing".into()))?,
-        recipient_did: &locked_challenge.recipient_did,
-        authenticated_account_owner: account_owner_proof
-            .as_ref()
-            .map(|proof| proof.owner_did.as_str()),
-        now,
-    };
-    let locked_credential_admission_result = if credential_admission {
-        let locked_requested = locked_challenge
-            .requested_capabilities
-            .as_array()
-            .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
-        Some(if accountless_credential_admission {
-            validate_credential_admission_v4(
-                &request.requirement,
-                &request.credential,
-                &request.presentation,
-                &locked_policy,
-                &locked_claim_context,
-                runtime,
-                locked_requested,
-            )?
-        } else {
-            validate_credential_admission_v3(
-                &request.requirement,
-                &request.credential,
-                &request.presentation,
-                &locked_policy,
-                &locked_claim_context,
-                runtime,
-                locked_requested,
-            )?
-        })
-    } else {
-        validate_claim_and_presentation(
-            &request.claim,
-            &request.presentation,
-            &locked_claim_context,
-        )?;
-        None
-    };
-    if credential_admission_result
-        .as_ref()
-        .zip(locked_credential_admission_result.as_ref())
-        .is_some_and(|(before, after)| {
-            before.claim_jti != after.claim_jti
-                || before.credential_id != after.credential_id
-                || before.presentation_jti != after.presentation_jti
-                || before.credential_digest != after.credential_digest
-                || before.envelope_digest_hex != after.envelope_digest_hex
-                || before.presentation_digest_hex != after.presentation_digest_hex
-                || before.credential_space_owner_did != after.credential_space_owner_did
-        })
-    {
-        return Err((Status::Conflict, "credential-evaluation-changed".into()));
-    }
-    validate_requested_policy_capabilities(
-        locked_challenge
-            .requested_capabilities
-            .as_array()
-            .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?,
-        locked_policy
-            .get("capabilityCeiling")
-            .and_then(Value::as_array)
-            .ok_or((Status::Forbidden, "policy-registration-corrupt".into()))?,
-    )?;
-    let final_allow = evaluate_current_allow(
-        (!credential_admission).then_some(&request.claim),
-        &request.presentation,
-        &CurrentAllowContext {
-            challenge: &locked_challenge,
-            policy_root: &locked_root_events[0].0.delegation,
-            enforcement_root: &locked_root_events[1].0.delegation,
-            policy_root_cid: &locked_registration.policy_root_cid,
-            enforcement_root_cid: &locked_registration.enforcement_root_cid,
-            node_did: &runtime.node_did,
-            now,
-        },
-    )?;
-    if canonical_value_set(&final_allow.approved_capabilities)
-        != canonical_value_set(&allow.approved_capabilities)
-    {
-        return Err((Status::Conflict, "policy-evaluation-changed".into()));
-    }
+    // TC-2986: the claim, presentation and credential admission, the
+    // requested capabilities and the allow decision were evaluated before
+    // BEGIN, at this same `now`, from inputs shown equal under the locks
+    // above: the challenge's fields, the registration's policy bytes and
+    // root CIDs, and the roots those CIDs content-address. Their result
+    // cannot differ here, so they are not run again while holding the locks.
     let reserved = policy_v3_challenge::Entity::update_many()
         .col_expr(
             policy_v3_challenge::Column::ConsumedAt,
@@ -3058,7 +3043,7 @@ pub async fn mint(
         )
     })?;
     tinycloud
-        .delegate_batch_in_transaction(&txn, vec![event])
+        .delegate_batch_in_transaction_verified(&txn, vec![event], &verified)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     txn.commit().await.map_err(db_error)?;
@@ -4711,6 +4696,25 @@ async fn verify_signed_delegation(delegation: &TinyCloudDelegation) -> Result<()
         .await
         .map_err(|_| ())?;
     ucan.payload().validate_time(None).map_err(|_| ())
+}
+
+/// Verify a policy root before any lock (TC-2986): a UCAN within its time
+/// window, whose signature the core checks and records so the root's
+/// registration transaction does not check it again.
+async fn preverify_root(
+    tinycloud: &crate::TinyCloud,
+    root: &Delegation,
+    refusal: &'static str,
+) -> Result<tinycloud_core::db::PreVerified, (Status, String)> {
+    let refused = || (Status::Forbidden, refusal.to_owned());
+    let TinyCloudDelegation::Ucan(ucan) = &root.0.delegation else {
+        return Err(refused());
+    };
+    ucan.payload().validate_time(None).map_err(|_| refused())?;
+    tinycloud
+        .preverify_delegation(root)
+        .await
+        .map_err(|_| refused())
 }
 
 struct RegistrationProjections {
