@@ -1162,7 +1162,6 @@ async fn save<C: ConnectionTrait>(
     serialization: Vec<u8>,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    crate::space_purge_records::operation(db).await?;
     // Hash is always computed on plaintext (before encryption)
     let hash: Hash = crate::hash::hash(&serialization);
 
@@ -1307,25 +1306,7 @@ async fn save<C: ConnectionTrait>(
 }
 
 async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
-    match actor::Entity::insert_many(actors.iter().map(|a| {
-        actor::ActiveModel::from(actor::Model {
-            id: ToString::to_string(a),
-        })
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
-    Ok(())
+    crate::space_purge_records::operation_actors(db, actors).await
 }
 
 #[cfg(test)]

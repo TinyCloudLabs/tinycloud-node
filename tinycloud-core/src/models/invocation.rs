@@ -761,7 +761,6 @@ async fn save<C: ConnectionTrait>(
     parameters: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
-    crate::space_purge_records::operation(db).await?;
     // Hash is always computed on plaintext (before encryption)
     let hash = crate::hash::hash(&serialization);
     let issued_at = time.unwrap_or_else(OffsetDateTime::now_utc);
@@ -779,22 +778,7 @@ async fn save<C: ConnectionTrait>(
     );
 
     // Ensure the invoker actor exists before inserting the invocation
-    match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
-        id: invocation.invoker.clone(),
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
+    crate::space_purge_records::operation_actors(db, &[&invocation.invoker]).await?;
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
