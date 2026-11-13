@@ -132,3 +132,7 @@ impl<C: ConnectionTrait, B, K: Secrets> SpaceDatabase<C, B, K> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "resource_retirement_reader_tests.rs"]
+mod tests;

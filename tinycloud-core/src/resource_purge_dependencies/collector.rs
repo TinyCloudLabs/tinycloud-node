@@ -117,7 +117,7 @@ pub(crate) async fn native_outside(
     bytes: &[u8],
     info: &DelegationInfo,
 ) -> Result<bool, DbErr> {
-    if !delegation::is_policy_session(&info.delegation) {
+    if !delegation::is_policy_session(&info.delegation) || info.parents.len() != 2 {
         return Ok(false);
     }
     let cid = row.id.to_cid(0x55).to_string();
@@ -147,7 +147,6 @@ pub(crate) async fn native_outside(
         || !did_principal_matches(&projection.recipient_did, &info.delegate)
         || !did_principal_matches(fact("recipientDid")?, &info.delegate)
         || !did_principal_matches(fact("ownerDid")?, target.owner_did())
-        || info.parents.len() != 2
         || !info
             .parents
             .iter()
@@ -301,15 +300,36 @@ pub async fn collect_target_dependencies(
             Err(invocation::Error::Db(error)) => return Err(error),
             Err(_) => return Err(unavailable()),
         }
+        let mut endpoints = std::collections::HashSet::new();
         if native_outside(tx, target, row, &bytes, &info).await? {
-            if !graph.has_covering_path_to(
-                [id],
-                |cap| decrypt(&cap.ability) && relevant(target, &cap.resource).unwrap_or(false),
-                |_| true,
-                |row| row.id == id,
-            ) {
-                return Err(unavailable());
+            endpoints.insert(id);
+        }
+        for ancestor_id in graph.chain_ids_from(&id) {
+            if ancestor_id == id {
+                continue;
             }
+            let ancestor = graph.delegation(&ancestor_id).ok_or_else(unavailable)?;
+            let (bytes, info) = decode(ancestor, encryption)?;
+            if native_outside(tx, target, ancestor, &bytes, &info).await? {
+                endpoints.insert(ancestor_id);
+            }
+        }
+        let proven = caps.iter().any(|cap| {
+            graph.has_covering_path_to(
+                [id],
+                |ability| {
+                    cap.resource.extends(&ability.resource)
+                        && crate::policy_capability::ability_matches(
+                            ability.ability.as_ref().as_ref(),
+                            cap.ability.as_ref().as_ref(),
+                        )
+                        && ability.caveats == cap.caveats
+                },
+                |_| true,
+                |row| endpoints.contains(&row.id),
+            )
+        });
+        if proven {
             outside.push(DependencyIdentity::Grant(id));
         } else {
             ambiguous.insert(id);
