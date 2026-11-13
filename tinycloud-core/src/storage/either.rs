@@ -72,6 +72,18 @@ where
         }
     }
 
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        match self {
+            Self::A(l) => l.size(space, id, generation).await.map_err(Self::Error::A),
+            Self::B(r) => r.size(space, id, generation).await.map_err(Self::Error::B),
+        }
+    }
+
     async fn read_range(
         &self,
         space: &SpaceId,

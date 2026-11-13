@@ -1490,6 +1490,8 @@ fn kv_invoke_options_for_capabilities_with_cursor(
             }
         })
         .transpose()?;
+    let list_entries = take_metadata_header(&mut headers.0, "x-tinycloud-list-entries")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
     let list_cursor = take_metadata_header(&mut headers.0, "x-tinycloud-cursor")
         .map(|value| {
             // A list cursor is bound to one listed prefix, but the database
@@ -1531,6 +1533,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         max_response_bytes,
         list_limit,
         list_cursor,
+        list_entries,
         kv_sync: None,
         replay: None,
     })
@@ -2476,7 +2479,7 @@ async fn invoke_impl(
                     if let InvocationOutcome::KvSync(page) = outcome {
                         page.node_did = Some(encryption.node_did().to_string());
                     }
-                    if let InvocationOutcome::KvList(paths, truncated, next_cursor) = outcome {
+                    if let InvocationOutcome::KvList(paths, truncated, next_cursor, _) = outcome {
                         *next_cursor = if *truncated {
                             match (cursor_limit, cursor_target.as_ref(), paths.last()) {
                                 (Some(limit), Some((space, prefix)), Some(last)) => encode_kv_cursor(&cursor_key, &invocation_info.invoker, space, prefix, limit, last).ok(),
@@ -2558,7 +2561,7 @@ async fn invoke_impl(
                                 | (false, InvocationOutcome::KvMetadata(None)) => None,
                                 (
                                     false,
-                                    InvocationOutcome::KvMetadata(Some((metadata, hash))),
+                                    InvocationOutcome::KvMetadata(Some((metadata, hash, _))),
                                 ) => Some(KvBatchReadValue {
                                     metadata,
                                     hash,
@@ -12461,6 +12464,102 @@ mod tests {
         Ok(())
     }
 
+    /// TC-2492: a put records its value's size. A head reports it in
+    /// `x-tinycloud-content-length` (the body is empty) and the write's time
+    /// in `Last-Modified`. A list that asks with `x-tinycloud-list-entries`
+    /// returns each key's size and write time; one that doesn't returns bare
+    /// keys.
+    #[tokio::test]
+    async fn kv_head_and_list_entries_report_size_and_modified_time() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use tinycloud_core::models::{current_kv, invocation};
+
+        let fixture = KvSyncFixture::new().await?;
+        let report = b"twenty-one bytes long";
+        fixture.owner_write("docs/report.txt", Some(report)).await?;
+        fixture.owner_write("docs/notes.txt", Some(b"abc")).await?;
+
+        let mut written = HashMap::new();
+        for row in current_kv::Entity::find().all(&fixture.conn).await? {
+            let issued_at = invocation::Entity::find_by_id(row.invocation)
+                .one(&fixture.conn)
+                .await?
+                .expect("the writing invocation is stored")
+                .issued_at;
+            written.insert(row.key.to_string(), (row.size, issued_at));
+        }
+        assert_eq!(written["docs/report.txt"].0, Some(report.len() as i64));
+        assert_eq!(written["docs/notes.txt"].0, Some(3));
+        let report_written = written["docs/report.txt"].1;
+        let notes_written = written["docs/notes.txt"].1;
+
+        let uri = |path: &str| -> Result<String> {
+            Ok(fixture.resource_in(&fixture.space, "kv", path)?.to_string())
+        };
+        let head = fixture
+            .client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                fixture.owner_invocation(&[(uri("docs/report.txt")?, "tinycloud.kv/metadata")])?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(head.status(), Status::Ok);
+        assert_eq!(
+            head.headers().get_one("x-tinycloud-content-length"),
+            Some("21")
+        );
+        let http_date = time::format_description::parse(
+            "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT",
+        )?;
+        assert_eq!(
+            head.headers().get_one("Last-Modified"),
+            Some(
+                report_written
+                    .to_offset(time::UtcOffset::UTC)
+                    .format(&http_date)?
+                    .as_str()
+            )
+        );
+
+        let entries = fixture
+            .dispatch(
+                fixture.owner_invocation(&[(uri("docs")?, "tinycloud.kv/list")])?,
+                &[("x-tinycloud-list-entries", "true")],
+            )
+            .await;
+        assert_eq!(entries.status, Status::Ok, "{}", entries.body);
+        assert_eq!(
+            entries.json,
+            serde_json::json!([
+                {
+                    "key": "docs/notes.txt",
+                    "size": 3,
+                    "updatedAt": rfc3339(notes_written),
+                },
+                {
+                    "key": "docs/report.txt",
+                    "size": 21,
+                    "updatedAt": rfc3339(report_written),
+                },
+            ])
+        );
+
+        let keys = fixture
+            .dispatch(
+                fixture.owner_invocation(&[(uri("docs")?, "tinycloud.kv/list")])?,
+                &[],
+            )
+            .await;
+        assert_eq!(keys.status, Status::Ok, "{}", keys.body);
+        assert_eq!(
+            keys.json,
+            serde_json::json!(["docs/notes.txt", "docs/report.txt"])
+        );
+        Ok(())
+    }
+
     /// TC-1317: an `/invoke` KV read whose audit record cannot commit is
     /// answered `503 read_audit_busy` at the read-audit bound, without its
     /// data; once the drain frees up the same read is served.
@@ -13956,6 +14055,7 @@ mod tests {
                 value: Set(tinycloud_core::hash::hash(b"foreign secret")),
                 generation: Set(0),
                 metadata: Set(Metadata(Default::default())),
+                size: Set(None),
                 deleted: Set(false),
             }
             .insert(&fixture.conn)

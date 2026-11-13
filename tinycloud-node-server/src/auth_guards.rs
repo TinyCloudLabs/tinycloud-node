@@ -11,9 +11,11 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 use tinycloud_auth::{authorization::TinyCloudDelegation, ipld_core::cid::Cid, resource::SpaceId};
 use tinycloud_core::{
     events::Delegation, hash::Hash, types::Metadata, util::Capability, InvocationOutcome,
+    KvValueDetails,
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -95,13 +97,44 @@ fn kv_batch_read_response(items: Vec<tinycloud_core::KvBatchReadItem>) -> KvBatc
     KvBatchReadResponse { results }
 }
 
-struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool, Option<String>);
+struct KvListResponse(
+    Vec<tinycloud_auth::resource::Path>,
+    bool,
+    Option<String>,
+    Option<Vec<KvValueDetails>>,
+);
+
+/// One `kv/list` entry when the request asked for entries (TC-2492).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvListEntry {
+    key: String,
+    size: Option<u64>,
+    updated_at: Option<String>,
+}
 
 impl<'r> Responder<'r, 'static> for KvListResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let mut response = Json(self.0).respond_to(request)?;
-        response.set_header(Header::new("x-tinycloud-truncated", self.1.to_string()));
-        if let Some(next_cursor) = self.2 {
+        let KvListResponse(paths, truncated, next_cursor, details) = self;
+        let mut response = match details {
+            Some(details) => Json(
+                paths
+                    .into_iter()
+                    .zip(details)
+                    .map(|(path, details)| KvListEntry {
+                        key: path.to_string(),
+                        size: details.size,
+                        updated_at: details
+                            .modified
+                            .and_then(|modified| modified.format(&Rfc3339).ok()),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .respond_to(request)?,
+            None => Json(paths).respond_to(request)?,
+        };
+        response.set_header(Header::new("x-tinycloud-truncated", truncated.to_string()));
+        if let Some(next_cursor) = next_cursor {
             response.set_header(Header::new("x-tinycloud-next-cursor", next_cursor));
         }
         Ok(response)
@@ -139,14 +172,36 @@ impl<'r> Responder<'r, 'static> for KvMutationResponse {
     }
 }
 
-struct KvMetadataResponse(Metadata, Hash);
+struct KvMetadataResponse(Metadata, Hash, KvValueDetails);
 
 impl<'r> Responder<'r, 'static> for KvMetadataResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = ObjectHeaders(self.0).respond_to(request)?;
         response.set_header(Header::new("ETag", kv_etag(self.1)));
+        // The body is empty, so the stored size can't be its Content-Length.
+        if let Some(size) = self.2.size {
+            response.set_header(Header::new("x-tinycloud-content-length", size.to_string()));
+        }
+        if let Some(modified) = self.2.modified {
+            response.set_header(Header::new("Last-Modified", http_date(modified)));
+        }
         Ok(response)
     }
+}
+
+/// An HTTP-date (RFC 9110 IMF-fixdate), e.g. `Fri, 13 Nov 2026 15:00:00 GMT`.
+fn http_date(time: OffsetDateTime) -> String {
+    let time = time.to_offset(UtcOffset::UTC);
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        &time.weekday().to_string()[..3],
+        time.day(),
+        &time.month().to_string()[..3],
+        time.year(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
 }
 
 #[async_trait]
@@ -188,8 +243,8 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         match self.0 {
-            InvocationOutcome::KvList(list, truncated, next_cursor) => {
-                KvListResponse(list, truncated, next_cursor).respond_to(request)
+            InvocationOutcome::KvList(list, truncated, next_cursor, details) => {
+                KvListResponse(list, truncated, next_cursor, details).respond_to(request)
             }
             InvocationOutcome::KvSync(page) => {
                 let Some(node_did) = page.node_did.clone() else {
@@ -207,7 +262,7 @@ where
             }
             InvocationOutcome::KvDelete(hash) => KvMutationResponse(hash).respond_to(request),
             InvocationOutcome::KvMetadata(meta) => meta
-                .map(|(metadata, hash)| KvMetadataResponse(metadata, hash))
+                .map(|(metadata, hash, details)| KvMetadataResponse(metadata, hash, details))
                 .respond_to(request),
             InvocationOutcome::KvWrite(hash) => KvMutationResponse(Some(hash)).respond_to(request),
             InvocationOutcome::KvBatchWrite(written) => {
@@ -449,6 +504,7 @@ mod tests {
                 "text/plain".to_string(),
             )])),
             hash(b"hello"),
+            Default::default(),
         )
     }
 
