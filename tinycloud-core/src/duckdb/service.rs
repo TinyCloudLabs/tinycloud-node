@@ -666,6 +666,7 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
     match err {
         DatabaseArtifactError::WriteLimitExceeded { .. } => DuckDbError::DatabaseSizeLimit,
         DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
+        DatabaseArtifactError::StorageLimit => DuckDbError::StorageWouldGrow,
         err => DuckDbError::Internal(err.to_string()),
     }
 }

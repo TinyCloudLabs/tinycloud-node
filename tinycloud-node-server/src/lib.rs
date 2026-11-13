@@ -1004,33 +1004,25 @@ pub async fn app_with_control(
         tc_bench_block_get,
         tc_bench_health,
     ]);
-    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
-        Arc::new(SizeTrackingArtifactRepository::new(
-            Arc::new(
-                node_artifact_repository(&tinycloud)
-                    .with_max_write_bytes(
-                        tinycloud_config
-                            .storage
-                            .sql
-                            .max_artifact_write_bytes
-                            .as_u64(),
-                    )
-                    .with_max_read_bytes(
-                        tinycloud_config
-                            .storage
-                            .sql
-                            .max_artifact_read_bytes
-                            .as_u64(),
-                    )
-                    .with_chunk_limits(tinycloud_config.storage.sql.chunked_artifacts.then_some(
-                        tinycloud_core::database_artifacts::chunks::ChunkLimits {
-                            artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
-                            account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
-                        },
-                    )),
-            ),
-            sql_sizes.clone(),
-        ));
+    let raw_artifact_repository = node_artifact_repository(&tinycloud)
+        .with_max_write_bytes(tinycloud_config.storage.sql.max_artifact_write_bytes.as_u64())
+        .with_max_read_bytes(tinycloud_config.storage.sql.max_artifact_read_bytes.as_u64())
+        .with_chunk_limits(
+        tinycloud_config.storage.sql.chunked_artifacts.then_some(
+            tinycloud_core::database_artifacts::chunks::ChunkLimits {
+                artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
+                account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
+            },
+        ),
+    );
+    raw_artifact_repository.configure_chunked_storage().await?;
+    let artifact_collector = raw_artifact_repository
+        .chunk_storage_active()
+        .await?
+        .then_some(raw_artifact_repository.clone());
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SizeTrackingArtifactRepository::new(Arc::new(raw_artifact_repository), sql_sizes.clone()),
+    );
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -1137,6 +1129,28 @@ pub async fn app_with_control(
     let renewal_scheduler_tinycloud = tinycloud.clone();
     let renewal_scheduler_secret = key_setup.clone();
     let rocket = rocket::custom(config)
+        .attach(AdHoc::on_liftoff("artifact-part-collector", move |rocket| {
+            let collector=artifact_collector.clone();
+            let shutdown=rocket.shutdown();
+            Box::pin(async move {
+                if let Some(collector)=collector {
+                    tokio::spawn(async move {
+                        let mut interval=tokio::time::interval(Duration::from_secs(10));
+                        tokio::pin!(shutdown);
+                        loop {
+                            tokio::select! {
+                                _=interval.tick()=> {
+                                    if collector.reap_unused_parts(2048).await.is_err() {
+                                        ::tracing::warn!(event="artifact_part_collection_failed", "Artifact part collection deferred");
+                                    }
+                                },
+                                _=&mut shutdown=>break,
+                            }
+                        }
+                    });
+                }
+            })
+        }))
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
             let policy = egress_policy.clone();
             move |rocket| {

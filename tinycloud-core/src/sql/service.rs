@@ -1006,7 +1006,10 @@ impl SqlService {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
 
-        if self.artifact_repository.chunked_checkpoints() {
+        if self
+            .artifact_repository
+            .chunked_checkpoints("sql", &key.0, db_name)
+        {
             let snapshot = handle.snapshot().await?;
             let bytes = snapshot
                 .as_file()
@@ -2708,6 +2711,17 @@ mod tests {
             )
             .await
             .unwrap();
+        let superseded_part = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT checkpoint_part_id FROM database_artifact".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "checkpoint_part_id")
+            .unwrap();
         service
             .execute(
                 &space,
@@ -2766,11 +2780,32 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(before, reopened.export(&space, "main").await.unwrap());
+        let current_meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
         let state = fixture.conn.query_one(sea_orm::Statement::from_string(
             sea_orm::DbBackend::Postgres,
             "SELECT max(octet_length(payload))::bigint AS max_bytes, count(*)::bigint AS chunks, count(*) FILTER(WHERE pg_column_compression(payload) IS NOT NULL)::bigint AS compressed FROM artifact_chunk".to_string(),
         )).await.unwrap().unwrap();
-        assert!(state.try_get::<i64>("", "chunks").unwrap() >= 6);
+        assert_eq!(
+            state.try_get::<i64>("", "chunks").unwrap(),
+            (current_meta.checkpoint_size_bytes as u64).div_ceil(1024 * 1024) as i64
+        );
+        let old_chunks = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT count(*)::bigint AS chunks FROM artifact_chunk WHERE part_id=$1",
+                [superseded_part.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "chunks")
+            .unwrap();
+        assert_eq!(old_chunks, 0, "superseded checkpoint must be reclaimed");
         assert!(state.try_get::<i64>("", "max_bytes").unwrap() <= 1024 * 1024);
         assert_eq!(state.try_get::<i64>("", "compressed").unwrap(), 0);
         let meta = repo
@@ -2780,6 +2815,104 @@ mod tests {
             .unwrap();
         assert_eq!(meta.revision, 2);
         assert_eq!(meta.delta_size_bytes, 0);
+        reopened
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_flag_off_reopen_can_write() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_flag_off_reopen_can_write",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                },
+            )),
+        );
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let space = test_space_id("flag-off");
+        let service = SqlService::new(first.path().to_string_lossy().into_owned(), 0, repo);
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(value TEXT)".into()]),
+                    sql: "INSERT INTO items VALUES ('first')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        drop(service);
+        let flag_off = Arc::new(SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()));
+        assert!(flag_off.chunk_storage_active().await.unwrap());
+        let reopened = SqlService::new(
+            second.path().to_string_lossy().into_owned(),
+            0,
+            flag_off.clone(),
+        );
+        reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items VALUES ('second')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let result = reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT value FROM items ORDER BY rowid".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => {
+                assert_eq!(query.row_count, 2);
+                assert_eq!(query.rows[1][0], SqlValue::Text("second".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            flag_off
+                .load_meta("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_mode,
+            "checkpoint-parts-v1"
+        );
         reopened
             .discard_local_state(&(space.to_string(), "main".into()))
             .await

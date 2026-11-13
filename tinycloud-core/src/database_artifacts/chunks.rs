@@ -21,17 +21,71 @@ impl SeaOrmDatabaseArtifactRepository {
     pub(super) async fn ensure_legacy_write(
         &self,
         service: &str,
-        space: &str,
-        name: &str,
+        _space: &str,
+        _name: &str,
     ) -> Result<(), DatabaseArtifactError> {
         if self.conn.get_database_backend() != DbBackend::Postgres {
             return Ok(());
         }
-        if (self.chunk_limits.is_some() && service == "sql") || self.conn.query_one(statement(
-            "SELECT 1 AS present FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3 AND checkpoint_part_id IS NOT NULL",
-            vec![service.into(), space.into(), name.into()],
-        )).await?.is_some() {
+        if self.chunk_limits.is_some() && service == "sql" {
             return Err(DatabaseArtifactError::IncrementalPersistenceUnsupported);
+        }
+        Ok(())
+    }
+
+    pub async fn configure_chunked_storage(&self) -> Result<(), DatabaseArtifactError> {
+        if let Some(limits) = self.chunk_limits {
+            self.conn
+                .execute(statement(
+                    "SELECT artifact_enable($1,$2)",
+                    vec![
+                        (limits.account_bytes.min(i64::MAX as u64) as i64).into(),
+                        (limits.artifact_bytes.min(i64::MAX as u64) as i64).into(),
+                    ],
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn chunk_storage_active(&self) -> Result<bool, DatabaseArtifactError> {
+        if self.conn.get_database_backend() != DbBackend::Postgres {
+            return Ok(false);
+        }
+        Ok(self
+            .conn
+            .query_one(statement(
+                "SELECT account_limit>0 AS active FROM artifact_storage_settings WHERE id=1",
+                vec![],
+            ))
+            .await?
+            .is_some_and(|row| row.try_get::<bool>("", "active").unwrap_or(false)))
+    }
+
+    /// Each call frees at most one payload chunk per statement. Selection is
+    /// advisory; the database rechecks pointers and takes the owner/part locks.
+    pub async fn reap_unused_parts(&self, max_steps: usize) -> Result<(), DatabaseArtifactError> {
+        for _ in 0..max_steps {
+            let Some(row)=self.conn.query_one(statement(
+                "SELECT service,space,name,part_id FROM artifact_part p WHERE (state='deleting' OR lease_until<clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1", vec![],
+            )).await? else { break; };
+            let values = vec![
+                row.try_get::<String>("", "service")?.into(),
+                row.try_get::<String>("", "space")?.into(),
+                row.try_get::<String>("", "name")?.into(),
+                row.try_get::<String>("", "part_id")?.into(),
+            ];
+            let row = self
+                .conn
+                .query_one(statement(
+                    "SELECT artifact_reap_one($1,$2,$3,$4) AS progress",
+                    values,
+                ))
+                .await?
+                .ok_or(DatabaseArtifactError::ArtifactChanged)?;
+            if !row.try_get::<bool>("", "progress")? {
+                break;
+            }
         }
         Ok(())
     }
@@ -44,12 +98,20 @@ impl SeaOrmDatabaseArtifactRepository {
         snapshot: tempfile::NamedTempFile,
         expected: ArtifactExpectation,
     ) -> Result<ArtifactMeta, DatabaseArtifactError> {
-        let limits = self
-            .chunk_limits
-            .ok_or(DatabaseArtifactError::IncrementalPersistenceUnsupported)?;
         if self.conn.get_database_backend() != DbBackend::Postgres {
             return Err(DatabaseArtifactError::IncrementalPersistenceUnsupported);
         }
+        let limits = match self.chunk_limits {
+            Some(limits) => limits,
+            None => {
+                let row=self.conn.query_one(statement("SELECT account_limit,artifact_limit FROM artifact_storage_settings WHERE id=1",vec![]))
+                    .await?.ok_or(DatabaseArtifactError::IncrementalPersistenceUnsupported)?;
+                ChunkLimits {
+                    artifact_bytes: row.try_get::<i64>("", "artifact_limit")?.max(0) as u64,
+                    account_bytes: row.try_get::<i64>("", "account_limit")?.max(0) as u64,
+                }
+            }
+        };
         let size = snapshot.as_file().metadata().map_err(io_error)?.len();
         if limits.artifact_bytes == 0
             || limits.account_bytes == 0
@@ -62,7 +124,8 @@ impl SeaOrmDatabaseArtifactRepository {
             .parse()
             .map_err(|_| DatabaseArtifactError::Backend("invalid artifact space".into()))?;
         let owner = space_id.did().to_string();
-        let owner_prefix = format!("tinycloud:{}:", space_id.suffix());
+        self.configure_chunked_storage().await?;
+        self.reap_unused_parts(2048).await?;
         let current = self.load_meta(service, space, name).await?;
         expected.check(
             current
@@ -80,37 +143,37 @@ impl SeaOrmDatabaseArtifactRepository {
                 vec![owner.clone().into()],
             ))
             .await?;
-        // The owner-row update serialises parallel reservations. Legacy live
-        // artifacts are included until their pointer publication replaces them.
-        // A failed/cancelled upload remains reserved, never silently reusable.
+        let mut cleanup = UploadCleanup {
+            repo: self.clone(),
+            service: service.into(),
+            space: space.into(),
+            name: name.into(),
+            part_id: part_id.clone(),
+            armed: true,
+        };
         let reserved = self
             .conn
-            .execute(statement(
-                r#"
-WITH reservation AS (
- UPDATE artifact_account SET reserved_bytes=reserved_bytes+$2
- WHERE owner=$1 AND reserved_bytes <= $3-$2-
-   (SELECT COALESCE(sum(size_bytes),0) FROM database_artifact
-    WHERE checkpoint_part_id IS NULL AND left(space,length($4))=$4)
- RETURNING owner
-)
-INSERT INTO artifact_part(service,space,name,part_id,owner,size_bytes,chunk_count)
-SELECT $5,$6,$7,$8,owner,$2,$9 FROM reservation
-"#,
+            .query_one(statement(
+                "SELECT artifact_reserve($1,$2,$3,$4,$5,$6,$7,$8,$9) AS admitted",
                 vec![
-                    owner.into(),
-                    (size as i64).into(),
-                    (limits.account_bytes.min(i64::MAX as u64) as i64).into(),
-                    owner_prefix.into(),
                     service.into(),
                     space.into(),
                     name.into(),
                     part_id.clone().into(),
+                    owner.clone().into(),
+                    (size as i64).into(),
                     count.into(),
+                    current.as_ref().map(|m| m.revision).into(),
+                    current
+                        .as_ref()
+                        .map(|m| m.checkpoint_content_hash.clone())
+                        .into(),
                 ],
             ))
-            .await?;
-        if reserved.rows_affected() != 1 {
+            .await?
+            .ok_or(DatabaseArtifactError::ArtifactChanged)?;
+        if !reserved.try_get::<bool>("", "admitted")? {
+            cleanup.armed = false;
             return Err(DatabaseArtifactError::StorageLimit);
         }
 
@@ -139,7 +202,7 @@ SELECT $5,$6,$7,$8,owner,$2,$9 FROM reservation
             }
             hasher.update(&buffer[..used]);
             self.conn.execute(statement(
-                "INSERT INTO artifact_chunk(service,space,name,part_id,ordinal,payload) VALUES($1,$2,$3,$4,$5,$6)",
+                "WITH lease AS (UPDATE artifact_part SET lease_until=clock_timestamp()+interval '120 seconds' WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='uploading' RETURNING part_id) INSERT INTO artifact_chunk(service,space,name,part_id,ordinal,payload) SELECT $1,$2,$3,$4,$5,$6 FROM lease",
                 vec![service.into(),space.into(),name.into(),part_id.clone().into(),ordinal.into(),buffer[..used].to_vec().into()],
             )).await?;
             ordinal += 1;
@@ -156,8 +219,8 @@ SELECT $5,$6,$7,$8,owner,$2,$9 FROM reservation
             .conn
             .execute(statement(
                 r#"
-UPDATE artifact_part p SET sealed=true,content_hash=$5
-WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND NOT sealed
+UPDATE artifact_part p SET state='sealed',content_hash=$5
+WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='uploading'
  AND (SELECT count(*) FROM artifact_chunk c WHERE
  (c.service,c.space,c.name,c.part_id)=(p.service,p.space,p.name,p.part_id))=p.chunk_count
  AND (SELECT COALESCE(sum(octet_length(payload)),0) FROM artifact_chunk c WHERE
@@ -183,12 +246,16 @@ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND NOT sealed
             service.into(),
             space.into(),
             name.into(),
-            part_id.into(),
+            part_id.clone().into(),
             revision.into(),
             cid.clone().into(),
             (size as i64).into(),
             now.clone().into(),
         ];
+        #[cfg(test)]
+        if let Some(barrier) = &self.chunk_publish_barrier {
+            barrier.wait().await;
+        }
         // One metadata-only statement is the acknowledgement boundary. Parts
         // are already durable and sealed; no transaction spans the transfer.
         let sql = if let Some(previous) = current {
@@ -196,21 +263,26 @@ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND NOT sealed
                 previous.revision.into(),
                 previous.checkpoint_content_hash.into(),
             ]);
-            r#"WITH ready AS (SELECT part_id FROM artifact_part
- WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND sealed FOR UPDATE)
+            r#"WITH owner_lock AS MATERIALIZED (SELECT owner FROM artifact_account
+ WHERE owner=(SELECT owner FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4) FOR UPDATE),
+ ready AS (SELECT p.part_id FROM artifact_part p CROSS JOIN owner_lock
+ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='sealed' FOR UPDATE OF p)
 UPDATE database_artifact SET checkpoint_part_id=$4,delta_part_id=NULL,
  revision=$5,content_hash=$6,checkpoint_content_hash=$6,size_bytes=$7,
  checkpoint_size_bytes=$7,payload=''::bytea,delta_payload=NULL,
- delta_content_hash=NULL,delta_size_bytes=0,storage_mode='database-blob',updated_at=$8
+ delta_content_hash=NULL,delta_size_bytes=0,storage_mode='checkpoint-parts-v1',
+ layout_generation=layout_generation+1,updated_at=$8
 WHERE service=$1 AND space=$2 AND name=$3 AND revision=$9 AND checkpoint_content_hash=$10
  AND EXISTS(SELECT 1 FROM ready)"#
         } else {
-            r#"WITH ready AS (SELECT part_id FROM artifact_part
- WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND sealed FOR UPDATE)
+            r#"WITH owner_lock AS MATERIALIZED (SELECT owner FROM artifact_account
+ WHERE owner=(SELECT owner FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4) FOR UPDATE),
+ ready AS (SELECT p.part_id FROM artifact_part p CROSS JOIN owner_lock
+ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='sealed' FOR UPDATE OF p)
 INSERT INTO database_artifact(service,space,name,checkpoint_part_id,revision,content_hash,
  checkpoint_content_hash,size_bytes,checkpoint_size_bytes,payload,backend,storage_mode,
- created_at,updated_at,delta_size_bytes)
-SELECT $1,$2,$3,$4,$5,$6,$6,$7,$7,''::bytea,'storage.database','database-blob',$8,$8,0
+ created_at,updated_at,delta_size_bytes,layout_generation)
+SELECT $1,$2,$3,$4,$5,$6,$6,$7,$7,''::bytea,'storage.database','checkpoint-parts-v1',$8,$8,0,1
 FROM ready ON CONFLICT DO NOTHING"#
         };
         if self
@@ -222,6 +294,16 @@ FROM ready ON CONFLICT DO NOTHING"#
         {
             return Err(DatabaseArtifactError::StaleLineage);
         }
+        cleanup.armed = false;
+        // Reclamation is outside the publish statement. If this pass cannot
+        // finish, the periodic collector keeps the bytes charged until freed.
+        #[cfg(test)]
+        let reclaim = !self.chunk_reclaim_paused;
+        #[cfg(not(test))]
+        let reclaim = true;
+        if reclaim {
+            let _ = self.reap_unused_parts(2048).await;
+        }
         Ok(ArtifactMeta {
             revision,
             size_bytes: size as i64,
@@ -231,7 +313,7 @@ FROM ready ON CONFLICT DO NOTHING"#
             delta_content_hash: None,
             delta_size_bytes: 0,
             updated_at: now,
-            storage_mode: "database-blob".into(),
+            storage_mode: "checkpoint-parts-v1".into(),
             backend: "storage.database".into(),
         })
     }
@@ -244,13 +326,16 @@ FROM ready ON CONFLICT DO NOTHING"#
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<bool, DatabaseArtifactError> {
-        if self.conn.get_database_backend() != DbBackend::Postgres {
+        if self.conn.get_database_backend() != DbBackend::Postgres
+            || meta.storage_mode != "checkpoint-parts-v1"
+        {
             return Ok(false);
         }
         let row=self.conn.query_one(statement(
-            "SELECT checkpoint_part_id,delta_part_id,revision,checkpoint_content_hash FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3",
+            "SELECT checkpoint_part_id,delta_part_id,revision,checkpoint_content_hash,layout_generation FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3",
             vec![service.into(),space.into(),name.into()],
         )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
+        let generation: i64 = row.try_get("", "layout_generation")?;
         let part: Option<String> = row.try_get("", "checkpoint_part_id")?;
         let Some(part) = part else { return Ok(false) };
         if row.try_get::<i64>("", "revision")? != meta.revision
@@ -266,7 +351,7 @@ FROM ready ON CONFLICT DO NOTHING"#
             return Err(DatabaseArtifactError::IncrementalPersistenceUnsupported);
         }
         let manifest=self.conn.query_one(statement(
-            "SELECT size_bytes,chunk_count,content_hash FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND sealed",
+            "SELECT size_bytes,chunk_count,content_hash FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='sealed'",
             vec![service.into(),space.into(),name.into(),part.clone().into()],
         )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
         let size = manifest.try_get::<i64>("", "size_bytes")?;
@@ -309,14 +394,59 @@ FROM ready ON CONFLICT DO NOTHING"#
             return Err(DatabaseArtifactError::HashMismatch { part: "checkpoint" });
         }
         let unchanged=self.conn.query_one(statement(
-            "SELECT 1 AS present FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3 AND revision=$4 AND checkpoint_content_hash=$5 AND checkpoint_part_id=$6",
-            vec![service.into(),space.into(),name.into(),meta.revision.into(),cid.into(),part.into()],
+            "SELECT 1 AS present FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3 AND revision=$4 AND checkpoint_content_hash=$5 AND checkpoint_part_id=$6 AND layout_generation=$7",
+            vec![service.into(),space.into(),name.into(),meta.revision.into(),cid.into(),part.into(),generation.into()],
         )).await?.is_some();
         if !unchanged {
             return Err(DatabaseArtifactError::ArtifactChanged);
         };
         sink.finish_part().await?;
         Ok(true)
+    }
+}
+
+struct UploadCleanup {
+    repo: SeaOrmDatabaseArtifactRepository,
+    service: String,
+    space: String,
+    name: String,
+    part_id: String,
+    armed: bool,
+}
+impl Drop for UploadCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let repo = self.repo.clone();
+        let values: Vec<Value> = vec![
+            self.service.clone().into(),
+            self.space.clone().into(),
+            self.name.clone().into(),
+            self.part_id.clone().into(),
+        ];
+        runtime.spawn(async move {
+            // Publication may have committed despite a lost response: the
+            // database checks references before permitting any deletion.
+            for _ in 0..2048 {
+                let Ok(Some(row)) = repo
+                    .conn
+                    .query_one(statement(
+                        "SELECT artifact_reap_one($1,$2,$3,$4,true) AS progress",
+                        values.clone(),
+                    ))
+                    .await
+                else {
+                    break;
+                };
+                if row.try_get::<bool>("", "progress").ok() != Some(true) {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -406,7 +536,7 @@ mod tests {
             legacy
                 .save("sql", space, "main", vec![1], ArtifactExpectation::Any)
                 .await,
-            Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+            Err(DatabaseArtifactError::StaleLineage)
         ));
         let immutable = fixture
             .conn
@@ -423,5 +553,724 @@ mod tests {
             matches!(error, DatabaseArtifactError::HashMismatch { .. }),
             "{error:?}"
         );
+    }
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_publish_cas_race_and_reclamation() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_publish_cas_race_and_reclamation",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:race";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 8192,
+            }),
+        );
+        let legacy = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        let base = legacy
+            .save(
+                "sql",
+                space,
+                "main",
+                vec![0; 128],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let expected = ArtifactExpectation::Derived {
+            revision: base.revision,
+            checkpoint_content_hash: base.checkpoint_content_hash,
+        };
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut racing = repo.clone();
+        racing.chunk_publish_barrier = Some(barrier.clone());
+        let upload = tokio::spawn(async move {
+            racing
+                .save_snapshot("sql", space, "main", snapshot(&[1; 128]), expected)
+                .await
+        });
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fixture
+                .conn
+                .query_one(statement(
+                    "SELECT 1 AS ready FROM artifact_part WHERE state='sealed'",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < bound);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let second = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[2; 128]),
+                ArtifactExpectation::Any,
+            )
+            .await;
+        assert!(
+            matches!(second, Err(DatabaseArtifactError::StorageLimit)),
+            "second replacement must refuse: {second:?}"
+        );
+        // Administrative failure injection changes the base after reservation,
+        // modelling a late stale publication independently of the credit fence.
+        fixture.conn.execute_unprepared("ALTER TABLE database_artifact DISABLE TRIGGER artifact_metadata_guard; UPDATE database_artifact SET revision=revision+1; ALTER TABLE database_artifact ENABLE TRIGGER artifact_metadata_guard;").await.unwrap();
+        barrier.wait().await;
+        let outcome = upload.await.unwrap();
+        assert!(
+            matches!(outcome, Err(DatabaseArtifactError::StaleLineage)),
+            "stale publication was admitted: {outcome:?}"
+        );
+        for _ in 0..100 {
+            repo.reap_unused_parts(64).await.unwrap();
+            let n = fixture
+                .conn
+                .query_one(statement(
+                    "SELECT count(*)::bigint AS n FROM artifact_part",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "n")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Replacements must not accumulate quota charges or deleted bytes.
+        for byte in 3..15 {
+            repo.save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[byte; 128]),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+        }
+        let reserved = fixture
+            .conn
+            .query_one(statement(
+                "SELECT reserved_bytes FROM artifact_account",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "reserved_bytes")
+            .unwrap();
+        assert_eq!(reserved, 128);
+        fixture
+            .conn
+            .execute_unprepared("DELETE FROM database_artifact")
+            .await
+            .unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        let state=fixture.conn.query_one(statement("SELECT reserved_bytes,(SELECT count(*)::bigint FROM artifact_chunk) AS chunks FROM artifact_account",vec![])).await.unwrap().unwrap();
+        assert_eq!(state.try_get::<i64>("", "reserved_bytes").unwrap(), 0);
+        assert_eq!(state.try_get::<i64>("", "chunks").unwrap(), 0);
+        // A process crash after reservation/first chunk: the next pass fences
+        // the expired upload, deletes it and releases its charge.
+        fixture.conn.execute_unprepared(&format!("UPDATE artifact_account SET reserved_bytes=512; INSERT INTO artifact_part(service,space,name,part_id,owner,size_bytes,chunk_count,lease_until) SELECT 'sql','{space}','crashed','0123456789abcdef',owner,512,1,clock_timestamp()-interval '1 second' FROM artifact_account; INSERT INTO artifact_chunk SELECT service,space,name,part_id,0,decode(repeat('00',512),'hex') FROM artifact_part;")).await.unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(
+            fixture
+                .conn
+                .query_one(statement(
+                    "SELECT reserved_bytes FROM artifact_account",
+                    vec![]
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "reserved_bytes")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_exact_owner_and_legacy_duckdb_quota() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_exact_owner_and_legacy_duckdb_quota",
+        )
+        .await
+        else {
+            return;
+        };
+        let parent = "tinycloud:web:example.com:notes";
+        let child = "tinycloud:web:example.com:alice:notes";
+        let legacy = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        for space in [parent, child] {
+            legacy
+                .save(
+                    "duckdb",
+                    space,
+                    "main",
+                    vec![1; 600],
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+        }
+        let repo = legacy.clone().with_chunk_limits(Some(ChunkLimits {
+            artifact_bytes: 1024,
+            account_bytes: 1000,
+        }));
+        repo.configure_chunked_storage().await.unwrap();
+        let owners = fixture
+            .conn
+            .query_all(statement(
+                "SELECT owner,legacy_bytes FROM artifact_account ORDER BY owner",
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(
+            owners[0].try_get::<String>("", "owner").unwrap(),
+            "did:web:example.com"
+        );
+        assert_eq!(
+            owners[1].try_get::<String>("", "owner").unwrap(),
+            "did:web:example.com:alice"
+        );
+        assert!(owners
+            .iter()
+            .all(|row| row.try_get::<i64>("", "legacy_bytes").unwrap() == 600));
+        legacy
+            .save(
+                "duckdb",
+                parent,
+                "second",
+                vec![2; 400],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let refused = legacy
+            .save(
+                "duckdb",
+                parent,
+                "third",
+                vec![3; 1],
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(DatabaseArtifactError::StorageLimit)),
+            "{refused:?}"
+        );
+        legacy
+            .save(
+                "duckdb",
+                child,
+                "second",
+                vec![4; 400],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_cancelled_upload_releases_reservation() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_cancelled_upload_releases_reservation",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:cancel";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 1024,
+            }),
+        );
+        let mut blocked = repo.clone();
+        blocked.chunk_publish_barrier = Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
+        let upload = tokio::spawn(async move {
+            blocked
+                .save_snapshot(
+                    "sql",
+                    space,
+                    "cancelled",
+                    snapshot(&[9; 512]),
+                    ArtifactExpectation::Absent,
+                )
+                .await
+        });
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let staged = fixture
+                .conn
+                .query_one(statement(
+                    "SELECT 1 AS ready FROM artifact_part WHERE state='sealed'",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .is_some();
+            if staged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < bound,
+                "upload did not reach publication barrier"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let charge = fixture
+                .conn
+                .query_one(statement(
+                    "SELECT reserved_bytes FROM artifact_account",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "reserved_bytes")
+                .unwrap();
+            if charge == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < bound,
+                "cancelled reservation was not released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(repo
+            .load_meta("sql", space, "cancelled")
+            .await
+            .unwrap()
+            .is_none());
+        repo.save_snapshot(
+            "sql",
+            space,
+            "retry",
+            snapshot(&[10; 1024]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_at_quota_replacement_credit() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_at_quota_replacement_credit",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:credit";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 512,
+            }),
+        );
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&[1; 512]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let grow = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[2; 513]),
+                ArtifactExpectation::Any,
+            )
+            .await;
+        assert!(
+            matches!(grow, Err(DatabaseArtifactError::StorageLimit)),
+            "{grow:?}"
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut blocked = repo.clone();
+        blocked.chunk_publish_barrier = Some(barrier.clone());
+        let shrink = tokio::spawn(async move {
+            blocked
+                .save_snapshot(
+                    "sql",
+                    space,
+                    "main",
+                    snapshot(&[3; 256]),
+                    ArtifactExpectation::Any,
+                )
+                .await
+        });
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fixture
+                .conn
+                .query_one(statement(
+                    "SELECT 1 AS ready FROM artifact_part WHERE replacing AND state='sealed'",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < bound);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let second = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[4; 128]),
+                ArtifactExpectation::Any,
+            )
+            .await;
+        assert!(matches!(second, Err(DatabaseArtifactError::StorageLimit)));
+        // Pending shrinkage cannot fund another database, then be aborted.
+        let other = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "other",
+                snapshot(&[5; 1]),
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(matches!(other, Err(DatabaseArtifactError::StorageLimit)));
+        barrier.wait().await;
+        assert_eq!(shrink.await.unwrap().unwrap().size_bytes, 256);
+        repo.save_snapshot(
+            "sql",
+            space,
+            "other",
+            snapshot(&[6; 256]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let row = fixture
+            .conn
+            .query_one(statement(
+                "SELECT reserved_bytes,credit_bytes FROM artifact_account",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "reserved_bytes").unwrap(), 512);
+        assert_eq!(row.try_get::<i64>("", "credit_bytes").unwrap(), 0);
+    }
+    async fn ledger(fixture: &crate::test_support::PostgresTestSchema) -> (i64, i64) {
+        let row = fixture
+            .conn
+            .query_one(statement(
+                "SELECT reserved_bytes,credit_bytes FROM artifact_account",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            row.try_get("", "reserved_bytes").unwrap(),
+            row.try_get("", "credit_bytes").unwrap(),
+        )
+    }
+
+    async fn await_replacement(fixture: &crate::test_support::PostgresTestSchema) {
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fixture
+                .conn
+                .query_one(statement(
+                    "SELECT 1 AS ready FROM artifact_part WHERE replacing AND state='sealed'",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < bound);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_shrink_abort_and_staging_crash() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_shrink_abort_and_staging_crash",
+        )
+        .await
+        else {
+            return;
+        };
+        let space =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:abort-credit";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 512,
+            }),
+        );
+        let base = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[1; 512]),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut blocked = repo.clone();
+            blocked.chunk_publish_barrier = Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
+            let upload = tokio::spawn(async move {
+                blocked
+                    .save_snapshot(
+                        "sql",
+                        space,
+                        "main",
+                        snapshot(&[2; 256]),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+            });
+            await_replacement(&fixture).await;
+            assert_eq!(ledger(&fixture).await, (768, 256));
+            upload.abort();
+            assert!(upload.await.unwrap_err().is_cancelled());
+            let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while ledger(&fixture).await != (512, 0) {
+                assert!(tokio::time::Instant::now() < bound);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        // An owner process disappears after a partial chunk upload; there is
+        // no Rust drop guard in the crashed process to do this cleanup.
+        let owner = space.parse::<SpaceId>().unwrap().did().to_string();
+        let admitted = fixture
+            .conn
+            .query_one(statement(
+                "SELECT artifact_reserve('sql',$1,'main','crashed-credit',$2,256,1,$3,$4) AS ok",
+                vec![
+                    space.into(),
+                    owner.into(),
+                    base.revision.into(),
+                    base.checkpoint_content_hash.into(),
+                ],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<bool>("", "ok")
+            .unwrap();
+        assert!(admitted);
+        fixture.conn.execute(statement("INSERT INTO artifact_chunk SELECT service,space,name,part_id,0,$1 FROM artifact_part WHERE part_id='crashed-credit'",vec![vec![3u8;128].into()])).await.unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            (768, 256),
+            "unexpired upload stays charged"
+        );
+        fixture.conn.execute_unprepared("UPDATE artifact_part SET lease_until=clock_timestamp()-interval '1 second' WHERE part_id='crashed-credit'").await.unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(ledger(&fixture).await, (512, 0));
+        assert!(fixture
+            .conn
+            .query_one(statement(
+                "SELECT 1 FROM artifact_chunk WHERE part_id='crashed-credit'",
+                vec![]
+            ))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_delete_during_staging_fences_publish() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_delete_during_staging_fences_publish",
+        )
+        .await
+        else {
+            return;
+        };
+        let space =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:delete-credit";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 512,
+            }),
+        );
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&[1; 512]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut blocked = repo.clone();
+        blocked.chunk_publish_barrier = Some(barrier.clone());
+        let upload = tokio::spawn(async move {
+            blocked
+                .save_snapshot(
+                    "sql",
+                    space,
+                    "main",
+                    snapshot(&[2; 256]),
+                    ArtifactExpectation::Any,
+                )
+                .await
+        });
+        await_replacement(&fixture).await;
+        fixture
+            .conn
+            .execute_unprepared("DELETE FROM database_artifact")
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            (768, 0),
+            "all physical parts stay charged after deletion"
+        );
+        barrier.wait().await;
+        assert!(matches!(
+            upload.await.unwrap(),
+            Err(DatabaseArtifactError::StaleLineage)
+        ));
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(ledger(&fixture).await, (0, 0));
+        assert!(repo
+            .load_meta("sql", space, "main")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_publish_credit_waits_for_physical_deletion() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_publish_credit_waits_for_physical_deletion",
+        )
+        .await
+        else {
+            return;
+        };
+        let space =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:physical-credit";
+        let old = CHUNK_BYTES + 64;
+        let new = 256 * 1024;
+        let mut repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_chunk_limits(Some(ChunkLimits {
+                artifact_bytes: 2 * CHUNK_BYTES as u64,
+                account_bytes: old as u64,
+            }));
+        repo.chunk_reclaim_paused = true;
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&vec![1; old]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let old_part = fixture
+            .conn
+            .query_one(statement(
+                "SELECT checkpoint_part_id FROM database_artifact",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "checkpoint_part_id")
+            .unwrap();
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&vec![2; new]),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ledger(&fixture).await, ((old + new) as i64, new as i64));
+        let args = vec![
+            "sql".into(),
+            space.into(),
+            "main".into(),
+            old_part.clone().into(),
+        ];
+        fixture
+            .conn
+            .query_one(statement(
+                "SELECT artifact_reap_one($1,$2,$3,$4)",
+                args.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            ((old + new) as i64, new as i64),
+            "partial deletion must not free quota"
+        );
+        fixture
+            .conn
+            .query_one(statement("SELECT artifact_reap_one($1,$2,$3,$4)", args))
+            .await
+            .unwrap();
+        assert_eq!(ledger(&fixture).await, (new as i64, 0));
+        assert!(fixture
+            .conn
+            .query_one(statement(
+                "SELECT 1 FROM artifact_chunk WHERE part_id=$1",
+                vec![old_part.into()]
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        repo.save_snapshot(
+            "sql",
+            space,
+            "other",
+            snapshot(&vec![3; old - new]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
     }
 }

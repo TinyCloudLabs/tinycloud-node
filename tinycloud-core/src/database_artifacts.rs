@@ -106,7 +106,7 @@ pub struct DeltaSave {
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseArtifactError {
     #[error("database artifact storage error: {0}")]
-    Db(#[from] DbErr),
+    Db(DbErr),
     #[error("artifact storage limit reached")]
     StorageLimit,
     #[error("database artifact payload too large: {0} bytes")]
@@ -141,6 +141,18 @@ pub enum DatabaseArtifactError {
     /// the bytes; the message is the sink's own.
     #[error("{0}")]
     Sink(String),
+}
+
+impl From<DbErr> for DatabaseArtifactError {
+    fn from(error: DbErr) -> Self {
+        if error.to_string().contains("TC2917_QUOTA") {
+            Self::StorageLimit
+        } else if error.to_string().contains("TC2917_LAYOUT") {
+            Self::StaleLineage
+        } else {
+            Self::Db(error)
+        }
+    }
 }
 
 /// The stored metadata of one artifact row: everything but the payload bytes.
@@ -640,7 +652,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError>;
 
-    fn chunked_checkpoints(&self) -> bool {
+    fn chunked_checkpoints(&self, _service: &str, _space: &str, _name: &str) -> bool {
         false
     }
 
@@ -743,11 +755,16 @@ pub struct SeaOrmDatabaseArtifactRepository {
     /// every clone of this repository.
     large_transfers: std::sync::Arc<tokio::sync::Semaphore>,
     chunk_limits: Option<chunks::ChunkLimits>,
+    observed_chunked: std::sync::Arc<dashmap::DashSet<(String, String, String)>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
     #[cfg(test)]
     race_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    chunk_reclaim_paused: bool,
 }
 
 impl SeaOrmDatabaseArtifactRepository {
@@ -761,8 +778,13 @@ impl SeaOrmDatabaseArtifactRepository {
                 MAX_CONCURRENT_LARGE_TRANSFERS,
             )),
             chunk_limits: None,
+            observed_chunked: Default::default(),
             #[cfg(test)]
             race_barrier: None,
+            #[cfg(test)]
+            chunk_publish_barrier: None,
+            #[cfg(test)]
+            chunk_reclaim_paused: false,
         }
     }
 
@@ -966,7 +988,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         )>()
         .one(&self.conn)
         .await?;
-        Ok(row.map(
+        let meta = row.map(
             |(
                 revision,
                 size_bytes,
@@ -990,7 +1012,17 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 storage_mode,
                 backend,
             },
-        ))
+        );
+        let key = (service.to_string(), space.to_string(), name.to_string());
+        if meta
+            .as_ref()
+            .is_some_and(|m| m.storage_mode == "checkpoint-parts-v1")
+        {
+            self.observed_chunked.insert(key);
+        } else {
+            self.observed_chunked.remove(&key);
+        }
+        Ok(meta)
     }
 
     async fn read_chunks(
@@ -1066,8 +1098,11 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         Ok(())
     }
 
-    fn chunked_checkpoints(&self) -> bool {
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
         self.chunk_limits.is_some()
+            || self
+                .observed_chunked
+                .contains(&(service.into(), space.into(), name.into()))
     }
 
     async fn save_snapshot(

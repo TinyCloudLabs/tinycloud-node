@@ -119,8 +119,8 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
             .await
     }
 
-    fn chunked_checkpoints(&self) -> bool {
-        self.inner.chunked_checkpoints()
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.inner.chunked_checkpoints(service, space, name)
     }
 
     async fn save_snapshot(
