@@ -7,6 +7,7 @@ import {
   LAG_SEC,
   evaluateTarget,
   loadTargets,
+  missingSecrets,
   branchesUrl,
   metricsUrl,
   parseSeries,
@@ -216,4 +217,12 @@ test("parseSeries keeps numeric samples and turns non-numeric ones into null", (
     [NOW, 42],
     [NOW - 60, null],
   ]);
+});
+
+test("missingSecrets names every unset or blank secret of a target", () => {
+  const t = loadTargets([base])[0];
+  assert.deepEqual(missingSecrets(t, {}), [t.token_secret, t.heartbeat_secret]);
+  assert.deepEqual(missingSecrets(t, { [t.token_secret]: "id:tok", [t.heartbeat_secret]: "  " }), [t.heartbeat_secret]);
+  assert.deepEqual(missingSecrets(t, { [t.token_secret]: "", [t.heartbeat_secret]: "https://x" }), [t.token_secret]);
+  assert.deepEqual(missingSecrets(t, { [t.token_secret]: "id:tok", [t.heartbeat_secret]: "https://x" }), []);
 });
