@@ -3338,11 +3338,13 @@ mod tests {
             });
             let cache = TempDir::new().unwrap();
             let space = test_space_id("sql-transient");
-            let service = SqlService::new(
+            let mut service = SqlService::new(
                 cache.path().to_string_lossy().into_owned(),
                 u64::MAX,
                 repo.clone(),
             );
+            // Back-off off here: the TC-2961 back-off is covered by its own test.
+            service.checkpoint_backoff_bounds = (Duration::ZERO, Duration::ZERO);
             // The bound is above every bounded wait on this path (lock 30 s,
             // hydration 30 s, transfer 45 s), so a slow-but-bounded stall
             // surfaces as a typed `Busy(stage)` naming the stage; only an
