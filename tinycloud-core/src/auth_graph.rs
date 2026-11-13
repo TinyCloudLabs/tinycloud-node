@@ -457,7 +457,9 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         .from(abilities::Entity)
         .from(Alias::new("renewal_lease"))
         .from(Alias::new("renewal_stamp"))
-        .and_where(Expr::val(1).eq(0));
+        // Keep this constant visible to generic plans so the type anchor's
+        // cross joins are eliminated even without parameter values.
+        .and_where(Expr::cust("1 = 0"));
     let mut edge_rows = snapshot_branch(
         0,
         [
@@ -1131,6 +1133,38 @@ impl AuthGraphSnapshot {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn postgres_snapshot_literal_anchor_returns_only_graph_rows() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_snapshot_literal_anchor_returns_only_graph_rows",
+        )
+        .await
+        else {
+            return;
+        };
+        actor::ActiveModel {
+            id: Set("did:key:actor".to_string()),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        let ids = insert_chain(&fixture.conn, "literal-anchor", 2).await;
+        for roots in [vec![ids[0]], vec![hash(b"missing-anchor-root")]] {
+            let statement = DbBackend::Postgres.build(&snapshot_query(&roots));
+            assert!(statement.sql.contains("WHERE 1 = 0"));
+            let rows = fixture.conn.query_all(statement).await.unwrap();
+            assert!(!rows.is_empty());
+            for row in rows {
+                assert_ne!(row.try_get::<i32>("", "kind").unwrap(), 4);
+            }
+            let actual = AuthGraphSnapshot::load(&fixture.conn, &roots)
+                .await
+                .unwrap();
+            let expected = load_sequential(&fixture.conn, &roots).await.unwrap();
+            assert_snapshot_matches_legacy(&actual, &expected);
+        }
+    }
+
     #[test]
     fn renewal_extension_can_exceed_signed_expiry_but_not_ancestor_end() {
         assert_eq!(cap_effective_end(100, Some(200), &[250]), 200);
