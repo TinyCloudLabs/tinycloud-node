@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### Changes
-- A registered Policy/v3 root never authorizes a request by itself, whether the invocation cites it alone or beside other proofs: `/invoke` and the routes that share its policy check, the encryption network and key routes, and `POST /policy/v3/deliveries/authorize` answer 403. Access under a policy needs a session minted under the policy's conditions. Details: TC-2958.
+- A registered Policy/v3 root never authorizes a request by itself, whether the invocation cites it alone or beside other proofs, and whichever codec or multibase encoding of its CID it uses: `/invoke` and the routes that share its policy check, the encryption network and key routes, and `POST /policy/v3/deliveries/authorize` answer 403. Access under a policy needs a session minted under the policy's conditions. Details: TC-2958.
 - PostgreSQL: a request cancelled at its deadline while its database transaction is starting no longer leaves the pooled connection inside an open transaction, where the next request's acknowledged writes could be lost. The transaction is rolled back and the connection reused; as a backstop, any connection still inside a transaction when it is released is closed instead of pooled. Details: TC-2954.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.

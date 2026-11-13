@@ -377,7 +377,7 @@ impl PolicyV3Runtime {
         for parent in &event.0.parents {
             // Unknown registration must fail closed, preserving database
             // failures as retryable rather than refusing valid authority.
-            if self.is_registered_policy_root(&parent.to_string()).await? {
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
                 return Err("policy-root-cannot-be-ordinary-parent".into());
             }
         }
@@ -393,7 +393,7 @@ impl PolicyV3Runtime {
         parents: &[tinycloud_auth::ipld_core::cid::Cid],
     ) -> Result<(), AuthorizationError> {
         for parent in parents {
-            if self.is_registered_policy_root(&parent.to_string()).await? {
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
                 return Err("policy-root-cannot-authorize-invocation".into());
             }
         }
@@ -570,7 +570,7 @@ impl PolicyV3Runtime {
         &self,
         cid: tinycloud_auth::ipld_core::cid::Cid,
     ) -> Result<bool, AuthorizationError> {
-        let cid_string = cid.to_string();
+        let cid_string = stored_cid(cid);
         if policy_v3_session::Entity::find_by_id(cid_string.clone())
             .one(&self.conn)
             .await?
@@ -604,7 +604,7 @@ impl PolicyV3Runtime {
         let mut child: Option<Delegation> = None;
         let mut visited = std::collections::HashSet::new();
         for _ in 0..=8 {
-            if !visited.insert(current_cid.to_string()) {
+            if !visited.insert(stored_cid(current_cid)) {
                 return Err("policy-session-cycle".into());
             }
             let Some((row, event)) = tinycloud
@@ -834,6 +834,16 @@ async fn owner_holds_capabilities<C: ConnectionTrait>(
         return Err("policy-owner-not-authorized".into());
     }
     Ok(())
+}
+
+/// The CID a cited proof names a delegation by, in the form the graph and the
+/// policy tables store: its multihash under the raw codec. The graph resolves
+/// a proof by its multihash alone, so another codec or multibase spelling of
+/// the same proof names the same delegation and must match the same rows.
+fn stored_cid(cid: tinycloud_auth::ipld_core::cid::Cid) -> String {
+    tinycloud_core::hash::Hash::from(cid)
+        .to_cid(0x55)
+        .to_string()
 }
 
 /// Expiry of a newly minted policy session: the holder's requested expiry
