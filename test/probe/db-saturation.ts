@@ -125,6 +125,11 @@ export function loadTargets(raw: unknown): Target[] {
   });
 }
 
+/** Names of the target's secrets that are unset or blank. Any missing secret is a failure: a silent skip would hide saturation. */
+export function missingSecrets(t: Target, env: Record<string, string | undefined>): string[] {
+  return [t.token_secret, t.heartbeat_secret].filter((name) => !env[name]?.trim());
+}
+
 /** Branch list endpoint. Called once per run to find the production branch. */
 export function branchesUrl(t: Target): string {
   const enc = encodeURIComponent;
