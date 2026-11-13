@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.3](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.3) - 2026-11-13
+
+### Added
+
+- *(TC-2106)* add owner-signed renewal state controls
+
+### Fixed
+
+- *(TC-2920)* preserve stamp replay deadlines during SQLite cleanup
+- *(TC-2106)* retain control nonce deadlines through SQLite cleanup
+- *(TC-2106)* match control binding errors and prove recovery receipts
+- *(TC-2106)* enforce signed renewal controls and prove process races
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/tc-2106-renewal-stop
+- *(TC-2908)* read effective expiry at the current verifier time
+- Merge remote-tracking branch 'origin/main' into feat/tc-2920-stamp-replay-deadline
+- Merge remote-tracking branch 'origin/main' into feat/tc-2106-renewal-stop
+- Merge remote-tracking branch 'origin/main' into feat/tc-2106-renewal-stop
+- *(TC-2106)* prove revocation overrides successful enable receipts
+- *(TC-2106)* exercise concurrent state CAS and replay rollback
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
