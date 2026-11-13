@@ -124,6 +124,11 @@ where
     .await
 }
 
+/// `/invoke` answers one outcome; this 501 body refuses anything else,
+/// including a KV write mixed with a read (TC-2986).
+const MULTIPLE_OUTCOMES_UNSUPPORTED: &str =
+    "Multiple invocation outcomes require a homogeneous KV get or metadata batch";
+
 /// Body prefix of a database failure that is safe to retry with a fresh
 /// request; the response is a `503` with `Retry-After` (TC-1054).
 pub const UNAVAILABLE_RETRYABLE: &str = "unavailable_retryable";
@@ -2282,6 +2287,17 @@ async fn invoke_impl(
             ).into());
         }
 
+        // TC-2986: a KV write mixed with a read answers more than one
+        // outcome, which this route cannot return: it ended in 501 after
+        // the write had committed. Refuse it before any work instead, so
+        // nothing is applied and the replay row is not spent.
+        if tinycloud_core::kv_mixes_writes_and_reads(admitted.invocation()) {
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
+            return Err((Status::NotImplemented, MULTIPLE_OUTCOMES_UNSUPPORTED.to_string()).into());
+        }
+
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
         let mut kv_options = kv_invoke_options(
@@ -2532,8 +2548,7 @@ async fn invoke_impl(
                     if batch_specs.len() != outcomes.len() || !homogeneous {
                         Err((
                             Status::NotImplemented,
-                            "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
-                                .to_string(),
+                            MULTIPLE_OUTCOMES_UNSUPPORTED.to_string(),
                         ).into())
                     } else {
                         let mut results = Vec::with_capacity(outcomes.len());
@@ -2651,6 +2666,9 @@ async fn invoke_impl(
                         TxStoreError::LegacyMeetingFrozen => Status::Conflict,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::KvListCursorOutsidePrefix => Status::BadRequest,
+                        // The write was saved; unreachable here, since a
+                        // mixed write and read is refused before any work.
+                        TxStoreError::ReadAfterCommit(_) => Status::InternalServerError,
                         TxStoreError::Tx(TxError::InvalidInvocation(
                             invocation_model::InvocationError::MissingKvWrite(_),
                         )) => Status::NotFound,
