@@ -192,6 +192,7 @@ pub async fn complete_with_encryption(
         return Err(invalid());
     }
     let retained = crate::space_purge_records::complete_space(&tx, job, keys, encryption).await?;
+    crate::space_purge_database::delete_verified_empty_inventory(&tx, job).await?;
     let completed_at =
         OffsetDateTime::from_unix_timestamp(record.timestamp).map_err(|_| invalid())?;
     let inserted = tx

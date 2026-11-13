@@ -40,3 +40,33 @@ pub async fn delete_sql_and_hook_rows(
     }
     Ok(deleted)
 }
+
+/// Remove physical-object inventory only after the object phase has verified
+/// empty stores. Keeping it until terminal commit preserves restore candidates
+/// and orphan-upload claims across crashes and provider retries.
+pub(crate) async fn delete_verified_empty_inventory(
+    tx: &DatabaseTransaction,
+    job: &ClaimedPurge,
+) -> Result<u64, DbErr> {
+    if job.phase != "objects" || !renew(tx, job).await? {
+        return Err(DbErr::Custom("purge inventory lease unavailable".into()));
+    }
+    let mut deleted = 0;
+    for sql in [
+        "DELETE FROM kv_orphan_attempt WHERE space=$1",
+        "DELETE FROM kv_orphan_candidate WHERE space=$1",
+        "DELETE FROM kv_blob_generation WHERE space=$1",
+        "DELETE FROM sql_store_object WHERE space=$1",
+        "DELETE FROM sql_store_manifest WHERE space=$1",
+    ] {
+        deleted += tx
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                [job.space.clone().into()],
+            ))
+            .await?
+            .rows_affected();
+    }
+    Ok(deleted)
+}
