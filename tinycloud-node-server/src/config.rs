@@ -1657,7 +1657,7 @@ pub struct SqlStorageConfig {
     /// statement (TC-2961). A larger whole checkpoint is refused before it is
     /// sent (`507 sql_database_size_limit`): it travels as one parameter, and
     /// the server needs a multiple of it in memory, so one tenant's database
-    /// could take down the shared primary. On by default, 64 MiB; 0 turns it
+    /// could take down the shared primary. On by default, 32 MiB; 0 turns it
     /// off, for local tests only.
     #[serde(default = "default_sql_max_artifact_write_bytes")]
     pub max_artifact_write_bytes: ByteUnit,

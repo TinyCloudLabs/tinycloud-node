@@ -676,7 +676,7 @@ pub const ARTIFACT_READ_RETRIES: usize = 2;
 /// server needs a multiple of it in memory; one tenant's large database must
 /// not be able to take down the shared primary. Larger saves are refused
 /// until artifacts are stored in bounded parts (TC-2917).
-pub const DEFAULT_MAX_ARTIFACT_WRITE_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_ARTIFACT_WRITE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The stored metadata a full checkpoint save is checked against.
 struct CurrentArtifact {
@@ -1502,6 +1502,51 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.revision, 1);
         assert_eq!(loaded.payload, vec![1; 4096]);
+    }
+
+    /// TC-2961: the node's default write limit is 32 MiB: a checkpoint of
+    /// exactly 32 MiB is saved, one byte more is refused before it is written.
+    #[tokio::test]
+    async fn the_default_write_limit_admits_32_mib_and_refuses_one_byte_more() {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+        let limit = 32 * 1024 * 1024;
+
+        let over = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; limit + 1],
+                ArtifactExpectation::Absent,
+            )
+            .await;
+        assert!(
+            matches!(
+                over,
+                Err(DatabaseArtifactError::WriteLimitExceeded { bytes, limit: l })
+                    if bytes == limit as u64 + 1 && l == limit as u64
+            ),
+            "one byte over the default limit is refused"
+        );
+        assert!(repo
+            .load_meta("sql", "space", "main")
+            .await
+            .unwrap()
+            .is_none());
+
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![1; limit],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .expect("a checkpoint of exactly the default limit is saved");
     }
 
     /// TC-2961: a payload over the write limit is refused before anything is
