@@ -179,6 +179,15 @@ async fn show_statement_timeout<C: ConnectionTrait>(conn: &C) -> String {
         .unwrap()
 }
 
+async fn show<C: ConnectionTrait>(conn: &C, setting: &str) -> String {
+    conn.query_one(statement(&format!("SHOW {setting}")))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index::<String>(0)
+        .unwrap()
+}
+
 fn test_space(name: &str) -> SpaceId {
     let jwk = JWK::generate_ed25519().unwrap();
     let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
@@ -429,6 +438,59 @@ async fn postgres_statement_timeout_modes_scopes_and_migrations() {
     scope.commit().await.unwrap();
 
     for conn in [default, session, strict, local, off] {
+        conn.sea_orm_connection().clone().close().await.unwrap();
+    }
+    schema.drop().await;
+}
+
+/// TC-2954: every pooled connection carries an idle-in-transaction timeout,
+/// 15 s by default, so the server ends a transaction left idle that long and
+/// a fresh connection serves the next request; 0 turns it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
+    let Some(url) =
+        postgres_url("postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction")
+    else {
+        return;
+    };
+    let schema = Schema::new(&url, "idletx").await;
+    let setting = "idle_in_transaction_session_timeout";
+
+    let default = pool(schema.url(&url, None), |_| {}).await;
+    assert_eq!(show(&default, setting).await, "15s");
+    let off = pool(schema.url(&url, None), |config| {
+        config.database.idle_in_transaction_timeout_ms = 0;
+    })
+    .await;
+    assert_eq!(show(&off, setting).await, "0");
+
+    let short = pool(schema.url(&url, None), |config| {
+        config.database.idle_in_transaction_timeout_ms = 300;
+    })
+    .await;
+    let transaction = short.begin().await.unwrap();
+    let abandoned = transaction
+        .query_one(statement("SELECT pg_backend_pid()"))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index::<i32>(0)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    transaction
+        .execute(statement("SELECT 1"))
+        .await
+        .expect_err("the server ended the idle transaction");
+    drop(transaction);
+    let next = short
+        .query_one(statement("SELECT pg_backend_pid()"))
+        .await
+        .expect("a fresh connection serves the next request")
+        .unwrap()
+        .try_get_by_index::<i32>(0)
+        .unwrap();
+    assert_ne!(next, abandoned, "the ended session is not reused");
+    for conn in [default, off, short] {
         conn.sea_orm_connection().clone().close().await.unwrap();
     }
     schema.drop().await;

@@ -1929,6 +1929,14 @@ pub struct DatabaseConfig {
     /// writing a row to the client, so the download itself is not limited.
     #[serde(default = "default_database_bulk_statement_timeout_ms")]
     pub bulk_statement_timeout_ms: u64,
+    /// PostgreSQL `idle_in_transaction_session_timeout`, in milliseconds, set
+    /// once on every pooled connection (TC-2954): the server ends a session
+    /// that sits idle inside a transaction this long, so a leaked or stalled
+    /// transaction cannot hold its locks and pooled connection. A protected
+    /// legacy meeting write holds its transaction across its upload, so one
+    /// whose upload takes longer fails. Zero disables it.
+    #[serde(default = "default_database_idle_in_transaction_timeout_ms")]
+    pub idle_in_transaction_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
     /// sockets, so a connection the network silently drops fails within tens
     /// of seconds instead of the kernel's ~15 min retransmission timeout
@@ -1995,6 +2003,10 @@ fn default_database_bulk_statement_timeout_ms() -> u64 {
     120_000
 }
 
+fn default_database_idle_in_transaction_timeout_ms() -> u64 {
+    15_000
+}
+
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
 }
@@ -2029,6 +2041,7 @@ impl Default for DatabaseConfig {
             statement_timeout_mode: StatementTimeoutMode::default(),
             statement_timeout_ms: default_database_statement_timeout_ms(),
             bulk_statement_timeout_ms: default_database_bulk_statement_timeout_ms(),
+            idle_in_transaction_timeout_ms: default_database_idle_in_transaction_timeout_ms(),
             tcp_keepalive: true,
             tcp_keepalive_idle_secs: default_database_tcp_keepalive_idle_secs(),
             tcp_keepalive_interval_secs: default_database_tcp_keepalive_interval_secs(),
@@ -2058,6 +2071,17 @@ impl DatabaseConfig {
             return Err("database.read_audit_wait_ms must be greater than zero");
         }
         Ok(())
+    }
+
+    /// The statement that sets the pool's idle-in-transaction timeout on a new
+    /// connection, or `None` when it is off.
+    pub fn idle_in_transaction_statement(&self) -> Option<String> {
+        (self.idle_in_transaction_timeout_ms > 0).then(|| {
+            format!(
+                "SET idle_in_transaction_session_timeout = {}",
+                self.idle_in_transaction_timeout_ms
+            )
+        })
     }
 
     /// The pool's PostgreSQL `statement_timeout` policy.
