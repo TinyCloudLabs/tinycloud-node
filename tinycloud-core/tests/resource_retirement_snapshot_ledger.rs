@@ -94,3 +94,23 @@ fn retirement_commitments_bind_target_operation_and_manifest_without_publishing_
         .retirement_snapshot_hmac("unknown", retirement, body)
         .is_err());
 }
+
+#[test]
+fn raw_relationship_body_is_redacted_in_both_persisted_and_active_models() {
+    use tinycloud_core::{
+        models::resource_retirement_snapshot::{Model, SnapshotBody},
+        sea_orm::IntoActiveModel,
+    };
+    let body = SnapshotBody::new(b"private relationship did:key:outside".to_vec());
+    assert!(!format!("{body:?}").contains("did:key:outside"));
+    let row = Model {
+        retirement_id: "retirement".into(),
+        hmac_key_id: "test".into(),
+        target_hmac: vec![1; 32],
+        network_hmac: vec![1; 32],
+        snapshot_body: body,
+        snapshot_commitment: vec![2; 32],
+    };
+    assert!(!format!("{row:?}").contains("did:key:outside"));
+    assert!(!format!("{:?}", row.into_active_model()).contains("did:key:outside"));
+}
