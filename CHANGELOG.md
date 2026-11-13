@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- PostgreSQL: every pooled connection sets `idle_in_transaction_session_timeout` (`database.idle_in_transaction_timeout_ms`, env `TINYCLOUD_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT_MS`, default 300000 = 5 min, `0` off), so the server ends a transaction left idle that long and the pool replaces the session. A non-zero value of 240 s or less is refused at startup: a protected legacy meeting write legitimately holds its transaction across an upload of up to 240 s. It is not set in `statement_timeout_mode = "local"` (transaction-pooling proxies). `database.idle_in_transaction_timeout_ms`, `statement_timeout_ms` and `bulk_statement_timeout_ms` above 2147483647 (PostgreSQL's largest) are now refused at startup instead of failing every connection. Details: TC-2954.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.

@@ -516,6 +516,13 @@ pub async fn postgres_pool_with_recovery(
     );
     let statement_timeouts = database.statement_timeouts();
     let session_statement = statement_timeouts.session_statement();
+    let idle_in_transaction_statement = database.idle_in_transaction_statement();
+    // The value in effect: 0 when off or in `local` statement-timeout mode.
+    let idle_in_transaction_timeout_ms = if idle_in_transaction_statement.is_some() {
+        database.idle_in_transaction_timeout_ms
+    } else {
+        0
+    };
     let pool = recovery
         .install(
             connect_opts
@@ -524,9 +531,13 @@ pub async fn postgres_pool_with_recovery(
         )
         .after_connect(move |conn, _meta| {
             let session_statement = session_statement.clone();
+            let idle_in_transaction_statement = idle_in_transaction_statement.clone();
             Box::pin(async move {
                 POSTGRES_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
-                if let Some(statement) = session_statement {
+                for statement in [session_statement, idle_in_transaction_statement]
+                    .into_iter()
+                    .flatten()
+                {
                     conn.execute(statement.as_str()).await?;
                 }
                 Ok(())
@@ -541,6 +552,7 @@ pub async fn postgres_pool_with_recovery(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
         bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        idle_in_transaction_timeout_ms,
         retry_window_ms = database.retry_window_ms,
         tcp_keepalive = keepalive.is_some(),
         tcp_keepalive_idle_secs = keepalive.map(|k| k.idle.as_secs()),
