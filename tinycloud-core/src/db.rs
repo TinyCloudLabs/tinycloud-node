@@ -6426,13 +6426,17 @@ mod test {
             size: None,
             modified: Some(issued_at),
         };
-        let (_, _, details) = kv_metadata_details(&db.conn, &NoSizeProbeStore, &space, legacy)
-            .await
-            .unwrap();
-        assert_eq!(
-            details, unknown_size,
-            "without a cheap probe, head reports no size and reads nothing"
-        );
+        for probe_fails in [false, true] {
+            let store = UnreadableStore { probe_fails };
+            let (_, _, details) = kv_metadata_details(&db.conn, &store, &space, legacy.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                details, unknown_size,
+                "without a working cheap probe (failing: {probe_fails}), head reports no size \
+                 and reads nothing"
+            );
+        }
         assert_eq!(
             kv_list_details(&db.conn, &space, &[path, missing])
                 .await
@@ -6442,11 +6446,14 @@ mod test {
         );
     }
 
-    /// A store with no cheap size probe whose object reads fail the test.
-    struct NoSizeProbeStore;
+    /// A store whose object reads fail the test. Its size probe finds
+    /// nothing, or fails when `probe_fails`.
+    struct UnreadableStore {
+        probe_fails: bool,
+    }
 
     #[async_trait::async_trait]
-    impl ImmutableReadStore for NoSizeProbeStore {
+    impl ImmutableReadStore for UnreadableStore {
         type Error = std::io::Error;
         type Readable = futures::io::Cursor<Vec<u8>>;
         async fn contains(
@@ -6465,6 +6472,18 @@ mod test {
         ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
             panic!("a head must not read the stored object")
         }
+        async fn size(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<Option<u64>, Self::Error> {
+            if self.probe_fails {
+                Err(std::io::Error::other("probe refused"))
+            } else {
+                Ok(None)
+            }
+        }
         async fn read_range(
             &self,
             _space: &SpaceId,
@@ -6473,6 +6492,63 @@ mod test {
             _range: crate::storage::ByteRangeSpec,
         ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
             panic!("a head must not read the stored object")
+        }
+    }
+
+    /// TC-2492: the recorded size is the count of stored bytes, whatever
+    /// length the writer declares, and a list's details come from the listed
+    /// space only.
+    #[tokio::test]
+    async fn kv_value_size_is_the_stored_byte_count_and_stays_in_its_space() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let db = get_db().await.unwrap();
+        let mine = test_space_id("size-mine");
+        let theirs = test_space_id("size-theirs");
+        for space in [&mine, &theirs] {
+            space::ActiveModel {
+                id: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        let path: Path = "docs/report.txt".parse().unwrap();
+        for (space, value, declared) in [
+            (&mine, &b"twenty-one bytes long"[..], "999"),
+            (&theirs, &b"x"[..], "1"),
+        ] {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(value).await.unwrap();
+            db.invoke_internal_kv_put::<MemoryStaging>(
+                space.clone(),
+                path.clone(),
+                Metadata(std::collections::BTreeMap::from([(
+                    "content-length".to_string(),
+                    declared.to_string(),
+                )])),
+                stage,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        }
+        let row = get_kv_entity(&db.conn, &mine, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.size, Some(21), "size is the stored byte count");
+        for (space, size) in [(&mine, 21), (&theirs, 1)] {
+            let details = kv_list_details(&db.conn, space, std::slice::from_ref(&path))
+                .await
+                .unwrap();
+            assert_eq!(
+                details[0].size,
+                Some(size),
+                "details come from the listed space"
+            );
         }
     }
 

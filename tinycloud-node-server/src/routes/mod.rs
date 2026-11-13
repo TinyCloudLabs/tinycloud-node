@@ -12536,12 +12536,12 @@ mod tests {
                 {
                     "key": "docs/notes.txt",
                     "size": 3,
-                    "updatedAt": rfc3339(notes_written),
+                    "updatedAt": rfc3339(notes_written.replace_nanosecond(0)?),
                 },
                 {
                     "key": "docs/report.txt",
                     "size": 21,
-                    "updatedAt": rfc3339(report_written),
+                    "updatedAt": rfc3339(report_written.replace_nanosecond(0)?),
                 },
             ])
         );
@@ -12557,6 +12557,149 @@ mod tests {
             keys.json,
             serde_json::json!(["docs/notes.txt", "docs/report.txt"])
         );
+        Ok(())
+    }
+
+    /// TC-2492: list entries under a prefix-restricted, list-only grant stay
+    /// inside the grant, the returned page and the space, and stay aligned
+    /// with the keys across cursor pages. A list grant answers no head, and a
+    /// batch head carries no size header.
+    #[tokio::test]
+    async fn kv_list_entries_stay_in_the_grant_page_and_space() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use tinycloud_core::{
+            models::{current_kv, space as space_model},
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::{Metadata, SpaceIdWrap},
+        };
+
+        let fixture = KvSyncFixture::new().await?;
+        fixture.owner_write("notes/a", Some(b"abc")).await?;
+        fixture.owner_write("notes/b", Some(b"abcde")).await?;
+        fixture.owner_write("notes/c", Some(b"abcdefg")).await?;
+        fixture
+            .owner_write("notes/d", Some(b"deleted value!!"))
+            .await?;
+        fixture.owner_write("notes/d", None).await?;
+        fixture
+            .owner_write("secret/x", Some(b"eleven byte"))
+            .await?;
+
+        // The same keys in another space, with another size.
+        let foreign_space = test_space_id("tc2492-foreign");
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(foreign_space.clone())),
+        }
+        .insert(&fixture.conn)
+        .await?;
+        for key in ["notes/a", "notes/b", "notes/c"] {
+            current_kv::ActiveModel {
+                space: Set(SpaceIdWrap(foreign_space.clone())),
+                key: Set(tinycloud_core::types::Path::try_from(key.to_string())?),
+                invocation: Set(tinycloud_core::hash::hash(b"tc2492-foreign-invocation")),
+                seq: Set(1),
+                epoch: Set(tinycloud_core::hash::hash(b"tc2492-foreign-epoch")),
+                epoch_seq: Set(1),
+                value: Set(tinycloud_core::hash::hash(b"foreign secret")),
+                generation: Set(0),
+                metadata: Set(Metadata(Default::default())),
+                size: Set(Some(999)),
+                deleted: Set(false),
+            }
+            .insert(&fixture.conn)
+            .await?;
+        }
+
+        let grant = fixture
+            .device_grant("tc2492-list-only", &["tinycloud.kv/list"])
+            .await?;
+
+        let mut entries = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..5 {
+            let mut request = fixture
+                .client
+                .post("/invoke")
+                .header(Header::new(
+                    "Authorization",
+                    fixture.device_invocation(&[("notes/", "tinycloud.kv/list")], grant)?,
+                ))
+                .header(Header::new("x-tinycloud-list-entries", "true"))
+                .header(Header::new("x-tinycloud-limit", "1"));
+            if let Some(cursor) = cursor.as_deref() {
+                request = request.header(Header::new("x-tinycloud-cursor", cursor.to_owned()));
+            }
+            let response = request.dispatch().await;
+            assert_eq!(response.status(), Status::Ok);
+            let next = response
+                .headers()
+                .get_one("x-tinycloud-next-cursor")
+                .map(str::to_owned);
+            let body: serde_json::Value =
+                serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+            for entry in body.as_array().expect("entries array") {
+                entries.push((
+                    entry["key"].as_str().unwrap().to_owned(),
+                    entry["size"].clone(),
+                    entry["updatedAt"].is_string(),
+                ));
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            entries,
+            vec![
+                ("notes/a".to_owned(), serde_json::json!(3), true),
+                ("notes/b".to_owned(), serde_json::json!(5), true),
+                ("notes/c".to_owned(), serde_json::json!(7), true),
+            ],
+            "paged entries: in the grant, live, in the own space, aligned with their keys"
+        );
+
+        // Outside the grant: the whole KV and a sibling prefix are refused.
+        for prefix in ["", "secret/"] {
+            let header = fixture.device_invocation(&[(prefix, "tinycloud.kv/list")], grant)?;
+            let reply = fixture
+                .dispatch(header, &[("x-tinycloud-list-entries", "true")])
+                .await;
+            assert_eq!(
+                reply.status,
+                Status::Unauthorized,
+                "{prefix}: {}",
+                reply.body
+            );
+        }
+
+        // A list-only grant answers no head.
+        let header = fixture.device_invocation(&[("notes/a", "tinycloud.kv/metadata")], grant)?;
+        let reply = fixture.dispatch(header, &[]).await;
+        assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
+
+        // A batch head (two metadata capabilities) carries no size header.
+        let both = fixture.owner_invocation(&[
+            (
+                fixture.kv_resource("notes/a")?.to_string(),
+                "tinycloud.kv/metadata",
+            ),
+            (
+                fixture.kv_resource("notes/b")?.to_string(),
+                "tinycloud.kv/metadata",
+            ),
+        ])?;
+        let response = fixture
+            .client
+            .post("/invoke")
+            .header(Header::new("Authorization", both))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert!(response
+            .headers()
+            .get_one("x-tinycloud-content-length")
+            .is_none());
         Ok(())
     }
 
