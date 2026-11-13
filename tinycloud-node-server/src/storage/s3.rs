@@ -1,3 +1,5 @@
+mod purge_inventory;
+
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3::config::{
     RequestChecksumCalculation, ResponseChecksumValidation, SharedHttpClient,

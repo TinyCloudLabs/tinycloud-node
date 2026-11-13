@@ -15,6 +15,8 @@
 //!   a temporary file in the target directory, is fsynced, and is published
 //!   with a hard link, which fails instead of replacing an existing file.
 
+pub mod purge;
+
 use std::{
     collections::HashMap,
     fmt,

@@ -45,3 +45,5 @@ impl BlobOperationLocks {
 pub mod purge_ledger;
 
 pub mod purge_completion;
+
+pub mod purge_inventory;
