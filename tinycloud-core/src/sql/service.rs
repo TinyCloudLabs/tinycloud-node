@@ -946,12 +946,10 @@ impl SqlService {
     /// (TC-2961): the refusal or failure its last whole-checkpoint save met.
     fn checkpoint_backoff_error(&self, key: &(String, String)) -> Option<SqlError> {
         let backoff = *self.checkpoint_backoff.get(key)?;
-        (Instant::now() < backoff.until).then(|| {
-            if backoff.refused {
-                SqlError::DatabaseSizeLimit
-            } else {
-                SqlError::Unavailable
-            }
+        (Instant::now() < backoff.until).then_some(if backoff.refused {
+            SqlError::DatabaseSizeLimit
+        } else {
+            SqlError::Unavailable
         })
     }
 
