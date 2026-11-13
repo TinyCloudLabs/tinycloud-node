@@ -911,11 +911,18 @@ async fn register_lease_at<C: ConnectionTrait>(
         ],
     )).await?;
     if let Some(row) = existing {
+        // Renewal metadata is stored at whole-second precision.
         let same = row.try_get::<String>("", "grantor")? == lease.delegator
             && row.try_get::<String>("", "renewer_did")? == renewer_did
             && row.try_get::<i64>("", "renewer_epoch")? == renewer_epoch as i64
-            && row.try_get::<OffsetDateTime>("", "lease_expiry")? == lease_expiry
-            && row.try_get::<OffsetDateTime>("", "original_expiry")? == original_expiry
+            && row
+                .try_get::<OffsetDateTime>("", "lease_expiry")?
+                .unix_timestamp()
+                == lease_expiry.unix_timestamp()
+            && row
+                .try_get::<OffsetDateTime>("", "original_expiry")?
+                .unix_timestamp()
+                == original_expiry.unix_timestamp()
             && row.try_get::<i64>("", "period_seconds")? == period
             && row.try_get::<Vec<u8>>("", "audience_public_key")? == audience_public_key;
         return if same {
@@ -1111,8 +1118,17 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         now,
     )
     .await?;
-    if snapshot.delegation(&original).and_then(|row| row.expiry) != Some(original_expiry)
-        || snapshot.delegation(&lease).and_then(|row| row.expiry) != Some(lease_expiry)
+    // Compare with the precision stored by register_lease_at; caps remain floored.
+    if snapshot
+        .delegation(&original)
+        .and_then(|row| row.expiry)
+        .map(|expiry| expiry.unix_timestamp())
+        != Some(original_expiry.unix_timestamp())
+        || snapshot
+            .delegation(&lease)
+            .and_then(|row| row.expiry)
+            .map(|expiry| expiry.unix_timestamp())
+            != Some(lease_expiry.unix_timestamp())
     {
         return Err(RenewalStoreError::InvalidInput);
     }
@@ -1330,8 +1346,10 @@ async fn status_authorized<C: ConnectionTrait>(
     )
 }
 
-/// Read-only, non-authoritative history guarded by per-delegation status rules.
-pub async fn renewal_history<C: ConnectionTrait>(
+/// Read-only, non-authoritative history guarded by original status rights.
+/// Call only inside the status snapshot after evaluating the original's status
+/// decision, including its revocation state, on the same connection.
+pub(crate) async fn renewal_history<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
     invoker: &str,
@@ -1343,6 +1361,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
     if !status_authorized(db, invoker, proofs, original_id).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
+    let canonical_original_cid = original_id.to_cid(0x55).to_string();
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
         "SELECT s.cid, s.lease_cid, s.generation, s.previous_stamp_cid, s.new_end, s.signed_bytes, s.signature FROM renewal_stamp s WHERE s.original_canonical = $1 ORDER BY s.lease_cid, s.generation",
@@ -1353,7 +1372,14 @@ pub async fn renewal_history<C: ConnectionTrait>(
         let cid = Hash::try_from(row.try_get::<Vec<u8>>("", "cid")?).map_err(DbErr::from)?;
         let lease =
             Hash::try_from(row.try_get::<Vec<u8>>("", "lease_cid")?).map_err(DbErr::from)?;
-        if !status_authorized(db, invoker, proofs, lease).await? {
+        // The enclosing status snapshot authorizes the original, including
+        // its revocation state. Lease-party rights do not gate its stamps.
+        let signed_bytes: Vec<u8> = row.try_get("", "signed_bytes")?;
+        let Ok(signed) = serde_ipld_dagcbor::from_slice::<CanonicalRenewalStamp<'_>>(&signed_bytes)
+        else {
+            continue;
+        };
+        if signed.unsigned.original_cid != canonical_original_cid {
             continue;
         }
         let previous = Hash::try_from(row.try_get::<Vec<u8>>("", "previous_stamp_cid")?)
@@ -1365,7 +1391,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
             new_end: new_end.unix_timestamp(),
             previous_stamp_cid: previous.to_cid(0x55).to_string(),
             generation: row.try_get::<i64>("", "generation")? as u64,
-            signed_bytes: row.try_get("", "signed_bytes")?,
+            signed_bytes,
             signature: row.try_get("", "signature")?,
         });
     }
