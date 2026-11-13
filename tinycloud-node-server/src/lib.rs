@@ -701,6 +701,19 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
     routes
 }
 
+/// Settings the node no longer reads that a deployment may still set, in
+/// its file or environment. Configuration extraction ignores unknown keys,
+/// so each is named once at startup instead of being dropped silently.
+const REMOVED_SETTINGS: &[&str] = &["database.bulk_statement_timeout_ms"];
+
+fn removed_settings(config: &Figment) -> Vec<&'static str> {
+    REMOVED_SETTINGS
+        .iter()
+        .copied()
+        .filter(|setting| config.find_value(setting).is_ok())
+        .collect()
+}
+
 pub async fn app_with_control(
     config: &Figment,
     tinycloud_config: &Config,
@@ -746,6 +759,12 @@ pub async fn app_with_control(
         offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS, "did resolution policy");
     if tinycloud_config.did_resolution.network_methods {
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
+    }
+    for setting in removed_settings(config) {
+        ::tracing::warn!(
+            setting,
+            "removed setting is set and ignored; delete it from the configuration (TC-2961)"
+        );
     }
 
     let key_setup: StaticSecret =
@@ -2847,5 +2866,28 @@ mod no_transform_fairing_tests {
                 "{path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod removed_settings_tests {
+    use super::*;
+    use rocket::figment::providers::Serialized;
+
+    /// TC-2961: `database.bulk_statement_timeout_ms` is gone; a deployment
+    /// that still sets it is told so, and a default one is not.
+    #[test]
+    fn a_set_removed_setting_is_named() {
+        let defaults = Figment::from(Serialized::defaults(Config::default()));
+        assert!(removed_settings(&defaults).is_empty());
+        let old = defaults.merge(("database.bulk_statement_timeout_ms", 120_000));
+        assert_eq!(
+            removed_settings(&old),
+            ["database.bulk_statement_timeout_ms"]
+        );
+        assert!(
+            old.extract::<Config>().is_ok(),
+            "still ignored, not refused"
+        );
     }
 }

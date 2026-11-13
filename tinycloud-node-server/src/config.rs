@@ -2025,6 +2025,7 @@ fn default_database_idle_in_transaction_timeout_ms() -> u64 {
 
 /// PostgreSQL's largest millisecond timeout setting (`INT_MAX`).
 const POSTGRES_MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
+
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
 }
