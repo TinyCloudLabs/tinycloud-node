@@ -98,7 +98,7 @@ jobs:
   test:
     name: test (workspace, PostgreSQL-backed, ${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -224,7 +224,7 @@ jobs:
 
     # The node feature graph rebuilds bundled DuckDB from cold: in PR #582 that
     # compile took about 14.5m, and the 15m cap stopped the step while its tests ran.
-    # 25m still fits the job's 45m cap after the 20m core step.
+    # The job's 60m cap covers this step after the 20m core step and setup.
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 25
