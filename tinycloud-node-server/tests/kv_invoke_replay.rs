@@ -247,6 +247,56 @@ async fn sqlite_replay_row_follows_the_write() -> Result<()> {
     replay_row_follows_the_write(&client).await
 }
 
+/// TC-2986: a KV write mixed with a read in one invocation is refused with
+/// 501 before any work. Before, the write committed and only then was the
+/// invocation answered 501. Nothing is written, and the replay row is not
+/// spent: the same request is refused the same way again, not answered 409.
+#[tokio::test]
+async fn a_write_mixed_with_a_read_is_refused_before_any_work() -> Result<()> {
+    let (client, _dir) = node("sqlite::memory:").await?;
+    let session = sign_in(&client).await?;
+    let resource = |key: &str| -> Result<_> {
+        Ok(session.space_id.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some(key.parse::<Path>()?),
+            None,
+            None,
+        ))
+    };
+    let mixed = session
+        .invoke_any(
+            [
+                (
+                    resource("mixed/a")?,
+                    ["tinycloud.kv/put".parse::<Ability>()?],
+                ),
+                (
+                    resource("mixed/b")?,
+                    ["tinycloud.kv/get".parse::<Ability>()?],
+                ),
+            ],
+            None,
+        )?
+        .encode()?;
+    for attempt in ["first", "resent"] {
+        let (status, body) = send(&client, &mixed, b"mixed", &[]).await?;
+        ensure!(
+            status == Status::NotImplemented
+                && body.contains(
+                    "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
+                ),
+            "{attempt} mixed write and read: {status} {body}"
+        );
+    }
+    let read = signed(&session, "tinycloud.kv/get", "mixed/a")?;
+    let (status, body) = send(&client, &read, b"", &[]).await?;
+    ensure!(
+        status == Status::NotFound,
+        "nothing written: {status} {body}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replay_row_follows_the_write() -> Result<()> {
     let Some(url) = common::postgres_test_url("postgres_replay_row_follows_the_write") else {

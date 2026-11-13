@@ -459,6 +459,12 @@ where
     /// The presented `tinycloud.kv/retain` grant is refused.
     #[error("kv/sync retention grant refused: {}", .0.as_str())]
     KvSyncRetentionRefused(crate::kv_sync::KvSyncRetentionError),
+    /// The invocation's KV write committed, and a read it also asked for
+    /// failed after the commit (TC-2986). `/invoke` refuses an invocation
+    /// that mixes the two before any work ([`kv_mixes_writes_and_reads`]), so
+    /// only internal callers see this. It carries the read's error message.
+    #[error("the write was saved; the read failed: {0}")]
+    ReadAfterCommit(String),
 }
 
 impl<B, S, K> TxStoreError<B, S, K>
@@ -3272,7 +3278,8 @@ where
         drop(kv_object_guards);
         let outcomes = self
             .answer_after_commit::<S>(pending, &invoker, &options, caps_read_params.as_ref())
-            .await?;
+            .await
+            .map_err(|error| TxStoreError::ReadAfterCommit(error.to_string()))?;
         Ok((commit, outcomes))
     }
 
@@ -3840,6 +3847,37 @@ pub fn kv_mutation_keys(invocation: &Invocation) -> Vec<(SpaceId, Path)> {
             Some((resource.space().clone(), resource.path()?.clone()))
         })
         .collect()
+}
+
+/// Whether `invocation` both writes KV (a put or delete) and asks for a read
+/// answer: `kv/get`, `kv/list`, `kv/metadata`, or `capabilities/read` on
+/// `all`, the capabilities [`SpaceDatabase::invocation_side_effects`] answers.
+/// Such an invocation answers more than one outcome, which `/invoke` cannot
+/// return, so the route refuses it before any work (TC-2986).
+pub fn kv_mixes_writes_and_reads(invocation: &Invocation) -> bool {
+    let (mut writes, mut reads) = (false, false);
+    for cap in &invocation.0.capabilities {
+        let Some(resource) = cap.resource.tinycloud_resource() else {
+            continue;
+        };
+        let Some(path) = resource.path() else {
+            continue;
+        };
+        match (
+            resource.service().as_str(),
+            crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref()),
+        ) {
+            ("kv", "tinycloud.kv/put" | "tinycloud.kv/del") => writes = true,
+            ("kv", "tinycloud.kv/get" | "tinycloud.kv/list" | "tinycloud.kv/metadata") => {
+                reads = true
+            }
+            ("capabilities", "tinycloud.capabilities/read") if path.as_str() == "all" => {
+                reads = true
+            }
+            _ => {}
+        }
+    }
+    writes && reads
 }
 
 fn kv_sync_target(
@@ -7406,6 +7444,360 @@ mod test {
             }
         }
         assert!(written && read && listed && sessions);
+    }
+
+    /// TC-2986 regression tests from Bobbie's #593 review (T1, T3, T4, T5):
+    /// a write mixed with reads, whose reads now run after COMMIT.
+    mod reads_after_commit {
+        use super::*;
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+        type Db = SpaceDatabase<sea_orm::DbConn, ReadPausedStore, StaticSecret>;
+
+        async fn setup(name: &str) -> (tempfile::TempDir, Db, ReadPausedStore) {
+            let directory = tempfile::tempdir().unwrap();
+            let url = format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join(format!("{name}.sqlite")).display()
+            );
+            let storage = ReadPausedStore::default();
+            let db = SpaceDatabase::new(
+                Database::connect(url).await.unwrap(),
+                storage.clone(),
+                StaticSecret::new(vec![0; 32]).unwrap(),
+            )
+            .await
+            .unwrap();
+            (directory, db, storage)
+        }
+
+        async fn host(db: &Db, space: &SpaceId) {
+            space::ActiveModel {
+                id: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        async fn put(db: Db, space: SpaceId, key: &'static str, body: &'static [u8]) {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(body).await.unwrap();
+            db.invoke_internal_kv_put::<MemoryStaging>(
+                space,
+                key.parse().unwrap(),
+                Metadata(Default::default()),
+                stage,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        }
+
+        fn res(space: &SpaceId, path: &str) -> tinycloud_auth::resource::ResourceId {
+            space.clone().to_resource(
+                "kv".parse().unwrap(),
+                Some(path.parse().unwrap()),
+                None,
+                None,
+            )
+        }
+
+        fn ability(name: &str) -> Vec<tinycloud_auth::ucan_capabilities_object::Ability> {
+            vec![name.parse().unwrap()]
+        }
+
+        async fn inputs(
+            space: &SpaceId,
+            key: &str,
+            body: &'static [u8],
+        ) -> InvocationInputs<<MemoryStaging as ImmutableStaging>::Writable> {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(body).await.unwrap();
+            HashMap::from([(
+                (space.clone(), key.parse().unwrap()),
+                (Metadata(Default::default()), stage),
+            )])
+        }
+
+        async fn live(db: &Db, space: &SpaceId, key: &str) -> Option<Hash> {
+            get_kv_entity(&db.conn, space, &key.parse().unwrap())
+                .await
+                .unwrap()
+                .map(|entry| entry.value)
+        }
+
+        /// T1: a read that fails after COMMIT says the write was saved, and
+        /// the write is applied.
+        #[tokio::test]
+        async fn a_read_failing_after_commit_reports_the_write_saved() {
+            let (_dir, db, _storage) = setup("t1").await;
+            let space = test_space_id("t1");
+            host(&db, &space).await;
+            put(db.clone(), space.clone(), "docs/b", b"seeded-bytes").await;
+            let invocation = internal_invocation(vec![
+                (res(&space, "docs/a"), ability("tinycloud.kv/put")),
+                (res(&space, "docs/b"), ability("tinycloud.kv/get")),
+            ])
+            .unwrap();
+            let result = db
+                .invoke_with_options_mode::<MemoryStaging>(
+                    invocation,
+                    inputs(&space, "docs/a", b"written").await,
+                    KvInvokeOptions {
+                        max_response_bytes: Some(1),
+                        ..Default::default()
+                    },
+                    InvokeMode::Internal,
+                )
+                .await;
+            let Err(TxStoreError::ReadAfterCommit(error)) = result else {
+                panic!("expected a read failure after commit");
+            };
+            assert!(
+                error.contains("exceeding the requested limit"),
+                "the oversized get: {error}"
+            );
+            assert!(live(&db, &space, "docs/a").await.is_some(), "write applied");
+        }
+
+        /// T3: while the after-COMMIT block read is in flight, a
+        /// revocation's exclusive chain guard on the invocation's chain
+        /// cannot be taken.
+        #[tokio::test]
+        async fn the_chain_guard_is_held_through_the_read_after_commit() {
+            let (_dir, db, storage) = setup("t3").await;
+            let space = test_space_id("t3");
+            host(&db, &space).await;
+            put(db.clone(), space.clone(), "docs/b", b"seeded").await;
+            // A presented retention grant is a guard root, held in the same
+            // chain guards as the invocation's proofs, with no stored parent.
+            let grant = crate::hash::hash(b"tc2986-guard-root");
+            let invocation = internal_invocation(vec![
+                (res(&space, "docs/a"), ability("tinycloud.kv/put")),
+                (res(&space, "docs/b"), ability("tinycloud.kv/get")),
+            ])
+            .unwrap();
+            let keys = crate::auth_graph::load_chain_lock_ids(&db.conn, &[grant])
+                .await
+                .unwrap();
+            assert!(!keys.is_empty());
+            let options = KvInvokeOptions {
+                kv_sync: Some(crate::kv_sync::KvSyncRequest {
+                    limit: 1,
+                    cursor: None,
+                    cursor_key: [0; 32],
+                    retention_grant: Some(grant),
+                }),
+                ..Default::default()
+            };
+            storage
+                .pause
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mixed_db = db.clone();
+            let mixed_inputs = inputs(&space, "docs/a", b"written").await;
+            let mixed = tokio::spawn(async move {
+                mixed_db
+                    .invoke_with_options_mode::<MemoryStaging>(
+                        invocation,
+                        mixed_inputs,
+                        options,
+                        InvokeMode::Internal,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                storage.reading.notified(),
+            )
+            .await
+            .expect("the kv/get reads the store");
+            assert!(
+                live(&db, &space, "docs/a").await.is_some(),
+                "the write committed before the paused read"
+            );
+            let blocked = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                db.acquire_exclusive_chain_guards_for_keys(keys),
+            )
+            .await
+            .is_err();
+            storage
+                .pause
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            storage.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), mixed)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                blocked,
+                "a revocation's exclusive guard waits for the read after commit"
+            );
+        }
+
+        /// T4: the kv/get answers the row resolved in the transaction (the
+        /// invocation's own write), even when a concurrent write to the same
+        /// key commits between COMMIT and the block read.
+        #[tokio::test]
+        async fn a_get_after_commit_reads_the_committed_row_not_the_key() {
+            let (_dir, db, storage) = setup("t4").await;
+            let space = test_space_id("t4");
+            host(&db, &space).await;
+            put(db.clone(), space.clone(), "docs/0", b"seeded").await;
+            let invocation = internal_invocation(vec![
+                (res(&space, "docs/a"), ability("tinycloud.kv/put")),
+                (res(&space, "docs/0"), ability("tinycloud.kv/get")),
+                (res(&space, "docs/a"), ability("tinycloud.kv/get")),
+            ])
+            .unwrap();
+            storage
+                .pause
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mixed_db = db.clone();
+            let mixed_inputs = inputs(&space, "docs/a", b"v1-own-write").await;
+            let mixed = tokio::spawn(async move {
+                mixed_db
+                    .invoke_with_options_mode::<MemoryStaging>(
+                        invocation,
+                        mixed_inputs,
+                        KvInvokeOptions::default(),
+                        InvokeMode::Internal,
+                    )
+                    .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                storage.reading.notified(),
+            )
+            .await
+            .expect("the first kv/get reads the store");
+            // A same-key writer is not blocked: the object guard is dropped.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                put(db.clone(), space.clone(), "docs/a", b"v2-concurrent"),
+            )
+            .await
+            .expect("a same-key write completes while the read is paused");
+            storage
+                .pause
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            storage.release.notify_one();
+            let (_, outcomes) = tokio::time::timeout(std::time::Duration::from_secs(10), mixed)
+                .await
+                .unwrap()
+                .unwrap()
+                .map_err(|error| error.to_string())
+                .unwrap();
+            let mut bodies = Vec::new();
+            for outcome in outcomes {
+                if let InvocationOutcome::KvRead(Some((_, hash, mut content))) = outcome {
+                    let mut body = Vec::new();
+                    content.read_to_end(&mut body).await.unwrap();
+                    assert_eq!(
+                        hash,
+                        crate::hash::hash(&body),
+                        "metadata hash matches bytes"
+                    );
+                    bodies.push(body);
+                }
+            }
+            assert_eq!(bodies, vec![b"seeded".to_vec(), b"v1-own-write".to_vec()]);
+        }
+
+        /// T5: a public invocation that writes its own space and reads
+        /// another tenant's space is refused, and nothing is written.
+        #[tokio::test]
+        async fn a_cross_tenant_read_in_a_write_is_refused() {
+            let (_dir, db, _storage) = setup("t5").await;
+            let mut jwk = JWK::generate_ed25519().unwrap();
+            jwk.algorithm = Some(tinycloud_auth::ssi::jwk::Algorithm::EdDSA);
+            let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+            let mine = SpaceId::new(did.clone(), "default".parse().unwrap()).unwrap();
+            let theirs = test_space_id("victim");
+            host(&db, &mine).await;
+            host(&db, &theirs).await;
+            put(db.clone(), theirs.clone(), "docs/secret", b"victim-secret").await;
+            let did = did.to_string();
+            let vm = format!("{did}#{}", did.rsplit(':').next().unwrap());
+            let parent = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+                0x55,
+                tinycloud_auth::multihash_codetable::Code::Blake3_256.digest(b"tc2986-none"),
+            );
+            let build = |caps: Vec<(
+                tinycloud_auth::resource::ResourceId,
+                Vec<tinycloud_auth::ucan_capabilities_object::Ability>,
+            )>| {
+                let signed = make_invocation(
+                    caps,
+                    &parent,
+                    &jwk,
+                    &vm,
+                    (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp()
+                        as f64,
+                    InvocationOptions {
+                        proof: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let encoded = signed.encode().unwrap().into_bytes();
+                crate::events::SerializedEvent(
+                    crate::util::InvocationInfo::try_from(signed).unwrap(),
+                    encoded,
+                )
+            };
+            // Control: the owner's own mixed invocation is authorized.
+            let own = db
+                .invoke_with_options::<MemoryStaging>(
+                    build(vec![
+                        (res(&mine, "docs/a"), ability("tinycloud.kv/put")),
+                        (res(&mine, "docs/a"), ability("tinycloud.kv/get")),
+                    ]),
+                    inputs(&mine, "docs/a", b"mine").await,
+                    KvInvokeOptions::default(),
+                )
+                .await;
+            assert!(
+                own.is_ok(),
+                "control: {:?}",
+                own.as_ref().err().map(|error| error.to_string())
+            );
+            let result = db
+                .invoke_with_options::<MemoryStaging>(
+                    build(vec![
+                        (res(&mine, "docs/x"), ability("tinycloud.kv/put")),
+                        (res(&theirs, "docs/secret"), ability("tinycloud.kv/get")),
+                    ]),
+                    inputs(&mine, "docs/x", b"x").await,
+                    KvInvokeOptions::default(),
+                )
+                .await;
+            let leaked = match result {
+                Err(_) => None,
+                Ok((_, outcomes)) => {
+                    let mut leaked = Some(String::new());
+                    for outcome in outcomes {
+                        if let InvocationOutcome::KvRead(Some((_, _, mut content))) = outcome {
+                            let mut body = Vec::new();
+                            content.read_to_end(&mut body).await.unwrap();
+                            leaked = Some(String::from_utf8_lossy(&body).into_owned());
+                        }
+                    }
+                    leaked
+                }
+            };
+            assert_eq!(leaked, None, "refused, nothing read");
+            assert!(
+                live(&db, &mine, "docs/x").await.is_none(),
+                "nothing written"
+            );
+        }
     }
 
     #[tokio::test]
