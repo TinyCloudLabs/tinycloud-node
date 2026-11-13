@@ -66,17 +66,13 @@ HTTP authentication envelopes valid under wall time too; this narrow seam does
 not replace all node authentication clocks. Use a separate private home, port,
 and data directory for each SDK scenario. Stop only your own node process.
 
-The harness is validated on proofless owner-lease registration PR #554,
-commit `41680ca14e2d6eb4906dcd2e42223c379c018180` (runtime fix
-`e9ebf6da576aa728c4c4be30cc85856552693e5b`). No SDK restore/read claim follows
-from this status test; the SDK scenario must independently verify admitted
-authority and perform its ordinary read.
+The runtime baseline is main `7684febe62242b603d09c662692954423c2235c0`,
+including proofless owner-lease registration (#554), consistent status snapshots
+(#556), holder-visible original-bound history (#559), and fractional SIWE expiry
+comparisons (#561). No SDK restore/read claim follows from this status test; the
+SDK scenario must independently verify admitted authority and perform its ordinary
+read.
 
-The consistent status projection is supplied by PR #556, commit
-`fefa533e239a50db961799b15860abd27036754d`.
-
-Holder-visible signed history is supplied by PR #559, commit
-`372736a3654d4d15963a5f528acaf692bb64085b`; this harness is stacked there.
 Status reads use the original holder's proofless signature. CI exports only
 public synthetic stamp fixtures as `renewal-scheduler-history-sdk` for the SDK
 verifier, at a captured time after the original signed expiry.
