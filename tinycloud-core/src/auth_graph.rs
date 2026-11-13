@@ -1153,7 +1153,7 @@ mod tests {
             let statement = DbBackend::Postgres.build(&snapshot_query(&roots));
             assert!(statement.sql.contains("WHERE 1 = 0"));
             let rows = fixture.conn.query_all(statement).await.unwrap();
-            assert!(!rows.is_empty());
+            assert_eq!(rows.is_empty(), roots[0] != ids[0]);
             for row in rows {
                 assert_ne!(row.try_get::<i32>("", "kind").unwrap(), 4);
             }
