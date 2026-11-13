@@ -4,9 +4,9 @@
 //!
 //! - TCP keepalive and `TCP_USER_TIMEOUT` are set on every pool socket
 //!   (read back with `getsockopt`).
-//! - `statement_timeout` applies per session, is lifted for migrations,
-//!   raised for whole-artifact transfers, and surfaces as a retryable
-//!   `SqlError::Unavailable` (503) that releases the database's lock.
+//! - `statement_timeout` applies per session, is lifted for migrations, and
+//!   surfaces as a retryable `SqlError::Unavailable` (503) that releases the
+//!   database's lock.
 //! - Large artifacts still persist and hydrate under the default limits.
 //!
 //! PostgreSQL-backed tests connect only when `TINYCLOUD_TEST_POSTGRES_URL` is set
@@ -54,9 +54,12 @@ use tinycloud_auth::resource::SpaceId;
 use tinycloud_auth::ssi::dids::DIDBuf;
 use tinycloud_auth::ssi::jwk::JWK;
 use tinycloud_core::database_artifacts::{
-    DatabaseArtifactError, DatabaseArtifactRepository, MemorySink, SeaOrmDatabaseArtifactRepository,
+    ArtifactExpectation, DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository,
+    MemorySink, SeaOrmDatabaseArtifactRepository,
 };
-use tinycloud_core::db_pool::{is_transient_error, transient_error_class, StatementTimeoutMode};
+use tinycloud_core::db_pool::{
+    is_transient_error, track_writes, transient_error_class, StatementTimeoutMode,
+};
 use tinycloud_core::sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
     TransactionTrait,
@@ -69,6 +72,11 @@ use tokio::net::{TcpListener, TcpStream};
 fn postgres_url(test: &str) -> Option<String> {
     common::postgres_test_url(test)
 }
+
+/// Held by the tests that move whole checkpoints over 8 MiB or time a
+/// refusal, so they do not run at once: on a shared debug-build server one
+/// test's transfer can push another's timed statement past its bound.
+static LARGE_TRANSFERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The black-hole tests' URL, when `TINYCLOUD_TEST_BLACKHOLE=1` allows them.
 fn blackhole_url(test: &str) -> Option<String> {
@@ -140,6 +148,78 @@ impl Schema {
             .admin
             .execute_unprepared(&format!("DROP SCHEMA {} CASCADE", self.name))
             .await;
+    }
+
+    async fn exec(&self, sql: &str) {
+        self.admin.execute_unprepared(sql).await.unwrap();
+    }
+
+    async fn i64(&self, sql: &str) -> i64 {
+        self.admin
+            .query_one(statement(sql))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap()
+    }
+
+    /// The `main` artifact row's revision and checkpoint hash.
+    async fn main_row(&self) -> (i64, String) {
+        let row = self
+            .admin
+            .query_one(statement(&format!(
+                "SELECT revision, checkpoint_content_hash FROM {}.database_artifact \
+                 WHERE name = 'main'",
+                self.name
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            row.try_get_by_index(0).unwrap(),
+            row.try_get_by_index(1).unwrap(),
+        )
+    }
+
+    /// Wait until `want` of this schema's pool sessions match `what`.
+    async fn wait_for_sessions(&self, what: &str, want: i64) {
+        let sql = format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = '{}' AND {what}",
+            self.name
+        );
+        let started = Instant::now();
+        while self.i64(&sql).await < want {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no session with {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Every update of an artifact row now counts an attempt and takes
+    /// `seconds` inside PostgreSQL.
+    async fn slow_updates(&self, seconds: f64) {
+        let name = &self.name;
+        self.exec(&format!(
+            "CREATE SEQUENCE {name}.attempts; \
+             CREATE FUNCTION {name}.slow() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM nextval('{name}.attempts'); PERFORM pg_sleep({seconds}); \
+             RETURN NEW; END $$; \
+             CREATE TRIGGER slow BEFORE UPDATE ON {name}.database_artifact \
+             FOR EACH ROW EXECUTE FUNCTION {name}.slow();"
+        ))
+        .await;
+    }
+
+    /// How many artifact updates reached the server since `slow_updates`.
+    async fn update_attempts(&self) -> i64 {
+        self.i64(&format!(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM {}.attempts",
+            self.name
+        ))
+        .await
     }
 }
 
@@ -342,9 +422,8 @@ async fn postgres_pool_sockets_carry_keepalive_and_user_timeout() {
 }
 
 /// The session `statement_timeout` bounds a statement on a live connection
-/// with a transient error (57014); a bulk scope raises it for its
-/// transaction only; migrations run with none; `local` and `off` behave as
-/// documented.
+/// with a transient error (57014); migrations run with none; `local` and
+/// `off` behave as documented.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_statement_timeout_modes_scopes_and_migrations() {
     let Some(url) = postgres_url("postgres_statement_timeout_modes_scopes_and_migrations") else {
@@ -358,7 +437,6 @@ async fn postgres_statement_timeout_modes_scopes_and_migrations() {
 
     let session = pool(schema.url(&url, None), |config| {
         config.database.statement_timeout_ms = 300;
-        config.database.bulk_statement_timeout_ms = 5_000;
     })
     .await;
     assert_eq!(show_statement_timeout(&session).await, "300ms");
@@ -374,21 +452,6 @@ async fn postgres_statement_timeout_modes_scopes_and_migrations() {
     );
     assert!(is_transient_error(&error), "{error:?}");
     assert_eq!(transient_error_class(&error), Some("sqlstate_57014"));
-
-    let scope = session.begin_bulk().await.unwrap();
-    assert_eq!(show_statement_timeout(&scope).await, "5s");
-    scope
-        .execute(statement("SELECT pg_sleep(0.6)"))
-        .await
-        .expect("the bulk timeout applies inside the scope");
-    scope.commit().await.unwrap();
-    for _ in 0..4 {
-        assert_eq!(
-            show_statement_timeout(&session).await,
-            "300ms",
-            "SET LOCAL did not leak"
-        );
-    }
 
     // Migrations are exempt: they apply from scratch on a pool whose every
     // other statement must finish within 1 ms.
@@ -429,13 +492,6 @@ async fn postgres_statement_timeout_modes_scopes_and_migrations() {
     })
     .await;
     assert_eq!(show_statement_timeout(&off).await, "0");
-    let scope = off.begin_bulk().await.unwrap();
-    assert_eq!(
-        show_statement_timeout(&scope).await,
-        "0",
-        "no bulk transaction when off"
-    );
-    scope.commit().await.unwrap();
 
     for conn in [default, session, strict, local, off] {
         conn.sea_orm_connection().clone().close().await.unwrap();
@@ -520,7 +576,8 @@ async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
 /// A statement timeout on the SQL persistence path is a bounded, retryable
 /// `Unavailable` (503): the database's operation lock is released, the
 /// next request on it succeeds, and other databases are unaffected. A full
-/// checkpoint larger than a delta runs under the bulk timeout.
+/// checkpoint over 8 MiB is no exception (TC-2961): it runs under the same
+/// base timeout and nothing of it is applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_sql_statement_timeout_is_retryable_and_releases_the_lock() {
     let Some(url) =
@@ -528,10 +585,10 @@ async fn postgres_sql_statement_timeout_is_retryable_and_releases_the_lock() {
     else {
         return;
     };
+    let _serial = LARGE_TRANSFERS.lock().await;
     let schema = Schema::new(&url, "sqllock").await;
     let conn = pool(schema.url(&url, None), |config| {
         config.database.statement_timeout_ms = 500;
-        config.database.bulk_statement_timeout_ms = 10_000;
     })
     .await;
     tinycloud_core::db::migrate(&conn).await.unwrap();
@@ -577,11 +634,17 @@ async fn postgres_sql_statement_timeout_is_retryable_and_releases_the_lock() {
     write(&service, &space, "b", 1024).await.unwrap();
     assert_eq!(count(&service, &space, "b").await.unwrap(), 2);
 
-    // A WAL past the 8 MiB delta bound persists as a full checkpoint, whose
-    // write runs under the bulk timeout and survives the slow trigger.
-    write(&service, &space, "a", 9 * 1024 * 1024)
+    // TC-2961: a full checkpoint (a WAL over 8 MiB) is one autocommit UPDATE
+    // under the same base timeout: refused, retryable, the lock released,
+    // and nothing of it applied.
+    let error = write(&service, &space, "a", 9 * 1024 * 1024)
         .await
-        .expect("a full checkpoint runs under the bulk statement timeout");
+        .expect_err("the full checkpoint update exceeds the statement timeout");
+    assert!(matches!(error, SqlError::Unavailable), "{error:?}");
+    let next = tokio::time::timeout(Duration::from_secs(5), count(&service, &space, "a"))
+        .await
+        .expect("the failed checkpoint save released the database lock");
+    assert_eq!(next.unwrap(), 1);
 
     schema
         .admin
@@ -593,7 +656,7 @@ async fn postgres_sql_statement_timeout_is_retryable_and_releases_the_lock() {
     write(&service, &space, "a", 1024).await.unwrap();
     let cold_cache = tempfile::TempDir::new().unwrap();
     let cold = sql_service(&conn, &cold_cache);
-    assert_eq!(count(&cold, &space, "a").await.unwrap(), 3);
+    assert_eq!(count(&cold, &space, "a").await.unwrap(), 2);
     conn.sea_orm_connection().clone().close().await.unwrap();
     schema.drop().await;
 }
@@ -646,6 +709,189 @@ async fn postgres_large_artifacts_persist_under_default_timeouts() {
     schema.drop().await;
 }
 
+/// TC-2961: a whole-checkpoint save over 8 MiB, its first INSERT and a full
+/// checkpoint UPDATE, sends no `BEGIN`: each is one autocommit statement on
+/// the production pool, so no transaction stays open while the payload
+/// uploads. The proxy sees every byte the pool sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_checkpoint_saves_send_no_begin() {
+    let Some(url) = postgres_url("postgres_checkpoint_saves_send_no_begin") else {
+        return;
+    };
+    let _serial = LARGE_TRANSFERS.lock().await;
+    let schema = Schema::new(&url, "nobegin").await;
+    let direct = pool(schema.url(&url, None), |_| {}).await;
+    tinycloud_core::db::migrate(&direct).await.unwrap();
+    let proxy = Proxy::start(upstream_addr(&url), None).await;
+    let conn = pool(schema.url(&url, Some(proxy.addr)), |_| {}).await;
+    let repository = SeaOrmDatabaseArtifactRepository::new(conn.clone());
+    let large = 9 * 1024 * 1024;
+
+    let created = repository
+        .save(
+            "sql",
+            "space",
+            "main",
+            vec![1; large],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+    repository
+        .save(
+            "sql",
+            "space",
+            "main",
+            vec![2; large],
+            ArtifactExpectation::Derived {
+                revision: created.revision,
+                checkpoint_content_hash: created.checkpoint_content_hash,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(proxy.simple_queries(b"BEGIN"), 0, "no transaction");
+    // The pool's own transactions do pass the proxy.
+    conn.begin().await.unwrap().commit().await.unwrap();
+    assert_eq!(proxy.simple_queries(b"BEGIN"), 1);
+
+    for conn in [direct, conn] {
+        conn.sea_orm_connection().clone().close().await.unwrap();
+    }
+    schema.drop().await;
+}
+
+fn derived(artifact: &DatabaseArtifact) -> ArtifactExpectation {
+    ArtifactExpectation::Derived {
+        revision: artifact.revision,
+        checkpoint_content_hash: artifact.checkpoint_content_hash.clone(),
+    }
+}
+
+/// TC-2961 (Bobbie's #592 review): a whole-checkpoint save read revision 1
+/// on checkpoint A; before its UPDATE lands, a delta save moves the row to
+/// revision 2 on the same checkpoint A. The checkpoint hash still matches,
+/// so only the revision in the UPDATE's predicate refuses the stale save;
+/// without it the delta would be lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
+    let Some(url) = postgres_url("postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused")
+    else {
+        return;
+    };
+    let _serial = LARGE_TRANSFERS.lock().await;
+    let schema = Schema::new(&url, "casdelta").await;
+    let conn = pool(schema.url(&url, None), |_| {}).await;
+    tinycloud_core::db::migrate(&conn).await.unwrap();
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+    let large = 9 * 1024 * 1024;
+    let seed = repository
+        .save(
+            "sql",
+            "space",
+            "main",
+            vec![1; large],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+    // Hold the row so the save's UPDATE waits behind it.
+    let holder = schema.admin.begin().await.unwrap();
+    holder
+        .execute_unprepared(&format!(
+            "SELECT 1 FROM {}.database_artifact WHERE name = 'main' FOR UPDATE",
+            schema.name
+        ))
+        .await
+        .unwrap();
+    let save = {
+        let (repository, expected) = (repository.clone(), derived(&seed));
+        tokio::spawn(async move {
+            repository
+                .save("sql", "space", "main", vec![9; large], expected)
+                .await
+        })
+    };
+    schema
+        .wait_for_sessions("wait_event_type = 'Lock' AND query LIKE 'UPDATE%'", 1)
+        .await;
+    // What a delta save does to the row: the next revision, same checkpoint.
+    holder
+        .execute_unprepared(&format!(
+            "UPDATE {}.database_artifact SET revision = revision + 1, \
+             delta_payload = '\\x01', delta_size_bytes = 1, delta_content_hash = 'delta' \
+             WHERE name = 'main'",
+            schema.name
+        ))
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
+
+    let result = save.await.unwrap();
+    assert!(
+        matches!(&result, Err(DatabaseArtifactError::Backend(message))
+            if message == "concurrent database artifact update"),
+        "{result:?}"
+    );
+    assert_eq!(
+        schema.main_row().await,
+        (seed.revision + 1, seed.checkpoint_content_hash),
+        "the delta's row stands"
+    );
+    conn.sea_orm_connection().clone().close().await.unwrap();
+    schema.drop().await;
+}
+
+/// TC-2961 (Bobbie's #592 review): a whole-checkpoint UPDATE that the
+/// server's statement timeout cancels is refused once. It is not retried,
+/// not tracked as possibly applied, and the row is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_a_timed_out_checkpoint_update_is_refused_once_and_not_applied() {
+    let Some(url) =
+        postgres_url("postgres_a_timed_out_checkpoint_update_is_refused_once_and_not_applied")
+    else {
+        return;
+    };
+    let _serial = LARGE_TRANSFERS.lock().await;
+    let schema = Schema::new(&url, "updtimeout").await;
+    let conn = pool(schema.url(&url, None), |config| {
+        config.database.statement_timeout_ms = 500;
+    })
+    .await;
+    tinycloud_core::db::migrate(&conn).await.unwrap();
+    let repository = SeaOrmDatabaseArtifactRepository::new(conn.clone());
+    let large = 9 * 1024 * 1024;
+    let seed = repository
+        .save(
+            "sql",
+            "space",
+            "main",
+            vec![1; large],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+    schema.slow_updates(1.5).await;
+
+    let (result, applied) =
+        track_writes(repository.save("sql", "space", "main", vec![2; large], derived(&seed))).await;
+    let class = match &result {
+        Err(DatabaseArtifactError::Db(error)) => transient_error_class(error),
+        _ => None,
+    };
+    assert_eq!(class, Some("sqlstate_57014"), "{result:?}");
+    assert!(!applied, "a refused autocommit statement did not apply");
+    assert_eq!(schema.update_attempts().await, 1, "never retried");
+    assert_eq!(
+        schema.main_row().await,
+        (seed.revision, seed.checkpoint_content_hash),
+        "nothing written"
+    );
+    conn.sea_orm_connection().clone().close().await.unwrap();
+    schema.drop().await;
+}
+
 /// Hydration is a series of 4 MiB slice statements, each under the BASE
 /// statement timeout (TC-822): a large artifact hydrates through a pool whose
 /// base timeout is far below the whole-artifact transfer, and a slice whose
@@ -671,7 +917,6 @@ async fn postgres_hydration_slices_run_under_the_base_timeout() {
     }
     let strict = pool(schema.url(&url, None), |config| {
         config.database.statement_timeout_ms = 500;
-        config.database.bulk_statement_timeout_ms = 10_000;
     })
     .await;
     let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
@@ -779,6 +1024,8 @@ struct Link {
     client: SocketAddr,
     /// Bytes forwarded from PostgreSQL to the pool.
     down: Arc<AtomicU64>,
+    /// Bytes forwarded from the pool to PostgreSQL.
+    up: Arc<Mutex<Vec<u8>>>,
 }
 
 /// A TCP proxy between a pool and PostgreSQL that records its connections
@@ -800,11 +1047,13 @@ impl Proxy {
                     continue;
                 };
                 let down = Arc::new(AtomicU64::new(0));
+                let up = Arc::new(Mutex::new(Vec::new()));
                 registry.lock().unwrap().push(Link {
                     client: peer,
                     down: Arc::clone(&down),
+                    up: Arc::clone(&up),
                 });
-                tokio::spawn(pipe(client, server, down, down_bytes_per_sec));
+                tokio::spawn(pipe(client, server, down, up, down_bytes_per_sec));
             }
         });
         Self { addr, links }
@@ -836,14 +1085,37 @@ impl Proxy {
             .map(|link| link.client)
             .collect()
     }
+
+    /// How many simple-protocol queries (`Q` messages) the pool sent whose
+    /// text starts with `prefix`, over every connection.
+    fn simple_queries(&self, prefix: &[u8]) -> usize {
+        self.links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|link| {
+                let up = link.up.lock().unwrap();
+                up.windows(5 + prefix.len())
+                    .filter(|window| window[0] == b'Q' && window[5..] == *prefix)
+                    .count()
+            })
+            .sum()
+    }
 }
 
-async fn pipe(client: TcpStream, server: TcpStream, down: Arc<AtomicU64>, rate: Option<u64>) {
+async fn pipe(
+    client: TcpStream,
+    server: TcpStream,
+    down: Arc<AtomicU64>,
+    up: Arc<Mutex<Vec<u8>>>,
+    rate: Option<u64>,
+) {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut server_read, mut server_write) = server.into_split();
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         while let Ok(n @ 1..) = client_read.read(&mut buf).await {
+            up.lock().unwrap().extend_from_slice(&buf[..n]);
             if server_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }

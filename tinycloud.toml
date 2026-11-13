@@ -60,7 +60,6 @@ cors = true
     # tcp_user_timeout_ms = 30000
     # statement_timeout_mode = "session"   # session | local | off
     # statement_timeout_ms = 30000
-    # bulk_statement_timeout_ms = 120000
     # retry_window_ms = 10000
     ## How long an authorized read waits for its audit record before 503
     ## read_audit_busy (TC-1317). Its data is never returned without the record.
