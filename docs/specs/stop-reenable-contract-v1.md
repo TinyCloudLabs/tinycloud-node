@@ -1,6 +1,6 @@
 # Stop and re-enable renewal: proposed control contract v1
 
-Status: DOC-ONLY PROPOSAL, revised for Bobbie323fd442 (six required changes), for delta review then Naomi freeze. Not approved wire vocabulary. Requested by Naomi3411713e. No runtime or frozen-fixture changes are authorized by this document.
+Status: FROZEN v1, approved 2026-11-11 (Naomi; security review Bobbie c2da5283). Runtime implemented in this PR.
 
 The current node runtime slice ships **renew + existing revoke/status only**. Stop/re-enable are deferred to the next slice. Existing #545/#546 Renew leases grant only `tinycloud.delegation/renew`; this proposal does not modify those bytes, CIDs, capabilities or the stamp format. `design.md` R5 is target behavior for that later slice, not a claim that stop is currently exposed. Never substitute revoke when a caller asks to stop: revoking the lease invalidates renewal-added time and falls back to the original signed expiry; revoking the original ends its access/descendants. Stop preserves admitted stamps. This proposal adds no “stop and end now” mode.
 

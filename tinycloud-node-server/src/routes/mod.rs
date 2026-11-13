@@ -646,6 +646,43 @@ impl DelegationStatusResponse {
     }
 }
 
+/// Owner-only, signed renewal state control. This never triggers renewal.
+#[post("/delegation/renewal/state", data = "<body>")]
+pub async fn renewal_state_control(
+    invocation: Option<AuthHeaderGetter<InvocationInfo>>,
+    body: Option<Json<serde_json::Value>>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<tinycloud_core::renewal::control::StateReceipt>, Custom<Json<serde_json::Value>>> {
+    fn refusal(code: &'static str) -> Custom<Json<serde_json::Value>> {
+        let status = match code {
+            "invalid_request" => Status::BadRequest,
+            "auth_required" => Status::Unauthorized,
+            "unauthorized_control" => Status::Forbidden,
+            "renewal_state_unavailable" => Status::ServiceUnavailable,
+            _ => Status::Conflict,
+        };
+        Custom(
+            status,
+            Json(serde_json::json!({"version":1,"code":code,"message":code})),
+        )
+    }
+    let invocation = invocation.ok_or_else(|| refusal("auth_required"))?;
+    let body = body.ok_or_else(|| refusal("invalid_request"))?;
+    let admitted = tinycloud_core::AdmittedInvocation::admit(invocation.0, 60)
+        .await
+        .map_err(|_| refusal("auth_required"))?;
+    let replay = crate::invocation_replay::InvocationReplayCache::invoker_nonce_reservation(
+        admitted.invocation(),
+        60,
+    )
+    .map_err(|_| refusal("invalid_request"))?;
+    tinycloud
+        .renewal_state_control(&admitted, &body, replay)
+        .await
+        .map(Json)
+        .map_err(|error| refusal(error.0))
+}
+
 #[post("/delegation/status", format = "json", data = "<request>")]
 pub async fn delegation_status(
     invocation: AuthHeaderGetter<InvocationInfo>,
