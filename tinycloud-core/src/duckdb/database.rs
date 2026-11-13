@@ -438,6 +438,8 @@ pub(crate) fn spawn_actor_with_parts(
     DatabaseHandle { id, tx }
 }
 
+type ActorEntry<'a> = dashmap::mapref::entry::Entry<'a, (String, String), DatabaseHandle>;
+
 /// Keep registration until the cache paths are free. A replacement actor's
 /// cache must never be removed by its predecessor. Explicit shutdown already
 /// holds the service's per-database operation fence, even if it removed the
@@ -445,6 +447,9 @@ pub(crate) fn spawn_actor_with_parts(
 ///
 /// The files are only renamed aside while the map entry is held, so a lookup
 /// of any other database in the same map shard never waits on file deletion.
+/// The order is carried by the types in [`cleanup`]: renaming aside needs the
+/// held entry, releasing consumes it, and only the released form can be
+/// deleted.
 fn deregister_actor(
     databases: &DashMap<(String, String), DatabaseHandle>,
     key: (String, String),
@@ -452,43 +457,82 @@ fn deregister_actor(
     path: &Path,
     remove_files: bool,
 ) {
-    use dashmap::mapref::entry::Entry;
     let entry = databases.entry(key);
-    if matches!(&entry, Entry::Occupied(entry) if entry.get().id != id) {
+    if matches!(&entry, ActorEntry::Occupied(entry) if entry.get().id != id) {
         return;
     }
-    let mut failed = false;
-    let mut aside = Vec::new();
-    if remove_files {
-        for candidate in cache_file_paths(path) {
-            // The sweep before each hydration removes this name if the
-            // process stops before the deletion below.
-            let temp = crate::database_artifacts::staging_path(path);
-            match std::fs::rename(&candidate, &temp) {
-                Ok(()) => aside.push(temp),
-                Err(error) => {
-                    failed |= error.kind() != std::io::ErrorKind::NotFound;
-                    crate::database_artifacts::release_staging(&temp);
-                }
-            }
-        }
-    }
-    match entry {
-        Entry::Occupied(entry) => {
-            entry.remove();
-        }
-        Entry::Vacant(entry) => drop(entry),
-    }
-    for temp in aside {
-        failed |= remove_cache_entry(&temp).is_err();
-        crate::database_artifacts::release_staging(&temp);
-    }
-    if failed {
+    let moved = if remove_files {
+        cleanup::move_aside(&entry, path)
+    } else {
+        cleanup::MovedAside::default()
+    };
+    if cleanup::delete_aside(cleanup::release(entry, moved)) {
         // Operators use this value-free event when checking cache-disk headroom.
         tracing::warn!(
             event = "duckdb_cache_cleanup_failed",
             "Database cache cleanup failed"
         );
+    }
+}
+
+/// The cleanup steps, in a module of their own so that a [`cleanup::Released`]
+/// can only come from [`cleanup::release`].
+mod cleanup {
+    use std::path::{Path, PathBuf};
+
+    use super::{cache_file_paths, remove_cache_entry, ActorEntry};
+
+    /// Cache files renamed to staging names, not yet deleted.
+    #[derive(Default)]
+    pub(super) struct MovedAside {
+        temps: Vec<PathBuf>,
+        failed: bool,
+    }
+
+    /// [`MovedAside`] once the registration is gone: the only form that can
+    /// be deleted.
+    pub(super) struct Released(MovedAside);
+
+    /// Rename the cache files at `path` aside while `_held` keeps the
+    /// registration, so the paths are free before it can disappear. The
+    /// sweep before each hydration removes the names if the process stops
+    /// before [`delete_aside`].
+    pub(super) fn move_aside(_held: &ActorEntry<'_>, path: &Path) -> MovedAside {
+        let mut moved = MovedAside::default();
+        for candidate in cache_file_paths(path) {
+            let temp = crate::database_artifacts::staging_path(path);
+            match std::fs::rename(&candidate, &temp) {
+                Ok(()) => moved.temps.push(temp),
+                Err(error) => {
+                    moved.failed |= error.kind() != std::io::ErrorKind::NotFound;
+                    crate::database_artifacts::release_staging(&temp);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Drop the registration (or the vacant entry's lock), releasing the
+    /// shard.
+    pub(super) fn release(entry: ActorEntry<'_>, moved: MovedAside) -> Released {
+        match entry {
+            ActorEntry::Occupied(entry) => {
+                entry.remove();
+            }
+            ActorEntry::Vacant(entry) => drop(entry),
+        }
+        Released(moved)
+    }
+
+    /// Delete what was moved aside, outside the map lock. True if anything
+    /// failed, including the renames.
+    pub(super) fn delete_aside(Released(moved): Released) -> bool {
+        let mut failed = moved.failed;
+        for temp in moved.temps {
+            failed |= remove_cache_entry(&temp).is_err();
+            crate::database_artifacts::release_staging(&temp);
+        }
+        failed
     }
 }
 
