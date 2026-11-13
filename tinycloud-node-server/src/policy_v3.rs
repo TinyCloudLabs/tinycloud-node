@@ -255,7 +255,7 @@ impl PolicyV3Runtime {
         else {
             return Err("policy-session-registration-missing".into());
         };
-        let proofs: Vec<String> = event.0.parents.iter().map(ToString::to_string).collect();
+        let proofs: Vec<String> = event.0.parents.iter().copied().map(stored_cid).collect();
         if proofs
             != [
                 registration.policy_root_cid.clone(),
@@ -377,8 +377,24 @@ impl PolicyV3Runtime {
         for parent in &event.0.parents {
             // Unknown registration must fail closed, preserving database
             // failures as retryable rather than refusing valid authority.
-            if self.is_registered_policy_root(&parent.to_string()).await? {
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
                 return Err("policy-root-cannot-be-ordinary-parent".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Sibling roots are stored in the ordinary graph only so S0 can have
+    /// normal proof edges. Neither root is invocation authority, cited alone
+    /// or beside other proofs: a registered policy's conditions hold only
+    /// through a session minted from both roots.
+    pub(crate) async fn refuse_policy_root_proofs(
+        &self,
+        parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    ) -> Result<(), AuthorizationError> {
+        for parent in parents {
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
+                return Err("policy-root-cannot-authorize-invocation".into());
             }
         }
         Ok(())
@@ -393,12 +409,18 @@ impl PolicyV3Runtime {
         decrypt_body: Option<&Value>,
         now: OffsetDateTime,
     ) -> Result<bool, AuthorizationError> {
+        // Reject before ordinary fallback: D_enforce's audience is the
+        // enforcer, so an enforcer-signed invocation would otherwise collapse AND.
+        self.refuse_policy_root_proofs(&invocation.parents).await?;
         if invocation.parents.len() != 1 {
             for parent in invocation.parents.iter().copied() {
                 let loaded = match tinycloud.load_signed_delegation(parent).await {
                     Ok(parent) => parent,
                     Err(error) if error.is::<tinycloud_core::sea_orm::DbErr>() => {
                         return Err(error)
+                    }
+                    Err(_) if self.is_policy_protected_parent(parent).await? => {
+                        return Err("policy-session-invalid".into());
                     }
                     Err(_) => None,
                 };
@@ -420,16 +442,6 @@ impl PolicyV3Runtime {
         let Some((immediate_row, immediate)) = loaded else {
             return Ok(false);
         };
-        // Sibling roots are stored in the ordinary graph only so S0 can have
-        // normal proof edges. Neither root is invocation authority by itself.
-        // Reject before ordinary fallback: D_enforce's audience is the node,
-        // so an enforcer-signed invocation would otherwise collapse AND.
-        if self
-            .is_registered_policy_root(&invocation.parents[0].to_string())
-            .await?
-        {
-            return Err("policy-root-cannot-authorize-invocation".into());
-        }
         if !is_policy_session(&immediate.0) {
             return Ok(false);
         }
@@ -470,7 +482,7 @@ impl PolicyV3Runtime {
             .one(&self.conn)
             .await?
             .ok_or("policy-registration-missing")?;
-        let proof_cids: Vec<String> = session.0.parents.iter().map(ToString::to_string).collect();
+        let proof_cids: Vec<String> = session.0.parents.iter().copied().map(stored_cid).collect();
         if proof_cids
             != [
                 registration.policy_root_cid.clone(),
@@ -558,7 +570,7 @@ impl PolicyV3Runtime {
         &self,
         cid: tinycloud_auth::ipld_core::cid::Cid,
     ) -> Result<bool, AuthorizationError> {
-        let cid_string = cid.to_string();
+        let cid_string = stored_cid(cid);
         if policy_v3_session::Entity::find_by_id(cid_string.clone())
             .one(&self.conn)
             .await?
@@ -592,7 +604,7 @@ impl PolicyV3Runtime {
         let mut child: Option<Delegation> = None;
         let mut visited = std::collections::HashSet::new();
         for _ in 0..=8 {
-            if !visited.insert(current_cid.to_string()) {
+            if !visited.insert(stored_cid(current_cid)) {
                 return Err("policy-session-cycle".into());
             }
             let Some((row, event)) = tinycloud
@@ -650,7 +662,8 @@ impl PolicyV3Runtime {
                     .0
                     .parents
                     .iter()
-                    .map(ToString::to_string)
+                    .copied()
+                    .map(stored_cid)
                     .collect::<Vec<_>>();
                 if proofs
                     != [
@@ -749,7 +762,8 @@ impl PolicyV3Runtime {
             .0
             .parents
             .iter()
-            .map(ToString::to_string)
+            .copied()
+            .map(stored_cid)
             .collect::<Vec<_>>();
         stored_parents.sort();
         signed_parents.sort();
@@ -822,6 +836,16 @@ async fn owner_holds_capabilities<C: ConnectionTrait>(
         return Err("policy-owner-not-authorized".into());
     }
     Ok(())
+}
+
+/// The CID a cited proof names a delegation by, in the form the graph and the
+/// policy tables store: its multihash under the raw codec. The graph resolves
+/// a proof by its multihash alone, so another codec or multibase spelling of
+/// the same proof names the same delegation and must match the same rows.
+fn stored_cid(cid: tinycloud_auth::ipld_core::cid::Cid) -> String {
+    tinycloud_core::hash::Hash::from(cid)
+        .to_cid(0x55)
+        .to_string()
 }
 
 /// Expiry of a newly minted policy session: the holder's requested expiry
@@ -1498,10 +1522,11 @@ fn build_delivery_authorization_receipt(
 pub async fn authorize_delivery(
     request: DeliveryBody,
     runtime: &State<PolicyV3Runtime>,
+    tinycloud: &State<crate::TinyCloud>,
     invocation: AuthHeaderGetter<InvocationInfo>,
 ) -> Result<Json<Value>, DeliveryFailure> {
     let mut retry_after = None;
-    authorize_delivery_inner(request, runtime, invocation, &mut retry_after)
+    authorize_delivery_inner(request, runtime, tinycloud, invocation, &mut retry_after)
         .await
         .map_err(|(status, body)| DeliveryFailure {
             status,
@@ -1533,6 +1558,7 @@ fn refuse_db(reason: &'static str, error: impl std::fmt::Display) -> (Status, St
 async fn authorize_delivery_inner(
     request: DeliveryBody,
     runtime: &PolicyV3Runtime,
+    tinycloud: &crate::TinyCloud,
     invocation: AuthHeaderGetter<InvocationInfo>,
     retry_after: &mut Option<u64>,
 ) -> Result<Json<Value>, (Status, String)> {
@@ -1557,6 +1583,37 @@ async fn authorize_delivery_inner(
             "delivery-authorization-invalid",
         ),
     })?;
+    // The same policy gate as `/invoke`: a registered root never authorizes,
+    // and a policy session holds every condition of its policy.
+    let invocation_refused = |error: AuthorizationError| {
+        if error.is::<tinycloud_core::sea_orm::DbErr>() {
+            authorization_failure(error)
+        } else {
+            refuse(
+                "policy_invocation_refused",
+                Status::Forbidden,
+                "delivery-authorization-invalid",
+            )
+        }
+    };
+    let session_policy_cid = if runtime
+        .authorize_invocation(tinycloud, &invocation.0 .0, None, OffsetDateTime::now_utc())
+        .await
+        .map_err(invocation_refused)?
+    {
+        let (_, session) = tinycloud
+            .load_signed_delegation(invocation.0 .0.parents[0])
+            .await
+            .map_err(invocation_refused)?
+            .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?;
+        Some(
+            fact(&session.0.delegation, "policyCid")
+                .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let request = request.0;
     let invalid =
         |reason: &'static str| refuse(reason, Status::BadRequest, "delivery-authorization-invalid");
@@ -1648,6 +1705,14 @@ async fn authorize_delivery_inner(
                 "delivery-authorization-invalid",
             )
         })?;
+    // A policy session delivers only a share under its own policy.
+    if session_policy_cid.is_some_and(|cid| cid != registration.policy_cid) {
+        return Err(refuse(
+            "policy_session_other_policy",
+            Status::Forbidden,
+            "delivery-authorization-invalid",
+        ));
+    }
     // The link cannot outlive the share, and one key issued the record, signed
     // the envelope and owns the registration.
     let share_expires = parse_time(&registration.expires_at).map_err(|_| {
@@ -12242,3 +12307,7 @@ mod unbound_source_tests;
 #[cfg(test)]
 #[path = "policy_v3/share_key_record_tests.rs"]
 mod share_key_record_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/policy_root_proof_tests.rs"]
+mod policy_root_proof_tests;
