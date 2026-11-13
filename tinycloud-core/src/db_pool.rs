@@ -2181,3 +2181,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "db_pool/release_tests.rs"]
+mod release_tests;

@@ -341,6 +341,13 @@ impl<DB: Database> Floating<DB, Live<DB>> {
             // closes the socket and releases the permit.
             let _ = crate::rt::timeout(CLOSE_ON_DROP_TIMEOUT, self.close_hard()).await;
             false
+        } else if self.raw.in_server_transaction_block() {
+            // TC-2954: the ping read the server's transaction status after everything queued,
+            // including any drop-time rollback. A session still inside a transaction would run
+            // the next borrower's statements in it, so close it; ending the session ends the
+            // transaction. Bounded like the close above.
+            let _ = crate::rt::timeout(CLOSE_ON_DROP_TIMEOUT, self.close()).await;
+            false
         } else {
             // if the connection is still viable, release it to the pool
             self.release();
