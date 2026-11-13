@@ -478,10 +478,21 @@ async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
         .try_get_by_index::<i32>(0)
         .unwrap();
     tokio::time::sleep(Duration::from_millis(1_000)).await;
-    transaction
+    // The request whose transaction was ended gets one prompt error of the
+    // connection class: the routes answer it 503 unavailable_retryable, or
+    // 500 outcome_unknown once a write began (TC-1054). Statements inside a
+    // transaction are never retried, so nothing reconnects in a loop.
+    let started = Instant::now();
+    let error = transaction
         .execute(statement("SELECT 1"))
         .await
         .expect_err("the server ended the idle transaction");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(is_transient_error(&error), "{error:?}");
     drop(transaction);
     let next = short
         .query_one(statement("SELECT pg_backend_pid()"))
@@ -491,6 +502,15 @@ async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
         .try_get_by_index::<i32>(0)
         .unwrap();
     assert_ne!(next, abandoned, "the ended session is not reused");
+    // The ended session is closed, not kept: one replacement serves the pool.
+    let pool = short.sea_orm_connection().get_postgres_connection_pool();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.size() != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the pool holds exactly the replacement connection");
     for conn in [default, off, short] {
         conn.sea_orm_connection().clone().close().await.unwrap();
     }
