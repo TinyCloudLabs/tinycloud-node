@@ -20,6 +20,16 @@
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
 - Disk headroom is visible without a shell on the node. Every 5 minutes the node logs a `storage headroom` event per local store, with only `store` (`sql`, and `duckdb` in DuckDB builds) and `free_bytes` (the free bytes on that store's filesystem, rounded down to a whole 64 MiB). The log sidecar ships it to Better Stack as `node_storage_headroom`. The exact value is served as the gauge `tinycloud_storage_free_bytes{store}` on the metrics endpoint, and `tinycloud_disk_headroom_refusals_total{engine="sql"}` counts requests answered `507 sql_disk_headroom`. Details: TC-2917.
   - **N0 compose.** The embedded Vector configuration is regenerated for the new event, so the reviewed N0 compose template changes to `90841a34…` (raw `5419a6fb…`; `docs/releasing.md`, `.github/workflows/docker.yml`).
+- The log sidecar ships six more node warnings to Better Stack as event codes, each a per-minute count of `node_warning` events with no other fields. Until now they shipped as `unclassified`.
+  - `db_pool_closed_in_transaction`: a pooled connection was released inside a transaction and closed.
+  - `sql_database_too_large_to_load`: a database over the artifact read limit was not loaded.
+  - `sql_checkpoint_save_backoff`: a database's writes are refused during its checkpoint back-off.
+  - `kv_head_size_probe_failed`: the KV head size probe failed.
+  - `chain_guard_slow_wait`: a chain-guard wait over 500 ms.
+  - `http_5xx`: the line every 5xx response leaves. Each 5xx request still ships on its own under the `node_request_5xx` cap.
+
+  The vendored log schema now matches the canonical schema, pinned in `log-shipper/canonical.json`. `chain_guard_slow_wait` is no longer a capped class there, since a per-minute cap for it does not fit the TC-1843 reserve. The pooled-connection warning (vendored sqlx-core) now logs under the target `tinycloud_core::db_pool` (`vendor/sqlx-core/PATCH.md`). Details: TC-3006, TC-2954, TC-2961, TC-3027.
+  - **N0 compose.** The embedded Vector configuration is regenerated for these codes, so the reviewed N0 compose template changes to `efad41d5…` (raw `7ee085c6…`; `docs/releasing.md`, `.github/workflows/docker.yml`).
 
 ## [1.26.5] - 2026-11-13
 

@@ -145,6 +145,9 @@ released with a transaction open.
   Closing the session makes the server roll the transaction back, and a
   `warn!` ("closing a pooled connection released inside a transaction")
   records each such leak. The pool opens a replacement on the next acquire.
+  The `warn!` carries `target: "tinycloud_core::db_pool"`, so the node's log
+  shipper classifies it as `db_pool_closed_in_transaction`; the default
+  `sqlx_core::…` target would ship as unclassified (TC-3006).
 
 ### Re-applying on a vendor bump
 

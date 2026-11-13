@@ -346,8 +346,12 @@ impl<DB: Database> Floating<DB, Live<DB>> {
             // including any drop-time rollback. A session still inside a transaction would run
             // the next borrower's statements in it, so close it; ending the session ends the
             // transaction. Bounded like the close above.
-            // A leak the drop guards missed: logged so it is seen, not only absorbed.
-            tracing::warn!("closing a pooled connection released inside a transaction");
+            // A leak the drop guards missed: logged so it is seen, not only absorbed. The target
+            // is the node's pool module so the log shipper classifies it (TC-3006).
+            tracing::warn!(
+                target: "tinycloud_core::db_pool",
+                "closing a pooled connection released inside a transaction"
+            );
             let _ = crate::rt::timeout(CLOSE_ON_DROP_TIMEOUT, self.close()).await;
             false
         } else {
