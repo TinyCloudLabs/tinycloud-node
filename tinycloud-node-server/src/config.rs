@@ -1935,7 +1935,10 @@ pub struct DatabaseConfig {
     /// transaction cannot hold its locks and pooled connection indefinitely.
     /// It must exceed the longest legitimate hold, a protected legacy meeting
     /// write's upload (`KV_UPLOAD_TIMEOUT`, 240 s); `validate` refuses less.
-    /// Zero disables it.
+    /// Zero disables it. Not set in `statement_timeout_mode = "local"`: a
+    /// session `SET` behind a transaction-pooling proxy would land on
+    /// whichever server connection served it and reach the proxy's other
+    /// clients.
     #[serde(default = "default_database_idle_in_transaction_timeout_ms")]
     pub idle_in_transaction_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
@@ -2008,6 +2011,9 @@ fn default_database_idle_in_transaction_timeout_ms() -> u64 {
     300_000
 }
 
+/// PostgreSQL's largest millisecond timeout setting (`INT_MAX`).
+const POSTGRES_MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
+
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
 }
@@ -2067,8 +2073,9 @@ pub struct DidResolutionConfig {
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero
     /// read-audit wait would answer every authorized read `read_audit_busy`,
-    /// and an idle-in-transaction timeout within the legacy upload hold would
-    /// fail legitimate writes (TC-2954).
+    /// an idle-in-transaction timeout within the legacy upload hold would
+    /// fail legitimate writes (TC-2954), and a timeout above PostgreSQL's
+    /// largest (`INT_MAX` ms) would fail every connection after startup.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.read_audit_wait_ms == 0 {
             return Err("database.read_audit_wait_ms must be greater than zero");
@@ -2081,18 +2088,39 @@ impl DatabaseConfig {
                 "database.idle_in_transaction_timeout_ms must be 0 (off) or exceed the 240 s legacy upload hold",
             );
         }
+        for (value, error) in [
+            (
+                self.idle_in_transaction_timeout_ms,
+                "database.idle_in_transaction_timeout_ms must be at most 2147483647",
+            ),
+            (
+                self.statement_timeout_ms,
+                "database.statement_timeout_ms must be at most 2147483647",
+            ),
+            (
+                self.bulk_statement_timeout_ms,
+                "database.bulk_statement_timeout_ms must be at most 2147483647",
+            ),
+        ] {
+            if value > POSTGRES_MAX_TIMEOUT_MS {
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
     /// The statement that sets the pool's idle-in-transaction timeout on a new
-    /// connection, or `None` when it is off.
+    /// connection, or `None` when it is off or the statement timeout mode is
+    /// `local` (a transaction-pooling proxy).
     pub fn idle_in_transaction_statement(&self) -> Option<String> {
-        (self.idle_in_transaction_timeout_ms > 0).then(|| {
-            format!(
-                "SET idle_in_transaction_session_timeout = {}",
-                self.idle_in_transaction_timeout_ms
-            )
-        })
+        (self.idle_in_transaction_timeout_ms > 0
+            && self.statement_timeout_mode != StatementTimeoutMode::Local)
+            .then(|| {
+                format!(
+                    "SET idle_in_transaction_session_timeout = {}",
+                    self.idle_in_transaction_timeout_ms
+                )
+            })
     }
 
     /// The pool's PostgreSQL `statement_timeout` policy.
@@ -2337,7 +2365,14 @@ mod tests {
             Config::default().database.idle_in_transaction_timeout_ms,
             300_000
         );
-        for (timeout_ms, ok) in [(0, true), (1, false), (240_000, false), (240_001, true)] {
+        for (timeout_ms, ok) in [
+            (0, true),
+            (1, false),
+            (240_000, false),
+            (240_001, true),
+            (2_147_483_647, true),
+            (2_147_483_648, false),
+        ] {
             let mut config = Config::default();
             config.database.idle_in_transaction_timeout_ms = timeout_ms;
             assert_eq!(
@@ -2346,6 +2381,39 @@ mod tests {
                 "{timeout_ms}"
             );
         }
+    }
+
+    /// TC-2954: a statement timeout above PostgreSQL's largest is refused at
+    /// startup instead of failing every connection after the old node has
+    /// stopped.
+    #[test]
+    fn startup_rejects_a_statement_timeout_postgres_cannot_hold() {
+        for (base, bulk, ok) in [
+            (2_147_483_647, 2_147_483_647, true),
+            (2_147_483_648, 120_000, false),
+            (30_000, 2_147_483_648, false),
+        ] {
+            let mut config = Config::default();
+            config.database.statement_timeout_ms = base;
+            config.database.bulk_statement_timeout_ms = bulk;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{base} {bulk}"
+            );
+        }
+    }
+
+    /// TC-2954: behind a transaction-pooling proxy (`local` mode) the
+    /// session-level idle-in-transaction timeout is not set.
+    #[test]
+    fn the_idle_in_transaction_timeout_is_not_set_in_local_mode() {
+        let mut database = Config::default().database;
+        assert!(database.idle_in_transaction_statement().is_some());
+        database.statement_timeout_mode = StatementTimeoutMode::Local;
+        assert_eq!(database.idle_in_transaction_statement(), None);
+        database.statement_timeout_mode = StatementTimeoutMode::Off;
+        assert!(database.idle_in_transaction_statement().is_some());
     }
 
     /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
