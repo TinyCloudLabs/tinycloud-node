@@ -32,6 +32,10 @@ const dbCodes = ['unavailable_retryable', 'outcome_unknown', 'internal', 'sql_bu
 const dbServices = ['sql', 'duckdb', 'kv', 'other'];
 const dbKinds = ['pool_timeout', 'pool_closed', 'io', 'statement_timeout', 'serialization', 'connection_lost', 'artifact_changed', 'lock_wait', 'hydration', 'artifact_transfer', 'request_timeout', 'read_audit_busy', 'other'];
 const reject = (name, input, insertAt = 'logship_gate') => ({ name, inputs: [{ insert_at: insertAt, type: 'log', log_fields: logFields(input) }], no_outputs_from: ['allowlist'], outputs: [{ extract_from: 'gate_counts', conditions: [{ type: 'vrl', source: 'assert!(.count == 1)\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC"))' }] }] });
+// TC-2917: the node's disk headroom line, one per local store every 5 minutes (target, message and fields as emitted
+// by tinycloud-node). It ships as an individual info event with exactly `store` and `free_bytes`; any deviation drops it.
+export const storageHeadroom = (fields = {}, extra = {}) => ({ timestamp, level: 'INFO', target: 'tinycloud::storage', ...extra, fields: { message: 'storage headroom', store: 'sql', free_bytes: 7516192768, ...fields } });
+const headroomShipped = ['event', 'free_bytes', 'level', 'store', 'svc', 'ts'];
 // TC-1843: per-window caps. Each capped class has its own route and `lua` cap transform. Events are injected at
 // event_route (the post-sanitize shape) so the route and the cap both run. A Vector test condition is met by any one
 // event, so exact membership is pinned by expected_event_count plus one condition per sequence number.
@@ -155,6 +159,14 @@ export const vectorTests = [
   check('node 5xx diagnostic at error level is a plain unclassified error', envelope(dbFailure({}, { level: 'ERROR' })), `.event == "node_error" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
   check('node 5xx diagnostic input with SQL, ids and message-like text in extra fields ships none of it', envelope({ ...dbFailure({ sql: `SELECT ${canary} FROM t`, error: canary, space_id: 'tinycloud:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef:default', db_name: 'notes.db', did: 'did:pkh:eip155:1:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }), span: { sql: canary } }), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])} && !contains(encode_json(.), "SELECT") && !contains(encode_json(.), "notes.db") && !contains(encode_json(.), "did:") && !contains(encode_json(.), "tinycloud:")`),
   reject('node 5xx diagnostic at info level is not an individual event', envelope(dbFailure({}, { level: 'INFO' }))),
+  check('disk headroom ships exactly store and free_bytes as an individual info event', envelope(storageHeadroom()), `.event == "node_storage_headroom" && .svc == "api" && .level == "info" && .store == "sql" && .free_bytes == 7516192768 && ${keysAre(headroomShipped)}`),
+  ...['sql', 'duckdb'].map(store => check(`disk headroom ships store ${store}`, envelope(storageHeadroom({ store })), `.event == "node_storage_headroom" && .store == "${store}" && ${keysAre(headroomShipped)}`)),
+  ...[0, 9007199254740991].map(free_bytes => check(`disk headroom ships free_bytes ${free_bytes}`, envelope(storageHeadroom({ free_bytes })), `.event == "node_storage_headroom" && .free_bytes == ${free_bytes} && ${keysAre(headroomShipped)}`)),
+  check('disk headroom discards span, spans and envelope extras', envelope({ ...storageHeadroom(), span: { path: canary }, spans: [{ request_id: canary }], filename: canary, thread_id: canary }), `.event == "node_storage_headroom" && ${keysAre(headroomShipped)}`),
+  ...[['an unknown store', { store: 'blocks' }], ['a free-text store', { store: canary }], ['a path as store', { store: '/app/data/sql' }], ['a missing store', { store: undefined }], ['negative free_bytes', { free_bytes: -1 }], ['free_bytes above the safe integer range', { free_bytes: 9007199254740992 }], ['string free_bytes', { free_bytes: '7516192768' }], ['float free_bytes', { free_bytes: 1.5 }], ['missing free_bytes', { free_bytes: undefined }], ['an extra path field', { path: canary }], ['an extra error field', { error: canary }], ['a message with a suffix', { message: `storage headroom: ${canary}` }], ['a message in a different case', { message: 'Storage headroom' }]].map(([label, fields]) => reject(`disk headroom with ${label} is dropped, never shipped`, envelope(storageHeadroom(fields)))),
+  reject('disk headroom on another node target is dropped', envelope(storageHeadroom({}, { target: 'tinycloud::request' }))),
+  reject('an unrelated info line on the headroom target is dropped', envelope(storageHeadroom({ message: canary, store: undefined, free_bytes: undefined }))),
+  check('disk headroom at warn level is a plain unclassified warning', envelope(storageHeadroom({}, { level: 'WARN' })), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
   check('dependency warning is a fixed unclassified diagnostic', envelope({ timestamp, level: 'WARN', target: 'hyper::proto', fields: { message: canary, error: canary } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
   check('dependency error without a message still counts', envelope({ timestamp, level: 'ERROR', target: 'sqlx::pool', fields: { error: canary } }), '.event == "node_error" && .event_code == "unclassified" && .event_count == 1'),
   check('warning without a target or fields still counts', envelope({ timestamp, level: 'WARN' }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
@@ -246,6 +258,12 @@ export function requestProfileTests(profile) {
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(dbFailure({ code: canary, sql: canary }))) }],
       no_outputs_from: ['event_route.db_failure_5xx', 'event_route.request'],
       outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])})\nassert!(${safe})` }] }],
+    },
+    {
+      name: `${profile}: disk headroom routes as an individual event, never into the count reducer or a cap`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(storageHeadroom({ store: 'duckdb' }))) }],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request', ...capNames.map(name => `event_route.${name}`)],
+      outputs: [{ extract_from: 'event_route.storage_headroom', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "node_storage_headroom" && .store == "duckdb" && .free_bytes == 7516192768)\nassert!(${keysAre(headroomShipped)})\nassert!(${safe})` }] }],
     },
     // TC-1843: the capped classes reach their cap transform from the raw envelope, with the same fields.
     ...[

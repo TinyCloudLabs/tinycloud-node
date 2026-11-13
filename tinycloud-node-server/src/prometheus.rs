@@ -2,8 +2,8 @@ use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    register_int_gauge, register_int_gauge_vec, Encoder, Histogram, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 
 pub use tinycloud_core::telemetry::{
@@ -198,6 +198,22 @@ lazy_static! {
         "SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof."
     )
     .unwrap();
+    /// Free bytes an unprivileged process can still allocate on the filesystem
+    /// behind each local store. The label is the store (`sql`, `duckdb`).
+    pub static ref STORAGE_FREE_BYTES: IntGaugeVec = register_int_gauge_vec!(
+        "tinycloud_storage_free_bytes",
+        "Free bytes on the filesystem behind each local store, by store.",
+        &["store"]
+    )
+    .unwrap();
+    /// Writes refused because the disk was short of the configured headroom.
+    /// The label is the engine (`sql`).
+    pub static ref DISK_HEADROOM_REFUSALS: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_disk_headroom_refusals_total",
+        "Writes refused for disk headroom, by engine.",
+        &["engine"]
+    )
+    .unwrap();
 }
 
 pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
@@ -265,6 +281,22 @@ pub fn set_db_pool_gauges(size: i64, idle: i64) {
     if enabled() {
         DB_POOL_SIZE.set(size);
         DB_POOL_IDLE.set(idle);
+    }
+}
+
+/// Record the free bytes behind a local store from a sampler tick.
+pub fn set_storage_free_bytes(store: &str, free_bytes: u64) {
+    if enabled() {
+        STORAGE_FREE_BYTES
+            .with_label_values(&[store])
+            .set(i64::try_from(free_bytes).unwrap_or(i64::MAX));
+    }
+}
+
+/// Count one write refused for disk headroom.
+pub fn observe_disk_headroom_refusal(engine: &str) {
+    if enabled() {
+        DISK_HEADROOM_REFUSALS.with_label_values(&[engine]).inc();
     }
 }
 
