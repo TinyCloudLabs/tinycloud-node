@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.0) - 2026-11-13
+
+### Fixed
+
+- *(TC-2872)* compare renewal expiries at stored second precision
+- *(TC-2872)* scope renewal history to the original status party
+- *(TC-2872)* preserve status history error and CID bindings
+- *(TC-2872)* read delegation status from one snapshot
+
+### Other
+
+- Merge pull request #559 from TinyCloudLabs/feat/tc-2872-holder-renewal-history
+- *(TC-2872)* refresh status snapshot after 1.26.0 release
+- *(TC-2872)* refresh status snapshot on main
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
