@@ -12323,3 +12323,7 @@ mod share_key_record_tests;
 #[cfg(test)]
 #[path = "policy_v3/policy_root_proof_tests.rs"]
 mod policy_root_proof_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/mint_locked_inputs_tests.rs"]
+mod mint_locked_inputs_tests;
