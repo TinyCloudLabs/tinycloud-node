@@ -1932,9 +1932,10 @@ pub struct DatabaseConfig {
     /// PostgreSQL `idle_in_transaction_session_timeout`, in milliseconds, set
     /// once on every pooled connection (TC-2954): the server ends a session
     /// that sits idle inside a transaction this long, so a leaked or stalled
-    /// transaction cannot hold its locks and pooled connection. A protected
-    /// legacy meeting write holds its transaction across its upload, so one
-    /// whose upload takes longer fails. Zero disables it.
+    /// transaction cannot hold its locks and pooled connection indefinitely.
+    /// It must exceed the longest legitimate hold, a protected legacy meeting
+    /// write's upload (`KV_UPLOAD_TIMEOUT`, 240 s); `validate` refuses less.
+    /// Zero disables it.
     #[serde(default = "default_database_idle_in_transaction_timeout_ms")]
     pub idle_in_transaction_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
@@ -2004,7 +2005,7 @@ fn default_database_bulk_statement_timeout_ms() -> u64 {
 }
 
 fn default_database_idle_in_transaction_timeout_ms() -> u64 {
-    15_000
+    300_000
 }
 
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
@@ -2065,10 +2066,20 @@ pub struct DidResolutionConfig {
 
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero
-    /// read-audit wait would answer every authorized read `read_audit_busy`.
+    /// read-audit wait would answer every authorized read `read_audit_busy`,
+    /// and an idle-in-transaction timeout within the legacy upload hold would
+    /// fail legitimate writes (TC-2954).
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.read_audit_wait_ms == 0 {
             return Err("database.read_audit_wait_ms must be greater than zero");
+        }
+        if self.idle_in_transaction_timeout_ms != 0
+            && u128::from(self.idle_in_transaction_timeout_ms)
+                <= tinycloud_core::db::KV_UPLOAD_TIMEOUT.as_millis()
+        {
+            return Err(
+                "database.idle_in_transaction_timeout_ms must be 0 (off) or exceed the 240 s legacy upload hold",
+            );
         }
         Ok(())
     }
@@ -2313,6 +2324,26 @@ mod tests {
                 crate::resolve_runtime_config(&config).is_ok(),
                 ok,
                 "{wait_ms}"
+            );
+        }
+    }
+
+    /// TC-2954: the idle-in-transaction timeout is on by default (300 s) and,
+    /// when on, must outlast the 240 s a protected legacy write holds its
+    /// transaction.
+    #[test]
+    fn tc2954_startup_rejects_an_idle_in_transaction_timeout_within_the_upload_hold() {
+        assert_eq!(
+            Config::default().database.idle_in_transaction_timeout_ms,
+            300_000
+        );
+        for (timeout_ms, ok) in [(0, true), (1, false), (240_000, false), (240_001, true)] {
+            let mut config = Config::default();
+            config.database.idle_in_transaction_timeout_ms = timeout_ms;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{timeout_ms}"
             );
         }
     }

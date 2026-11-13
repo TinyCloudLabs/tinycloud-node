@@ -444,7 +444,7 @@ async fn postgres_statement_timeout_modes_scopes_and_migrations() {
 }
 
 /// TC-2954: every pooled connection carries an idle-in-transaction timeout,
-/// 15 s by default, so the server ends a transaction left idle that long and
+/// 300 s by default, so the server ends a transaction left idle that long and
 /// a fresh connection serves the next request; 0 turns it off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
@@ -457,13 +457,14 @@ async fn postgres_idle_in_transaction_timeout_ends_an_abandoned_transaction() {
     let setting = "idle_in_transaction_session_timeout";
 
     let default = pool(schema.url(&url, None), |_| {}).await;
-    assert_eq!(show(&default, setting).await, "15s");
+    assert_eq!(show(&default, setting).await, "5min");
     let off = pool(schema.url(&url, None), |config| {
         config.database.idle_in_transaction_timeout_ms = 0;
     })
     .await;
     assert_eq!(show(&off, setting).await, "0");
 
+    // Below the legacy upload hold `validate` refuses; the pool itself takes it.
     let short = pool(schema.url(&url, None), |config| {
         config.database.idle_in_transaction_timeout_ms = 300;
     })
