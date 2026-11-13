@@ -56,3 +56,5 @@ pub mod purge_completion;
 pub mod purge_inventory;
 
 pub mod purge_reconcile;
+
+pub mod purge_restore;
