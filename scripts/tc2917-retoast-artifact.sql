@@ -1,6 +1,7 @@
 -- Operator only, after the TC-2917 migration. One explicitly selected row/transaction.
 -- psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v service=sql -v space=... -v name=... \
 --   -f scripts/tc2917-retoast-artifact.sql
+-- See scripts/tc2917-README.md for disk, WAL/replica and row-lock precautions.
 -- No payloads or identities are printed. Re-run for each reviewed large row.
 \set ON_ERROR_STOP on
 BEGIN;
