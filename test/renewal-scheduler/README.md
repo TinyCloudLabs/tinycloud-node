@@ -48,7 +48,8 @@ admission and status evaluation. It also polls the real scheduler every 25 ms;
 there is no HTTP clock/issuance endpoint. Both changes require the explicit
 `renewal-test-clock` Cargo feature **and** clock environment variable. Without
 that variable, cadence is 300 seconds and the clock is wall time, including in
-a feature build. Standard production builds cannot read the clock file.
+a feature build. The feature requires debug assertions; release builds fail at
+compile time, and container builds reject it in the feature arguments.
 
 Advance monotonically by atomically renaming a new file over the clock file:
 

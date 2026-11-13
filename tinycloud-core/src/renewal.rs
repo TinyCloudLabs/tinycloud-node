@@ -1,3 +1,6 @@
+#[cfg(all(feature = "renewal-test-clock", not(debug_assertions)))]
+compile_error!("renewal-test-clock is restricted to debug harness builds");
+
 #[cfg(test)]
 #[path = "renewal/registration_tests.rs"]
 mod registration_tests;
