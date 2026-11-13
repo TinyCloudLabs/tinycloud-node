@@ -434,7 +434,10 @@ async fn postgres_separate_processes_serialize_stop_enable_and_stamp_issuance() 
             assert_eq!(f.snapshot().await["stamps"], 1);
             assert!(
                 f.db()
-                    .delegation_effective_expiry(f.original_id, f.now)
+                    .delegation_effective_expiry(
+                        f.original_id,
+                        time::OffsetDateTime::now_utc().unix_timestamp(),
+                    )
                     .await
                     .unwrap()
                     .unwrap()
