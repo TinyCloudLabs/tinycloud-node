@@ -26,6 +26,13 @@ type TestPause = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::No
 struct BlobOperationLocks(Arc<Mutex<HashMap<BlobGenerationKey, Weak<Mutex<()>>>>>);
 
 impl BlobOperationLocks {
+    async fn forget_space(&self, space: &SpaceId) {
+        self.0
+            .lock()
+            .await
+            .retain(|(candidate, _, _), _| candidate != space);
+    }
+
     async fn lock(&self, key: BlobGenerationKey) -> OwnedMutexGuard<()> {
         let lock = {
             let mut registry = self.0.lock().await;
