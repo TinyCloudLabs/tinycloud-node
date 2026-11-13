@@ -4164,6 +4164,10 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
         DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => Status::new(507),
+        DuckDbError::DiskHeadroom => {
+            crate::prometheus::observe_disk_headroom_refusal("duckdb");
+            Status::new(507)
+        }
         DuckDbError::Unavailable => Status::ServiceUnavailable,
         DuckDbError::IngestError(_) => Status::InternalServerError,
         DuckDbError::ExportError(_) => Status::InternalServerError,
@@ -8454,6 +8458,18 @@ mod tests {
             duckdb_error_to_status(&DuckDbError::Unavailable),
             Status::ServiceUnavailable
         );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_disk_headroom_is_507_with_its_own_code() {
+        assert_eq!(
+            duckdb_error_to_status(&DuckDbError::DiskHeadroom),
+            Status::new(507)
+        );
+        assert!(DuckDbError::DiskHeadroom
+            .to_string()
+            .starts_with("duckdb_disk_headroom:"));
     }
 
     #[tokio::test]

@@ -18,7 +18,9 @@ use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     caveats::DuckDbCaveats,
-    describe, parser,
+    describe,
+    disk::{self, DuckDbDiskPolicy},
+    parser,
     storage::{self, StorageMode},
     types::*,
 };
@@ -242,6 +244,34 @@ pub(crate) fn spawn_actor_with_parts(
     max_memory_per_connection: String,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
+    spawn_actor_with_disk(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        force_file,
+        idle_timeout_secs,
+        max_memory_per_connection,
+        databases,
+        DuckDbDiskPolicy::default(),
+    )
+}
+
+/// [`spawn_actor_with_parts`] under `disk`: its connections spill at most
+/// `disk.max_temp_directory_bytes`, and each statement runs under the disk
+/// watcher.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_actor_with_disk(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    force_file: bool,
+    idle_timeout_secs: u64,
+    max_memory_per_connection: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    disk: DuckDbDiskPolicy,
+) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
@@ -265,7 +295,11 @@ pub(crate) fn spawn_actor_with_parts(
         };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            match storage::open_connection(opening_path, &max_memory_per_connection) {
+            match storage::open_spill_capped_connection(
+                opening_path,
+                &max_memory_per_connection,
+                disk.max_temp_directory_bytes,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to open database");
@@ -335,26 +369,31 @@ pub(crate) fn spawn_actor_with_parts(
                     without_growth,
                     response_tx,
                 } => {
-                    let result = if without_growth {
-                        handle_message_without_growth(
-                            &conn,
-                            &request,
-                            &caveats,
-                            &ability,
-                            arrow_format,
-                        )
-                    } else {
-                        handle_message(&conn, &request, &caveats, &ability, arrow_format, None)
-                    };
+                    let budget_key = disk::budget_key(&space_id, &db_name);
+                    let write = disk::writes(&request);
+                    let result = disk.watch(&budget_key, &file_path, &conn, write, || {
+                        if without_growth {
+                            handle_message_without_growth(
+                                &conn,
+                                &request,
+                                &caveats,
+                                &ability,
+                                arrow_format,
+                            )
+                        } else {
+                            handle_message(&conn, &request, &caveats, &ability, arrow_format, None)
+                        }
+                    });
 
                     // Post-write promotion check
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
                         if let Ok(size) = storage::database_size(&conn) {
                             if size > memory_threshold {
-                                match storage::promote_to_file(
+                                match storage::promote_to_spill_capped_file(
                                     &conn,
                                     &file_path,
                                     &max_memory_per_connection,
+                                    disk.max_temp_directory_bytes,
                                 ) {
                                     Ok(new_conn) => {
                                         conn = new_conn;

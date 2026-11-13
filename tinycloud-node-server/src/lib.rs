@@ -1055,13 +1055,17 @@ pub async fn app_with_control(
     )
     .await?;
 
+    // One disk budget for the node: SQL and DuckDB writes reserve from it.
+    let sql_durability = tinycloud_config.storage.sql.durability();
+    #[cfg(feature = "duckdb")]
+    let disk_budget = sql_durability.budget.clone();
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
     )
     .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
-    .with_durability(tinycloud_config.storage.sql.durability())
+    .with_durability(sql_durability)
     .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
 
     let mut policy_v3_runtime =
@@ -1108,7 +1112,15 @@ pub async fn app_with_control(
             .max_memory_per_connection
             .clone(),
         database_artifact_repository,
+    )
+    .with_disk_policy(
+        tinycloud_config
+            .storage
+            .duckdb
+            .disk_policy(artifact_collector.is_some(), disk_budget),
     );
+    #[cfg(feature = "duckdb")]
+    duckdb_service.sweep_stale_cache_files().await;
 
     // Billing shares TINYCLOUD_ADMIN_SECRET with the node (it calls the
     // node's admin API with it) and accepts it on quota fetches (TC-627).
