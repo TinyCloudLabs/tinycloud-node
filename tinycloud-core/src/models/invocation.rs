@@ -570,6 +570,8 @@ async fn validate_capabilities<C: ConnectionTrait>(
             } else {
                 policy_v3_root::Entity::find()
                     .filter(policy_v3_root::Column::RootCid.is_in(terminal_cids))
+                    .filter(policy_v3_root::Column::RevokedAt.is_null())
+                    .filter(policy_v3_root::Column::RevocationBytes.is_null())
                     .all(db)
                     .await?
                     .into_iter()
@@ -1771,6 +1773,24 @@ mod tests {
 
     #[tokio::test]
     async fn signed_invocations_require_registered_policy_terminals() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        assert_signed_policy_terminals(&db).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_signed_invocations_require_registered_policy_terminals() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_signed_invocations_require_registered_policy_terminals",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_signed_policy_terminals(&fixture.conn).await;
+    }
+
+    async fn assert_signed_policy_terminals(db: &DatabaseConnection) {
         use crate::events::{Delegation, SerializedEvent, TinyCloudDelegation};
         use tinycloud_auth::{
             ssi::{claims::jwt::NumericDate, jwk::Algorithm, ucan::Payload},
@@ -1812,8 +1832,6 @@ mod tests {
             .unwrap()
         }
         for service in ["sql", "duckdb"] {
-            let db = Database::connect("sqlite::memory:").await.unwrap();
-            Migrator::up(&db, None).await.unwrap();
             let (owner_key, owner) = identity();
             let (holder_key, holder) = identity();
             let (child_key, child) = identity();
@@ -1835,7 +1853,7 @@ mod tests {
                     .unwrap()
             };
             assert!(
-                verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![]), now)
+                verify_and_authorize(db, &invoke(&holder_key, &holder, vec![]), now)
                     .await
                     .is_err()
             );
@@ -1849,7 +1867,7 @@ mod tests {
                 now.unix_timestamp(),
             );
             let ordinary = Delegation::from_header_ser::<TinyCloudDelegation>(&ordinary).unwrap();
-            assert!(delegation::process(&db, &ordinary, None).await.is_err());
+            assert!(delegation::process(db, &ordinary, None).await.is_err());
             let grant = token(
                 (&owner_key, &owner),
                 &holder,
@@ -1862,12 +1880,12 @@ mod tests {
             let grant = Delegation::from_header_ser::<TinyCloudDelegation>(&grant).unwrap();
             let grant_cid = grant.content_hash().to_cid(0x55);
             assert!(
-                verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+                verify_and_authorize(db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
                     .await
                     .is_err()
             );
-            delegation::process(&db, &grant, None).await.unwrap();
-            verify_and_authorize(&db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+            delegation::process(db, &grant, None).await.unwrap();
+            verify_and_authorize(db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
                 .await
                 .unwrap();
             let child_grant = token(
@@ -1881,9 +1899,9 @@ mod tests {
             );
             let child_grant =
                 Delegation::from_header_ser::<TinyCloudDelegation>(&child_grant).unwrap();
-            delegation::process(&db, &child_grant, None).await.unwrap();
+            delegation::process(db, &child_grant, None).await.unwrap();
             verify_and_authorize(
-                &db,
+                db,
                 &invoke(
                     &child_key,
                     &child,
@@ -1906,7 +1924,7 @@ mod tests {
                 &ability,
                 vec![],
                 Some(vec![facts]),
-                now.unix_timestamp(),
+                now.unix_timestamp() - 180,
             );
             let root = SerializedEvent::<util::DelegationInfo>::from_header_ser::<
                 TinyCloudDelegation,
@@ -1917,17 +1935,17 @@ mod tests {
                 &root.0.capabilities[0],
                 &root.0.delegator
             ));
-            delegation::process(&db, &root, None).await.unwrap();
+            delegation::process(db, &root, None).await.unwrap();
             let root_cid = root.content_hash().to_cid(0x55);
             let invocation = invoke(&holder_key, &holder, vec![root_cid]);
             assert!(matches!(
-                verify_and_authorize(&db, &invocation, now).await,
+                verify_and_authorize(db, &invocation, now).await,
                 Err(Error::InvalidInvocation(
                     InvocationError::UnauthorizedAction(_, _)
                 ))
             ));
             // The holder has a valid owner grant before this registry fixture is inserted.
-            authorize_holder(&db, &holder, &root.0.capabilities, &[grant_cid], now)
+            authorize_holder(db, &holder, &root.0.capabilities, &[grant_cid], now)
                 .await
                 .unwrap();
             policy_v3_root::ActiveModel {
@@ -1944,10 +1962,52 @@ mod tests {
                 revoked_at: Set(None),
                 revocation_bytes: Set(None),
             }
-            .insert(&db)
+            .insert(db)
             .await
             .unwrap();
-            verify_and_authorize(&db, &invocation, now).await.unwrap();
+            verify_and_authorize(db, &invocation, now).await.unwrap();
+            for (revoked_at, revocation_bytes) in [
+                (Some("2026-01-01T00:00:00Z".to_owned()), None),
+                (None, Some(vec![1_u8])),
+                (Some("2026-01-01T00:00:00Z".to_owned()), Some(vec![1_u8])),
+            ] {
+                policy_v3_root::Entity::update_many()
+                    .col_expr(policy_v3_root::Column::RevokedAt, Expr::value(revoked_at))
+                    .col_expr(
+                        policy_v3_root::Column::RevocationBytes,
+                        Expr::value(revocation_bytes),
+                    )
+                    .filter(policy_v3_root::Column::RootCid.eq(root_cid.to_string()))
+                    .exec(db)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    verify_and_authorize(db, &invocation, now).await,
+                    Err(Error::InvalidInvocation(
+                        InvocationError::UnauthorizedAction(_, _)
+                    ))
+                ));
+            }
+            policy_v3_root::Entity::update_many()
+                .col_expr(
+                    policy_v3_root::Column::RevokedAt,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    policy_v3_root::Column::RevocationBytes,
+                    Expr::value(Option::<Vec<u8>>::None),
+                )
+                .filter(policy_v3_root::Column::RootCid.eq(root_cid.to_string()))
+                .exec(db)
+                .await
+                .unwrap();
+            // The signed root expires at now + 120; the invocation and owner grant at now + 300.
+            assert!(matches!(
+                verify_and_authorize(db, &invocation, now + time::Duration::seconds(121)).await,
+                Err(Error::InvalidInvocation(
+                    InvocationError::UnauthorizedAction(_, _)
+                ))
+            ));
         }
     }
 
