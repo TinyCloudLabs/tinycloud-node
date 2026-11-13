@@ -2347,6 +2347,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn postgres_external_artifact_storage_preserves_streamed_bytes() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::migrated_through(
+            "postgres_external_artifact_storage_preserves_streamed_bytes",
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        let settings = fixture.conn.query_all(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT attstorage::text AS storage FROM pg_attribute WHERE attrelid = 'database_artifact'::regclass AND attname IN ('payload', 'delta_payload')".to_string(),
+        )).await.unwrap();
+        assert_eq!(settings.len(), 2);
+        for setting in settings {
+            assert_eq!(setting.try_get::<String>("", "storage").unwrap(), "e");
+        }
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        for len in [0, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + 1] {
+            let name = format!("external-{len}");
+            let payload = bytes(len, 3);
+            let wal = bytes(len, 4);
+            repo.save(
+                "sql",
+                "space",
+                &name,
+                payload.clone(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
+            repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
+                .await
+                .unwrap();
+            let mut sink = MemorySink::default();
+            read_artifact(&repo, "sql", "space", &name, &mut sink)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sink.checkpoint, payload);
+            assert_eq!(sink.wal, Some(wal));
+        }
+        let compressed = fixture.conn.query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT count(*)::bigint AS count FROM database_artifact WHERE pg_column_compression(payload) IS NOT NULL OR pg_column_compression(delta_payload) IS NOT NULL".to_string(),
+        )).await.unwrap().unwrap();
+        assert_eq!(compressed.try_get::<i64>("", "count").unwrap(), 0);
+    }
+
     fn names(dir: &std::path::Path) -> Vec<String> {
         let mut found: Vec<String> = std::fs::read_dir(dir)
             .unwrap()

@@ -37,6 +37,8 @@ pub mod m20261109_000000_column_encryption_format;
 pub mod m20261111_000000_delegation_renewals;
 pub mod m20261112_000000_renewal_identity;
 
+pub mod m20261113_000000_database_artifact_external;
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -80,6 +82,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261109_000000_column_encryption_format::Migration),
             Box::new(m20261111_000000_delegation_renewals::Migration),
             Box::new(m20261112_000000_renewal_identity::Migration),
+            Box::new(m20261113_000000_database_artifact_external::Migration),
         ]
     }
 }
