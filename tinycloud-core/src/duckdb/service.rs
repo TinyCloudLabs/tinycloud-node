@@ -578,11 +578,27 @@ impl DuckDbService {
             return self.checkpoint(space, db_name, handle, false).await;
         }
 
-        if let Some(wal) = handle
-            .wal()
-            .await?
-            .filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES)
-        {
+        let wal = if expected != ArtifactExpectation::Absent {
+            match self
+                .artifact_repository
+                .load_meta("duckdb", &key.0, db_name)
+                .await
+                .map_err(artifact_error_to_duckdb)?
+            {
+                Some(meta) if meta.checkpoint_size_bytes >= 0 => {
+                    handle
+                        .wal_for_checkpoint(
+                            meta.checkpoint_size_bytes as u64,
+                            meta.checkpoint_content_hash,
+                        )
+                        .await?
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
                 .artifact_repository
                 .save_delta("duckdb", &space.to_string(), db_name, wal, expected.clone())
@@ -1937,5 +1953,158 @@ mod tests {
             .discard_local_state(&(space.to_string(), "main".into()))
             .await
             .unwrap();
+    }
+    #[tokio::test]
+    async fn tc2990_large_file_backed_insert_recovers_all_acknowledged_rows() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("large-file-write-recovery");
+        let key = (space.to_string(), "main".to_string());
+        let service = file_service(&cache, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id BIGINT, body VARCHAR)".into()]),
+                    sql: "INSERT INTO items VALUES (0, 'seed')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Hydration guarantees a file-backed actor, including when the native
+        // size estimate keeps a newly-created database in memory.
+        service.discard_local_state(&key).await.unwrap();
+        let mut expected_count = 1i64;
+        let mut expected_sum = 0i64;
+        for (round, rows) in [(1i64, 5i64), (2, 300_000), (3, 5)] {
+            service.execute(&space,"main",DuckDbRequest::Execute {
+                schema:None,
+                sql:format!("INSERT INTO items SELECT {round}*1000000+i, md5(i::VARCHAR) FROM range({rows}) t(i)"),
+                params:vec![],
+            },None,"tinycloud.duckdb/write".into(),false).await.unwrap();
+            expected_count += rows;
+            expected_sum += round * 1_000_000 * rows + rows * (rows - 1) / 2;
+            let fresh = TempDir::new().unwrap();
+            let reader = file_service(&fresh, repo.clone());
+            let recovered=reader.execute(&space,"main",DuckDbRequest::Query {
+                sql:"SELECT count(*),sum(id)::BIGINT,sum(CASE WHEN id=0 OR body=md5((id%1000000)::VARCHAR) THEN 1 ELSE 0 END)::BIGINT FROM items".into(),
+                params:vec![],
+            },None,"tinycloud.duckdb/read".into(),false).await;
+            let _ = reader.discard_local_state(&key).await;
+            let recovered = match recovered {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = service.discard_local_state(&key).await;
+                    panic!("acknowledged round {round} must recover from a fresh cache: {error:?}");
+                }
+            };
+            let DuckDbResponse::Query(query) = recovered.response else {
+                panic!("query required");
+            };
+            assert_eq!(
+                query.rows,
+                vec![vec![
+                    DuckDbValue::Integer(expected_count),
+                    DuckDbValue::Integer(expected_sum),
+                    DuckDbValue::Integer(expected_count)
+                ]]
+            );
+        }
+        service.discard_local_state(&key).await.unwrap();
+        let bytes = service.export(&space, "main").await.unwrap();
+        let export_dir = TempDir::new().unwrap();
+        let path = export_dir.path().join("recovered.duckdb");
+        std::fs::write(&path, bytes).unwrap();
+        let conn = storage::open_connection(Some(&path), "128MB").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, expected_count);
+    }
+    #[tokio::test]
+    async fn tc2990_wal_requires_both_checkpoint_length_and_cid() {
+        let repo = artifact_repository().await;
+        let source_cache = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("wal-checkpoint-identity");
+        let key = (space.to_string(), "main".to_string());
+        let source = file_service(&source_cache, repo.clone());
+        source
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        source.discard_local_state(&key).await.unwrap();
+        let service = file_service(&cache, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items VALUES (2)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/write".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let meta = repo
+            .load_meta("duckdb", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            meta.has_delta(),
+            "a small write must retain the WAL fast path"
+        );
+        let handle = service.databases.get(&key).unwrap().clone();
+        let wal = handle.wal().await.unwrap().unwrap();
+        assert!(handle
+            .wal_for_checkpoint(
+                meta.checkpoint_size_bytes as u64 + 1,
+                meta.checkpoint_content_hash.clone()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let wrong = crate::hash::hash(b"different checkpoint")
+            .to_cid(0x55)
+            .to_string();
+        assert!(handle
+            .wal_for_checkpoint(meta.checkpoint_size_bytes as u64, wrong)
+            .await
+            .unwrap()
+            .is_none());
+        let verified = handle
+            .wal_for_checkpoint(
+                meta.checkpoint_size_bytes as u64,
+                meta.checkpoint_content_hash,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verified, wal,
+            "failed identity checks must not checkpoint or truncate the WAL"
+        );
+        service.discard_local_state(&key).await.unwrap();
     }
 }
