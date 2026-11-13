@@ -232,7 +232,10 @@ impl SqlService {
 
     /// The checkpoint back-off (TC-2961): `first` after a failed or refused
     /// whole-checkpoint save, doubling per further failure up to `max`. The
-    /// node keeps the defaults (30 s, 15 min); only tests lower them.
+    /// node keeps the defaults (30 s, 15 min); only tests lower them. Public
+    /// only for the node-server tests: wiring it to node config is a
+    /// behaviour change that needs review, since a zero back-off brings back
+    /// the reload-and-retry loop TC-2961 removed.
     pub fn with_checkpoint_backoff(mut self, first: Duration, max: Duration) -> Self {
         self.checkpoint_backoff_bounds = (first, max);
         self
