@@ -662,8 +662,9 @@ fn migration_lock_wait_error(error: DbErr) -> DbErr {
         return error;
     }
     DbErr::Migration(format!(
-        "a migration gave up after waiting {MIGRATION_LOCK_TIMEOUT} (lock_timeout) for a table \
-         lock; another session holds a conflicting lock (SQLSTATE 55P03: {database}). Nothing \
+        "a migration reached its configured lock_timeout (boot default {MIGRATION_LOCK_TIMEOUT}; \
+         migrations may set a shorter limit) while waiting for a table lock; another session \
+         holds a conflicting lock (SQLSTATE 55P03: {database}). Nothing \
          was applied; end that session and restart."
     ))
 }

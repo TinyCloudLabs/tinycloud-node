@@ -1606,6 +1606,13 @@ pub struct SpacesConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SqlStorageConfig {
+    /// Opt-in PostgreSQL checkpoint parts (TC-2917); requires explicit capacities.
+    #[serde(default)]
+    pub chunked_artifacts: bool,
+    #[serde(default)]
+    pub chunked_artifact_max_bytes: u64,
+    #[serde(default)]
+    pub chunked_account_max_bytes: u64,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default = "default_sql_memory_threshold")]
@@ -1743,6 +1750,9 @@ impl SqlStorageConfig {
 impl Default for SqlStorageConfig {
     fn default() -> Self {
         Self {
+            chunked_artifacts: false,
+            chunked_artifact_max_bytes: 0,
+            chunked_account_max_bytes: 0,
             path: None,
             memory_threshold: default_sql_memory_threshold(),
             lock_wait_timeout_ms: default_sql_lock_wait_timeout_ms(),

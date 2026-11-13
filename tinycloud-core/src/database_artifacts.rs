@@ -1,4 +1,5 @@
 use std::future::Future;
+pub mod chunks;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -105,7 +106,9 @@ pub struct DeltaSave {
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseArtifactError {
     #[error("database artifact storage error: {0}")]
-    Db(#[from] DbErr),
+    Db(DbErr),
+    #[error("artifact storage limit reached")]
+    StorageLimit,
     #[error("database artifact payload too large: {0} bytes")]
     PayloadTooLarge(u64),
     /// A payload larger than the repository's single-statement write limit
@@ -138,6 +141,18 @@ pub enum DatabaseArtifactError {
     /// the bytes; the message is the sink's own.
     #[error("{0}")]
     Sink(String),
+}
+
+impl From<DbErr> for DatabaseArtifactError {
+    fn from(error: DbErr) -> Self {
+        if error.to_string().contains("TC2917_QUOTA") {
+            Self::StorageLimit
+        } else if error.to_string().contains("TC2917_LAYOUT") {
+            Self::StaleLineage
+        } else {
+            Self::Db(error)
+        }
+    }
 }
 
 /// The stored metadata of one artifact row: everything but the payload bytes.
@@ -205,6 +220,11 @@ pub trait ArtifactSink: Send {
     fn size_hint(&mut self, _part: ArtifactPart, _bytes: u64) {}
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
+    /// Whether the sink holds the whole artifact in memory. Such a read of a
+    /// large artifact waits for a large-transfer slot in either layout.
+    fn buffers_in_memory(&self) -> bool {
+        false
+    }
 }
 
 /// The most [`MemorySink`] allocates ahead of the bytes it is given.
@@ -232,6 +252,10 @@ impl ArtifactSink for MemorySink {
             self.wal = Some(Vec::new());
         }
         Ok(())
+    }
+
+    fn buffers_in_memory(&self) -> bool {
+        true
     }
 
     fn size_hint(&mut self, part: ArtifactPart, bytes: u64) {
@@ -637,6 +661,21 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError>;
 
+    fn chunked_checkpoints(&self, _service: &str, _space: &str, _name: &str) -> bool {
+        false
+    }
+
+    async fn save_snapshot(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _snapshot: tempfile::NamedTempFile,
+        _expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -724,11 +763,17 @@ pub struct SeaOrmDatabaseArtifactRepository {
     /// Permits for transfers over [`BASE_TIMEOUT_PAYLOAD_BYTES`]; shared by
     /// every clone of this repository.
     large_transfers: std::sync::Arc<tokio::sync::Semaphore>,
+    chunk_limits: Option<chunks::ChunkLimits>,
+    observed_chunked: std::sync::Arc<dashmap::DashSet<(String, String, String)>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
     #[cfg(test)]
     race_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    chunk_reclaim_paused: bool,
 }
 
 impl SeaOrmDatabaseArtifactRepository {
@@ -741,9 +786,20 @@ impl SeaOrmDatabaseArtifactRepository {
             large_transfers: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_LARGE_TRANSFERS,
             )),
+            chunk_limits: None,
+            observed_chunked: Default::default(),
             #[cfg(test)]
             race_barrier: None,
+            #[cfg(test)]
+            chunk_publish_barrier: None,
+            #[cfg(test)]
+            chunk_reclaim_paused: false,
         }
+    }
+
+    pub fn with_chunk_limits(mut self, limits: Option<chunks::ChunkLimits>) -> Self {
+        self.chunk_limits = limits;
+        self
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -941,7 +997,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         )>()
         .one(&self.conn)
         .await?;
-        Ok(row.map(
+        let meta = row.map(
             |(
                 revision,
                 size_bytes,
@@ -965,7 +1021,17 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 storage_mode,
                 backend,
             },
-        ))
+        );
+        let key = (service.to_string(), space.to_string(), name.to_string());
+        if meta
+            .as_ref()
+            .is_some_and(|m| m.storage_mode == "checkpoint-parts-v1")
+        {
+            self.observed_chunked.insert(key);
+        } else {
+            self.observed_chunked.remove(&key);
+        }
+        Ok(meta)
     }
 
     async fn read_chunks(
@@ -976,6 +1042,14 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
+        // Parts stream in bounded statements: the whole-artifact read cap and
+        // the large-transfer permit below are for the single-row layout.
+        if self
+            .read_chunk_layout(service, space, name, meta, sink)
+            .await?
+        {
+            return Ok(());
+        }
         // TC-2961: refuse an oversized database before any slice is read.
         if self.max_read_bytes != 0 {
             for (part, bytes) in [
@@ -1033,6 +1107,25 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         Ok(())
     }
 
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.chunk_limits.is_some()
+            || self
+                .observed_chunked
+                .contains(&(service.into(), space.into(), name.into()))
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.write_chunk_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -1048,6 +1141,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let _ = TRANSFER_STARTED.try_with(|started| {
             started.store(true, std::sync::atomic::Ordering::Release);
         });
+        self.ensure_legacy_write(service, space, name).await?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1256,6 +1350,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         self.check_write(payload.len())?;
+        self.ensure_legacy_write(service, space, name).await?;
         let _writer = match &self.sqlite_writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
