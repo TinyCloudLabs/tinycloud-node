@@ -209,7 +209,7 @@ impl DuckDbService {
 
         // Room for this write and for the snapshot copy its save can take,
         // which is at most the local database files.
-        let writes = disk::writes(&request, &caveats, &ability);
+        let writes = self.disk.active() && disk::writes(&request, &caveats, &ability);
         let _reservation = if writes {
             let cache_path = self.cache_path(space, db_name);
             let local_bytes = local_file_bytes(&cache_path).await;
@@ -3122,6 +3122,70 @@ mod tests {
             let durable = chunked_service(&fresh, repo);
             assert_eq!(
                 count(&durable, &space, "main", "SELECT count(*) FROM t").await,
+                1
+            );
+        }
+
+        /// An admin's `PREPARE … AS INSERT` and `EXECUTE`, sent as queries,
+        /// are held to the floor like the INSERT itself: the parser calls
+        /// both read-only, but neither is a plain query.
+        #[tokio::test]
+        async fn postgres_duckdb_prepared_insert_is_held_to_the_floor() {
+            let Some((_fixture, repo)) = chunked("postgres_duckdb_prepared_insert_floor").await
+            else {
+                return;
+            };
+            let cache = TempDir::new().unwrap();
+            let free = Arc::new(FakeFree(PLENTY.into()));
+            let service = chunked_service(&cache, repo).with_disk_policy(disk_policy(&free, MIN));
+            let space = test_space_id("prepared-insert");
+            exec(
+                &service,
+                &space,
+                "main",
+                write_request(
+                    "INSERT INTO t VALUES ('x')",
+                    Some("CREATE TABLE t(s VARCHAR)"),
+                ),
+            )
+            .await
+            .unwrap();
+            let query = |sql: &str| DuckDbRequest::Query {
+                sql: sql.into(),
+                params: vec![],
+            };
+            free.0.store(0, SeqCst);
+            let prepare = exec(
+                &service,
+                &space,
+                "main",
+                query("PREPARE grow AS INSERT INTO t SELECT md5(i::VARCHAR) FROM range(1000) r(i)"),
+            )
+            .await;
+            assert!(
+                matches!(prepare, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                prepare.map(|_| ())
+            );
+            free.0.store(PLENTY, SeqCst);
+            exec(
+                &service,
+                &space,
+                "main",
+                query("PREPARE grow AS INSERT INTO t SELECT md5(i::VARCHAR) FROM range(1000) r(i)"),
+            )
+            .await
+            .unwrap();
+            free.0.store(0, SeqCst);
+            let execute = exec(&service, &space, "main", query("EXECUTE grow")).await;
+            assert!(
+                matches!(execute, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                execute.map(|_| ())
+            );
+            free.0.store(PLENTY, SeqCst);
+            assert_eq!(
+                count(&service, &space, "main", "SELECT count(*) FROM t").await,
                 1
             );
         }

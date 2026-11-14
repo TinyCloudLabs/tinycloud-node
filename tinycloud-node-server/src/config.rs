@@ -2336,6 +2336,56 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&explicit.budget, &budget));
     }
 
+    /// With chunked artifacts on, the DuckDB floor must hold one artifact
+    /// ceiling; 0 (off) is refused too. With chunked artifacts off nothing is
+    /// required.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn chunked_artifacts_require_a_duckdb_floor_of_one_artifact_ceiling() {
+        const GIB: u64 = 1 << 30;
+        let chunked = |ceiling: u64, floor: Option<u64>| {
+            let mut config = Config::default();
+            config.storage.database = Some("postgres://test@localhost/test".into());
+            config.storage.sql.chunked_artifacts = true;
+            config.storage.sql.chunked_artifact_max_bytes = ceiling;
+            config.storage.sql.chunked_account_max_bytes = ceiling * 4;
+            config.storage.duckdb.min_free_bytes = floor.map(ByteUnit::Byte);
+            config
+        };
+        let mut flag_off = Config::default();
+        flag_off.storage.duckdb.min_free_bytes = Some(ByteUnit::Byte(1));
+        for (label, config, accepted) in [
+            (
+                "default floor (2 GiB), ceiling 2 GiB",
+                chunked(2 * GIB, None),
+                true,
+            ),
+            (
+                "default floor (2 GiB), ceiling 2 GiB + 1",
+                chunked(2 * GIB + 1, None),
+                false,
+            ),
+            (
+                "floor 4 GiB, ceiling 3 GiB",
+                chunked(3 * GIB, Some(4 * GIB)),
+                true,
+            ),
+            (
+                "floor 1 GiB, ceiling 3 GiB",
+                chunked(3 * GIB, Some(GIB)),
+                false,
+            ),
+            ("floor 0 (off), ceiling 1 GiB", chunked(GIB, Some(0)), false),
+            ("flag off, floor 1 byte", flag_off, true),
+        ] {
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                accepted,
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn column_encryption_strict_defaults_off_and_accepts_opt_in() {
         assert!(!Config::default().column_encryption.strict);

@@ -141,18 +141,23 @@ checkpoint also needs an owned temporary copy while streaming, and old/new
 versions overlap in PostgreSQL until their deletions commit. PostgreSQL can reuse deleted storage after vacuum; relation files need not
 shrink. Size refusal occurs after native execution.
 
-DuckDB keeps disk headroom on the filesystem behind its cache. With parts
-enabled, `storage.duckdb.min_free_bytes` defaults to 2 GiB and
-`storage.duckdb.max_temp_directory_size` to 1 GiB per connection; with parts
-off both stay off unless set. The 2 GiB floor is provisional until the
-`storage_headroom` event shows real headroom on production nodes; operators tune
-it by config. With parts enabled, the node refuses to start unless the floor is
-at least `storage.sql.chunked_artifact_max_bytes`: a write's save copies the
-database once more, outside the write's reservation. Leave a margin above that.
+DuckDB keeps disk headroom on the filesystem behind its cache. Both limits key
+on `storage.sql.chunked_artifacts`: with it on, `storage.duckdb.min_free_bytes`
+defaults to 2 GiB and `storage.duckdb.max_temp_directory_size` to 1 GiB per
+connection; with it off both stay off unless set. The 2 GiB floor is
+provisional until the `storage_headroom` event shows real headroom on
+production nodes; operators tune it by config. With chunked artifacts on, the
+node refuses to start unless the floor is at least
+`storage.sql.chunked_artifact_max_bytes`, so the floor cannot be turned off
+(0) while they are on: a write's save copies the database once more, outside
+the write's reservation. Leave a margin above that.
 
 - A write is any request that can change the database: executes, batches,
-  imports, and a query whose SQL is not read-only (the parser decides, as for
-  authorization).
+  imports, and any query that is not purely plain `SELECT`-style queries and
+  `EXPLAIN` without `ANALYZE` (so an admin's `PREPARE … AS INSERT` and
+  `EXECUTE`, `CALL`, `CREATE SCHEMA` and the like count). SQL that fails to
+  parse or is refused also counts, so while free space is below the floor it
+  answers `507 duckdb_disk_headroom` rather than its 400 or 403.
 - Before a write runs, it reserves its local database files' size (the bound
   of the snapshot copy its save can take); an import reserves twice its size.
   Reservations share the node-wide budget with SQL. A reservation that would

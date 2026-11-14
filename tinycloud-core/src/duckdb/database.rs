@@ -370,7 +370,8 @@ pub(crate) fn spawn_actor_with_disk(
                     response_tx,
                 } => {
                     let budget_key = disk::budget_key(&space_id, &db_name);
-                    let write = disk::writes(&request, &caveats, &ability);
+                    let write =
+                        disk.headroom_checked() && disk::writes(&request, &caveats, &ability);
                     let result = disk.watch(&budget_key, &file_path, &conn, write, || {
                         if without_growth {
                             handle_message_without_growth(

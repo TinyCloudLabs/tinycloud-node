@@ -64,18 +64,31 @@ pub(crate) fn budget_key(space: &str, db_name: &str) -> String {
 }
 
 /// Requests that can change the database and are saved afterwards: they
-/// reserve room and run under the watcher. A `query` counts when its SQL is
-/// not read-only (the parser decides, as the route does); exports and
-/// `describe` never do. Only the spill limit applies to the rest.
+/// reserve room and run under the watcher. A `query` is read-only only when
+/// the parser finds it read-only *and* every statement is a plain query or an
+/// `EXPLAIN` that does not run its statement; anything else an admin may send
+/// as a query (`PREPARE … AS INSERT` with `EXECUTE`, `CALL checkpoint()`,
+/// `CREATE SCHEMA`, …) counts as a write, as does SQL the parser refuses.
+/// Exports and `describe` never do. Only the spill limit applies to the rest.
 pub(crate) fn writes(
     request: &DuckDbRequest,
     caveats: &Option<DuckDbCaveats>,
     ability: &str,
 ) -> bool {
+    use sqlparser::ast::Statement;
     match request {
-        // A query the parser refuses never runs; counting it is harmless.
-        DuckDbRequest::Query { sql, .. } => super::parser::validate_sql(sql, caveats, ability)
-            .map_or(true, |parsed| !parsed.is_read_only),
+        DuckDbRequest::Query { sql, .. } => !super::parser::validate_sql(sql, caveats, ability)
+            .is_ok_and(|parsed| {
+                parsed.is_read_only
+                    && parsed.statements.iter().all(|statement| {
+                        matches!(
+                            statement,
+                            Statement::Query(_)
+                                | Statement::ExplainTable { .. }
+                                | Statement::Explain { analyze: false, .. }
+                        )
+                    })
+            }),
         DuckDbRequest::Describe | DuckDbRequest::Export | DuckDbRequest::ExportToKv { .. } => false,
         _ => true,
     }
@@ -84,6 +97,12 @@ pub(crate) fn writes(
 impl DuckDbDiskPolicy {
     pub(crate) fn headroom_checked(&self) -> bool {
         self.min_free_bytes > 0
+    }
+
+    /// Whether the policy can refuse anything: a floor or a spill limit. With
+    /// neither, requests are not classified at all.
+    pub(crate) fn active(&self) -> bool {
+        self.headroom_checked() || self.max_temp_directory_bytes > 0
     }
 
     /// Reserve `bytes` for one operation of `key`, measured against the

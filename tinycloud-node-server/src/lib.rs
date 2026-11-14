@@ -1121,11 +1121,12 @@ pub async fn app_with_control(
             .clone(),
         database_artifact_repository,
     )
+    // Keyed on the configured flag, as the startup floor check is.
     .with_disk_policy(
         tinycloud_config
             .storage
             .duckdb
-            .disk_policy(artifact_collector.is_some(), disk_budget),
+            .disk_policy(tinycloud_config.storage.sql.chunked_artifacts, disk_budget),
     );
     #[cfg(feature = "duckdb")]
     duckdb_service.sweep_stale_cache_files().await;
