@@ -472,8 +472,10 @@ impl Drop for StagingRelease {
 
 /// Remove the `<final>.tmp.<pid>.<n>` files a crashed hydration left beside
 /// each of `finals`: exactly this sink's temp-name pattern, and never a file
-/// this process still has in flight. Run before a hydration begins, under the
-/// database's hydration exclusion.
+/// this process still has in flight. A directory with that name is a DuckDB
+/// spill directory an evicted actor moved aside, and is removed with its
+/// contents. Run before a hydration begins, under the database's hydration
+/// exclusion.
 pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
     for path in finals {
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -505,8 +507,17 @@ pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&temp);
-            if is_staging && !live && tokio::fs::remove_file(&temp).await.is_ok() {
-                tracing::info!("Removed a staging file left by an interrupted hydration");
+            if !is_staging || live {
+                continue;
+            }
+            let removed = match entry.file_type().await {
+                Ok(kind) if kind.is_dir() => tokio::fs::remove_dir_all(&temp).await,
+                _ => tokio::fs::remove_file(&temp).await,
+            };
+            if removed.is_ok() {
+                tracing::info!(
+                    "Removed a staging file left by an interrupted hydration or cleanup"
+                );
             }
         }
     }

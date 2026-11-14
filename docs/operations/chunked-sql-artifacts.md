@@ -128,7 +128,12 @@ New DuckDB databases with parts enabled start file-backed under the existing
 node data directory, regardless of the in-memory threshold. Their actor fence
 protects checkpoint/WAL copies. Closing or idle-evicting an actor removes its
 cache files after the native connection is closed; the next access rehydrates
-from durable parts. Legacy actors retain their existing storage behavior.
+from durable parts. The files are renamed aside while the actor's registration
+is held and deleted after it is released, so other databases' lookups do not
+wait on the deletion; if the process stops in between, the next hydration of
+that database removes them. A spill directory left by a stopped process does
+not block hydration, and an import that fails leaves no staged or imported
+file. Legacy actors retain their existing storage behavior.
 
 For disk headroom, each successfully persisted open database retains at most
 the configured artifact ceiling in checkpoint plus cumulative WAL. A full
@@ -152,7 +157,6 @@ the local main file's length and CID with the stored checkpoint under the
 actor fence. A mismatch requires a complete checkpoint, including blocks
 written directly to the main file by a large insert.
 
-The feature remains off. Additional file-removal lock duration, spill-directory
-cleanup, import failure cleanup and disk/spill admission conditions still need
-their separate acceptance before activation, alongside conversion and the
+The feature remains off. DuckDB disk and spill admission still needs its
+separate acceptance before activation, alongside conversion and the
 ceiling-load benchmark.
