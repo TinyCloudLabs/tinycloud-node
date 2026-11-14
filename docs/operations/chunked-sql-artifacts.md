@@ -139,10 +139,44 @@ For disk headroom, each successfully persisted open database retains at most
 the configured artifact ceiling in checkpoint plus cumulative WAL. A full
 checkpoint also needs an owned temporary copy while streaming, and old/new
 versions overlap in PostgreSQL until their deletions commit. PostgreSQL can reuse deleted storage after vacuum; relation files need not
-shrink. Size refusal occurs after native execution;
-the separate snapshot/headroom acceptance must cover transient oversized
-writes and temporary copies before enabling. Operators check CVM disk headroom
-against the number and ceilings of open databases, plus that transient cost.
+shrink. Size refusal occurs after native execution.
+
+DuckDB keeps disk headroom on the filesystem behind its cache. Both limits key
+on `storage.sql.chunked_artifacts`: with it on, `storage.duckdb.min_free_bytes`
+defaults to 2 GiB and `storage.duckdb.max_temp_directory_size` to 1 GiB per
+connection; with it off both stay off unless set. The 2 GiB floor is
+provisional until the `storage_headroom` event shows real headroom on
+production nodes; operators tune it by config. With chunked artifacts on, the
+node refuses to start unless the floor is at least
+`storage.sql.chunked_artifact_max_bytes`, so the floor cannot be turned off
+(0) while they are on: a write's save copies the database once more, outside
+the write's reservation. Leave a margin above that.
+
+- A write is any request that can change the database: executes, batches,
+  imports, and any query that is not purely plain `SELECT`-style queries and
+  `EXPLAIN` without `ANALYZE` (so an admin's `PREPARE … AS INSERT` and
+  `EXECUTE`, `CALL`, `CREATE SCHEMA` and the like count). SQL that fails to
+  parse or is refused also counts, so while free space is below the floor it
+  answers `507 duckdb_disk_headroom` rather than its 400 or 403.
+- Before a write runs, it reserves its local database files' size (the bound
+  of the snapshot copy its save can take); an import reserves twice its size.
+  Reservations share the node-wide budget with SQL. A reservation that would
+  leave less than the floor is refused with `507 duckdb_disk_headroom` and
+  nothing runs.
+- While a write runs, it is interrupted whenever free space is below what
+  other operations hold plus the floor. It answers `507 duckdb_disk_headroom`,
+  and the database's local copy is dropped and reloaded from its last saved
+  artifact on the next request. So nothing from the request is kept: not a
+  transaction that committed just before the interrupt was reported, and not
+  the earlier statements of a non-transactional batch.
+- A statement that spills past the per-connection limit also answers
+  `507 duckdb_disk_headroom`. Read-only queries and exports reserve nothing and
+  are not interrupted for headroom; only the spill limit applies to them.
+- Hydration is not gated: it writes at most the artifact ceiling and is freed
+  at eviction.
+- At startup, before it serves, the node removes what a stopped process left in
+  the DuckDB cache: spill directories and staging or renamed-aside files. The
+  cache files themselves stay, because a legacy database reopens them.
 
 Artifact, account and single-statement capacity refusals return 507. Existing
 per-space growth refusals retain 402. A concurrent replacement or contended
@@ -157,6 +191,5 @@ the local main file's length and CID with the stored checkpoint under the
 actor fence. A mismatch requires a complete checkpoint, including blocks
 written directly to the main file by a large insert.
 
-The feature remains off. DuckDB disk and spill admission still needs its
-separate acceptance before activation, alongside conversion and the
-ceiling-load benchmark.
+The feature remains off. Conversion and the ceiling-load benchmark still need
+their separate acceptance before activation.

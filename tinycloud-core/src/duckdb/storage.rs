@@ -15,7 +15,17 @@ pub enum StorageMode {
 /// Open a database with the native diagnostic and external-access policy locked.
 /// A missing path selects an in-memory database.
 pub fn open_connection(path: Option<&Path>, max_memory: &str) -> Result<Connection, DuckDbError> {
-    open_guarded_connection(path, Some(max_memory))
+    open_guarded_connection(path, Some(max_memory), 0)
+}
+
+/// [`open_connection`], with at most `max_temp_directory_bytes` spilled to the
+/// connection's temporary directory (0 keeps DuckDB's default).
+pub fn open_spill_capped_connection(
+    path: Option<&Path>,
+    max_memory: &str,
+    max_temp_directory_bytes: u64,
+) -> Result<Connection, DuckDbError> {
+    open_guarded_connection(path, Some(max_memory), max_temp_directory_bytes)
 }
 
 /// Open an offline snapshot/cache under the node's complete native admission
@@ -23,12 +33,13 @@ pub fn open_connection(path: Option<&Path>, max_memory: &str) -> Result<Connecti
 /// trusted memory setting, so preserve DuckDB's native default rather than
 /// inventing a node limit or reading operator configuration.
 pub fn open_offline_connection(path: &Path) -> Result<Connection, DuckDbError> {
-    open_guarded_connection(Some(path), None)
+    open_guarded_connection(Some(path), None, 0)
 }
 
 fn open_guarded_connection(
     path: Option<&Path>,
     max_memory: Option<&str>,
+    max_temp_directory_bytes: u64,
 ) -> Result<Connection, DuckDbError> {
     // External access must already be disabled during native open/WAL recovery.
     // Profiling and logging are disabled by default; their setters require a
@@ -49,7 +60,7 @@ fn open_guarded_connection(
         }
     };
 
-    apply_security_settings(&conn, max_memory)?;
+    apply_security_settings(&conn, max_memory, max_temp_directory_bytes)?;
     audit_stored_code(&conn)?;
 
     Ok(conn)
@@ -75,7 +86,11 @@ fn validate_max_memory(value: &str) -> Result<(), DuckDbError> {
     Ok(())
 }
 
-fn apply_security_settings(conn: &Connection, max_memory: Option<&str>) -> Result<(), DuckDbError> {
+fn apply_security_settings(
+    conn: &Connection,
+    max_memory: Option<&str>,
+    max_temp_directory_bytes: u64,
+) -> Result<(), DuckDbError> {
     if let Some(max_memory) = max_memory {
         validate_max_memory(max_memory)?;
     }
@@ -99,6 +114,16 @@ fn apply_security_settings(conn: &Connection, max_memory: Option<&str>) -> Resul
         .map_err(|e| DuckDbError::Internal(format!("Failed to apply security settings: {}", e)))?;
     if let Some(max_memory) = max_memory {
         let sql = format!("SET max_memory = '{}';", max_memory);
+        let result = {
+            let _timer = QueryTimer::new();
+            conn.execute_batch(&sql)
+        };
+        result.map_err(|e| {
+            DuckDbError::Internal(format!("Failed to apply security settings: {}", e))
+        })?;
+    }
+    if max_temp_directory_bytes > 0 {
+        let sql = format!("SET max_temp_directory_size = '{max_temp_directory_bytes}B';");
         let result = {
             let _timer = QueryTimer::new();
             conn.execute_batch(&sql)
@@ -228,7 +253,18 @@ pub fn promote_to_file(
     path: &Path,
     max_memory: &str,
 ) -> Result<Connection, DuckDbError> {
-    let file_conn = open_connection(Some(path), max_memory)?;
+    promote_to_spill_capped_file(conn, path, max_memory, 0)
+}
+
+/// [`promote_to_file`], opening the file under the spill limit of
+/// [`open_spill_capped_connection`].
+pub fn promote_to_spill_capped_file(
+    conn: &Connection,
+    path: &Path,
+    max_memory: &str,
+    max_temp_directory_bytes: u64,
+) -> Result<Connection, DuckDbError> {
+    let file_conn = open_spill_capped_connection(Some(path), max_memory, max_temp_directory_bytes)?;
 
     // Copy tables from in-memory conn to file-backed conn
     copy_tables(conn, &file_conn)?;
