@@ -16,7 +16,7 @@ use rocket::{
     Build, Rocket, Route,
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -1390,6 +1390,27 @@ pub async fn app_with_control(
         rocket
     };
 
+    // TC-2917: every 5 minutes, report the free bytes behind each local store
+    // as a log event (shipped by the log sidecar) and as a gauge. Operators
+    // have no shell on the node; this is how they see disk headroom.
+    let headroom_stores = local_stores(&tinycloud_config.storage);
+    let rocket = rocket.attach(AdHoc::on_liftoff("storage-headroom", move |rocket| {
+        let stores = headroom_stores.clone();
+        let shutdown = rocket.shutdown();
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(STORAGE_HEADROOM_PERIOD);
+                tokio::pin!(shutdown);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => report_storage_headroom(&stores),
+                        _ = &mut shutdown => break,
+                    }
+                }
+            });
+        })
+    }));
+
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
         let control_stopping = control.clone();
@@ -1693,6 +1714,51 @@ async fn sample_db_telemetry(
     let read_audit = tinycloud.read_audit_health();
     crate::prometheus::observe_read_audit(last_read_audit, &read_audit);
     *last_read_audit = read_audit;
+}
+
+/// How often [`report_storage_headroom`] runs.
+const STORAGE_HEADROOM_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The local stores whose filesystem headroom is reported, by the label they
+/// are reported under.
+fn local_stores(storage: &config::Storage) -> Vec<(&'static str, PathBuf)> {
+    let mut stores = Vec::new();
+    if let Some(path) = &storage.sql.path {
+        stores.push(("sql", PathBuf::from(path)));
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(path) = &storage.duckdb.path {
+        stores.push(("duckdb", PathBuf::from(path)));
+    }
+    stores
+}
+
+/// The granularity of the free bytes in the shipped headroom event: exact
+/// values every 5 minutes would let a quiet node's write volume be inferred
+/// by whoever reads the logs; 64 MiB steps still show headroom.
+const STORAGE_HEADROOM_STEP_BYTES: u64 = 64 << 20;
+
+/// The log target of the headroom event. It is not a module path, so no other
+/// line in the node can carry it by accident.
+const STORAGE_HEADROOM_TARGET: &str = "tinycloud::disk_headroom";
+
+/// One `statvfs` per store: the exact free bytes go to the gauge, and one
+/// `storage headroom` event per store carries them rounded down to
+/// [`STORAGE_HEADROOM_STEP_BYTES`]; the log sidecar ships it with only these
+/// two fields. A store that cannot be read is skipped.
+fn report_storage_headroom(stores: &[(&'static str, PathBuf)]) {
+    use tinycloud_core::sql::durability::{FreeSpace, StatvfsFreeSpace};
+    for (store, path) in stores {
+        if let Ok(free_bytes) = StatvfsFreeSpace.free_bytes(path) {
+            crate::prometheus::set_storage_free_bytes(store, free_bytes);
+            ::tracing::info!(
+                target: STORAGE_HEADROOM_TARGET,
+                store = *store,
+                free_bytes = free_bytes - free_bytes % STORAGE_HEADROOM_STEP_BYTES,
+                "storage headroom"
+            );
+        }
+    }
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed

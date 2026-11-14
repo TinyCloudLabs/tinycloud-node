@@ -51,6 +51,10 @@ enum DbMessage {
     Snapshot {
         response_tx: oneshot::Sender<Result<tempfile::NamedTempFile, SqlError>>,
     },
+    WalSnapshot {
+        max_bytes: u64,
+        response_tx: oneshot::Sender<Result<Option<tempfile::NamedTempFile>, SqlError>>,
+    },
     Checkpoint {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
@@ -181,6 +185,26 @@ impl DatabaseHandle {
             .send((
                 request_telemetry::current(),
                 DbMessage::Snapshot { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".into()))?
+    }
+
+    pub async fn wal_snapshot(
+        &self,
+        max_bytes: u64,
+    ) -> Result<Option<tempfile::NamedTempFile>, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::WalSnapshot {
+                    max_bytes,
+                    response_tx,
+                },
             ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
@@ -431,6 +455,14 @@ pub fn spawn_actor_with_policy(
                     }
                     let _ = response_tx.send(result);
                 }
+                DbMessage::WalSnapshot {
+                    max_bytes,
+                    response_tx,
+                } => {
+                    // Actor ownership fences the copy from concurrent writes/checkpoints.
+                    let result = handle_wal_snapshot(&mode, &file_path, max_bytes);
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Checkpoint { response_tx } => {
                     let result = handle_checkpoint(&conn, &mode, &file_path);
                     if result.is_ok() {
@@ -475,6 +507,33 @@ fn existing_ancestor(path: &Path) -> &Path {
     path.ancestors()
         .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())
         .unwrap_or_else(|| Path::new("."))
+}
+
+fn handle_wal_snapshot(
+    mode: &StorageMode,
+    file_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<tempfile::NamedTempFile>, SqlError> {
+    if !matches!(mode, StorageMode::File(_)) {
+        return Ok(None);
+    }
+    let mut source = match std::fs::File::open(format!("{}-wal", file_path.display())) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SqlError::Internal(error.to_string())),
+    };
+    let size = source
+        .metadata()
+        .map_err(|e| SqlError::Internal(e.to_string()))?
+        .len();
+    if size == 0 || size >= max_bytes {
+        return Ok(None);
+    }
+    let mut snapshot =
+        tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
+    std::io::copy(&mut source, snapshot.as_file_mut())
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(Some(snapshot))
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, SqlError> {

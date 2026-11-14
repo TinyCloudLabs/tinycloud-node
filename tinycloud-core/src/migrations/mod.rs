@@ -40,6 +40,7 @@ pub mod m20261112_000000_renewal_identity;
 pub mod m20261113_000000_database_artifact_external;
 
 pub mod m20261113_010000_artifact_chunks;
+pub mod m20261113_020000_artifact_chunk_wal;
 
 pub struct Migrator;
 
@@ -86,6 +87,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261112_000000_renewal_identity::Migration),
             Box::new(m20261113_000000_database_artifact_external::Migration),
             Box::new(m20261113_010000_artifact_chunks::Migration),
+            Box::new(m20261113_020000_artifact_chunk_wal::Migration),
         ]
     }
 }

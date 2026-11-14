@@ -69,7 +69,8 @@
         "ingress_request",
         "node_warning",
         "node_error",
-        "logship_gate_summary_total"
+        "logship_gate_summary_total",
+        "node_storage_headroom"
       ],
       "fields": {
         "svc": { "type": "enum", "values": ["api", "ingress", "logship"] },
@@ -94,7 +95,9 @@
         "write_may_have_applied": { "type": "boolean" },
         "class": { "type": "enum", "values": ["db_failure_5xx", "node_request_5xx", "ingress_request_5xx", "node_request_4xx", "ingress_request_4xx"] },
         "dropped": { "type": "integer", "min": 1, "max": 9007199254740991 },
-        "window_s": { "type": "integer", "min": 60, "max": 60 }
+        "window_s": { "type": "integer", "min": 60, "max": 60 },
+        "store": { "type": "enum", "values": ["sql", "duckdb"] },
+        "free_bytes": { "type": "integer", "min": 0, "max": 9007199254740991 }
       }
     },
     "tinychat-backend": { "events": [], "fields": {} },

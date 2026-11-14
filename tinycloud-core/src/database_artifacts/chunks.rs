@@ -123,8 +123,31 @@ impl SeaOrmDatabaseArtifactRepository {
         snapshot: tempfile::NamedTempFile,
         expected: ArtifactExpectation,
     ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.write_chunk_file(
+            service,
+            space,
+            name,
+            snapshot,
+            expected,
+            ArtifactPart::Checkpoint,
+        )
+        .await
+    }
+
+    pub(super) async fn write_chunk_file(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+        kind: ArtifactPart,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
         if self.conn.get_database_backend() != DbBackend::Postgres {
             return Err(DatabaseArtifactError::IncrementalPersistenceUnsupported);
+        }
+        if kind == ArtifactPart::Wal && !matches!(expected, ArtifactExpectation::Derived { .. }) {
+            return Err(DatabaseArtifactError::StaleLineage);
         }
         let limits = match self.chunk_limits {
             Some(limits) => limits,
@@ -158,6 +181,22 @@ impl SeaOrmDatabaseArtifactRepository {
                 .as_ref()
                 .map(|m| (m.revision, m.checkpoint_content_hash.as_str())),
         )?;
+        if kind == ArtifactPart::Wal
+            && current
+                .as_ref()
+                .is_none_or(|m| m.storage_mode != "checkpoint-parts-v1")
+        {
+            return Err(DatabaseArtifactError::MissingCheckpoint);
+        }
+        let logical_size = if kind == ArtifactPart::Wal {
+            size.checked_add(current.as_ref().unwrap().checkpoint_size_bytes.max(0) as u64)
+                .ok_or(DatabaseArtifactError::StorageLimit)?
+        } else {
+            size
+        };
+        if logical_size > limits.artifact_bytes || logical_size > i64::MAX as u64 {
+            return Err(DatabaseArtifactError::StorageLimit);
+        }
         let mut random = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut random);
         let part_id = hex::encode(random);
@@ -180,7 +219,7 @@ impl SeaOrmDatabaseArtifactRepository {
         let reserved = self
             .conn
             .query_one(statement(
-                "SELECT artifact_reserve($1,$2,$3,$4,$5,$6,$7,$8,$9) AS admitted",
+                "SELECT artifact_reserve_part($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) AS admitted",
                 vec![
                     service.into(),
                     space.into(),
@@ -194,6 +233,7 @@ impl SeaOrmDatabaseArtifactRepository {
                         .as_ref()
                         .map(|m| m.checkpoint_content_hash.clone())
                         .into(),
+                    (kind == ArtifactPart::Wal).into(),
                 ],
             ))
             .await?
@@ -235,7 +275,7 @@ impl SeaOrmDatabaseArtifactRepository {
         }
         if total != size || ordinal != count {
             return Err(DatabaseArtifactError::SizeMismatch {
-                part: "checkpoint",
+                part: kind.as_str(),
                 expected: size,
                 actual: total,
             });
@@ -284,7 +324,42 @@ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='uploading'
         }
         // One metadata-only statement is the acknowledgement boundary. Parts
         // are already durable and sealed; no transaction spans the transfer.
-        let sql = if let Some(previous) = current {
+        let checkpoint_hash = if kind == ArtifactPart::Wal {
+            current.as_ref().unwrap().checkpoint_content_hash.clone()
+        } else {
+            cid.clone()
+        };
+        let content_hash = if kind == ArtifactPart::Wal {
+            hash(format!("{checkpoint_hash}:{cid}").as_bytes())
+                .to_cid(0x55)
+                .to_string()
+        } else {
+            cid.clone()
+        };
+        let checkpoint_size = if kind == ArtifactPart::Wal {
+            current.as_ref().unwrap().checkpoint_size_bytes
+        } else {
+            size as i64
+        };
+        let sql = if kind == ArtifactPart::Wal {
+            let previous = current.as_ref().unwrap();
+            values.extend([
+                previous.revision.into(),
+                checkpoint_hash.clone().into(),
+                content_hash.clone().into(),
+                (logical_size as i64).into(),
+            ]);
+            r#"WITH owner_lock AS MATERIALIZED (SELECT owner FROM artifact_account
+ WHERE owner=(SELECT owner FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4) FOR UPDATE),
+ ready AS (SELECT p.part_id FROM artifact_part p CROSS JOIN owner_lock
+ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='sealed' FOR UPDATE OF p)
+UPDATE database_artifact SET delta_part_id=$4,revision=$5,delta_content_hash=$6,
+ delta_size_bytes=$7,updated_at=$8,content_hash=$11,size_bytes=$12,
+ delta_payload=NULL,layout_generation=layout_generation+1
+WHERE service=$1 AND space=$2 AND name=$3 AND revision=$9 AND checkpoint_content_hash=$10
+ AND checkpoint_part_id IS NOT NULL AND storage_mode='checkpoint-parts-v1'
+ AND EXISTS(SELECT 1 FROM ready)"#
+        } else if let Some(previous) = current {
             values.extend([
                 previous.revision.into(),
                 previous.checkpoint_content_hash.into(),
@@ -332,12 +407,16 @@ FROM ready ON CONFLICT DO NOTHING"#
         }
         Ok(ArtifactMeta {
             revision,
-            size_bytes: size as i64,
-            content_hash: cid.clone(),
-            checkpoint_content_hash: cid,
-            checkpoint_size_bytes: size as i64,
-            delta_content_hash: None,
-            delta_size_bytes: 0,
+            size_bytes: logical_size as i64,
+            content_hash,
+            checkpoint_content_hash: checkpoint_hash,
+            checkpoint_size_bytes: checkpoint_size,
+            delta_content_hash: (kind == ArtifactPart::Wal).then_some(cid),
+            delta_size_bytes: if kind == ArtifactPart::Wal {
+                size as i64
+            } else {
+                0
+            },
             updated_at: now,
             storage_mode: "checkpoint-parts-v1".into(),
             backend: "storage.database".into(),
@@ -375,71 +454,93 @@ FROM ready ON CONFLICT DO NOTHING"#
             vec![service.into(),space.into(),name.into()],
         )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
         let generation: i64 = row.try_get("", "layout_generation")?;
-        let part: Option<String> = row.try_get("", "checkpoint_part_id")?;
-        let Some(part) = part else { return Ok(false) };
+        let checkpoint: Option<String> = row.try_get("", "checkpoint_part_id")?;
+        let wal: Option<String> = row.try_get("", "delta_part_id")?;
+        let checkpoint = checkpoint.ok_or(DatabaseArtifactError::ArtifactChanged)?;
         if row.try_get::<i64>("", "revision")? != meta.revision
             || row.try_get::<String>("", "checkpoint_content_hash")? != meta.checkpoint_content_hash
+            || wal.is_some() != meta.has_delta()
         {
             return Err(DatabaseArtifactError::ArtifactChanged);
         }
-        if row
-            .try_get::<Option<String>>("", "delta_part_id")?
-            .is_some()
-            || meta.has_delta()
-        {
-            return Err(DatabaseArtifactError::IncrementalPersistenceUnsupported);
+        let mut parts = vec![(
+            ArtifactPart::Checkpoint,
+            checkpoint.clone(),
+            meta.checkpoint_size_bytes,
+            meta.checkpoint_content_hash.clone(),
+        )];
+        if let Some(part) = &wal {
+            parts.push((
+                ArtifactPart::Wal,
+                part.clone(),
+                meta.delta_size_bytes,
+                meta.delta_content_hash
+                    .clone()
+                    .ok_or(DatabaseArtifactError::ArtifactChanged)?,
+            ));
         }
-        let manifest=self.conn.query_one(statement(
-            "SELECT size_bytes,chunk_count,content_hash FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='published'",
-            vec![service.into(),space.into(),name.into(),part.clone().into()],
-        )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
-        let size = manifest.try_get::<i64>("", "size_bytes")?;
-        let count = manifest.try_get::<i32>("", "chunk_count")?;
-        let cid = manifest.try_get::<String>("", "content_hash")?;
-        if size != meta.checkpoint_size_bytes
-            || cid != meta.checkpoint_content_hash
-            || size < 0
-            || count as u64 != (size as u64).div_ceil(CHUNK_BYTES as u64)
-        {
-            return Err(DatabaseArtifactError::ArtifactChanged);
-        }
-        sink.begin_part(ArtifactPart::Checkpoint).await?;
-        sink.size_hint(ArtifactPart::Checkpoint, size as u64);
-        let mut hasher = Blake3Hasher::new();
-        let mut total = 0u64;
-        for ordinal in 0..count {
-            let row=self.conn.query_one(statement(
-                "SELECT payload FROM artifact_chunk WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND ordinal=$5",
-                vec![service.into(),space.into(),name.into(),part.clone().into(),ordinal.into()],
+        for (kind, part, size, cid) in parts {
+            let manifest=self.conn.query_one(statement(
+                "SELECT size_bytes,chunk_count,content_hash FROM artifact_part WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='published'",
+                vec![service.into(),space.into(),name.into(),part.clone().into()],
             )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
-            let bytes: Vec<u8> = row.try_get("", "payload")?;
-            let expected = (size as u64 - total).min(CHUNK_BYTES as u64);
-            if bytes.len() as u64 != expected {
-                return Err(DatabaseArtifactError::SizeMismatch {
-                    part: "checkpoint",
-                    expected,
-                    actual: bytes.len() as u64,
+            let count = manifest.try_get::<i32>("", "chunk_count")?;
+            if size < 0
+                || manifest.try_get::<i64>("", "size_bytes")? != size
+                || manifest.try_get::<String>("", "content_hash")? != cid
+                || count as u64 != (size as u64).div_ceil(CHUNK_BYTES as u64)
+            {
+                return Err(DatabaseArtifactError::ArtifactChanged);
+            }
+            sink.begin_part(kind).await?;
+            sink.size_hint(kind, size as u64);
+            let mut hasher = Blake3Hasher::new();
+            let mut total = 0u64;
+            for ordinal in 0..count {
+                let row=self.conn.query_one(statement(
+                    "SELECT payload FROM artifact_chunk WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND ordinal=$5",
+                    vec![service.into(),space.into(),name.into(),part.clone().into(),ordinal.into()],
+                )).await?.ok_or(DatabaseArtifactError::ArtifactChanged)?;
+                let bytes: Vec<u8> = row.try_get("", "payload")?;
+                let expected = (size as u64 - total).min(CHUNK_BYTES as u64);
+                if bytes.len() as u64 != expected {
+                    return Err(DatabaseArtifactError::SizeMismatch {
+                        part: kind.as_str(),
+                        expected,
+                        actual: bytes.len() as u64,
+                    });
+                }
+                hasher.update(&bytes);
+                sink.write(&bytes).await?;
+                total += bytes.len() as u64;
+            }
+            if hasher.finalize().to_cid(0x55).to_string() != cid {
+                tracing::warn!(
+                    event = "artifact_part_hash_mismatch",
+                    "Artifact part integrity check failed"
+                );
+                return Err(DatabaseArtifactError::HashMismatch {
+                    part: kind.as_str(),
                 });
             }
-            hasher.update(&bytes);
-            sink.write(&bytes).await?;
-            total += bytes.len() as u64;
+            sink.finish_part().await?;
         }
-        if hasher.finalize().to_cid(0x55).to_string() != cid || cid != meta.content_hash {
-            tracing::warn!(
-                event = "artifact_part_hash_mismatch",
-                "Artifact part integrity check failed"
-            );
-            return Err(DatabaseArtifactError::HashMismatch { part: "checkpoint" });
+        let logical = match &meta.delta_content_hash {
+            Some(delta) => hash(format!("{}:{delta}", meta.checkpoint_content_hash).as_bytes())
+                .to_cid(0x55)
+                .to_string(),
+            None => meta.checkpoint_content_hash.clone(),
+        };
+        if logical != meta.content_hash {
+            return Err(DatabaseArtifactError::HashMismatch { part: "content" });
         }
         let unchanged=self.conn.query_one(statement(
-            "SELECT 1 AS present FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3 AND revision=$4 AND checkpoint_content_hash=$5 AND checkpoint_part_id=$6 AND layout_generation=$7",
-            vec![service.into(),space.into(),name.into(),meta.revision.into(),cid.into(),part.into(),generation.into()],
+            "SELECT 1 AS present FROM database_artifact WHERE service=$1 AND space=$2 AND name=$3 AND revision=$4 AND checkpoint_content_hash=$5 AND checkpoint_part_id=$6 AND layout_generation=$7 AND delta_part_id IS NOT DISTINCT FROM $8",
+            vec![service.into(),space.into(),name.into(),meta.revision.into(),meta.checkpoint_content_hash.clone().into(),checkpoint.into(),generation.into(),wal.into()],
         )).await?.is_some();
         if !unchanged {
             return Err(DatabaseArtifactError::ArtifactChanged);
-        };
-        sink.finish_part().await?;
+        }
         Ok(true)
     }
 }
@@ -1861,5 +1962,268 @@ mod tests {
         );
         drop(held);
         assert_eq!(waiting.await.unwrap().unwrap(), size);
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_wal_lifecycle_quota_and_integrity() {
+        use crate::database_artifacts::test_support::ReadAll;
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_wal_lifecycle_quota_and_integrity",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:wal";
+        let mut repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_chunk_limits(Some(ChunkLimits {
+                artifact_bytes: 8 * CHUNK_BYTES as u64,
+                account_bytes: 8 * CHUNK_BYTES as u64,
+            }));
+        repo.chunk_reclaim_paused = true;
+        let checkpoint = vec![1; CHUNK_BYTES + 17];
+        let first = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&checkpoint),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let expectation = |meta: &ArtifactMeta| ArtifactExpectation::Derived {
+            revision: meta.revision,
+            checkpoint_content_hash: meta.checkpoint_content_hash.clone(),
+        };
+        let wal = vec![2; CHUNK_BYTES + 23];
+        let second = repo
+            .save_wal_snapshot("sql", space, "main", snapshot(&wal), expectation(&first))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.checkpoint_content_hash,
+            first.checkpoint_content_hash
+        );
+        assert_eq!(second.size_bytes, (checkpoint.len() + wal.len()) as i64);
+        let durable = repo.read_all("sql", space, "main").await.unwrap().unwrap();
+        assert_eq!(durable.payload, checkpoint);
+        assert_eq!(durable.delta_payload.as_ref(), Some(&wal));
+        assert!(matches!(
+            repo.save_wal_snapshot("sql", space, "main", snapshot(&[9]), expectation(&first))
+                .await,
+            Err(DatabaseArtifactError::StaleLineage)
+        ));
+        assert!(matches!(
+            repo.save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[9]),
+                ArtifactExpectation::Any
+            )
+            .await,
+            Err(DatabaseArtifactError::StaleLineage)
+        ));
+        let smaller = vec![3; 127];
+        let third = repo
+            .save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&smaller),
+                expectation(&second),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            (
+                (checkpoint.len() + wal.len() + smaller.len()) as i64,
+                smaller.len() as i64
+            )
+        );
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            ((checkpoint.len() + smaller.len()) as i64, 0)
+        );
+        let replacement = vec![4; CHUNK_BYTES + 7];
+        let fourth = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&replacement),
+                expectation(&third),
+            )
+            .await
+            .unwrap();
+        assert!(!fourth.has_delta());
+        let credit = replacement.len().min(checkpoint.len() + smaller.len()) as i64;
+        assert_eq!(
+            ledger(&fixture).await,
+            (
+                (checkpoint.len() + smaller.len() + replacement.len()) as i64,
+                credit
+            )
+        );
+        // Delete the checkpoint first. Its overlapping credit is released
+        // with its byte charge; the remaining old WAL stays fully charged.
+        let old: String = fixture
+            .conn
+            .query_one(statement(
+                "SELECT part_id FROM artifact_part WHERE content_hash=$1",
+                vec![first.checkpoint_content_hash.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "part_id")
+            .unwrap();
+        for _ in 0..2 {
+            fixture
+                .conn
+                .execute(statement(
+                    "SELECT artifact_reap_one('sql',$1,'main',$2)",
+                    vec![space.into(), old.clone().into()],
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ledger(&fixture).await,
+            ((smaller.len() + replacement.len()) as i64, 0)
+        );
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(ledger(&fixture).await, (replacement.len() as i64, 0));
+        assert_eq!(
+            repo.read_all("sql", space, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            replacement
+        );
+        // An authorized test mutation corrupts the WAL; reads refuse it.
+        let fifth = repo
+            .save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[5; 127]),
+                expectation(&fourth),
+            )
+            .await
+            .unwrap();
+        fixture
+            .conn
+            .execute_unprepared("ALTER TABLE artifact_chunk DISABLE TRIGGER artifact_chunk_guard")
+            .await
+            .unwrap();
+        fixture.conn.execute(statement("UPDATE artifact_chunk SET payload=decode(repeat('00',127),'hex') WHERE part_id=(SELECT delta_part_id FROM database_artifact)",vec![])).await.unwrap();
+        fixture
+            .conn
+            .execute_unprepared("ALTER TABLE artifact_chunk ENABLE TRIGGER artifact_chunk_guard")
+            .await
+            .unwrap();
+        let mut sink = MemorySink::default();
+        assert!(matches!(
+            repo.read_chunks("sql", space, "main", &fifth, &mut sink)
+                .await,
+            Err(DatabaseArtifactError::HashMismatch { part: "wal" })
+        ));
+    }
+    #[tokio::test]
+    async fn postgres_chunked_wal_combined_limits_and_publish_fence() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_wal_combined_limits_and_publish_fence",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:wal-cap";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 1024,
+                account_bytes: 1024,
+            }),
+        );
+        let expectation = |meta: &ArtifactMeta| ArtifactExpectation::Derived {
+            revision: meta.revision,
+            checkpoint_content_hash: meta.checkpoint_content_hash.clone(),
+        };
+        let first = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[1; 768]),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[2; 257]),
+                expectation(&first)
+            )
+            .await,
+            Err(DatabaseArtifactError::StorageLimit)
+        ));
+        let second = repo
+            .save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[2; 256]),
+                expectation(&first),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ledger(&fixture).await, (1024, 0));
+        let third = repo
+            .save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[3; 128]),
+                expectation(&second),
+            )
+            .await
+            .unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        assert_eq!(ledger(&fixture).await, (896, 0));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut racing = repo.clone();
+        racing.chunk_publish_barrier = Some(barrier.clone());
+        let expected = expectation(&third);
+        let upload = tokio::spawn(async move {
+            racing
+                .save_wal_snapshot("sql", space, "main", snapshot(&[4; 64]), expected)
+                .await
+        });
+        await_replacement(&fixture).await;
+        // Administrative injection advances the durable revision after seal.
+        fixture.conn.execute_unprepared("ALTER TABLE database_artifact DISABLE TRIGGER artifact_layout_guard; UPDATE database_artifact SET revision=revision+1; ALTER TABLE database_artifact ENABLE TRIGGER artifact_layout_guard;").await.unwrap();
+        barrier.wait().await;
+        let outcome = upload.await.unwrap();
+        assert!(
+            matches!(outcome, Err(DatabaseArtifactError::StaleLineage)),
+            "{outcome:?}"
+        );
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ledger(&fixture).await != (896, 0) {
+            repo.reap_unused_parts(64).await.unwrap();
+            assert!(tokio::time::Instant::now() < until);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let durable = repo.load_meta("sql", space, "main").await.unwrap().unwrap();
+        assert_eq!(durable.delta_content_hash, third.delta_content_hash);
+        assert_eq!(durable.revision, third.revision + 1);
     }
 }
