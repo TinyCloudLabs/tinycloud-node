@@ -1318,6 +1318,8 @@ mod tests {
             "EXECUTE p",
             "DEALLOCATE p",
             "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            "EXPLAIN ANALYZE UPDATE t SET a = 1",
+            "EXPLAIN ANALYZE DELETE FROM t",
         ] {
             assert!(
                 matches!(
@@ -1340,6 +1342,22 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// `EXPLAIN ANALYZE` runs what it wraps, so wrapping `EXECUTE` is the
+    /// same bypass shape as `EXECUTE` itself. It is a read-only violation if
+    /// the parser accepts it, and a parse refusal otherwise; never allowed.
+    #[test]
+    fn read_only_caveat_refuses_explain_analyze_of_execute() {
+        let result = validate_sql("EXPLAIN ANALYZE EXECUTE p", &read_only_caveat(), ADMIN);
+        assert!(
+            matches!(
+                result,
+                Err(DuckDbError::ReadOnlyViolation) | Err(DuckDbError::ParseError(_))
+            ),
+            "{:?}",
+            result.map(|parsed| parsed.is_read_only)
+        );
     }
 
     #[test]
