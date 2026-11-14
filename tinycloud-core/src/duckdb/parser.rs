@@ -665,10 +665,17 @@ fn classify_statement(
             *is_ddl = true;
             extract_tables_from_statement(stmt, tables);
         }
-        Statement::SetVariable { .. } => {
-            *is_read_only = false;
-        }
-        _ => {}
+        // Plans and transactions don't write, and a read tier may use them.
+        Statement::ExplainTable { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => {}
+        // Everything else is not known to be a read: `SET`, and the admin
+        // tier's statements that run a stored body, change data or settings,
+        // or touch files (`PREPARE`, `EXECUTE`, `CALL`, `COPY`, `ATTACH`,
+        // `CREATE SCHEMA`, ...). A statement the parser learns later is
+        // refused under a `read_only` caveat until it is classified here.
+        _ => *is_read_only = false,
     }
 }
 

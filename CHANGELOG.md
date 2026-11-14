@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- DuckDB: a delegation with the `read_only` caveat allows only queries, `EXPLAIN` and transaction statements, whatever its ability tier. Any other statement (for example `PREPARE`, `EXECUTE`, `CALL`, `COPY`) is refused with a read-only violation. Details: TC-3035.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
