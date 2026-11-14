@@ -4,9 +4,10 @@
 //! cache. Before a write or an import runs, the bytes it can need are reserved
 //! in the node-wide [`DiskBudget`] that SQL uses too, so two databases cannot
 //! count the same free bytes. While a statement runs, a watcher interrupts it
-//! once free space falls below what other operations hold plus the floor. A
-//! refused or interrupted write answers [`DuckDbError::DiskHeadroom`] and is
-//! never acknowledged.
+//! whenever free space is below what other operations hold plus the floor. A
+//! refused or interrupted write answers [`DuckDbError::DiskHeadroom`], is never
+//! acknowledged, and the database's local state is discarded so nothing from
+//! the request is kept or saved later.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ use crate::sql::durability::{
     DiskBudget, FreeSpace, ReservationGuard, ReservationRefused, StatvfsFreeSpace,
 };
 
+use super::caveats::DuckDbCaveats;
 use super::types::{DuckDbError, DuckDbRequest};
 
 /// How often the watcher reads free space while a statement runs.
@@ -62,16 +64,21 @@ pub(crate) fn budget_key(space: &str, db_name: &str) -> String {
 }
 
 /// Requests that can change the database and are saved afterwards: they
-/// reserve room and run under the watcher. Queries, exports and `describe`
-/// do neither; only the spill limit applies to them.
-pub(crate) fn writes(request: &DuckDbRequest) -> bool {
-    !matches!(
-        request,
-        DuckDbRequest::Query { .. }
-            | DuckDbRequest::Describe
-            | DuckDbRequest::Export
-            | DuckDbRequest::ExportToKv { .. }
-    )
+/// reserve room and run under the watcher. A `query` counts when its SQL is
+/// not read-only (the parser decides, as the route does); exports and
+/// `describe` never do. Only the spill limit applies to the rest.
+pub(crate) fn writes(
+    request: &DuckDbRequest,
+    caveats: &Option<DuckDbCaveats>,
+    ability: &str,
+) -> bool {
+    match request {
+        // A query the parser refuses never runs; counting it is harmless.
+        DuckDbRequest::Query { sql, .. } => super::parser::validate_sql(sql, caveats, ability)
+            .map_or(true, |parsed| !parsed.is_read_only),
+        DuckDbRequest::Describe | DuckDbRequest::Export | DuckDbRequest::ExportToKv { .. } => false,
+        _ => true,
+    }
 }
 
 impl DuckDbDiskPolicy {
@@ -110,10 +117,14 @@ impl DuckDbDiskPolicy {
         }
     }
 
-    /// Run `statement` on `conn`. A write (`write`) is interrupted if free
-    /// space behind `dir` falls below what other operations hold plus the
-    /// floor. A statement stopped that way, or one that hit the spill limit,
-    /// is [`DuckDbError::DiskHeadroom`].
+    /// Run `statement` on `conn`. A write (`write`) is interrupted whenever
+    /// free space behind `dir` is below what other operations hold plus the
+    /// floor: DuckDB clears an interrupt when its next query starts, so the
+    /// watcher re-interrupts on every short reading until the statement
+    /// returns. A failed statement that was interrupted, or one that hit the
+    /// spill limit, is [`DuckDbError::DiskHeadroom`]; the caller discards the
+    /// database's local state, because a COMMIT can finish before DuckDB
+    /// reports the interrupt.
     pub(crate) fn watch<T>(
         &self,
         key: &str,
@@ -147,7 +158,6 @@ impl DuckDbDiskPolicy {
                     if short {
                         tripped.store(true, Ordering::Relaxed);
                         interrupt.interrupt();
-                        break;
                     }
                 }
             });

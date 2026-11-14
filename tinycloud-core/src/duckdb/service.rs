@@ -108,6 +108,11 @@ impl DuckDbService {
                 return 0;
             };
             for space in spaces.filter_map(Result::ok) {
+                // `file_type` does not follow links: a link in place of a
+                // space directory is never descended into.
+                if !space.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
                 let Ok(entries) = std::fs::read_dir(space.path()) else {
                     continue;
                 };
@@ -204,7 +209,8 @@ impl DuckDbService {
 
         // Room for this write and for the snapshot copy its save can take,
         // which is at most the local database files.
-        let _reservation = if disk::writes(&request) {
+        let writes = disk::writes(&request, &caveats, &ability);
+        let _reservation = if writes {
             let cache_path = self.cache_path(space, db_name);
             let local_bytes = local_file_bytes(&cache_path).await;
             self.disk
@@ -220,6 +226,14 @@ impl DuckDbService {
             && result.is_err()
             && self.expectation(&key) == ArtifactExpectation::Absent
         {
+            self.discard_local_state(&key).await?;
+        }
+        // A write stopped for disk headroom may have committed locally (an
+        // interrupted COMMIT reports the interrupt after committing), or
+        // applied earlier statements of its batch. Drop the local copy, so
+        // the durable artifact stays the truth and no later save carries the
+        // refused request.
+        if writes && matches!(result, Err(DuckDbError::DiskHeadroom)) {
             self.discard_local_state(&key).await?;
         }
         let result = result?;
@@ -2923,5 +2937,450 @@ mod tests {
                 "notes.db"
             ]
         );
+    }
+
+    /// A link in place of a space directory is never descended into.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duckdb_startup_sweep_does_not_follow_a_linked_space() {
+        let cache = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let service = service(&cache, artifact_repository().await);
+        std::fs::create_dir_all(outside.path().join("x.duckdb.tmp")).unwrap();
+        std::fs::write(outside.path().join("x.duckdb.tmp.1.2"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache.path().join("space-link")).unwrap();
+        assert_eq!(service.sweep_stale_cache_files().await, 0);
+        assert_eq!(
+            dir_entries(outside.path()),
+            vec!["x.duckdb.tmp", "x.duckdb.tmp.1.2"]
+        );
+    }
+
+    mod headroom {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        use std::time::Duration;
+
+        const MIN: u64 = 8 << 20;
+        const PLENTY: u64 = 64 << 20;
+
+        async fn exec(
+            service: &DuckDbService,
+            space: &SpaceId,
+            db: &str,
+            request: DuckDbRequest,
+        ) -> Result<DuckDbExecutionResult, DuckDbError> {
+            service
+                .execute(
+                    space,
+                    db,
+                    request,
+                    None,
+                    "tinycloud.duckdb/admin".into(),
+                    false,
+                )
+                .await
+        }
+
+        async fn count(service: &DuckDbService, space: &SpaceId, db: &str, sql: &str) -> i64 {
+            let result = service
+                .execute(
+                    space,
+                    db,
+                    DuckDbRequest::Query {
+                        sql: sql.into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(rows) = result.response else {
+                panic!("not a query response");
+            };
+            match &rows.rows[0][0] {
+                DuckDbValue::Integer(n) => *n,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn statement(sql: &str) -> DuckDbStatement {
+            DuckDbStatement {
+                sql: sql.into(),
+                params: vec![],
+            }
+        }
+
+        fn short_after(free: &Arc<FakeFree>, after: Duration) -> std::thread::JoinHandle<()> {
+            let free = free.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                free.0.store(0, SeqCst);
+            })
+        }
+
+        /// A repository with chunked artifacts on: databases are file-backed
+        /// from their first write, as with the flag on.
+        async fn chunked(
+            test: &str,
+        ) -> Option<(
+            crate::test_support::PostgresTestSchema,
+            Arc<SeaOrmDatabaseArtifactRepository>,
+        )> {
+            let fixture = crate::test_support::PostgresTestSchema::new(test).await?;
+            let repo = Arc::new(
+                SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+                    Some(crate::database_artifacts::chunks::ChunkLimits {
+                        artifact_bytes: 1 << 30,
+                        account_bytes: 4 << 30,
+                    }),
+                ),
+            );
+            Some((fixture, repo))
+        }
+
+        fn chunked_service(
+            cache: &TempDir,
+            repo: Arc<SeaOrmDatabaseArtifactRepository>,
+        ) -> DuckDbService {
+            DuckDbService::new(
+                cache.path().to_string_lossy().into_owned(),
+                u64::MAX,
+                300,
+                "1GB".into(),
+                repo,
+            )
+        }
+
+        /// A write sent as `query` is held to the floor like any other write.
+        #[tokio::test]
+        async fn postgres_duckdb_query_shaped_write_is_held_to_the_floor() {
+            let Some((_fixture, repo)) = chunked("postgres_duckdb_query_shaped_write_floor").await
+            else {
+                return;
+            };
+            let cache = TempDir::new().unwrap();
+            let free = Arc::new(FakeFree(PLENTY.into()));
+            let service =
+                chunked_service(&cache, repo.clone()).with_disk_policy(disk_policy(&free, MIN));
+            let space = test_space_id("query-shaped-write");
+            exec(
+                &service,
+                &space,
+                "main",
+                write_request("INSERT INTO t VALUES (1)", Some("CREATE TABLE t(i BIGINT)")),
+            )
+            .await
+            .unwrap();
+
+            free.0.store(0, SeqCst);
+            let query = exec(
+                &service,
+                &space,
+                "main",
+                DuckDbRequest::Query {
+                    sql: "INSERT INTO t VALUES (3)".into(),
+                    params: vec![],
+                },
+            )
+            .await;
+            assert!(
+                matches!(query, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                query.map(|_| ())
+            );
+
+            // Free space running out while a long query-shaped write runs.
+            free.0.store(PLENTY, SeqCst);
+            let flip = short_after(&free, Duration::from_millis(200));
+            let long = exec(
+                &service,
+                &space,
+                "main",
+                DuckDbRequest::Query {
+                    sql: "INSERT INTO t SELECT i FROM range(8000000) r(i) WHERE md5(i::VARCHAR) <> ''"
+                        .into(),
+                    params: vec![],
+                },
+            )
+            .await;
+            flip.join().unwrap();
+            assert!(
+                matches!(long, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                long.map(|_| ())
+            );
+
+            free.0.store(PLENTY, SeqCst);
+            assert_eq!(
+                count(&service, &space, "main", "SELECT count(*) FROM t").await,
+                1
+            );
+            let fresh = TempDir::new().unwrap();
+            let durable = chunked_service(&fresh, repo);
+            assert_eq!(
+                count(&durable, &space, "main", "SELECT count(*) FROM t").await,
+                1
+            );
+        }
+
+        /// A request refused for headroom keeps nothing: not the statements of
+        /// its batch that ran before the refusal, locally or after the next
+        /// saved write.
+        #[tokio::test]
+        async fn duckdb_headroom_refusal_keeps_nothing_from_the_request() {
+            let repo = artifact_repository().await;
+            let cache = TempDir::new().unwrap();
+            let free = Arc::new(FakeFree(PLENTY.into()));
+            let service =
+                file_service(&cache, repo.clone()).with_disk_policy(disk_policy(&free, MIN));
+            let space = test_space_id("headroom-keeps-nothing");
+            exec(
+                &service,
+                &space,
+                "main",
+                write_request(
+                    "CREATE TABLE m(k VARCHAR)",
+                    Some("CREATE TABLE t(i BIGINT)"),
+                ),
+            )
+            .await
+            .unwrap();
+            let flip = short_after(&free, Duration::from_millis(300));
+            let refused = exec(
+                &service,
+                &space,
+                "main",
+                DuckDbRequest::Batch {
+                    statements: vec![
+                        statement("INSERT INTO m VALUES ('before-the-refusal')"),
+                        statement(
+                            "INSERT INTO t SELECT i FROM range(2000000000) r(i) WHERE md5(i::VARCHAR) <> ''",
+                        ),
+                    ],
+                    transactional: false,
+                },
+            )
+            .await;
+            flip.join().unwrap();
+            free.0.store(PLENTY, SeqCst);
+            assert!(
+                matches!(refused, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                refused.map(|_| ())
+            );
+            let kept = "SELECT count(*) FROM m WHERE k = 'before-the-refusal'";
+            assert_eq!(count(&service, &space, "main", kept).await, 0);
+            exec(
+                &service,
+                &space,
+                "main",
+                write_request("INSERT INTO m VALUES ('next')", None),
+            )
+            .await
+            .unwrap();
+            let fresh = TempDir::new().unwrap();
+            let durable = file_service(&fresh, repo);
+            assert_eq!(count(&durable, &space, "main", kept).await, 0);
+            assert_eq!(
+                count(&durable, &space, "main", "SELECT count(*) FROM m").await,
+                1
+            );
+        }
+
+        /// Free space that runs short from a given watcher reading on, so a
+        /// refusal can be placed late in a write, around its COMMIT.
+        struct ShortFromReading {
+            readings: AtomicU64,
+            short_from: AtomicU64,
+        }
+
+        impl crate::sql::durability::FreeSpace for ShortFromReading {
+            fn free_bytes(&self, _: &Path) -> std::io::Result<u64> {
+                let n = self.readings.fetch_add(1, SeqCst) + 1;
+                Ok(if n >= self.short_from.load(SeqCst) {
+                    0
+                } else {
+                    1 << 36
+                })
+            }
+        }
+
+        /// A transactional batch refused near or during its COMMIT is never
+        /// kept: an answer of 507 means the change is in neither the local
+        /// copy nor the durable artifact.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn postgres_duckdb_batch_refused_around_commit_is_not_kept() {
+            let Some((_fixture, repo)) = chunked("postgres_duckdb_batch_refused_commit").await
+            else {
+                return;
+            };
+            let cache = TempDir::new().unwrap();
+            let free = Arc::new(ShortFromReading {
+                readings: AtomicU64::new(0),
+                short_from: AtomicU64::new(u64::MAX),
+            });
+            let service =
+                chunked_service(&cache, repo.clone()).with_disk_policy(DuckDbDiskPolicy {
+                    min_free_bytes: MIN,
+                    free_space: free.clone(),
+                    ..Default::default()
+                });
+            let space = test_space_id("batch-refused-commit");
+            let setup = |db: String| {
+                let (service, space) = (&service, &space);
+                async move {
+                    exec(
+                        service,
+                        space,
+                        &db,
+                        DuckDbRequest::Batch {
+                            statements: vec![
+                                statement("CREATE TABLE t(i BIGINT, s VARCHAR)"),
+                                statement("CREATE TABLE m(k VARCHAR)"),
+                                statement(
+                                    "INSERT INTO t SELECT i, md5(i::VARCHAR) FROM range(1000000) r(i)",
+                                ),
+                            ],
+                            transactional: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+            let batch = |marker: &str| DuckDbRequest::Batch {
+                statements: vec![
+                    statement(&format!("INSERT INTO m VALUES ('{marker}')")),
+                    statement(&format!("UPDATE t SET s = md5(s || '{marker}')")),
+                ],
+                transactional: true,
+            };
+            // How many free-space readings one batch takes.
+            setup("calibrate".into()).await;
+            let before = free.readings.load(SeqCst);
+            exec(&service, &space, "calibrate", batch("calibrate"))
+                .await
+                .unwrap();
+            let readings = free.readings.load(SeqCst) - before;
+            let mut kept = Vec::new();
+            for round in 0..10u64 {
+                let db = format!("round{round}");
+                free.short_from.store(u64::MAX, SeqCst);
+                setup(db.clone()).await;
+                let marker = format!("x{round}");
+                let start = free.readings.load(SeqCst);
+                free.short_from.store(
+                    start + readings.saturating_sub(1 + 2 * round).max(2),
+                    SeqCst,
+                );
+                let result = exec(&service, &space, &db, batch(&marker)).await;
+                free.short_from.store(u64::MAX, SeqCst);
+                let marked = format!("SELECT count(*) FROM m WHERE k = '{marker}'");
+                let local = count(&service, &space, &db, &marked).await;
+                if result.is_err() {
+                    exec(
+                        &service,
+                        &space,
+                        &db,
+                        write_request("INSERT INTO m VALUES ('next')", None),
+                    )
+                    .await
+                    .unwrap();
+                    let fresh = TempDir::new().unwrap();
+                    let durable =
+                        count(&chunked_service(&fresh, repo.clone()), &space, &db, &marked).await;
+                    if local != 0 || durable != 0 {
+                        kept.push((round, local, durable));
+                    }
+                } else if local != 1 {
+                    kept.push((round, local, -1));
+                }
+            }
+            assert!(
+                kept.is_empty(),
+                "refused batches kept, or accepted batches lost: {kept:?}"
+            );
+        }
+
+        /// A shortfall first seen between two DuckDB calls still stops the
+        /// statement that follows: DuckDB clears an interrupt when a query
+        /// starts, so the watcher keeps interrupting.
+        #[test]
+        fn duckdb_shortfall_between_calls_still_stops_the_next_statement() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("d.duckdb");
+            let conn = storage::open_connection(Some(&path), "512MB").unwrap();
+            let free = Arc::new(FakeFree(0.into()));
+            let result = disk_policy(&free, MIN).watch("duckdb:test/d", &path, &conn, true, || {
+                // Rust-side work between two DuckDB calls, where the first
+                // reading lands.
+                std::thread::sleep(Duration::from_millis(120));
+                conn.execute_batch(
+                    "CREATE TABLE big AS SELECT i, md5(i::VARCHAR) s FROM range(3000000) r(i)",
+                )
+                .map_err(|error| DuckDbError::DuckDb(error.to_string()))
+            });
+            assert!(
+                matches!(result, Err(DuckDbError::DiskHeadroom)),
+                "{result:?}"
+            );
+        }
+
+        /// A write reserves its database's local size against the node-wide
+        /// budget: while another operation holds room, a write that would
+        /// leave less than the floor is refused before it runs, and the same
+        /// write runs once that room is released. Nothing stays reserved.
+        #[tokio::test]
+        async fn postgres_duckdb_write_reserves_its_database_size() {
+            let Some((_fixture, repo)) = chunked("postgres_duckdb_write_reserves_size").await
+            else {
+                return;
+            };
+            let cache = TempDir::new().unwrap();
+            let free = Arc::new(FakeFree(PLENTY.into()));
+            let policy = disk_policy(&free, MIN);
+            let service = chunked_service(&cache, repo).with_disk_policy(policy.clone());
+            let space = test_space_id("write-reserves-size");
+            exec(
+                &service,
+                &space,
+                "main",
+                write_request(
+                    "INSERT INTO t SELECT i, md5(i::VARCHAR) FROM range(200000) r(i)",
+                    Some("CREATE TABLE t(i BIGINT, s VARCHAR)"),
+                ),
+            )
+            .await
+            .unwrap();
+            let dir = cache.path().join(space.to_string());
+            let size: u64 = ["", ".wal"]
+                .iter()
+                .map(|ext| {
+                    std::fs::metadata(dir.join(format!("main.duckdb{ext}")))
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                })
+                .sum();
+            assert!(size > 0, "the database is not file-backed");
+            // Room above the floor for one database of this size, not two.
+            free.0.store(MIN + size + size / 2, SeqCst);
+            let in_flight = policy
+                .reserve("duckdb:other/in-flight", size, &dir)
+                .unwrap()
+                .expect("the check is on");
+            let small_write = || write_request("INSERT INTO t VALUES (-1, 'x')", None);
+            let refused = exec(&service, &space, "main", small_write()).await;
+            assert!(
+                matches!(refused, Err(DuckDbError::DiskHeadroom)),
+                "{:?}",
+                refused.map(|_| ())
+            );
+            drop(in_flight);
+            exec(&service, &space, "main", small_write()).await.unwrap();
+            assert_eq!(policy.budget.reserved(), 0);
+        }
     }
 }

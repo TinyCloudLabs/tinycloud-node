@@ -146,19 +146,27 @@ enabled, `storage.duckdb.min_free_bytes` defaults to 2 GiB and
 `storage.duckdb.max_temp_directory_size` to 1 GiB per connection; with parts
 off both stay off unless set. The 2 GiB floor is provisional until the
 `storage_headroom` event shows real headroom on production nodes; operators tune
-it by config.
+it by config. With parts enabled, the node refuses to start unless the floor is
+at least `storage.sql.chunked_artifact_max_bytes`: a write's save copies the
+database once more, outside the write's reservation. Leave a margin above that.
 
+- A write is any request that can change the database: executes, batches,
+  imports, and a query whose SQL is not read-only (the parser decides, as for
+  authorization).
 - Before a write runs, it reserves its local database files' size (the bound
   of the snapshot copy its save can take); an import reserves twice its size.
   Reservations share the node-wide budget with SQL. A reservation that would
   leave less than the floor is refused with `507 duckdb_disk_headroom` and
   nothing runs.
-- While a write runs, it is interrupted if free space falls below what other
-  operations hold plus the floor. The write is not applied, not saved and not
-  acknowledged; it answers `507 duckdb_disk_headroom`.
+- While a write runs, it is interrupted whenever free space is below what
+  other operations hold plus the floor. It answers `507 duckdb_disk_headroom`,
+  and the database's local copy is dropped and reloaded from its last saved
+  artifact on the next request. So nothing from the request is kept: not a
+  transaction that committed just before the interrupt was reported, and not
+  the earlier statements of a non-transactional batch.
 - A statement that spills past the per-connection limit also answers
-  `507 duckdb_disk_headroom`. Queries and exports reserve nothing and are not
-  interrupted for headroom; only the spill limit applies to them.
+  `507 duckdb_disk_headroom`. Read-only queries and exports reserve nothing and
+  are not interrupted for headroom; only the spill limit applies to them.
 - Hydration is not gated: it writes at most the artifact ceiling and is freed
   at eviction.
 - At startup, before it serves, the node removes what a stopped process left in

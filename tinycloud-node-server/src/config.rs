@@ -1802,6 +1802,19 @@ const CHUNKED_DUCKDB_MAX_TEMP_DIRECTORY_BYTES: u64 = 1 << 30;
 
 #[cfg(feature = "duckdb")]
 impl DuckDbStorageConfig {
+    /// The DuckDB free-space floor in effect: the configured value, else the
+    /// flag-on default when chunked artifact storage is enabled, else 0 (off).
+    pub fn effective_min_free_bytes(&self, chunked: bool) -> u64 {
+        self.min_free_bytes.map_or(
+            if chunked {
+                CHUNKED_DUCKDB_MIN_FREE_BYTES
+            } else {
+                0
+            },
+            |value| value.as_u64(),
+        )
+    }
+
     /// The DuckDB disk policy. `chunked` is whether chunked artifact storage
     /// is enabled, which sets the defaults; `budget` is the node-wide disk
     /// budget shared with SQL.
@@ -1810,14 +1823,15 @@ impl DuckDbStorageConfig {
         chunked: bool,
         budget: std::sync::Arc<tinycloud_core::sql::durability::DiskBudget>,
     ) -> tinycloud_core::duckdb::disk::DuckDbDiskPolicy {
-        let or_flag_default = |value: Option<ByteUnit>, default: u64| {
-            value.map_or(if chunked { default } else { 0 }, |value| value.as_u64())
-        };
         tinycloud_core::duckdb::disk::DuckDbDiskPolicy {
-            min_free_bytes: or_flag_default(self.min_free_bytes, CHUNKED_DUCKDB_MIN_FREE_BYTES),
-            max_temp_directory_bytes: or_flag_default(
-                self.max_temp_directory_size,
-                CHUNKED_DUCKDB_MAX_TEMP_DIRECTORY_BYTES,
+            min_free_bytes: self.effective_min_free_bytes(chunked),
+            max_temp_directory_bytes: self.max_temp_directory_size.map_or(
+                if chunked {
+                    CHUNKED_DUCKDB_MAX_TEMP_DIRECTORY_BYTES
+                } else {
+                    0
+                },
+                |value| value.as_u64(),
             ),
             budget,
             ..Default::default()
