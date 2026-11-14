@@ -25,6 +25,26 @@ pub struct ParsedQuery {
     pub is_ddl: bool,
 }
 
+impl ParsedQuery {
+    /// Whether the statements are plain reads: queries, `EXPLAIN TABLE`, and
+    /// `EXPLAIN` without `ANALYZE`, none of which writes. Anything else,
+    /// including statements that run a stored body or change settings, is
+    /// not. Transactions are not either: `is_read_only` lets a read tier
+    /// open one, but a caller deciding whether a request can write should
+    /// treat it like any non-read statement.
+    pub fn is_plain_read(&self) -> bool {
+        self.is_read_only
+            && self.statements.iter().all(|statement| {
+                matches!(
+                    statement,
+                    Statement::Query(_)
+                        | Statement::ExplainTable { .. }
+                        | Statement::Explain { analyze: false, .. }
+                )
+            })
+    }
+}
+
 fn ascii_prefix(value: &str, prefix: &str) -> bool {
     value
         .as_bytes()
@@ -645,10 +665,17 @@ fn classify_statement(
             *is_ddl = true;
             extract_tables_from_statement(stmt, tables);
         }
-        Statement::SetVariable { .. } => {
-            *is_read_only = false;
-        }
-        _ => {}
+        // Plans and transactions don't write, and a read tier may use them.
+        Statement::ExplainTable { .. }
+        | Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => {}
+        // Everything else is not known to be a read: `SET`, and the admin
+        // tier's statements that run a stored body, change data or settings,
+        // or touch files (`PREPARE`, `EXECUTE`, `CALL`, `COPY`, `ATTACH`,
+        // `CREATE SCHEMA`, ...). A statement the parser learns later is
+        // refused under a `read_only` caveat until it is classified here.
+        _ => *is_read_only = false,
     }
 }
 
@@ -1264,5 +1291,112 @@ mod tests {
             result.write_targets,
             vec![TouchedTables::supported(vec!["users".to_string()])]
         );
+    }
+
+    const ADMIN: &str = "tinycloud.duckdb/admin";
+
+    fn read_only_caveat() -> Option<DuckDbCaveats> {
+        Some(DuckDbCaveats {
+            tables: None,
+            columns: None,
+            statements: None,
+            read_only: Some(true),
+        })
+    }
+
+    /// A `read_only` caveat holds for the admin tier too: a statement that can
+    /// change data, settings or files, or that runs a stored body, is refused
+    /// whether or not the parser models its effect.
+    #[test]
+    fn read_only_caveat_refuses_what_is_not_a_plain_read_for_admin() {
+        // These must parse, and be refused for being writes.
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "PREPARE p AS INSERT INTO t VALUES (1)",
+            "PREPARE p AS UPDATE t SET a = 1",
+            "PREPARE p AS DELETE FROM t",
+            "EXECUTE p",
+            "DEALLOCATE p",
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            "EXPLAIN ANALYZE UPDATE t SET a = 1",
+            "EXPLAIN ANALYZE DELETE FROM t",
+        ] {
+            assert!(
+                matches!(
+                    validate_sql(sql, &read_only_caveat(), ADMIN),
+                    Err(DuckDbError::ReadOnlyViolation)
+                ),
+                "{sql}"
+            );
+        }
+        // These may also be refused earlier, by the parser; never allowed.
+        for sql in [
+            "CALL checkpoint()",
+            "COPY t TO 'out.csv'",
+            "CREATE SCHEMA s",
+            "CREATE SEQUENCE q",
+            "ATTACH ':memory:' AS m",
+        ] {
+            assert!(
+                validate_sql(sql, &read_only_caveat(), ADMIN).is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    /// `EXPLAIN ANALYZE` runs what it wraps, so wrapping `EXECUTE` is the
+    /// same bypass shape as `EXECUTE` itself. It is a read-only violation if
+    /// the parser accepts it, and a parse refusal otherwise; never allowed.
+    #[test]
+    fn read_only_caveat_refuses_explain_analyze_of_execute() {
+        let result = validate_sql("EXPLAIN ANALYZE EXECUTE p", &read_only_caveat(), ADMIN);
+        assert!(
+            matches!(
+                result,
+                Err(DuckDbError::ReadOnlyViolation) | Err(DuckDbError::ParseError(_))
+            ),
+            "{:?}",
+            result.map(|parsed| parsed.is_read_only)
+        );
+    }
+
+    #[test]
+    fn read_only_caveat_still_allows_plain_reads_for_admin() {
+        for sql in [
+            "SELECT 1",
+            "SELECT * FROM t",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "BEGIN",
+            "COMMIT",
+        ] {
+            let parsed = validate_sql(sql, &read_only_caveat(), ADMIN)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert!(parsed.is_read_only, "{sql}");
+        }
+    }
+
+    /// `is_plain_read` is the rule a request that can't write must meet:
+    /// queries and non-`ANALYZE` plans only.
+    #[test]
+    fn only_queries_and_plans_are_plain_reads() {
+        for (sql, plain) in [
+            ("SELECT 1", true),
+            ("WITH c AS (SELECT 1) SELECT * FROM c", true),
+            ("EXPLAIN SELECT * FROM t", true),
+            ("EXPLAIN ANALYZE SELECT * FROM t", false),
+            ("BEGIN", false),
+            ("COMMIT", false),
+            ("INSERT INTO t VALUES (1)", false),
+            ("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c", false),
+            ("PREPARE p AS INSERT INTO t VALUES (1)", false),
+            ("EXECUTE p", false),
+            ("DEALLOCATE p", false),
+        ] {
+            let parsed =
+                validate_sql(sql, &None, ADMIN).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(parsed.is_plain_read(), plain, "{sql}");
+        }
     }
 }
