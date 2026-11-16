@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- `POST /delegate` accepts a child delegation that expires at its parent's exact expiry, milliseconds included, again. Since 1.26.0 the parent's end was read in whole seconds, so a child expiring in the parent's last partial second was refused with 401 "Child delegation expiry exceeds parent expiry". node-sdk's `useDelegation` asks for exactly that expiry, so every new activation failed. A child expiring even 1 ms after its parent is still refused, and a renewed parent's end is unchanged. Details: TC-3076.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
