@@ -2299,16 +2299,15 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
-        // TC-2986: the signature is checked before any lock, so a forged or
-        // slow one never holds the guards or the spaces' write order.
-        let verified = self.preverify_delegation(&delegation).await?;
-        self.delegate_verified(delegation, &verified).await
+        self.delegate_verified(delegation, &PreVerified::default())
+            .await
     }
 
     /// As [`Self::delegate`], with the signature `verified` holds, from
     /// [`Self::preverify_delegation`] on these exact bytes, so a caller can
-    /// check it before its own reads (TC-3000). Bytes `verified` does not
-    /// cover have their signature checked inside the transaction instead.
+    /// check it before its own reads (TC-3000). When `verified` does not
+    /// cover these bytes, their signature is checked here, still before any
+    /// read or lock.
     pub async fn delegate_verified(
         &self,
         delegation: Delegation,
@@ -2322,6 +2321,15 @@ where
             ));
         }
         let renewal_lease = crate::renewal::lease_original_from_signed(&delegation)?.is_some();
+        // TC-2986: the signature is checked before any lock, so a forged or
+        // slow one never holds the guards or the spaces' write order.
+        let checked;
+        let verified = if verified.contains(&delegation.content_hash()) {
+            verified
+        } else {
+            checked = self.preverify_delegation(&delegation).await?;
+            &checked
+        };
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents

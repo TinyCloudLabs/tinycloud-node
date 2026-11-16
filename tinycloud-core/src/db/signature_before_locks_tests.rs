@@ -1069,4 +1069,165 @@ mod binding {
         );
         lock.rollback().await.unwrap();
     }
+
+    /// TC-3000 (Bobbie's #610 review, R4): the transaction decides the
+    /// revoker's standing. A revocation authorized by a revoke control grant
+    /// passes the pre-check and waits for its target's chain guard; the
+    /// control grant is revoked meanwhile, and the transaction refuses it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revocation_whose_control_grant_is_revoked_while_it_waits_is_refused() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let device = JWK::generate_ed25519().unwrap();
+        let target = format!("urn:cid:{}", cid_of(&g));
+        let control = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&device).0,
+            &target,
+            "tinycloud.delegation/revoke",
+        );
+        f.db.delegate(deleg(&control))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let (node, _) = did_vm(&JWK::generate_ed25519().unwrap());
+        let revocation = ucan_full(
+            &device,
+            &device,
+            &node,
+            &target,
+            "tinycloud.delegation/revoke",
+            vec![cid_of(&control)],
+            now() - 30,
+            now() + 300,
+        );
+        let held =
+            f.db.acquire_chain_guards(&[Hash::from(cid_of(&g))])
+                .await
+                .ok()
+                .expect("guard");
+        let db = f.db.clone();
+        let pending = tokio::spawn(async move { short(&db.revoke(revoc(&revocation)).await) });
+        tokio::time::sleep(BRIEF).await;
+        assert!(
+            !pending.is_finished(),
+            "the revocation must pass the pre-check and wait for its target's chain guard"
+        );
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"tc3000-control-revocation")),
+            revoker: Set(did_vm(&f.owner).0),
+            revoked: Set(Hash::from(cid_of(&control))),
+            serialization: Set(b"tc3000-control-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&f.db.conn)
+        .await
+        .unwrap();
+        drop(held);
+        let out = pending.await.unwrap();
+        assert!(
+            out.starts_with("Err(") && out.contains("Unauthorized Revoker"),
+            "revocation admitted on a revoked control grant: {out}"
+        );
+    }
+
+    /// TC-3000 (Bobbie's #610 review, R2): a stranger's renewal lease of a
+    /// stored original is refused before its own chain guard and the SQLite
+    /// writer lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stranger_renewal_lease_is_refused_before_its_locks() {
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let stranger = JWK::generate_ed25519().unwrap();
+        let lease = ucan_full(
+            &stranger,
+            &stranger,
+            &did_vm(&JWK::generate_ed25519().unwrap()).0,
+            &format!("urn:cid:{}", cid_of(&g)),
+            "tinycloud.delegation/renew",
+            vec![],
+            now() - 30,
+            now() + 300,
+        );
+        assert!(crate::renewal::lease_original_from_signed(&deleg(&lease))
+            .unwrap()
+            .is_some());
+        let held_guard =
+            f.db.acquire_chain_guards(&[crate::hash::hash(lease.as_bytes())])
+                .await
+                .ok()
+                .expect("guard");
+        let held_writer =
+            f.db.writer_lock
+                .as_ref()
+                .expect("SQLite writer lock")
+                .clone()
+                .lock_owned()
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&lease))).await;
+        drop(held_writer);
+        drop(held_guard);
+        let r = r.expect("a stranger's lease must not wait for its chain guard or the writer lock");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::Renewal(
+                    crate::renewal::RenewalStoreError::Unauthorized
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
+
+    /// TC-3000 (Bobbie's #610 review): a path with no pre-check (a policy
+    /// registration's `delegate_batch`) is held to the delegation's time
+    /// window by the transaction itself.
+    #[tokio::test]
+    async fn an_expired_delegation_is_refused_without_a_pre_check() {
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 7200,
+            now() - 3600,
+        );
+        let r = f.db.delegate_batch(vec![deleg(&token)]).await;
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::InvalidTime
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
 }
