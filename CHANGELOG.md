@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 ### Changes
+- `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
+  - a delegation whose issuer neither owns the spaces it names nor holds a stored parent granted to it;
+  - a revocation by someone who may not revoke its target, or of a target that is not stored;
+  - a renewal lease not issued by the delegator of the original it renews;
+  - an expired or not-yet-valid delegation or revocation.
+  The checks run again inside the transaction, which decides. A delegation already stored still answers as registered when posted again, even after it has expired. Refusal messages are unchanged, except that a stranger's renewal lease is now refused as unauthorized even where its window or shape was also wrong. `/delegate` also checks the request's signature before the Policy/v3 admission reads the graph, so a badly signed delegation citing a policy root answers 401 `Failed to verify signature` instead of 403. Details: TC-3000.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.

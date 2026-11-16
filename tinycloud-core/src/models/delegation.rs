@@ -10,7 +10,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
-    ConnectionTrait, DbBackend, QueryTrait, Statement,
+    ConnectionTrait, DbBackend, QuerySelect, QueryTrait, Statement,
 };
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -272,13 +272,7 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
     if !signature_verified {
         check_signature(&delegation.0.delegation).await?;
     }
-    verify_time(&delegation.0.delegation)?;
-    if !delegation.0.parents.is_empty()
-        || !crate::renewal::lease_original_from_signed(delegation)
-            .is_ok_and(|original| original.is_some())
-    {
-        return Err(DelegationError::MissingParents.into());
-    }
+    check_owner_renewal_lease(delegation)?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -484,57 +478,11 @@ async fn validate_with<C: ConnectionTrait>(
     if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
     }
-    for parent in &delegation.parents {
-        let parent_id = Hash::from(*parent);
-        let is_renewal_lease = db
-            .query_one(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
-                [sea_orm::sea_query::Value::Bytes(Some(Box::new(
-                    parent_id.as_ref().to_vec(),
-                )))],
-            ))
-            .await?;
-        if is_renewal_lease.is_some() {
-            return Err(DelegationError::MissingParents.into());
-        }
-    }
-    // Without named keys, a capability on a key or key prefix is refused for
-    // every delegation, before the root-authority filter, so a delegation
-    // issued by the key's owner is covered too.
-    if !named_keys
-        && delegation
-            .capabilities
-            .iter()
-            .any(|cap| cap.resource.is_named_key())
-    {
-        return Err(DelegationError::NamedKeysUnavailable.into());
-    }
-    check_app_id_domain_binding(delegation)?;
-    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
-    // before the root-authority filter.
-    for cap in &delegation.capabilities {
-        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
-    }
-    // Key deletion is never delegated, including by the key's owner.
-    if delegation.capabilities.iter().any(|cap| {
-        crate::policy_capability::ability_matches(
-            &cap.ability.to_string(),
-            "tinycloud.encryption/key.delete",
-        )
-    }) {
-        return Err(DelegationError::KeyDeleteNotDelegable.into());
-    }
+    refuse_renewal_lease_parents(db, delegation).await?;
+    check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
 
     // get caps which rely on delegated caps
-    let dependant_caps: Vec<_> = delegation
-        .capabilities
-        .iter()
-        .filter(|c| {
-            // remove caps for which the delegator is the root authority
-            !is_root_authority(c, &delegation.delegator)
-        })
-        .collect();
+    let dependant_caps = dependant_capabilities(delegation);
 
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
         // no dependant caps, no parents needed, must be valid
@@ -839,6 +787,155 @@ async fn validate_with<C: ConnectionTrait>(
             Ok(())
         }
     }
+}
+
+/// A renewal lease is never a parent: a child citing one is refused as if the
+/// parent were missing.
+async fn refuse_renewal_lease_parents<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+) -> Result<(), Error> {
+    for parent in &delegation.parents {
+        let parent_id = Hash::from(*parent);
+        let is_renewal_lease = db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
+                [sea_orm::sea_query::Value::Bytes(Some(Box::new(
+                    parent_id.as_ref().to_vec(),
+                )))],
+            ))
+            .await?;
+        if is_renewal_lease.is_some() {
+            return Err(DelegationError::MissingParents.into());
+        }
+    }
+    Ok(())
+}
+
+/// The rules on a delegation's own capabilities that hold whoever issues it.
+fn check_capability_rules(
+    delegation: &util::DelegationInfo,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+) -> Result<(), Error> {
+    // Without named keys, a capability on a key or key prefix is refused for
+    // every delegation, before the root-authority filter, so a delegation
+    // issued by the key's owner is covered too.
+    if !named_keys
+        && delegation
+            .capabilities
+            .iter()
+            .any(|cap| cap.resource.is_named_key())
+    {
+        return Err(DelegationError::NamedKeysUnavailable.into());
+    }
+    check_app_id_domain_binding(delegation)?;
+    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
+    // before the root-authority filter.
+    for cap in &delegation.capabilities {
+        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
+    }
+    // Key deletion is never delegated, including by the key's owner.
+    if delegation.capabilities.iter().any(|cap| {
+        crate::policy_capability::ability_matches(
+            &cap.ability.to_string(),
+            "tinycloud.encryption/key.delete",
+        )
+    }) {
+        return Err(DelegationError::KeyDeleteNotDelegable.into());
+    }
+    Ok(())
+}
+
+/// The capabilities the issuer does not hold as a root authority, which a
+/// parent or an owner revoke grant has to support.
+fn dependant_capabilities(delegation: &util::DelegationInfo) -> Vec<&util::Capability> {
+    delegation
+        .capabilities
+        .iter()
+        .filter(|c| !is_root_authority(c, &delegation.delegator))
+        .collect()
+}
+
+/// The checks of [`process_with`] that need no lock, run on the pool before
+/// a delegation takes any chain guard, space write order or transaction
+/// (TC-3000): its signed time window, and the issuer's standing. A stranger
+/// naming another tenant's space or parent, or an expired delegation, is
+/// refused here instead of queueing behind that tenant's locks.
+///
+/// The issuer has standing when it is the root authority for every
+/// capability, or holds an owner revoke grant on each other capability, or
+/// each cited parent is stored and was granted to it. Every check runs again
+/// inside the transaction, which stays the authority. In error order this
+/// follows [`process_with`], except that a cited parent is read directly
+/// instead of through the transaction's graph snapshot.
+pub(crate) async fn precheck<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewer_did: Option<&str>,
+) -> Result<(), Error> {
+    verify_time(&delegation.0.delegation)?;
+    let delegation = &delegation.0;
+    if renewer_did.is_some_and(|renewer_did| delegation.delegator == renewer_did) {
+        return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
+    }
+    refuse_renewal_lease_parents(db, delegation).await?;
+    check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
+    let dependant_caps = dependant_capabilities(delegation);
+    if dependant_caps.is_empty() {
+        return Ok(());
+    }
+    if delegation.parents.is_empty() {
+        if is_policy_root(&delegation.delegation) {
+            return Ok(());
+        }
+        for cap in &dependant_caps {
+            if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
+                return Err(DelegationError::MissingParents.into());
+            }
+        }
+        return Ok(());
+    }
+    let parent_ids: Vec<Hash> = delegation.parents.iter().copied().map(Hash::from).collect();
+    let delegatees: std::collections::HashMap<Hash, String> = Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .column(Column::Delegatee)
+        .filter(Column::Id.is_in(parent_ids.iter().copied()))
+        .into_tuple::<(Hash, String)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+    let policy_session = is_policy_session(&delegation.delegation);
+    for id in &parent_ids {
+        let Some(delegatee) = delegatees.get(id) else {
+            return Err(DelegationError::MissingParents.into());
+        };
+        if !policy_session && *delegatee != delegation.delegator {
+            return Err(
+                DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The checks of [`save_owner_renewal_lease`] that need neither the database
+/// nor a lock: the lease's time window, no cited parents, and a signed
+/// original to renew.
+pub(crate) fn check_owner_renewal_lease(delegation: &Delegation) -> Result<(), Error> {
+    verify_time(&delegation.0.delegation)?;
+    if !delegation.0.parents.is_empty()
+        || !crate::renewal::lease_original_from_signed(delegation)
+            .is_ok_and(|original| original.is_some())
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
+    Ok(())
 }
 
 fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {

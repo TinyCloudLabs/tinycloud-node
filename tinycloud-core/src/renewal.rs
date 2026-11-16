@@ -804,8 +804,10 @@ async fn register_lease_at<C: ConnectionTrait>(
 
 /// Check the stored original a renewal lease renews, on `db`, before the
 /// lease's transaction (TC-2986): it must be stored, match its address and
-/// verify, as the transaction requires. Returns its content hash. The
-/// lease's own signature is checked by the caller.
+/// verify, as the transaction requires, and the lease must be issued by the
+/// original's delegator (TC-3000), so a stranger's lease takes no lock.
+/// Returns its content hash. The lease's own signature is checked by the
+/// caller.
 pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
     db: &C,
     lease_event: &crate::events::Delegation,
@@ -817,7 +819,11 @@ pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
     let (original_bytes, _) = stored_original(db, original, encryption)
         .await?
         .ok_or(RenewalStoreError::InvalidInput)?;
-    verify_signed_signature(&signed_delegation_info(&original_bytes)?).await?;
+    let original_info = signed_delegation_info(&original_bytes)?;
+    verify_signed_signature(&original_info).await?;
+    if lease_event.0.delegator != original_info.delegator {
+        return Err(RenewalStoreError::Unauthorized);
+    }
     Ok(original)
 }
 
@@ -2311,5 +2317,63 @@ mod tests {
             Some((original, renewed_end))
         );
         tx.rollback().await.unwrap();
+    }
+
+    /// TC-3000 (F5): a stored original is used only when its bytes hash to
+    /// the address the lease names, so a replaced or tampered row is refused
+    /// before and inside the lease's transaction.
+    #[tokio::test]
+    async fn a_stored_original_whose_bytes_do_not_match_its_address_is_refused() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
+            .await
+            .unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+        ))
+        .unwrap();
+        let original_bytes = fixture["originalToken"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let original = hash(&original_bytes);
+        let info = signed_delegation_info(&original_bytes).unwrap();
+        for actor in [&info.delegator, &info.delegate] {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO actor (id) VALUES ($1)",
+                [Value::String(Some(Box::new(actor.clone())))],
+            ))
+            .await
+            .unwrap();
+        }
+        let store = |serialization: Vec<u8>| {
+            Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO delegation (id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization, serialization_format) VALUES ($1,$2,$3,NULL,NULL,NULL,NULL,$4,0) ON CONFLICT (id) DO UPDATE SET serialization = excluded.serialization",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                    Value::String(Some(Box::new(info.delegator.clone()))),
+                    Value::String(Some(Box::new(info.delegate.clone()))),
+                    Value::Bytes(Some(Box::new(serialization))),
+                ],
+            )
+        };
+
+        db.execute(store(original_bytes.clone())).await.unwrap();
+        let (stored, _) = stored_original(&db, original, None)
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored, original_bytes);
+
+        let mut tampered = original_bytes.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        db.execute(store(tampered)).await.unwrap();
+        assert!(matches!(
+            stored_original(&db, original, None).await,
+            Err(RenewalStoreError::InvalidInput)
+        ));
     }
 }
