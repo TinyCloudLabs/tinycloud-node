@@ -9,6 +9,8 @@ TinyCloud Node is the server component of the TinyCloud Protocol — a framework
 
 TinyCloud Node hosts user data spaces, processes delegations, and serves the KV storage API. It is a descendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Spaces, where your data lives and who has access.
 
+Access control is not encryption. The node does not yet encrypt ordinary KV or SQL values itself, so whoever operates a node can read them unless the application encrypts them first; [docs/at-rest/INTERFACES.md](docs/at-rest/INTERFACES.md) tracks the at-rest work. A wallet you run keeps its signing key with you; OpenKey holds and uses its keys in its own service. See [Security and trust](https://docs.tinycloud.xyz/concepts/security-and-trust) for key custody, application encryption and authorized-client boundaries.
+
 ## Protocol Version
 
 TinyCloud Node v1.0.0 introduces a protocol version system for SDK-node compatibility. The node exposes a public `/version` endpoint:
