@@ -754,6 +754,9 @@ fn live_chain_effective_ends(
     Ok(ends)
 }
 
+/// Register a renewal lease inside the caller's transaction. Signatures in
+/// `verified` (the lease's, its stored original's) were checked before the
+/// transaction by [`preverify_lease`] and are not checked again (TC-2986).
 pub(crate) async fn register_lease<C: ConnectionTrait>(
     tx: &C,
     lease_event: &crate::events::Delegation,
@@ -761,19 +764,22 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     renewer_epoch: u64,
     stable_node_did: &str,
     encryption: Option<&crate::encryption::ColumnEncryption>,
+    verified: &crate::db::PreVerified,
 ) -> Result<(), RenewalStoreError> {
-    register_lease_at(
+    register_lease_checked(
         tx,
         lease_event,
         renewal_seed,
         renewer_epoch,
         stable_node_did,
         encryption,
+        verified,
         verifier_now().unix_timestamp(),
     )
     .await
 }
 
+#[cfg(test)]
 async fn register_lease_at<C: ConnectionTrait>(
     tx: &C,
     lease_event: &crate::events::Delegation,
@@ -783,21 +789,52 @@ async fn register_lease_at<C: ConnectionTrait>(
     encryption: Option<&crate::encryption::ColumnEncryption>,
     now: i64,
 ) -> Result<(), RenewalStoreError> {
-    let lease_bytes = lease_event.serialized_bytes();
-    let lease = signed_delegation_info(lease_bytes)?;
-    verify_signed_signature(&lease).await?;
+    register_lease_checked(
+        tx,
+        lease_event,
+        renewal_seed,
+        renewer_epoch,
+        stable_node_did,
+        encryption,
+        &crate::db::PreVerified::default(),
+        now,
+    )
+    .await
+}
+
+/// Check the stored original a renewal lease renews, on `db`, before the
+/// lease's transaction (TC-2986): it must be stored, match its address and
+/// verify, as the transaction requires. Returns its content hash. The
+/// lease's own signature is checked by the caller.
+pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
+    db: &C,
+    lease_event: &crate::events::Delegation,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<Hash, RenewalStoreError> {
     let original_cid =
         lease_original_from_signed(lease_event)?.ok_or(RenewalStoreError::Unauthorized)?;
-    let (original_cid, original) = canonical_cid(&original_cid)?;
-    let lease_hash = crate::hash::hash(lease_bytes);
+    let (_, original) = canonical_cid(&original_cid)?;
+    let (original_bytes, _) = stored_original(db, original, encryption)
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    verify_signed_signature(&signed_delegation_info(&original_bytes)?).await?;
+    Ok(original)
+}
 
-    let lease = &lease;
-
-    let original_row = tx.query_one(Statement::from_sql_and_values(
-        tx.get_database_backend(),
+/// The stored original delegation `original` addresses, decrypted and checked
+/// against its address, with its graph row; `None` when it is not stored.
+async fn stored_original<C: ConnectionTrait>(
+    db: &C,
+    original: Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<Option<(Vec<u8>, sea_orm::QueryResult)>, RenewalStoreError> {
+    let Some(original_row) = db.query_one(Statement::from_sql_and_values(
+        db.get_database_backend(),
         "SELECT serialization, serialization_format, delegator, delegatee, expiry FROM delegation WHERE id = $1",
         [Value::Bytes(Some(Box::new(Vec::<u8>::from(original))))],
-    )).await?.ok_or(RenewalStoreError::InvalidInput)?;
+    )).await? else {
+        return Ok(None);
+    };
     let stored_bytes: Vec<u8> = original_row.try_get("", "serialization")?;
     let stored_format: i16 = original_row.try_get("", "serialization_format")?;
     let original_id_bytes = Vec::<u8>::from(original);
@@ -811,8 +848,39 @@ async fn register_lease_at<C: ConnectionTrait>(
     if crate::hash::hash(&original_bytes) != original {
         return Err(RenewalStoreError::InvalidInput);
     }
+    Ok(Some((original_bytes, original_row)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_lease_checked<C: ConnectionTrait>(
+    tx: &C,
+    lease_event: &crate::events::Delegation,
+    renewal_seed: [u8; 32],
+    renewer_epoch: u64,
+    stable_node_did: &str,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+    verified: &crate::db::PreVerified,
+    now: i64,
+) -> Result<(), RenewalStoreError> {
+    let lease_bytes = lease_event.serialized_bytes();
+    let lease = signed_delegation_info(lease_bytes)?;
+    let lease_hash = crate::hash::hash(lease_bytes);
+    if !verified.contains(&lease_hash) {
+        verify_signed_signature(&lease).await?;
+    }
+    let original_cid =
+        lease_original_from_signed(lease_event)?.ok_or(RenewalStoreError::Unauthorized)?;
+    let (original_cid, original) = canonical_cid(&original_cid)?;
+
+    let lease = &lease;
+
+    let (original_bytes, original_row) = stored_original(tx, original, encryption)
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
     let original_info = signed_delegation_info(&original_bytes)?;
-    verify_signed_signature(&original_info).await?;
+    if !verified.contains(&original) {
+        verify_signed_signature(&original_info).await?;
+    }
     let graph_delegator: String = original_row.try_get("", "delegator")?;
     let graph_delegatee: String = original_row.try_get("", "delegatee")?;
     let graph_expiry: Option<OffsetDateTime> = original_row.try_get("", "expiry")?;

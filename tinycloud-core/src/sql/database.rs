@@ -48,6 +48,9 @@ enum DbMessage {
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
+    Snapshot {
+        response_tx: oneshot::Sender<Result<tempfile::NamedTempFile, SqlError>>,
+    },
     Checkpoint {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
@@ -170,6 +173,20 @@ impl DatabaseHandle {
         response_rx
             .await
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn snapshot(&self) -> Result<tempfile::NamedTempFile, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::Snapshot { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".into()))?
     }
 
     pub async fn checkpoint(&self) -> Result<Vec<u8>, SqlError> {
@@ -407,6 +424,13 @@ pub fn spawn_actor_with_policy(
                     let result = handle_export(&conn, &mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::Snapshot { response_tx } => {
+                    let result = handle_snapshot(&conn, &mode);
+                    if result.is_ok() {
+                        policy.budget.forget(&key);
+                    }
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Checkpoint { response_tx } => {
                     let result = handle_checkpoint(&conn, &mode, &file_path);
                     if result.is_ok() {
@@ -495,6 +519,28 @@ fn handle_export(
     drop(dest);
 
     std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
+}
+
+fn handle_snapshot(
+    conn: &rusqlite::Connection,
+    mode: &StorageMode,
+) -> Result<tempfile::NamedTempFile, SqlError> {
+    if matches!(mode, StorageMode::File(_)) {
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        if busy != 0 {
+            return Err(SqlError::Internal("Database checkpoint is busy".into()));
+        }
+    }
+    let snapshot = tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
+    let mut dest = rusqlite::Connection::open(snapshot.path())
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    rusqlite::backup::Backup::new(conn, &mut dest)
+        .and_then(|backup| backup.run_to_completion(i32::MAX, std::time::Duration::ZERO, None))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    drop(dest);
+    Ok(snapshot)
 }
 
 fn handle_checkpoint(

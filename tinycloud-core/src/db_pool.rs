@@ -103,8 +103,8 @@ impl RecoveringConnection {
     }
 
     /// Record the `statement_timeout` policy the pool was built with, so
-    /// [`Self::begin`] (in [`StatementTimeoutMode::Local`]) and
-    /// [`Self::begin_bulk`] can scope it. PostgreSQL only; other backends ignore it.
+    /// [`Self::begin`] can scope it in [`StatementTimeoutMode::Local`].
+    /// PostgreSQL only; other backends ignore it.
     pub fn with_statement_timeouts(mut self, statement_timeouts: StatementTimeouts) -> Self {
         self.statement_timeouts = Some(statement_timeouts);
         self
@@ -317,47 +317,6 @@ impl RecoveringConnection {
 }
 
 impl RecoveringConnection {
-    /// Open a scope whose statements are allowed the bulk `statement_timeout`
-    /// ([`StatementTimeouts::bulk`]), for statements that legitimately move a
-    /// whole database artifact (TC-1054). Finish it with
-    /// [`BulkScope::commit`]; dropping it rolls back.
-    ///
-    /// On PostgreSQL with a statement timeout configured, the scope is a
-    /// transaction opened with `SET LOCAL statement_timeout`: three more
-    /// round trips (`BEGIN`, `SET LOCAL`, `COMMIT`), so use it only on
-    /// infrequent paths. Statements in it are not retried after a lost
-    /// connection; a read-only scope is not retried either. Everywhere
-    /// else the scope is the pool itself, statement by statement, under the
-    /// usual retry policy.
-    pub async fn begin_bulk(&self) -> Result<BulkScope, DbErr> {
-        let scope = self.begin_bulk_read().await?;
-        if matches!(scope, BulkScope::Transaction(_)) {
-            note_write_may_have_applied();
-        }
-        Ok(scope)
-    }
-
-    /// [`Self::begin_bulk`] for a scope that only reads: it does not count as
-    /// a write that may have taken effect ([`track_writes`]).
-    pub async fn begin_bulk_read(&self) -> Result<BulkScope, DbErr> {
-        let Some(timeout) = self.bulk_statement_timeout() else {
-            return Ok(BulkScope::Pool(self.clone()));
-        };
-        let transaction = self.run("begin", true, || self.conn.begin()).await?;
-        transaction
-            .execute_unprepared(&set_local_statement_timeout(timeout))
-            .await?;
-        Ok(BulkScope::Transaction(transaction))
-    }
-
-    /// The `statement_timeout` a [`Self::begin_bulk`] transaction runs with, or
-    /// `None` when no statement timeout applies to this pool.
-    fn bulk_statement_timeout(&self) -> Option<Duration> {
-        let timeouts = self.statement_timeouts?;
-        (self.conn.get_database_backend() == DatabaseBackend::Postgres && timeouts.is_enabled())
-            .then_some(timeouts.bulk)
-    }
-
     /// Apply [`StatementTimeoutMode::Local`] to a transaction just begun.
     async fn scope_local_timeout(
         &self,
@@ -377,75 +336,6 @@ impl RecoveringConnection {
     }
 }
 
-/// A [`RecoveringConnection::begin_bulk`] scope: the pool itself, or the
-/// transaction that raised the statement timeout.
-pub enum BulkScope {
-    Pool(RecoveringConnection),
-    Transaction(DatabaseTransaction),
-}
-
-impl BulkScope {
-    /// Commit the scope's transaction, if it has one.
-    pub async fn commit(self) -> Result<(), DbErr> {
-        match self {
-            Self::Pool(_) => Ok(()),
-            Self::Transaction(transaction) => transaction.commit().await,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ConnectionTrait for BulkScope {
-    fn get_database_backend(&self) -> DatabaseBackend {
-        match self {
-            Self::Pool(conn) => conn.get_database_backend(),
-            Self::Transaction(transaction) => transaction.get_database_backend(),
-        }
-    }
-
-    async fn execute(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
-        match self {
-            Self::Pool(conn) => conn.execute(stmt).await,
-            Self::Transaction(transaction) => transaction.execute(stmt).await,
-        }
-    }
-
-    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        match self {
-            Self::Pool(conn) => conn.execute_unprepared(sql).await,
-            Self::Transaction(transaction) => transaction.execute_unprepared(sql).await,
-        }
-    }
-
-    async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
-        match self {
-            Self::Pool(conn) => conn.query_one(stmt).await,
-            Self::Transaction(transaction) => transaction.query_one(stmt).await,
-        }
-    }
-
-    async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        match self {
-            Self::Pool(conn) => conn.query_all(stmt).await,
-            Self::Transaction(transaction) => transaction.query_all(stmt).await,
-        }
-    }
-
-    fn support_returning(&self) -> bool {
-        match self {
-            Self::Pool(conn) => conn.support_returning(),
-            Self::Transaction(transaction) => transaction.support_returning(),
-        }
-    }
-
-    fn is_mock_connection(&self) -> bool {
-        match self {
-            Self::Pool(conn) => conn.is_mock_connection(),
-            Self::Transaction(transaction) => transaction.is_mock_connection(),
-        }
-    }
-}
-
 /// How the node's PostgreSQL pool applies `statement_timeout` (TC-1054).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -457,9 +347,9 @@ pub enum StatementTimeoutMode {
     /// autocommit ones included. Behind a transaction-pooling proxy
     /// (PgBouncer, PlanetScale PSBouncer) the `SET` lands on whichever server
     /// connection served it, so coverage is best-effort there and the setting
-    /// can reach other clients of the proxy. The scoped limits
-    /// ([`EXEMPT_STATEMENT_TIMEOUT`], [`RecoveringConnection::begin_bulk`])
-    /// use `SET LOCAL` and stay inside their transaction.
+    /// can reach other clients of the proxy. The migrations' exemption
+    /// ([`EXEMPT_STATEMENT_TIMEOUT`]) uses `SET LOCAL` and stays inside its
+    /// transaction.
     #[default]
     Session,
     /// `SET LOCAL statement_timeout` at the start of every explicit
@@ -477,9 +367,6 @@ pub struct StatementTimeouts {
     /// The timeout of every statement. Zero disables it, like
     /// [`StatementTimeoutMode::Off`].
     pub base: Duration,
-    /// The timeout of a [`RecoveringConnection::begin_bulk`] scope's
-    /// statements: whole-artifact loads and full checkpoint saves.
-    pub bulk: Duration,
 }
 
 impl StatementTimeouts {
@@ -1741,7 +1628,6 @@ mod tests {
         let timeouts = |mode, base_ms| StatementTimeouts {
             mode,
             base: Duration::from_millis(base_ms),
-            bulk: Duration::from_secs(120),
         };
         assert_eq!(
             timeouts(StatementTimeoutMode::Session, 30_000)
@@ -1790,12 +1676,6 @@ mod tests {
                 .await
                 .unwrap()
                 .rollback()
-                .await
-                .unwrap();
-            conn.begin_bulk_read()
-                .await
-                .unwrap()
-                .commit()
                 .await
                 .unwrap();
         })
@@ -1880,24 +1760,12 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
-    /// Off PostgreSQL, a bulk scope is the pool itself: no transaction, and
-    /// statements keep their retry policy.
+    /// `local` mode issues nothing off PostgreSQL.
     #[tokio::test]
-    async fn bulk_scope_is_the_pool_off_postgres() {
-        let conn = sqlite().await.with_statement_timeouts(StatementTimeouts {
-            mode: StatementTimeoutMode::Session,
-            base: Duration::from_millis(1),
-            bulk: Duration::from_millis(1),
-        });
-        let scope = conn.begin_bulk().await.unwrap();
-        assert!(matches!(scope, BulkScope::Pool(_)));
-        assert_eq!(actor::Entity::find().count(&scope).await.unwrap(), 0);
-        scope.commit().await.unwrap();
-        // `local` mode issues nothing on SQLite either.
+    async fn local_mode_issues_nothing_off_postgres() {
         let local = sqlite().await.with_statement_timeouts(StatementTimeouts {
             mode: StatementTimeoutMode::Local,
             base: Duration::from_millis(1),
-            bulk: Duration::from_millis(1),
         });
         local.begin().await.unwrap().commit().await.unwrap();
     }

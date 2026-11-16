@@ -124,6 +124,11 @@ where
     .await
 }
 
+/// `/invoke` answers one outcome; this 501 body refuses anything else,
+/// including a KV write mixed with a read (TC-2986).
+const MULTIPLE_OUTCOMES_UNSUPPORTED: &str =
+    "Multiple invocation outcomes require a homogeneous KV get or metadata batch";
+
 /// Body prefix of a database failure that is safe to retry with a fresh
 /// request; the response is a `503` with `Retry-After` (TC-1054).
 pub const UNAVAILABLE_RETRYABLE: &str = "unavailable_retryable";
@@ -2282,6 +2287,17 @@ async fn invoke_impl(
             ).into());
         }
 
+        // TC-2986: a KV write mixed with a read answers more than one
+        // outcome, which this route cannot return: it ended in 501 after
+        // the write had committed. Refuse it before any work instead, so
+        // nothing is applied and the replay row is not spent.
+        if tinycloud_core::kv_mixes_writes_and_reads(admitted.invocation()) {
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
+            return Err((Status::NotImplemented, MULTIPLE_OUTCOMES_UNSUPPORTED.to_string()).into());
+        }
+
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
         let mut kv_options = kv_invoke_options(
@@ -2532,8 +2548,7 @@ async fn invoke_impl(
                     if batch_specs.len() != outcomes.len() || !homogeneous {
                         Err((
                             Status::NotImplemented,
-                            "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
-                                .to_string(),
+                            MULTIPLE_OUTCOMES_UNSUPPORTED.to_string(),
                         ).into())
                     } else {
                         let mut results = Vec::with_capacity(outcomes.len());
@@ -2651,6 +2666,9 @@ async fn invoke_impl(
                         TxStoreError::LegacyMeetingFrozen => Status::Conflict,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::KvListCursorOutsidePrefix => Status::BadRequest,
+                        // The write was saved; unreachable here, since a
+                        // mixed write and read is refused before any work.
+                        TxStoreError::ReadAfterCommit(_) => Status::InternalServerError,
                         TxStoreError::Tx(TxError::InvalidInvocation(
                             invocation_model::InvocationError::MissingKvWrite(_),
                         )) => Status::NotFound,
@@ -3661,7 +3679,11 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         // 507, not 413: the SQL client reads 413 as `SQL_RESPONSE_TOO_LARGE`
         // and the KV and quota clients as an exhausted storage plan, and
         // TC-1012's 413 is the request body cap. Neither is true here.
-        SqlError::DatabaseSizeLimit | SqlError::DiskHeadroom => Status::new(507),
+        SqlError::DatabaseSizeLimit | SqlError::DatabaseTooLargeToLoad => Status::new(507),
+        SqlError::DiskHeadroom => {
+            crate::prometheus::observe_disk_headroom_refusal("sql");
+            Status::new(507)
+        }
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation | SqlError::CaveatViolation(_) => Status::Forbidden,
@@ -4141,6 +4163,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ResponseTooLarge(..) => Status::new(413),
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
+        DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => Status::new(507),
         DuckDbError::IngestError(_) => Status::InternalServerError,
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
@@ -8377,6 +8400,26 @@ mod tests {
         assert!(SqlError::CommitFailed
             .to_string()
             .starts_with("sql_commit_failed:"));
+    }
+
+    /// TC-2961: a database too large to load answers 507 with the size-limit
+    /// code, for SQL and DuckDB alike, never 500.
+    #[test]
+    fn a_database_too_large_to_load_is_507() {
+        assert_eq!(
+            sql_error_to_status(&SqlError::DatabaseTooLargeToLoad),
+            Status::new(507)
+        );
+        let body = SqlError::DatabaseTooLargeToLoad.to_string();
+        assert!(body.starts_with("sql_database_size_limit:"), "{body}");
+        #[cfg(feature = "duckdb")]
+        for error in [
+            DuckDbError::DatabaseSizeLimit,
+            DuckDbError::DatabaseTooLargeToLoad,
+        ] {
+            assert_eq!(duckdb_error_to_status(&error), Status::new(507));
+            assert!(error.to_string().starts_with("sql_database_size_limit:"));
+        }
     }
 
     #[tokio::test]

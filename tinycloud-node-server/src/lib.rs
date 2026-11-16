@@ -16,7 +16,7 @@ use rocket::{
     Build, Rocket, Route,
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -468,9 +468,8 @@ pub fn postgres_connections_opened() -> u64 {
 ///   seconds instead of hanging for up to ~15 min. A connect whose options
 ///   cannot be set fails;
 /// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
-///   statement stuck on a live connection fails server-side. Migrations and
-///   whole-artifact transfers scope their own limits
-///   ([`tinycloud_core::db::migrate`], [`RecoveringConnection::begin_bulk`]).
+///   statement stuck on a live connection fails server-side. Migrations
+///   lift it for their own transaction ([`tinycloud_core::db::migrate`]).
 ///
 /// sea-orm's `Database::connect` cannot install these hooks, so the pool is
 /// built here with the same connect options it would have applied: the URL,
@@ -516,6 +515,13 @@ pub async fn postgres_pool_with_recovery(
     );
     let statement_timeouts = database.statement_timeouts();
     let session_statement = statement_timeouts.session_statement();
+    let idle_in_transaction_statement = database.idle_in_transaction_statement();
+    // The value in effect: 0 when off or in `local` statement-timeout mode.
+    let idle_in_transaction_timeout_ms = if idle_in_transaction_statement.is_some() {
+        database.idle_in_transaction_timeout_ms
+    } else {
+        0
+    };
     let pool = recovery
         .install(
             connect_opts
@@ -524,9 +530,13 @@ pub async fn postgres_pool_with_recovery(
         )
         .after_connect(move |conn, _meta| {
             let session_statement = session_statement.clone();
+            let idle_in_transaction_statement = idle_in_transaction_statement.clone();
             Box::pin(async move {
                 POSTGRES_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
-                if let Some(statement) = session_statement {
+                for statement in [session_statement, idle_in_transaction_statement]
+                    .into_iter()
+                    .flatten()
+                {
                     conn.execute(statement.as_str()).await?;
                 }
                 Ok(())
@@ -540,7 +550,7 @@ pub async fn postgres_pool_with_recovery(
     ::tracing::info!(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
-        bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        idle_in_transaction_timeout_ms,
         retry_window_ms = database.retry_window_ms,
         tcp_keepalive = keepalive.is_some(),
         tcp_keepalive_idle_secs = keepalive.map(|k| k.idle.as_secs()),
@@ -583,6 +593,11 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
     resolved.database.validate().map_err(anyhow::Error::msg)?;
     resolved
+        .storage
+        .sql
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    resolved
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;
@@ -594,6 +609,20 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
+    if resolved.storage.sql.chunked_artifacts {
+        anyhow::ensure!(
+            resolved.storage.database().starts_with("postgres"),
+            "chunked artifacts require PostgreSQL"
+        );
+        anyhow::ensure!(
+            resolved.storage.sql.chunked_artifact_max_bytes > 0
+                && resolved.storage.sql.chunked_account_max_bytes > 0
+                && resolved.storage.sql.chunked_artifact_max_bytes <= i64::MAX as u64
+                && resolved.storage.sql.chunked_account_max_bytes <= i64::MAX as u64,
+            "chunked artifacts require explicit positive capacities within int64"
+        );
+    }
+
     resolved
         .sql_store
         .validate_for_database(resolved.storage.database())
@@ -686,6 +715,19 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
     routes
 }
 
+/// Settings the node no longer reads that a deployment may still set, in
+/// its file or environment. Configuration extraction ignores unknown keys,
+/// so each is named once at startup instead of being dropped silently.
+const REMOVED_SETTINGS: &[&str] = &["database.bulk_statement_timeout_ms"];
+
+fn removed_settings(config: &Figment) -> Vec<&'static str> {
+    REMOVED_SETTINGS
+        .iter()
+        .copied()
+        .filter(|setting| config.find_value(setting).is_ok())
+        .collect()
+}
+
 pub async fn app_with_control(
     config: &Figment,
     tinycloud_config: &Config,
@@ -731,6 +773,12 @@ pub async fn app_with_control(
         offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS, "did resolution policy");
     if tinycloud_config.did_resolution.network_methods {
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
+    }
+    for setting in removed_settings(config) {
+        ::tracing::warn!(
+            setting,
+            "removed setting is set and ignored; delete it from the configuration (TC-2961)"
+        );
     }
 
     let key_setup: StaticSecret =
@@ -956,19 +1004,35 @@ pub async fn app_with_control(
         tc_bench_block_get,
         tc_bench_health,
     ]);
-    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
-        Arc::new(SizeTrackingArtifactRepository::new(
-            Arc::new(
-                node_artifact_repository(&tinycloud).with_max_write_bytes(
-                    tinycloud_config
-                        .storage
-                        .sql
-                        .max_artifact_write_bytes
-                        .as_u64(),
-                ),
-            ),
-            sql_sizes.clone(),
+    let raw_artifact_repository = node_artifact_repository(&tinycloud)
+        .with_max_write_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_write_bytes
+                .as_u64(),
+        )
+        .with_max_read_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_read_bytes
+                .as_u64(),
+        )
+        .with_chunk_limits(tinycloud_config.storage.sql.chunked_artifacts.then_some(
+            tinycloud_core::database_artifacts::chunks::ChunkLimits {
+                artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
+                account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
+            },
         ));
+    raw_artifact_repository.configure_chunked_storage().await?;
+    let artifact_collector = raw_artifact_repository
+        .chunk_storage_active()
+        .await?
+        .then_some(raw_artifact_repository.clone());
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SizeTrackingArtifactRepository::new(Arc::new(raw_artifact_repository), sql_sizes.clone()),
+    );
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -1075,6 +1139,28 @@ pub async fn app_with_control(
     let renewal_scheduler_tinycloud = tinycloud.clone();
     let renewal_scheduler_secret = key_setup.clone();
     let rocket = rocket::custom(config)
+        .attach(AdHoc::on_liftoff("artifact-part-collector", move |rocket| {
+            let collector=artifact_collector.clone();
+            let shutdown=rocket.shutdown();
+            Box::pin(async move {
+                if let Some(collector)=collector {
+                    tokio::spawn(async move {
+                        let mut interval=tokio::time::interval(Duration::from_secs(10));
+                        tokio::pin!(shutdown);
+                        loop {
+                            tokio::select! {
+                                _=interval.tick()=> {
+                                    if !matches!(tokio::time::timeout(Duration::from_secs(1), collector.reap_unused_parts(128)).await, Ok(Ok(()))) {
+                                        ::tracing::warn!(event="artifact_part_collection_failed", "Artifact part collection deferred");
+                                    }
+                                },
+                                _=&mut shutdown=>break,
+                            }
+                        }
+                    });
+                }
+            })
+        }))
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
             let policy = egress_policy.clone();
             move |rocket| {
@@ -1303,6 +1389,27 @@ pub async fn app_with_control(
     } else {
         rocket
     };
+
+    // TC-2917: every 5 minutes, report the free bytes behind each local store
+    // as a log event (shipped by the log sidecar) and as a gauge. Operators
+    // have no shell on the node; this is how they see disk headroom.
+    let headroom_stores = local_stores(&tinycloud_config.storage);
+    let rocket = rocket.attach(AdHoc::on_liftoff("storage-headroom", move |rocket| {
+        let stores = headroom_stores.clone();
+        let shutdown = rocket.shutdown();
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(STORAGE_HEADROOM_PERIOD);
+                tokio::pin!(shutdown);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => report_storage_headroom(&stores),
+                        _ = &mut shutdown => break,
+                    }
+                }
+            });
+        })
+    }));
 
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
@@ -1607,6 +1714,51 @@ async fn sample_db_telemetry(
     let read_audit = tinycloud.read_audit_health();
     crate::prometheus::observe_read_audit(last_read_audit, &read_audit);
     *last_read_audit = read_audit;
+}
+
+/// How often [`report_storage_headroom`] runs.
+const STORAGE_HEADROOM_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The local stores whose filesystem headroom is reported, by the label they
+/// are reported under.
+fn local_stores(storage: &config::Storage) -> Vec<(&'static str, PathBuf)> {
+    let mut stores = Vec::new();
+    if let Some(path) = &storage.sql.path {
+        stores.push(("sql", PathBuf::from(path)));
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(path) = &storage.duckdb.path {
+        stores.push(("duckdb", PathBuf::from(path)));
+    }
+    stores
+}
+
+/// The granularity of the free bytes in the shipped headroom event: exact
+/// values every 5 minutes would let a quiet node's write volume be inferred
+/// by whoever reads the logs; 64 MiB steps still show headroom.
+const STORAGE_HEADROOM_STEP_BYTES: u64 = 64 << 20;
+
+/// The log target of the headroom event. It is not a module path, so no other
+/// line in the node can carry it by accident.
+const STORAGE_HEADROOM_TARGET: &str = "tinycloud::disk_headroom";
+
+/// One `statvfs` per store: the exact free bytes go to the gauge, and one
+/// `storage headroom` event per store carries them rounded down to
+/// [`STORAGE_HEADROOM_STEP_BYTES`]; the log sidecar ships it with only these
+/// two fields. A store that cannot be read is skipped.
+fn report_storage_headroom(stores: &[(&'static str, PathBuf)]) {
+    use tinycloud_core::sql::durability::{FreeSpace, StatvfsFreeSpace};
+    for (store, path) in stores {
+        if let Ok(free_bytes) = StatvfsFreeSpace.free_bytes(path) {
+            crate::prometheus::set_storage_free_bytes(store, free_bytes);
+            ::tracing::info!(
+                target: STORAGE_HEADROOM_TARGET,
+                store = *store,
+                free_bytes = free_bytes - free_bytes % STORAGE_HEADROOM_STEP_BYTES,
+                "storage headroom"
+            );
+        }
+    }
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed
@@ -2824,5 +2976,28 @@ mod no_transform_fairing_tests {
                 "{path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod removed_settings_tests {
+    use super::*;
+    use rocket::figment::providers::Serialized;
+
+    /// TC-2961: `database.bulk_statement_timeout_ms` is gone; a deployment
+    /// that still sets it is told so, and a default one is not.
+    #[test]
+    fn a_set_removed_setting_is_named() {
+        let defaults = Figment::from(Serialized::defaults(Config::default()));
+        assert!(removed_settings(&defaults).is_empty());
+        let old = defaults.merge(("database.bulk_statement_timeout_ms", 120_000));
+        assert_eq!(
+            removed_settings(&old),
+            ["database.bulk_statement_timeout_ms"]
+        );
+        assert!(
+            old.extract::<Config>().is_ok(),
+            "still ignored, not refused"
+        );
     }
 }
