@@ -447,6 +447,24 @@ fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), 
     Ok(())
 }
 
+/// The end a child delegation's expiry is held to: the parent's effective end
+/// from the authorization graph (renewals and ancestors applied), which the
+/// graph keeps in whole seconds (TC-3076). When that end is the parent's own
+/// signed expiry, use the signed expiry at full precision instead. Otherwise
+/// a child expiring at the parent's exact instant, or anywhere in its last
+/// partial second, would be refused. A renewed end (later than that second)
+/// or an ancestor's cap (earlier) is used as it is.
+fn parent_end_for_child(
+    effective_end: Option<i64>,
+    signed_expiry: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    match (effective_end, signed_expiry) {
+        (Some(end), Some(signed)) if end == signed.unix_timestamp() => Some(signed),
+        (Some(end), signed) => OffsetDateTime::from_unix_timestamp(end).ok().or(signed),
+        (None, signed) => signed,
+    }
+}
+
 // verify parenthood and authorization
 #[cfg(test)]
 async fn validate<C: ConnectionTrait>(
@@ -693,10 +711,8 @@ async fn validate_with<C: ConnectionTrait>(
                 .filter(|p| {
                     // valid time bounds: child's validity must be within parent's validity
                     // expiry: child must expire at or before parent (None = no expiry)
-                    let parent_effective_expiry = graph
-                        .effective_expiry(&p.id)
-                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
-                        .or(p.expiry);
+                    let parent_effective_expiry =
+                        parent_end_for_child(graph.effective_expiry(&p.id), p.expiry);
                     let expiry_valid = match (parent_effective_expiry, delegation.expiry) {
                         (None, _) => true,
                         (Some(_), None) => false,
@@ -2961,5 +2977,89 @@ mod tests {
             }
         }
         assert_eq!((decided, skipped), (20, 3));
+    }
+
+    /// TC-3076: a child may expire at its parent's exact instant, milliseconds
+    /// included, as node-sdk's useDelegation asks; one millisecond later is
+    /// refused.
+    #[tokio::test]
+    async fn a_child_may_expire_at_its_parents_millisecond_but_not_after() {
+        use sea_orm::sea_query::Expr;
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let db = database().await;
+        let parent = crate::hash::hash(b"tc3076-parent");
+        let prefix = "tinycloud:did:key:other:files/kv";
+        insert_parent_grant(
+            &db,
+            parent,
+            "did:key:other",
+            "did:key:actor",
+            prefix,
+            "tinycloud.kv/get",
+        )
+        .await;
+        let parent_expiry = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        Entity::update_many()
+            .col_expr(Column::Expiry, Expr::value(parent_expiry))
+            .filter(Column::Id.eq(parent))
+            .exec(&db)
+            .await
+            .unwrap();
+        let child_at = |expiry: &str| {
+            let mut child = key_grant_info(
+                "did:key:actor",
+                "tinycloud:did:key:other:files/kv/doc",
+                "tinycloud.kv/get",
+                &[parent],
+            );
+            child.expiry = Some(OffsetDateTime::parse(expiry, &Rfc3339).unwrap());
+            child
+        };
+        for accepted in ["2027-11-15T23:12:08.000Z", "2027-11-15T23:12:08.053Z"] {
+            validate(&db, &child_at(accepted))
+                .await
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+        }
+        let refused = validate(&db, &child_at("2027-11-15T23:12:08.054Z")).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::InvalidDelegation(
+                    DelegationError::ExpiryExceedsParent
+                ))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// TC-3076: only the parent's own signed second is read at full
+    /// precision; a renewed end and an ancestor's cap are used as the graph
+    /// computed them.
+    #[test]
+    fn the_parent_end_is_exact_only_where_it_is_the_signed_expiry() {
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let signed = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        let second = signed.unix_timestamp();
+        let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+        // No renewal: the graph's end is the signed second; the signed instant counts.
+        assert_eq!(
+            parent_end_for_child(Some(second), Some(signed)),
+            Some(signed)
+        );
+        // Renewed past the signed expiry: the renewed end, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second + 600), Some(signed)),
+            Some(at(second + 600))
+        );
+        // Capped by an ancestor before it: the cap, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second - 1), Some(signed)),
+            Some(at(second - 1))
+        );
+        // No graph end: the signed expiry; no expiry at all: none.
+        assert_eq!(parent_end_for_child(None, Some(signed)), Some(signed));
+        assert_eq!(parent_end_for_child(None, None), None);
+        // No signed expiry and an unbounded graph end: no expiry, as before.
+        assert_eq!(parent_end_for_child(Some(i64::MAX), None), None);
     }
 }
