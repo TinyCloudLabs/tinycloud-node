@@ -588,6 +588,10 @@ its branch policy before any workflow that names it runs.
      `kv-sync-v1`, `kv-sync-root`, `tee`).
      A release that includes TC-2132 also reports `delegation-issued-query-v1`;
      without it `POST /delegation/query` answers `direction: "issued"` with 400.
+     A release that includes TC-3174 also reports `hooks-effective-end-v1`:
+     hook tickets and stream opens use the current effective end (renewal
+     stamps included); without it a renewed grant's hooks stop at its signed
+     expiry.
    - Every PostgreSQL connection got its TCP keepalive options (TC-1054,
      1.20.5 on). The production logs are private, so this is read from
      `/info`, which carries two counts (no hosts or errors):

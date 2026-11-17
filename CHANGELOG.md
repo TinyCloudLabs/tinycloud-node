@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Hooks honour renewal stamps. A hook ticket's `parent_exp` is now the cited delegations' current effective end, the one `/invoke` reads use: the latest admitted stamp of the node's current renewer epoch, capped by every ancestor, else the signed expiry. It is recomputed at every `/hooks/events` open and reopen, so a renewed grant (including an owner-lease-renewed one) keeps its subscription past its signed expiry, and a stream ends at the earliest of its ticket's `exp`, that current end and `hooks.max_ticket_ttl_seconds` (300 s by default) after it opened. Each open still checks the whole chain for revocation; a stream already open when a delegation in its chain is revoked, or when stamping stops, ends at that deadline and its reopen is refused. Unrenewed grants are unchanged. `/info` reports `hooks-effective-end-v1`. Details: TC-3174.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.

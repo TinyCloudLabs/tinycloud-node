@@ -366,6 +366,9 @@ fn build_info(
     features.push("duckdb");
     features.extend([
         "hooks",
+        // Hook tickets and stream opens use the current effective end, renewal
+        // stamps included, instead of the signed expiry.
+        "hooks-effective-end-v1",
         "signed-urls",
         "encryption",
         "kv-sync-v1",
