@@ -10,9 +10,17 @@
 //!   #625).
 //! - **Per account:** the account is the owner of the invocation's spaces,
 //!   keyed by the same HMAC pseudonym `node_request` logs as `account_hash`.
-//!   - A database-time budget: a token bucket in milliseconds, debited by each
-//!     response's measured query time on every route.
-//!   - A cap on the account's requests in flight at once.
+//!   - A database-time budget: a token bucket in milliseconds, debited by the
+//!     measured query time of each response on every route. Only a response
+//!     below 400 is charged to its account. Anyone with a valid session key
+//!     can sign an invocation naming any space, and its authorization
+//!     queries run before it is refused. If refused requests were charged,
+//!     anyone could put a stranger's account in debt. A failed response's
+//!     database time counts toward the node's total as unattributed.
+//!   - A cap on the account's requests in flight at once. It is taken before
+//!     authorization, so requests that will be refused also occupy places.
+//!     That is harmless in shadow mode. Enforcing it needs those requests
+//!     kept out of the count (TC-3216, before enforcement).
 //!
 //!   An invocation that targets more than one account has no single account
 //!   and is not limited per account.
@@ -504,7 +512,13 @@ impl FairShare {
     /// Account one response's database time, `query_time_ns`, to `account`,
     /// the request's single target account if it had one. Debits the
     /// account's budget and adds to the top-talker window.
-    pub fn observe_db_time(&self, account: Option<AccountHash>, query_time_ns: u64) {
+    ///
+    /// A response with `status` 400 or above is charged to no account and
+    /// counts as unattributed. Its request may have named a space it was then
+    /// refused, and charging the space's owner would let anyone spend a
+    /// stranger's budget.
+    pub fn observe_db_time(&self, account: Option<AccountHash>, status: u16, query_time_ns: u64) {
+        let account = account.filter(|_| status < 400);
         if let (Some(buckets), Some(account)) = (&self.db_time_ms, account) {
             if query_time_ns > 0 {
                 buckets.spend(&account, query_time_ns as f64 / 1_000_000.0, Instant::now());
@@ -667,7 +681,7 @@ mod tests {
         );
 
         // 500 ms against a 101 ms bucket: the debt is capped at one bucket.
-        fair_share.observe_db_time(Some(A), 500_000_000);
+        fair_share.observe_db_time(Some(A), 200, 500_000_000);
         let retry_after = fair_share
             .check_account(A)
             .err()
@@ -698,7 +712,7 @@ mod tests {
     #[test]
     fn database_time_debt_is_counted_but_admitted_in_shadow_mode() {
         let fair_share = FairShare::new(&db_time_config(false));
-        fair_share.observe_db_time(Some(A), 500_000_000);
+        fair_share.observe_db_time(Some(A), 200, 500_000_000);
         assert!(fair_share.check_account(A).is_ok());
         assert!(fair_share.check_account(A).is_ok());
         let report = fair_share.take_window();
@@ -710,8 +724,24 @@ mod tests {
     #[test]
     fn database_time_without_a_single_account_spends_no_budget() {
         let fair_share = FairShare::new(&db_time_config(true));
-        fair_share.observe_db_time(None, 500_000_000);
+        fair_share.observe_db_time(None, 200, 500_000_000);
         assert!(fair_share.check_account(A).is_ok());
+    }
+
+    #[test]
+    fn a_refused_requests_database_time_is_charged_to_no_account() {
+        let fair_share = FairShare::new(&db_time_config(true));
+        for status in [401, 403, 404, 500] {
+            fair_share.observe_db_time(Some(A), status, 500_000_000);
+        }
+        assert!(
+            fair_share.check_account(A).is_ok(),
+            "a stranger's refused requests do not spend the account's budget"
+        );
+        let talkers = fair_share.take_window().talkers.expect("database time");
+        assert_eq!(talkers.unattributed_db_ms, 2_000);
+        assert_eq!(talkers.accounts, 0);
+        assert!(talkers.top.is_empty());
     }
 
     #[test]
@@ -798,13 +828,13 @@ mod tests {
     fn the_top_talkers_are_ranked_by_database_time_with_their_share() {
         let fair_share = FairShare::new(&config());
         for _ in 0..3 {
-            fair_share.observe_db_time(Some(A), 100_000_000);
+            fair_share.observe_db_time(Some(A), 200, 100_000_000);
         }
-        fair_share.observe_db_time(Some(B), 500_000_000);
-        fair_share.observe_db_time(Some(C), 200_000_000);
-        fair_share.observe_db_time(Some(D), 100_000_000);
-        fair_share.observe_db_time(None, 100_000_000);
-        fair_share.observe_db_time(Some(D), 0);
+        fair_share.observe_db_time(Some(B), 200, 500_000_000);
+        fair_share.observe_db_time(Some(C), 304, 200_000_000);
+        fair_share.observe_db_time(Some(D), 200, 100_000_000);
+        fair_share.observe_db_time(None, 200, 100_000_000);
+        fair_share.observe_db_time(Some(D), 200, 0);
 
         let talkers = fair_share.take_window().talkers.expect("database time");
         assert_eq!(talkers.db_ms, 1_200);

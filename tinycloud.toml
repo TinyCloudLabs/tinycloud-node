@@ -81,7 +81,8 @@ cors = true
     # rate_limit_enforce = false
     ## Per-account /invoke limits (TC-3216); the account is the owner of the
     ## invocation's spaces. A database-time budget in query-time ms a minute plus
-    ## a burst, debited by every response's measured query time (0 = off), and a
+    ## a burst, debited by the measured query time of every response below 400
+    ## (0 = off), and a
     ## cap on invocations in flight at once (0 = off). Over either, an invocation
     ## is counted (tinycloud_account_limited_total); only with
     ## account_limit_enforce = true is it refused (429 rate_limited, Retry-After).

@@ -2206,8 +2206,10 @@ pub struct InvocationConfig {
     pub rate_limit_enforce: bool,
     /// Per-account database-time budget for `/invoke`, in milliseconds of
     /// query time a minute, sustained. The account is the owner of the
-    /// invocation's spaces. Every response's measured query time, on every
-    /// route, is debited from it. While an account is in debt, its next
+    /// invocation's spaces. The measured query time of every response below
+    /// 400, on every route, is debited from it. A refused request is charged
+    /// to no account, so nobody can spend a stranger's budget by naming their
+    /// space. While an account is in debt, its next
     /// invocation is counted (`tinycloud_account_limited_total{limit="db_time"}`
     /// and the minute's `account_limited` line, which names the account's
     /// pseudonym). Only when `account_limit_enforce` is set is it answered

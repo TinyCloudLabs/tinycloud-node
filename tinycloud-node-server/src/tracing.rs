@@ -688,7 +688,7 @@ impl Fairing for TracingFairing {
         let database = telemetry.context.snapshot();
         let hashes = telemetry.context.hashes();
         if let Some(fair_share) = req.rocket().state::<Arc<crate::fair_share::FairShare>>() {
-            fair_share.observe_db_time(hashes.account_hash, database.query_time_ns);
+            fair_share.observe_db_time(hashes.account_hash, status, database.query_time_ns);
         }
         let mut account_buffer = [0; 64];
         let mut space_buffer = [0; 64];
