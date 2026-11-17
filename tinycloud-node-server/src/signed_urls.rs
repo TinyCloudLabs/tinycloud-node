@@ -423,12 +423,10 @@ pub async fn load_signed_kv_ticket(
     validate_signed_kv_ticket(&ticket)?;
     // Re-check revocation of the whole chain (the cited delegations and every
     // ancestor) at every use, as hook streams do: the mint-time check alone
-    // let a revoked grant's URL serve content until its `expires_at`.
-    // Recompute the cited delegations' current effective end at every use: a
-    // URL minted while stamps extended its grant stops when they lapse (the
-    // stored `expires_at` is only the end known at mint). This is not a
-    // revocation check: revoking a delegation only shows here when it drops
-    // the effective end, i.e. once the grant's signed expiry has passed.
+    // let a revoked grant's URL serve content until its `expires_at`. Then
+    // recompute the cited delegations' current effective end: a URL minted
+    // while stamps extended its grant stops when they lapse (the stored
+    // `expires_at` is only the end known at mint).
     if let Some(parents) = &ticket.parent_cids_json {
         let invalid = || {
             (
