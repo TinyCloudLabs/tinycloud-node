@@ -922,6 +922,26 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
         .await
     }
 
+    /// Pause or resume all scheduled renewals on this node's database.
+    pub async fn set_renewals_paused(
+        &self,
+        paused: bool,
+    ) -> Result<crate::renewal::RenewalSwitch, crate::renewal::RenewalStoreError>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        crate::renewal::set_renewals_paused(
+            &self.conn,
+            paused,
+            crate::renewal::verifier_now().unix_timestamp(),
+        )
+        .await
+    }
+
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()

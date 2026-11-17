@@ -257,7 +257,9 @@ use routes::tc_bench::{
     kv_put as tc_bench_kv_put, BenchState,
 };
 use routes::{
-    admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
+    admin::{
+        delete_quota, get_quota, get_renewals, get_usage, list_quotas, set_quota, set_renewals,
+    },
     admin_stats::get_stats,
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
@@ -695,6 +697,8 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         get_quota,
         list_quotas,
         get_usage,
+        get_renewals,
+        set_renewals,
         get_stats,
         create_encryption_network,
         get_encryption_network,
@@ -1201,7 +1205,7 @@ pub async fn app_with_control(
                     if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
                         ::tracing::warn!(
                             event = "renewal_scheduler_tick_failed",
-                            error = %error,
+                            code = renewal::tick_failure_code(&error),
                             "internal renewal scheduler pass failed"
                         );
                     }
@@ -1214,7 +1218,7 @@ pub async fn app_with_control(
                                 if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
                                     ::tracing::warn!(
                                         event = "renewal_scheduler_tick_failed",
-                                        error = %error,
+                                        code = renewal::tick_failure_code(&error),
                                         "internal renewal scheduler pass failed"
                                     );
                                 }

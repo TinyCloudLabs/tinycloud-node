@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Renewals: an operator can pause and resume all scheduled renewal stamps on a node with `PUT /admin/renewals` `{"paused":true|false}` (admin Bearer secret; `GET` reads the state). The switch is persisted in the node database (one migration, `m20261117_000000_renewal_switch`, seeded as running, so nothing changes on deploy) and is re-checked inside the stamp transaction. Lease registration and already-issued stamps are unchanged while paused; a grant that ends while paused is not revived on resume. Runbook: `docs/runbooks/renewal-leases.md`. Details: TC-3163.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
