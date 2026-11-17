@@ -371,7 +371,10 @@ async fn each_use_recomputes_the_effective_end() {
     assert_eq!(grant.get(&url).await, Status::Unauthorized);
 }
 
-async fn revoked_url_is_refused(revoke_parent: bool) {
+/// Passes through the effective-end collapse only: the grant is stamped and
+/// past its signed expiry, so revoking drops its effective end to the past.
+/// Use-time revocation in general is TC-3177.
+async fn revoke_collapses_effective_end_past_signed_exp(revoke_parent: bool) {
     let (grant, _, _) = Grant::stamped(60, 3).await;
     sleep_past(grant.child_end).await;
     let (url, _) = grant.mint_ok().await;
@@ -386,13 +389,13 @@ async fn revoked_url_is_refused(revoke_parent: bool) {
 }
 
 #[tokio::test]
-async fn revoking_the_child_refuses_the_url() {
-    revoked_url_is_refused(false).await;
+async fn revoke_child_collapses_effective_end_past_signed_exp() {
+    revoke_collapses_effective_end_past_signed_exp(false).await;
 }
 
 #[tokio::test]
-async fn revoking_an_ancestor_refuses_the_url() {
-    revoked_url_is_refused(true).await;
+async fn revoke_ancestor_collapses_effective_end_past_signed_exp() {
+    revoke_collapses_effective_end_past_signed_exp(true).await;
 }
 
 #[tokio::test]
