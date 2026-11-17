@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.8](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.8) - 2026-11-17
+
+### Added
+
+- *(TC-2917)* account replacement credits and reclaim checkpoint parts
+- *(TC-2917)* add opt-in streamed SQL checkpoint parts
+- *(TC-2917)* report disk headroom as a shipped log event and metrics
+- *(TC-2961)* artifact read limit and a cap on concurrent large transfers
+
+### Fixed
+
+- *(TC-2986)* do not re-verify or re-evaluate a policy mint or registration under its locks
+- *(TC-2917)* preserve statement caps and checkpoint backoff
+- *(TC-2917)* isolate reclamation and permit non-growing replacements
+- *(TC-2917)* round shipped headroom to 64 MiB, own log target, gate-reason tests
+- *(TC-2986)* refuse a KV write mixed with a read on /invoke before any work; adopt review tests
+- *(TC-2961)* save whole checkpoints in autocommit and remove the bulk statement scope
+- *(TC-2961)* no back-off for a save still queued for its transfer slot; DuckDB 507; cap cross-check; review tests
+- *(TC-2954)* bound PostgreSQL timeouts at INT_MAX and skip the session idle timeout in local mode
+- default the idle-in-transaction timeout to 300 s and refuse values within the 240 s upload hold (TC-2954)
+- end PostgreSQL transactions left idle for 15 s (TC-2954)
+
+### Other
+
+- Merge pull request #612 from TinyCloudLabs/hotfix/1.26.8-admin-secret
+- Merge main (1.26.6) into hotfix 1.26.7 (TC-3076)
+- *(tinycloud-node)* release 1.26.6
+- Merge pull request #596 from TinyCloudLabs/feat/tc-2986-mint-no-revalidation
+- Merge pull request #600 from TinyCloudLabs/skgbafa/tc-2917-disk-free-metric
+- *(TC-2986)* a mint input changed before the locks refuses the mint
+- Merge pull request #602 from TinyCloudLabs/fix/tc-2954-digest-tamper-flake
+- *(TC-2954)* always change the tampered request digest's first character
+- *(TC-2961)* pin the CAS revision and no-retry outcomes; warn on the removed bulk timeout; serialize large-transfer tests
+- an ended idle transaction is one prompt connection-class error and one replacement connection (TC-2954)
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
