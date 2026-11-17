@@ -304,11 +304,13 @@ pub struct TeeState<'a> {
 /// and `--validate-config` runs the same function, so the preflight refuses
 /// whatever these refuse at boot. `storage_seals`: whether storage seals
 /// every write (startup: the declared seal paths; validation:
-/// [`STORAGE_SEALS_EVERY_WRITE`]).
+/// [`STORAGE_SEALS_EVERY_WRITE`]). `chunked_artifacts`:
+/// `storage.sql.chunked_artifacts`, whose checkpoint parts are plaintext.
 pub fn check_config(
     config: &AtRestConfig,
     roots: &Roots,
     storage_seals: bool,
+    chunked_artifacts: bool,
     tee: TeeState<'_>,
 ) -> Result<()> {
     let escrow = &config.escrow;
@@ -322,6 +324,12 @@ pub fn check_config(
     if config.mode != AtRestMode::Off && !storage_seals {
         bail!(
             "at_rest.mode = \"{}\" is refused: this build's storage has no at-rest seal path, so nothing would be encrypted; use mode = \"off\"",
+            mode_name(config.mode)
+        );
+    }
+    if config.mode != AtRestMode::Off && chunked_artifacts {
+        bail!(
+            "at_rest.mode = \"{}\" is refused while storage.sql.chunked_artifacts is on: SQL checkpoint parts are stored in plaintext; turn chunked artifacts off or use mode = \"off\"",
             mode_name(config.mode)
         );
     }
@@ -654,11 +662,27 @@ pub async fn setup(
         config,
         &roots,
         runtime.has_seal_path(),
+        storage.sql.chunked_artifacts,
         TeeState {
             indicated: tee_indicated,
             present: tee.is_some(),
         },
     )?;
+    if !enabled(config) {
+        return Ok(());
+    }
+    // With the flag off, a database already stored in parts keeps writing
+    // plaintext parts (TC-2917), so their presence refuses encryption too.
+    if config.mode != AtRestMode::Off
+        && tinycloud_core::database_artifacts::chunks::published_parts_exist(&db)
+            .await
+            .context("at-rest: checking for SQL checkpoint parts")?
+    {
+        bail!(
+            "at_rest.mode = \"{}\" is refused: SQL databases are stored in checkpoint parts, which are plaintext; use mode = \"off\"",
+            mode_name(config.mode)
+        );
+    }
     if !enabled(config) {
         return Ok(());
     }

@@ -20,6 +20,23 @@ fn statement(sql: &str, values: Vec<Value>) -> Statement {
 const REAP_CANDIDATE: &str = "SELECT service,space,name,part_id FROM artifact_part p WHERE state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
 const OWNER_REAP_CANDIDATE: &str = "SELECT service,space,name,part_id FROM artifact_part p WHERE owner=$1 AND state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
 
+/// Whether any SQL or DuckDB database is stored in published checkpoint
+/// parts. Parts are written in plaintext, and a database stored in parts
+/// keeps writing parts with `storage.sql.chunked_artifacts` off, so at-rest
+/// encryption (TC-887) refuses to start while one exists. Parts exist only
+/// on PostgreSQL.
+pub async fn published_parts_exist(conn: &impl ConnectionTrait) -> Result<bool, DbErr> {
+    if conn.get_database_backend() != DbBackend::Postgres {
+        return Ok(false);
+    }
+    conn.query_one(statement(
+        "SELECT EXISTS(SELECT 1 FROM artifact_part WHERE state='published') AS present",
+        vec![],
+    ))
+    .await?
+    .map_or(Ok(false), |row| row.try_get::<bool>("", "present"))
+}
+
 impl SeaOrmDatabaseArtifactRepository {
     pub(super) async fn ensure_legacy_write(
         &self,
@@ -597,6 +614,63 @@ mod tests {
             matches!(error, DatabaseArtifactError::HashMismatch { .. }),
             "{error:?}"
         );
+    }
+    /// TC-887: checkpoint parts are plaintext. At-rest encryption refuses to
+    /// start while any is published, whatever the chunked flag says, and
+    /// `strict` refuses to read them.
+    #[tokio::test]
+    async fn postgres_published_parts_are_detected_and_refused_by_strict() {
+        use crate::at_rest::{AtRestMode, TestAtRestSource};
+        let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("postgres_published_parts_are_detected")
+                .await
+        else {
+            return;
+        };
+        assert!(!published_parts_exist(&fixture.conn).await.unwrap());
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:one";
+        let source = TestAtRestSource::new(AtRestMode::Off, false, None);
+        let legacy = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_at_rest(source.clone());
+        legacy
+            .save(
+                "sql",
+                space,
+                "legacy",
+                vec![1; 128],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !published_parts_exist(&fixture.conn).await.unwrap(),
+            "a single-row artifact is not stored in parts"
+        );
+        let repo = legacy.with_chunk_limits(Some(ChunkLimits {
+            artifact_bytes: CHUNK_BYTES as u64,
+            account_bytes: (CHUNK_BYTES + 128) as u64,
+        }));
+        repo.save_snapshot(
+            "sql",
+            space,
+            "main",
+            snapshot(&[7; 64]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        assert!(published_parts_exist(&fixture.conn).await.unwrap());
+        let mut sink = MemorySink::default();
+        read_artifact(&repo, "sql", space, "main", &mut sink)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.checkpoint, vec![7; 64]);
+        source.set(AtRestMode::Strict, false);
+        assert!(matches!(
+            read_artifact(&repo, "sql", space, "main", &mut MemorySink::default()).await,
+            Err(DatabaseArtifactError::LegacyPlaintextRefused { part: "checkpoint" })
+        ));
     }
     #[tokio::test]
     async fn postgres_chunked_checkpoint_publish_cas_race_and_reclamation() {

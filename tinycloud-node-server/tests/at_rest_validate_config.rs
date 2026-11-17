@@ -56,7 +56,7 @@ fn validate_config_refuses_what_startup_refuses() {
     }
 
     type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
-    let refused: [Case; 3] = [
+    let refused: [Case; 4] = [
         (
             "env root with escrow_none",
             vec![("TINYCLOUD_AT_REST__ESCROW_NONE", "true")],
@@ -74,6 +74,26 @@ fn validate_config_refuses_what_startup_refuses() {
                 ("DSTACK_SIMULATOR_ENDPOINT", "/nonexistent/dstack.sock"),
             ],
             "TEE",
+        ),
+        (
+            "encrypt with chunked SQL artifacts, whose parts are plaintext",
+            vec![
+                ("TINYCLOUD_AT_REST__MODE", "encrypt"),
+                (
+                    "TINYCLOUD_STORAGE__DATABASE",
+                    "postgres://unused@127.0.0.1/unused",
+                ),
+                ("TINYCLOUD_STORAGE__SQL__CHUNKED_ARTIFACTS", "true"),
+                (
+                    "TINYCLOUD_STORAGE__SQL__CHUNKED_ARTIFACT_MAX_BYTES",
+                    "1048576",
+                ),
+                (
+                    "TINYCLOUD_STORAGE__SQL__CHUNKED_ACCOUNT_MAX_BYTES",
+                    "1048576",
+                ),
+            ],
+            "storage.sql.chunked_artifacts",
         ),
     ];
     for (case, extra, needle) in refused {

@@ -674,6 +674,7 @@ pub fn validate_at_rest(tinycloud_config: &Config, root_env: &at_rest::RootEnv) 
         &tinycloud_config.at_rest,
         &roots,
         at_rest::STORAGE_SEALS_EVERY_WRITE,
+        tinycloud_config.storage.sql.chunked_artifacts,
         at_rest::TeeState {
             indicated: dstack_indication(&tinycloud_config.tee),
             present: false,

@@ -1637,6 +1637,17 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
     ) -> Result<(), DatabaseArtifactError> {
         // Parts stream in bounded statements: the whole-artifact read cap and
         // the large-transfer permit below are for the single-row layout.
+        // Parts are plaintext (TC-887), so `strict` refuses them like any
+        // legacy part.
+        if meta.storage_mode == "checkpoint-parts-v1" && !self.at_rest_view().legacy_readable() {
+            tracing::error!(
+                role = ArtifactPart::Checkpoint.as_str(),
+                "Plaintext checkpoint parts refused in strict at-rest mode"
+            );
+            return Err(DatabaseArtifactError::LegacyPlaintextRefused {
+                part: ArtifactPart::Checkpoint.as_str(),
+            });
+        }
         if self
             .read_chunk_layout(service, space, name, meta, sink)
             .await?

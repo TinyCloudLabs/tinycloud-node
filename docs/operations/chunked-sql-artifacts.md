@@ -39,6 +39,12 @@ older writers before enabling this format; turning the switch off does not
 convert published parts back to legacy blobs. Current readers understand both
 layouts; legacy persistence refuses a database already using parts.
 
+Parts are stored in plaintext. At-rest encryption (TC-887) therefore refuses
+`at_rest.mode = "encrypt"` or `"strict"` while `chunked_artifacts` is on, and,
+with it off, while any published part exists: the node does not start, and
+`--validate-config` refuses the first case. A part read in `strict` mode is
+refused like any legacy plaintext.
+
 Do not enable for prolonged operation until the approved ceiling load acceptance and
 remaining migration/WAL slices are complete. On each test release, report
 reserved, staged and retained bytes from the following metadata-only inventory:
