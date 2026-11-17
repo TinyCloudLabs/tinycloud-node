@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Mutex,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 use tinycloud_auth::{
     identity::{canonicalize_did, parse_pkh_did},
@@ -18,6 +21,9 @@ use tinycloud_auth::{
 
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Longest outage window the record cache may be configured to (Sam: "~5 min max").
+pub const MAX_OUTAGE_CACHE: Duration = Duration::from_secs(300);
 
 /// Registry failures never grant hosting authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -264,14 +270,43 @@ impl VerifiedRecord {
     }
 }
 
-/// Fetches and verifies the current owner record. No cross-request record cache
-/// or caller-provided proof is used; only the highest accepted sequence is kept.
+/// What the node holds about one owner between requests.
+#[derive(Debug)]
+struct OwnerState {
+    /// Highest accepted sequence and its payload digest: rollback memory, never lowered.
+    sequence: u64,
+    digest: [u8; 32],
+    /// The record and the instant its lookup started, from the last successful
+    /// confirmation; kept only while the outage cache is on.
+    confirmed: Option<(Arc<VerifiedRecord>, Instant)>,
+}
+
+/// How one registry lookup ended.
+enum Lookup {
+    Record(Box<VerifiedRecord>),
+    /// The registry could not be reached or answered 502/503/504: an outage.
+    Outage,
+    /// Any other answer, including absence and an invalid or older record.
+    Refused(RegistryError),
+}
+
+/// Fetches and verifies the current owner record. Callers never supply a
+/// record. With the outage cache on, the last successfully confirmed record
+/// stands in for the registry only while the registry is unreachable, and only
+/// for less than `outage_cache` after that confirmation began.
 #[derive(Debug)]
 pub struct RegistryAdmission {
     base: reqwest::Url,
     node: String,
     client: reqwest::Client,
-    sequences: Mutex<HashMap<String, (u64, [u8; 32])>>,
+    owners: Mutex<HashMap<String, OwnerState>>,
+    outage_cache: Duration,
+    /// Bumped by every refused lookup. A confirmation arms the cache only if no
+    /// lookup was refused while it was in flight, so a late answer cannot undo
+    /// a newer refusal.
+    refusals: AtomicU64,
+    #[cfg(feature = "test-util")]
+    clock_offset: Mutex<Duration>,
 }
 
 impl RegistryAdmission {
@@ -286,77 +321,170 @@ impl RegistryAdmission {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| RegistryError::Unavailable)?,
-            sequences: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
+            outage_cache: Duration::ZERO,
+            refusals: AtomicU64::new(0),
+            #[cfg(feature = "test-util")]
+            clock_offset: Mutex::new(Duration::ZERO),
         })
     }
 
-    async fn current(&self, owner: &str) -> Result<VerifiedRecord, RegistryError> {
-        let key = owner_key(owner, false)?;
+    /// While the registry is unreachable, keep admitting reads and writes from
+    /// the last confirmed record for less than `window` after that confirmation
+    /// began. Zero (the default) turns the cache off. At most [`MAX_OUTAGE_CACHE`].
+    pub fn with_outage_cache(mut self, window: Duration) -> Result<Self, RegistryError> {
+        if window > MAX_OUTAGE_CACHE {
+            return Err(RegistryError::Unavailable);
+        }
+        self.outage_cache = window;
+        Ok(self)
+    }
+
+    /// Move this instance's monotonic clock forward, for outage-window tests.
+    #[cfg(feature = "test-util")]
+    pub fn advance_clock(&self, by: Duration) {
+        *self.clock_offset.lock().unwrap() += by;
+    }
+
+    fn now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(feature = "test-util")]
+        let now = now + *self.clock_offset.lock().unwrap();
+        now
+    }
+
+    async fn lookup(&self, key: &str) -> Lookup {
         let mut url = self.base.clone();
-        url.path_segments_mut()
-            .map_err(|_| RegistryError::Unavailable)?
-            .extend(["v2", "locations", &key]);
-        let mut response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|_| RegistryError::Unavailable)?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(
-                if self
-                    .sequences
+        match url.path_segments_mut() {
+            Ok(mut segments) => {
+                segments.extend(["v2", "locations", key]);
+            }
+            Err(()) => return Lookup::Refused(RegistryError::Unavailable),
+        }
+        let Ok(mut response) = self.client.get(url).send().await else {
+            return Lookup::Outage;
+        };
+        match response.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT => return Lookup::Outage,
+            reqwest::StatusCode::NOT_FOUND => {
+                // Absence of an owner this node accepted before is not a clean
+                // "not hosted here".
+                let known = self
+                    .owners
                     .lock()
-                    .map_err(|_| RegistryError::Unavailable)?
-                    .contains_key(&key)
-                {
+                    .map_or(true, |owners| owners.contains_key(key));
+                return Lookup::Refused(if known {
                     RegistryError::Unavailable
                 } else {
                     RegistryError::Denied
-                },
-            );
+                });
+            }
+            _ => return Lookup::Refused(RegistryError::Unavailable),
         }
-        if response.status() != reqwest::StatusCode::OK
-            || response
-                .content_length()
-                .is_some_and(|n| n > MAX_BYTES as u64)
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_BYTES as u64)
         {
-            return Err(RegistryError::Unavailable);
+            return Lookup::Refused(RegistryError::Unavailable);
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| RegistryError::Unavailable)?
-        {
-            if body.len() + chunk.len() > MAX_BYTES {
-                return Err(RegistryError::Unavailable);
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len() + chunk.len() <= MAX_BYTES => {
+                    body.extend_from_slice(&chunk)
+                }
+                Ok(None) => break,
+                Ok(Some(_)) | Err(_) => return Lookup::Refused(RegistryError::Unavailable),
             }
-            body.extend_from_slice(&chunk);
         }
-        let response: Response =
-            serde_json::from_slice(&body).map_err(|_| RegistryError::Unavailable)?;
-        let record = VerifiedRecord::verify(response.record)?;
-        if record.owner_key != key {
-            return Err(RegistryError::Unavailable);
+        let Ok(response) = serde_json::from_slice::<Response>(&body) else {
+            return Lookup::Refused(RegistryError::Unavailable);
+        };
+        match VerifiedRecord::verify(response.record) {
+            Ok(record) if record.owner_key == key => Lookup::Record(Box::new(record)),
+            Ok(_) => Lookup::Refused(RegistryError::Unavailable),
+            Err(error) => Lookup::Refused(error),
         }
-        let digest: [u8; 32] = sha2::Sha256::digest(&record.payload).into();
-        let mut sequences = self
-            .sequences
-            .lock()
-            .map_err(|_| RegistryError::Unavailable)?;
-        if sequences.get(&key).is_some_and(|(seq, prior)| {
-            record.record.sequence < *seq || (record.record.sequence == *seq && prior != &digest)
-        }) {
-            return Err(RegistryError::Unavailable);
+    }
+
+    /// The owner's current record. With `cached`, an outage falls back to the
+    /// last confirmation while it is younger than the configured window.
+    async fn current(
+        &self,
+        owner: &str,
+        cached: bool,
+    ) -> Result<Arc<VerifiedRecord>, RegistryError> {
+        let key = owner_key(owner, false)?;
+        let started = self.now();
+        let refusals = self.refusals.load(Ordering::SeqCst);
+        let lookup = self.lookup(&key).await;
+        let mut owners = self.owners.lock().map_err(|_| RegistryError::Unavailable)?;
+        let error = match lookup {
+            Lookup::Record(record) => {
+                let digest: [u8; 32] = sha2::Sha256::digest(&record.payload).into();
+                let sequence = record.record.sequence;
+                match owners.get_mut(&key) {
+                    Some(state)
+                        if sequence < state.sequence
+                            || (sequence == state.sequence && state.digest != digest) =>
+                    {
+                        RegistryError::Unavailable
+                    }
+                    state => {
+                        let record = Arc::<VerifiedRecord>::from(record);
+                        let confirmed = (!self.outage_cache.is_zero()
+                            && self.refusals.load(Ordering::SeqCst) == refusals)
+                            .then(|| (record.clone(), started));
+                        match state {
+                            Some(state) => {
+                                state.sequence = sequence;
+                                state.digest = digest;
+                                if confirmed.is_some() {
+                                    state.confirmed = confirmed;
+                                }
+                            }
+                            None => {
+                                owners.insert(
+                                    key,
+                                    OwnerState {
+                                        sequence,
+                                        digest,
+                                        confirmed,
+                                    },
+                                );
+                            }
+                        }
+                        return Ok(record);
+                    }
+                }
+            }
+            Lookup::Outage => {
+                let now = self.now();
+                return owners
+                    .get(&key)
+                    .and_then(|state| state.confirmed.as_ref())
+                    .filter(|(_, at)| {
+                        cached && now.saturating_duration_since(*at) < self.outage_cache
+                    })
+                    .map(|(record, _)| record.clone())
+                    .ok_or(RegistryError::Unavailable);
+            }
+            Lookup::Refused(error) => error,
+        };
+        // A refusal ends any use of the cached record; rollback memory stays.
+        self.refusals.fetch_add(1, Ordering::SeqCst);
+        if let Some(state) = owners.get_mut(&key) {
+            state.confirmed = None;
         }
-        sequences.insert(key, (record.record.sequence, digest));
-        Ok(record)
+        Err(error)
     }
 
     /// Check a data resource, including public and ticket-authorized reads.
     pub async fn authorize_space(&self, space: &SpaceId, write: bool) -> Result<(), RegistryError> {
-        let record = self.current(space.did().as_str()).await?;
+        let record = self.current(space.did().as_str(), true).await?;
         if record.allows_space(space, &self.node, write) {
             Ok(())
         } else {
@@ -366,7 +494,7 @@ impl RegistryAdmission {
 
     /// Check a raw encryption network independently from data membership.
     pub async fn authorize_encryption(&self, owner: &str) -> Result<(), RegistryError> {
-        let record = self.current(owner).await?;
+        let record = self.current(owner, true).await?;
         if record.record.encryption_node.as_deref() == Some(&self.node) {
             Ok(())
         } else {
@@ -396,7 +524,8 @@ impl RegistryAdmission {
             };
             let key = owner_key(&owner, false)?;
             if !records.contains_key(&key) {
-                records.insert(key.clone(), self.current(&owner).await?);
+                // Activating a replica for a new grant always needs the registry itself.
+                records.insert(key.clone(), self.current(&owner, false).await?);
             }
             let record = &records[&key];
             if let Some(space) = cap.resource.space() {
@@ -432,7 +561,7 @@ impl RegistryAdmission {
             };
             let key = owner_key(&owner, false)?;
             if !records.contains_key(&key) {
-                records.insert(key.clone(), self.current(&owner).await?);
+                records.insert(key.clone(), self.current(&owner, true).await?);
             }
             let record = &records[&key];
             let allowed = if let Some(space) = cap.resource.space() {
