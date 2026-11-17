@@ -14,7 +14,10 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tinycloud_auth::resource::{Path, Service, SpaceId};
+use tinycloud_auth::{
+    ipld_core::cid::Cid,
+    resource::{Path, Service, SpaceId},
+};
 use tinycloud_core::{
     hash::Hash,
     models::{delegation, signed_kv_ticket},
@@ -415,6 +418,33 @@ pub async fn load_signed_kv_ticket(
             )
         })?;
     validate_signed_kv_ticket(&ticket)?;
+    // Re-check revocation of the whole chain (the cited delegations and every
+    // ancestor) at every use, as hook streams do: the mint-time check alone
+    // let a revoked grant's URL serve content until its `expires_at`.
+    if let Some(parents) = &ticket.parent_cids_json {
+        let invalid = || {
+            (
+                Status::Unauthorized,
+                "signed URL ticket is invalid".to_string(),
+            )
+        };
+        let parents = serde_json::from_str::<Vec<String>>(parents)
+            .map_err(|_| invalid())?
+            .iter()
+            .map(|cid| cid.parse::<Cid>().map_err(|_| invalid()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if tinycloud
+            .delegation_chains_revocation(&parents)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+            .is_some()
+        {
+            return Err((
+                Status::Unauthorized,
+                "signed URL authority revoked".to_string(),
+            ));
+        }
+    }
     Ok(ticket)
 }
 
