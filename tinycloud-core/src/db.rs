@@ -984,8 +984,8 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     }
 
     /// The hosting admission policy, present only when explicitly configured.
-    pub fn registry_admission(&self) -> Option<&crate::registry_admission::RegistryAdmission> {
-        self.registry.as_deref()
+    pub fn registry_admission(&self) -> Option<&Arc<crate::registry_admission::RegistryAdmission>> {
+        self.registry.as_ref()
     }
 
     /// Raw encryption uses its own registered destination, not space membership.

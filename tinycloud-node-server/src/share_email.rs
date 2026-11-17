@@ -969,6 +969,9 @@ pub struct SqlNamedStore {
     pub conn: tinycloud_core::RecoveringConnection,
     pub write_fence: bool,
     pub fence_cache: Arc<tinycloud_core::database_migration::EffectiveFenceCache>,
+    /// Hosting admission (TC-2481): SQL rows are served only for a space this
+    /// node is currently listed for, as KV reads are via `kv_get`.
+    pub registry: Option<Arc<tinycloud_core::registry_admission::RegistryAdmission>>,
 }
 
 impl SqlNamedStore {
@@ -1033,6 +1036,17 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         // Validate the pinned source path before resolving its physical artifact.
         sql_source_db_name(&space, source.path.as_str())?;
+        if let Some(registry) = &self.registry {
+            registry
+                .authorize_space(&space, false)
+                .await
+                .map_err(|error| match error {
+                    tinycloud_core::registry_admission::RegistryError::Unavailable => {
+                        PortError::Unavailable
+                    }
+                    tinycloud_core::registry_admission::RegistryError::Denied => PortError::Denied,
+                })?;
+        }
         let physical = tinycloud_core::database_migration::resolve(
             &self.conn,
             "sql",
@@ -1241,6 +1255,7 @@ pub fn compose(
         ));
     }
     let fence_cache = tinycloud.database_fence_cache();
+    let registry = tinycloud.registry_admission().cloned();
     let kv = TinyCloudKvStore {
         tinycloud,
         space_name: config.space_name.clone(),
@@ -1252,6 +1267,7 @@ pub fn compose(
         conn: conn.clone(),
         write_fence,
         fence_cache,
+        registry,
     };
     let data_plane = HolderBoundDataPlane::new(
         bridge.clone(),
@@ -2953,6 +2969,7 @@ mod tests {
             conn: conn.into(),
             write_fence: false,
             fence_cache: Arc::new(Default::default()),
+            registry: None,
         };
         let did = tinycloud_auth::resolver::DID_METHODS
             .generate(
@@ -2980,6 +2997,89 @@ mod tests {
         let error = store.execute_named(&source, &pinned).await.unwrap_err();
         assert_eq!(error, PortError::Unavailable);
         assert_eq!(DataPlaneError::from(error), DataPlaneError::Storage);
+    }
+
+    /// TC-2481: with registry admission configured, a holder's named SQL read
+    /// is refused for a space this node is not listed for, before the SQL
+    /// service is reached (the same read without a registry reaches it).
+    #[tokio::test]
+    async fn named_sql_store_refuses_a_space_the_registry_does_not_list() {
+        use tinycloud_core::{
+            database_artifacts::SeaOrmDatabaseArtifactRepository,
+            registry_admission::RegistryAdmission, sea_orm::Database,
+            sea_orm_migration::MigratorTrait,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let registry = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "{\"error\":\"location record not found\"}",
+                )
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let generate = || {
+            tinycloud_auth::resolver::DID_METHODS
+                .generate(
+                    &tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap(),
+                    "key",
+                )
+                .unwrap()
+                .to_string()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        tinycloud_core::migrations::Migrator::up(&conn, None)
+            .await
+            .unwrap();
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        let mut store = SqlNamedStore {
+            service: Arc::new(SqlService::new(
+                dir.path().join("sql").display().to_string(),
+                0,
+                repo,
+            )),
+            space_name: "test".into(),
+            conn: conn.into(),
+            write_fence: false,
+            fence_cache: Arc::new(Default::default()),
+            registry: None,
+        };
+        let source = SqlReadSource {
+            space: Did::parse(generate()).unwrap(),
+            database: tinycloud_core::share_email::DatabaseName::parse("content_db").unwrap(),
+            path: Path::parse("web/threads").unwrap(),
+            statement: tinycloud_core::share_email::NamedStatement::parse("read_threads").unwrap(),
+            arguments: Default::default(),
+            arguments_digest: tinycloud_core::share_email::Sha256Digest::from_bytes([0; 32]),
+        };
+        let pinned = PinnedNamedStatement {
+            database: source.database.clone(),
+            path: source.path.clone(),
+            statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
+                name: source.statement.as_str().to_owned(),
+                sql: "SELECT v FROM t".into(),
+                fixed_params: vec![],
+            },
+        };
+        // Without a registry the read reaches the SQL service (no such database).
+        let unconfigured = store.execute_named(&source, &pinned).await.unwrap_err();
+        assert_eq!(unconfigured, PortError::Storage);
+        store.registry = Some(Arc::new(
+            RegistryAdmission::new(&origin, generate()).unwrap(),
+        ));
+        let refused = store.execute_named(&source, &pinned).await.unwrap_err();
+        assert_eq!(refused, PortError::Denied);
+        registry.abort();
     }
 
     #[tokio::test]
@@ -3073,6 +3173,7 @@ mod tests {
             conn: conn.into(),
             write_fence: false,
             fence_cache: Arc::new(Default::default()),
+            registry: None,
         };
         let pinned = PinnedNamedStatement {
             database: source.database.clone(),
