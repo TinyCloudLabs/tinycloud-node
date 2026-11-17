@@ -421,6 +421,9 @@ pub async fn load_signed_kv_ticket(
             )
         })?;
     validate_signed_kv_ticket(&ticket)?;
+    // Re-check revocation of the whole chain (the cited delegations and every
+    // ancestor) at every use, as hook streams do: the mint-time check alone
+    // let a revoked grant's URL serve content until its `expires_at`.
     // Recompute the cited delegations' current effective end at every use: a
     // URL minted while stamps extended its grant stops when they lapse (the
     // stored `expires_at` is only the end known at mint). This is not a
@@ -438,6 +441,17 @@ pub async fn load_signed_kv_ticket(
             .iter()
             .map(|cid| cid.parse::<Cid>().map_err(|_| invalid()))
             .collect::<Result<Vec<_>, _>>()?;
+        if tinycloud
+            .delegation_chains_revocation(&parents)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+            .is_some()
+        {
+            return Err((
+                Status::Unauthorized,
+                "signed URL authority revoked".to_string(),
+            ));
+        }
         let now = OffsetDateTime::now_utc().unix_timestamp();
         if find_parent_expiry(&parents, tinycloud, now)
             .await?
