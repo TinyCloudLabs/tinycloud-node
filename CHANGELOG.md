@@ -10,6 +10,36 @@
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
+- Webhook registration (`POST /hooks/webhooks`) accepts optional write-only `headers` (`{name: value}`). They are sent on every delivery alongside the unchanged `X-TinyCloud-*` headers and HMAC signature, so a callback that requires its own credential (`Authorization: Bearer …`) can be woken. Validation:
+  - At most 8 headers, 4096 bytes in total.
+  - Names are RFC 7230 tokens of up to 64 bytes.
+  - Values are 1–1024 bytes of printable ASCII (0x20–0x7E), so no tab, CR, LF or NUL, and no leading or trailing space.
+  - Case-insensitive duplicates are refused.
+  - Reserved names are refused: `Host`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-MD5`, `Content-Range`, `Transfer-Encoding`, `Accept-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie`, `Set-Cookie`, `Forwarded`, `Via`, `X-Real-IP`, and anything starting `Proxy-`, `Sec-`, `X-Forwarded-` or `X-TinyCloud-`.
+  - A refusal returns 400 and stores nothing.
+
+  Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
+- SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
+
+## [1.26.9] - 2026-11-17
+
+Ships the 1.26.6 changes below, which were built but never deployed, on top of 1.26.8 (1.26.5 plus the TC-3076 fix and a rotated admin secret).
+
+### Upgrade notes
+
+- **One database migration, fix-forward only:** `m20261113_010000_artifact_chunks` (PostgreSQL, runs at boot, waits at most 500 ms for each table lock; details under 1.26.6). The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.9 is fixed forward, not rolled back to 1.26.8.
+- **Read limit:** a SQL or DuckDB database whose stored checkpoint or WAL delta is over 64 MiB is no longer loaded and answers `507 sql_database_size_limit` until it is converted to checkpoint parts. Nothing is deleted. Details: TC-2961.
+- Checkpoint saves, idle transactions and the N0 compose template change as in the 1.26.6 upgrade notes.
+
+### Changes
+
+- The 16 Nov incident fixes, detailed under 1.26.6:
+  - whole-checkpoint saves over 8 MiB run without a transaction, and at most two large artifact transfers run at once per node (TC-2961);
+  - PostgreSQL ends transactions left idle for 5 minutes, and a protected legacy meeting write waits for its space's write order before opening its transaction (TC-2954);
+  - `/invoke` refuses a KV write mixed with a read before any work, `POST /delegate` and `POST /revoke` check signatures before any lock, and Policy/v3 mint and registration no longer re-verify under their locks (TC-2986);
+  - opt-in PostgreSQL checkpoint parts (off by default), and disk headroom as a shipped log event and metrics (TC-2917).
+- Unchanged from 1.26.8: the TC-3076 child-expiry fix and the rotated admin secret.
+- Docs: README and `TinyCloud.md` copy aligned with the documented trust model.
 
 ## [1.26.8] - 2026-11-17
 
