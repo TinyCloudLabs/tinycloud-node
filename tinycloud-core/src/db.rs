@@ -5465,29 +5465,43 @@ impl KvReadLookup {
     }
 }
 
-/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL
-/// `key = ANY($2)`) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN` lists).
-/// A key with no live row is absent from the map.
+/// The PostgreSQL batch lookup: one index seek per key, whatever the plan.
+///
+/// TC-3211: `space = $1 AND deleted = $2 AND key = ANY($3)` is a prepared
+/// statement, and after five executions PostgreSQL may switch to its generic
+/// plan. With the space and the array length unknown, that plan walked the
+/// whole space on `idx_current_kv_space_order` (`key` is its fifth column) and
+/// checked every key against the array. In production this was about 740
+/// buffer pages to return 44 rows. Joining each key from `unnest($3)` to a
+/// `LIMIT 1` lateral lookup makes every plan, generic or custom, a seek on
+/// `(space, deleted, key)` or the primary key. `LIMIT 1` changes no answer,
+/// since `(space, key)` is the primary key, and it keeps the subquery from
+/// being flattened back into a join the planner could reorder.
+const KV_LOOKUP_POSTGRES: &str = r#"SELECT "c".* FROM unnest($3::text[]) AS "k"("key") CROSS JOIN LATERAL (SELECT * FROM "current_kv" WHERE "current_kv"."space" = $1 AND "current_kv"."deleted" = $2 AND "current_kv"."key" = "k"."key" LIMIT 1) AS "c""#;
+
+/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL,
+/// [`KV_LOOKUP_POSTGRES`]) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN`
+/// lists). A key with no live row is absent from the map.
 async fn get_kv_entities<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     keys: &[&Path],
 ) -> Result<HashMap<String, current_kv::Model>, DbErr> {
-    let live = || {
-        current_kv::Entity::find()
-            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
-            .filter(current_kv::Column::Deleted.eq(false))
-    };
     let rows = match db.get_database_backend() {
         DbBackend::Postgres => {
             let keys = keys
                 .iter()
                 .map(|key| key.as_str().to_owned())
                 .collect::<Vec<_>>();
-            live()
-                .filter(Expr::cust_with_values(
-                    r#""current_kv"."key" = ANY($1)"#,
-                    [keys],
+            current_kv::Entity::find()
+                .from_raw_sql(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    KV_LOOKUP_POSTGRES,
+                    [
+                        SpaceIdWrap(space_id.clone()).into(),
+                        false.into(),
+                        keys.into(),
+                    ],
                 ))
                 .all(db)
                 .await?
@@ -5496,7 +5510,9 @@ async fn get_kv_entities<C: ConnectionTrait>(
             let mut rows = Vec::new();
             for chunk in keys.chunks(KV_LOOKUP_CHUNK) {
                 rows.extend(
-                    live()
+                    current_kv::Entity::find()
+                        .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                        .filter(current_kv::Column::Deleted.eq(false))
                         .filter(
                             current_kv::Column::Key
                                 .is_in(chunk.iter().map(|key| crate::types::Path((*key).clone()))),
@@ -9187,7 +9203,7 @@ mod test {
         else {
             return;
         };
-        // `key = ANY($2)` takes any number of keys in one statement.
+        // `unnest($3)` takes any number of keys in one statement.
         assert_kv_lookup_statement_counts(&mut fixture.conn.clone(), 1).await;
     }
 
@@ -13677,6 +13693,85 @@ mod test {
         // Same answers either way.
         let listed = kv_list_pages(conn, &space, "docs", 100).await;
         assert_eq!(listed, vec![wanted]);
+    }
+
+    /// TC-3211: the batch lookup seeks each key even in PostgreSQL's generic
+    /// plan, the one a prepared statement switches to after five executions.
+    /// The old `key = ANY($3)` filter's generic plan walked the whole space on
+    /// `idx_current_kv_space_order` and filtered every row against the array.
+    #[tokio::test]
+    async fn postgres_kv_batch_lookup_generic_plan_seeks_each_key() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_batch_lookup_generic_plan_seeks_each_key",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &fixture.conn;
+        let keys: Vec<String> = (0..300).map(|i| format!("items/{i:03}")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let space = seed_kv_keys(conn, "pg-batch-lookup-plan", &refs).await;
+        conn.execute_unprepared("ANALYZE current_kv").await.unwrap();
+
+        let tx = conn.begin().await.unwrap();
+        tx.execute_unprepared("SET LOCAL plan_cache_mode = force_generic_plan")
+            .await
+            .unwrap();
+        tx.execute_unprepared(&format!(
+            "PREPARE tc3211_lookup(text, boolean, text[]) AS {KV_LOOKUP_POSTGRES}"
+        ))
+        .await
+        .unwrap();
+        let plan = tx
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) EXECUTE \
+                     tc3211_lookup('{space}', false, ARRAY['items/007', 'items/250', 'absent'])"
+                ),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        tx.execute_unprepared("DEALLOCATE tc3211_lookup")
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        println!("TC-3211 generic plan:\n{plan}");
+
+        assert!(
+            plan.contains("Function Scan on unnest"),
+            "one probe per key: {plan}"
+        );
+        assert!(
+            plan.lines()
+                .any(|line| line.contains("Index Cond") && line.contains("= k.key")),
+            "each key is an index condition: {plan}"
+        );
+        assert!(!plan.contains("ANY"), "no array filter: {plan}");
+        assert!(
+            !plan.contains("idx_current_kv_space_order"),
+            "the space is not walked: {plan}"
+        );
+
+        let found = get_kv_entities(
+            conn,
+            &space,
+            &[
+                &"items/007".parse().unwrap(),
+                &"items/250".parse().unwrap(),
+                &"absent".parse().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut found: Vec<&str> = found.keys().map(String::as_str).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["items/007", "items/250"]);
     }
 
     /// TC-1274: SQLite needs no `COLLATE` index. Its `BINARY` bounds already
