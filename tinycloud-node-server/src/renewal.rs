@@ -85,6 +85,11 @@ pub(crate) async fn scheduler_tick(
 ) -> Result<()> {
     let now = renewal::verifier_now().unix_timestamp();
     let conn = tinycloud.connection();
+    // Paused node-wide: issue nothing and log nothing; the stamp transaction
+    // re-checks the switch, so a pause landing mid-pass also stops stamps.
+    if renewal::renewal_switch(conn).await?.paused {
+        return Ok(());
+    }
     let identity = tinycloud
         .renewal_identity()
         .ok_or_else(|| anyhow!("node renewal identity is not initialized"))?;
@@ -140,7 +145,9 @@ where
                 .is_some_and(|error| {
                     matches!(
                         error,
-                        RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
+                        RenewalStoreError::LeaseUnavailable
+                            | RenewalStoreError::IdentityEpoch
+                            | RenewalStoreError::Paused
                     )
                 });
             if expected_skip {

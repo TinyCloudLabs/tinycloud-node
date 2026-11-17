@@ -76,6 +76,84 @@ pub enum RenewalStoreError {
     Unauthorized,
     #[error("renewal input is invalid")]
     InvalidInput,
+    #[error("renewals are paused node-wide")]
+    Paused,
+}
+
+/// The node-wide renewal STOP-ALL switch (`renewal_switch`, one row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenewalSwitch {
+    pub paused: bool,
+    /// Unix seconds of the last change; `None` until first set.
+    pub changed_at: Option<i64>,
+}
+
+/// Read the switch. Inside a stamp transaction pass `lock = true`: on
+/// PostgreSQL the row is held `FOR SHARE` until commit, so a concurrent pause
+/// waits for an in-flight stamp, and no stamp commits after a pause commits.
+/// SQLite write transactions already hold the database write lock.
+async fn read_renewal_switch<C: ConnectionTrait>(
+    db: &C,
+    lock: bool,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    let backend = db.get_database_backend();
+    let query = match (backend, lock) {
+        (DatabaseBackend::Postgres, true) => {
+            "SELECT paused, changed_at FROM renewal_switch WHERE id = 1 FOR SHARE"
+        }
+        (DatabaseBackend::MySql, _) => return Err(RenewalStoreError::InvalidInput),
+        _ => "SELECT paused, changed_at FROM renewal_switch WHERE id = 1",
+    };
+    let row = db
+        .query_one(Statement::from_string(backend, query))
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    Ok(RenewalSwitch {
+        paused: row.try_get("", "paused")?,
+        changed_at: row.try_get("", "changed_at")?,
+    })
+}
+
+/// Current state of the node-wide renewal switch.
+pub async fn renewal_switch<C: ConnectionTrait>(
+    db: &C,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    read_renewal_switch(db, false).await
+}
+
+/// Pause or resume all scheduled renewals. Lease rows are untouched;
+/// `changed_at` moves only when the state actually changes.
+pub async fn set_renewals_paused<C: TransactionTrait + ConnectionTrait>(
+    conn: &C,
+    paused: bool,
+    now: i64,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    let tx = crate::db::begin_write_transaction(conn, None).await?;
+    let result = async {
+        tx.execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            "UPDATE renewal_switch SET paused = $1, changed_at = $2 WHERE id = 1 AND paused <> $3",
+            [
+                Value::Bool(Some(paused)),
+                Value::BigInt(Some(now)),
+                Value::Bool(Some(paused)),
+            ],
+        ))
+        .await?;
+        read_renewal_switch(&tx, false).await
+    }
+    .await;
+    match result {
+        Ok(switch) => {
+            tx.commit().await?;
+            Ok(switch)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 /// Stamp issue request identity; signed content and bounds are computed in core.
@@ -1103,6 +1181,9 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
     let (_, original) = canonical_cid(&request.original_cid)?;
     let tx = crate::db::begin_write_transaction(conn, None).await?;
     let result = async {
+        if read_renewal_switch(&tx, true).await?.paused {
+            return Err(RenewalStoreError::Paused);
+        }
         lock_original(&tx, &original).await?;
         if request.replay_expires_at <= now {
             return Err(RenewalStoreError::InvalidInput);
@@ -2311,5 +2392,90 @@ mod tests {
             Some((original, renewed_end))
         );
         tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_switch_refuses_stamps_inside_the_transaction() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
+            .await
+            .unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        assert_eq!(
+            renewal_switch(&db).await.unwrap(),
+            RenewalSwitch {
+                paused: false,
+                changed_at: None
+            },
+            "a migrated node starts with renewals running"
+        );
+        let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+        let (renewer_did, epoch, _) =
+            initialize_renewal_identity(&db, secret.derive_key(RENEWER_KEY_CONTEXT))
+                .await
+                .unwrap();
+        let identity = RenewalNodeIdentity {
+            stable_node_did: secret.node_did(),
+            renewer_did,
+            epoch,
+        };
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+        ))
+        .unwrap();
+        let token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
+            fixture["originalToken"].as_str().unwrap(),
+        )
+        .unwrap();
+        let now = 1_000;
+        let request = StampIssue {
+            invocation: crate::util::InvocationInfo::try_from(token).unwrap(),
+            original_cid: "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4".to_owned(),
+            lease_cid: "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq".to_owned(),
+            replay_hash: hash(b"paused switch request"),
+            replay_expires_at: now + 60,
+        };
+        let replay_rows = || async {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM invocation_replay",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap()
+        };
+
+        let paused = set_renewals_paused(&db, true, 500).await.unwrap();
+        assert_eq!(
+            paused,
+            RenewalSwitch {
+                paused: true,
+                changed_at: Some(500)
+            }
+        );
+        assert_eq!(
+            set_renewals_paused(&db, true, 600).await.unwrap(),
+            paused,
+            "a repeated pause keeps the original change time"
+        );
+        assert!(matches!(
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
+            Err(RenewalStoreError::Paused)
+        ));
+        assert_eq!(replay_rows().await, 0, "a paused refusal spends no replay");
+
+        assert_eq!(
+            set_renewals_paused(&db, false, 700).await.unwrap(),
+            RenewalSwitch {
+                paused: false,
+                changed_at: Some(700)
+            }
+        );
+        let resumed = issue_stamp_at(&db, request, &secret, &identity, now).await;
+        assert!(
+            !matches!(resumed, Err(RenewalStoreError::Paused)),
+            "resume lets the request through the switch: {resumed:?}"
+        );
     }
 }
