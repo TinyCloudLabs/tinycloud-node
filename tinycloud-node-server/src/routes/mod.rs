@@ -2820,6 +2820,7 @@ async fn emit_kv_hook_events(
                 path: Some(row.key.to_string()),
                 database_path: None,
                 table_name: None,
+                row_id: None,
                 actor: invocation.invoker.clone(),
                 epoch: commit.rev.to_cid(0x55).to_string(),
                 event_index: current_index,
@@ -2834,6 +2835,7 @@ async fn emit_kv_hook_events(
                 path: Some(row.key.to_string()),
                 database_path: None,
                 table_name: None,
+                row_id: None,
                 actor: invocation.invoker.clone(),
                 epoch: commit.rev.to_cid(0x55).to_string(),
                 event_index: current_index,
@@ -3211,6 +3213,7 @@ async fn handle_sql_invoke(
                 &event_epoch,
                 &timestamp,
                 &response.write_targets,
+                &response.write_row_ids,
             );
             if !events.is_empty() {
                 spawn_database_hook_delivery(
@@ -4126,6 +4129,8 @@ async fn handle_duckdb_invoke(
                 &event_epoch,
                 &timestamp,
                 &response.write_targets,
+                // DuckDB has no rowid to report.
+                &[],
             );
             if !events.is_empty() {
                 spawn_database_hook_delivery(
@@ -4171,6 +4176,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn database_write_events(
     space: &str,
     service: &str,
@@ -4179,15 +4185,17 @@ fn database_write_events(
     epoch: &str,
     timestamp: &str,
     write_targets: &[TouchedTables],
+    row_ids: &[Option<i64>],
 ) -> Vec<WriteEvent> {
     let mut events = Vec::new();
     let mut event_index = 0u32;
     let ability = database_write_ability(service);
 
-    for target in write_targets {
+    for (target_index, target) in write_targets.iter().enumerate() {
         let TouchedTables::Supported(tables) = target else {
             continue;
         };
+        let row_id = row_ids.get(target_index).copied().flatten();
 
         for table in tables {
             events.push(WriteEvent {
@@ -4199,6 +4207,7 @@ fn database_write_events(
                 path: Some(db_table_path(db_path, table)),
                 database_path: db_path.map(ToString::to_string),
                 table_name: Some(table.to_string()),
+                row_id,
                 actor: actor.to_string(),
                 epoch: epoch.to_string(),
                 event_index,
@@ -5415,6 +5424,9 @@ mod tests {
     ) -> hook_subscription::Model {
         hook_subscription::Model {
             encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: id.to_string(),
             subscriber_did: "did:key:test".to_string(),
             space_id: space.to_string(),
@@ -5451,6 +5463,7 @@ mod tests {
                 TouchedTables::unsupported(),
                 TouchedTables::supported(vec!["audit".to_string()]),
             ],
+            &[],
         );
         publish_database_hook_events(&hook_runtime, &events);
 
@@ -5513,6 +5526,7 @@ mod tests {
             "epoch",
             "2026-01-01T00:00:00Z",
             &[TouchedTables::supported(vec!["users".to_string()])],
+            &[],
         );
         assert_eq!(events.len(), 1);
         assert!(
@@ -5548,6 +5562,7 @@ mod tests {
             "epoch",
             "2026-01-01T00:00:00Z",
             &[TouchedTables::supported(vec!["events".to_string()])],
+            &[],
         );
         publish_database_hook_events(&hook_runtime, &events);
 
@@ -5666,6 +5681,7 @@ mod tests {
             "epoch-sql",
             "2026-04-09T01:00:00Z",
             &[TouchedTables::supported(vec!["users".to_string()])],
+            &[],
         );
         let duck_events = database_write_events(
             "tinycloud:space",
@@ -5675,6 +5691,7 @@ mod tests {
             "epoch-duck",
             "2026-04-09T01:00:01Z",
             &[TouchedTables::supported(vec!["events".to_string()])],
+            &[],
         );
         let mut events = sql_events;
         events.extend(duck_events);
@@ -5686,6 +5703,7 @@ mod tests {
             "epoch-child",
             "2026-04-09T01:00:02Z",
             &[TouchedTables::supported(vec!["users".to_string()])],
+            &[],
         ));
 
         enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
@@ -5728,6 +5746,7 @@ mod tests {
             "epoch-sql",
             "2026-04-09T01:00:00Z",
             &[TouchedTables::unsupported()],
+            &[],
         );
         assert!(events.is_empty());
         enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
@@ -9474,6 +9493,7 @@ mod tests {
                 what,
                 "2026-01-01T00:00:00Z",
                 &result.write_targets,
+                &result.write_row_ids,
             );
             assert_eq!(batch.len(), 1, "{what}: one event for the one table");
             publish_database_hook_events(&hooks, &batch);
@@ -9484,6 +9504,172 @@ mod tests {
             published.push(what);
         }
         assert_eq!(published.len(), 3);
+        Ok(())
+    }
+
+    /// TC-3123: a SQL write event names the row only when the statement
+    /// provably inserted exactly that one row; every other write omits it
+    /// rather than reporting a stale or ambiguous rowid.
+    #[tokio::test]
+    async fn tc3123_sql_events_carry_only_provable_inserted_row_ids() -> Result<()> {
+        use tinycloud_core::sql::{types::SqlStatement as BatchStatement, SqlValue};
+        let (_cache, service) = fresh_sql_service().await;
+        let space = test_space_id("tc3123-row-ids");
+        let run = |request: SqlRequest| {
+            let service = service.clone();
+            let space = space.clone();
+            async move {
+                service
+                    .execute_authorized(
+                        &space,
+                        "feed",
+                        request,
+                        None,
+                        SqlAuthority::new(["tinycloud.sql/write", "tinycloud.sql/schema"]),
+                    )
+                    .await
+            }
+        };
+        let statement = |sql: &str, params: Vec<SqlValue>| BatchStatement {
+            sql: sql.to_string(),
+            params,
+        };
+        let events = |result: &tinycloud_core::sql::SqlExecutionResult| {
+            database_write_events(
+                "tinycloud:space",
+                "sql",
+                Some("feed.db"),
+                "did:key:test",
+                "epoch",
+                "2026-01-01T00:00:00Z",
+                &result.write_targets,
+                &result.write_row_ids,
+            )
+            .into_iter()
+            .map(|event| (event.table_name.unwrap(), event.row_id))
+            .collect::<Vec<_>>()
+        };
+        run(SqlRequest::Batch {
+            statements: vec![
+                statement(
+                    "CREATE TABLE feed_responses (sequence INTEGER PRIMARY KEY AUTOINCREMENT, \
+                     response_id TEXT NOT NULL UNIQUE, card_id TEXT NOT NULL, response_json TEXT NOT NULL)",
+                    vec![],
+                ),
+                statement(
+                    "CREATE TABLE payloads (response_id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+                    vec![],
+                ),
+                statement(
+                    "CREATE TABLE tags (tag TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID",
+                    vec![],
+                ),
+                statement(
+                    "INSERT INTO feed_responses (response_id, card_id, response_json) \
+                     VALUES ('seed', 'card-0', '{}')",
+                    vec![],
+                ),
+            ],
+        })
+        .await?;
+
+        // The Home feed answer shape: one batch, two single-row INSERTs.
+        let answer = run(SqlRequest::Batch {
+            statements: vec![
+                statement(
+                    "INSERT INTO feed_responses (response_id, card_id, response_json) VALUES (?, ?, ?)",
+                    vec![
+                        SqlValue::Text("resp-1".into()),
+                        SqlValue::Text("card-1".into()),
+                        SqlValue::Text("{\"secret\":\"content\"}".into()),
+                    ],
+                ),
+                statement(
+                    "INSERT INTO payloads (response_id, body) VALUES (?, ?)",
+                    vec![
+                        SqlValue::Text("resp-1".into()),
+                        SqlValue::Text("private".into()),
+                    ],
+                ),
+            ],
+        })
+        .await?;
+        assert_eq!(
+            events(&answer),
+            [
+                ("feed_responses".to_string(), Some(2)),
+                ("payloads".to_string(), Some(1)),
+            ]
+        );
+        let serialized = serde_json::to_string(&database_write_events(
+            "tinycloud:space",
+            "sql",
+            Some("feed.db"),
+            "did:key:test",
+            "epoch",
+            "2026-01-01T00:00:00Z",
+            &answer.write_targets,
+            &answer.write_row_ids,
+        ))?;
+        assert!(serialized.contains("\"rowId\":2"), "{serialized}");
+        for content in ["resp-1", "card-1", "secret", "private"] {
+            assert!(!serialized.contains(content), "{serialized}");
+        }
+
+        let execute = |sql: &str| SqlRequest::Execute {
+            sql: sql.to_string(),
+            params: vec![],
+            schema: None,
+        };
+        for (sql, what) in [
+            (
+                "INSERT INTO feed_responses (response_id, card_id, response_json) \
+                 VALUES ('m1', 'c', '{}'), ('m2', 'c', '{}')",
+                "multi-row insert",
+            ),
+            (
+                "UPDATE feed_responses SET card_id = 'x' WHERE response_id = 'seed'",
+                "update",
+            ),
+            (
+                "INSERT INTO feed_responses (response_id, card_id, response_json) \
+                 VALUES ('seed', 'c', '{}') ON CONFLICT (response_id) DO UPDATE SET card_id = 'y'",
+                "upsert that updated",
+            ),
+            (
+                "INSERT OR IGNORE INTO feed_responses (response_id, card_id, response_json) \
+                 VALUES ('seed', 'c', '{}')",
+                "ignored insert",
+            ),
+            ("INSERT INTO tags (tag, n) VALUES ('t', 1)", "without rowid"),
+            (
+                "DELETE FROM feed_responses WHERE response_id = 'm1'",
+                "delete",
+            ),
+        ] {
+            let result = run(execute(sql)).await?;
+            let events = events(&result);
+            assert_eq!(events.len(), 1, "{what}");
+            assert_eq!(events[0].1, None, "{what}");
+        }
+
+        // A single-row INSERT sent alone (and with schema init) still names it.
+        let result = run(SqlRequest::Execute {
+            sql: "INSERT INTO feed_responses (response_id, card_id, response_json) \
+                  VALUES ('resp-2', 'card-2', '{}')"
+                .to_string(),
+            params: vec![],
+            schema: Some(vec![
+                "CREATE TABLE IF NOT EXISTS other (id INTEGER PRIMARY KEY)".to_string(),
+            ]),
+        })
+        .await?;
+        let SqlResponse::Execute(response) = &result.response else {
+            panic!("execute response");
+        };
+        let row = response.last_insert_row_id;
+        assert_eq!(events(&result).last().unwrap().1, row);
+        assert!(row.is_some());
         Ok(())
     }
     #[tokio::test]
@@ -9572,12 +9758,12 @@ mod tests {
             })?)
             .dispatch()
             .await;
-        assert_eq!(
-            write.status(),
-            Status::Ok,
-            "{}",
-            write.into_string().await.unwrap_or_default()
-        );
+        let write_status = write.status();
+        let write_body = write.into_string().await.unwrap_or_default();
+        assert_eq!(write_status, Status::Ok, "{write_body}");
+        let inserted = serde_json::from_str::<serde_json::Value>(&write_body)?["lastInsertRowId"]
+            .as_i64()
+            .expect("INSERT reports its rowid");
 
         let failed_write = client
             .post("/invoke")
@@ -9625,6 +9811,10 @@ mod tests {
         assert_eq!(event.table_name.as_deref(), Some("labels"));
         assert_eq!(event.epoch, write_cid);
         assert_eq!(event.id, format!("{}:0", event.epoch));
+        // TC-3123: the single-row INSERT names its row, ids only.
+        assert_eq!(event.row_id, Some(inserted));
+        assert!(write_data.contains(&format!("\"rowId\":{inserted}")));
+        assert!(!write_data.contains("hook-event"));
         Ok(())
     }
 
@@ -16126,6 +16316,7 @@ mod tests {
                 epoch,
                 &rfc3339(OffsetDateTime::now_utc()),
                 &[TouchedTables::supported(vec!["users".into()])],
+                &[],
             );
             enqueue_database_webhook_deliveries(tinycloud, &events).await?;
             let expected = usize::from(owner || epoch.ends_with("-1"));
@@ -16200,6 +16391,9 @@ mod tests {
             hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
                 hook_subscription::Model {
                     encrypted_secret_format: 2,
+                    header_names_json: None,
+                    encrypted_headers: None,
+                    encrypted_headers_format: 0,
                     id: id.to_string(),
                     subscriber_did: subscriber,
                     space_id: f.space.to_string(),

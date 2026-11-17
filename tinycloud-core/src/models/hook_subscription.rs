@@ -17,6 +17,12 @@ pub struct Model {
     pub secret_key_id: String,
     pub active: bool,
     pub created_at: String,
+    /// TC-3123: JSON array of custom header names, returned on list.
+    pub header_names_json: Option<String>,
+    /// TC-3123: sealed JSON `[[name, value], ...]`, bound to
+    /// (`hook_subscription`, `encrypted_headers`, id). Never returned.
+    pub encrypted_headers: Option<Vec<u8>>,
+    pub encrypted_headers_format: i16,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -46,6 +52,13 @@ impl Model {
             None
         } else {
             Some(serde_json::to_string(abilities).expect("serializing abilities should not fail"))
+        }
+    }
+
+    pub fn header_names(&self) -> Result<Vec<String>, serde_json::Error> {
+        match self.header_names_json.as_deref() {
+            Some(json) => serde_json::from_str(json),
+            None => Ok(Vec::new()),
         }
     }
 }
