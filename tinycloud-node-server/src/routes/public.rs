@@ -134,8 +134,71 @@ impl<K: Eq + Hash> Buckets<K> {
         K: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
     {
+        self.with_bucket(key, now, |bucket| {
+            self.available(bucket)?;
+            bucket.tokens -= 1.0;
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
+    }
+
+    /// Whether `key` has a token now, spending none; the wait as
+    /// [`take`](Self::take).
+    fn peek<Q>(&self, key: &Q, now: Instant) -> Result<(), Option<Duration>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        self.with_bucket(key, now, |bucket| self.available(bucket))
+            .unwrap_or(Ok(()))
+    }
+
+    /// Spend one token for `key` whether or not it has one. Requests admitted
+    /// together by [`peek`](Self::peek) can overdraw the bucket; the debt,
+    /// bounded by one full bucket, is repaid by refill before the next
+    /// admission.
+    fn charge<Q>(&self, key: &Q, now: Instant)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        let floor = -self.max_tokens();
+        self.with_bucket(key, now, |bucket| {
+            bucket.tokens = (bucket.tokens - 1.0).max(floor);
+        });
+    }
+
+    fn max_tokens(&self) -> f64 {
+        self.burst as f64 + self.tokens_per_second
+    }
+
+    /// `Ok` when `bucket` holds a whole token, else how long until it does.
+    fn available(&self, bucket: &TokenBucket) -> Result<(), Option<Duration>> {
+        if bucket.tokens >= 1.0 {
+            Ok(())
+        } else if self.tokens_per_second > 0.0 {
+            Err(Some(Duration::from_secs_f64(
+                (1.0 - bucket.tokens) / self.tokens_per_second,
+            )))
+        } else {
+            Err(None)
+        }
+    }
+
+    /// Run `f` on `key`'s bucket, refilled to `now`; a new key starts full.
+    /// `None` when the key cannot be tracked (see [`MAX_TRACKED_CALLERS`]).
+    fn with_bucket<Q, R>(
+        &self,
+        key: &Q,
+        now: Instant,
+        f: impl FnOnce(&mut TokenBucket) -> R,
+    ) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let max_tokens = self.burst as f64 + self.tokens_per_second;
+        let max_tokens = self.max_tokens();
         let refilled = |bucket: &TokenBucket| {
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
             (bucket.tokens + elapsed * self.tokens_per_second).min(max_tokens)
@@ -144,7 +207,7 @@ impl<K: Eq + Hash> Buckets<K> {
             if state.len() >= MAX_TRACKED_CALLERS {
                 state.retain(|_, bucket| refilled(bucket) < max_tokens);
                 if state.len() >= MAX_TRACKED_CALLERS {
-                    return Ok(());
+                    return None;
                 }
             }
             state.insert(
@@ -155,21 +218,10 @@ impl<K: Eq + Hash> Buckets<K> {
                 },
             );
         }
-        let Some(bucket) = state.get_mut(key) else {
-            return Ok(());
-        };
+        let bucket = state.get_mut(key)?;
         bucket.tokens = refilled(bucket);
         bucket.last_refill = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Ok(())
-        } else if self.tokens_per_second > 0.0 {
-            Err(Some(Duration::from_secs_f64(
-                (1.0 - bucket.tokens) / self.tokens_per_second,
-            )))
-        } else {
-            Err(None)
-        }
+        Some(f(bucket))
     }
 }
 
@@ -203,15 +255,18 @@ impl RateLimiter {
             .map_err(|_| Status::TooManyRequests)
     }
 
-    /// Take one `/invoke` request for `invoker` (a verified invocation's
-    /// issuer). Over the limit and enforced, return the whole seconds to
+    /// Admit one `/invoke` request for `invoker` (a verified invocation's
+    /// issuer) if its share has a token, spending none: the request is
+    /// charged by [`charge_invoker`](Self::charge_invoker) once it proves not
+    /// to be a replay, so a replayed copy of someone's request cannot spend
+    /// their share. Over the limit and enforced, return the whole seconds to
     /// send as `Retry-After`; shadowed, count it and admit it.
     pub fn check_invoker(&self, invoker: &str) -> Result<(), u64> {
         let Some(limit) = &self.invokers else {
             return Ok(());
         };
         let now = Instant::now();
-        let Err(wait) = limit.buckets.take(invoker, now) else {
+        let Err(wait) = limit.buckets.peek(invoker, now) else {
             return Ok(());
         };
         limit.observe_over(now);
@@ -219,6 +274,16 @@ impl RateLimiter {
             return Ok(());
         }
         Err(wait.map_or(u64::MAX, |wait| wait.as_secs_f64().ceil().max(1.0) as u64))
+    }
+
+    /// Spend one of `invoker`'s tokens for a request [`check_invoker`]
+    /// admitted that was not refused as a replay.
+    ///
+    /// [`check_invoker`]: Self::check_invoker
+    pub fn charge_invoker(&self, invoker: &str) {
+        if let Some(limit) = &self.invokers {
+            limit.buckets.charge(invoker, Instant::now());
+        }
     }
 }
 

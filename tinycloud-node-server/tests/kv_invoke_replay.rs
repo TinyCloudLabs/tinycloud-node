@@ -333,3 +333,48 @@ async fn postgres_replay_row_follows_the_write() -> Result<()> {
         .await?;
     result
 }
+
+/// TC-3216 (Bobbie on #625): a replayed copy of a committed request is refused
+/// 409 and charged to nobody, so whoever holds a leaked request cannot use it
+/// to drain its invoker's `/invoke` share once the limit is enforced.
+#[tokio::test]
+async fn a_replayed_request_does_not_spend_the_invokers_share() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = tinycloud::config::Config::default();
+    config.storage.datadir = dir.path().into();
+    config.storage.database = Some("sqlite::memory:".into());
+    config.keys = serde_json::from_value(json!({
+        "type": "static",
+        "secret": base64::encode_config([109; 32], base64::URL_SAFE_NO_PAD),
+    }))?;
+    // Two requests, then one a minute, refused past that.
+    config.invocation.rate_limit_per_minute = 1;
+    config.invocation.rate_limit_burst = 2;
+    config.invocation.rate_limit_enforce = true;
+    let figment = Figment::from(rocket::Config {
+        log_level: rocket::config::LogLevel::Off,
+        ..rocket::Config::default()
+    })
+    .merge(Serialized::defaults(&config));
+    let client = Client::tracked(tinycloud::app(&figment).await?).await?;
+    let session = sign_in(&client).await?;
+
+    let leaked = signed(&session, "tinycloud.kv/put", "share/a")?;
+    let (status, body) = send(&client, &leaked, b"one", &[]).await?;
+    ensure!(status == Status::Ok, "first put: {status} {body}");
+    for _ in 0..3 {
+        let (status, body) = send(&client, &leaked, b"one", &[]).await?;
+        ensure!(status == Status::Conflict, "replay: {status} {body}");
+    }
+    // The original spent one of the two; the replays spent none.
+    let next = signed(&session, "tinycloud.kv/put", "share/b")?;
+    let (status, body) = send(&client, &next, b"two", &[]).await?;
+    ensure!(status == Status::Ok, "after the replays: {status} {body}");
+    let over = signed(&session, "tinycloud.kv/put", "share/c")?;
+    let (status, body) = send(&client, &over, b"three", &[]).await?;
+    ensure!(
+        status == Status::TooManyRequests,
+        "over the share: {status} {body}"
+    );
+    Ok(())
+}

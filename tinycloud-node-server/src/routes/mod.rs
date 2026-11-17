@@ -276,6 +276,9 @@ pub enum InvokeError {
     /// `429 rate_limited`: the invoker is over its share; retry after this
     /// many seconds.
     RateLimited(u64),
+    /// `409 duplicate invocation`: the invocation was already spent. Kept
+    /// apart so a replay is never charged to the invoker's share (TC-3216).
+    Replayed,
 }
 
 impl From<(Status, String)> for InvokeError {
@@ -292,7 +295,10 @@ impl From<StorageRejection> for InvokeError {
 
 impl From<crate::invocation_replay::InvocationReplayError> for InvokeError {
     fn from(error: crate::invocation_replay::InvocationReplayError) -> Self {
-        <(Status, String)>::from(error).into()
+        match error {
+            crate::invocation_replay::InvocationReplayError::Duplicate => Self::Replayed,
+            error => <(Status, String)>::from(error).into(),
+        }
     }
 }
 
@@ -313,6 +319,10 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
                     retry_after_secs.to_string(),
                 ));
                 Ok(response)
+            }
+            Self::Replayed => {
+                <(Status, String)>::from(crate::invocation_replay::InvocationReplayError::Duplicate)
+                    .respond_to(request)
             }
         }
     }
@@ -1976,6 +1986,11 @@ async fn invoke_impl(
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
+    let rate_limiter = rate_limiter.0;
+    // The verified invoker, once admitted, to charge its share for the
+    // outcome below (TC-3216).
+    let admitted_invoker = std::sync::OnceLock::<String>::new();
+    let admitted_invoker_slot = &admitted_invoker;
     // Instrumenting async block to handle yielding properly
     let result = async move {
         let timer = crate::prometheus::enabled().then(|| {
@@ -2020,11 +2035,16 @@ async fn invoke_impl(
             })?;
         // Sam 11-17: one verified invoker gets a fair share of the node. The
         // check follows signature verification, so nobody can spend another
-        // invoker's budget, and precedes every database read.
-        if let Some(limiter) = rate_limiter.0 {
+        // invoker's budget, and precedes every database read. It spends
+        // nothing: the request is charged after its outcome, unless it was
+        // refused as a replay, so replaying a captured request cannot drain
+        // its invoker's share (Bobbie, #625).
+        if let Some(limiter) = rate_limiter {
+            let invoker = &admitted.invocation().0.invoker;
             limiter
-                .check_invoker(&admitted.invocation().0.invoker)
+                .check_invoker(invoker)
                 .map_err(InvokeError::RateLimited)?;
+            let _ = admitted_invoker_slot.set(invoker.clone());
         }
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
@@ -2713,6 +2733,11 @@ async fn invoke_impl(
     }
     .instrument(span)
     .await;
+    if let (Some(limiter), Some(invoker)) = (rate_limiter, admitted_invoker.get()) {
+        if !matches!(result, Err(InvokeError::Replayed)) {
+            limiter.charge_invoker(invoker);
+        }
+    }
     // Every storage rejection carries the owner's account totals when billing
     // has supplied them, whichever path refused the write.
     match result {
