@@ -10,6 +10,26 @@
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
 
+## [1.26.9] - 2026-11-17
+
+Ships the 1.26.6 changes below, which were built but never deployed, on top of 1.26.8 (1.26.5 plus the TC-3076 fix and a rotated admin secret).
+
+### Upgrade notes
+
+- **One database migration, fix-forward only:** `m20261113_010000_artifact_chunks` (PostgreSQL, runs at boot, waits at most 500 ms for each table lock; details under 1.26.6). The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.9 is fixed forward, not rolled back to 1.26.8.
+- **Read limit:** a SQL or DuckDB database whose stored checkpoint or WAL delta is over 64 MiB is no longer loaded and answers `507 sql_database_size_limit` until it is converted to checkpoint parts. Nothing is deleted. Details: TC-2961.
+- Checkpoint saves, idle transactions and the N0 compose template change as in the 1.26.6 upgrade notes.
+
+### Changes
+
+- The 16 Nov incident fixes, detailed under 1.26.6:
+  - whole-checkpoint saves over 8 MiB run without a transaction, and at most two large artifact transfers run at once per node (TC-2961);
+  - PostgreSQL ends transactions left idle for 5 minutes, and a protected legacy meeting write waits for its space's write order before opening its transaction (TC-2954);
+  - `/invoke` refuses a KV write mixed with a read before any work, `POST /delegate` and `POST /revoke` check signatures before any lock, and Policy/v3 mint and registration no longer re-verify under their locks (TC-2986);
+  - opt-in PostgreSQL checkpoint parts (off by default), and disk headroom as a shipped log event and metrics (TC-2917).
+- Unchanged from 1.26.8: the TC-3076 child-expiry fix and the rotated admin secret.
+- Docs: README and `TinyCloud.md` copy aligned with the documented trust model.
+
 ## [1.26.8] - 2026-11-17
 
 ### Changes
