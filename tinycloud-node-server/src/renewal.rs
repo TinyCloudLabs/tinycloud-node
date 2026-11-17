@@ -79,12 +79,43 @@ fn build_scheduled_invocation(
     Ok((invocation, expiry))
 }
 
+/// The switch could not be read; the pass fails closed and issues nothing.
+#[derive(Debug, thiserror::Error)]
+#[error("renewal switch unavailable")]
+struct SwitchUnavailable;
+
+/// Fixed code for a failed scheduler pass. Only this is logged: a raw `DbErr`
+/// can carry SQL or database-generated text.
+pub(crate) fn tick_failure_code(error: &anyhow::Error) -> &'static str {
+    if error.is::<SwitchUnavailable>() {
+        "renewal_switch_unavailable"
+    } else if error.is::<tinycloud_core::sea_orm::DbErr>()
+        || matches!(
+            error.downcast_ref::<RenewalStoreError>(),
+            Some(RenewalStoreError::Db(_))
+        )
+    {
+        "renewal_db_unavailable"
+    } else {
+        "renewal_tick_failed"
+    }
+}
+
 pub(crate) async fn scheduler_tick(
     tinycloud: &crate::TinyCloud,
     secret: &StaticSecret,
 ) -> Result<()> {
     let now = renewal::verifier_now().unix_timestamp();
     let conn = tinycloud.connection();
+    // Paused node-wide: issue nothing and log nothing; the stamp transaction
+    // re-checks the switch, so a pause landing mid-pass also stops stamps.
+    if renewal::renewal_switch(conn)
+        .await
+        .map_err(|_| SwitchUnavailable)?
+        .paused
+    {
+        return Ok(());
+    }
     let identity = tinycloud
         .renewal_identity()
         .ok_or_else(|| anyhow!("node renewal identity is not initialized"))?;
@@ -140,7 +171,9 @@ where
                 .is_some_and(|error| {
                     matches!(
                         error,
-                        RenewalStoreError::LeaseUnavailable | RenewalStoreError::IdentityEpoch
+                        RenewalStoreError::LeaseUnavailable
+                            | RenewalStoreError::IdentityEpoch
+                            | RenewalStoreError::Paused
                     )
                 });
             if expected_skip {
@@ -319,6 +352,29 @@ mod scheduler_tests {
         assert!(!due_for_renewal(100, 102, 1));
         assert!(due_for_renewal(100, 100, 1));
     }
+    #[test]
+    fn failed_passes_log_fixed_codes_never_database_text() {
+        use super::{tick_failure_code, SwitchUnavailable};
+        use tinycloud_core::sea_orm::DbErr;
+        let sql = || DbErr::Custom("SELECT paused FROM renewal_switch WHERE id = 1".to_owned());
+        assert_eq!(
+            tick_failure_code(&anyhow::Error::new(SwitchUnavailable)),
+            "renewal_switch_unavailable"
+        );
+        assert_eq!(
+            tick_failure_code(&anyhow::Error::new(RenewalStoreError::Db(sql()))),
+            "renewal_db_unavailable"
+        );
+        assert_eq!(
+            tick_failure_code(&anyhow::Error::new(sql())),
+            "renewal_db_unavailable"
+        );
+        assert_eq!(
+            tick_failure_code(&anyhow::anyhow!("node renewal identity is not initialized")),
+            "renewal_tick_failed"
+        );
+    }
+
     #[tokio::test]
     async fn scheduler_continues_after_a_lease_failure() {
         let lease = |original_cid: &str| LeaseRecord {

@@ -229,7 +229,9 @@ async fn mint_hook_ticket(
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation)?;
-    let parent_exp = find_parent_expiry(invocation, tinycloud)
+    // The current effective end of the cited delegations (renewal stamps
+    // included), never a projected one: see `find_parent_expiry`.
+    let parent_exp = find_parent_expiry(&invocation.parents, tinycloud, now.unix_timestamp())
         .await?
         .unwrap_or(invocation_exp);
     let requested_ttl = request
@@ -339,25 +341,40 @@ pub async fn hook_events<'r>(
             tinycloud_core::request_telemetry::observe_space(&space);
         }
     }
+    // Each open (and reopen) re-checks the ticket's authority: the whole
+    // delegation chain for revocation (the cited delegations and every
+    // ancestor), and the chain's current effective end, recomputed now. The
+    // stream ends at the earliest of the ticket's `exp`, its `parent_exp`,
+    // that current end and `max_ticket_ttl_seconds` from now. A stream open
+    // when a delegation in the chain is revoked, or when stamping stops, is
+    // not re-checked: it ends at its deadline, at most
+    // `hooks.max_ticket_ttl_seconds` (300 s by default) later, and the reopen
+    // is refused. Hooks only signal; content is read through KV, which checks
+    // revocation and the effective end per request.
     let revoked = std::sync::Mutex::new(None);
+    let current_end = std::sync::Mutex::new(None);
     let stream_deadline = hook_stream_deadline(
         &claims,
         hooks.config().max_ticket_ttl_seconds,
         || async {
-            match tinycloud
+            if let Some(code) = tinycloud
                 .delegation_chains_revocation(&claims.authorizing_delegations)
                 .await
                 .map_err(|error| (Status::InternalServerError, error.to_string()))?
             {
-                None => Ok(()),
-                Some(code) => {
-                    *revoked.lock().unwrap() = Some(code);
-                    Err((
-                        Status::Unauthorized,
-                        "hook ticket authority revoked".to_string(),
-                    ))
-                }
+                *revoked.lock().unwrap() = Some(code);
+                return Err((
+                    Status::Unauthorized,
+                    "hook ticket authority revoked".to_string(),
+                ));
             }
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let end = find_parent_expiry(&claims.authorizing_delegations, tinycloud, now).await?;
+            if end.is_some_and(|end| end <= now) {
+                return Err((Status::Unauthorized, "hook ticket expired".to_string()));
+            }
+            *current_end.lock().unwrap() = end;
+            Ok(())
         },
         OffsetDateTime::now_utc,
     )
@@ -366,6 +383,17 @@ pub async fn hook_events<'r>(
         Some(code) => InvokeError::Revoked(code, message),
         None => InvokeError::Text(status, message),
     })?;
+    let stream_deadline = match current_end
+        .lock()
+        .unwrap()
+        .and_then(|end| OffsetDateTime::from_unix_timestamp(end).ok())
+    {
+        Some(end) => stream_deadline.min(
+            rocket::tokio::time::Instant::now()
+                + Duration::try_from(end - OffsetDateTime::now_utc()).unwrap_or_default(),
+        ),
+        None => stream_deadline,
+    };
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
@@ -977,11 +1005,22 @@ fn hook_subscription_id(
     hasher.finalize().to_cid(0x55).to_string()
 }
 
+/// The current effective end of the delegations that authorize a hook ticket:
+/// the earliest, over the cited delegations, of the end `/invoke` reads use.
+/// That is the authorization graph's effective end
+/// (`SpaceDatabase::delegation_effective_expiry`): the latest admitted
+/// renewal stamp of this node's current renewer epoch (stamps of older epochs
+/// or that fail verification are ignored), capped by every ancestor's
+/// effective end. Without one, as for `/invoke`, the signed expiry applies. It
+/// is never a projected end: a stamp counts only once it is stored, so when
+/// stamping stops the end stays at the last stamp's end. `None` when nothing
+/// in the chain expires.
 async fn find_parent_expiry(
-    invocation: &InvocationInfo,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
     tinycloud: &TinyCloud,
+    now: i64,
 ) -> Result<Option<i64>, (Status, String)> {
-    if invocation.parents.is_empty() {
+    if parents.is_empty() {
         return Ok(None);
     }
 
@@ -990,22 +1029,31 @@ async fn find_parent_expiry(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    let parent_ids: Vec<Hash> = invocation
-        .parents
-        .iter()
-        .map(|cid| Hash::from(*cid))
-        .collect();
+    let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
 
-    let expiries = delegation::Entity::find()
+    let signed = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
         .all(&tx)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    drop(tx);
 
-    Ok(expiries
-        .into_iter()
-        .filter_map(|delegation| delegation.expiry.map(|expiry| expiry.unix_timestamp()))
-        .min())
+    let mut end = None;
+    for parent in signed {
+        let effective = tinycloud
+            .delegation_effective_expiry(parent.id, now)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        // A chain with no expiry anywhere resolves to `i64::MAX`.
+        let parent_end = effective
+            .or(parent.expiry.map(|expiry| expiry.unix_timestamp()))
+            .filter(|parent_end| *parent_end != i64::MAX);
+        end = match (end, parent_end) {
+            (Some(end), Some(parent_end)) => Some(std::cmp::min(end, parent_end)),
+            (end, parent_end) => end.or(parent_end),
+        };
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
