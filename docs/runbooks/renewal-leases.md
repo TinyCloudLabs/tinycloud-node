@@ -31,3 +31,5 @@ While paused:
 - Lease rows are kept. On resume the next scheduler pass (within 5 minutes) renews every grant that is still live, with no new consent.
 - A grant whose end passes while paused expires and is **not** revived on resume: the scheduler never renews past an ended grant. Its owner grants again.
 
+A failed scheduler pass logs `internal renewal scheduler pass failed` with a fixed `code`, never the raw error: `renewal_switch_unavailable` (the switch could not be read, so the pass issued nothing), `renewal_db_unavailable` (another database error) or `renewal_tick_failed` (anything else). The pass retries on the next tick.
+

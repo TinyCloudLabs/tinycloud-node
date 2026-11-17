@@ -2394,23 +2394,16 @@ mod tests {
         tx.rollback().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn paused_switch_refuses_stamps_inside_the_transaction() {
-        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
-            .await
-            .unwrap();
-        crate::migrations::Migrator::up(&db, None).await.unwrap();
-        assert_eq!(
-            renewal_switch(&db).await.unwrap(),
-            RenewalSwitch {
-                paused: false,
-                changed_at: None
-            },
-            "a migrated node starts with renewals running"
-        );
+    /// Node identity plus a stamp request for the frozen lease fixture. The
+    /// switch is the first statement of the stamp transaction, so a paused
+    /// refusal needs no lease rows.
+    async fn switch_test_stamp<C: TransactionTrait + ConnectionTrait>(
+        db: &C,
+        now: i64,
+    ) -> (StaticSecret, RenewalNodeIdentity, StampIssue) {
         let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
         let (renewer_did, epoch, _) =
-            initialize_renewal_identity(&db, secret.derive_key(RENEWER_KEY_CONTEXT))
+            initialize_renewal_identity(db, secret.derive_key(RENEWER_KEY_CONTEXT))
                 .await
                 .unwrap();
         let identity = RenewalNodeIdentity {
@@ -2426,7 +2419,6 @@ mod tests {
             fixture["originalToken"].as_str().unwrap(),
         )
         .unwrap();
-        let now = 1_000;
         let request = StampIssue {
             invocation: crate::util::InvocationInfo::try_from(token).unwrap(),
             original_cid: "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4".to_owned(),
@@ -2434,17 +2426,38 @@ mod tests {
             replay_hash: hash(b"paused switch request"),
             replay_expires_at: now + 60,
         };
-        let replay_rows = || async {
-            db.query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS n FROM invocation_replay",
-            ))
+        (secret, identity, request)
+    }
+
+    async fn row_count<C: ConnectionTrait>(db: &C, table: &str) -> i64 {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT COUNT(*) AS n FROM {table}"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn paused_switch_refuses_stamps_inside_the_transaction() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
             .await
-            .unwrap()
-            .unwrap()
-            .try_get::<i64>("", "n")
-            .unwrap()
-        };
+            .unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        assert_eq!(
+            renewal_switch(&db).await.unwrap(),
+            RenewalSwitch {
+                paused: false,
+                changed_at: None
+            },
+            "a migrated node starts with renewals running"
+        );
+        let now = 1_000;
+        let (secret, identity, request) = switch_test_stamp(&db, now).await;
+        let replay_rows = || row_count(&db, "invocation_replay");
 
         let paused = set_renewals_paused(&db, true, 500).await.unwrap();
         assert_eq!(
@@ -2477,5 +2490,78 @@ mod tests {
             !matches!(resumed, Err(RenewalStoreError::Paused)),
             "resume lets the request through the switch: {resumed:?}"
         );
+    }
+
+    /// PostgreSQL: the pause and the stamp transaction serialize on the
+    /// switch row, so no stamp commits after a pause call returns.
+    ///
+    /// A stamp cannot be held open mid-`issue_stamp_at` deterministically, so
+    /// part 1 holds the transaction at its first statement, the same
+    /// `FOR SHARE` read: a pause then waits until that transaction ends, so
+    /// the pause cannot return while a stamp that read "running" is uncommitted.
+    /// Part 2 holds a pause uncommitted: a real `issue_stamp_at` waits on the
+    /// row, then sees the pause and saves nothing. Without `FOR SHARE` both
+    /// waits disappear and the test fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_pause_and_stamp_transactions_serialize_on_the_switch_row() {
+        const TEST: &str = "postgres_pause_and_stamp_transactions_serialize_on_the_switch_row";
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let db = fixture.conn.clone();
+        let now = 1_000;
+        let (secret, identity, request) = switch_test_stamp(&db, now).await;
+        let waits = std::time::Duration::from_millis(500);
+        let bound = std::time::Duration::from_secs(20);
+
+        // 1. Stamp transaction in flight → the pause waits for it.
+        let stamp_tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        assert!(!read_renewal_switch(&stamp_tx, true).await.unwrap().paused);
+        let pause = tokio::spawn({
+            let db = db.clone();
+            async move { set_renewals_paused(&db, true, 500).await }
+        });
+        tokio::time::sleep(waits).await;
+        assert!(
+            !pause.is_finished(),
+            "a pause must wait for the in-flight stamp transaction"
+        );
+        stamp_tx.commit().await.unwrap();
+        let paused = tokio::time::timeout(bound, pause)
+            .await
+            .expect("pause finishes once the stamp transaction ends")
+            .unwrap()
+            .unwrap();
+        assert!(paused.paused);
+
+        // 2. Pause in flight → a stamp waits for it, then refuses and saves nothing.
+        set_renewals_paused(&db, false, 600).await.unwrap();
+        let pause_tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        pause_tx
+            .execute_unprepared(
+                "UPDATE renewal_switch SET paused = TRUE, changed_at = 700 WHERE id = 1",
+            )
+            .await
+            .unwrap();
+        let stamp = tokio::spawn({
+            let db = db.clone();
+            async move { issue_stamp_at(&db, request, &secret, &identity, now).await }
+        });
+        tokio::time::sleep(waits).await;
+        assert!(
+            !stamp.is_finished(),
+            "a stamp transaction must wait for the in-flight pause"
+        );
+        pause_tx.commit().await.unwrap();
+        let refused = tokio::time::timeout(bound, stamp)
+            .await
+            .expect("stamp finishes once the pause commits")
+            .unwrap();
+        assert!(
+            matches!(refused, Err(RenewalStoreError::Paused)),
+            "{refused:?}"
+        );
+        assert_eq!(row_count(&db, "renewal_stamp").await, 0);
+        assert_eq!(row_count(&db, "invocation_replay").await, 0);
     }
 }

@@ -1204,7 +1204,7 @@ pub async fn app_with_control(
                     if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
                         ::tracing::warn!(
                             event = "renewal_scheduler_tick_failed",
-                            error = %error,
+                            code = renewal::tick_failure_code(&error),
                             "internal renewal scheduler pass failed"
                         );
                     }
@@ -1217,7 +1217,7 @@ pub async fn app_with_control(
                                 if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
                                     ::tracing::warn!(
                                         event = "renewal_scheduler_tick_failed",
-                                        error = %error,
+                                        code = renewal::tick_failure_code(&error),
                                         "internal renewal scheduler pass failed"
                                     );
                                 }
