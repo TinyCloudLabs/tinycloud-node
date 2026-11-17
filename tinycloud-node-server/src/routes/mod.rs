@@ -978,7 +978,7 @@ pub struct RevokeResponse {
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
-    rate_limiter: public::InvokeRateLimiter<'_>,
+    fair_share: crate::fair_share::InvokeFairShare<'_>,
     req_span: TracingSpan,
     headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -997,7 +997,7 @@ pub async fn invoke(
         config,
         Box::pin(invoke_impl(
             i,
-            rate_limiter,
+            fair_share,
             req_span,
             headers,
             data,
@@ -1021,7 +1021,7 @@ pub async fn invoke(
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
-    rate_limiter: public::InvokeRateLimiter<'_>,
+    fair_share: crate::fair_share::InvokeFairShare<'_>,
     req_span: TracingSpan,
     headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -1039,7 +1039,7 @@ pub async fn invoke(
         config,
         Box::pin(invoke_impl(
             i,
-            rate_limiter,
+            fair_share,
             req_span,
             headers,
             data,
@@ -1967,7 +1967,7 @@ fn classify_invocation_time_rejection(
 #[allow(clippy::too_many_arguments)]
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
-    rate_limiter: public::InvokeRateLimiter<'_>,
+    fair_share: crate::fair_share::InvokeFairShare<'_>,
     req_span: TracingSpan,
     mut headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -1986,9 +1986,9 @@ async fn invoke_impl(
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
-    let rate_limiter = rate_limiter.0;
-    // The verified invoker, once admitted, to charge its share for the
-    // outcome below (TC-3216).
+    let fair_share = fair_share.0;
+    // The verified invoker whose token the fair-share check took, to give it
+    // back if the request is refused before doing its work (TC-3216).
     let admitted_invoker = std::sync::OnceLock::<String>::new();
     let admitted_invoker_slot = &admitted_invoker;
     // Instrumenting async block to handle yielding properly
@@ -2033,22 +2033,35 @@ async fn invoke_impl(
                 };
                 (Status::Unauthorized, message)
             })?;
-        // Sam 11-17: one verified invoker gets a fair share of the node. The
-        // check follows signature verification, so nobody can spend another
-        // invoker's budget, and precedes every database read. It spends
-        // nothing: the request is charged after its outcome, unless it was
-        // refused as a replay, so replaying a captured request cannot drain
-        // its invoker's share (Bobbie, #625).
-        if let Some(limiter) = rate_limiter {
-            let invoker = &admitted.invocation().0.invoker;
-            limiter
-                .check_invoker(invoker)
-                .map_err(InvokeError::RateLimited)?;
-            let _ = admitted_invoker_slot.set(invoker.clone());
-        }
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
         }
+        // Sam 11-17: one verified invoker, and one account, gets a fair share
+        // of the node. The checks follow signature verification, so nobody
+        // can spend another invoker's share, and precede every database read.
+        // The invoker's token is taken here, so concurrent requests cannot
+        // all pass on one token. It is given back below if the request turns
+        // out to be a replay, so replaying a captured request cannot drain
+        // its invoker's share (Bobbie, #625). The account is the single owner
+        // of the invocation's spaces, as `node_request` logs it.
+        let _account_permit = match fair_share {
+            Some(fair_share) => {
+                let account = tinycloud_core::request_telemetry::current()
+                    .and_then(|context| context.hashes().account_hash);
+                let invoker = &admitted.invocation().0.invoker;
+                if fair_share
+                    .check_invoker(invoker, account)
+                    .map_err(InvokeError::RateLimited)?
+                {
+                    let _ = admitted_invoker_slot.set(invoker.clone());
+                }
+                account
+                    .map(|account| fair_share.check_account(account))
+                    .transpose()
+                    .map_err(InvokeError::RateLimited)?
+            }
+            None => None,
+        };
 
         // Named keys are served only while `named_keys_v1` is on: with it
         // off, an invocation on a key or key prefix is refused before any
@@ -2733,9 +2746,12 @@ async fn invoke_impl(
     }
     .instrument(span)
     .await;
-    if let (Some(limiter), Some(invoker)) = (rate_limiter, admitted_invoker.get()) {
-        if !matches!(result, Err(InvokeError::Replayed)) {
-            limiter.charge_invoker(invoker);
+    if let (Some(fair_share), Some(invoker)) = (fair_share, admitted_invoker.get()) {
+        if matches!(
+            result,
+            Err(InvokeError::Replayed | InvokeError::RateLimited(_))
+        ) {
+            fair_share.refund_invoker(invoker);
         }
     }
     // Every storage rejection carries the owner's account totals when billing
@@ -11386,10 +11402,9 @@ mod tests {
             rate_limit_enforce: enforce,
             ..Default::default()
         };
-        let rocket = rocket.manage(
-            public::RateLimiter::new(&crate::config::PublicSpacesConfig::default())
-                .with_invocation_limit(&limits),
-        );
+        let rocket = rocket.manage(std::sync::Arc::new(crate::fair_share::FairShare::new(
+            &limits,
+        )));
         Ok((
             tempdirs,
             rocket::local::asynchronous::Client::tracked(rocket).await?,

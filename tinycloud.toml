@@ -79,6 +79,19 @@ cors = true
     # rate_limit_per_minute = 600
     # rate_limit_burst = 240
     # rate_limit_enforce = false
+    ## Per-account /invoke limits (TC-3216); the account is the owner of the
+    ## invocation's spaces. A database-time budget in query-time ms a minute plus
+    ## a burst, debited by every response's measured query time (0 = off), and a
+    ## cap on invocations in flight at once (0 = off). Over either, an invocation
+    ## is counted (tinycloud_account_limited_total); only with
+    ## account_limit_enforce = true is it refused (429 rate_limited, Retry-After).
+    ## Starting values, not yet calibrated: see the node_top_talkers log line.
+    ## Env: TINYCLOUD_INVOCATION__ACCOUNT_DB_MS_PER_MINUTE, TINYCLOUD_INVOCATION__ACCOUNT_DB_BURST_MS,
+    ## TINYCLOUD_INVOCATION__ACCOUNT_MAX_IN_FLIGHT, TINYCLOUD_INVOCATION__ACCOUNT_LIMIT_ENFORCE
+    # account_db_ms_per_minute = 20000
+    # account_db_burst_ms = 30000
+    # account_max_in_flight = 8
+    # account_limit_enforce = false
 
 [global.keys]
     # Provision a unique, persistent root before starting this node.
