@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tinycloud_core::{encryption::RowBinding, ColumnEncryption};
+use tinycloud_core::{encryption::RowBinding, registry_admission::RegistryError, ColumnEncryption};
 
 type WebhookMac = Hmac<Sha256>;
 
@@ -50,11 +50,13 @@ impl WebhookDispatcher {
             .context("loading due webhook deliveries")?;
 
         // TC-991: re-derived once per subscription per pass and never carried across passes,
-        // so a revocation or expiry applies by the next pass.
+        // so a revocation or expiry applies by the next pass. TC-2481: so is the space's
+        // registry admission, so a delisting stops its deliveries by the next pass.
         let mut authority = HashMap::<String, bool>::new();
+        let mut hosting = HashMap::<String, Result<(), RegistryError>>::new();
         for delivery in deliveries {
             if self
-                .dispatch_delivery(delivery, &mut authority)
+                .dispatch_delivery(delivery, &mut authority, &mut hosting)
                 .await
                 .is_err()
             {
@@ -69,6 +71,7 @@ impl WebhookDispatcher {
         &self,
         delivery: tinycloud_core::db::PendingWebhookDelivery,
         authority: &mut HashMap<String, bool>,
+        hosting: &mut HashMap<String, Result<(), RegistryError>>,
     ) -> Result<()> {
         let current_attempt = delivery.attempts + 1;
 
@@ -112,6 +115,40 @@ impl WebhookDispatcher {
             )
             .await?;
             return Ok(());
+        }
+
+        let hosted = match hosting.get(&delivery.subscription_id) {
+            Some(hosted) => *hosted,
+            None => {
+                let hosted = match delivery
+                    .space_id
+                    .parse::<tinycloud_auth::resource::SpaceId>()
+                {
+                    Ok(space) => self.tinycloud.check_registry_space(&space, false).await,
+                    Err(_) => Err(RegistryError::Denied),
+                };
+                hosting.insert(delivery.subscription_id.clone(), hosted);
+                hosted
+            }
+        };
+        match hosted {
+            Ok(()) => {}
+            // Delisted: this delivery ends, but the subscription stays, as it
+            // does for every other refused delivery, until its authority lapses.
+            Err(RegistryError::Denied) => {
+                self.record_terminal_failure(delivery.id, current_attempt, "space not hosted here")
+                    .await?;
+                return Ok(());
+            }
+            Err(RegistryError::Unavailable) => {
+                self.record_retryable_failure(
+                    delivery.id,
+                    current_attempt,
+                    RegistryError::Unavailable.to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
         }
 
         if delivery.secret_key_id != PRIMARY_SECRET_KEY_ID {
@@ -591,6 +628,62 @@ mod tests {
         );
         assert_eq!(delivery.attempts, 1);
         assert!(delivery.delivered_at.is_some());
+        Ok(())
+    }
+
+    /// A registry that answers every lookup with `status` and an empty body.
+    async fn spawn_registry(status: u16) -> Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        Ok(origin)
+    }
+
+    /// TC-2481: a delivery for a space the registry does not list here ends
+    /// without being sent, and one the registry can't confirm is retried.
+    #[tokio::test]
+    async fn deliveries_follow_the_registry() -> Result<()> {
+        for (registry_status, delivery_status) in [
+            (404, tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER),
+            (503, tinycloud_core::db::HOOK_DELIVERY_STATUS_RETRYING),
+        ] {
+            let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
+            let registry = tinycloud_core::registry_admission::RegistryAdmission::new(
+                &spawn_registry(registry_status).await?,
+                OWNER_DID.to_string(),
+            )?;
+            let tinycloud = tinycloud.with_registry_admission(Some(Arc::new(registry)));
+            let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
+            let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+            WebhookDispatcher::new(
+                tinycloud,
+                HooksConfig::default(),
+                encryption,
+                EgressPolicy::test_loopback(),
+            )?
+            .dispatch_due_once()
+            .await?;
+
+            let delivery = hook_delivery::Entity::find_by_id(delivery_id)
+                .one(&db)
+                .await?
+                .expect("delivery row");
+            assert_eq!(delivery.status, delivery_status, "{registry_status}");
+            assert!(
+                receiver.try_recv().is_err(),
+                "{registry_status}: nothing is sent"
+            );
+        }
         Ok(())
     }
 
