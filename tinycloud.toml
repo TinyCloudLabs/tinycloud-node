@@ -70,6 +70,15 @@ cors = true
     ## answered 503 request_timeout. Keep it below the ingress timeout (60 s). 0 = off.
     ## Env: TINYCLOUD_INVOCATION__DEADLINE_MS
     # deadline_ms = 55000
+    ## Per-invoker /invoke rate (TC-3216): sustained requests per minute for one
+    ## verified session key, plus the burst above it. 0 = off. Over it, a request
+    ## is counted (tinycloud_invoke_rate_limited_total); only with
+    ## rate_limit_enforce = true is it refused (429 rate_limited, Retry-After).
+    ## Env: TINYCLOUD_INVOCATION__RATE_LIMIT_PER_MINUTE, TINYCLOUD_INVOCATION__RATE_LIMIT_BURST,
+    ## TINYCLOUD_INVOCATION__RATE_LIMIT_ENFORCE
+    # rate_limit_per_minute = 600
+    # rate_limit_burst = 240
+    # rate_limit_enforce = false
 
 [global.keys]
     # Provision a unique, persistent root before starting this node.

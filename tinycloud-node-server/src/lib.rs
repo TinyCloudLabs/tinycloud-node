@@ -1126,7 +1126,8 @@ pub async fn app_with_control(
     // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
-    let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+    let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces)
+        .with_invocation_limit(&tinycloud_config.invocation);
     let webhook_dispatcher = WebhookDispatcher::new(
         tinycloud.clone(),
         tinycloud_config.hooks.clone(),

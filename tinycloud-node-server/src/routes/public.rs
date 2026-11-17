@@ -6,13 +6,22 @@ use rocket::{
     serde::json::Json,
     State,
 };
-use std::{collections::HashMap, net::IpAddr, sync::Mutex, time::Instant};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    hash::Hash,
+    net::IpAddr,
+    sync::{Mutex, PoisonError},
+    time::{Duration, Instant},
+};
 use tinycloud_auth::resource::{Path, SpaceId};
 use tinycloud_core::storage::{Content, ImmutableReadStore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{
-    auth_guards::STREAM_MAX_CHUNK_SIZE, config::PublicSpacesConfig, BlockStores, TinyCloud,
+    auth_guards::STREAM_MAX_CHUNK_SIZE,
+    config::{InvocationConfig, PublicSpacesConfig},
+    BlockStores, TinyCloud,
 };
 use tinycloud_core::types::Metadata;
 
@@ -42,8 +51,64 @@ pub fn is_public_space(space_id: &SpaceId) -> bool {
 
 // --- Rate Limiter ---
 
+/// Token buckets for the public endpoints (per client IP) and, when
+/// configured, for `/invoke` (per verified invoker).
 pub struct RateLimiter {
-    state: Mutex<HashMap<IpAddr, TokenBucket>>,
+    public: Buckets<IpAddr>,
+    invokers: Option<InvokerLimit>,
+}
+
+/// The `/invoke` limit per verified invoker (TC-3216). In shadow mode (the
+/// default) a request over it is counted and reported but admitted; enforced,
+/// it is refused with `429`.
+struct InvokerLimit {
+    buckets: Buckets<String>,
+    enforce: bool,
+    report: Mutex<OverLimitReport>,
+}
+
+/// Over-limit `/invoke` requests not yet in a log line.
+struct OverLimitReport {
+    count: u64,
+    since: Option<Instant>,
+}
+
+/// At most one `invoke_rate_limited` log line per this many seconds.
+const OVER_LIMIT_REPORT_SECS: u64 = 60;
+
+impl InvokerLimit {
+    /// Count one over-limit request: the metric always, and a log line with
+    /// the count so far when none was emitted in the last window. The line
+    /// names no invoker, space or account.
+    fn observe_over(&self, now: Instant) {
+        let mode = if self.enforce { "enforce" } else { "shadow" };
+        crate::prometheus::observe_invoke_rate_limited(mode);
+        let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
+        report.count += 1;
+        let due = report.since.is_none_or(|since| {
+            now.saturating_duration_since(since) >= Duration::from_secs(OVER_LIMIT_REPORT_SECS)
+        });
+        if due {
+            tracing::warn!(
+                event = "invoke_rate_limited",
+                mode,
+                count = report.count,
+                window_s = OVER_LIMIT_REPORT_SECS,
+                "invocations over the per-invoker rate limit"
+            );
+            report.count = 0;
+            report.since = Some(now);
+        }
+    }
+}
+
+/// Most callers tracked at once per bucket family. A full bucket is the same
+/// as no bucket, so full ones are forgotten first; past that, a new caller is
+/// admitted untracked rather than growing the map.
+const MAX_TRACKED_CALLERS: usize = 100_000;
+
+struct Buckets<K> {
+    state: Mutex<HashMap<K, TokenBucket>>,
     tokens_per_second: f64,
     burst: u32,
 }
@@ -53,36 +118,119 @@ struct TokenBucket {
     last_refill: Instant,
 }
 
-impl RateLimiter {
-    pub fn new(config: &PublicSpacesConfig) -> Self {
+impl<K: Eq + Hash> Buckets<K> {
+    fn new(per_minute: u32, burst: u32) -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
-            tokens_per_second: config.rate_limit_per_minute as f64 / 60.0,
-            burst: config.rate_limit_burst,
+            tokens_per_second: per_minute as f64 / 60.0,
+            burst,
         }
     }
 
-    pub fn check(&self, ip: IpAddr) -> Result<(), Status> {
-        let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
+    /// Take one token for `key`, or return how long until one is available
+    /// (`None` when the bucket never refills).
+    fn take<Q>(&self, key: &Q, now: Instant) -> Result<(), Option<Duration>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let max_tokens = self.burst as f64 + self.tokens_per_second;
-
-        let bucket = state.entry(ip).or_insert(TokenBucket {
-            tokens: max_tokens,
-            last_refill: now,
-        });
-
-        // Refill tokens based on elapsed time
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.tokens_per_second).min(max_tokens);
+        let refilled = |bucket: &TokenBucket| {
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+            (bucket.tokens + elapsed * self.tokens_per_second).min(max_tokens)
+        };
+        if !state.contains_key(key) {
+            if state.len() >= MAX_TRACKED_CALLERS {
+                state.retain(|_, bucket| refilled(bucket) < max_tokens);
+                if state.len() >= MAX_TRACKED_CALLERS {
+                    return Ok(());
+                }
+            }
+            state.insert(
+                key.to_owned(),
+                TokenBucket {
+                    tokens: max_tokens,
+                    last_refill: now,
+                },
+            );
+        }
+        let Some(bucket) = state.get_mut(key) else {
+            return Ok(());
+        };
+        bucket.tokens = refilled(bucket);
         bucket.last_refill = now;
-
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             Ok(())
+        } else if self.tokens_per_second > 0.0 {
+            Err(Some(Duration::from_secs_f64(
+                (1.0 - bucket.tokens) / self.tokens_per_second,
+            )))
         } else {
-            Err(Status::TooManyRequests)
+            Err(None)
         }
+    }
+}
+
+impl RateLimiter {
+    pub fn new(config: &PublicSpacesConfig) -> Self {
+        Self {
+            public: Buckets::new(config.rate_limit_per_minute, config.rate_limit_burst),
+            invokers: None,
+        }
+    }
+
+    /// Also limit `/invoke` per invoker, as `config` sets; a zero rate leaves
+    /// it unlimited. A burst below one would refuse every request, so it is
+    /// raised to one. Only `rate_limit_enforce` refuses; otherwise the limit
+    /// is shadowed.
+    pub fn with_invocation_limit(mut self, config: &InvocationConfig) -> Self {
+        self.invokers = (config.rate_limit_per_minute > 0).then(|| InvokerLimit {
+            buckets: Buckets::new(config.rate_limit_per_minute, config.rate_limit_burst.max(1)),
+            enforce: config.rate_limit_enforce,
+            report: Mutex::new(OverLimitReport {
+                count: 0,
+                since: None,
+            }),
+        });
+        self
+    }
+
+    pub fn check(&self, ip: IpAddr) -> Result<(), Status> {
+        self.public
+            .take(&ip, Instant::now())
+            .map_err(|_| Status::TooManyRequests)
+    }
+
+    /// Take one `/invoke` request for `invoker` (a verified invocation's
+    /// issuer). Over the limit and enforced, return the whole seconds to
+    /// send as `Retry-After`; shadowed, count it and admit it.
+    pub fn check_invoker(&self, invoker: &str) -> Result<(), u64> {
+        let Some(limit) = &self.invokers else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        let Err(wait) = limit.buckets.take(invoker, now) else {
+            return Ok(());
+        };
+        limit.observe_over(now);
+        if !limit.enforce {
+            return Ok(());
+        }
+        Err(wait.map_or(u64::MAX, |wait| wait.as_secs_f64().ceil().max(1.0) as u64))
+    }
+}
+
+/// The node's [`RateLimiter`] for `/invoke`, when one is managed. Rockets
+/// built without one (unit-test rockets) are not limited.
+pub struct InvokeRateLimiter<'r>(pub Option<&'r RateLimiter>);
+
+#[async_trait]
+impl<'r> FromRequest<'r> for InvokeRateLimiter<'r> {
+    type Error = ();
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        Outcome::Success(Self(request.rocket().state::<RateLimiter>()))
     }
 }
 

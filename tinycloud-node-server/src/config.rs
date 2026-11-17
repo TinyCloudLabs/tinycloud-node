@@ -2185,6 +2185,25 @@ pub struct InvocationConfig {
     /// The default sits below the ingress's 60 s, so the node answers first.
     #[serde(default = "default_invocation_deadline_ms")]
     pub deadline_ms: u64,
+    /// Per-invoker `/invoke` rate: sustained requests per minute for one
+    /// verified invoker (session key); zero turns the limit off. A request
+    /// over it is counted (`tinycloud_invoke_rate_limited_total`, and at most
+    /// one `invoke_rate_limited` log line a minute) and, only when
+    /// `rate_limit_enforce` is set, answered `429 rate_limited` with
+    /// `Retry-After` before any database work. Defaults are about twice the
+    /// busiest account's last-24h peaks on 11-17 (306 a minute, 120 in 10 s;
+    /// roci-xo peaked at 67 a minute), counted per account, which bounds any
+    /// one session key, so normal first-party use never meets them.
+    #[serde(default = "default_invocation_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+    /// Requests one invoker may send at once above the sustained rate.
+    #[serde(default = "default_invocation_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    /// Refuse requests over the per-invoker rate. Off by default: the limit
+    /// runs in shadow mode, counting and reporting only, until the counts
+    /// show first-party traffic stays under it.
+    #[serde(default)]
+    pub rate_limit_enforce: bool,
 }
 
 fn default_invocation_max_lifetime_secs() -> u64 {
@@ -2193,6 +2212,14 @@ fn default_invocation_max_lifetime_secs() -> u64 {
 
 fn default_invocation_deadline_ms() -> u64 {
     55_000
+}
+
+fn default_invocation_rate_limit_per_minute() -> u32 {
+    600
+}
+
+fn default_invocation_rate_limit_burst() -> u32 {
+    240
 }
 
 impl InvocationConfig {
@@ -2206,6 +2233,9 @@ impl Default for InvocationConfig {
         Self {
             max_lifetime_secs: default_invocation_max_lifetime_secs(),
             deadline_ms: default_invocation_deadline_ms(),
+            rate_limit_per_minute: default_invocation_rate_limit_per_minute(),
+            rate_limit_burst: default_invocation_rate_limit_burst(),
+            rate_limit_enforce: false,
         }
     }
 }

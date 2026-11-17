@@ -273,6 +273,9 @@ pub enum InvokeError {
     /// A `401` whose JSON body is `{"code": <code>, "error": <message>}`; the
     /// message is the unchanged human text of the refusal.
     Revoked(RevocationCode, String),
+    /// `429 rate_limited`: the invoker is over its share; retry after this
+    /// many seconds.
+    RateLimited(u64),
 }
 
 impl From<(Status, String)> for InvokeError {
@@ -303,6 +306,14 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
                 Json(serde_json::json!({ "code": code.as_str(), "error": message })),
             )
                 .respond_to(request),
+            Self::RateLimited(retry_after_secs) => {
+                let mut response = (Status::TooManyRequests, "rate_limited").respond_to(request)?;
+                response.set_header(rocket::http::Header::new(
+                    "Retry-After",
+                    retry_after_secs.to_string(),
+                ));
+                Ok(response)
+            }
         }
     }
 }
@@ -957,6 +968,7 @@ pub struct RevokeResponse {
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
+    rate_limiter: public::InvokeRateLimiter<'_>,
     req_span: TracingSpan,
     headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -975,6 +987,7 @@ pub async fn invoke(
         config,
         Box::pin(invoke_impl(
             i,
+            rate_limiter,
             req_span,
             headers,
             data,
@@ -998,6 +1011,7 @@ pub async fn invoke(
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
+    rate_limiter: public::InvokeRateLimiter<'_>,
     req_span: TracingSpan,
     headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -1015,6 +1029,7 @@ pub async fn invoke(
         config,
         Box::pin(invoke_impl(
             i,
+            rate_limiter,
             req_span,
             headers,
             data,
@@ -1942,6 +1957,7 @@ fn classify_invocation_time_rejection(
 #[allow(clippy::too_many_arguments)]
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
+    rate_limiter: public::InvokeRateLimiter<'_>,
     req_span: TracingSpan,
     mut headers: ObjectHeaders,
     data: DataIn<'_>,
@@ -2002,6 +2018,14 @@ async fn invoke_impl(
                 };
                 (Status::Unauthorized, message)
             })?;
+        // Sam 11-17: one verified invoker gets a fair share of the node. The
+        // check follows signature verification, so nobody can spend another
+        // invoker's budget, and precedes every database read.
+        if let Some(limiter) = rate_limiter.0 {
+            limiter
+                .check_invoker(&admitted.invocation().0.invoker)
+                .map_err(InvokeError::RateLimited)?;
+        }
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
         }
@@ -11323,6 +11347,163 @@ mod tests {
         Ok(tinycloud_core::models::invocation_replay::Entity::find()
             .count(conn)
             .await?)
+    }
+
+    /// A `/invoke` client whose node allows one request per invoker, then one
+    /// a minute, refusing past that only when `enforce`.
+    async fn rate_limited_invoke_client(
+        enforce: bool,
+    ) -> Result<(Vec<TempDir>, rocket::local::asynchronous::Client)> {
+        let (tempdirs, rocket, _replay_db) = tc341_invoke_rocket().await?;
+        let limits = crate::config::InvocationConfig {
+            rate_limit_per_minute: 1,
+            rate_limit_burst: 1,
+            rate_limit_enforce: enforce,
+            ..Default::default()
+        };
+        let rocket = rocket.manage(
+            public::RateLimiter::new(&crate::config::PublicSpacesConfig::default())
+                .with_invocation_limit(&limits),
+        );
+        Ok((
+            tempdirs,
+            rocket::local::asynchronous::Client::tracked(rocket).await?,
+        ))
+    }
+
+    async fn invoke_with(
+        client: &rocket::local::asynchronous::Client,
+        header: String,
+    ) -> (rocket::http::Status, Option<String>, String) {
+        let response = client
+            .post("/invoke")
+            .header(rocket::http::Header::new("Authorization", header))
+            .header(rocket::http::ContentType::Plain)
+            .body("fair-share")
+            .dispatch()
+            .await;
+        let status = response.status();
+        let retry_after = response.headers().get_one("Retry-After").map(str::to_owned);
+        (
+            status,
+            retry_after,
+            response.into_string().await.unwrap_or_default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn invoke_over_the_invoker_rate_is_429_with_retry_after() -> Result<()> {
+        use rocket::http::Status;
+
+        let (_tempdirs, client) = rate_limited_invoke_client(true).await?;
+        let signer = JWK::generate_ed25519()?;
+        let vm = tc341_verification_method(&signer)?;
+        let expiration = test_invocation_expiration();
+
+        let first = invoke_with(
+            &client,
+            tc341_kv_invocation(&signer, &vm, expiration, "urn:uuid:fair-share-1")?,
+        )
+        .await;
+        assert_ne!(
+            first.0,
+            Status::TooManyRequests,
+            "the burst admits the first request: {first:?}"
+        );
+
+        let (status, retry_after, body) = invoke_with(
+            &client,
+            tc341_kv_invocation(&signer, &vm, expiration, "urn:uuid:fair-share-2")?,
+        )
+        .await;
+        assert_eq!(status, Status::TooManyRequests, "{body}");
+        assert_eq!(body, "rate_limited");
+        // One token a minute, nearly all of it still to refill.
+        let retry_after: u64 = retry_after.expect("429 carries Retry-After").parse()?;
+        assert!(
+            (55..=60).contains(&retry_after),
+            "Retry-After {retry_after}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invoke_rate_limit_is_per_verified_invoker() -> Result<()> {
+        use rocket::http::Status;
+
+        let (_tempdirs, client) = rate_limited_invoke_client(true).await?;
+        let alice = JWK::generate_ed25519()?;
+        let alice_vm = tc341_verification_method(&alice)?;
+        let bob = JWK::generate_ed25519()?;
+        let bob_vm = tc341_verification_method(&bob)?;
+        let expiration = test_invocation_expiration();
+
+        // Bob claims to be Alice. Admission refuses the bad signature, and the
+        // refusal must not spend Alice's budget.
+        let forged = invoke_with(
+            &client,
+            tc341_kv_invocation(&bob, &alice_vm, expiration, "urn:uuid:fair-share-forged")?,
+        )
+        .await;
+        assert_eq!(forged.0, Status::Unauthorized, "{forged:?}");
+
+        let alice_first = invoke_with(
+            &client,
+            tc341_kv_invocation(&alice, &alice_vm, expiration, "urn:uuid:fair-share-a1")?,
+        )
+        .await;
+        assert_ne!(alice_first.0, Status::TooManyRequests, "{alice_first:?}");
+        let alice_second = invoke_with(
+            &client,
+            tc341_kv_invocation(&alice, &alice_vm, expiration, "urn:uuid:fair-share-a2")?,
+        )
+        .await;
+        assert_eq!(alice_second.0, Status::TooManyRequests, "{alice_second:?}");
+
+        // Alice being over her share leaves Bob's untouched.
+        let bob_first = invoke_with(
+            &client,
+            tc341_kv_invocation(&bob, &bob_vm, expiration, "urn:uuid:fair-share-b1")?,
+        )
+        .await;
+        assert_ne!(bob_first.0, Status::TooManyRequests, "{bob_first:?}");
+        Ok(())
+    }
+
+    /// TC-3216: the default shadow mode counts a request over the limit but
+    /// admits it.
+    #[tokio::test]
+    async fn shadowed_invoke_rate_limit_admits_over_the_limit() -> Result<()> {
+        use rocket::http::Status;
+
+        let (_tempdirs, client) = rate_limited_invoke_client(false).await?;
+        let signer = JWK::generate_ed25519()?;
+        let vm = tc341_verification_method(&signer)?;
+        let expiration = test_invocation_expiration();
+        let before = crate::prometheus::INVOKE_RATE_LIMITED
+            .with_label_values(&["shadow"])
+            .get();
+        for nonce in [
+            "urn:uuid:shadow-1",
+            "urn:uuid:shadow-2",
+            "urn:uuid:shadow-3",
+        ] {
+            let (status, retry_after, body) = invoke_with(
+                &client,
+                tc341_kv_invocation(&signer, &vm, expiration, nonce)?,
+            )
+            .await;
+            assert_ne!(status, Status::TooManyRequests, "{body}");
+            assert_eq!(retry_after, None);
+        }
+        assert!(
+            crate::prometheus::INVOKE_RATE_LIMITED
+                .with_label_values(&["shadow"])
+                .get()
+                >= before + 2,
+            "both requests over the limit are counted"
+        );
+        Ok(())
     }
 
     #[tokio::test]
