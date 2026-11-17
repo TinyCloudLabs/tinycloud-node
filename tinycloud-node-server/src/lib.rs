@@ -564,6 +564,7 @@ pub async fn postgres_pool_with_recovery(
         connections_opened = postgres_connections_opened(),
         "PostgreSQL pool connection limits"
     );
+    prometheus::set_db_pool_timeouts(statement_timeouts, idle_in_transaction_timeout_ms);
     Ok(RecoveringConnection::with_recovery(
         SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         recovery,
