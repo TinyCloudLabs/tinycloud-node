@@ -69,6 +69,7 @@ pub mod tee;
 mod tracing;
 pub mod tunnel;
 pub mod webhook_dispatcher;
+pub mod webhook_headers;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
