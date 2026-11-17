@@ -361,7 +361,15 @@ impl RegistryAdmission {
             }
             Err(()) => return Lookup::Refused(RegistryError::Unavailable),
         }
-        let Ok(mut response) = self.client.get(url).send().await else {
+        // A lookup that an HTTP cache in between answers with a stale record
+        // would restart the outage lease from it: ask for the origin's answer.
+        let Ok(mut response) = self
+            .client
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()
+            .await
+        else {
             return Lookup::Outage;
         };
         match response.status() {
@@ -652,5 +660,102 @@ mod tests {
             malformed.pointer_mut(pointer).unwrap()["extra"] = Value::Bool(true);
             assert!(VerifiedRecord::parse(&serde_json::to_vec(&malformed).unwrap()).is_err());
         }
+    }
+
+    /// One scripted reply of the fake registry: an optional gate it waits on
+    /// before answering, the status and the body.
+    type Script = (Option<tokio::sync::oneshot::Receiver<()>>, u16, Vec<u8>);
+
+    /// A fake registry that answers each connection with the next script, and
+    /// reports each request as soon as it has read it.
+    async fn scripted() -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<Script>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Script>();
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (gate, status, body) = rx.recv().await.unwrap();
+                let seen = seen_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = seen.send(());
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+        (origin, tx, seen_rx)
+    }
+
+    /// The fixture's first record: its owner, its node and a lookup body.
+    fn first_record() -> (String, String, Vec<u8>) {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/registry-v2.json")).unwrap();
+        let record = &fixture["records"][0]["record"];
+        let body = serde_json::to_vec(&serde_json::json!({ "record": record })).unwrap();
+        (
+            record["subject"].as_str().unwrap().to_owned(),
+            record["nodes"][0]["did"].as_str().unwrap().to_owned(),
+            body,
+        )
+    }
+
+    /// A confirmation whose lookup was in flight when a refusal for the same
+    /// owner landed must not re-arm the outage cache: the withdrawn owner is
+    /// not served from it.
+    #[tokio::test]
+    async fn a_success_that_lands_after_a_refusal_does_not_rearm_the_cache() {
+        let (owner, node, body) = first_record();
+        let (origin, script, mut seen) = scripted().await;
+        let registry = Arc::new(
+            RegistryAdmission::new(&origin, node)
+                .unwrap()
+                .with_outage_cache(Duration::from_secs(300))
+                .unwrap(),
+        );
+        // Armed by a confirmation.
+        script.send((None, 200, body.clone())).unwrap();
+        registry.current(&owner, true).await.unwrap();
+        seen.recv().await.unwrap();
+        // A: a confirmation held in flight.
+        let (release, gate) = tokio::sync::oneshot::channel();
+        script.send((Some(gate), 200, body.clone())).unwrap();
+        let a = tokio::spawn({
+            let registry = registry.clone();
+            let owner = owner.clone();
+            async move { registry.current(&owner, true).await.map(|_| ()) }
+        });
+        seen.recv().await.unwrap();
+        // B: the owner is withdrawn (404) while A is in flight.
+        script.send((None, 404, b"{}".to_vec())).unwrap();
+        assert_eq!(
+            registry.current(&owner, true).await.unwrap_err(),
+            RegistryError::Unavailable
+        );
+        seen.recv().await.unwrap();
+        // A's stale confirmation lands after the refusal.
+        release.send(()).unwrap();
+        a.await.unwrap().unwrap();
+        // C: an outage. The withdrawn owner is not served from the cache.
+        script.send((None, 503, Vec::new())).unwrap();
+        assert_eq!(
+            registry.current(&owner, true).await.unwrap_err(),
+            RegistryError::Unavailable
+        );
     }
 }
