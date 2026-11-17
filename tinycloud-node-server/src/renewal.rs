@@ -87,7 +87,12 @@ pub(crate) async fn scheduler_tick(
     let conn = tinycloud.connection();
     // Paused node-wide: issue nothing and log nothing; the stamp transaction
     // re-checks the switch, so a pause landing mid-pass also stops stamps.
-    if renewal::renewal_switch(conn).await?.paused {
+    // Fixed text: the tick's caller logs this error, and a raw DbErr may carry SQL detail.
+    if renewal::renewal_switch(conn)
+        .await
+        .map_err(|_| anyhow!("renewal switch unavailable"))?
+        .paused
+    {
         return Ok(());
     }
     let identity = tinycloud
