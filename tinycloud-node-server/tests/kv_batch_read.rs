@@ -520,3 +520,85 @@ async fn conditional_batch_reads_answer_304_only_while_unchanged() -> Result<()>
     ensure!(status == Status::NotModified, "settled: {status} {body}");
     Ok(())
 }
+
+/// TC-3217: `If-None-Match: *` on a batch read is not a state, so it never
+/// answers 304; and two key sets that differ only in keys never written have
+/// different states.
+#[tokio::test]
+async fn conditional_batch_reads_never_match_a_wildcard_or_another_absent_key() -> Result<()> {
+    let (client, _dir) = node().await?;
+    let session = sign_in(&client).await?;
+    put(&client, &session, "board/a", b"a1").await?;
+    put(&client, &session, "board/b", b"b1").await?;
+    let get = "tinycloud.kv/get";
+
+    for wildcard in ["*", " * "] {
+        let (status, _, body) = conditional_batch(
+            &client,
+            &session,
+            get,
+            &["board/a", "board/b"],
+            Some(wildcard),
+        )
+        .await?;
+        ensure!(
+            status == Status::BadRequest,
+            "{wildcard:?}: {status} {body}"
+        );
+    }
+
+    let (status, tag, body) =
+        conditional_batch(&client, &session, get, &["board/a", "board/x"], None).await?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    let tag = tag.context("ETag")?;
+    let (status, other, body) =
+        conditional_batch(&client, &session, get, &["board/a", "board/y"], Some(&tag)).await?;
+    ensure!(status == Status::Ok, "other absent key: {status} {body}");
+    ensure!(other.as_deref() != Some(tag.as_str()), "{other:?}");
+    Ok(())
+}
+
+/// TC-3217: a live key whose stored value can't be read is answered as not
+/// found with no `ETag`, so a client never caches that answer under the state
+/// of a key that is present.
+#[tokio::test]
+async fn a_batch_read_with_an_unreadable_value_has_no_etag() -> Result<()> {
+    let (client, dir) = node().await?;
+    let session = sign_in(&client).await?;
+    put(&client, &session, "board/a", b"a1").await?;
+    put(&client, &session, "board/b", b"b1").await?;
+    let get = "tinycloud.kv/get";
+    let board = ["board/a", "board/b"];
+
+    let block = files(dir.path())
+        .into_iter()
+        .find(|file| std::fs::read(file).is_ok_and(|bytes| bytes == b"a1"))
+        .context("the block of board/a")?;
+    let aside = block.with_extension("aside");
+    std::fs::rename(&block, &aside)?;
+    let (status, etag, body) = conditional_batch(&client, &session, get, &board, None).await?;
+    std::fs::rename(&aside, &block)?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    ensure!(found(&body, "board/a")?.is_none(), "{body}");
+    ensure!(etag.is_none(), "{etag:?}");
+
+    let (status, etag, body) = conditional_batch(&client, &session, get, &board, None).await?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    ensure!(found(&body, "board/a")? == Some(b"a1".to_vec()), "{body}");
+    ensure!(etag.is_some(), "a readable batch has an ETag");
+    Ok(())
+}
+
+/// Every file under `dir`.
+fn files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

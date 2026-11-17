@@ -3811,6 +3811,9 @@ where
             }
         }
         let unchanged = matches!(results.last(), Some(InvocationOutcome::KvBatchUnchanged(_)));
+        // A live row whose content can't be read is answered as not found,
+        // which its state does not describe: that answer carries no state.
+        let mut unreadable = false;
         for cap in caps {
             match cap {
                 (_, "kv", "tinycloud.kv/get" | "tinycloud.kv/metadata", _) if unchanged => {}
@@ -3823,9 +3826,13 @@ where
                             .map_err(|error| TxStoreError::Tx(error.into()))?,
                     };
                     let data = match row {
-                        Some(entry) => read_kv_entity(&self.storage, space, entry)
-                            .await
-                            .map_err(TxStoreError::StoreRead)?,
+                        Some(entry) => {
+                            let data = read_kv_entity(&self.storage, space, entry)
+                                .await
+                                .map_err(TxStoreError::StoreRead)?;
+                            unreadable |= data.is_none();
+                            data
+                        }
                         None => None,
                     };
                     if let Some((size, limit)) = oversized_kv_response(&options, data.as_ref()) {
@@ -3868,7 +3875,7 @@ where
                 _ => {}
             }
         }
-        if let Some((_, state)) = batch_rows {
+        if let Some((_, state)) = batch_rows.filter(|_| !unreadable) {
             results.push(InvocationOutcome::KvBatchState(state));
         }
 
@@ -6532,6 +6539,73 @@ mod test {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         SpaceId::new(did, name.parse().unwrap()).unwrap()
+    }
+
+    /// TC-3217: a batch state names each target's row by every field of its
+    /// write position and its value digest, and an absent target by its key,
+    /// so two batches that differ in any one of them never share a state.
+    #[test]
+    fn kv_batch_state_tells_apart_rows_that_differ_in_one_field() {
+        let space = test_space_id("default");
+        let (a, x, y): (Path, Path, Path) = (
+            "board/a".parse().unwrap(),
+            "board/x".parse().unwrap(),
+            "board/y".parse().unwrap(),
+        );
+        let row = current_kv::Model {
+            space: SpaceIdWrap(space.clone()),
+            key: crate::types::Path(a.clone()),
+            invocation: crate::hash::hash(b"invocation"),
+            seq: 7,
+            epoch: crate::hash::hash(b"epoch"),
+            epoch_seq: 3,
+            value: crate::hash::hash(b"a1"),
+            generation: 0,
+            metadata: Metadata(Default::default()),
+            deleted: false,
+        };
+        let get = "tinycloud.kv/get";
+        let state = |rows: &[(&Path, Option<current_kv::Model>)]| {
+            kv_batch_state(
+                &rows
+                    .iter()
+                    .map(|(path, row)| (&space, get, *path, row.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let base = state(&[(&a, Some(row.clone())), (&x, None)]);
+        let variants = [
+            current_kv::Model {
+                seq: 8,
+                ..row.clone()
+            },
+            current_kv::Model {
+                epoch: crate::hash::hash(b"other epoch"),
+                ..row.clone()
+            },
+            current_kv::Model {
+                epoch_seq: 4,
+                ..row.clone()
+            },
+            current_kv::Model {
+                value: crate::hash::hash(b"a2"),
+                ..row.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                state(&[(&a, Some(variant.clone())), (&x, None)]),
+                base,
+                "{variant:?}"
+            );
+        }
+        assert_ne!(state(&[(&a, None), (&x, None)]), base, "present vs absent");
+        assert_ne!(
+            state(&[(&a, Some(row.clone())), (&y, None)]),
+            base,
+            "key sets that differ only in an absent key"
+        );
+        assert_eq!(state(&[(&a, Some(row)), (&x, None)]), base);
     }
 
     #[tokio::test]
