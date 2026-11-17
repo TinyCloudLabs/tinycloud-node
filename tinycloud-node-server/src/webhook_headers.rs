@@ -18,7 +18,7 @@ pub const MAX_TOTAL_BYTES: usize = 4096;
 /// Exact names refused case-insensitively: framing, routing, hop-by-hop and
 /// proxy-identity headers the node or its egress owns, `Content-Type` which
 /// the node sets, and cookies. Kept identical to the js-sdk client list.
-const RESERVED: [&str; 19] = [
+const RESERVED: [&str; 20] = [
     "host",
     "content-length",
     "content-type",
@@ -34,6 +34,7 @@ const RESERVED: [&str; 19] = [
     "trailer",
     "expect",
     "cookie",
+    "cookie2",
     "set-cookie",
     "forwarded",
     "via",
@@ -241,6 +242,7 @@ mod tests {
             "x-tinycloud-delivery-id",
             "X-TINYCLOUD-Anything",
             "Cookie",
+            "cookie2",
             "set-cookie",
             "Forwarded",
             "Via",
