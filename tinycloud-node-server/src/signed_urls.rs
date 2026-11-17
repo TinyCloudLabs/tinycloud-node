@@ -14,7 +14,10 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tinycloud_auth::resource::{Path, Service, SpaceId};
+use tinycloud_auth::{
+    ipld_core::cid::Cid,
+    resource::{Path, Service, SpaceId},
+};
 use tinycloud_core::{
     hash::Hash,
     models::{delegation, signed_kv_ticket},
@@ -330,7 +333,10 @@ pub async fn mint_signed_kv_url(
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation);
-    let parent_expiry = find_parent_expiry(invocation, tinycloud).await?;
+    // The current effective end of the cited delegations (renewal stamps
+    // included), never a projected one: see `find_parent_expiry`.
+    let parent_expiry =
+        find_parent_expiry(&invocation.parents, tinycloud, now.unix_timestamp()).await?;
     let parent_exp = parent_expiry.unwrap_or(invocation_exp);
     let requested_ttl = request
         .ttl_seconds
@@ -415,6 +421,31 @@ pub async fn load_signed_kv_ticket(
             )
         })?;
     validate_signed_kv_ticket(&ticket)?;
+    // Recompute the cited delegations' current effective end at every use: a
+    // URL minted while stamps extended its grant stops when they lapse (the
+    // stored `expires_at` is only the end known at mint). This is not a
+    // revocation check: revoking a delegation only shows here when it drops
+    // the effective end, i.e. once the grant's signed expiry has passed.
+    if let Some(parents) = &ticket.parent_cids_json {
+        let invalid = || {
+            (
+                Status::Unauthorized,
+                "signed URL ticket is invalid".to_string(),
+            )
+        };
+        let parents = serde_json::from_str::<Vec<String>>(parents)
+            .map_err(|_| invalid())?
+            .iter()
+            .map(|cid| cid.parse::<Cid>().map_err(|_| invalid()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if find_parent_expiry(&parents, tinycloud, now)
+            .await?
+            .is_some_and(|end| end <= now)
+        {
+            return Err((Status::Unauthorized, "signed URL expired".to_string()));
+        }
+    }
     Ok(ticket)
 }
 
@@ -554,11 +585,21 @@ fn invocation_expiry(invocation: &InvocationInfo) -> i64 {
         .floor() as i64
 }
 
+/// The current effective end of the delegations that authorize a signed URL:
+/// the earliest, over the cited delegations, of the end `/invoke` reads use.
+/// That is the authorization graph's effective end
+/// (`SpaceDatabase::delegation_effective_expiry`): the latest admitted
+/// renewal stamp of this node's current renewer epoch (stamps of older epochs
+/// or that fail verification are ignored), capped by every ancestor's
+/// effective end. Without one, as for `/invoke`, the signed expiry applies. It
+/// is never a projected end: a stamp counts only once it is stored. `None`
+/// when nothing in the chain expires.
 async fn find_parent_expiry(
-    invocation: &InvocationInfo,
+    parents: &[Cid],
     tinycloud: &TinyCloud,
+    now: i64,
 ) -> Result<Option<i64>, (Status, String)> {
-    if invocation.parents.is_empty() {
+    if parents.is_empty() {
         return Ok(None);
     }
 
@@ -566,21 +607,30 @@ async fn find_parent_expiry(
         .readable()
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-    let parent_ids: Vec<Hash> = invocation
-        .parents
-        .iter()
-        .map(|cid| Hash::from(*cid))
-        .collect();
-    let expiries = delegation::Entity::find()
+    let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
+    let signed = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
         .all(&tx)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    drop(tx);
 
-    Ok(expiries
-        .into_iter()
-        .filter_map(|delegation| delegation.expiry.map(|expiry| expiry.unix_timestamp()))
-        .min())
+    let mut end = None;
+    for parent in signed {
+        let effective = tinycloud
+            .delegation_effective_expiry(parent.id, now)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        // A chain with no expiry anywhere resolves to `i64::MAX`.
+        let parent_end = effective
+            .or(parent.expiry.map(|expiry| expiry.unix_timestamp()))
+            .filter(|parent_end| *parent_end != i64::MAX);
+        end = match (end, parent_end) {
+            (Some(end), Some(parent_end)) => Some(std::cmp::min(end, parent_end)),
+            (end, parent_end) => end.or(parent_end),
+        };
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
