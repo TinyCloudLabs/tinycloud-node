@@ -14,8 +14,9 @@
   - Names are RFC 7230 tokens of up to 64 bytes.
   - Values are 1–1024 bytes of printable ASCII (0x20–0x7E), so no tab, CR, LF or NUL, and no leading or trailing space.
   - Case-insensitive duplicates are refused.
-  - Reserved names are refused: `Host`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-MD5`, `Content-Range`, `Transfer-Encoding`, `Accept-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie`, `Set-Cookie`, `Forwarded`, `Via`, `X-Real-IP`, and anything starting `Proxy-`, `Sec-`, `X-Forwarded-` or `X-TinyCloud-`.
+  - Reserved names are refused: `Host`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-MD5`, `Content-Range`, `Transfer-Encoding`, `Accept-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie`, `Cookie2`, `Set-Cookie`, `Forwarded`, `Via`, `X-Real-IP`, and anything starting `Proxy-`, `Sec-`, `X-Forwarded-` or `X-TinyCloud-`.
   - A refusal returns 400 and stores nothing.
+  - A body that fails to parse (for example `headers` sent as a string) answers 422, and no part of it reaches a log line at any log level.
 
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
