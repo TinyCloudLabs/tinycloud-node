@@ -326,6 +326,14 @@ pub struct KvInvokeOptions {
     /// no KV mutation (see [`kv_mutation_keys`]), which has no such
     /// transaction.
     pub replay: Option<invocation_replay::Model>,
+    /// TC-3217: `Some` for a batch read (every capability a `kv/get`, or
+    /// every one a `kv/metadata`), holding the batch states the client
+    /// already has (from `If-None-Match`; often none). The invocation answers
+    /// its batch state (see [`kv_batch_state`]) after its outcomes as
+    /// [`InvocationOutcome::KvBatchState`]; if that state is one of these,
+    /// it reads no value and answers [`InvocationOutcome::KvBatchUnchanged`]
+    /// alone. Either way it is authorized and its read audited as usual.
+    pub kv_batch_if_none_match: Option<Vec<[u8; 32]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3776,14 +3784,45 @@ where
             })
             .collect::<Vec<_>>();
         let mut kv_lookup = KvReadLookup::fetch(&self.conn, &caps).await;
-        for cap in caps {
-            match cap {
-                (space, "kv", "tinycloud.kv/get", path) => {
-                    let data = match kv_lookup
+        // TC-3217: a batch read looks every row up before reading any value,
+        // so its state names exactly the rows it answers from.
+        let mut batch_rows = None;
+        if let Some(known) = options.kv_batch_if_none_match.as_ref() {
+            let mut rows = Vec::with_capacity(caps.len());
+            for &(space, service, ability, path) in &caps {
+                if service != "kv" {
+                    continue;
+                }
+                let row = match ability {
+                    "tinycloud.kv/get" => kv_lookup
                         .entity(&self.conn, space, path)
                         .await
-                        .map_err(|error| TxStoreError::Tx(error.into()))?
-                    {
+                        .map_err(|error| TxStoreError::Tx(error.into()))?,
+                    "tinycloud.kv/metadata" => kv_lookup.entity(&self.conn, space, path).await?,
+                    _ => continue,
+                };
+                rows.push((space, ability, path, row));
+            }
+            let state = kv_batch_state(&rows);
+            if known.iter().any(|known| known.as_slice() == state.as_ref()) {
+                results.push(InvocationOutcome::KvBatchUnchanged(state));
+            } else {
+                batch_rows = Some((rows.into_iter().map(|(.., row)| row), state));
+            }
+        }
+        let unchanged = matches!(results.last(), Some(InvocationOutcome::KvBatchUnchanged(_)));
+        for cap in caps {
+            match cap {
+                (_, "kv", "tinycloud.kv/get" | "tinycloud.kv/metadata", _) if unchanged => {}
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let row = match batch_rows.as_mut() {
+                        Some((rows, _)) => rows.next().flatten(),
+                        None => kv_lookup
+                            .entity(&self.conn, space, path)
+                            .await
+                            .map_err(|error| TxStoreError::Tx(error.into()))?,
+                    };
+                    let data = match row {
                         Some(entry) => read_kv_entity(&self.storage, space, entry)
                             .await
                             .map_err(TxStoreError::StoreRead)?,
@@ -3806,11 +3845,12 @@ where
                     results.push(InvocationOutcome::KvList(list, truncated, None));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
+                    let row = match batch_rows.as_mut() {
+                        Some((rows, _)) => rows.next().flatten(),
+                        None => kv_lookup.entity(&self.conn, space, path).await?,
+                    };
                     results.push(InvocationOutcome::KvMetadata(
-                        kv_lookup
-                            .entity(&self.conn, space, path)
-                            .await?
-                            .map(|entry| (entry.metadata, entry.value)),
+                        row.map(|entry| (entry.metadata, entry.value)),
                     ));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
@@ -3827,6 +3867,9 @@ where
                 }
                 _ => {}
             }
+        }
+        if let Some((_, state)) = batch_rows {
+            results.push(InvocationOutcome::KvBatchState(state));
         }
 
         let read_audit_start = Instant::now();
@@ -4259,7 +4302,15 @@ pub enum InvocationOutcome<R> {
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
-    KvBatchRead(Vec<KvBatchReadItem>),
+    /// A batch of `kv/get` or `kv/metadata` answers, in request order, with
+    /// the batch state they were read from (TC-3217).
+    KvBatchRead(Vec<KvBatchReadItem>, Option<Hash>),
+    /// The state a batch read answered from (see [`kv_batch_state`]),
+    /// following its outcomes (TC-3217).
+    KvBatchState(Hash),
+    /// A conditional batch read whose state the client already has: no
+    /// value was read (TC-3217).
+    KvBatchUnchanged(Hash),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, Delegation>),
     /// Ordered delegation chain from leaf to root, retaining exact signed bytes.
@@ -5371,6 +5422,39 @@ async fn get_kv_entity<C: ConnectionTrait>(
         start.elapsed(),
     );
     Ok(result)
+}
+
+/// Domain separator of [`kv_batch_state`] (TC-3217).
+const KV_BATCH_STATE_DOMAIN: &[u8] = b"tinycloud/kv-batch-state/v2\0";
+
+/// TC-3217: one value naming everything a batch KV read answers: each target
+/// in request order (ability, space and key) and the live row it found, by
+/// its write position (`seq`, `epoch`, `epoch_seq`) and value digest, or its
+/// absence. A write, a delete or a re-creation of any of those keys changes
+/// the row, so an equal value means an equal answer. Computed from the rows
+/// the batch already looked up: it costs no statement.
+fn kv_batch_state(rows: &[(&SpaceId, &str, &Path, Option<current_kv::Model>)]) -> Hash {
+    let mut preimage = KV_BATCH_STATE_DOMAIN.to_vec();
+    let field = |preimage: &mut Vec<u8>, bytes: &[u8]| {
+        preimage.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(bytes);
+    };
+    for (space, ability, path, row) in rows {
+        field(&mut preimage, ability.as_bytes());
+        field(&mut preimage, space.to_string().as_bytes());
+        field(&mut preimage, path.as_str().as_bytes());
+        match row {
+            Some(row) => {
+                preimage.push(1);
+                preimage.extend_from_slice(&row.seq.to_be_bytes());
+                field(&mut preimage, row.epoch.as_ref());
+                preimage.extend_from_slice(&row.epoch_seq.to_be_bytes());
+                field(&mut preimage, row.value.as_ref());
+            }
+            None => preimage.push(0),
+        }
+    }
+    crate::hash::hash(&preimage)
 }
 
 /// Most keys one `IN (...)` statement carries where there is no array
