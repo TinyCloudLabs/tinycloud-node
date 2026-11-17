@@ -67,13 +67,20 @@ impl MigrationTrait for Migration {
 mod tests {
     use crate::migrations::Migrator;
     use sea_orm::{ConnectionTrait, Database, DbBackend, EntityTrait, Statement};
-    use sea_orm_migration::MigratorTrait;
+    use sea_orm_migration::{MigrationName, MigratorTrait};
 
     #[tokio::test]
     async fn existing_subscriptions_gain_empty_headers_and_down_drops_columns() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        let before = (Migrator::migrations().len() - 1) as u32;
-        Migrator::up(&db, Some(before)).await.unwrap();
+        // This migration's position, not the list's end: later migrations
+        // follow it, and `down` must roll back through it.
+        let migrations = Migrator::migrations();
+        let before = migrations
+            .iter()
+            .position(|migration| migration.name() == super::Migration.name())
+            .unwrap();
+        let after = migrations.len() - before;
+        Migrator::up(&db, Some(before as u32)).await.unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO hook_subscription (id, subscriber_did, space_id, target_service, \
@@ -96,7 +103,7 @@ mod tests {
         assert_eq!(row.encrypted_headers_format, 0);
         assert_eq!(row.encrypted_secret, [1, 2]);
 
-        Migrator::down(&db, Some(1)).await.unwrap();
+        Migrator::down(&db, Some(after as u32)).await.unwrap();
         let row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
