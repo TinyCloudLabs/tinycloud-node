@@ -9024,11 +9024,13 @@ dependencies = [
  "if-addrs",
  "lazy_static",
  "libc",
+ "lru",
  "multer",
  "native-tls",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "percent-encoding",
  "pin-project",
  "prometheus",
@@ -9054,6 +9056,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "time",
+ "tinycloud-at-rest-escrow",
  "tinycloud-auth",
  "tinycloud-core",
  "tokio",
@@ -9067,6 +9070,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
