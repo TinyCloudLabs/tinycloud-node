@@ -46,8 +46,8 @@ use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Expr, Order, Query, SelectStatement},
-    Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect, Statement,
-    TransactionTrait,
+    AccessMode, Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -772,11 +772,19 @@ async fn feed_rows<C: ConnectionTrait>(
 /// statement shape is right for both prefixes in a generic plan. So the first
 /// page is planned per execution. That costs one transaction's extra round
 /// trips, on a page each client reads once per cursor.
+///
+/// The transaction is read-only: PostgreSQL enforces it, and the request's
+/// write tracking stays clear, so a failed first page still counts as safe to
+/// retry. Its BEGIN is retried on a connection-class error like any
+/// statement. The feed statement inside it is not retried here (the
+/// transaction is gone with its connection), unlike a statement on the pool.
 async fn first_page_rows<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     statement: Statement,
 ) -> Result<Vec<FeedRow>, DbErr> {
-    let tx = db.begin().await?;
+    let tx = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
     tx.execute_unprepared("SET LOCAL plan_cache_mode = force_custom_plan")
         .await?;
     let rows = feed_rows(&tx, statement).await?;
@@ -3362,7 +3370,8 @@ pub(crate) mod tests {
     /// their generic plan, as a pooled connection's do after five executions.
     /// That generic plan reads the broad prefix's every row on the key index
     /// and sorts them; reading the order index from the start instead would
-    /// walk the whole space for the narrow prefix.
+    /// walk the whole space for the narrow prefix. The first page's own
+    /// transaction leaves the request's write tracking clear.
     #[tokio::test]
     async fn postgres_first_sync_page_reads_a_page_for_broad_and_narrow_prefixes() {
         const ROWS: usize = 4000;
@@ -3454,6 +3463,8 @@ pub(crate) mod tests {
         conn.execute_unprepared("SET plan_cache_mode = force_generic_plan")
             .await
             .unwrap();
+        // The node's own connection type, which marks a request's writes.
+        let node_conn = crate::db_pool::RecoveringConnection::new(conn.clone());
         let broad: Path = "app".parse().unwrap();
         let narrow: Path = "app/few".parse().unwrap();
 
@@ -3478,9 +3489,14 @@ pub(crate) mod tests {
 
         for (prefix, expected) in [(&broad, LIMIT), (&narrow, 10)] {
             let before = current_kv_pages(&conn).await;
-            let (changes, more, next) = kv_sync_page(&conn, &space, prefix, LIMIT, None)
-                .await
-                .unwrap();
+            let (page, write_may_have_applied) =
+                crate::db_pool::track_writes(kv_sync_page(&node_conn, &space, prefix, LIMIT, None))
+                    .await;
+            let (changes, more, next) = page.unwrap();
+            assert!(
+                !write_may_have_applied,
+                "{prefix}: a first page is a read, safe to retry"
+            );
             let pages = current_kv_pages(&conn).await - before;
             println!(
                 "TC-3256 first page {prefix}: {pages} pages (generic plan, broad: {generic_pages})"
