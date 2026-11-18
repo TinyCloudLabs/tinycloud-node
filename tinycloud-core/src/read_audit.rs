@@ -6,14 +6,15 @@
 //! before the response is acknowledged. Concurrent records are drained into
 //! one transaction. Mutations and audit batches share the same writer lock.
 //!
-//! A read's record is its invoker's `actor` row and its `invocation` row,
-//! which holds the signed request (TC-3259). Unlike a mutation's record it has
-//! no `invoked_abilities` or `parent_delegations` rows. Both lists are inside
-//! the signed `serialization`, so the evidence is complete without them.
-//! Nothing traverses an invocation's parent edges: every reader of
-//! `parent_delegations` starts from a delegation id. Not writing them also
+//! A read's record is its invoker's `actor` row, its `invocation` row, which
+//! holds the signed request, and one `invoked_abilities` row per capability
+//! (TC-3259). Unlike a mutation's record it has no `parent_delegations` rows:
+//! the parents are inside the signed `serialization`, and not writing them
 //! stops reads from growing that table, which the permission check searches.
-//! Records written before TC-3259 keep their derived rows.
+//! The `invoked_abilities` rows stay because they are how a read is found by
+//! its space: the TC-2871 space purge seeds a space's invocations from them,
+//! and the legacy-artifact inventory attributes databases from them.
+//! Records written before TC-3259 keep their parent edges.
 
 use crate::{
     db_pool::{is_transient_error, transient_error_class, RecoveringConnection},
@@ -21,7 +22,9 @@ use crate::{
     events::Invocation,
     hash::Hash,
     models::{actor, invocation},
+    relationships::invoked_abilities,
     request_telemetry::{self, Metrics, RequestContext, Snapshot},
+    types::{Ability, Resource},
 };
 use sea_orm::{
     sea_query::{Alias, CommonTableExpression, OnConflict, WithClause},
@@ -41,9 +44,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 const CHANNEL_CAPACITY: usize = 1024;
 const MAX_BATCH_SIZE: usize = 64;
 
-/// What a read's audit stores: the signed request and who sent it. The
-/// capabilities and parents it cites are in `serialization`; see the module
-/// docs for why they get no rows of their own.
+/// What a read's audit stores: the signed request, who sent it, and the
+/// capabilities it cites. The parents it cites are in `serialization`; see the
+/// module docs for why they get no rows of their own.
 #[derive(Debug)]
 struct ReadAuditRecord {
     id: Hash,
@@ -51,6 +54,7 @@ struct ReadAuditRecord {
     issued_at: OffsetDateTime,
     serialization: Vec<u8>,
     serialization_format: i16,
+    abilities: Vec<(Resource, Ability)>,
 }
 
 impl ReadAuditRecord {
@@ -66,6 +70,12 @@ impl ReadAuditRecord {
                 RowBinding::new("invocation", "serialization", &[&Vec::<u8>::from(id)]),
             ),
             serialization_format: if encryption.is_some() { 2 } else { 0 },
+            abilities: invocation
+                .0
+                .capabilities
+                .iter()
+                .map(|capability| (capability.resource.clone(), capability.ability.clone()))
+                .collect(),
         }
     }
 }
@@ -639,14 +649,13 @@ async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result
         return Ok(());
     };
     if conn.get_database_backend() == DbBackend::Postgres {
-        // Both INSERTs in the statement are `ON CONFLICT DO NOTHING` on keys
-        // fixed by the batch, and the readers wait only for "the rows exist",
-        // so running it again after a lost connection is a no-op if the first
-        // run committed (TC-951).
-        return conn
-            .execute_idempotent(postgres_single_statement(&inserts))
-            .await
-            .map(|_| ());
+        if let Some(statement) = postgres_single_statement(&inserts) {
+            // Every INSERT in the statement is `ON CONFLICT DO NOTHING` on
+            // keys fixed by the batch, and the readers wait only for "the
+            // rows exist", so running it again after a lost connection is a
+            // no-op if the first run committed (TC-951).
+            return conn.execute_idempotent(statement).await.map(|_| ());
+        }
     }
     let tx = conn.begin().await?;
     persist_inserts(&tx, inserts).await?;
@@ -656,31 +665,39 @@ async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result
 /// PostgreSQL commits the batch's INSERTs as one statement instead of
 /// `BEGIN`, one statement per table and `COMMIT`. The INSERTs are exactly
 /// those `persist_inserts` runs, with the same rows and `ON CONFLICT DO
-/// NOTHING` targets: the actor INSERT is a data-modifying CTE of the
-/// invocation INSERT. One statement is atomic on its own, and PostgreSQL
-/// checks the invocation's foreign key to its actor at the end of the
-/// statement, so an actor inserted by the CTE satisfies it. PostgreSQL does
-/// not define the order in which the CTE and the invocation INSERT run, so
-/// their rows may be locked in a different order than the transaction's; only
-/// two writers of the same invocation id could notice, and the invocation
-/// replay guard admits an invocation once.
+/// NOTHING` targets, as data-modifying CTEs of the invocation INSERT. One
+/// statement is atomic on its own, and PostgreSQL checks the foreign keys
+/// between these tables (invocation to actor, invoked ability to invocation)
+/// at the end of the statement, so rows inserted by a sibling CTE satisfy
+/// them. PostgreSQL does not define the order in which the CTEs run, so their
+/// rows may be locked in a different order than the transaction's; only two
+/// writers of the same invocation id could notice, and the invocation replay
+/// guard admits an invocation once.
 ///
-/// The statement binds at most `MAX_BATCH_SIZE` × 7 parameters (64 × (1 per
-/// actor + 6 per invocation) = 448), far below the 65,535 PostgreSQL's
-/// protocol allows, so every batch fits.
-fn postgres_single_statement(inserts: &AuditInserts) -> Statement {
-    let mut statement = inserts.invocations.as_query().clone();
-    statement.with_cte(
-        WithClause::new()
-            .cte(
-                CommonTableExpression::new()
-                    .table_name(Alias::new("read_audit_actor"))
-                    .query(inserts.actors.as_query().clone())
-                    .to_owned(),
-            )
+/// `None` when the combined statement would bind more than the 65,535
+/// parameters PostgreSQL's protocol allows (a read can cite any number of
+/// capabilities); `persist_batch` then takes the transactional path.
+fn postgres_single_statement(inserts: &AuditInserts) -> Option<Statement> {
+    let mut ctes = WithClause::new();
+    ctes.cte(
+        CommonTableExpression::new()
+            .table_name(Alias::new("read_audit_actor"))
+            .query(inserts.actors.as_query().clone())
             .to_owned(),
     );
-    DbBackend::Postgres.build(&statement)
+    if let Some(abilities) = &inserts.abilities {
+        ctes.cte(
+            CommonTableExpression::new()
+                .table_name(Alias::new("read_audit_invoked_abilities"))
+                .query(abilities.as_query().clone())
+                .to_owned(),
+        );
+    }
+    let mut statement = inserts.invocations.as_query().clone();
+    statement.with_cte(ctes);
+    let statement = DbBackend::Postgres.build(&statement);
+    let parameters = statement.values.as_ref().map_or(0, |values| values.0.len());
+    (parameters <= usize::from(u16::MAX)).then_some(statement)
 }
 
 /// The INSERTs that persist one drained batch: one `insert_many` per table.
@@ -698,6 +715,7 @@ fn postgres_single_statement(inserts: &AuditInserts) -> Statement {
 struct AuditInserts {
     actors: Insert<actor::ActiveModel>,
     invocations: Insert<invocation::ActiveModel>,
+    abilities: Option<Insert<invoked_abilities::ActiveModel>>,
 }
 
 /// `None` for a batch with no records.
@@ -749,21 +767,61 @@ fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
             .to_owned(),
     );
 
+    // 3. Invoked abilities — every (invocation, resource, ability) across the
+    //    batch, deduplicated by the full primary key.
+    let mut seen_abilities = HashSet::new();
+    let abilities: Vec<invoked_abilities::ActiveModel> = records
+        .iter()
+        .flat_map(|record| {
+            let invocation = record.id;
+            record
+                .abilities
+                .iter()
+                .map(move |(resource, ability)| (invocation, resource.clone(), ability.clone()))
+        })
+        .filter(|(invocation, resource, ability)| {
+            seen_abilities.insert((*invocation, resource.clone(), ability.clone()))
+        })
+        .map(
+            |(invocation, resource, ability)| invoked_abilities::ActiveModel {
+                invocation: Set(invocation),
+                resource: Set(resource),
+                ability: Set(ability),
+            },
+        )
+        .collect();
+    let abilities = (!abilities.is_empty()).then(|| {
+        invoked_abilities::Entity::insert_many(abilities).on_conflict(
+            OnConflict::columns([
+                invoked_abilities::Column::Invocation,
+                invoked_abilities::Column::Resource,
+                invoked_abilities::Column::Ability,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+    });
+
     Some(AuditInserts {
         actors,
         invocations,
+        abilities,
     })
 }
 
 /// Persist a drained batch inside the caller's transaction with one statement
-/// per table (SQLite and MySQL).
+/// per table (SQLite, MySQL, and PostgreSQL past the parameter limit).
 async fn persist_inserts<C: ConnectionTrait>(db: &C, inserts: AuditInserts) -> Result<(), DbErr> {
     let AuditInserts {
         actors,
         invocations,
+        abilities,
     } = inserts;
     ignore_record_not_inserted(actors.exec(db).await)?;
     ignore_record_not_inserted(invocations.exec(db).await)?;
+    if let Some(abilities) = abilities {
+        ignore_record_not_inserted(abilities.exec(db).await)?;
+    }
     Ok(())
 }
 
@@ -791,6 +849,7 @@ mod tests {
             issued_at: OffsetDateTime::now_utc(),
             serialization: format!("serialized-{index}").into_bytes(),
             serialization_format: 0,
+            abilities: Vec::new(),
         }
     }
 
@@ -951,6 +1010,15 @@ mod tests {
         audit.await.unwrap().unwrap();
     }
 
+    fn resource(uri: &str) -> Resource {
+        uri.parse().expect("valid resource uri")
+    }
+
+    fn ability(uri: &str) -> Ability {
+        uri.to_string().try_into().expect("valid ability")
+    }
+
+    /// A read citing one capability on a resource named after `seed`.
     fn rich_record(seed: &str, invoker: &str) -> ReadAuditRecord {
         ReadAuditRecord {
             id: crate::hash::hash(seed.as_bytes()),
@@ -958,6 +1026,10 @@ mod tests {
             issued_at: OffsetDateTime::now_utc(),
             serialization: format!("serialized-{seed}").into_bytes(),
             serialization_format: 0,
+            abilities: vec![(
+                resource(&format!("tinycloud:did:key:read-audit:files/kv/{seed}")),
+                ability("tinycloud.kv/get"),
+            )],
         }
     }
 
@@ -1141,9 +1213,9 @@ mod tests {
         )
     }
 
-    /// A batch leaves one actor per invoker and one invocation per read with
-    /// its serialization verbatim, and no derived rows (TC-3259). Persisting
-    /// it again is a no-op.
+    /// A batch leaves one actor per invoker, one invocation per read with its
+    /// serialization verbatim, one invoked ability per capability and no
+    /// parent edges (TC-3259). Persisting it again is a no-op.
     async fn assert_batched_persist_contents(conn: &DatabaseConnection, persist: Persist) {
         let conn = conn.clone();
 
@@ -1184,13 +1256,37 @@ mod tests {
         assert_eq!(by_id[&alice2_id].invoker, "did:key:alice");
         assert_eq!(by_id[&bob_id].invoker, "did:key:bob");
 
-        // Read audits write no invoked abilities or parent edges.
-        assert_eq!(derived_rows(&conn).await, (0, 0));
+        // Read audits write their invoked abilities and no parent edges.
+        let abilities: HashSet<(Hash, String)> = invoked_abilities::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.invocation, row.resource.to_string()))
+            .collect();
+        assert_eq!(
+            abilities,
+            HashSet::from([
+                (
+                    alice1_id,
+                    "tinycloud:did:key:read-audit:files/kv/alice-1".to_string()
+                ),
+                (
+                    alice2_id,
+                    "tinycloud:did:key:read-audit:files/kv/alice-2".to_string()
+                ),
+                (
+                    bob_id,
+                    "tinycloud:did:key:read-audit:files/kv/bob-1".to_string()
+                ),
+            ])
+        );
+        assert_eq!(derived_rows(&conn).await, (3, 0));
 
         // Re-persisting the identical batch is a no-op (ON CONFLICT DO NOTHING).
         persist(&conn, &batch).await.unwrap();
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 3);
-        assert_eq!(derived_rows(&conn).await, (0, 0));
+        assert_eq!(derived_rows(&conn).await, (3, 0));
     }
 
     async fn audit_rows(
@@ -1283,7 +1379,7 @@ mod tests {
         };
         for (conn, persist, expected) in [
             (&single.conn, persist_batch_boxed as Persist, 1),
-            (&transactional.conn, persist_in_transaction as Persist, 2),
+            (&transactional.conn, persist_in_transaction as Persist, 3),
         ] {
             let statements = Arc::new(AtomicUsize::new(0));
             let counter = statements.clone();
@@ -1347,6 +1443,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn single_statement_audit_falls_back_past_the_parameter_limit() {
+        let single_statement = |seed: &str, abilities: usize| {
+            let get = ability("tinycloud.kv/get");
+            let record = ReadAuditRecord {
+                abilities: (0..abilities)
+                    .map(|index| {
+                        (
+                            resource(&format!("tinycloud:did:key:read-audit:files/kv/{index}")),
+                            get.clone(),
+                        )
+                    })
+                    .collect(),
+                ..rich_record(seed, "did:key:limit")
+            };
+            postgres_single_statement(&audit_inserts(&[command(record)]).unwrap())
+        };
+
+        // 7 parameters for the actor and invocation, 3 per invoked ability:
+        // past 65,535 the batch takes the transactional path instead.
+        let fits = (65_535 - 7) / 3;
+        assert!(single_statement("at-limit", fits).is_some());
+        assert!(single_statement("past-limit", fits + 1).is_none());
+    }
+
     // PostgreSQL regressions for the read-audit pipeline as a whole (TC-951):
     // completeness under saturated, overlapping reads, and atomicity when a
     // batch fails part-way through, on the single statement and the
@@ -1370,14 +1491,18 @@ mod tests {
     }
 
     /// The rows `reads` must leave, derived from the records alone: every
-    /// invoker, one invocation per id, and no invoked abilities or parent
-    /// edges (TC-3259).
+    /// invoker, one invocation per id, one invoked ability per capability and
+    /// no parent edges (TC-3259).
     fn expected_rows(reads: &[ReadAuditRecord]) -> RowSets {
         let mut rows = RowSets::default();
         for read in reads {
             rows.0.insert(read.invoker.clone());
             rows.1
                 .insert((read.id, read.invoker.clone(), read.serialization.clone()));
+            for (resource, ability) in &read.abilities {
+                rows.2
+                    .insert((read.id, resource.to_string(), ability.to_string()));
+            }
         }
         rows
     }
@@ -2451,6 +2576,7 @@ mod tests {
             issued_at: OffsetDateTime::now_utc(),
             serialization: record.serialization.clone(),
             serialization_format: record.serialization_format,
+            abilities: record.abilities.clone(),
         };
 
         let pipeline = ReadAuditPipeline::start(conn.clone(), None);
@@ -2549,25 +2675,15 @@ mod tests {
         )
     }
 
-    /// The rows v1.26.9 wrote for `read`: its actor and invocation, one
-    /// `invoked_abilities` row per capability and one `parent_delegations`
-    /// row per cited delegation.
+    /// The rows v1.26.9 wrote for `read`: the record a read writes now (its
+    /// actor, invocation and one `invoked_abilities` row per capability) plus
+    /// one `parent_delegations` row per cited delegation.
     async fn insert_full_record(conn: &DatabaseConnection, read: &Invocation) {
         let id = read.content_hash();
         persist_in_transaction(
             conn,
             &[command(ReadAuditRecord::from_invocation(read, None))],
         )
-        .await
-        .unwrap();
-        invoked_abilities::Entity::insert_many(read.0.capabilities.iter().map(|capability| {
-            invoked_abilities::ActiveModel {
-                invocation: Set(id),
-                resource: Set(capability.resource.clone()),
-                ability: Set(capability.ability.clone()),
-            }
-        }))
-        .exec(conn)
         .await
         .unwrap();
         parent_delegations::Entity::insert_many(read.0.parents.iter().map(|parent| {
@@ -2591,9 +2707,10 @@ mod tests {
 
     /// A full record written before TC-3259 still reads after slim records
     /// join it: replaying the same read through the pipeline leaves its
-    /// invocation row and derived rows as they were, a new read adds only its
-    /// invocation row, and the migration inventory still attributes a legacy
-    /// SQL artifact from the old record's `invoked_abilities` row.
+    /// invocation row and derived rows as they were, a new read adds its
+    /// invocation and invoked ability but no parent edge, and the migration
+    /// inventory still attributes a legacy SQL artifact from the old record's
+    /// `invoked_abilities` row.
     async fn assert_full_records_still_read(
         conn: DatabaseConnection,
         writer_lock: Option<Arc<Mutex<()>>>,
@@ -2648,10 +2765,16 @@ mod tests {
         assert_eq!(added.serialization, new.serialized_bytes());
         assert_eq!(added.serialization_format, 0);
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 2);
+        let (mut abilities, parents) = derived;
+        abilities.insert((
+            new_id,
+            format!("{space}/kv/notes"),
+            "tinycloud.kv/get".to_string(),
+        ));
         assert_eq!(
             derived_row_sets(&conn).await,
-            derived,
-            "the old record's derived rows are untouched and the new read has none"
+            (abilities, parents),
+            "the old record's derived rows are untouched and the new read adds no parent edge"
         );
 
         let datadir = tempfile::tempdir().unwrap();

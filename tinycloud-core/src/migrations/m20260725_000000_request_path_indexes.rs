@@ -43,8 +43,8 @@ impl MigrationTrait for Migration {
 
         // 2. parent_delegation(child) -- highest priority. `child` is the
         //    trailing PK column of (parent, child). Both arms of the
-        //    recursive ancestor-closure CTE filter on it, and it now also
-        //    grows with read volume via TC-273's read audit.
+        //    recursive ancestor-closure CTE filter on it. TC-273's read audit
+        //    grew it with read volume until TC-3259 stopped reads writing it.
         manager
             .create_index(
                 Index::create()
