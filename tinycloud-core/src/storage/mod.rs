@@ -130,6 +130,13 @@ pub trait ImmutableReadStore: Send + Sync {
         id: &Hash,
         generation: i64,
     ) -> Result<bool, Self::Error>;
+    /// Whether a writing invocation must prepare the spaces it writes
+    /// ([`ImmutableWriteStore::prepare_write`]) once it is authorized and its
+    /// spaces are checked as hosted, before any database write lock or
+    /// transaction. Default: no.
+    fn prepares(&self) -> bool {
+        false
+    }
     async fn read(
         &self,
         space: &SpaceId,
@@ -183,6 +190,15 @@ where
     S::Writable: 'static,
 {
     type Error: StdError + Send + Sync;
+    /// When [`ImmutableReadStore::prepares`]: called for each space an
+    /// invocation writes, once it is authorized and its spaces are checked
+    /// as hosted, before any upload and before its write lock and
+    /// transaction. A store that needs its own database writes for a space
+    /// (e.g. creating the space's at-rest data key) does them here.
+    /// Default: nothing.
+    async fn prepare_write(&self, _space: &SpaceId) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn persist(
         &self,
         space: &SpaceId,
@@ -251,6 +267,9 @@ where
     ) -> Result<bool, Self::Error> {
         (**self).contains(space, id, generation).await
     }
+    fn prepares(&self) -> bool {
+        (**self).prepares()
+    }
     async fn read(
         &self,
         space: &SpaceId,
@@ -301,6 +320,9 @@ where
     W::Writable: 'static,
 {
     type Error = S::Error;
+    async fn prepare_write(&self, space: &SpaceId) -> Result<(), Self::Error> {
+        (**self).prepare_write(space).await
+    }
     async fn persist(
         &self,
         space: &SpaceId,

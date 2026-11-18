@@ -5,9 +5,10 @@
 //! keyring needs its tables: [`AtRestRuntime::new`] before storage, then
 //! [`setup`] after migrations installs the keyring.
 //!
-//! In this build no storage seals anything yet: nothing calls
-//! [`AtRestRuntime::declare_seal_path`], so `setup` refuses every mode
-//! but `off` and `encrypting()` is always false.
+//! Storage declares its seal paths ([`AtRestRuntime::declare_seal_path`]):
+//! block storage when it is attached ([`crate::storage::attach_at_rest`]).
+//! Until every seal path is declared, `setup` refuses every mode but `off`
+//! and `encrypting()` is always false.
 //!
 //! With the default config (`mode = "off"`, `root_source = "escrow"`, no
 //! recipients, no `escrow_none`) nothing is set up: no key reads, no rows, no
@@ -362,14 +363,14 @@ pub enum SealPath {
     SqlArtifacts,
 }
 
-/// At-rest state shared by the routes and `/info` (and, once it seals
-/// writes, block storage). Rocket manages it as `Arc<AtRestRuntime>`.
+/// At-rest state shared by the routes, `/info` and block storage. Rocket
+/// manages it as `Arc<AtRestRuntime>`.
 ///
-/// The contract for the storage seal path (TC-887 S3), not yet wired: mode
-/// `off` behaves exactly as without at-rest. Otherwise writes are sealed
-/// only while [`encrypting`](Self::encrypting) (else 503, never plaintext);
-/// a sealed read whose key is `Locked` is a 503; legacy plaintext reads are
-/// allowed unless the mode is `strict`.
+/// The contract for the storage seal paths (TC-887): mode `off` behaves
+/// exactly as without at-rest. Otherwise writes are sealed only while
+/// [`encrypting`](Self::encrypting) (else 503, never plaintext); a sealed
+/// read whose key is `Locked` is a 503; legacy plaintext reads are allowed
+/// unless the mode is `strict`.
 pub struct AtRestRuntime {
     mode: AtRestMode,
     escrow_none: bool,
