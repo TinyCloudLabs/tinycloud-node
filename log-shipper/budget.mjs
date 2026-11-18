@@ -3,8 +3,15 @@ import { pathToFileURL } from 'node:url';
 
 const schema = JSON.parse(readFileSync(new URL('./fields.json', import.meta.url), 'utf8')).services['tinycloud-node'];
 const longest = values => values.reduce((chosen, value) => Buffer.byteLength(value) > Buffer.byteLength(chosen) ? value : chosen, '');
-/** Event codes that ship as individual events, outside the count reducer (TC-1840). */
-export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx']);
+/** TC-3216: the node's fair-share report codes; each line is emitted at most once per report window (60 s). */
+export const FAIR_SHARE_EVENT_CODES = Object.freeze(['invoke_rate_limited', 'account_limited', 'node_top_talkers']);
+/**
+ * Most fair-share events in one 60 s report window: one invoke_rate_limited, one account_limited per account limit
+ * (`limit` values) and one node_top_talkers.
+ */
+export const FAIR_SHARE_EVENTS_PER_MINUTE = 2 + schema.fields.limit.values.length;
+/** Event codes that ship as individual events, outside the count reducer (TC-1840, TC-3216). */
+export const INDIVIDUAL_EVENT_CODES = Object.freeze(['db_failure_5xx', ...FAIR_SHARE_EVENT_CODES]);
 /** Event codes the shipper emits itself; no node log line maps to them (TC-1843). */
 export const SHIPPER_EVENT_CODES = Object.freeze(['errors_dropped']);
 const aggregatedCodes = schema.fields.event_code.values.filter(code => !INDIVIDUAL_EVENT_CODES.includes(code) && !SHIPPER_EVENT_CODES.includes(code));
@@ -55,7 +62,9 @@ const request = {
  * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only. The node's 5xx
  * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code. The
  * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window. The
- * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes.
+ * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes. The fair-share events
+ * (TC-3216) ship individually, at most once per line per minute: fairShareLimited is the larger of the two limit lines
+ * (account_limited, with a top account) and topTalkers carries all three ranks with a long round-trippable share.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
@@ -75,6 +84,19 @@ export const representativeEvents = Object.freeze({
   storageHeadroom: Object.freeze({
     level: 'info', ts: common.ts, event: 'node_storage_headroom', svc: 'api',
     store: longest(schema.fields.store.values), free_bytes: schema.fields.free_bytes.max,
+  }),
+  fairShareLimited: Object.freeze({
+    level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: 'account_limited', mode: longest(schema.fields.mode.values),
+    count: schema.fields.count.max, accounts: schema.fields.accounts.max, window_s: schema.fields.window_s.max,
+    limit: longest(schema.fields.limit.values), top_account_hash: 'f'.repeat(64), top_account_count: schema.fields.top_account_count.max,
+  }),
+  topTalkers: Object.freeze({
+    level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: 'node_top_talkers', window_s: schema.fields.window_s.max,
+    db_ms: schema.fields.db_ms.max, requests: schema.fields.requests.max, unattributed_db_ms: schema.fields.unattributed_db_ms.max, accounts: schema.fields.accounts.max,
+    ...Object.fromEntries([1, 2, 3].flatMap(rank => [
+      [`top${rank}_account_hash`, 'f'.repeat(64)], [`top${rank}_db_ms`, schema.fields[`top${rank}_db_ms`].max],
+      [`top${rank}_requests`, schema.fields[`top${rank}_requests`].max], [`top${rank}_share`, 0.0000010000000000000002],
+    ])),
   }),
   gate: Object.freeze({ level: 'warn', ts: common.ts, event: 'logship_gate_summary_total', svc: 'logship', reason: longest(schema.fields.reason.values), count: schema.fields.count.max }),
 });
@@ -119,6 +141,10 @@ export function calculateBudget({
   // TC-2917: a fixed rate, one event per store every 5 minutes, whatever the traffic; reported on its own.
   const headroomEventsPerMinute = schema.fields.store.values.length / 5;
   const headroomBytes30Days = headroomEventsPerMinute * eventBytes.storageHeadroom * MINUTES_30_DAYS;
+  // TC-3216: a fixed rate whatever the traffic, reported on its own like the headroom event. Each minute at most one
+  // top-talker line plus FAIR_SHARE_EVENTS_PER_MINUTE - 1 limit lines (one invoker, one per account limit), each limit
+  // line charged at the larger account_limited representative.
+  const fairShareBytes30Days = (eventBytes.topTalkers + (FAIR_SHARE_EVENTS_PER_MINUTE - 1) * eventBytes.fairShareLimited) * MINUTES_30_DAYS;
   const sustainableRequestsPerMinute = allocationBytes / (requestPairBytes * MINUTES_30_DAYS);
   const cappedClasses = Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute, representative }]) => [name, {
     capPerMinute, eventBytes: eventBytes[representative], bytes30Days: capPerMinute * eventBytes[representative] * MINUTES_30_DAYS,
@@ -137,6 +163,7 @@ export function calculateBudget({
     sustainableWholeRequestsPerMinute: Math.floor(sustainableRequestsPerMinute),
     withinRequestAllocation: requestBytes30Days <= allocationBytes,
     diagnosticEventsPerMinute, gateEventsPerMinute, headroomEventsPerMinute, headroomBytes30Days,
+    fairShareEventsPerMinute: FAIR_SHARE_EVENTS_PER_MINUTE, fairShareBytes30Days,
     cappedWindowSeconds: CAP_WINDOW_SECONDS, cappedClasses,
     cappedEventBytes30Days, droppedCountBytes30Days, cappedReserveBytes30Days,
     cappedAllocationBytes: CAPPED_ALLOCATION_BYTES,

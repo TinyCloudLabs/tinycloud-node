@@ -27,6 +27,22 @@
 
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
+- The log sidecar ships six more node warnings to Better Stack as event codes, each a per-minute count of `node_warning` events with no other fields. Until now they shipped as `unclassified`.
+  - `db_pool_closed_in_transaction`: a pooled connection was released inside a transaction and closed.
+  - `sql_database_too_large_to_load`: a database over the artifact read limit was not loaded.
+  - `sql_checkpoint_save_backoff`: a database's writes are refused during its checkpoint back-off.
+  - `kv_head_size_probe_failed`: the KV head size probe failed.
+  - `chain_guard_slow_wait`: a chain-guard wait over 500 ms.
+  - `http_5xx`: the line every 5xx response leaves. Each 5xx request still ships on its own under the `node_request_5xx` cap.
+
+  The vendored log schema now matches the canonical schema, pinned in `log-shipper/canonical.json`. `chain_guard_slow_wait` is no longer a capped class there, since a per-minute cap for it does not fit the TC-1843 reserve. The pooled-connection warning (vendored sqlx-core) now logs under the target `tinycloud_core::db_pool` (`vendor/sqlx-core/PATCH.md`). Details: TC-3006, TC-2954, TC-2961, TC-3027.
+- The log sidecar ships the node's three fair-share report lines (TC-3216) to Better Stack as individual `node_warning` events, outside the per-minute count; until now they shipped only as `unclassified` counts. Each line is emitted at most once a minute, so at most four events a minute (`account_limited` once per limit): worst case 79.4 MB per 30 days at the worst-valid sizes, reported on its own (`fairShareBytes30Days` in `log-shipper/budget.mjs`), like the headroom event.
+  - `invoke_rate_limited`: `mode`, `count`, `accounts`, `window_s`, and the top account's pseudonym `top_account_hash` with its `top_account_count`.
+  - `account_limited`: the same, plus `limit` (`db_time` or `in_flight`).
+  - `node_top_talkers`: `db_ms`, `requests`, `unattributed_db_ms`, `accounts`, `window_s`, and up to three ranks `topN_account_hash`, `topN_db_ms`, `topN_requests`, `topN_share`.
+
+  The sidecar ships a line only with exactly these keys, declared types, enum values and bounds; account fields only as 64-hex pseudonyms. A top account or rank the node reports as absent (empty pseudonym, zero counts) is omitted. Any other line on the fair-share target falls back to an `unclassified` count with no fields.
+  - **N0 compose.** The embedded Vector configuration is regenerated for the TC-3006 codes and these events, so the reviewed N0 compose template changes from `90841a34…` to `15448ac0…` (raw `5419a6fb…` to `99c68db3…`; `docs/releasing.md`, `.github/workflows/docker.yml`). The release notes must say the compose hash changes.
 
 ## [1.26.9] - 2026-11-17
 
@@ -85,16 +101,6 @@ Hotfix built from 1.26.5: it does not contain the 1.26.6 changes below.
 - Policy/v3: minting a session and registering a policy no longer re-verify signatures or re-run the claim, presentation, credential admission and allow evaluations while holding their spaces' write order and row locks. Under the locks they check that the challenge, registration and roots are unchanged; those decisions were made before the locks, at the same time, from the same inputs. Refusal codes are unchanged, except that `credential-evaluation-changed` and `policy-evaluation-changed` can no longer occur. Details: TC-2986.
 - Disk headroom is visible without a shell on the node. Every 5 minutes the node logs a `storage headroom` event per local store, with only `store` (`sql`, and `duckdb` in DuckDB builds) and `free_bytes` (the free bytes on that store's filesystem, rounded down to a whole 64 MiB). The log sidecar ships it to Better Stack as `node_storage_headroom`. The exact value is served as the gauge `tinycloud_storage_free_bytes{store}` on the metrics endpoint, and `tinycloud_disk_headroom_refusals_total{engine="sql"}` counts requests answered `507 sql_disk_headroom`. Details: TC-2917.
   - **N0 compose.** The embedded Vector configuration is regenerated for the new event, so the reviewed N0 compose template changes to `90841a34…` (raw `5419a6fb…`; `docs/releasing.md`, `.github/workflows/docker.yml`).
-- The log sidecar ships six more node warnings to Better Stack as event codes, each a per-minute count of `node_warning` events with no other fields. Until now they shipped as `unclassified`.
-  - `db_pool_closed_in_transaction`: a pooled connection was released inside a transaction and closed.
-  - `sql_database_too_large_to_load`: a database over the artifact read limit was not loaded.
-  - `sql_checkpoint_save_backoff`: a database's writes are refused during its checkpoint back-off.
-  - `kv_head_size_probe_failed`: the KV head size probe failed.
-  - `chain_guard_slow_wait`: a chain-guard wait over 500 ms.
-  - `http_5xx`: the line every 5xx response leaves. Each 5xx request still ships on its own under the `node_request_5xx` cap.
-
-  The vendored log schema now matches the canonical schema, pinned in `log-shipper/canonical.json`. `chain_guard_slow_wait` is no longer a capped class there, since a per-minute cap for it does not fit the TC-1843 reserve. The pooled-connection warning (vendored sqlx-core) now logs under the target `tinycloud_core::db_pool` (`vendor/sqlx-core/PATCH.md`). Details: TC-3006, TC-2954, TC-2961, TC-3027.
-  - **N0 compose.** The embedded Vector configuration is regenerated for these codes, so the reviewed N0 compose template changes to `efad41d5…` (raw `7ee085c6…`; `docs/releasing.md`, `.github/workflows/docker.yml`).
 
 ## [1.26.5] - 2026-11-13
 

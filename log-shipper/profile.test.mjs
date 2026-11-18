@@ -24,10 +24,11 @@ test('runtime profile interpolation is an explicit boolean compiler choice', () 
 test('the real sink receives the uncapped requests, the five cap transforms, the count reducers and the gate counts; the reducer only the counted diagnostics (TC-1843)', () => {
   for (const profile of ['errors_slow', 'all_requests']) {
     const { sinks, transforms } = buildConfig({ profile });
-    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'event_route.storage_headroom', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_node_request_4xx', 'cap_ingress_request_4xx', 'diagnostic_output', 'gate_output']);
+    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'event_route.storage_headroom', 'event_route.fair_share', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_node_request_4xx', 'cap_ingress_request_4xx', 'diagnostic_output', 'gate_output']);
     assert.deepEqual(transforms.diagnostic_reduce.inputs, ['event_route.diagnostic']);
-    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx', 'db_failure_5xx', 'storage_headroom', 'diagnostic']);
-    assert.match(transforms.event_route.route.diagnostic, /event_code != "db_failure_5xx"/);
+    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx', 'db_failure_5xx', 'storage_headroom', 'fair_share', 'diagnostic']);
+    assert.equal(transforms.event_route.route.diagnostic, '(.event == "node_warning" && !includes(["db_failure_5xx","invoke_rate_limited","account_limited","node_top_talkers"], .event_code)) || .event == "node_error"');
+    assert.equal(transforms.event_route.route.fair_share, '.event == "node_warning" && includes(["invoke_rate_limited","account_limited","node_top_talkers"], .event_code)');
   }
 });
 
