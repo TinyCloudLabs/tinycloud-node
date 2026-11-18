@@ -221,10 +221,13 @@ export const vectorTests = [
     ['an uppercase pseudonym', { top_account_hash: 'B'.repeat(64) }], ['a short pseudonym', { top_account_hash: 'b'.repeat(63) }], ['a raw identifier as pseudonym', { top_account_hash: canary }], ['a numeric pseudonym', { top_account_hash: 7 }],
     ['a pseudonym with top_account_count 0', { top_account_count: 0 }], ['an empty pseudonym with a top_account_count', { top_account_hash: '' }], ['a string top_account_count', { top_account_count: '9' }],
     ['the account-limit event name', { event: 'account_limited' }], ['a message with a suffix', { message: `invocations over the per-invoker rate limit: ${canary}` }],
+    // A key renamed with the key count unchanged: only the per-key checks can reject it.
+    ['top_account_count renamed', { top_account_count: undefined, top_account_total: 9 }], ['mode renamed', { mode: undefined, enforce: 'shadow' }],
   ].map(([what, fields]) => fairFallback(`fair share: invoker line with ${what} falls back to unclassified`, invokeRateLimited(fields))),
   ...[
     ['limit invoker', { limit: 'invoker' }], ['a free-text limit', { limit: canary }], ['a missing limit', { limit: undefined }], ['an extra field', { space: canary }],
     ['the invoker event name', { event: 'invoke_rate_limited' }], ['an unknown mode', { mode: 'Shadow' }], ['a long pseudonym', { top_account_hash: 'b'.repeat(65) }],
+    ['limit renamed', { limit: undefined, kind: 'db_time' }],
   ].map(([what, fields]) => fairFallback(`fair share: account line with ${what} falls back to unclassified`, accountLimited(fields))),
   ...[
     ['an extra field', { error: canary }], ['a missing rank field', { top3_share: undefined }], ['a fourth rank', rankFields(4, fairHashes[0], 1, 1, 0.01)], ['negative db_ms', { db_ms: -1 }],
@@ -233,6 +236,7 @@ export const vectorTests = [
     ['a raw identifier as a rank pseudonym', { top2_account_hash: canary }], ['an uppercase rank pseudonym', { top1_account_hash: 'C'.repeat(64) }],
     ['an empty rank with database time', rankFields(3, '', 5, 0, 0)], ['an empty rank with requests', rankFields(3, '', 0, 1, 0)], ['an empty rank with a share', rankFields(3, '', 0, 0, 0.1)],
     ['the invoker event name', { event: 'invoke_rate_limited' }], ['a different message', { message: 'accounts with the most database time ' }],
+    ['a rank share renamed', { top3_share: undefined, top3_ratio: 0.08 }], ['db_ms renamed', { db_ms: undefined, cpu_ms: 5000 }],
   ].map(([what, fields]) => fairFallback(`fair share: top-talker line with ${what} falls back to unclassified`, topTalkers(fields))),
   ...[['an invoker', invokeRateLimited()], ['a top-talker', topTalkers()]].map(([what, line]) => fairFallback(`fair share: ${what} line on another target is unclassified`, { ...line, target: 'tinycloud::request' })),
   ...[['an invoker', invokeRateLimited()], ['a top-talker', topTalkers()]].map(([what, line]) => rejectFor(`fair share: ${what} line at info level is dropped at the gate`, envelope({ ...line, level: 'INFO' }), 'filtered_level')),
