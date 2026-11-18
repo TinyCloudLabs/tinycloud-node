@@ -86,7 +86,7 @@ cors = true
     ## cap on invocations in flight at once (0 = off). Over either, an invocation
     ## is counted (tinycloud_account_limited_total); only with
     ## account_limit_enforce = true is it refused (429 rate_limited, Retry-After).
-    ## Starting values, not yet calibrated: see the node_top_talkers log line.
+    ## Uncalibrated: set from 24 h of node_top_talkers / account_limited in production before enforcing.
     ## Env: TINYCLOUD_INVOCATION__ACCOUNT_DB_MS_PER_MINUTE, TINYCLOUD_INVOCATION__ACCOUNT_DB_BURST_MS,
     ## TINYCLOUD_INVOCATION__ACCOUNT_MAX_IN_FLIGHT, TINYCLOUD_INVOCATION__ACCOUNT_LIMIT_ENFORCE
     # account_db_ms_per_minute = 20000

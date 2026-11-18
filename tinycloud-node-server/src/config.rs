@@ -2215,9 +2215,12 @@ pub struct InvocationConfig {
     /// and the minute's `account_limited` line, which names the account's
     /// pseudonym). Only when `account_limit_enforce` is set is it answered
     /// `429 rate_limited`, with `Retry-After` until the debt is repaid, before
-    /// any database work. Zero turns the budget off. The default is a starting
-    /// value, not yet calibrated: the `node_top_talkers` line, which reports
-    /// real per-account database time, sets it before enforcement.
+    /// any database work. Zero turns the budget off. The default is
+    /// uncalibrated: no production record had per-account database time
+    /// before the `node_top_talkers` line (the shipped request log keeps only
+    /// wall time, and only for requests that failed or took over 1 s). It is
+    /// set from 24 hours of `node_top_talkers` and `account_limited` in
+    /// production before enforcement.
     #[serde(default = "default_invocation_account_db_ms_per_minute")]
     pub account_db_ms_per_minute: u32,
     /// Query-time milliseconds one account may spend at once above the
