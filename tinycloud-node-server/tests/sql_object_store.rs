@@ -908,7 +908,8 @@ async fn mock_s3_object_without_hash_metadata_is_an_error() -> Result<()> {
 async fn mock_s3_kv_scan_ignores_sql_objects() -> Result<()> {
     let (s3, config) = start_mock(Conditional::Honour).await?;
     kv_scan_ignores_sql_objects(&config).await;
-    // The scan asks for the KV key prefix only.
+    // The scan asks for the KV key prefix and the sealed KV prefix (TC-887)
+    // only, never the whole bucket.
     let lists: Vec<String> = s3
         .requests
         .lock()
@@ -917,7 +918,10 @@ async fn mock_s3_kv_scan_ignores_sql_objects() -> Result<()> {
         .cloned()
         .collect();
     assert!(
-        !lists.is_empty() && lists.iter().all(|r| r == "LIST tinycloud:"),
+        lists.iter().any(|r| r == "LIST tinycloud:")
+            && lists
+                .iter()
+                .all(|r| r == "LIST tinycloud:" || r == "LIST v1/"),
         "{lists:?}"
     );
     Ok(())
