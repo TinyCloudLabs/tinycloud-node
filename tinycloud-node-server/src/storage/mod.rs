@@ -19,20 +19,16 @@ use crate::{
     BlockStores,
 };
 
-/// Links the opened block store to the node's at-rest state (TC-887).
-///
-/// The FileSystem store seals KV blocks when the mode and keys allow, so it
-/// declares the blocks seal path. The S3 store does not seal in this build
-/// and declares none, so `at_rest::setup` refuses a non-`off` mode with S3
-/// block storage rather than write plaintext.
+/// Links the opened block store to the node's at-rest state (TC-887). Both
+/// stores seal KV blocks when the mode and keys allow, so attaching either
+/// declares the blocks seal path.
 pub fn attach_at_rest(stores: &mut BlockStores, runtime: &Arc<AtRestRuntime>) {
+    let handle = sealed::AtRestHandle::new(runtime.clone());
     match stores {
-        Either::B(fs) => {
-            runtime.declare_seal_path(SealPath::Blocks);
-            fs.attach_at_rest(sealed::AtRestHandle::new(runtime.clone()));
-        }
-        Either::A(_) => {}
+        Either::A(s3) => s3.attach_at_rest(handle),
+        Either::B(fs) => fs.attach_at_rest(handle),
     }
+    runtime.declare_seal_path(SealPath::Blocks);
 }
 
 /// One physical blob lifetime; a later generation must never share its
