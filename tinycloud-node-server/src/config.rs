@@ -2190,10 +2190,11 @@ pub struct InvocationConfig {
     /// over it is counted (`tinycloud_invoke_rate_limited_total`, and at most
     /// one `invoke_rate_limited` log line a minute) and, only when
     /// `rate_limit_enforce` is set, answered `429 rate_limited` with
-    /// `Retry-After` before any database work. Defaults are about twice the
-    /// busiest account's last-24h peaks on 11-17 (306 a minute, 120 in 10 s;
-    /// roci-xo peaked at 67 a minute), counted per account, which bounds any
-    /// one session key, so normal first-party use never meets them.
+    /// `Retry-After` before any database work. Defaults are at least twice the
+    /// busiest account's peaks over the 24 hours to 11-17 21:53Z (306 a minute,
+    /// 120 in 10 s; roci-xo 231 a minute, 85 in 10 s), counted per account,
+    /// which bounds any one session key. Those peaks come from the shipped
+    /// errors-and-slow request log, so they are a floor.
     #[serde(default = "default_invocation_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
     /// Requests one invoker may send at once above the sustained rate.
@@ -2246,7 +2247,7 @@ fn default_invocation_deadline_ms() -> u64 {
 }
 
 fn default_invocation_rate_limit_per_minute() -> u32 {
-    600
+    640
 }
 
 fn default_invocation_rate_limit_burst() -> u32 {

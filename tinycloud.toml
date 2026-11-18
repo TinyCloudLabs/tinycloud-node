@@ -76,7 +76,7 @@ cors = true
     ## rate_limit_enforce = true is it refused (429 rate_limited, Retry-After).
     ## Env: TINYCLOUD_INVOCATION__RATE_LIMIT_PER_MINUTE, TINYCLOUD_INVOCATION__RATE_LIMIT_BURST,
     ## TINYCLOUD_INVOCATION__RATE_LIMIT_ENFORCE
-    # rate_limit_per_minute = 600
+    # rate_limit_per_minute = 640
     # rate_limit_burst = 240
     # rate_limit_enforce = false
     ## Per-account /invoke limits (TC-3216); the account is the owner of the
