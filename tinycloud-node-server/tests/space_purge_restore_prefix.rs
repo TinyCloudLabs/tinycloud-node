@@ -2,8 +2,7 @@
 //! Full dual-write transition tests belong to the durable repair orchestrator.
 use std::{collections::BTreeMap, sync::Arc};
 use tinycloud::storage::{
-    file_system::FileSystemConfig,
-    purge_ledger::PurgeLedgerStore,
+    purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
     purge_reconcile::{PrefixStoreKind, VerifiedPurgePrefix},
     purge_restore::{purge_restore_prefix_batch, RestorePrefixOutcome, RestorePurgeStore},
     sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore},
@@ -70,11 +69,14 @@ fn accepted(
     (record, target, neighbor)
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is its own `FsPurgeLedger` directory, apart from the block directory.
 #[tokio::test]
 async fn authenticated_hashed_restore_restarts_without_raw_space_and_preserves_ahead_ledger() {
     let root = tempfile::tempdir().unwrap();
     let blocks_root = root.path().join("blocks");
-    let ledger = FileSystemConfig::new(&blocks_root).open().await.unwrap();
+    let ledger_root = root.path().join("purge-ledger");
+    let ledger = FsPurgeLedger::new(ledger_root.clone()).unwrap();
     let sql_root = root.path().join("sql-store");
     let store = FsSqlObjectStore::open(sql_root.clone(), &blocks_root).unwrap();
     let keys = keys();
@@ -138,8 +140,12 @@ async fn authenticated_hashed_restore_restarts_without_raw_space_and_preserves_a
     .unwrap();
     let fence = SpacePurgeFence::new(keys.clone());
     let drain = fence.restore_drain().await;
+    let blocks = tinycloud::storage::file_system::FileSystemConfig::new(&blocks_root)
+        .open()
+        .await
+        .unwrap();
     assert!(
-        purge_restore_prefix_batch(RestorePurgeStore::KvFileSystem(&ledger), &drain, &proof)
+        purge_restore_prefix_batch(RestorePurgeStore::KvFileSystem(&blocks), &drain, &proof)
             .await
             .is_err()
     );
@@ -164,7 +170,7 @@ async fn authenticated_hashed_restore_restarts_without_raw_space_and_preserves_a
     drop(ledger);
     // Crash/restart after one destructive batch: no cursor, owner lookup, raw
     // SpaceId, synthetic space job, or previous claim participates in resumption.
-    let ledger = FileSystemConfig::new(&blocks_root).open().await.unwrap();
+    let ledger = FsPurgeLedger::new(ledger_root).unwrap();
     let store = FsSqlObjectStore::open(sql_root.clone(), &blocks_root).unwrap();
     let fence = SpacePurgeFence::new(keys.clone());
     let drain = fence.restore_drain().await;
@@ -272,9 +278,13 @@ fn acceptance_prefix_proof_is_required_and_tampering_never_authorizes_repair() {
     .is_err());
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is `S3PurgeLedger` on its own (Object Lock) bucket; the SQL objects and the
+// neighbour stay in the data bucket, reached through the block store client.
 #[tokio::test]
 async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_progress() {
     use tinycloud::storage::{
+        purge_ledger::{S3PurgeLedger, S3PurgeLedgerConfig},
         s3::S3BlockConfig,
         sql_object::{S3SqlObjectStore, WriteMode},
     };
@@ -282,21 +292,31 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
         return;
     };
     let bucket = std::env::var("TC735_TEST_MINIO_BUCKET").unwrap();
-    let ledger = S3BlockConfig {
+    let Ok(ledger_bucket) = std::env::var("TC735_TEST_MINIO_LEDGER_BUCKET") else {
+        return;
+    };
+    let data = S3BlockConfig {
         bucket: bucket.clone(),
         endpoint: Some(endpoint.parse().unwrap()),
     }
     .open()
     .await
     .unwrap();
+    let ledger = S3PurgeLedger::new(&S3PurgeLedgerConfig {
+        bucket: ledger_bucket,
+        endpoint: Some(endpoint.parse().unwrap()),
+        region: None,
+        access_key_id: None,
+        secret_access_key: None,
+    })
+    .await;
     let keys = keys();
     let (accepted, target, neighbor) = accepted(&keys, PrefixStoreKind::SqlS3);
     let path = accepted.object_key().unwrap();
     let body = accepted.to_bytes().unwrap();
     ledger.append_purge_record(&path, &body).await.unwrap();
     let neighbor_key = format!("{}keep", neighbor.as_str());
-    ledger
-        .client
+    data.client
         .put_object()
         .bucket(&bucket)
         .key(&neighbor_key)
@@ -305,8 +325,7 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
         .await
         .unwrap();
     for index in 0..260 {
-        ledger
-            .client
+        data.client
             .put_object()
             .bucket(&bucket)
             .key(format!("{}{index}", target.as_str()))
@@ -325,11 +344,7 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
         target.as_str(),
     )
     .unwrap();
-    let store = S3SqlObjectStore::new(
-        ledger.client.clone(),
-        bucket.clone(),
-        WriteMode::Conditional,
-    );
+    let store = S3SqlObjectStore::new(data.client.clone(), bucket.clone(), WriteMode::Conditional);
     assert_eq!(
         purge_restore_prefix_batch(RestorePurgeStore::SqlS3(&store), &drain, &proof)
             .await
@@ -342,11 +357,7 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
     // with new runtime guards and the original immutable accepted inventory.
     let fence = SpacePurgeFence::new(keys.clone());
     let drain = fence.restore_drain().await;
-    let store = S3SqlObjectStore::new(
-        ledger.client.clone(),
-        bucket.clone(),
-        WriteMode::Conditional,
-    );
+    let store = S3SqlObjectStore::new(data.client.clone(), bucket.clone(), WriteMode::Conditional);
     let stored = ledger.read_purge_record(&path).await.unwrap().unwrap();
     let proof = VerifiedPurgePrefix::verify_candidate(
         &keys,
@@ -376,7 +387,7 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
         neighbor.as_str()
     )
     .is_err());
-    let neighbor_bytes = ledger
+    let neighbor_bytes = data
         .client
         .get_object()
         .bucket(&bucket)
@@ -392,8 +403,7 @@ async fn minio_authenticated_hashed_restore_rechecks_empty_after_lost_batch_prog
     assert!(neighbor_bytes.as_ref() == b"synthetic neighbor");
     assert!(ledger.read_purge_record(&path).await.unwrap().unwrap() == body);
     // Fixture cleanup is one exact object created by this test, outside repair.
-    ledger
-        .client
+    data.client
         .delete_object()
         .bucket(&bucket)
         .key(&neighbor_key)
@@ -424,6 +434,8 @@ fn cache_record(keys: &LedgerKeys, space: &SpaceId, kind: PrefixStoreKind) -> Le
     .unwrap()
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is its own `FsPurgeLedger` directory.
 #[tokio::test]
 async fn sqlite_cache_prefix_closes_live_actors_and_preserves_neighbor_export() {
     use tinycloud_core::{
@@ -435,10 +447,7 @@ async fn sqlite_cache_prefix_closes_live_actors_and_preserves_neighbor_export() 
     };
     let root = tempfile::tempdir().unwrap();
     let cache = root.path().join("sqlite-cache");
-    let ledger = FileSystemConfig::new(root.path().join("blocks"))
-        .open()
-        .await
-        .unwrap();
+    let ledger = FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let service = SqlService::new(
@@ -514,6 +523,8 @@ async fn sqlite_cache_prefix_closes_live_actors_and_preserves_neighbor_export() 
 }
 
 #[cfg(feature = "duckdb")]
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is its own `FsPurgeLedger` directory.
 #[tokio::test]
 async fn duckdb_cache_prefix_closes_live_actors_and_preserves_neighbor_export() {
     use tinycloud_core::{
@@ -527,10 +538,7 @@ async fn duckdb_cache_prefix_closes_live_actors_and_preserves_neighbor_export() 
     };
     let root = tempfile::tempdir().unwrap();
     let cache = root.path().join("duckdb-cache");
-    let ledger = FileSystemConfig::new(root.path().join("blocks"))
-        .open()
-        .await
-        .unwrap();
+    let ledger = FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db));

@@ -4,8 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 use tinycloud::storage::{
-    file_system::FileSystemConfig,
-    purge_ledger::PurgeLedgerStore,
+    purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
     resource_review::{record_and_consume, verify_current},
 };
 use tinycloud_core::{
@@ -14,9 +13,10 @@ use tinycloud_core::{
     resource_review::{ReviewExpectation, ReviewUse, ReviewVerifier, TargetRow},
     sea_orm::{Database, DatabaseConnection, EntityTrait, PaginatorTrait, TransactionTrait},
     sea_orm_migration::MigratorTrait,
-    storage::StorageConfig,
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 async fn adapter(db: &DatabaseConnection) {
     Migrator::up(db, None).await.unwrap();
     let fixture: Value = serde_json::from_str(include_str!(
@@ -61,10 +61,7 @@ async fn adapter(db: &DatabaseConnection) {
         OffsetDateTime::from_unix_timestamp(fixture["verifyAtUnix"].as_i64().unwrap()).unwrap();
     let clock = move || now;
     let directory = tempfile::tempdir().unwrap();
-    let ledger = FileSystemConfig::new(directory.path())
-        .open()
-        .await
-        .unwrap();
+    let ledger = FsPurgeLedger::new(directory.path().to_path_buf()).unwrap();
     let body = serde_json::to_vec(proof).unwrap();
     let id = "00000000-0000-4000-8000-000000000099";
     let tx = db.begin().await.unwrap();
@@ -226,6 +223,8 @@ impl PurgeLedgerStore for FaultLedger<'_> {
     }
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn review_job_mismatch_and_io_or_expiry_during_final_read_never_consume() {
     use std::sync::{
@@ -276,10 +275,7 @@ async fn review_job_mismatch_and_io_or_expiry_during_final_read_never_consume() 
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let ledger = FileSystemConfig::new(directory.path())
-        .open()
-        .await
-        .unwrap();
+    let ledger = FsPurgeLedger::new(directory.path().to_path_buf()).unwrap();
     let wrong_job = ReviewExpectation {
         job_id: "00000000-0000-4000-8000-000000000099",
         ..expected

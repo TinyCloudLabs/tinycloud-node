@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use tinycloud::{
     space_lifecycle::{purge_space, LifecycleRuntime, PurgeStorageLayout},
     storage::{
-        file_system::FileSystemConfig, purge_ledger::PurgeLedgerStore,
+        purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
         purge_reconcile::PrefixStoreKind,
     },
 };
@@ -22,7 +22,6 @@ use tinycloud_core::{
     sea_orm::{Database, EntityTrait, PaginatorTrait},
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 fn new_owner() -> (JWK, String) {
     let mut key = JWK::generate_secp256k1();
@@ -58,6 +57,8 @@ fn signed(key: &JWK, owner: &str, space: &str, id: &str) -> String {
     .unwrap()
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn every_configured_namespace_is_signed_and_missing_layout_never_accepts() {
     use PrefixStoreKind::*;
@@ -69,12 +70,7 @@ async fn every_configured_namespace_is_signed_and_missing_layout_never_accepts()
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            FileSystemConfig::new(directory.path())
-                .open()
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(FsPurgeLedger::new(directory.path().to_path_buf()).unwrap());
         let keys = Arc::new(
             LedgerKeys::new(
                 "test".into(),

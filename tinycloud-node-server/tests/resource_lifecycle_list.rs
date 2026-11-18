@@ -9,7 +9,7 @@ use tinycloud::{
         resources::{list_my_resources, ResourceListResponse},
         LifecycleRuntime,
     },
-    storage::file_system::FileSystemConfig,
+    storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -22,7 +22,6 @@ use tinycloud_core::{
     sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 
 fn new_owner() -> (JWK, String) {
@@ -59,6 +58,8 @@ fn signed(key: &JWK, signer: &str, target: &str) -> (String, String) {
     (invocation.encode().unwrap(), id)
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn resource_inventory_pages_all_networks_and_keys_and_refuses_nonowners() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -112,10 +113,7 @@ async fn resource_inventory_pages_all_networks_and_keys_and_refuses_nonowners() 
         .unwrap();
     }
     let directory = tempfile::tempdir().unwrap();
-    let store = FileSystemConfig::new(directory.path())
-        .open()
-        .await
-        .unwrap();
+    let store = FsPurgeLedger::new(directory.path().to_path_buf()).unwrap();
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

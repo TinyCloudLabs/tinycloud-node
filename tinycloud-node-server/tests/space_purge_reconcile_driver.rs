@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use tinycloud::storage::{
-    file_system::FileSystemConfig,
-    purge_ledger::PurgeLedgerStore,
+    purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
     purge_reconcile::{
         finish_absent_prefix, repair_acceptance_copies, repair_one, scan_store_inventory,
         PrefixStoreKind, RepairOneOutcome, VerifiedPurgePrefix,
@@ -16,9 +15,10 @@ use tinycloud_core::{
     sea_orm_migration::MigratorTrait,
     space_purge_fence::SpacePurgeFence,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is its own `FsPurgeLedger` directory, apart from the block directory.
 #[tokio::test]
 async fn postgres_restore_driver_deletes_only_matched_hash_prefix_and_proves_absence_after_restart()
 {
@@ -44,7 +44,7 @@ async fn postgres_restore_driver_deletes_only_matched_hash_prefix_and_proves_abs
     let root = tempfile::tempdir().unwrap();
     let blocks = root.path().join("blocks");
     let sql_root = root.path().join("sql-store");
-    let ledger = FileSystemConfig::new(&blocks).open().await.unwrap();
+    let ledger = FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap();
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

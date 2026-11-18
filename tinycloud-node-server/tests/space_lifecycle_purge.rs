@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tinycloud::{
     space_lifecycle::{purge_space, purge_status, LifecycleRuntime, PurgeResponse},
-    storage::{file_system::FileSystemConfig, purge_ledger::PurgeLedgerStore},
+    storage::purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -23,7 +23,6 @@ use tinycloud_core::{
     sea_orm_migration::MigratorTrait,
     space_purge_fence::FenceError,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 fn new_owner() -> (JWK, String) {
     let mut key = JWK::generate_secp256k1();
@@ -58,17 +57,14 @@ fn signed(key: &JWK, owner: &str, space: &str, id: &str) -> String {
     .encode()
     .unwrap()
 }
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn purge_enqueue_is_idempotent_bound_to_target_and_status_uses_inline_owner_proof() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        FileSystemConfig::new(directory.path())
-            .open()
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(FsPurgeLedger::new(directory.path().to_path_buf()).unwrap());
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

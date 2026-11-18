@@ -1,28 +1,24 @@
 use std::sync::Arc;
 use tinycloud::{
     space_lifecycle::LifecycleRuntime,
-    storage::{file_system::FileSystemConfig, purge_ledger::PurgeLedgerStore},
+    storage::purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
 };
 use tinycloud_core::{
     migrations::Migrator,
     sea_orm::{Database, TransactionTrait},
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn lifecycle_requires_stable_host_and_independent_key_and_cannot_disable_existing_ledger() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let conn = tinycloud_core::RecoveringConnection::from(db);
     let directory = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        FileSystemConfig::new(directory.path())
-            .open()
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(FsPurgeLedger::new(directory.path().to_path_buf()).unwrap());
     let raw = base64::encode_config([9_u8; 32], base64::URL_SAFE_NO_PAD);
     assert!(
         LifecycleRuntime::from_settings(conn.clone(), store.clone(), None, None)
@@ -86,7 +82,7 @@ async fn lifecycle_requires_stable_host_and_independent_key_and_cannot_disable_e
     // Removing configuration and pointing at an empty ledger cannot bypass
     // a fence that is still present in the database.
     let empty = tempfile::tempdir().unwrap();
-    let empty_store = Arc::new(FileSystemConfig::new(empty.path()).open().await.unwrap());
+    let empty_store = Arc::new(FsPurgeLedger::new(empty.path().to_path_buf()).unwrap());
     let fence = tinycloud_core::space_purge_fence::SpacePurgeFence::new(Arc::new(keys));
     let tx = conn.begin().await.unwrap();
     fence

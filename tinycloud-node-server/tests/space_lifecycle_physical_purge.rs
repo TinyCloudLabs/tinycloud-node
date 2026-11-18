@@ -11,7 +11,7 @@ use tinycloud::{
     space_purge_executor::{PhaseOutcome, SpacePurgeExecutor, SqlPurgeStore},
     storage::{
         file_system::FileSystemConfig,
-        purge_ledger::PurgeLedgerStore,
+        purge_ledger::{FsPurgeLedger, PurgeLedger, PurgeLedgerStore},
         sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore},
     },
     BlockStores,
@@ -64,6 +64,8 @@ fn signed(
     (invocation.encode().unwrap(), id)
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the runtime
+// and the executor share one ledger in its own directory, apart from `blocks`.
 #[tokio::test]
 async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_target() {
     if std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").as_deref() != Ok("1")
@@ -139,10 +141,10 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
         )
         .unwrap(),
     );
-    let ledger: Arc<dyn PurgeLedgerStore> = match &blocks {
-        Either::B(store) => Arc::new(store.clone()),
-        Either::A(_) => unreachable!(),
-    };
+    let purge_ledger = Arc::new(PurgeLedger::Local(
+        FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap(),
+    ));
+    let ledger: Arc<dyn PurgeLedgerStore> = purge_ledger.clone();
     // Exercise the real five-minute worker grace without sleeping or changing
     // accepted DB rows: the trusted controller clock models earlier acceptance.
     let accepted_time = OffsetDateTime::now_utc() - time::Duration::minutes(6);
@@ -233,6 +235,7 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
     let executor = SpacePurgeExecutor {
         db: &db,
         blocks: &blocks,
+        ledger: &purge_ledger,
         sql: &sql,
         #[cfg(feature = "duckdb")]
         duckdb: None,

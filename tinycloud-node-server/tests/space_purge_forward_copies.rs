@@ -2,8 +2,7 @@
 //! injected crashes. Completion copies deliberately wait for physical proof.
 use std::{collections::BTreeMap, io, sync::Arc};
 use tinycloud::storage::{
-    file_system::{FileSystemConfig, FileSystemStore},
-    purge_ledger::PurgeLedgerStore,
+    purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
     purge_reconcile::{repair_acceptance_copies, CopyRepairPoint},
 };
 use tinycloud_auth::resource::SpaceId;
@@ -17,15 +16,16 @@ use tinycloud_core::{
     sea_orm_migration::MigratorTrait,
     space_purge_fence::{FenceError, SpacePurgeFence},
     space_purge_ledger::{LedgerKeys, LedgerRecord},
-    storage::StorageConfig,
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the fixture
+// ledger is its own `FsPurgeLedger`, not a block store; assertions unchanged.
 struct Fixture {
     admin: DatabaseConnection,
     db: DatabaseConnection,
     schema: String,
     _root: tempfile::TempDir,
-    ledger: FileSystemStore,
+    ledger: FsPurgeLedger,
     keys: Arc<LedgerKeys>,
     space: SpaceId,
     acceptance: LedgerRecord,
@@ -46,7 +46,7 @@ impl Fixture {
         let db = Database::connect(options).await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let root = tempfile::tempdir().unwrap();
-        let ledger = FileSystemConfig::new(root.path()).open().await.unwrap();
+        let ledger = FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap();
         let keys = Arc::new(
             LedgerKeys::new(
                 "test".into(),

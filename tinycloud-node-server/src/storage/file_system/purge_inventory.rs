@@ -3,7 +3,7 @@ use crate::storage::purge_inventory::{PhysicalSpacePrefix, SpacePrefixPage};
 
 impl FileSystemStore {
     /// Keyset pages retain at most 257 candidates while scanning directory names.
-    /// Symlink directories are refused, and the reserved ledger is never traversed.
+    /// Symlink directories are refused.
     pub async fn list_purge_prefixes(
         &self,
         cursor: Option<&str>,
@@ -15,9 +15,6 @@ impl FileSystemStore {
                 .file_name()
                 .into_string()
                 .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid owner path"))?;
-            if suffix == "_purge-ledger" {
-                continue;
-            }
             let kind = owner.file_type().await?;
             if kind.is_symlink() {
                 return Err(IoError::new(ErrorKind::InvalidData, "unsafe owner path"));

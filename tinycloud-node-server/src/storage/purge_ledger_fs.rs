@@ -1,5 +1,23 @@
-use super::*;
-use crate::storage::purge_ledger::{validate_key, PurgeLedgerStore, PREFIX};
+use super::{validate_key, PurgeLedgerStore, PREFIX};
+use std::{
+    io::{Error as IoError, ErrorKind},
+    path::{Path, PathBuf},
+};
+use tempfile::NamedTempFile;
+
+/// The purge ledger in a directory of its own, never inside the block
+/// directory (single-host and development nodes).
+#[derive(Debug, Clone)]
+pub struct FsPurgeLedger {
+    path: PathBuf,
+}
+
+impl FsPurgeLedger {
+    pub fn new(path: PathBuf) -> Result<Self, IoError> {
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
 
 fn checked_parent(root: &Path, key: &str, create: bool) -> Result<PathBuf, IoError> {
     validate_key(key)?;
@@ -25,7 +43,7 @@ fn checked_parent(root: &Path, key: &str, create: bool) -> Result<PathBuf, IoErr
 }
 
 #[rocket::async_trait]
-impl PurgeLedgerStore for FileSystemStore {
+impl PurgeLedgerStore for FsPurgeLedger {
     async fn append_purge_record(&self, key: &str, body: &[u8]) -> Result<(), IoError> {
         validate_key(key)?;
         let root = self.path.clone();

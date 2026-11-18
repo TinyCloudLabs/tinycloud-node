@@ -7,7 +7,7 @@ use tinycloud::{
     space_lifecycle::{
         lifecycle_error, list_my_spaces, resources::list_my_resources, LifecycleRuntime,
     },
-    storage::file_system::FileSystemConfig,
+    storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -19,17 +19,15 @@ use tinycloud_core::{
     sea_orm::{ConnectionTrait, Database},
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn lifecycle_guard_and_json_refusals_use_the_configured_host_envelope_without_lookup() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let store = FileSystemConfig::new(directory.path())
-        .open()
-        .await
-        .unwrap();
+    let store = FsPurgeLedger::new(directory.path().to_path_buf()).unwrap();
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

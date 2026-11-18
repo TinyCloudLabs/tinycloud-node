@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tinycloud::{
     space_lifecycle::{retire_owner, LifecycleRuntime},
-    storage::{file_system::FileSystemConfig, purge_ledger::PurgeLedgerStore},
+    storage::purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -20,7 +20,6 @@ use tinycloud_core::{
     sea_orm_migration::MigratorTrait,
     space_purge_fence::FenceError,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 
 fn new_owner() -> (JWK, String) {
@@ -57,17 +56,14 @@ fn signed(key: &JWK, owner: &str, target: &str, id: &str) -> String {
     .unwrap()
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn retirement_is_owner_only_durable_idempotent_and_replay_safe() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        FileSystemConfig::new(directory.path())
-            .open()
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(FsPurgeLedger::new(directory.path().to_path_buf()).unwrap());
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),
@@ -225,18 +221,15 @@ async fn retirement_is_owner_only_durable_idempotent_and_replay_safe() {
     assert_eq!(restored.accepted_at.unix_timestamp(), timestamp);
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn external_acceptance_followed_by_db_failure_fences_serving_until_reconciliation() {
     use tinycloud_core::sea_orm::ConnectionTrait;
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        FileSystemConfig::new(directory.path())
-            .open()
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(FsPurgeLedger::new(directory.path().to_path_buf()).unwrap());
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

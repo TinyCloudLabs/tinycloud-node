@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, io};
 use time::OffsetDateTime;
 use tinycloud::storage::{
-    file_system::FileSystemConfig, purge_completion::complete_purge, purge_ledger::PurgeLedgerStore,
+    purge_completion::complete_purge,
+    purge_ledger::{FsPurgeLedger, PurgeLedgerStore},
 };
 use tinycloud_core::sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DbBackend,
@@ -13,7 +14,6 @@ use tinycloud_core::{
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
     space_purge_worker::claim,
-    storage::StorageConfig,
 };
 
 struct UnavailableLedger;
@@ -30,6 +30,8 @@ impl PurgeLedgerStore for UnavailableLedger {
     }
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as the block store.
 #[tokio::test]
 async fn postgres_completion_resumes_after_ledger_publication_and_clears_identity_atomically() {
     let Ok(url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
@@ -46,7 +48,7 @@ async fn postgres_completion_resumes_after_ledger_publication_and_clears_identit
     let db = Database::connect(options).await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let root = tempfile::tempdir().unwrap();
-    let store = FileSystemConfig::new(root.path()).open().await.unwrap();
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
     let keys = LedgerKeys::new(
         "test".into(),
         BTreeMap::from([("test".into(), vec![7; 32])]),
@@ -152,7 +154,7 @@ async fn postgres_completion_resumes_after_ledger_publication_and_clears_identit
         .await
         .unwrap();
     drop(store);
-    let store = FileSystemConfig::new(root.path()).open().await.unwrap();
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
     let mut stale = job.clone();
     stale.lease_token = uuid::Uuid::new_v4().to_string();
     assert!(!complete_purge(&db, &store, &keys, &stale).await.unwrap());

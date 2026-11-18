@@ -10,7 +10,7 @@ use tinycloud::{
         list_my_spaces, purge_space, purge_status, resources::list_my_resources, retire_owner,
         LifecycleRuntime,
     },
-    storage::file_system::FileSystemConfig,
+    storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -27,13 +27,14 @@ use tinycloud_core::{
     },
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the host's
+// ledger is its own `FsPurgeLedger`, not a block store.
 async fn host(id: &str, byte: u8) -> (Client, tempfile::TempDir, DatabaseConnection) {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let root = tempfile::tempdir().unwrap();
-    let store = FileSystemConfig::new(root.path()).open().await.unwrap();
+    let store = FsPurgeLedger::new(root.path().to_path_buf()).unwrap();
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),

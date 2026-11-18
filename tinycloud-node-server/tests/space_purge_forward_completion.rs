@@ -7,7 +7,7 @@ use tinycloud::{
     storage::{
         file_system::{FileSystemConfig, FileSystemStore},
         purge_completion::complete_purge,
-        purge_ledger::PurgeLedgerStore,
+        purge_ledger::{FsPurgeLedger, PurgeLedger, PurgeLedgerStore},
         sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore},
     },
     BlockStores,
@@ -29,12 +29,16 @@ use tinycloud_core::{
     storage::{either::Either, StorageConfig},
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the fixture
+// keeps the purge ledger in its own directory (`ledger`), apart from the block
+// store (`blocks`); the assertions are unchanged.
 struct Fixture {
     admin: DatabaseConnection,
     db: DatabaseConnection,
     schema: String,
     root: tempfile::TempDir,
-    store: FileSystemStore,
+    blocks: FileSystemStore,
+    ledger: PurgeLedger,
     sql_store: FsSqlObjectStore,
     sql: SqlService,
     keys: Arc<LedgerKeys>,
@@ -61,6 +65,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let blocks = root.path().join("blocks");
         let store = FileSystemConfig::new(&blocks).open().await.unwrap();
+        let ledger =
+            PurgeLedger::Local(FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap());
         let sql_store = FsSqlObjectStore::open(root.path().join("sql-store"), &blocks).unwrap();
         let sql = SqlService::new(
             root.path().join("cache").to_string_lossy().into_owned(),
@@ -143,7 +149,7 @@ impl Fixture {
         .unwrap();
         tx.commit().await.unwrap();
         if external_acceptance {
-            store
+            ledger
                 .append_purge_record(
                     &accepted.object_key().unwrap(),
                     &accepted.to_bytes().unwrap(),
@@ -160,7 +166,8 @@ impl Fixture {
             db,
             schema,
             root,
-            store,
+            blocks: store,
+            ledger,
             sql_store,
             sql,
             keys,
@@ -174,6 +181,7 @@ impl Fixture {
         SpacePurgeExecutor {
             db: &self.db,
             blocks,
+            ledger: &self.ledger,
             sql: &self.sql,
             #[cfg(feature = "duckdb")]
             duckdb: None,
@@ -205,6 +213,8 @@ impl Fixture {
     }
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): ledger reads
+// and writes go to `f.ledger`, the executor gets `f.blocks`.
 #[tokio::test]
 async fn database_only_acceptance_cannot_delete_before_matching_object_copy_exists() {
     let Some(f) = Fixture::new("drain", false).await else {
@@ -227,7 +237,7 @@ async fn database_only_acceptance_cannot_delete_before_matching_object_copy_exis
         .drain_during_restore(&f.db, &f.space, &restore)
         .await
         .unwrap();
-    let blocks = Either::B(f.store.clone());
+    let blocks = Either::B(f.blocks.clone());
     let executor = f.executor(&blocks);
     assert!(executor.execute_claimed(&f.job, &drain).await.is_err());
     assert!(directory.join("keep").exists());
@@ -235,13 +245,13 @@ async fn database_only_acceptance_cannot_delete_before_matching_object_copy_exis
     f.pending().await;
     let completed = f.completed(OffsetDateTime::now_utc().unix_timestamp());
     assert!(f
-        .store
+        .ledger
         .read_purge_record(&completed.object_key().unwrap())
         .await
         .unwrap()
         .is_none());
     // A matching durable copy repairs acceptance forward, without completing it.
-    f.store
+    f.ledger
         .append_purge_record(
             &f.accepted.object_key().unwrap(),
             &f.accepted.to_bytes().unwrap(),
@@ -256,7 +266,7 @@ async fn database_only_acceptance_cannot_delete_before_matching_object_copy_exis
     assert!(directory.join("keep").exists());
     assert!(!cache.exists());
     assert!(f
-        .store
+        .ledger
         .read_purge_record(&completed.object_key().unwrap())
         .await
         .unwrap()
@@ -266,6 +276,8 @@ async fn database_only_acceptance_cannot_delete_before_matching_object_copy_exis
     f.dispose().await;
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the damaged
+// record is written into the ledger's own directory.
 #[tokio::test]
 async fn tampered_acceptance_stays_pending_without_publishing_completion() {
     let Some(f) = Fixture::new("objects", true).await else {
@@ -276,17 +288,17 @@ async fn tampered_acceptance_stays_pending_without_publishing_completion() {
     damaged.prefixes[0].prefix_hmac = "00".repeat(32);
     // Simulated damaged restore media; the append-only application API is not used to overwrite it.
     std::fs::write(
-        f.root.path().join("blocks").join(&path),
+        f.root.path().join("purge-ledger").join(&path),
         damaged.to_bytes().unwrap(),
     )
     .unwrap();
-    assert!(complete_purge(&f.db, &f.store, &f.keys, &f.job)
+    assert!(complete_purge(&f.db, &f.ledger, &f.keys, &f.job)
         .await
         .is_err());
     f.pending().await;
     let completed = f.completed(OffsetDateTime::now_utc().unix_timestamp());
     assert!(f
-        .store
+        .ledger
         .read_purge_record(&completed.object_key().unwrap())
         .await
         .unwrap()
@@ -294,6 +306,8 @@ async fn tampered_acceptance_stays_pending_without_publishing_completion() {
     f.dispose().await;
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): ledger reads
+// and writes go to `f.ledger`.
 #[tokio::test]
 async fn conflicting_authenticated_completion_inventory_is_never_overwritten_or_committed() {
     let Some(f) = Fixture::new("objects", true).await else {
@@ -306,12 +320,12 @@ async fn conflicting_authenticated_completion_inventory_is_never_overwritten_or_
         .unwrap();
     let path = wrong.object_key().unwrap();
     let body = wrong.to_bytes().unwrap();
-    f.store.append_purge_record(&path, &body).await.unwrap();
-    assert!(complete_purge(&f.db, &f.store, &f.keys, &f.job)
+    f.ledger.append_purge_record(&path, &body).await.unwrap();
+    assert!(complete_purge(&f.db, &f.ledger, &f.keys, &f.job)
         .await
         .is_err());
     f.pending().await;
-    assert!(f.store.read_purge_record(&path).await.unwrap().unwrap() == body);
+    assert!(f.ledger.read_purge_record(&path).await.unwrap().unwrap() == body);
     assert!(space_purge_ledger_copy::Entity::find_by_id(path)
         .one(&f.db)
         .await
@@ -320,6 +334,8 @@ async fn conflicting_authenticated_completion_inventory_is_never_overwritten_or_
     f.dispose().await;
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): ledger reads
+// and writes go to `f.ledger`, the executor gets `f.blocks`.
 #[tokio::test]
 async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_with_current_claim() {
     let Some(f) = Fixture::new("objects", true).await else {
@@ -328,7 +344,7 @@ async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_wi
     let completed = f.completed(OffsetDateTime::now_utc().unix_timestamp() - 300);
     let path = completed.object_key().unwrap();
     let body = completed.to_bytes().unwrap();
-    f.store.append_purge_record(&path, &body).await.unwrap();
+    f.ledger.append_purge_record(&path, &body).await.unwrap();
     let kv = f
         .root
         .path()
@@ -366,7 +382,7 @@ async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_wi
         .drain_during_restore(&f.db, &f.space, &restore)
         .await
         .unwrap();
-    let blocks = Either::B(f.store.clone());
+    let blocks = Either::B(f.blocks.clone());
     let executor = f.executor(&blocks);
     assert_eq!(
         executor.execute_claimed(&f.job, &drain).await.unwrap(),
@@ -375,7 +391,7 @@ async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_wi
     f.pending().await;
     assert!(kv.exists());
     assert!(sql.exists());
-    assert!(f.store.read_purge_record(&path).await.unwrap().unwrap() == body);
+    assert!(f.ledger.read_purge_record(&path).await.unwrap().unwrap() == body);
     let mut failed_terminal = false;
     for _ in 0..4 {
         let job = claim_specific(&f.db, &uuid::Uuid::new_v4().to_string(), &f.job.purge_id)
@@ -404,7 +420,7 @@ async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_wi
         .await
         .unwrap();
     f.db.execute(Statement::from_sql_and_values(DbBackend::Postgres,"UPDATE space_purge_job SET lease_until=clock_timestamp()-INTERVAL '1 second' WHERE purge_id=$1",[f.job.purge_id.clone().into()])).await.unwrap();
-    assert!(!complete_purge(&f.db, &f.store, &f.keys, &f.job)
+    assert!(!complete_purge(&f.db, &f.ledger, &f.keys, &f.job)
         .await
         .unwrap());
     let resumed = claim_specific(&f.db, &uuid::Uuid::new_v4().to_string(), &f.job.purge_id)
@@ -428,7 +444,7 @@ async fn ahead_object_completion_redeletes_restored_prefixes_and_commits_only_wi
         .unwrap()
         .unwrap();
     assert!(copied.body == body);
-    assert!(f.store.read_purge_record(&path).await.unwrap().unwrap() == body);
+    assert!(f.ledger.read_purge_record(&path).await.unwrap().unwrap() == body);
     drop(drain);
     drop(restore);
     f.dispose().await;

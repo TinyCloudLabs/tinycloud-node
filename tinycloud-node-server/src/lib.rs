@@ -595,6 +595,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
     resolved
+        .storage
+        .validate_purge_ledger()
+        .map_err(anyhow::Error::msg)?;
+    resolved
         .sql_store
         .validate_for_database(resolved.storage.database())
         .map_err(anyhow::Error::msg)?;

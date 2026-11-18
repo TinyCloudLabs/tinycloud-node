@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tinycloud::{
     space_lifecycle::{list_my_spaces, resources::list_my_resources, LifecycleRuntime},
-    storage::file_system::FileSystemConfig,
+    storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
@@ -21,7 +21,6 @@ use tinycloud_core::{
     sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, EntityTrait},
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
-    storage::StorageConfig,
 };
 fn signed(key: &JWK, owner: &str, action: &str, id: &str) -> String {
     let now = OffsetDateTime::now_utc().unix_timestamp() as f64;
@@ -42,6 +41,8 @@ fn signed(key: &JWK, owner: &str, action: &str, id: &str) -> String {
     .encode()
     .unwrap()
 }
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is opened as its own `FsPurgeLedger`, not as a block store.
 #[tokio::test]
 async fn list_key_reuse_with_fresh_nonce_is_read_only_and_creates_no_request_records() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -60,7 +61,7 @@ async fn list_key_reuse_with_fresh_nonce_is_read_only_and_creates_no_request_rec
     .await
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    let store = FileSystemConfig::new(root.path()).open().await.unwrap();
+    let store = FsPurgeLedger::new(root.path().to_path_buf()).unwrap();
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),
