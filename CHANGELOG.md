@@ -28,6 +28,28 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.10] - 2026-11-18
+
+Ships the changes merged since 1.26.9 (#611, #615, #622, #626, #627), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **Two database migrations, fix-forward only** (both run at boot and are additive):
+  - `m20261117_000000_hook_subscription_headers` adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged.
+  - `m20261117_000000_renewal_switch` adds the node-wide renewal switch, seeded as running, so nothing changes on deploy.
+
+  The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.10 is fixed forward, not rolled back to 1.26.9. Two older migration files change only inside their `#[cfg(test)]` modules (`m20260725_000000_request_path_indexes`, `m20261005_000000_deactivate_hook_subscriptions`: test fixtures gain the new `hook_subscription` columns); their migration code is unchanged.
+
+### Changes
+
+- PostgreSQL: a batch KV read seeks each key under a generic plan too (TC-3211, #627).
+- A batch KV read answers with an `ETag`, and `If-None-Match` answers `304` while none of its keys changed (TC-3217, #626).
+- Renewals: an operator can pause and resume all scheduled renewal stamps with `PUT /admin/renewals` (TC-3163, #622).
+- Hook tickets and signed KV URLs honour renewal stamps (the cited delegations' current effective end), and signed KV URLs re-check whole-chain revocation at every use (TC-3174, TC-3176, TC-3177, #622).
+- Metrics: the PostgreSQL pool's timeouts in effect are exported (TC-3178, #622).
+- Webhooks accept optional write-only custom `headers`, and SQL write events carry `rowId` for a single-row insert (TC-3123, #611).
+- Docs: `docs/releasing.md` and comments in `.github/workflows/docker.yml` say `PROD_TINYCLOUD_ADMIN_SECRET` is a production-environment secret (#615; comments only, no workflow change).
+
 ## [1.26.9] - 2026-11-17
 
 Ships the 1.26.6 changes below, which were built but never deployed, on top of 1.26.8 (1.26.5 plus the TC-3076 fix and a rotated admin secret).
