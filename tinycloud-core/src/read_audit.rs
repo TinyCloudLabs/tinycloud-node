@@ -2805,14 +2805,45 @@ mod tests {
         assert_full_records_still_read(conn, Some(Arc::new(Mutex::new(())))).await;
     }
 
+    /// The TC-2871 space purge (#550) seeds a space's invocations with this
+    /// query and deletes what it finds. A slim read has no `event_order` row
+    /// and no parent edge, so its `invoked_abilities` row is how the purge
+    /// finds it: every read of the space, old or slim, must come back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_full_records_written_before_tc3259_still_read() {
         use crate::test_support::PostgresTestSchema;
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
         const TEST: &str = "postgres_full_records_written_before_tc3259_still_read";
         let Some(schema) = PostgresTestSchema::new(TEST).await else {
             return;
         };
         assert_full_records_still_read(schema.conn.clone(), None).await;
+
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default";
+        let seeds: HashSet<Hash> = schema
+            .conn
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT invocation AS id FROM invoked_abilities WHERE split_part(resource,'/',1)=$1",
+                [space.into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<Hash>("", "id").unwrap())
+            .collect();
+        let invocations: HashSet<Hash> = invocation::Entity::find()
+            .all(&schema.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            seeds, invocations,
+            "the space purge finds the slim read as it finds the full record"
+        );
     }
 }
