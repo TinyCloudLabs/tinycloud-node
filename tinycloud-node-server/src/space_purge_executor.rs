@@ -3,7 +3,7 @@
 use crate::{
     storage::{
         purge_completion::{complete_purge_with_encryption, verified_acceptance},
-        purge_ledger::PurgeLedgerStore,
+        purge_ledger::PurgeLedger,
         purge_reconcile::{PrefixStoreKind, VerifiedPurgePrefix},
         sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore, S3SqlObjectStore},
     },
@@ -52,6 +52,8 @@ pub enum PurgeExecutionError {
 pub struct SpacePurgeExecutor<'a> {
     pub db: &'a DatabaseConnection,
     pub blocks: &'a BlockStores,
+    /// The purge ledger's own store, never `blocks` (TC-2871).
+    pub ledger: &'a PurgeLedger,
     pub sql: &'a SqlService,
     #[cfg(feature = "duckdb")]
     pub duckdb: Option<&'a tinycloud_core::duckdb::DuckDbService>,
@@ -73,11 +75,9 @@ impl SpacePurgeExecutor<'_> {
         if !space_purge_worker::renew(self.db, job).await? {
             return Ok(PhaseOutcome::LeaseLost);
         }
-        let accepted = match self.blocks {
-            Either::A(store) => verified_acceptance(self.db, store, self.keys, job).await,
-            Either::B(store) => verified_acceptance(self.db, store, self.keys, job).await,
-        }
-        .map_err(|_| PurgeExecutionError::PrefixInventory)?;
+        let accepted = verified_acceptance(self.db, self.ledger, self.keys, job)
+            .await
+            .map_err(|_| PurgeExecutionError::PrefixInventory)?;
         self.verify_inventory(&accepted, drain.space())?;
         if !grace_ready(self.db, job).await? {
             return Ok(PhaseOutcome::Deferred);
@@ -235,24 +235,15 @@ impl SpacePurgeExecutor<'_> {
                 PhaseOutcome::LeaseLost
             });
         }
-        let completed = match self.blocks {
-            Either::A(store) => self.complete(job, store).await?,
-            Either::B(store) => self.complete(job, store).await?,
-        };
+        let completed =
+            complete_purge_with_encryption(self.db, self.ledger, self.keys, job, self.encryption)
+                .await
+                .map_err(|_| PurgeExecutionError::Storage)?;
         Ok(if completed {
             PhaseOutcome::Complete
         } else {
             PhaseOutcome::LeaseLost
         })
-    }
-    async fn complete(
-        &self,
-        job: &ClaimedPurge,
-        store: &impl PurgeLedgerStore,
-    ) -> Result<bool, PurgeExecutionError> {
-        complete_purge_with_encryption(self.db, store, self.keys, job, self.encryption)
-            .await
-            .map_err(|_| PurgeExecutionError::Storage)
     }
 }
 

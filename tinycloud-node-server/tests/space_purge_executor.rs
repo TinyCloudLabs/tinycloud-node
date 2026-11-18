@@ -3,7 +3,7 @@ use tinycloud::{
     space_purge_executor::{PhaseOutcome, SpacePurgeExecutor, SqlPurgeStore},
     storage::{
         file_system::FileSystemConfig,
-        purge_ledger::PurgeLedgerStore,
+        purge_ledger::{FsPurgeLedger, PurgeLedger, PurgeLedgerStore},
         sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore},
     },
     BlockStores,
@@ -21,6 +21,9 @@ use tinycloud_core::{
     storage::{either::Either, StorageConfig},
 };
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the accepted
+// record goes to the executor's own `ledger` (a separate directory), not into
+// the block store.
 #[tokio::test]
 async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_prefixes() {
     let Ok(url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
@@ -41,6 +44,8 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
     let cache_root = root.path().join("cache");
     let sql_root = root.path().join("sql-store");
     let blocks: BlockStores = Either::B(FileSystemConfig::new(&blocks_root).open().await.unwrap());
+    let ledger_root = root.path().join("purge-ledger");
+    let ledger = PurgeLedger::Local(FsPurgeLedger::new(ledger_root.clone()).unwrap());
     let sql_store = FsSqlObjectStore::open(sql_root.clone(), &blocks_root).unwrap();
     let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone()));
     let sql = SqlService::new(
@@ -123,15 +128,13 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
         )
         .unwrap();
     let accepted_at = time::OffsetDateTime::from_unix_timestamp(accepted.timestamp).unwrap();
-    if let Either::B(store) = &blocks {
-        store
-            .append_purge_record(
-                &accepted.object_key().unwrap(),
-                &accepted.to_bytes().unwrap(),
-            )
-            .await
-            .unwrap();
-    }
+    ledger
+        .append_purge_record(
+            &accepted.object_key().unwrap(),
+            &accepted.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
     let tx = db.begin().await.unwrap();
     let generation = fence
         .fence_hmac(&tx, "space", "test", &digest)
@@ -155,6 +158,7 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
     let executor = SpacePurgeExecutor {
         db: &db,
         blocks: &blocks,
+        ledger: &ledger,
         sql: &sql,
         #[cfg(feature = "duckdb")]
         duckdb: None,
@@ -220,15 +224,18 @@ async fn postgres_filesystem_executor_drains_defers_claims_and_resumes_exact_pre
     assert_eq!(still_claimed, 1);
     drop(drain);
     drop(blocks);
+    drop(ledger);
     // Rebuild transport, service registries and guards from durable state after
     // a successful batch, with neither an object cursor nor the old lease.
     let blocks: BlockStores = Either::B(FileSystemConfig::new(&blocks_root).open().await.unwrap());
+    let ledger = PurgeLedger::Local(FsPurgeLedger::new(ledger_root).unwrap());
     let resumed_sql = SqlService::new(cache_root.to_string_lossy().into_owned(), 0, repository);
     let resumed_fence = SpacePurgeFence::new(keys.clone());
     let drain = resumed_fence.drain(&db, &a).await.unwrap();
     let executor = SpacePurgeExecutor {
         db: &db,
         blocks: &blocks,
+        ledger: &ledger,
         sql: &resumed_sql,
         #[cfg(feature = "duckdb")]
         duckdb: None,

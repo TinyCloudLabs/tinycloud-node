@@ -56,7 +56,7 @@ pub fn http_client() -> SharedHttpClient {
         .build_https()
 }
 
-async fn aws_config() -> SdkConfig {
+pub(crate) async fn aws_config() -> SdkConfig {
     aws_config::defaults(behavior_version())
         .http_client(http_client())
         .load()
@@ -1308,9 +1308,6 @@ mod tests {
 #[cfg(test)]
 #[path = "space_purge_s3_tests.rs"]
 mod space_purge_tests;
-
-#[path = "purge_ledger_s3.rs"]
-mod purge_ledger;
 
 #[cfg(test)]
 #[path = "space_purge_probe_s3_tests.rs"]

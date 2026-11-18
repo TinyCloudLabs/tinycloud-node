@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Space purge: the purge ledger moves out of the block store into its own `[storage.purge_ledger]` store: an Object Lock bucket on S3, or `<datadir>/purge-ledger` by default on local storage. Startup refuses a ledger that shares the block bucket or directory. The data bucket never carries Object Lock; old versions of purged objects expire through a 7-day noncurrent lifecycle rule. Runbook: `docs/runbooks/space-purge-storage.md`. Details: TC-2871.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.

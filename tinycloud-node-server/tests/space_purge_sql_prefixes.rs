@@ -201,8 +201,10 @@ async fn filesystem_prefix_inventory_pages_without_reversing_hashed_identity() {
     assert!(first.prefixes.last().unwrap() < second.prefixes.first().unwrap());
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the block
+// directory no longer holds a ledger, so there is no reserved ledger to skip.
 #[tokio::test]
-async fn filesystem_kv_inventory_returns_exact_relative_prefix_and_skips_reserved_ledger() {
+async fn filesystem_kv_inventory_returns_exact_relative_prefix() {
     use tinycloud::storage::file_system::FileSystemConfig;
     let temp = tempfile::tempdir().unwrap();
     let store = FileSystemConfig::new(temp.path()).open().await.unwrap();
@@ -211,12 +213,6 @@ async fn filesystem_kv_inventory_returns_exact_relative_prefix_and_skips_reserve
         .unwrap();
     let relative = format!("{}/{}/", space.suffix(), space.name());
     std::fs::create_dir_all(temp.path().join(&relative)).unwrap();
-    std::fs::create_dir_all(temp.path().join("_purge-ledger/owners/key")).unwrap();
-    std::fs::write(
-        temp.path().join("_purge-ledger/owners/key/opaque"),
-        b"ledger",
-    )
-    .unwrap();
     let page = store.list_purge_prefixes(None).await.unwrap();
     assert_eq!(page.prefixes.len(), 1);
     assert_eq!(page.prefixes[0].space, space);

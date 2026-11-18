@@ -71,11 +71,14 @@ async fn purge_retries_after_io_failure_and_relists_late_objects() {
     assert!(store.purge_space_batch(&space).await.unwrap());
 }
 
+// test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the ledger
+// is its own store, so it is opened as `FsPurgeLedger` in a directory of its
+// own; a block-store space purge can no longer reach it.
 #[tokio::test]
-async fn ledger_is_append_only_survives_boot_and_space_purge() {
-    use crate::storage::purge_ledger::PurgeLedgerStore;
+async fn ledger_is_append_only_and_survives_reopen() {
+    use crate::storage::purge_ledger::{FsPurgeLedger, PurgeLedgerStore};
     let root = tempfile::tempdir().unwrap();
-    let store = FileSystemStore::new(root.path().to_owned()).await.unwrap();
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
     let key = "_purge-ledger/owners/test-key/opaque-hmac";
     assert_eq!(store.read_purge_record(key).await.unwrap(), None);
     store
@@ -106,9 +109,7 @@ async fn ledger_is_append_only_survives_boot_and_space_purge() {
             .is_err());
     }
     drop(store);
-    let store = FileSystemStore::new(root.path().to_owned()).await.unwrap();
-    let space: SpaceId = "tinycloud:key:test:purge".parse().unwrap();
-    assert!(store.purge_space_batch(&space).await.unwrap());
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
     assert_eq!(
         store.list_purge_records().await.unwrap(),
         vec![key.to_owned()]

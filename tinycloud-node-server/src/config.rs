@@ -1,6 +1,10 @@
 use crate::{
     allow_list::SpaceAllowListService,
-    storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
+    storage::{
+        file_system::FileSystemConfig,
+        purge_ledger::{DataStoreLocation, PurgeLedgerConfig},
+        s3::S3BlockConfig,
+    },
     BlockConfig, BlockStage,
 };
 use base64::{decode_config, URL_SAFE_NO_PAD};
@@ -1776,6 +1780,12 @@ pub struct Storage {
     pub sql: SqlStorageConfig,
     #[serde(default)]
     pub duckdb: DuckDbStorageConfig,
+    /// `[storage.purge_ledger]`: the space-purge ledger's own store (TC-2871),
+    /// never the block store. Local block storage defaults it to
+    /// `<datadir>/purge-ledger`; S3 block storage has no default, and the
+    /// purge stays unavailable until a ledger bucket is configured.
+    #[serde(default)]
+    pub purge_ledger: Option<PurgeLedgerConfig>,
 }
 
 fn default_datadir() -> PathBuf {
@@ -1808,6 +1818,12 @@ impl Storage {
             }
         }
 
+        if self.purge_ledger.is_none() && matches!(self.blocks, BlockConfig::B(_)) {
+            self.purge_ledger = Some(PurgeLedgerConfig::Local {
+                path: dir.join("purge-ledger"),
+            });
+        }
+
         if self.limit.map(|limit| limit.as_u64()) == Some(0) {
             self.limit = None;
         }
@@ -1818,6 +1834,21 @@ impl Storage {
         self.database
             .as_deref()
             .expect("Storage::resolve() must be called before accessing database")
+    }
+
+    /// Refuse a purge ledger that shares the block store. Call after resolve().
+    pub fn validate_purge_ledger(&self) -> Result<(), String> {
+        let Some(ledger) = &self.purge_ledger else {
+            return Ok(());
+        };
+        let data = match &self.blocks {
+            BlockConfig::A(s3) => DataStoreLocation::S3 {
+                bucket: &s3.bucket,
+                endpoint: s3.endpoint.as_ref(),
+            },
+            BlockConfig::B(fs) => DataStoreLocation::Local(fs.path()),
+        };
+        ledger.validate_separate_from(&data)
     }
 }
 
@@ -1831,6 +1862,7 @@ impl Default for Storage {
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
+            purge_ledger: None,
         }
     }
 }
