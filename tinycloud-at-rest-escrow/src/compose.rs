@@ -568,7 +568,12 @@ mod tests {
     #[test]
     fn production_compose_passes() {
         let yaml = include_str!("../../docker-compose.dstack-postgres.yaml");
-        assert_eq!(images(yaml).unwrap().len(), 4);
+        let images = images(yaml).unwrap();
+        assert_eq!(images.len(), 3);
+        assert!(
+            images.iter().all(|(name, _)| name != "ssh-gateway"),
+            "TC-2520 removed the ssh-gateway service: {images:?}"
+        );
     }
 
     #[test]

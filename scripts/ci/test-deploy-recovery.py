@@ -251,7 +251,6 @@ class RecoveryTests(unittest.TestCase):
             (root / "sitecustomize.py").write_text(HTTP)
             (root / "tinycloud-node-server").mkdir()
             (root / "tinycloud-node-server/Cargo.toml").write_text('version = "1.20.7"\n')
-            (root / "dstack-authorized-keys").write_text("synthetic-public-key\n")
             (root / "phala-env-sync").mkdir()
             (root / "scripts/ci").mkdir(parents=True)
             (root / "scripts/ci/reconcile-quota.py").write_bytes((ROOT / "scripts/ci/reconcile-quota.py").read_bytes())
