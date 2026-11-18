@@ -1695,24 +1695,12 @@ async fn delegator_revoke_grant_admission_refuses_every_other_form() -> Result<(
     Ok(())
 }
 
-/// TC-3150: a hand-back grant ends when it is itself revoked, and when the
-/// chain the target was issued under is revoked.
+/// TC-3150: a hand-back grant ends when the chain the target was issued
+/// under is revoked.
 #[tokio::test]
-async fn delegator_revoke_grant_ends_with_itself_or_the_targets_chain() -> Result<()> {
+async fn delegator_revoke_grant_ends_with_the_targets_chain() -> Result<()> {
     let hand = HandBack::new("handback-ends").await?;
     let fixture = &hand.fixture;
-    let control = hand.activate_hand_back(hand.reshare).await?;
-    // The device withdraws its hand-back grant.
-    assert_revoked_ok(
-        fixture,
-        control,
-        fixture.scoped_revoke_header(control, None)?,
-    )
-    .await?;
-    fixture
-        .assert_scope_denied(hand.reshare, hand.helper_revokes(hand.reshare, control)?)
-        .await?;
-
     // The owner revokes the parent the sibling was issued under.
     let sibling_control = hand.activate_hand_back(hand.sibling).await?;
     let owner = fixture.signed_scope_token(
@@ -1730,6 +1718,45 @@ async fn delegator_revoke_grant_ends_with_itself_or_the_targets_chain() -> Resul
             hand.sibling,
             hand.helper_revokes(hand.sibling, sibling_control)?,
         )
+        .await
+}
+
+/// TC-3150 (Bobbie N1): a hand-back grant presented after its own expiry is
+/// refused at `/revoke`. As in `expired_control_retry_does_not_reapply_a_revocation`,
+/// the stored expiry is moved into the past rather than waiting it out.
+#[tokio::test]
+async fn delegator_revoke_grant_presented_after_its_expiry_is_refused() -> Result<()> {
+    let hand = HandBack::new("handback-expired").await?;
+    let fixture = &hand.fixture;
+    let control = hand.activate_hand_back(hand.reshare).await?;
+    delegation::Entity::update_many()
+        .col_expr(
+            delegation::Column::Expiry,
+            tinycloud_core::sea_orm::sea_query::Expr::value(whole_seconds_from_now(-1)),
+        )
+        .filter(delegation::Column::Id.eq(control))
+        .exec(&fixture.conn)
+        .await?;
+    fixture
+        .assert_scope_denied(hand.reshare, hand.helper_revokes(hand.reshare, control)?)
+        .await
+}
+
+/// TC-3150 (Bobbie N1): a hand-back grant used after its issuer, the
+/// target's delegator, revoked the grant itself is refused at `/revoke`.
+#[tokio::test]
+async fn delegator_revoke_grant_used_after_its_issuer_revokes_it_is_refused() -> Result<()> {
+    let hand = HandBack::new("handback-withdrawn").await?;
+    let fixture = &hand.fixture;
+    let control = hand.activate_hand_back(hand.reshare).await?;
+    assert_revoked_ok(
+        fixture,
+        control,
+        fixture.scoped_revoke_header(control, None)?,
+    )
+    .await?;
+    fixture
+        .assert_scope_denied(hand.reshare, hand.helper_revokes(hand.reshare, control)?)
         .await
 }
 
