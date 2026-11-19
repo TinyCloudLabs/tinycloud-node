@@ -502,7 +502,12 @@ FROM ready ON CONFLICT DO NOTHING"#
         let generation: i64 = row.try_get("", "layout_generation")?;
         let checkpoint: Option<String> = row.try_get("", "checkpoint_part_id")?;
         let wal: Option<String> = row.try_get("", "delta_part_id")?;
-        let checkpoint = checkpoint.ok_or(DatabaseArtifactError::ArtifactChanged)?;
+        // A row with no checkpoint part is a legacy row (a legacy row replaced
+        // the parts row after `meta` was read): read it as one. The legacy
+        // read's revision/hash guard restarts a stale read.
+        let Some(checkpoint) = checkpoint else {
+            return Ok(false);
+        };
         if row.try_get::<i64>("", "revision")? != meta.revision
             || row.try_get::<String>("", "checkpoint_content_hash")? != meta.checkpoint_content_hash
             || wal.is_some() != meta.has_delta()
