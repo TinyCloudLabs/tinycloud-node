@@ -1731,9 +1731,9 @@ async fn kv_put(
 /// failure before any write as `503 unavailable_retryable` with
 /// `Retry-After`, and one after the `COMMIT` was sent as `500
 /// outcome_unknown` without it, through the real node and its pool. The
-/// proxy cuts a connection: both `BEGIN` attempts of a KV put (the one retry
-/// included), all four of a delegation (its operation is run once more after
-/// a loss before any write, TC-2346, so both runs lose both attempts), or a
+/// proxy cuts a connection: the `BEGIN` of a KV put (a put is not replayed),
+/// both runs of a delegation (its operation is run once more after a loss
+/// before any write, TC-2610, so each run loses its `BEGIN`), or a
 /// `COMMIT` that the server receives and commits but whose reply never
 /// arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1769,13 +1769,12 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         let (status, body, _) = kv_put(&node, &session, "tc1054/warm").await?;
         ensure!(status == Status::Ok, "warm-up put: {status} {body}");
 
-        // KV put's preparatory BEGIN retries once in the recovering pool and
-        // once around the idempotent preparation (two attempts each). Exhaust
-        // both layers before asserting the public retryable response.
+        // A KV put's preparatory BEGIN runs once: a put is not replayed, so
+        // the cut BEGIN answers the public retryable response.
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 4);
+        cut.arm(&[b"BEGIN"], 1);
         let (status, body, retry_after) = kv_put(&node, &session, "tc1054/retryable").await?;
-        ensure!(!cut.armed(), "all preparatory BEGIN attempts were cut");
+        ensure!(!cut.armed(), "the preparatory BEGIN was cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "kv put before any write: {status} {body}"
@@ -1814,18 +1813,18 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
             "reading back finds the committed put: {status} {read}"
         );
 
-        // Delegation: no connection survives BEGIN. Two attempts per run (the
-        // pool's one retry included), and the route runs the operation twice.
+        // Delegation: no connection survives BEGIN. One attempt per run, and
+        // the route runs the operation twice.
         let retryable = authorization(&new_session(&account)?.delegation_header)?;
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 4);
+        cut.arm(&[b"BEGIN"], 2);
         let (status, body, retry_after) = dispatch(
             node.client
                 .post("/delegate")
                 .header(Header::new("Authorization", retryable)),
         )
         .await;
-        ensure!(!cut.armed(), "all four BEGIN attempts were cut");
+        ensure!(!cut.armed(), "both BEGIN attempts were cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "delegate before any write: {status} {body}"
@@ -1936,17 +1935,14 @@ async fn postgres_delegate_is_retried_when_no_connection_survives_its_first_begi
 
         let header = authorization(&new_session(&account)?.delegation_header)?;
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 2);
+        cut.arm(&[b"BEGIN"], 1);
         let (status, body, _) = dispatch(
             node.client
                 .post("/delegate")
                 .header(Header::new("Authorization", header)),
         )
         .await;
-        ensure!(
-            !cut.armed(),
-            "both BEGIN attempts of the first run were cut"
-        );
+        ensure!(!cut.armed(), "the first run's BEGIN was cut");
         ensure!(
             status == Status::Ok,
             "delegate retried after a loss before any write: {status} {body}"
@@ -1970,15 +1966,13 @@ async fn postgres_delegate_is_retried_when_no_connection_survives_its_first_begi
     result.expect("delegate retry");
 }
 
-/// TC-735: a KV put's preparatory `BEGIN` is retried a bounded number of times
-/// (two in the recovering pool, around two passes of the preparatory block),
-/// and only while the `BEGIN` itself fails. Once a statement of the commit
-/// transaction has run, a lost connection is an unknown outcome and nothing is
-/// retried: a put that retried would answer 200.
+/// TC-735: a KV put's preparatory `BEGIN` is not retried, and a lost
+/// connection after a statement of the commit transaction has run is an
+/// unknown outcome that nothing retries: a put that retried would answer 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement() {
+async fn postgres_kv_put_begin_is_not_retried_and_nothing_follows_a_statement() {
     let Some(url) =
-        postgres_test_url("postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement")
+        postgres_test_url("postgres_kv_put_begin_is_not_retried_and_nothing_follows_a_statement")
     else {
         return;
     };
@@ -2008,14 +2002,14 @@ async fn postgres_kv_put_begin_retry_is_bounded_and_never_follows_a_statement() 
         let (status, body, _) = kv_put(&node, &session, "tc735/warm").await?;
         ensure!(status == Status::Ok, "warm-up put: {status} {body}");
 
-        // Five BEGIN cuts are armed, but a put makes four attempts at most, so
+        // Two BEGIN cuts are armed, but the put attempts its BEGIN once, so
         // one cut is still armed after it answers.
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 5);
+        cut.arm(&[b"BEGIN"], 2);
         let (status, body, _) = kv_put(&node, &session, "tc735/bounded").await?;
         ensure!(
             cut.armed(),
-            "a fifth BEGIN was attempted: the retry is not bounded"
+            "a second BEGIN was attempted: the put was retried"
         );
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),

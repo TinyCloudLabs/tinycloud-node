@@ -286,7 +286,7 @@ impl Fixture {
         format!("urn:uuid:tc951-{}-{}", self.name, self.requests)
     }
 
-    async fn put(&mut self, key: &str) -> Result<(), String> {
+    async fn put(&mut self, key: &str) -> Result<(), RequestError> {
         let key: Path = key.parse().unwrap();
         let nonce = self.nonce();
         let invocation = self
@@ -304,16 +304,16 @@ impl Fixture {
             .invoke::<MemoryStaging>(invocation, inputs)
             .await
             .map(|_| ())
-            .map_err(|error| format!("kv put: {error}"))
+            .map_err(|error| RequestError::new("kv put", &error, store_database_error(&error)))
     }
 
-    async fn get(&mut self, key: &str) -> Result<(), String> {
+    async fn get(&mut self, key: &str) -> Result<(), RequestError> {
         self.get_audited(key).await.map(|_| ())
     }
 
     /// A KV get; returns the id of its invocation, which the read audit
     /// records.
-    async fn get_audited(&mut self, key: &str) -> Result<Hash, String> {
+    async fn get_audited(&mut self, key: &str) -> Result<Hash, RequestError> {
         let key: Path = key.parse().unwrap();
         let nonce = self.nonce();
         let invocation = self
@@ -325,11 +325,14 @@ impl Fixture {
             .db
             .invoke::<MemoryStaging>(invocation, HashMap::new())
             .await
-            .map_err(|error| format!("kv get: {error}"))?;
+            .map_err(|error| RequestError::new("kv get", &error, store_database_error(&error)))?;
         if outcomes.len() == 1 {
             Ok(id)
         } else {
-            Err(format!("kv get: {} outcomes", outcomes.len()))
+            Err(RequestError::without_database(format!(
+                "kv get: {} outcomes",
+                outcomes.len()
+            )))
         }
     }
 
@@ -351,15 +354,33 @@ impl Fixture {
             .unwrap()
     }
 
-    async fn delegate(&mut self, key: &str) -> Result<(), String> {
+    /// A delegate through `retry_owner` with the pool's retry policy and
+    /// `Replay::Never`, as the `/delegate` route calls it.
+    async fn delegate(&mut self, key: &str) -> Result<(), RequestError> {
         let key: Path = key.parse().unwrap();
         let nonce = self.nonce();
         let delegation = self.owner.delegation(&key, &nonce).unwrap();
-        self.db
-            .delegate(delegation)
-            .await
+        let db = self.db.clone();
+        let (result, _) =
+            tinycloud_core::db_retry::isolate_overload(tinycloud_core::db_retry::retry_owner(
+                "delegate",
+                self.conn.retry_policy(),
+                tinycloud_core::db_retry::Replay::Never,
+                || db.delegate(delegation.clone()),
+                delegation_db_error,
+            ))
+            .await;
+        result
             .map(|_| ())
-            .map_err(|error| format!("delegate: {error}"))
+            .map_err(|error| RequestError::new("delegate", &error, delegation_db_error(&error)))
+    }
+
+    async fn request(&mut self, request: Request, key: &str) -> Result<(), RequestError> {
+        match request {
+            Request::Put => self.put(key).await,
+            Request::Get => self.get(key).await,
+            Request::Delegate => self.delegate(key).await,
+        }
     }
 
     /// Run two rounds of `WARM_CONCURRENCY` concurrent put + get pairs, so
@@ -552,14 +573,78 @@ impl Fixture {
     }
 }
 
-/// Retries and losses observed during one request.
+/// Losses and revalidations observed during one request.
 fn delta(before: PoolRecoveryStats, after: PoolRecoveryStats) -> PoolRecoveryStats {
     PoolRecoveryStats {
         losses: after.losses - before.losses,
-        retries: after.retries - before.retries,
-        idempotent_retries: after.idempotent_retries - before.idempotent_retries,
         revalidations: after.revalidations - before.revalidations,
         revalidation_failures: after.revalidation_failures - before.revalidation_failures,
+    }
+}
+
+/// A failed request: its message, and whether the database error inside it
+/// is a connection-class error (`is_connection_error`).
+#[derive(Debug)]
+struct RequestError {
+    message: String,
+    connection: bool,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl RequestError {
+    fn new(
+        what: &str,
+        error: &impl std::fmt::Display,
+        database: Option<&tinycloud_core::sea_orm::DbErr>,
+    ) -> Self {
+        Self {
+            message: format!("{what}: {error}"),
+            connection: database.is_some_and(is_connection_error),
+        }
+    }
+
+    fn without_database(message: String) -> Self {
+        Self {
+            message,
+            connection: false,
+        }
+    }
+}
+
+/// The database error inside a KV invocation's failure.
+fn store_database_error(
+    error: &tinycloud_core::TxStoreError<MemoryStore, MemoryStaging, StaticSecret>,
+) -> Option<&tinycloud_core::sea_orm::DbErr> {
+    match error {
+        tinycloud_core::TxStoreError::Tx(error) => delegation_db_error(error),
+        _ => None,
+    }
+}
+
+/// The requests the fixture sends. A put and a get call the database
+/// directly (neither is a retry owner); a delegate runs under `retry_owner`
+/// as the `/delegate` route does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Request {
+    Put,
+    Get,
+    Delegate,
+}
+
+impl Request {
+    const ALL: [Request; 3] = [Request::Put, Request::Get, Request::Delegate];
+
+    fn name(self) -> &'static str {
+        match self {
+            Request::Put => "put",
+            Request::Get => "get",
+            Request::Delegate => "delegate",
+        }
     }
 }
 
@@ -610,22 +695,6 @@ impl Proxy {
     fn cut_after_forwarding_in_order(&self, markers: &[&[u8]]) {
         self.cut_after
             .send_replace(Some(markers.iter().map(|m| m.to_vec()).collect()));
-    }
-
-    /// [`Self::cut_after_forwarding`] for the first `times` connections that
-    /// forward `marker`: each is re-armed as soon as the previous one fires.
-    fn cut_after_forwarding_times(&self, marker: &[u8], times: usize) {
-        self.cut_after_forwarding(marker);
-        let cut_after = Arc::clone(&self.cut_after);
-        let marker = marker.to_vec();
-        tokio::spawn(async move {
-            for _ in 1..times {
-                while cut_after.borrow().is_some() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                cut_after.send_replace(Some(vec![marker.clone()]));
-            }
-        });
     }
 }
 
@@ -692,9 +761,10 @@ async fn pipe(
 }
 
 /// Mass loss, as in a failover: every idle backend of the pool is
-/// terminated. Requests issued one at a time each succeed, with at most one
-/// retry, and the pool replaces the dead connections. (Concurrent requests
-/// right after the loss: `postgres_concurrent_wave_after_mass_loss`.)
+/// terminated. The first request, issued alone, meets one dead connection
+/// and fails once with a connection error; every request after it succeeds
+/// (the pool revalidates and replaces the other dead connections). (Concurrent
+/// requests right after the loss: `postgres_concurrent_wave_after_mass_loss`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_requests_survive_termination_of_every_idle_connection() {
     let Some(url) = postgres_url("postgres_requests_survive_termination_of_every_idle_connection")
@@ -707,16 +777,29 @@ async fn postgres_requests_survive_termination_of_every_idle_connection() {
     assert_eq!(before.losses, 0);
     fixture.terminate(&idle).await;
 
-    let mut per_request = Vec::new();
-    for request in ["put", "get", "delegate"] {
+    // The first request meets a dead connection and fails once with a
+    // connection error; it applied nothing. From then on the acquire hook
+    // checks each connection idle since before the loss as the queue hands
+    // it out, and closes the dead ones, so the rest succeed.
+    let written = fixture.row_count("kv_write").await;
+    let error = fixture
+        .put("after/mass")
+        .await
+        .expect_err("the first put meets a dead connection and is not retried");
+    assert!(error.connection, "{error}");
+    assert_eq!(
+        fixture.row_count("kv_write").await,
+        written,
+        "nothing applied"
+    );
+    let mut per_request = vec![("failed put", delta(before, fixture.stats()))];
+    for request in [Request::Put, Request::Get, Request::Delegate] {
         let start = fixture.stats();
-        let result = match request {
-            "put" => fixture.put("after/mass").await,
-            "get" => fixture.get("after/mass").await,
-            _ => fixture.delegate("after/mass").await,
-        };
-        result.unwrap_or_else(|error| panic!("{request} after mass termination: {error}"));
-        per_request.push((request, delta(start, fixture.stats())));
+        fixture
+            .request(request, "after/mass")
+            .await
+            .unwrap_or_else(|error| panic!("{request:?} after mass termination: {error}"));
+        per_request.push((request.name(), delta(start, fixture.stats())));
     }
     let total = delta(before, fixture.stats());
     eprintln!(
@@ -724,15 +807,8 @@ async fn postgres_requests_survive_termination_of_every_idle_connection() {
         idle.len()
     );
 
-    // The first statement met a dead connection and was retried once. From
-    // then on the acquire hook checks each connection idle since before the
-    // loss as the queue hands it out, and closes the dead ones.
-    assert_eq!(per_request[0].1.retries, 1, "{per_request:?}");
-    assert!(
-        per_request.iter().all(|(_, d)| d.retries <= 1),
-        "{per_request:?}"
-    );
-    assert_eq!((total.losses, total.retries), (1, 1), "{total:?}");
+    assert_eq!(per_request[0].1.losses, 1, "{per_request:?}");
+    assert_eq!(total.losses, 1, "{total:?}");
     assert!(
         total.revalidation_failures >= 1,
         "the hook closed dead idle connections: {total:?}"
@@ -751,7 +827,7 @@ async fn postgres_requests_survive_termination_of_every_idle_connection() {
             .unwrap_or_else(|error| panic!("get round {rounds}: {error}"));
     }
     let total = delta(before, fixture.stats());
-    assert_eq!((total.losses, total.retries), (1, 1), "{total:?}");
+    assert_eq!(total.losses, 1, "{total:?}");
     assert_eq!(
         total.revalidation_failures,
         (idle.len() - 1) as u64,
@@ -767,21 +843,27 @@ async fn postgres_requests_survive_termination_of_every_idle_connection() {
 }
 
 /// One stale connection among live ones, at every position of the FIFO idle
-/// queue in turn: whichever statement of a put, get or delegate meets it,
-/// requests cycle the queue through it and every request succeeds.
+/// queue in turn. Requests cycle the queue through it. The one request
+/// whose statement meets the dead connection fails once with a connection
+/// error and applies nothing (a put, get or direct database call is not a
+/// retry owner); the same request sent again succeeds. A delegate, whose
+/// owner (`retry_owner`, as the route calls it) reruns the operation, never
+/// fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_requests_survive_one_stale_pooled_connection() {
-    let Some(url) = postgres_url("postgres_requests_survive_one_stale_pooled_connection") else {
+async fn postgres_one_stale_pooled_connection_fails_one_request() {
+    let Some(url) = postgres_url("postgres_one_stale_pooled_connection_fails_one_request") else {
         return;
     };
     let mut fixture = Fixture::new("single", &url, None).await;
     fixture.warm().await;
     let mut rounds_to_reach = Vec::new();
+    let mut failed = Vec::new();
     for position in 0..WARM_CONNECTIONS {
         fixture.fill_pool().await;
         let victim = fixture.order_idle_queue(position).await;
         fixture.terminate(&BTreeSet::from([victim])).await;
         let before = fixture.stats();
+        let mut failures = Vec::new();
 
         // Until a statement meets the dead connection.
         let mut rounds = 0;
@@ -792,35 +874,57 @@ async fn postgres_requests_survive_one_stale_pooled_connection() {
                 "position {position}: the pool never reached the stale connection"
             );
             let key = format!("after/single/{position}/{rounds}");
-            for result in [
-                fixture.put(&key).await,
-                fixture.get(&key).await,
-                fixture.delegate(&key).await,
-            ] {
-                result.unwrap_or_else(|error| panic!("position {position}: {error}"));
+            for request in Request::ALL {
+                let written = fixture.row_count("kv_write").await;
+                match fixture.request(request, &key).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        assert!(
+                            request != Request::Delegate,
+                            "position {position}: its owner retries a delegate: {error}"
+                        );
+                        assert!(error.connection, "position {position}: {error}");
+                        assert_eq!(
+                            fixture.row_count("kv_write").await,
+                            written,
+                            "position {position}: the failed {request:?} applied nothing"
+                        );
+                        failures.push(request);
+                        fixture
+                            .request(request, &key)
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!("position {position}: {request:?} sent again: {error}")
+                            });
+                    }
+                }
             }
         }
+        assert!(
+            failures.len() <= 1,
+            "position {position}: one dead connection failed {failures:?}"
+        );
         let key = format!("after/single/{position}/tail");
         fixture.put(&key).await.unwrap();
         fixture.get(&key).await.unwrap();
         fixture.delegate(&key).await.unwrap();
         let total = delta(before, fixture.stats());
-        assert_eq!(
-            (total.losses, total.retries),
-            (1, 1),
-            "position {position}: {total:?}"
-        );
+        assert_eq!(total.losses, 1, "position {position}: {total:?}");
         rounds_to_reach.push(rounds);
+        failed.push(failures.first().copied());
     }
-    eprintln!("one stale connection at each queue position 0..{WARM_CONNECTIONS}: reached in request rounds {rounds_to_reach:?}");
+    eprintln!("one stale connection at each queue position 0..{WARM_CONNECTIONS}: reached in request rounds {rounds_to_reach:?}; failed requests {failed:?}");
     fixture.drop_schema().await;
 }
 
-/// Ordinary KV writes begin with an idempotent preparatory transaction.
-/// A stale idle connection must not produce an orphan or prevent the write.
+/// Ordinary KV writes begin with a preparatory transaction. A stale idle
+/// connection met by it fails the put once with a connection error, before
+/// anything is applied: no `kv_write` row and no orphan candidate or
+/// attempt remains, and the same put sent again commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_ordinary_put_recovers_stale_connection_without_orphan() {
-    let Some(url) = postgres_url("postgres_ordinary_put_recovers_stale_connection_without_orphan")
+async fn postgres_ordinary_put_on_a_stale_connection_fails_once_without_orphan() {
+    let Some(url) =
+        postgres_url("postgres_ordinary_put_on_a_stale_connection_fails_once_without_orphan")
     else {
         return;
     };
@@ -829,28 +933,38 @@ async fn postgres_ordinary_put_recovers_stale_connection_without_orphan() {
     let victim = fixture.order_idle_queue(0).await;
     fixture.terminate(&BTreeSet::from([victim])).await;
     let before = fixture.stats();
+    let written = fixture.row_count("kv_write").await;
+    let error = fixture
+        .put("after/preflight/stale")
+        .await
+        .expect_err("the put meets the dead connection and is not retried");
+    assert!(error.connection, "{error}");
+    let failed = delta(before, fixture.stats());
+    assert_eq!(failed.losses, 1, "{failed:?}");
+    assert_eq!(fixture.row_count("kv_write").await, written);
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    assert_eq!(fixture.row_count("kv_orphan_attempt").await, 0);
     fixture
         .put("after/preflight/stale")
         .await
-        .expect("ordinary write survives stale pooled connection");
-    let recovered = delta(before, fixture.stats());
-    assert_eq!(
-        (recovered.losses, recovered.retries),
-        (1, 1),
-        "{recovered:?}"
-    );
+        .expect("the same put sent again commits");
+    assert_eq!(fixture.row_count("kv_write").await, written + 1);
     assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
     assert_eq!(fixture.row_count("kv_orphan_attempt").await, 0);
     fixture.get("after/preflight/stale").await.unwrap();
+    assert_eq!(delta(before, fixture.stats()).losses, 1, "no further loss");
     fixture.drop_schema().await;
 }
 
 /// A protected write crosses the durable freeze row before storage.persist.
-/// Losing an idle pooled connection must not bypass that fence or strand its
-/// candidate; the resulting KV remains readable after the recovered commit.
+/// A stale idle connection met by it fails the put once with a connection
+/// error, before anything is applied: no `kv_write` row, guard row or
+/// orphan candidate remains. The same put sent again crosses the fence and
+/// commits, and once the space is frozen the fence still refuses a write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_protected_preupload_fence_survives_stale_connection() {
-    let Some(url) = postgres_url("postgres_protected_preupload_fence_survives_stale_connection")
+async fn postgres_protected_put_on_a_stale_connection_fails_once_and_keeps_the_fence() {
+    let Some(url) =
+        postgres_url("postgres_protected_put_on_a_stale_connection_fails_once_and_keeps_the_fence")
     else {
         return;
     };
@@ -859,29 +973,55 @@ async fn postgres_protected_preupload_fence_survives_stale_connection() {
     let victim = fixture.order_idle_queue(0).await;
     fixture.terminate(&BTreeSet::from([victim])).await;
     let before = fixture.stats();
+    let written = fixture.row_count("kv_write").await;
     let key = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/stale-pool";
+    let error = fixture
+        .put(key)
+        .await
+        .expect_err("the protected put meets the dead connection and is not retried");
+    assert!(error.connection, "{error}");
+    assert_eq!(delta(before, fixture.stats()).losses, 1);
+    assert_eq!(fixture.row_count("kv_write").await, written);
+    assert_eq!(fixture.row_count("meeting_legacy_write_guard").await, 0);
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+
     fixture
         .put(key)
         .await
-        .expect("protected put survives reconnect");
+        .expect("the same protected put sent again commits");
     fixture.get(key).await.expect("committed blob is readable");
-    let recovered = delta(before, fixture.stats());
-    assert_eq!(
-        (recovered.losses, recovered.retries),
-        (1, 1),
-        "{recovered:?}"
-    );
+    assert_eq!(fixture.row_count("kv_write").await, written + 1);
+    assert_eq!(fixture.row_count("meeting_legacy_write_guard").await, 1);
     assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+    assert_eq!(delta(before, fixture.stats()).losses, 1, "no further loss");
+
+    // The fence is honoured: a frozen space refuses the protected write.
+    fixture
+        .admin
+        .execute_unprepared(&format!(
+            "UPDATE {}.meeting_legacy_write_guard SET frozen = true",
+            fixture.schema
+        ))
+        .await
+        .unwrap();
+    let refused = fixture
+        .put("xyz.tinycloud.tinychat/connectors/fireflies/transcript/frozen")
+        .await
+        .expect_err("a frozen space refuses protected writes");
+    assert!(!refused.connection, "{refused}");
+    assert!(refused.message.contains("frozen"), "{refused}");
+    assert_eq!(fixture.row_count("kv_write").await, written + 1);
     fixture.drop_schema().await;
 }
 
-/// A dead backend during the protected row lock rolls back that transaction.
-/// Because storage has not run yet, the invocation can acquire a fresh
-/// transaction, retake the fence, then upload and commit exactly once.
+/// A dead backend during the protected row lock rolls back that
+/// transaction. The put is not retried: it fails once with a connection
+/// error before anything is applied (no `kv_write` row, guard row or
+/// orphan candidate), the lock is attempted exactly once, and the same put
+/// sent again retakes the fence, uploads and commits exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_preupload_freeze_lock_recovers_a_lost_transaction() {
-    let Some(url) = postgres_url("postgres_preupload_freeze_lock_recovers_a_lost_transaction")
-    else {
+async fn postgres_preupload_freeze_lock_loss_fails_the_put_once() {
+    let Some(url) = postgres_url("postgres_preupload_freeze_lock_loss_fails_the_put_once") else {
         return;
     };
     let mut fixture = Fixture::new("guardloss", &url, None).await;
@@ -902,34 +1042,57 @@ async fn postgres_preupload_freeze_lock_recovers_a_lost_transaction() {
         ))
         .await
         .unwrap();
+    let guard_attempts = |fixture: &Fixture| {
+        let admin = fixture.admin.clone();
+        let sql = format!("SELECT last_value AS n FROM {}.kill_once", fixture.schema);
+        async move {
+            admin
+                .query_one(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "n")
+                .unwrap()
+        }
+    };
+    let written = fixture.row_count("kv_write").await;
     let key = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/guard-loss";
+    let error = fixture
+        .put(key)
+        .await
+        .expect_err("the lost freeze-lock transaction fails the put");
+    assert!(error.connection, "{error}");
+    assert_eq!(
+        guard_attempts(&fixture).await,
+        1,
+        "the lock ran once, and killed"
+    );
+    assert_eq!(fixture.row_count("kv_write").await, written);
+    assert_eq!(fixture.row_count("meeting_legacy_write_guard").await, 0);
+    assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
+
     fixture
         .put(key)
         .await
-        .expect("retry preupload transaction after dead guard connection");
+        .expect("the same put sent again commits");
     fixture
         .get(key)
         .await
         .expect("only committed value survives");
-    let killed = fixture
-        .admin
-        .query_one(Statement::from_string(
-            DbBackend::Postgres,
-            format!("SELECT last_value AS n FROM {}.kill_once", fixture.schema),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "n")
-        .unwrap();
-    assert_eq!(killed, 2, "row lock was retried exactly once");
-    assert_eq!(fixture.row_count("kv_write").await, 2); // seed plus this put
+    assert_eq!(
+        guard_attempts(&fixture).await,
+        2,
+        "the second put took the lock once more, and was not killed"
+    );
+    assert_eq!(fixture.row_count("kv_write").await, written + 1);
+    assert_eq!(fixture.row_count("meeting_legacy_write_guard").await, 1);
     assert_eq!(fixture.row_count("kv_orphan_candidate").await, 0);
     fixture.drop_schema().await;
 }
 
 /// A network cut: a proxy resets every client connection while idle (EOF/RST,
-/// no FATAL message). Requests still succeed.
+/// no FATAL message). The first request meets a reset connection and fails
+/// once with a connection error; the requests after it succeed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_requests_survive_a_network_cut_of_every_connection() {
     let Some(url) = postgres_url("postgres_requests_survive_a_network_cut_of_every_connection")
@@ -955,6 +1118,17 @@ async fn postgres_requests_survive_a_network_cut_of_every_connection() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    let written = fixture.row_count("kv_write").await;
+    let error = fixture
+        .put("after/cut")
+        .await
+        .expect_err("the put meets a reset connection and is not retried");
+    assert!(error.connection, "{error}");
+    assert_eq!(
+        fixture.row_count("kv_write").await,
+        written,
+        "nothing applied"
+    );
     fixture.put("after/cut").await.unwrap();
     let first = delta(before, fixture.stats());
     fixture.get("after/cut").await.unwrap();
@@ -964,8 +1138,8 @@ async fn postgres_requests_survive_a_network_cut_of_every_connection() {
         "network cut of {} connections: first request {first:?}, total {total:?}",
         idle.len()
     );
-    assert_eq!(first.retries, 1, "{first:?}");
-    assert_eq!(total.retries, 1, "{total:?}");
+    assert_eq!(first.losses, 1, "{first:?}");
+    assert_eq!(total.losses, 1, "{total:?}");
     assert!(total.revalidation_failures >= 1, "{total:?}");
     fixture.drop_schema().await;
 }
@@ -1015,7 +1189,7 @@ async fn postgres_writes_are_never_retried() {
         .expect_err("an INSERT on a terminated connection fails");
     assert!(is_connection_error(&error), "{error:?}");
     let after = delta(before, fixture.stats());
-    assert_eq!((after.losses, after.retries), (1, 0), "{after:?}");
+    assert_eq!(after.losses, 1, "{after:?}");
     assert_eq!(fixture.row_count("tc951_effects").await, 0);
     eprintln!("INSERT on a terminated connection: {error:?}");
 
@@ -1030,7 +1204,7 @@ async fn postgres_writes_are_never_retried() {
         .expect_err("the INSERT's response was lost");
     assert!(is_connection_error(&error), "{error:?}");
     let after = delta(before, fixture.stats());
-    assert_eq!((after.losses, after.retries), (1, 0), "{after:?}");
+    assert_eq!(after.losses, 1, "{after:?}");
     assert_eq!(
         fixture.row_count("tc951_effects").await,
         1,
@@ -1233,18 +1407,23 @@ async fn postgres_steady_state_acquire_costs_no_ping() {
     assert_eq!(
         steady,
         PoolRecoveryStats::default(),
-        "no loss, no retry and no ping in the steady state"
+        "no loss and no ping in the steady state"
     );
 
     let victim = fixture.order_idle_queue(0).await;
     fixture.terminate(&BTreeSet::from([victim])).await;
+    let error = fixture
+        .put("steady/after-loss")
+        .await
+        .expect_err("the put meets the dead connection and is not retried");
+    assert!(error.connection, "{error}");
     fixture.put("steady/after-loss").await.unwrap();
     let after = fixture.stats();
     eprintln!(
         "steady state {steady:?}; after one loss among {} idle connections {after:?}",
         idle.len()
     );
-    assert_eq!((after.losses, after.retries), (1, 1), "{after:?}");
+    assert_eq!(after.losses, 1, "{after:?}");
     assert!(
         after.revalidations >= 1,
         "connections idle since before the loss are pinged: {after:?}"
@@ -1318,9 +1497,9 @@ fn select_one() -> Statement {
 
 /// PostgreSQL's `idle_session_timeout` ends an idle pooled session with
 /// FATAL 57P05 (Astra's repro). It is a lost connection: on the production
-/// pool, a read and a `BEGIN` after the timeout each succeed with one retry,
-/// and once a loss is seen the other reaped connections are revalidated
-/// before reuse.
+/// pool, a read and a `BEGIN` after the timeout each fail once with a
+/// connection error and are not retried by the pool, and once a loss is
+/// seen the other reaped connections are revalidated before reuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_idle_session_timeout_is_a_lost_connection() {
     let Some(url) = postgres_url("postgres_idle_session_timeout_is_a_lost_connection") else {
@@ -1340,34 +1519,52 @@ async fn postgres_idle_session_timeout_is_a_lost_connection() {
     eprintln!("a session reaped by idle_session_timeout: {error:?}");
     assert!(is_connection_error(&error), "{error:?}");
 
-    // One connection: a read, then a BEGIN, each after the timeout.
+    // One connection: a read, then a BEGIN, each after the timeout. Each
+    // meets the reaped session and fails once; the pool retries neither,
+    // and the next request on a fresh connection succeeds.
     let conn = session_pool(&url, &unique("57p05-one"), timeout, 1, None).await;
     let recovery = Arc::clone(conn.recovery().unwrap());
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let error = conn
+        .query_one(select_one())
+        .await
+        .expect_err("the read on a reaped session fails");
+    assert!(is_connection_error(&error), "{error:?}");
+    assert_eq!(recovery.stats().losses, 1);
     conn.query_one(select_one())
         .await
-        .expect("the read recovers")
+        .expect("the next read gets a fresh connection")
         .unwrap();
-    assert_eq!((recovery.stats().losses, recovery.stats().retries), (1, 1));
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let tx = conn.begin().await.expect("BEGIN recovers");
+    let error = conn
+        .begin()
+        .await
+        .expect_err("BEGIN on a reaped session fails");
+    assert!(is_connection_error(&error), "{error:?}");
+    assert_eq!(recovery.stats().losses, 2);
+    let tx = conn.begin().await.expect("the next BEGIN succeeds");
     tx.query_one(select_one()).await.unwrap().unwrap();
     tx.commit().await.unwrap();
-    assert_eq!((recovery.stats().losses, recovery.stats().retries), (2, 2));
+    assert_eq!(recovery.stats().losses, 2);
 
-    // Several reaped connections: after the first loss the rest are
-    // revalidated, and closed, before reuse.
+    // Several reaped connections: the first read meets one and fails; after
+    // that loss the rest are revalidated, and closed, before reuse.
     let conn = session_pool(&url, &unique("57p05-many"), timeout, 4, None).await;
     let recovery = Arc::clone(conn.recovery().unwrap());
     open_idle(&conn, 4).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let error = conn
+        .query_one(select_one())
+        .await
+        .expect_err("the first read meets a reaped connection");
+    assert!(is_connection_error(&error), "{error:?}");
     conn.query_one(select_one())
         .await
-        .expect("the read recovers")
+        .expect("the next read revalidates, closes the dead ones and recovers")
         .unwrap();
     let stats = recovery.stats();
-    eprintln!("4 reaped connections, one read: {stats:?}");
-    assert_eq!((stats.losses, stats.retries), (1, 1), "{stats:?}");
+    eprintln!("4 reaped connections, two reads: {stats:?}");
+    assert_eq!(stats.losses, 1, "{stats:?}");
     assert!(
         stats.revalidations >= 1 && stats.revalidation_failures >= 1,
         "{stats:?}"
@@ -1434,7 +1631,7 @@ async fn postgres_idle_reaped_connections_are_revalidated_before_reuse() {
     }
     let stats = recovery.stats();
     eprintln!("{rounds} rounds of INSERT and BEGIN after 1.5 s idle: {stats:?}");
-    assert_eq!((stats.losses, stats.retries), (0, 0), "{stats:?}");
+    assert_eq!(stats.losses, 0, "{stats:?}");
     assert!(stats.revalidations > 0, "{stats:?}");
     let rows = admin
         .query_one(Statement::from_string(
@@ -1481,7 +1678,7 @@ async fn postgres_side_effecting_select_is_not_retried() {
         .expect_err("the nextval response was lost");
     assert!(is_connection_error(&error), "{error:?}");
     let after = delta(before, fixture.stats());
-    assert_eq!((after.losses, after.retries), (1, 0), "{after:?}");
+    assert_eq!(after.losses, 1, "{after:?}");
     let last = fixture
         .admin
         .query_one(Statement::from_string(
@@ -1501,9 +1698,10 @@ async fn postgres_side_effecting_select_is_not_retried() {
 
 /// A concurrent wave right after every idle connection died. The tasks that
 /// acquired a dead connection before the first loss was observed each meet
-/// it: the reads and BEGINs among them are retried and succeed; the writes
-/// among them fail, never more than the dead connections. Every request
-/// after the wave succeeds with no further loss.
+/// it and fail once with a connection error, whatever their kind (read,
+/// BEGIN or write): the pool retries none of them, and no more fail than
+/// there were dead connections. Every request after the wave succeeds with
+/// no further loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_concurrent_wave_after_mass_loss() {
     let Some(url) = postgres_url("postgres_concurrent_wave_after_mass_loss") else {
@@ -1559,31 +1757,32 @@ async fn postgres_concurrent_wave_after_mass_loss() {
             })
         })
         .collect::<Vec<_>>();
-    let mut write_failures = 0u64;
+    let mut failures = 0u64;
     let mut written = 0i64;
     for task in tasks {
         let (kind, result) = task.await.unwrap();
         match (kind, result) {
-            (Kind::Write, Err(error)) => {
-                assert!(is_connection_error(&error), "{error:?}");
-                write_failures += 1;
+            (_, Err(error)) => {
+                assert!(is_connection_error(&error), "{kind:?}: {error:?}");
+                failures += 1;
             }
-            (_, Err(error)) => panic!("{kind:?} failed: {error:?}"),
             (Kind::Read, Ok(())) => {}
             (_, Ok(())) => written += 1,
         }
     }
     let wave_stats = delta(before, fixture.stats());
     eprintln!(
-        "wave of {} after terminating {} idle connections: {write_failures} write failures, {wave_stats:?}",
+        "wave of {} after terminating {} idle connections: {failures} failed requests, {wave_stats:?}",
         3 * per_kind,
         idle.len()
     );
-    assert!(write_failures <= idle.len() as u64);
+    assert!(
+        (1..=idle.len() as u64).contains(&failures),
+        "{failures} failed requests"
+    );
     assert_eq!(
-        wave_stats.losses,
-        wave_stats.retries + write_failures,
-        "every loss was retried, or is a failed write: {wave_stats:?}"
+        wave_stats.losses, failures,
+        "each failed request met one dead connection and none was retried: {wave_stats:?}"
     );
     assert_eq!(
         fixture.row_count("tc951_wave").await,
@@ -1619,10 +1818,13 @@ async fn postgres_concurrent_wave_after_mass_loss() {
 }
 
 /// The read audit commits on PostgreSQL as one `WITH ... INSERT` statement,
-/// which the read-only classifier does not retry. It goes through
-/// `execute_idempotent` instead: with one dead connection at each position
-/// of the idle queue, some KV get's audit statement meets it, is retried,
-/// and the get succeeds with its audit row written exactly once.
+/// which its owner (`retry_owner` with `Replay::IdempotentStatement`) runs
+/// once more after a lost connection. A KV get itself is not an owner: with
+/// one dead connection at each position of the idle queue, a get whose
+/// authorization statements meet it fails once with a connection error and
+/// its client-level retry succeeds; a get whose audit statement meets it
+/// succeeds in one call, with its audit row written exactly once. Some
+/// position must put the dead connection under the audit statement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_read_audit_statement_survives_a_stale_connection() {
     let Some(url) = postgres_url("postgres_read_audit_statement_survives_a_stale_connection")
@@ -1639,13 +1841,23 @@ async fn postgres_read_audit_statement_survives_a_stale_connection() {
         fixture.terminate(&BTreeSet::from([victim])).await;
         let before = fixture.stats();
         let mut rounds = 0;
+        let mut failed_gets = 0;
         while fixture.stats().losses == before.losses {
             rounds += 1;
             assert!(rounds <= 30, "position {position}: never reached");
-            let id = fixture
-                .get_audited("audit/key")
-                .await
-                .unwrap_or_else(|error| panic!("position {position}: {error}"));
+            let id = match fixture.get_audited("audit/key").await {
+                Ok(id) => id,
+                Err(error) => {
+                    // A statement of the get that is not the audit met the
+                    // dead connection: it failed once and applied nothing.
+                    assert!(error.connection, "position {position}: {error}");
+                    failed_gets += 1;
+                    fixture
+                        .get_audited("audit/key")
+                        .await
+                        .unwrap_or_else(|error| panic!("position {position}: retry: {error}"))
+                }
+            };
             assert_eq!(
                 fixture.audit_rows(id).await,
                 1,
@@ -1653,12 +1865,12 @@ async fn postgres_read_audit_statement_survives_a_stale_connection() {
             );
         }
         let total = delta(before, fixture.stats());
-        assert_eq!(
-            (total.losses, total.retries),
-            (1, 1),
-            "position {position}: {total:?}"
+        assert_eq!(total.losses, 1, "position {position}: {total:?}");
+        assert!(
+            failed_gets <= 1,
+            "position {position}: {failed_gets} failed gets"
         );
-        if total.idempotent_retries == 1 {
+        if failed_gets == 0 {
             audit_hits.push(position);
         }
     }
@@ -1690,15 +1902,15 @@ fn id_marker(delegation: &Delegation) -> Vec<u8> {
     }
 }
 
-/// TC-2346: a connection that is lost on the delegation's lookup and on that
-/// statement's own retry (a burst, not one stale connection) before any
-/// write fails the first run of the operation. The operation is run once more
-/// and succeeds, and the delegation is stored once. The loss is a real reset
-/// socket from a proxy, which the pool reports as `io`.
+/// TC-2346, TC-2610: a connection lost on the delegation's lookup, before
+/// any write, fails the first run of the delegate operation. The operation
+/// owner (`retry_owner`, as the `/delegate` route calls it) runs it once
+/// more and it succeeds, and the delegation is stored once. The loss is a
+/// real reset socket from a proxy, which the pool reports as `io`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_delegate_is_retried_once_after_a_loss_before_any_write() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tinycloud_core::db_pool::track_writes_retrying;
+    use tinycloud_core::db_retry::{isolate_overload, retry_owner, Replay};
 
     let Some(url) = postgres_url("postgres_delegate_is_retried_once_after_a_loss_before_any_write")
     else {
@@ -1711,28 +1923,30 @@ async fn postgres_delegate_is_retried_once_after_a_loss_before_any_write() {
     let key: Path = "tc2346/retry".parse().unwrap();
     let nonce = fixture.nonce();
     let delegation = fixture.owner.delegation(&key, &nonce).unwrap();
-    // The lookup `SELECT ... WHERE id = $1` of the first run, then of its
-    // statement retry; the second run's lookup passes.
-    proxy.cut_after_forwarding_times(&id_marker(&delegation), 2);
+    // The lookup `SELECT ... WHERE id = $1` of the first run; the second
+    // run's lookup passes.
+    proxy.cut_after_forwarding(&id_marker(&delegation));
 
     let attempts = AtomicUsize::new(0);
     let db = fixture.db.clone();
-    let (result, applied) = track_writes_retrying(
+    let (result, applied) = isolate_overload(retry_owner(
         "delegate",
-        fixture.conn.retry_window(),
+        fixture.conn.retry_policy(),
+        Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let (db, delegation) = (db.clone(), delegation.clone());
             async move { db.delegate(delegation).await }
         },
         delegation_db_error,
-    )
+    ))
     .await;
 
     assert!(result.is_ok(), "{:?}", result.err().map(|e| e.to_string()));
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry");
     assert!(applied, "the second run wrote");
     assert_eq!(fixture.row_count("delegation").await, 1);
+    assert_eq!(fixture.stats().losses, 1, "one lost connection, one retry");
     fixture.drop_schema().await;
 }
 
@@ -1742,7 +1956,8 @@ async fn postgres_delegate_is_retried_once_after_a_loss_before_any_write() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_delegate_is_not_retried_after_its_transaction_began() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tinycloud_core::db_pool::{classify_failure, track_writes_retrying, TransientFailure};
+    use tinycloud_core::db_pool::{classify_failure, TransientFailure};
+    use tinycloud_core::db_retry::{isolate_overload, retry_owner, Replay};
 
     let Some(url) = postgres_url("postgres_delegate_is_not_retried_after_its_transaction_began")
     else {
@@ -1761,16 +1976,17 @@ async fn postgres_delegate_is_not_retried_after_its_transaction_began() {
 
     let attempts = AtomicUsize::new(0);
     let db = fixture.db.clone();
-    let (result, applied) = track_writes_retrying(
+    let (result, applied) = isolate_overload(retry_owner(
         "delegate",
-        fixture.conn.retry_window(),
+        fixture.conn.retry_policy(),
+        Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let (db, delegation) = (db.clone(), delegation.clone());
             async move { db.delegate(delegation).await }
         },
         delegation_db_error,
-    )
+    ))
     .await;
 
     let error = match result {

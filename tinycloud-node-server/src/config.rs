@@ -1923,16 +1923,17 @@ pub struct DatabaseConfig {
     /// kernel default.
     #[serde(default = "default_database_tcp_user_timeout_ms")]
     pub tcp_user_timeout_ms: u64,
-    /// A read (or `BEGIN`) whose connection is lost is retried once only if
-    /// that attempt failed within this many milliseconds (TC-1054). A
-    /// connection found dead at once is retried; one whose loss took a
-    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not. This
-    /// bounds the retry, so one read waits for one detection plus at most
-    /// this window (~40 s) of connection-loss detection rather than two
-    /// detections (~60 s). It is not a request or per-db lock deadline:
-    /// acquisition waits, legitimate transfers and queueing behind the lock
-    /// add to it (those are bounded by `invocation.deadline_ms` and the
-    /// `storage.sql` wait bounds, TC-1274).
+    /// The time budget of one database operation's single retry, in
+    /// milliseconds (TC-2610). An operation (`/delegate`, the `/invoke`
+    /// authorization step, a KV read, a read-audit batch, the metadata read
+    /// that starts a SQL hydration) whose connection is lost is run once more
+    /// only when nothing can have committed, and only if the first run leaves
+    /// room in this budget for a short backoff and a second run; the second
+    /// run is stopped when the budget ends. Statements, `BEGIN` and `COMMIT`
+    /// are not retried on their own. It is not a request or per-db lock
+    /// deadline: acquisition waits, legitimate transfers and queueing behind
+    /// the lock add to it (those are bounded by `invocation.deadline_ms` and
+    /// the `storage.sql` wait bounds, TC-1274).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
     /// How long an authorized read waits for its audit record to commit

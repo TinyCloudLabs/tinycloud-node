@@ -8,7 +8,11 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tinycloud_core::ColumnEncryption;
+use tinycloud_core::{
+    db_retry::{retry_owner, Replay},
+    sea_orm::DbErr,
+    ColumnEncryption,
+};
 
 type WebhookMac = Hmac<Sha256>;
 
@@ -68,12 +72,18 @@ impl WebhookDispatcher {
         let mut unsent = Vec::<Claim>::new();
         let mut claim_error = None;
         for _ in 0..DISPATCH_BATCH_SIZE {
-            let delivery = match self
-                .tinycloud
-                .claim_due_webhook_deliveries(1, lease)
-                .await
-                .context("claiming due webhook deliveries")
-            {
+            // The claim is a SELECT, a conditional UPDATE and a read-back. A
+            // second run takes a fresh token and only happens when the tracker
+            // shows the UPDATE cannot have committed (TC-2610).
+            let (claimed, _) = retry_owner(
+                "webhook_claim_delivery",
+                self.tinycloud.connection().retry_policy(),
+                Replay::Never,
+                || self.tinycloud.claim_due_webhook_deliveries(1, lease),
+                |error: &DbErr| Some(error),
+            )
+            .await;
+            let delivery = match claimed.context("claiming due webhook deliveries") {
                 Ok(claimed) => match claimed.into_iter().next() {
                     Some(delivery) => delivery,
                     None => break,
@@ -142,19 +152,26 @@ impl WebhookDispatcher {
         let authorized = match authority.get(&delivery.subscription_id) {
             Some(authorized) => *authorized,
             None => {
-                let authorized = self
-                    .tinycloud
-                    .hook_register_authority_holds(
-                        &delivery.subscriber_did,
-                        &delivery.space_id,
-                        &crate::hooks::hook_scope_path(
-                            &delivery.target_service,
-                            delivery.path_prefix.as_deref(),
-                        ),
-                        OffsetDateTime::now_utc(),
-                    )
-                    .await
-                    .context("checking webhook subscription authority")?;
+                let scope_path = crate::hooks::hook_scope_path(
+                    &delivery.target_service,
+                    delivery.path_prefix.as_deref(),
+                );
+                let (authorized, _) = retry_owner(
+                    "webhook_authority",
+                    self.tinycloud.connection().retry_policy(),
+                    Replay::Never,
+                    || {
+                        self.tinycloud.hook_register_authority_holds(
+                            &delivery.subscriber_did,
+                            &delivery.space_id,
+                            &scope_path,
+                            OffsetDateTime::now_utc(),
+                        )
+                    },
+                    |error: &DbErr| Some(error),
+                )
+                .await;
+                let authorized = authorized.context("checking webhook subscription authority")?;
                 if !authorized {
                     self.tinycloud
                         .deactivate_hook_subscription(&delivery.subscription_id)
@@ -752,6 +769,7 @@ mod tests {
         };
         use tinycloud_core::{
             db_pool::PoolRecoveryStats,
+            db_retry::isolate_overload,
             hash::hash,
             models::{abilities, actor, delegation},
             sea_orm::{ConnectionTrait, DbBackend, Statement},
@@ -1114,8 +1132,6 @@ mod tests {
         fn delta(before: PoolRecoveryStats, after: PoolRecoveryStats) -> PoolRecoveryStats {
             PoolRecoveryStats {
                 losses: after.losses - before.losses,
-                retries: after.retries - before.retries,
-                idempotent_retries: after.idempotent_retries - before.idempotent_retries,
                 revalidations: after.revalidations - before.revalidations,
                 revalidation_failures: after.revalidation_failures - before.revalidation_failures,
             }
@@ -1187,11 +1203,13 @@ mod tests {
             let idle = fixture.fill_pool().await;
             let before = fixture.stats();
             fixture.terminate(&idle).await;
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             let mass = delta(before, fixture.stats());
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
-            assert_eq!((mass.losses, mass.retries), (1, 1), "{mass:?}");
+            assert_eq!(mass.losses, 1, "{mass:?}");
             assert!(mass.revalidation_failures >= 1, "{mass:?}");
 
             // (a') the authority check's statement is reset once.
@@ -1199,12 +1217,14 @@ mod tests {
             fixture.fill_pool().await;
             let before = fixture.stats();
             fixture.proxy.cuts.store(1, Ordering::SeqCst);
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             let reauth = delta(before, fixture.stats());
             assert_eq!(fixture.proxy.reset.load(Ordering::SeqCst), 1);
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
-            assert_eq!((reauth.losses, reauth.retries), (1, 1), "{reauth:?}");
+            assert_eq!(reauth.losses, 1, "{reauth:?}");
             eprintln!("dispatch after mass termination {mass:?}; after one reset authority check {reauth:?}");
             fixture.drop_schema().await;
         }
@@ -1228,7 +1248,9 @@ mod tests {
 
             let before = fixture.stats();
             fixture.proxy.cuts.store(-1, Ordering::SeqCst);
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             fixture.proxy.cuts.store(0, Ordering::SeqCst);
             let failed = delta(before, fixture.stats());
             assert_eq!(
@@ -1236,7 +1258,7 @@ mod tests {
                 2,
                 "the authority check ran, and was retried once"
             );
-            assert_eq!((failed.losses, failed.retries), (2, 1), "{failed:?}");
+            assert_eq!(failed.losses, 2, "{failed:?}");
             assert!(
                 fixture.subscription_active(&subscription).await,
                 "a connection error must not deactivate the subscription"
@@ -1253,7 +1275,9 @@ mod tests {
                 "no callback was sent"
             );
 
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
             eprintln!("authority check unreachable for one pass: {failed:?}");
