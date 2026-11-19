@@ -80,7 +80,7 @@ While the database is slow, retries must not add load. Owner-observable signal: 
 - `failure_kind` is `pool_timeout` or `statement_timeout` (stamped where `lost()` is called today, and by the
   owner when it sees one in a result).
 
-Decision (Naomi, option 1): any of the three stamps the marker, and while it is active ALL retries are
+Decision: any of the three stamps the marker, and while it is active ALL retries are
 suppressed for `OVERLOAD_SUPPRESS = 30 s` (every `retry_owner`, including `IdempotentStatement`; run-once,
 `skipped_overload` counted). Process-wide. The signal reflects timeouts already observed, so it takes effect
 from the first one.
@@ -113,7 +113,7 @@ Logging (`tracing::warn!` start, `tracing::info!` end), fields only `error_class
 (the window, 30000): "retries suppressed after a database overload signal" / "retries resumed". No request,
 space, statement or error text (TC-961).
 
-Fallback if Naomi's choice is revisited: delete `OverloadSignal` (~40 lines, three stamp sites, one check).
+To remove it: delete `OverloadSignal` (~40 lines, three stamp sites, one check).
 
 ## API (in `db_pool.rs`)
 
@@ -246,12 +246,11 @@ nested owner: outer + inner failing runs exactly one retry in total, and the inn
 `IdempotentStatement` retries an autocommit write that lost its connection, does NOT retry on `pool_timeout`,
 and does NOT retry when an explicit transaction's `COMMIT` is lost (the idempotent-path lost-COMMIT test).
 Route-level: existing `operation_retry.rs` retargeted. Existing statement-retry tests in `db_pool.rs` and
-`postgres_connection_recovery.rs` that pin the removed layers are deleted or rewritten (listed to the lead before push,
-and not pushed before Naomi approves).
+`postgres_connection_recovery.rs` that pin the removed layers are deleted or rewritten.
 
 ## Decisions
 
-Accepted in review: drop preparatory replay; `IdempotentStatement` only for `read_audit`; no concurrency cap in the first slice.
-Overload suppression: Naomi chose the process-wide signal (30 s, all retries), with start/end log lines.
+Accepted: drop preparatory replay; `IdempotentStatement` only for `read_audit`; no concurrency cap in the first slice.
+Overload suppression: a process-wide signal (30 s, all retries), with start and end log lines.
 
 Details: TC-2610
