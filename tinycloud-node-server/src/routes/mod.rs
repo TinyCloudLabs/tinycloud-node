@@ -279,7 +279,11 @@ where
         return InvokeError::Deleted("space_deleted");
     }
     if matches!(error, TxError::LifecycleUnavailable) {
-        return (Status::ServiceUnavailable, "Space lifecycle unavailable".into()).into();
+        return (
+            Status::ServiceUnavailable,
+            "Space lifecycle unavailable".into(),
+        )
+            .into();
     }
     match error.revocation_code() {
         Some(code) => InvokeError::Revoked(code, error.to_string()),
