@@ -40,8 +40,8 @@ jobs:
       CARGO_TARGET_DIR: target/threshold
       PROPTEST_CASES: "1024"
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -63,7 +63,7 @@ jobs:
         echo "${tool_dir}" >> "${GITHUB_PATH}"
     - name: Check threshold dependency policy
       run: cargo deny --manifest-path tinycloud-threshold/Cargo.toml --locked --config tinycloud-threshold/deny.toml check licenses bans advisories sources
-    - uses: oven-sh/setup-bun@v2
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       with:
         bun-version: "1.4.4"
     - name: Run the independent vector checker over every committed document
@@ -76,10 +76,10 @@ jobs:
     timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -128,10 +128,10 @@ jobs:
       TINYCLOUD_TEST_BLACKHOLE: "1"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
 
@@ -211,7 +211,7 @@ jobs:
 
     - name: Retain holder history for SDK verification
       if: always() && matrix.group == 'integration-rest'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: holder-renewal-history-sdk
         path: ${{ runner.temp }}/holder-renewal-history
@@ -272,10 +272,10 @@ jobs:
     timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -298,10 +298,10 @@ jobs:
     timeout-minutes: 10
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
 
@@ -312,13 +312,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Setup Node
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
         node-version: 20
     - name: Verify generated capability artifacts match capabilities.json
@@ -346,8 +346,8 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -356,7 +356,7 @@ jobs:
         shared-key: rust-1.97.1-test-m1-realdata
         workspaces: test/m1-realdata-e2e -> target
         save-if: ${{ github.ref == 'refs/heads/main' }}
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.12"
     - name: Install M1 vector generator dependencies
@@ -382,8 +382,8 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
     - name: Resolve each fetchable workspace with --locked
       run: |
         for manifest in Cargo.toml test/m1-realdata-e2e/Cargo.toml test/load/signer/Cargo.toml; do
@@ -408,12 +408,12 @@ jobs:
       contents: read
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -588,7 +588,7 @@ jobs:
       run: echo "::notice title=w5 lockfile not checked::POLICY_ENGINE_DEPLOY_KEY is not available (fork PR, or the key is not added yet); the w5 --locked resolve was skipped."
     - name: Checkout TinyCloud repository
       if: env.HAS_DEPLOY_KEY == 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
     # No toolchain action: rustup on the runner installs the toolchain pinned

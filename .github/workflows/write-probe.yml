@@ -119,10 +119,10 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.gate.outputs.run == 'true'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.gate.outputs.run == 'true'
         with:
           node-version: "20"
@@ -141,7 +141,7 @@ jobs:
       # file in the Actions cache (the newest entry wins on restore).
       - name: Restore failure count
         if: steps.gate.outputs.run == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: test/probe/.state
           key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
@@ -164,7 +164,7 @@ jobs:
 
       - name: Save failure count
         if: always() && steps.gate.outputs.run == 'true' && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure')
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: test/probe/.state
           key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
@@ -222,10 +222,10 @@ jobs:
           echo "::error::No confirmed handover from normal probe runs after 10 min; not starting the watch. Re-dispatch mode=dense."
           exit 1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.gate.outputs.run == 'true'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.gate.outputs.run == 'true'
         with:
           node-version: "20"
@@ -239,7 +239,7 @@ jobs:
       # Same failure state as normal runs, so a streak carries across modes.
       - name: Restore failure count
         if: steps.gate.outputs.run == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: test/probe/.state
           key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
@@ -259,7 +259,7 @@ jobs:
 
       - name: Save failure count
         if: always() && steps.gate.outputs.run == 'true' && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure')
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: test/probe/.state
           key: write-probe-state-${{ github.run_id }}-${{ github.run_attempt }}
