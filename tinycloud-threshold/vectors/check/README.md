@@ -1,17 +1,19 @@
 # Independent vector and transcript checker
 
 Independent TypeScript computation for `../v1/primitives.json`,
-`../v1/dkg-genesis.json` and `../v1/reshare.json`, using `@noble/curves` 2.4.0
-and Bun 1.4.4. All scalar inputs are public test values.
+`../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json` and
+`../v1/chain.json` (and the certificate-core document `../v1/cert-core.json`),
+using `@noble/curves` 2.4.0 and Bun 1.4.4. All scalar inputs are public test
+values.
 
 ```sh
 bun install --frozen-lockfile && bun run check
 ```
 
 `check` runs the Bun tests, TypeScript checking, and the real vector CLI over
-all three committed documents. The existing `threshold` CI job invokes this
-command. To check one JSON file (primitive, DKG or redistribution; the kind is
-read from its `spec_sections`):
+all six committed documents. The existing `threshold` CI job invokes this
+command. To check one JSON file (primitive, certificate, DKG, re-key,
+redistribution or chain; the transcript kind is read from its `spec_sections`):
 
 ```sh
 bun run vectors /absolute/path/to/document.json
@@ -24,7 +26,7 @@ CLI module, not the calling directory.
 ## Transcript verification (S0.5)
 
 `dkg.ts` (`dkgVerifyTranscript`) and `reshare.ts` (`reshareVerifyTranscript`)
-recompute a whole genesis DKG or reshare/refresh outcome from the raw signed
+recompute a whole genesis (or re-key) DKG or reshare/refresh outcome from the raw signed
 records, using `ceremony.ts` for the S0.2 layer. Check order:
 
 1. Byte-length sum of every closure body/signature and member envelope/signature
@@ -49,6 +51,102 @@ commitments, public shares, excluded dealers) are normative; error codes and
 their precedence are informative. Conditions SPEC describes without naming an
 error use the defaults in `DEFAULT_ERROR` (`ceremony.ts`), ruled by Naomi on
 2026-10-30.
+
+## Re-key and chain (S0.5)
+
+A re-key is the S0.3 DKG under an owner-authorized ceremony of kind 4 pinned to the
+current certificate. `dkgVerifyTranscript(anchor, statement, records, verify, pinned?)`
+is the one DKG entry point: without `pinned` the ceremony must be a genesis, with the
+pinned current certificate it must be a re-key, and every other kind, or either kind at
+the other call shape, is `InvalidCeremony`. `authorizeRekey` (`dkg.ts`) checks the owner
+signature and anchor of the statement, the pinned certificate (decode, anchor, owner
+signature, evaluated public shares; verified as soon as it is received, so no statement
+is judged against an unverified certificate), kind 4, the statement's current digest
+equal to the pinned digest, the checked successor `epoch` and `rekey`, and then the §3.0
+genesis budget for the *new* threshold (`UnsupportedFaultBudget`), all before any record
+is read. Rounds, cohorts
+(recipients only; a cohort-2 envelope does not resolve and is refused), H0 label, QUAL,
+R4–R6 and output are the unchanged genesis code. An output whose master key equals the
+pinned one is refused (SPEC names no code; `DEFAULT_ERROR.rekeyMpk`, informative).
+
+`chain.ts` (`verifyChainStep`, `chainOrder`, `verifyChain`) takes one `chain_step` case
+and in this order: sums transcript bytes (`LimitExceeded`); requires a genesis to name no
+predecessor and every other kind to name one; recomputes the ceremony outcome through the
+DKG (genesis, re-key) or redistribution (reshare, refresh) verifier against the pinned
+`previous_certificate`; verifies the candidate certificate (decode, anchor, owner
+signature); checks S0.2 lineage by ceremony kind against the pinned predecessor
+(`checkLineage`: reshare/refresh keep mpk, `rekey` and `genesis_t`; re-key changes mpk,
+names the old mpk, adds one to `rekey` and sets `genesis_t = t`; every successor has the
+pinned digest and epoch + 1); rebuilds the canonical body from the recomputed outcome and
+the pinned predecessor and requires it byte-for-byte; then verifies every readiness
+receipt (strict signature over the READY preimage, no duplicates or non-members) before
+counting, the all-holders quorum (`NotEnoughReady` below `n`), and the activation (exact
+sorted-receipt-hash preimage, owner signature). `chainOrder` requires the first case to
+pin nothing and case k to pin exactly case k−1's certificate (body and signature).
+`chain-vectors.ts` holds the chain document schema; only after all of that does it
+compare its own kind, epoch, `rekey`, `genesis_t`, threshold, members, mpk, commitments,
+public shares, transcript hash, certificate digest, activation and ceremony outcome with
+the declared `outputs`, which are never inputs to a decision. Chain error codes that
+SPEC does not name (`certificateOutcome`, `lineage`, `chainOrder`) are informative
+defaults in `DEFAULT_ERROR`.
+
+`transcript-common.ts` holds the schema pieces and helpers shared by every
+transcript-style document; `transcripts.ts` dispatches `dkg`, `rekey`, `reshare` and
+`chain` (the chain marker `S0.5 chain appendix` decides before `S0.5 re-key appendix`).
+
+### Adversarial coverage (all built in `testkit.ts` / `chain-kit.ts`, never by editing JSON alone)
+
+`chain-kit.ts` builds whole generations (ceremony, certificate, receipts, activation) in
+the scalar domain. A variant re-signs only the record it changes and regenerates the
+records that depend on it, so one rule is violated at a time; a control test shows the
+harness is clean. `rekey.test.ts` runs the DKG variants through `dkgVerifyTranscript`;
+`chain.test.ts` runs the chain variants through `verifyChainStep` / `verifyChain`.
+
+| Finding | Cases (file) |
+| --- | --- |
+| F1 fault budget | Re-key shapes 2-of-2, 3-of-3, 4-of-4, 4-of-5, 4-of-6, 5-of-8 → `UnsupportedFaultBudget` before any dealing, with and without honest records; 3-of-4, 2-of-3 (and 2-of-4, 3-of-5, 4-of-7, 5-of-9) pass the entry check; budget independent of the old threshold; 3-of-5 with two corrupt members (bad R4 and silence, or silence after R1) reconstructs the genuine mpk; the same shapes refused inside a chain step (`rekey.test.ts`, `chain.test.ts`) |
+| F2 selective extraction | Dealer 3 passes member 1's Feldman check only; upheld R5 forces R6, dealer stays in QUAL, genuine contribution recovered; missing R5 barrier, missing R6, extra R6, `InsufficientRecovery`; a chain re-key with the R5 barrier dropped (`rekey.test.ts`, `chain.test.ts`) |
+| F3 ceremony-scoped recipient keys | Altered HPKE key or swapped directory DIDs → new digest, edited statement fails the owner signature, re-signed statement leaves every closed round naming the old digest (`InvalidRound`, checked round by round); altered index not canonical; two ceremonies differing only in a recipient key never verify under each other; messages resolve only in this ceremony's directory, never from the old certificate (`rekey.test.ts`) |
+| F4 authorization before dealing | Stale, absent, foreign current digest; unchanged, skipped, regressed and u64-maximum `rekey`/`epoch`; kinds 1/2/3 (also with a successor's fields) and 4 at the wrong entry point; genesis statement as re-key and the reverse; redistribution statement at the DKG verifier and re-key at the reshare verifier; changed recipients or threshold versus the signed statement; cohort-2 envelope; master key kept; genesis/re-key transcripts under each other's ceremony and the redistribution H0 label (`rekey.test.ts`) |
+| F5 trust anchor | Fully replaced, correctly self-signed previous or candidate certificate for another owner or network (every chain step); foreign ceremony pinned to a foreign certificate; candidate signed by a non-owner key; a chain step pinning a replaced predecessor; pinned certificate for another owner/network/key in the DKG (`chain.test.ts`, `rekey.test.ts`) |
+| F6 context binding | Re-key certificate keeping the old mpk (with and without previous mpk), wrong previous mpk, `rekey` unchanged/skipped/zero, `genesis_t` not reset, new mpk differing from the ceremony output; reshare/refresh certificate changing mpk, `rekey`, `genesis_t` or dressed as a re-key; skipped/repeated epoch, wrong or absent previous digest; transcript hash, commitments, mpk, `n` differing from the recomputed outcome, certificate of another ceremony on the same predecessor, a changed dealing; receipts for the previous candidate, for another transcript, key or index; activation over another receipt set, candidate or key; fewer than `n` receipts (including `t′` alone), duplicates, non-members; skipped, repeated, reordered, branched and front-truncated chains; `checkLineage` applied to decoded candidates on its own (`chain.test.ts`) |
+
+`probes.ts` and `transcript-corruption.test.ts` flip one byte in each field class of every
+committed record of `../v1/dkg-rekey.json` as for the genesis and redistribution
+documents. `chain-probes.ts` and `rekey-chain-vectors.test.ts` flip one byte in the
+ceremony, every closure, first and last message of every round, the candidate and
+previous certificates, every receipt and the activation of every `chain.json` case (each
+must be rejected, with several distinct reasons), perturb every declared output, and run
+the real CLI on edited committed documents for each record class (exit code 1 and the
+failing case name on stderr).
+
+### Refusal cases of `dkg-rekey.json`
+
+`../v1/dkg-rekey.json` has 14 cases: seven honest or round-level cases (`rekey_*`,
+`insufficient_*`) followed by seven refusals whose expected result is an `error` and no
+`outputs`: `rekey_3of3_outside_the_genesis_budget` and `rekey_4of5_outside_the_genesis_budget`
+(`UnsupportedFaultBudget`), and `rekey_names_another_current_certificate`,
+`rekey_counter_not_incremented`, `rekey_skips_an_epoch`,
+`genesis_statement_presented_as_rekey` and `rekey_transcript_under_another_generation`
+(`InvalidCeremony`). The checker decides all of them from the statement bytes and
+`inputs.current_certificate` alone; attached rounds are never read when authorization
+fails (an honest transcript sealed under another statement's digest is attached to four of
+them on purpose). `ceremony_digest` and `initial_transcript` are functions of the
+statement bytes and are recomputed and compared for every case, including refusals;
+members and threshold are compared only when the statement decodes.
+
+`rekey-refusals.test.ts` writes the seven expected codes itself (not read from the
+document), recomputes them, decodes each statement to show the defect its name gives, runs
+the real CLI to show the computed code, and edits one byte of each case: statement
+unsigned (`InvalidSignature`) and re-signed (the declared digests become stale), pinned
+certificate body and signature, and every kind of attached record (the refusal and its
+code are unchanged, since no record is read). Repairing exactly the defect and re-signing
+reaches the next rule: the first three statements become the honest `rekey_2of3`
+statement byte for byte and its transcript is then accepted (and a byte of an attached
+round then decides `InvalidSignature`); the later-generation case is accepted under the
+certificate its statement names; the two budget refusals pass the budget when `t` is
+lowered and then lack rounds (`InvalidRound`). `cli-kit.ts` holds the shared helpers that
+edit a clone of a committed document and run the real CLI on it.
 
 `testkit.ts` builds signed transcripts from the published fixture seeds in
 `../v1/cert-core.json`, with payload encoders written separately from the
@@ -115,14 +213,18 @@ created path, set the homes before writing, and remove that exact directory.
 
 This checker was written in a separate implementation session from SPEC,
 public JSON vectors, and the JSON-only schema/byte-layout handoff. No Rust
-source, Rust tests, Rust diffs or Rust implementation traces were opened.
+source, Rust tests, Rust diffs or Rust implementation traces were opened. The
+re-key and chain extension was written from SPEC §§3.0, 3.7–3.9, 3.12 and the
+S0.2–S0.5 appendices and the public `../v1/dkg-rekey.json` and `../v1/chain.json`
+only; the expected outputs of those documents are comparison values and were
+never fed to a decision.
 Dependency implementation files were not opened or used as design inputs.
 
 | Consulted source | Use |
 | --- | --- |
 | TinyCloud approved design/plan and `../../SPEC.md` §§3.1–3.6, S0.1 appendix | Equations, DSTs, encodings, error ordering and RequestDigest amendment |
-| `../../SPEC.md` §§3.0, 3.7–3.12, S0.2, S0.3 and S0.4 appendices; plan r2 §§3.0–3.11, §5, §6 | Ceremony, certificate, envelope, closure and transcript layouts; DKG and redistribution rules (TC-2223) |
-| `../v1/primitives.json`, `../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/cert-core.json` seeds | Public inputs, expected bytes and fixture signing seeds |
+| `../../SPEC.md` §§3.0, 3.7–3.12, S0.2, S0.3, S0.4 and S0.5 appendices; plan r2 §§3.0–3.11, §5, §6 | Ceremony, certificate, envelope, closure and transcript layouts; DKG, re-key, redistribution and chain rules (TC-2223) |
+| `../v1/primitives.json`, `../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json`, `../v1/chain.json`, `../v1/cert-core.json` seeds | Public inputs, expected bytes and fixture signing seeds |
 | [RFC 9380 §§5.2–5.3.1](https://www.rfc-editor.org/rfc/rfc9380#section-5.2) | Scalar-field reduction and SHA-256 XMD algorithm |
 | [RFC 8032 §5.1](https://www.rfc-editor.org/rfc/rfc8032#section-5.1) | Ed25519 encodings for the strict-verification tests |
 | [noble-curves 2.4.0 API documentation](https://github.com/paulmillr/noble-curves/blob/2.4.0/README.md) | Group operations, hash-to-curve, pairings, field API and Ed25519 `zip215: false` |

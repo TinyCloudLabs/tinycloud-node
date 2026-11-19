@@ -3,13 +3,15 @@ import { checkVectors } from './vectors.ts';
 import { checkCertificateVectors } from './cert-vectors.ts';
 import { checkTranscripts, transcriptKind } from './transcripts.ts';
 
-const defaults = ['../v1/primitives.json', '../v1/cert-core.json', '../v1/dkg-genesis.json', '../v1/reshare.json'].map(p => new URL(p, import.meta.url));
+const defaults = ['../v1/primitives.json', '../v1/cert-core.json', '../v1/dkg-genesis.json', '../v1/reshare.json', '../v1/dkg-rekey.json', '../v1/chain.json']
+  .map(p => new URL(p, import.meta.url));
+const LABEL = { dkg: 'DKG', rekey: 'Re-key', reshare: 'Reshare', chain: 'Chain' } as const;
 
 function check(input: unknown) {
   if (transcriptKind(input) !== undefined) {
     const report = checkTranscripts(input);
     for (const name of report.passed) console.log(`PASS ${name}`);
-    console.log(`${report.kind === 'dkg' ? 'DKG' : 'Reshare'} transcripts: ${report.passed.length}/${report.passed.length}`);
+    console.log(`${LABEL[report.kind]} transcripts: ${report.passed.length}/${report.passed.length}`);
     return;
   }
   if (input && typeof input === 'object' && 'suite' in input && input.suite === 'TC-THRESHOLD-V1') {

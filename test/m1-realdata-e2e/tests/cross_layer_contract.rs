@@ -248,7 +248,7 @@ secret = "{}"
     let mut owner_jwk = JWK::generate_ed25519()?;
     owner_jwk.algorithm = Some(Algorithm::EdDSA);
     let (owner_did, owner_vm) = node_identity(&owner_jwk)?;
-    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?);
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?)?;
     space::ActiveModel {
         id: Set(SpaceIdWrap(space_id.clone())),
     }
@@ -1240,7 +1240,7 @@ async fn observe_grant_output_on_real_node(
     let owner_did = accept["parentFormatVector"]["issuer"]
         .as_str()
         .context("parent issuer")?;
-    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?);
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?)?;
     space::ActiveModel {
         id: Set(SpaceIdWrap(space_id.clone())),
     }
@@ -1883,7 +1883,7 @@ struct EngineSqlKvContext<'a> {
 async fn exercise_engine_sql_kv_mix(context: EngineSqlKvContext<'_>) -> Result<()> {
     let owner_jwk = ed25519_jwk_from_seed([0x44; 32])?;
     let (owner_did, owner_vm) = node_identity(&owner_jwk)?;
-    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?);
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?)?;
     space::ActiveModel {
         id: Set(SpaceIdWrap(space_id.clone())),
     }
@@ -2208,7 +2208,7 @@ fn evidence_verification_uses_fixture_time_under_hostile_ambient() -> Result<()>
     let mut owner_jwk = JWK::generate_ed25519()?;
     owner_jwk.algorithm = Some(Algorithm::EdDSA);
     let owner_did = node_identity(&owner_jwk)?.0;
-    let space = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?);
+    let space = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?)?;
     let policy = policy(&space, &owner_did);
     let requirement = match &policy.when {
         policy_core::Expression::Evidence(expression) => expression.evidence.clone(),

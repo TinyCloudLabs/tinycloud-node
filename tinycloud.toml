@@ -60,7 +60,6 @@ cors = true
     # tcp_user_timeout_ms = 30000
     # statement_timeout_mode = "session"   # session | local | off
     # statement_timeout_ms = 30000
-    # bulk_statement_timeout_ms = 120000
     # retry_window_ms = 10000
     ## How long an authorized read waits for its audit record before 503
     ## read_audit_busy (TC-1317). Its data is never returned without the record.
@@ -93,7 +92,18 @@ cors = true
     ## Issuer queries remain refused. Opt-in uses the unhardened SSI client (TC-1080).
     # network_methods = false
 
+[global.column_encryption]
+    ## Require encrypted values on recorded column reads. Off preserves legacy plaintext.
+    ## Env: TINYCLOUD_COLUMN_ENCRYPTION__STRICT
+    strict = false
+
 [global.encryption_network]
+    ## Emit TCW2 response wraps independently of incoming-wrap policy.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2
+    key_wrap_v2 = false
+    ## Require TCW2 incoming network-key wraps; receiver responses are independent.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_REQUIRE_V2
+    key_wrap_require_v2 = false
     ## Serve named keys and advertise the `encryption-named-keys-v1` feature in
     ## GET /info. Only while on are the key routes mounted, key and key-prefix
     ## resources accepted in delegations and named-key decrypt served on

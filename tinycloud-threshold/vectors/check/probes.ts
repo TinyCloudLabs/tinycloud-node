@@ -5,15 +5,15 @@ import { bytes, type Bytes } from './protocol.ts';
 import { decodeCeremony, decodeCertificate, type RoundRecord, type Statement } from './ceremony.ts';
 import { dkgVerifyTranscript } from './dkg.ts';
 import { reshareVerifyTranscript } from './reshare.ts';
-import { parseTranscriptDocument, recordsOf, statementOf, verifierOf, type DkgFile, type ReshareFile } from './transcripts.ts';
+import { parseCeremonyDocument, recordsOf, statementOf, transcriptKind, verifierOf, type DkgFile, type RekeyFile, type ReshareFile } from './transcripts.ts';
 import { code } from './testkit.ts';
 
 export interface TranscriptInput { ceremony: Statement; certificate?: Statement; records: RoundRecord[] }
 export interface Probe { record: string; field: string; offset: number; mask: number; expected: string; apply: (x: TranscriptInput) => void }
-export type Doc = DkgFile | ReshareFile;
+export type Doc = DkgFile | RekeyFile | ReshareFile;
 export type DocCase = Doc['cases'][number];
 export function loadDoc(file: string): Doc {
-  return parseTranscriptDocument(JSON.parse(readFileSync(new URL(`../v1/${file}`, import.meta.url), 'utf8')));
+  return parseCeremonyDocument(JSON.parse(readFileSync(new URL(`../v1/${file}`, import.meta.url), 'utf8')));
 }
 
 export function inputOf(c: DocCase): TranscriptInput {
@@ -28,14 +28,16 @@ export function clone(x: TranscriptInput): TranscriptInput {
 }
 export function verifyInput(doc: Doc, x: TranscriptInput): string {
   const verify = verifierOf(doc);
-  return code(() => x.certificate
-    ? reshareVerifyTranscript(doc.anchor, x.ceremony, x.certificate, x.records, verify)
-    : dkgVerifyTranscript(doc.anchor, x.ceremony, x.records, verify));
+  return code(() => transcriptKind(doc) === 'reshare'
+    ? reshareVerifyTranscript(doc.anchor, x.ceremony, x.certificate!, x.records, verify)
+    : dkgVerifyTranscript(doc.anchor, x.ceremony, x.records, verify, x.certificate));
 }
 
 function at(record: string, field: string, select: (x: TranscriptInput) => Bytes, offset: number, mask: number, expected: string): Probe {
   return { record, field, offset, mask, expected, apply: x => { const b = select(x); b[offset] = b[offset]! ^ mask; } };
 }
+/** Typed refusals decided by the ceremony statement and pinned certificate alone, before any record is read. */
+export const AUTHORIZATION_REFUSALS: ReadonlySet<string> = new Set(['InvalidCeremony', 'UnsupportedFaultBudget']);
 /** The fixed probe set for one case: every field class of every record kind, first and last message of each round. */
 export function probes(c: Doc['cases'][number]): Probe[] {
   const x = inputOf(c), out: Probe[] = [];
@@ -52,15 +54,18 @@ export function probes(c: Doc['cases'][number]): Probe[] {
     at('ceremony', 'signature S', y => y.ceremony.signature, 63, 1, 'InvalidSignature'),
   );
   if (x.certificate) {
-    const len = x.certificate.body.length;
-    if (x.certificate.body[len - 1] !== 0 || x.certificate.body[len - 2] !== 0) throw new Error('probe expects a certificate without predecessor fields');
+    // The transcript hash is followed by option(previous digest) and option(previous mpk).
+    const pinned = decodeCertificate(x.certificate.body);
+    const transcriptHash = x.certificate.body.length - (32 + 1 + (pinned.previous ? 32 : 0) + 1 + (pinned.previousMpk ? 96 : 0));
     out.push(
       at('certificate', 'version', y => y.certificate!.body, 0, 1, 'InvalidEncoding'),
       at('certificate', 'network', y => y.certificate!.body, 5, 1, 'InvalidCertificate'),
-      at('certificate', 'transcript hash', y => y.certificate!.body, len - 34, 1, 'InvalidSignature'),
+      at('certificate', 'transcript hash', y => y.certificate!.body, transcriptHash, 1, 'InvalidSignature'),
       at('certificate', 'signature', y => y.certificate!.signature, 0, 1, 'InvalidSignature'),
     );
   }
+  // A refusal at authorization never reads the attached rounds, so their bytes decide nothing in such a case.
+  if ('error' in c && AUTHORIZATION_REFUSALS.has(c.error)) return out;
   for (const [k, r] of x.records.entries()) {
     const name = `R${k + 1} closure`, closure = (y: TranscriptInput) => y.records[k]!.closure.body;
     out.push(

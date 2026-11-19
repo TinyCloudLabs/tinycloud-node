@@ -38,6 +38,8 @@ export function authorizeRedistribution(anchor: Anchor, statement: Statement, ce
 export interface ReshareOutput {
   threshold: number; members: number; dealers: number[]; excluded: Exclusion[];
   commitments: G2[]; mpk: G2; publicShares: G2[]; transcriptHash: Bytes; ceremony: Ceremony; initialTranscript: Bytes;
+  /** The verified pinned current certificate the redistribution starts from. */
+  current: Certificate;
 }
 
 /** reshare_verify_transcript: SPEC §3.8 with the S0.4 appendix rules, from raw signed records only. */
@@ -97,5 +99,5 @@ export function reshareVerifyTranscript(anchor: Anchor, statement: Statement, ce
   if (commitments[t2 - 1]!.equals(G2_ZERO)) fail('IdentityPoint');
   const publicShares = ceremony.directory.map(d => evaluate(commitments, d.index));
   if (publicShares.some(p => p.equals(G2_ZERO))) fail('IdentityPoint');
-  return { threshold: t2, members: n2, dealers, excluded, commitments, mpk: commitments[0]!, publicShares, transcriptHash: hash, ceremony, initialTranscript };
+  return { threshold: t2, members: n2, dealers, excluded, commitments, mpk: commitments[0]!, publicShares, transcriptHash: hash, ceremony, initialTranscript, current };
 }

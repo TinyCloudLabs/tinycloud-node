@@ -76,7 +76,7 @@ export function lagrange(i: number, set: readonly number[]): bigint {
 // --- S0.2 statements --------------------------------------------------------------
 export interface CeremonySpec {
   kind: number; id?: Bytes; network?: string; owner?: string; current?: Bytes;
-  t: number; n: number; rekey?: bigint; epoch?: bigint; directory?: { index: number; did: string }[];
+  t: number; n: number; rekey?: bigint; epoch?: bigint; directory?: { index: number; did: string }[]; hpke?: Record<number, Bytes>;
 }
 export function ceremonyBody(c: CeremonySpec): Bytes {
   const directory = c.directory ?? Array.from({ length: c.n }, (_, k) => ({ index: k + 1, did: did(k + 1) }));
@@ -84,7 +84,7 @@ export function ceremonyBody(c: CeremonySpec): Bytes {
     be(1n, 1), be(BigInt(c.kind), 1), c.id ?? new Uint8Array(32).fill(0x5a), lp(enc.encode(c.network ?? NETWORK)), lp(enc.encode(c.owner ?? OWNER)),
     c.current ? concat(be(1n, 1), c.current) : be(0n, 1),
     be(BigInt(c.t), 2), be(BigInt(c.n), 2), be(c.rekey ?? 0n, 8), be(c.epoch ?? 0n, 8), be(BigInt(directory.length), 2),
-    ...directory.map(d => concat(be(BigInt(d.index), 2), lp(enc.encode(d.did)), new Uint8Array(32).fill(d.index))),
+    ...directory.map(d => concat(be(BigInt(d.index), 2), lp(enc.encode(d.did)), c.hpke?.[d.index] ?? new Uint8Array(32).fill(d.index))),
   );
 }
 export function signedCeremony(c: CeremonySpec, signer = OWNER): Statement {
@@ -234,4 +234,24 @@ export function code(run: () => unknown): string {
 }
 export function flip(b: Bytes, offset: number, mask = 1): Bytes {
   const out = b.slice(); out[offset] = out[offset]! ^ mask; return out;
+}
+
+// --- Shared DKG scenario edits (verifier-independent) -------------------------------------
+export const msg = (index: number, payload: Bytes): Draft => ({ cohort: COHORT_RECIPIENTS, index, payload });
+/** Replaces sender `index`'s message(s) in round `r` (1-based) with the given drafts. */
+export function replace(from: DkgSetup | Draft[][], r: number, index: number, ...drafts: Draft[]): Draft[][] {
+  return (Array.isArray(from) ? from : from.rounds).map((round, k) => k + 1 !== r ? round : [...round.filter(d => d.index !== index), ...drafts]);
+}
+/** Every member's R6 with its Pedersen-valid pair for each reconstructed dealer. */
+export function r6(s: DkgSetup, dealers: number[], senders = s.dealers.map(d => d.index)): Draft[] {
+  return senders.map(j => msg(j, pairs(dealers.map(i => [i, ...pair(s.dealers[i - 1]!, j)] as const))));
+}
+/** Rebuilds dealer i with explicit coefficient vectors and regenerates its R1 and R4. */
+export function withDealer(s: DkgSetup, i: number, a: bigint[], b: bigint[]): DkgSetup {
+  const d = { index: i, a, b, C: a.map((x, k) => times(G2_BASE, x).add(times(H, b[k]!))), A: a.map(x => times(G2_BASE, x)) };
+  const dealers = s.dealers.map(x => x.index === i ? d : x), members = dealers.map(x => x.index);
+  const next = { ...s, dealers };
+  next.rounds = replace(next, 1, i, msg(i, deal(d.C, members, 64, i)));
+  next.rounds = replace(next, 4, i, msg(i, feldman(d.A)));
+  return next;
 }

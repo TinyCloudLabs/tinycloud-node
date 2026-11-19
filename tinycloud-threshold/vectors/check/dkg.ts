@@ -1,9 +1,9 @@
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
-import { DST, PEDERSEN_H_MESSAGE, ProtocolError, Reader, bytes, g2, scalar, tagged, type Bytes, type G2 } from './protocol.ts';
+import { DST, PEDERSEN_H_MESSAGE, ProtocolError, Reader, bytes, equal, g2, scalar, tagged, type Bytes, type G2 } from './protocol.ts';
 import {
   COHORT, DEFAULT_ERROR, KIND, TAG, authorizeCeremony, checkGenesisShape, checkTranscriptSize, classify, evaluate, fail, listCount,
-  memberIndex, mul, verifyChain, type Anchor, type Authenticated, type Ceremony, type Classified, type RoundRecord,
-  type Statement, type Verifier,
+  memberIndex, mul, verifyCertificate, verifyChain, type Anchor, type Authenticated, type Ceremony, type Certificate, type Classified,
+  type RoundRecord, type Statement, type Verifier,
 } from './ceremony.ts';
 
 const G2_BASE = bls.G2.Point.BASE, G2_ZERO = bls.G2.Point.ZERO;
@@ -92,6 +92,8 @@ export function interpolateCoefficients(points: readonly [number, bigint][]): bi
 export interface DkgOutput {
   qual: number[]; disqualified: Exclusion[]; reconstructed: number[];
   commitments: G2[]; mpk: G2; publicShares: G2[]; transcriptHash: Bytes; ceremony: Ceremony; initialTranscript: Bytes;
+  /** The pinned current certificate of a re-key; absent for genesis. */
+  current?: Certificate;
 }
 export function dkgInitialTranscript(ceremonyDigest: Bytes): Bytes { return tagged(TAG.dkgStart, ceremonyDigest); }
 
@@ -104,10 +106,31 @@ export function authorizeGenesis(anchor: Anchor, statement: Statement, verify: V
   return c;
 }
 
-/** dkg_verify_transcript: SPEC §3.7 with the S0.3 appendix rules, from raw signed records only. */
-export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, records: readonly RoundRecord[], verify: Verifier): DkgOutput {
+/**
+ * Re-key ceremony rules (S0.5 appendix): kind 4 pinned to the verified current certificate, the checked
+ * successor epoch and re-key counter, and the §3.0 genesis budget for the new threshold, all before any dealing.
+ * The pinned certificate is verified as soon as the entry point receives it, so no statement (of any kind) is
+ * judged against an unverified certificate.
+ */
+export function authorizeRekey(anchor: Anchor, statement: Statement, certificate: Statement, verify: Verifier): { ceremony: Ceremony; current: Certificate } {
+  const c = authorizeCeremony(anchor, statement, verify);
+  const current = verifyCertificate(anchor, certificate, verify);
+  if (c.kind !== KIND.rekey) fail('InvalidCeremony');
+  if (!c.current || !equal(c.current, current.digest)) fail('InvalidCeremony');
+  const max = 0xffffffffffffffffn;
+  if (current.epoch === max || c.epoch !== current.epoch + 1n || current.rekey === max || c.rekey !== current.rekey + 1n) fail(DEFAULT_ERROR.successorGeneration);
+  checkGenesisShape(c.t, c.n);
+  return { ceremony: c, current };
+}
+
+/**
+ * dkg_verify_transcript: SPEC §3.7 with the S0.3 appendix rules, from raw signed records only. Without `current`
+ * the ceremony must be a genesis; with the pinned current certificate it must be a re-key. Every other kind,
+ * and either kind at the other entry point, is InvalidCeremony.
+ */
+export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, records: readonly RoundRecord[], verify: Verifier, pinned?: Statement): DkgOutput {
   checkTranscriptSize(records);
-  const ceremony = authorizeGenesis(anchor, statement, verify);
+  const { ceremony, current } = pinned ? authorizeRekey(anchor, statement, pinned, verify) : { ceremony: authorizeGenesis(anchor, statement, verify), current: undefined };
   const { t, n } = ceremony, members = ceremony.directory.map(d => d.index);
   const initialTranscript = dkgInitialTranscript(ceremony.digest);
   const recipients = new Map(ceremony.directory.map(d => [d.index, d.did]));
@@ -187,5 +210,6 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
   if (mpk.equals(G2_ZERO) || commitments[t - 1]!.equals(G2_ZERO)) fail('IdentityPoint');
   const publicShares = members.map(j => evaluate(commitments, j));
   if (publicShares.some(p => p.equals(G2_ZERO))) fail('IdentityPoint');
-  return { qual, disqualified, reconstructed, commitments, mpk, publicShares, transcriptHash: hash, ceremony, initialTranscript };
+  if (current?.mpk.equals(mpk)) fail(DEFAULT_ERROR.rekeyMpk);
+  return { qual, disqualified, reconstructed, commitments, mpk, publicShares, transcriptHash: hash, ceremony, initialTranscript, ...(current ? { current } : {}) };
 }

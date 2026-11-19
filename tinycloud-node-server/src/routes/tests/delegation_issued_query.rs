@@ -52,7 +52,7 @@ impl Agent {
     /// `<did>:agent/delegation`: the resource of the list capability.
     fn list_resource(&self, did: &str) -> Result<Resource> {
         Ok(Resource::TinyCloud(
-            SpaceId::new(did.parse::<DIDBuf>()?, "agent".parse()?).to_resource(
+            SpaceId::new(did.parse::<DIDBuf>()?, "agent".parse()?)?.to_resource(
                 "delegation".parse()?,
                 None,
                 None,
@@ -169,6 +169,7 @@ impl Fixture {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&self.conn)
         .await?;
@@ -232,7 +233,7 @@ impl Served {
 
 fn kv_resource(space_did: &str, path: &str) -> Result<Resource> {
     Ok(Resource::TinyCloud(
-        SpaceId::new(space_did.parse::<DIDBuf>()?, "files".parse()?).to_resource(
+        SpaceId::new(space_did.parse::<DIDBuf>()?, "files".parse()?)?.to_resource(
             "kv".parse()?,
             Some(path.parse()?),
             None,
@@ -444,7 +445,7 @@ async fn issued_refuses_a_proof_or_another_principals_resource() -> Result<()> {
 
     // A narrower path than the whole delegation service is refused too.
     let narrow = Resource::TinyCloud(
-        SpaceId::new(a.did.parse::<DIDBuf>()?, "agent".parse()?).to_resource(
+        SpaceId::new(a.did.parse::<DIDBuf>()?, "agent".parse()?)?.to_resource(
             "delegation".parse()?,
             Some("narrow".parse()?),
             None,
@@ -601,7 +602,7 @@ async fn issued_direction_leaves_granted_received_all_bytes_unchanged() -> Resul
     for did in [holder.did.as_str(), wallet, peer] {
         fixture.actor(did).await?;
     }
-    let control = SpaceId::new(wallet.parse::<DIDBuf>()?, "control".parse()?);
+    let control = SpaceId::new(wallet.parse::<DIDBuf>()?, "control".parse()?)?;
     let list_resource = Resource::TinyCloud(control.clone().to_resource(
         "delegation".parse()?,
         None,
@@ -782,7 +783,7 @@ async fn issued_deep_ancestor_chain_is_the_same_503_as_the_account_path() -> Res
         }
     }
     // The account path over the same depth: a wallet row with 64 ancestors.
-    let control = SpaceId::new(wallet.parse::<DIDBuf>()?, "control".parse()?);
+    let control = SpaceId::new(wallet.parse::<DIDBuf>()?, "control".parse()?)?;
     let list_resource =
         Resource::TinyCloud(control.to_resource("delegation".parse()?, None, None, None));
     let session = fixture
@@ -846,7 +847,7 @@ async fn issued_refuses_extra_capabilities_and_query_or_fragment_resources() -> 
     let fixture = fixture.serve().await?;
     let issued = serde_json::json!({ "direction": "issued" });
     let own = a.list_resource(&a.did)?;
-    let space = SpaceId::new(a.did.parse::<DIDBuf>()?, "agent".parse()?);
+    let space = SpaceId::new(a.did.parse::<DIDBuf>()?, "agent".parse()?)?;
     let with_query = Resource::TinyCloud(space.clone().to_resource(
         "delegation".parse()?,
         None,

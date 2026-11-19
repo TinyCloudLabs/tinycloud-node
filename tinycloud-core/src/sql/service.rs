@@ -52,6 +52,8 @@ enum HydrationOutcome {
     Unavailable(&'static str),
     Failed(String),
     TimedOut,
+    /// The stored database exceeds the artifact read limit (TC-2961).
+    TooLarge,
 }
 
 use crate::database_artifacts::{ArtifactSink, DatabaseArtifact, DeltaSave};
@@ -99,6 +101,23 @@ impl DatabaseArtifactRepository for MetaRetry<'_> {
     ) -> Result<(), DatabaseArtifactError> {
         self.inner
             .read_chunks(service, space, name, meta, sink)
+            .await
+    }
+
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.inner.chunked_checkpoints(service, space, name)
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.inner
+            .save_snapshot(service, space, name, snapshot, expected)
             .await
     }
 
@@ -219,6 +238,23 @@ impl Default for SqlWaitBounds {
     }
 }
 
+/// The first back-off after a whole-checkpoint save fails (TC-2961).
+const CHECKPOINT_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest back-off: each further failure doubles it up to this.
+const CHECKPOINT_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// A database whose last whole-checkpoint save failed or was refused
+/// (TC-2961). Its writes are refused until `until` without reloading it, so a
+/// client retrying cannot drive hydrate, write, save, fail in a loop.
+#[derive(Clone, Copy)]
+struct CheckpointBackoff {
+    failures: u32,
+    until: Instant,
+    /// The save was refused by the artifact write limit (507), rather than
+    /// failed (503).
+    refused: bool,
+}
+
 #[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
@@ -240,6 +276,10 @@ pub struct SqlService {
     durability: DurabilityPolicy,
     ddl_policy: DdlPolicy,
     retry_policy: Option<RetryPolicy>,
+    /// See [`CheckpointBackoff`]; kept across `discard_local_state`.
+    checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
+    /// The first back-off and its cap.
+    checkpoint_backoff_bounds: (Duration, Duration),
 }
 
 impl SqlService {
@@ -260,6 +300,8 @@ impl SqlService {
             durability: DurabilityPolicy::default(),
             ddl_policy: DdlPolicy::default(),
             retry_policy: None,
+            checkpoint_backoff: Arc::new(DashMap::new()),
+            checkpoint_backoff_bounds: (CHECKPOINT_BACKOFF, CHECKPOINT_BACKOFF_MAX),
         }
     }
 
@@ -287,6 +329,17 @@ impl SqlService {
 
     pub fn with_wait_bounds(mut self, bounds: SqlWaitBounds) -> Self {
         self.bounds = bounds;
+        self
+    }
+
+    /// The checkpoint back-off (TC-2961): `first` after a failed or refused
+    /// whole-checkpoint save, doubling per further failure up to `max`. The
+    /// node keeps the defaults (30 s, 15 min); only tests lower them. Public
+    /// only for the node-server tests: wiring it to node config is a
+    /// behaviour change that needs review, since a zero back-off brings back
+    /// the reload-and-retry loop TC-2961 removed.
+    pub fn with_checkpoint_backoff(mut self, first: Duration, max: Duration) -> Self {
+        self.checkpoint_backoff_bounds = (first, max);
         self
     }
 
@@ -451,6 +504,12 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        // TC-2961: before hydration, so a backed-off database is not reloaded.
+        if request.is_write(caveats.as_ref()) {
+            if let Some(error) = self.checkpoint_backoff_error(&key) {
+                return Err(error);
+            }
+        }
         // Whatever the request still holds of the disk budget is released once
         // its outcome is known: after the durable save, or its failure.
         let _reservation = ReservationGuard::new(
@@ -791,6 +850,7 @@ impl SqlService {
                     return Err(SqlError::Unavailable);
                 }
                 HydrationOutcome::Failed(message) => return Err(SqlError::Internal(message)),
+                HydrationOutcome::TooLarge => return Err(SqlError::DatabaseTooLargeToLoad),
                 HydrationOutcome::TimedOut => {
                     log_busy(
                         SqlBusyStage::ArtifactTransfer,
@@ -1022,6 +1082,49 @@ impl SqlService {
         ))
     }
 
+    /// The error a write to `key` gets while its checkpoint back-off lasts
+    /// (TC-2961): the refusal or failure its last whole-checkpoint save met.
+    fn checkpoint_backoff_error(&self, key: &(String, String)) -> Option<SqlError> {
+        let backoff = *self.checkpoint_backoff.get(key)?;
+        (Instant::now() < backoff.until).then_some(if backoff.refused {
+            SqlError::DatabaseSizeLimit
+        } else {
+            SqlError::Unavailable
+        })
+    }
+
+    /// Start or lengthen `key`'s back-off after its whole-checkpoint save met
+    /// `error`: the first back-off, doubled per further failure up to the cap.
+    fn back_off_checkpoint(&self, key: &(String, String), error: &SqlError) {
+        let (first, max) = self.checkpoint_backoff_bounds;
+        let failures = self
+            .checkpoint_backoff
+            .get(key)
+            .map_or(0, |backoff| backoff.failures)
+            .saturating_add(1);
+        let factor = 1_u32.checked_shl(failures - 1).unwrap_or(u32::MAX);
+        let delay = first.saturating_mul(factor).min(max);
+        let refused = matches!(
+            error,
+            SqlError::DatabaseSizeLimit | SqlError::StorageWouldGrow
+        );
+        self.checkpoint_backoff.insert(
+            key.clone(),
+            CheckpointBackoff {
+                failures,
+                until: Instant::now() + delay,
+                refused,
+            },
+        );
+        tracing::warn!(
+            service = "sql",
+            failures,
+            refused,
+            retry_after_ms = delay.as_millis() as u64,
+            "Database checkpoint save failed; refusing its writes until the back-off ends"
+        );
+    }
+
     async fn persist_write(
         &self,
         space: &SpaceId,
@@ -1031,6 +1134,62 @@ impl SqlService {
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key).await?;
+
+        if self
+            .artifact_repository
+            .chunked_checkpoints("sql", &key.0, db_name)
+        {
+            let snapshot = handle.snapshot().await?;
+            let bytes = snapshot
+                .as_file()
+                .metadata()
+                .map_err(|e| SqlError::Internal(e.to_string()))?
+                .len();
+            if growth == GrowthPolicy::Forbid {
+                let durable = self
+                    .artifact_repository
+                    .load_meta("sql", &key.0, db_name)
+                    .await
+                    .map_err(request_artifact_error(space, db_name))?
+                    .map_or(0, |m| m.size_bytes.max(0) as u64);
+                if bytes > durable {
+                    return Err(SqlError::StorageWouldGrow);
+                }
+            }
+            let saved = match self
+                .bounded(
+                    (space, db_name),
+                    || SqlBusyStage::ArtifactTransfer,
+                    self.bounds.artifact_transfer,
+                    self.artifact_repository
+                        .save_snapshot("sql", &key.0, db_name, snapshot, expected),
+                )
+                .await
+            {
+                Ok(Ok(saved)) => saved,
+                Ok(Err(error)) => {
+                    let lineage_conflict = matches!(error, DatabaseArtifactError::StaleLineage);
+                    let error = request_artifact_error(space, db_name)(error);
+                    if !lineage_conflict {
+                        self.back_off_checkpoint(&key, &error);
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.back_off_checkpoint(&key, &error);
+                    return Err(error);
+                }
+            };
+            self.checkpoint_backoff.remove(&key);
+            self.lineage.insert(
+                key,
+                ArtifactExpectation::Derived {
+                    revision: saved.revision,
+                    checkpoint_content_hash: saved.checkpoint_content_hash,
+                },
+            );
+            return Ok(());
+        }
 
         // Repeated DELETE/UPDATE/DROP operations can append WAL frames without
         // adding a database page. Full spaces replace checkpoint + WAL, but
@@ -1097,8 +1256,8 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        let saved = self
-            .bounded(
+        let (saved, transfer_started) =
+            crate::database_artifacts::track_transfer_start(self.bounded(
                 (space, db_name),
                 || SqlBusyStage::ArtifactTransfer,
                 self.bounds.artifact_transfer,
@@ -1109,9 +1268,30 @@ impl SqlService {
                     payload,
                     expected,
                 ),
-            )
-            .await?
-            .map_err(request_artifact_error(space, db_name))?;
+            ))
+            .await;
+        let saved = match saved {
+            Ok(Ok(saved)) => saved,
+            Ok(Err(error)) => {
+                // A stale actor's lineage conflict is recovered by the
+                // re-hydration the caller forces; it is not a save that failed.
+                let lineage_conflict = matches!(error, DatabaseArtifactError::StaleLineage);
+                let error = request_artifact_error(space, db_name)(error);
+                if !lineage_conflict {
+                    self.back_off_checkpoint(&key, &error);
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                // TC-2961: a save cut while still queued for its large-transfer
+                // slot sent nothing; it is busy, not a failed checkpoint.
+                if transfer_started {
+                    self.back_off_checkpoint(&key, &error);
+                }
+                return Err(error);
+            }
+        };
+        self.checkpoint_backoff.remove(&key);
         self.lineage.insert(
             key,
             ArtifactExpectation::Derived {
@@ -1212,6 +1392,7 @@ fn request_artifact_error<'a>(
 
 fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
     match err {
+        DatabaseArtifactError::StorageLimit => SqlError::StorageWouldGrow,
         DatabaseArtifactError::Db(ref error) if is_transient_error(error) => {
             tracing::warn!(
                 service = "sql",
@@ -1229,6 +1410,24 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
                 "Database artifact kept changing while it was read"
             );
             SqlError::Unavailable
+        }
+        DatabaseArtifactError::WriteLimitExceeded { bytes, limit } => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_write_limit",
+                bytes,
+                limit,
+                "Database checkpoint exceeds the artifact write limit; not saved"
+            );
+            SqlError::DatabaseSizeLimit
+        }
+        DatabaseArtifactError::ReadLimitExceeded { .. } => {
+            tracing::warn!(
+                service = "sql",
+                error_class = "artifact_read_limit",
+                "Database exceeds the artifact read limit; not loaded"
+            );
+            SqlError::DatabaseTooLargeToLoad
         }
         err => SqlError::Internal(err.to_string()),
     }
@@ -1259,6 +1458,7 @@ fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
         SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
+        SqlError::DatabaseTooLargeToLoad => HydrationOutcome::TooLarge,
         error => HydrationOutcome::Failed(error.to_string()),
     }
 }
@@ -1317,7 +1517,7 @@ mod tests {
             SeaOrmDatabaseArtifactRepository,
         },
         migrations::Migrator,
-        sea_orm::{ConnectOptions, Database, DbErr},
+        sea_orm::{ConnectOptions, ConnectionTrait, Database, DbErr},
         sea_orm_migration::MigratorTrait,
         sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     };
@@ -1332,7 +1532,7 @@ mod tests {
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     async fn artifact_repository() -> Arc<SeaOrmDatabaseArtifactRepository> {
@@ -2667,6 +2867,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_chunked_checkpoint_save_restart_read() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_save_restart_read",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 16 * 1024 * 1024,
+                    account_bytes: 64 * 1024 * 1024,
+                },
+            )),
+        );
+        let cache_one = TempDir::new().unwrap();
+        let cache_two = TempDir::new().unwrap();
+        let space = test_space_id("chunked-checkpoint");
+        let service = SqlService::new(
+            cache_one.path().to_string_lossy().into_owned(),
+            0,
+            repo.clone(),
+        );
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT, body BLOB)".into(),
+                    ]),
+                    sql: "INSERT INTO items(value,body) VALUES ('durable',randomblob(2097153))"
+                        .into(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let superseded_part = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT checkpoint_part_id FROM database_artifact".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "checkpoint_part_id")
+            .unwrap();
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items(value,body) VALUES ('updated',x'01')".into(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let before = service.export(&space, "main").await.unwrap();
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        drop(service);
+        // A fresh repository and empty local cache must use the stored parts.
+        let reopened_repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 16 * 1024 * 1024,
+                    account_bytes: 64 * 1024 * 1024,
+                },
+            )),
+        );
+        let reopened = SqlService::new(
+            cache_two.path().to_string_lossy().into_owned(),
+            0,
+            reopened_repo,
+        );
+        let result = reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT value,length(body) FROM items ORDER BY id".into(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => {
+                assert_eq!(query.row_count, 2);
+                assert_eq!(query.rows[0][0], SqlValue::Text("durable".into()));
+                assert_eq!(query.rows[1][0], SqlValue::Text("updated".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(before, reopened.export(&space, "main").await.unwrap());
+        repo.reap_unused_parts(64).await.unwrap();
+        let current_meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = fixture.conn.query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT max(octet_length(payload))::bigint AS max_bytes, count(*)::bigint AS chunks, count(*) FILTER(WHERE pg_column_compression(payload) IS NOT NULL)::bigint AS compressed FROM artifact_chunk".to_string(),
+        )).await.unwrap().unwrap();
+        assert_eq!(
+            state.try_get::<i64>("", "chunks").unwrap(),
+            (current_meta.checkpoint_size_bytes as u64).div_ceil(1024 * 1024) as i64
+        );
+        let old_chunks = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT count(*)::bigint AS chunks FROM artifact_chunk WHERE part_id=$1",
+                [superseded_part.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "chunks")
+            .unwrap();
+        assert_eq!(old_chunks, 0, "superseded checkpoint must be reclaimed");
+        assert!(state.try_get::<i64>("", "max_bytes").unwrap() <= 1024 * 1024);
+        assert_eq!(state.try_get::<i64>("", "compressed").unwrap(), 0);
+        let meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.revision, 2);
+        assert_eq!(meta.delta_size_bytes, 0);
+        reopened
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_flag_off_reopen_can_write() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_flag_off_reopen_can_write",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                },
+            )),
+        );
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let space = test_space_id("flag-off");
+        let service = SqlService::new(first.path().to_string_lossy().into_owned(), 0, repo);
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(value TEXT)".into()]),
+                    sql: "INSERT INTO items VALUES ('first')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        drop(service);
+        let flag_off = Arc::new(SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()));
+        assert!(flag_off.chunk_storage_active().await.unwrap());
+        let reopened = SqlService::new(
+            second.path().to_string_lossy().into_owned(),
+            0,
+            flag_off.clone(),
+        );
+        reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items VALUES ('second')".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let result = reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT value FROM items ORDER BY rowid".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => {
+                assert_eq!(query.row_count, 2);
+                assert_eq!(query.rows[1][0], SqlValue::Text("second".into()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            flag_off
+                .load_meta("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .storage_mode,
+            "checkpoint-parts-v1"
+        );
+        reopened
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_checkpoint_refusal_preserves_backoff() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_checkpoint_refusal_preserves_backoff",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+                .with_chunk_limits(Some(crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                }))
+                .with_max_write_bytes(1),
+        );
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("chunk-backoff");
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+        for _ in 0..2 {
+            let outcome = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE items(value TEXT)".into()]),
+                        sql: "INSERT INTO items VALUES ('not saved')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                )
+                .await;
+            assert!(
+                matches!(outcome, Err(SqlError::DatabaseSizeLimit)),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                service
+                    .checkpoint_backoff
+                    .get(&(space.to_string(), "main".into()))
+                    .unwrap()
+                    .failures,
+                1,
+                "immediate retry must not perform another failed checkpoint"
+            );
+        }
+        assert!(repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn sql_write_survives_service_recreation_with_empty_cache() {
         let repo = artifact_repository().await;
         let cache_one = TempDir::new().unwrap();
@@ -3101,6 +3607,248 @@ mod tests {
         );
     }
 
+    /// TC-2961: a checkpoint over the artifact write limit answers 507 and is
+    /// never sent; the database's writes are then refused without reloading
+    /// it until a back-off ends, and each further refusal doubles the back-off.
+    #[tokio::test]
+    async fn a_refused_checkpoint_backs_off_writes_without_reloading() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cache = TempDir::new().unwrap();
+        let mut service = SqlService::new(
+            cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(CountingArtifactRepository {
+                inner: Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_write_bytes(1)),
+                loads: loads.clone(),
+            }),
+        );
+        let first = Duration::from_millis(300);
+        service.checkpoint_backoff_bounds = (first, Duration::from_secs(10));
+        let space = test_space_id("sql-checkpoint-backoff");
+        let write = || {
+            service.execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v)".to_string()]),
+                    sql: "INSERT INTO items VALUES (1)".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+            )
+        };
+        let refused = |result: Result<SqlExecutionResult, SqlError>| {
+            matches!(result, Err(SqlError::DatabaseSizeLimit))
+        };
+
+        assert!(refused(write().await), "the checkpoint is over the limit");
+        assert_eq!(loads.load(Ordering::Relaxed), 1, "one hydration");
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 1, "backed off: not reloaded");
+
+        tokio::time::sleep(first + Duration::from_millis(50)).await;
+        assert!(
+            refused(write().await),
+            "tried again once the back-off ended"
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        // The second back-off is twice the first.
+        tokio::time::sleep(first + Duration::from_millis(50)).await;
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 2, "still backed off");
+        tokio::time::sleep(first).await;
+        assert!(refused(write().await));
+        assert_eq!(loads.load(Ordering::Relaxed), 3);
+    }
+
+    /// TC-2961: a database stored over the artifact read limit is not
+    /// loaded; a read and a write to it both answer the 507 size limit, not
+    /// an internal error.
+    #[tokio::test]
+    async fn a_database_over_the_read_limit_answers_the_size_limit() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let space = test_space_id("sql-read-limit");
+        let insert = || SqlRequest::Execute {
+            schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v)".to_string()]),
+            sql: "INSERT INTO items VALUES (1)".to_string(),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let writer_cache = TempDir::new().unwrap();
+        let writer = SqlService::new(
+            writer_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+        );
+        writer
+            .execute(&space, "main", insert(), None, admin())
+            .await
+            .unwrap();
+
+        let reader_cache = TempDir::new().unwrap();
+        let reader = SqlService::new(
+            reader_cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_read_bytes(1)),
+        );
+        let read = reader
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT count(*) FROM items".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await;
+        assert!(
+            matches!(read, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{read:?}"
+        );
+        let written = reader
+            .execute(&space, "main", insert(), None, admin())
+            .await;
+        assert!(
+            matches!(written, Err(SqlError::DatabaseTooLargeToLoad)),
+            "{written:?}"
+        );
+    }
+
+    /// Holds every load at its first part until the gate opens.
+    struct StalledSink {
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl ArtifactSink for StalledSink {
+        async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn begin_part(
+            &mut self,
+            part: crate::database_artifacts::ArtifactPart,
+        ) -> Result<(), DatabaseArtifactError> {
+            if part == crate::database_artifacts::ArtifactPart::Checkpoint {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                drop(self.gate.acquire().await.unwrap());
+            }
+            Ok(())
+        }
+        async fn write(&mut self, _bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+        async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+            Ok(())
+        }
+    }
+
+    /// TC-2961 (Bobbie's F1): another tenant's two large loads hold both
+    /// large-transfer permits. This tenant's large checkpoint save queues for
+    /// a permit past `artifact_transfer`, sends nothing and is answered busy.
+    /// That is not a failed checkpoint: once the permits are free, its next
+    /// write goes through, with no back-off.
+    #[tokio::test]
+    async fn a_save_still_queued_for_a_permit_starts_no_back_off() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(db);
+        let large = crate::database_artifacts::BASE_TIMEOUT_PAYLOAD_BYTES + 1;
+        for name in ["h1", "h2"] {
+            repo.save(
+                "sql",
+                "other-tenant",
+                name,
+                vec![1; large],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let holders: Vec<_> = ["h1", "h2"]
+            .into_iter()
+            .map(|name| {
+                let repo = repo.clone();
+                let mut sink = StalledSink {
+                    entered: entered.clone(),
+                    gate: gate.clone(),
+                };
+                tokio::spawn(async move {
+                    let meta = repo
+                        .load_meta("sql", "other-tenant", name)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    repo.read_chunks("sql", "other-tenant", name, &meta, &mut sink)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the holders start");
+
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(
+            cache.path().to_string_lossy().to_string(),
+            u64::MAX,
+            Arc::new(repo.clone()),
+        )
+        .with_wait_bounds(SqlWaitBounds {
+            artifact_transfer: Duration::from_millis(500),
+            ..SqlWaitBounds::default()
+        });
+        let space = test_space_id("queued-save");
+        let write = |table: &str, value: &str| SqlRequest::Execute {
+            schema: Some(vec![format!("CREATE TABLE IF NOT EXISTS {table} (v)")]),
+            sql: format!("INSERT INTO {table} VALUES ({value})"),
+            params: Vec::new(),
+        };
+        let admin = || "tinycloud.sql/admin".to_string();
+        let queued = service
+            .execute(
+                &space,
+                "main",
+                write("b", "zeroblob(9437184)"),
+                None,
+                admin(),
+            )
+            .await;
+        assert!(
+            matches!(queued, Err(SqlError::Busy(SqlBusyStage::ArtifactTransfer))),
+            "{queued:?}"
+        );
+
+        gate.add_permits(1);
+        for holder in holders {
+            holder.await.unwrap().unwrap();
+        }
+        let next = service
+            .execute(&space, "main", write("s", "1"), None, admin())
+            .await;
+        assert!(next.is_ok(), "no back-off: {next:?}");
+    }
+
     /// Fails the next `failures` repository calls with `error`, then
     /// delegates.
     struct FlakyArtifactRepository {
@@ -3345,11 +4093,13 @@ mod tests {
             });
             let cache = TempDir::new().unwrap();
             let space = test_space_id("sql-transient");
-            let service = SqlService::new(
+            let mut service = SqlService::new(
                 cache.path().to_string_lossy().into_owned(),
                 u64::MAX,
                 repo.clone(),
             );
+            // Back-off off here: the TC-2961 back-off is covered by its own test.
+            service.checkpoint_backoff_bounds = (Duration::ZERO, Duration::ZERO);
             // The bound is above every bounded wait on this path (lock 30 s,
             // hydration 30 s, transfer 45 s), so a slow-but-bounded stall
             // surfaces as a typed `Busy(stage)` naming the stage; only an

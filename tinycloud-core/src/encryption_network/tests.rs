@@ -4,11 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, EntityTrait, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
@@ -28,7 +30,10 @@ use tinycloud_auth::{
 };
 
 use crate::encryption::ColumnEncryption;
-use crate::encryption_network::backend::{wrap_to_public_key, LocalOneOfOneBackend};
+use crate::encryption_network::backend::{
+    wrap_to_public_key, GeneratedKey, KeyBackendError, KeySeed, KeyWrapContext, KeyWrapVersion,
+    LocalOneOfOneBackend,
+};
 use crate::encryption_network::canonical::{canonical_hash, canonical_json_bytes};
 use crate::encryption_network::key_id::{parse as parse_resource, EncryptionResource, KeyLocation};
 use crate::encryption_network::keys::KeyState;
@@ -63,6 +68,274 @@ fn make_service(db: DatabaseConnection) -> EncryptionService {
     let seal = ColumnEncryption::new([0xABu8; 32]);
     let backend = Arc::new(LocalOneOfOneBackend::new(seal));
     EncryptionService::new(db, NODE_DID.to_string(), backend)
+}
+async fn race_network_creates(
+    db: DatabaseConnection,
+) -> [Result<crate::encryption_network::NetworkDescriptor, EncryptionServiceError>; 2] {
+    let backend = Arc::new(BarrierKeyBackend {
+        inner: LocalOneOfOneBackend::new(ColumnEncryption::new([0xABu8; 32])),
+        generate_barrier: Arc::new(GenerateBarrier::new(2)),
+    });
+    let service = Arc::new(EncryptionService::new(db, NODE_DID.to_string(), backend));
+    let owner = owner_did();
+    let request = || CreateNetworkRequest {
+        name: NETWORK_NAME.to_string(),
+        owner_did: owner.clone(),
+        threshold: Threshold::one_of_one(),
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let first_service = service.clone();
+    let first_request = request();
+    tasks.spawn(async move { first_service.create_one_of_one_network(first_request).await });
+    let second_service = service;
+    let second_request = request();
+    tasks.spawn(async move {
+        second_service
+            .create_one_of_one_network(second_request)
+            .await
+    });
+
+    match tokio::time::timeout(Duration::from_secs(30), async {
+        let first = tasks.join_next().await.expect("first create task").unwrap();
+        let second = tasks
+            .join_next()
+            .await
+            .expect("second create task")
+            .unwrap();
+        [first, second]
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            tasks.abort_all();
+            panic!("concurrent network creation must finish within 30 seconds");
+        }
+    }
+}
+async fn assert_losing_create_ceremony_is_failed(db: &DatabaseConnection) {
+    let ceremonies = encryption_ceremony::Entity::find()
+        .all(db)
+        .await
+        .expect("load create ceremonies");
+    assert_eq!(ceremonies.len(), 2);
+    assert_eq!(
+        ceremonies
+            .iter()
+            .filter(|row| row.state == "completed")
+            .count(),
+        1
+    );
+    assert!(
+        ceremonies.iter().all(|row| row.state != "started"),
+        "the losing create must not leave a started ceremony"
+    );
+    let failed = ceremonies
+        .iter()
+        .find(|row| row.state == "failed")
+        .expect("losing create ceremony is failed");
+    assert_eq!(failed.failure.as_deref(), Some("network_already_exists"));
+    assert!(failed.completed_at.is_some());
+}
+
+struct GenerateBarrier {
+    parties: usize,
+    state: Mutex<GenerateBarrierState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GenerateBarrierState {
+    waiting: usize,
+    released: bool,
+    broken: bool,
+}
+
+impl GenerateBarrier {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: Mutex::new(GenerateBarrierState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<(), KeyBackendError> {
+        let mut state = self.state.lock().expect("generate barrier mutex poisoned");
+        if state.broken {
+            return Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ));
+        }
+        state.waiting += 1;
+        if state.waiting == self.parties {
+            state.released = true;
+            self.changed.notify_all();
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.released && !state.broken {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            };
+            let (next_state, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("generate barrier mutex poisoned");
+            state = next_state;
+            if timeout.timed_out() && !state.released {
+                state.broken = true;
+                self.changed.notify_all();
+                return Err(KeyBackendError::Aead(
+                    "network create test barrier timed out".to_string(),
+                ));
+            }
+        }
+
+        if state.broken {
+            Err(KeyBackendError::Aead(
+                "network create test barrier timed out".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct BarrierKeyBackend {
+    inner: LocalOneOfOneBackend,
+    generate_barrier: Arc<GenerateBarrier>,
+}
+
+impl KeyBackend for BarrierKeyBackend {
+    fn kind(&self) -> KeyBackendKind {
+        self.inner.kind()
+    }
+
+    fn generate(&self) -> Result<GeneratedKey, KeyBackendError> {
+        tokio::task::block_in_place(|| self.generate_barrier.wait())?;
+        self.inner.generate()
+    }
+
+    fn unwrap(
+        &self,
+        sealed_private_key: &[u8],
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner.unwrap(sealed_private_key, wrapped_key, context)
+    }
+
+    fn rewrap(
+        &self,
+        symmetric_key: &[u8],
+        receiver_public_key: &[u8],
+        context: &KeyWrapContext<'_>,
+        version: KeyWrapVersion,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .rewrap(symmetric_key, receiver_public_key, context, version)
+    }
+
+    fn open_network_secret(
+        &self,
+        sealed_private_key: &[u8],
+    ) -> Result<X25519StaticSecret, KeyBackendError> {
+        self.inner.open_network_secret(sealed_private_key)
+    }
+
+    fn derive_named_public_key(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .derive_named_public_key(network_secret, canonical_urn, seed)
+    }
+
+    fn unwrap_named(
+        &self,
+        network_secret: &X25519StaticSecret,
+        canonical_urn: &str,
+        seed: Option<&KeySeed>,
+        wrapped_key: &[u8],
+        context: &KeyWrapContext<'_>,
+    ) -> Result<Vec<u8>, KeyBackendError> {
+        self.inner
+            .unwrap_named(network_secret, canonical_urn, seed, wrapped_key, context)
+    }
+
+    fn generate_seed(&self) -> Result<(KeySeed, Vec<u8>), KeyBackendError> {
+        self.inner.generate_seed()
+    }
+
+    fn open_seed(&self, sealed_seed: &[u8]) -> Result<KeySeed, KeyBackendError> {
+        self.inner.open_seed(sealed_seed)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("race.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+
+    let results = race_network_creates(db.clone()).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
+    assert_losing_create_ceremony_is_failed(&db).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_network_conflict_survives_ceremony_cleanup_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cleanup-failure.sqlite").display()
+    );
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(4);
+    let db = Database::connect(options).await.expect("connect sqlite");
+    Migrator::up(&db, None).await.expect("migrate");
+    db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TRIGGER fail_losing_ceremony_update \
+         BEFORE UPDATE ON encryption_ceremony \
+         WHEN NEW.state = 'failed' \
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+    ))
+    .await
+    .expect("install cleanup failure trigger");
+
+    let results = race_network_creates(db).await;
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "cleanup failure must not replace the conflict response with a 500"
+    );
 }
 
 fn owner_keypair() -> Keypair {
@@ -238,7 +511,7 @@ fn unwrap_with_secret(secret: &X25519StaticSecret, wrapped: &[u8]) -> Vec<u8> {
     let pub_peer = PublicKey::from(peer);
     let shared = secret.diffie_hellman(&pub_peer);
     ColumnEncryption::new(*shared.as_bytes())
-        .decrypt(&wrapped[32..])
+        .decrypt_legacy(&wrapped[32..])
         .expect("decrypt rewrapped key")
 }
 
@@ -1173,6 +1446,35 @@ async fn stored_unknown_state_is_refused_as_corrupt() {
 
 // PostgreSQL-backed. Locally these return early unless
 // TINYCLOUD_TEST_POSTGRES_URL is set; CI runs them with a PostgreSQL service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_concurrent_fresh_network_creates_map_unique_conflict_to_already_exists",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+
+    let results = race_network_creates(db.clone()).await;
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "results: {results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(EncryptionServiceError::NetworkAlreadyExists)))
+            .count(),
+        1,
+        "duplicate create should map to 409, never a DB error/500"
+    );
+    assert_losing_create_ceremony_is_failed(&db).await;
+}
+
 #[tokio::test]
 async fn postgres_concurrent_identical_creates_return_one_row() {
     let Some(fixture) = PostgresTestSchema::migrated_through(
@@ -2403,5 +2705,310 @@ async fn postgres_key_writes_wait_for_the_network_row_lock() {
             .unwrap_or_else(|_| panic!("{operation} did not finish after the lock was released"))
             .unwrap();
         result.unwrap_or_else(|e| panic!("{operation}: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn plaintext_stored_network_secret_is_refused() {
+    use crate::models::encryption_network;
+    let db = fresh_db().await;
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    let net = network_id();
+    let secret = X25519StaticSecret::from([7u8; 32]);
+    let mut row: encryption_network::ActiveModel =
+        encryption_network::Entity::find_by_id(net.to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    row.public_key = Set(PublicKey::from(&secret).as_bytes().to_vec());
+    row.sealed_private_key = Set(Some(secret.as_bytes().to_vec()));
+    row.update(&db).await.unwrap();
+    let ctx = make_client_request(PublicKey::from(&secret).as_bytes());
+    let (_, body) = build_body(&ctx, &net);
+    let invocation = build_invocation(&net, &body, &ctx, |_| {});
+    assert!(matches!(
+        svc.decrypt(&net, &invocation, &body).await,
+        Err(EncryptionServiceError::Backend(
+            super::backend::KeyBackendError::SealedKeyUnreadable
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn wrap_versions_are_independent_on_native_root_and_named_decrypt() {
+    use super::backend::{
+        open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
+        KeyWrapVersion,
+    };
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
+        for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
+            for path in ["", "docs/alpha", "apps/notes/alpha"] {
+                let svc = make_service(fresh_db().await)
+                    .with_key_wrap_v2(writer_v2)
+                    .with_key_wrap_require_v2(require_v2);
+                create_network(&svc).await;
+                let net = network_id();
+                let public = if path.is_empty() {
+                    svc.get_network(&net).await.unwrap().public_encryption_key
+                } else {
+                    svc.create_key(&key_loc(path), path.starts_with("apps/"))
+                        .await
+                        .unwrap()
+                        .public_encryption_key
+                };
+                assert_eq!(
+                    svc.get_network(&net).await.unwrap().alg,
+                    ALG_X25519_AES256GCM
+                );
+                let network = net.to_string();
+                let metadata = BTreeMap::from([("contentType".into(), "text/plain".into())]);
+                let context = KeyWrapContext {
+                    purpose: KeyWrapPurpose::NetworkKey,
+                    network_id: &network,
+                    key_path: path,
+                    key_version: 1,
+                    metadata: Some(&metadata),
+                };
+                let mut ctx = make_client_request(&public);
+                ctx.wrapped_key =
+                    wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                        .unwrap();
+                let (mut body, _) = build_body(&ctx, &net);
+                body.alg = incoming.alg().to_string();
+                body.key_path = (!path.is_empty()).then(|| path.to_string());
+                let body_value = serde_json::to_value(&body).unwrap();
+                let facts = serde_json::to_value(DecryptFacts {
+                    ty: DECRYPT_REQUEST_TYPE.into(),
+                    target_node: NODE_DID.into(),
+                    network_id: net.clone(),
+                    body_hash: canonical_hash(&body_value),
+                    encrypted_symmetric_key_hash: body.encrypted_symmetric_key_hash.clone(),
+                    receiver_public_key_hash: body.receiver_public_key_hash.clone(),
+                    alg: body.alg.clone(),
+                    key_version: 1,
+                    key_path: body.key_path.clone(),
+                })
+                .unwrap();
+                let target = if path.is_empty() {
+                    DecryptTarget::Root(net.clone())
+                } else {
+                    DecryptTarget::from_resource(&canonical_key_urn(&key_loc(path))).unwrap()
+                };
+                let resource = if path.is_empty() {
+                    network.clone()
+                } else {
+                    canonical_key_urn(&key_loc(path))
+                };
+                let invocation =
+                    build_session_invocation_for(&resource, DECRYPT_ACTION, vec![facts], NODE_DID);
+                let preflight = svc
+                    .validate_authorized_decrypt_request(&target, &invocation, &body_value)
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        preflight,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                } else {
+                    preflight.unwrap();
+                }
+                let result = svc
+                    .decrypt_authorized(&target, &invocation, &body_value)
+                    .await;
+                if require_v2 && incoming == KeyWrapVersion::V1 {
+                    assert!(matches!(
+                        result,
+                        Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                    ));
+                    continue;
+                }
+                let response = result.unwrap().response;
+                let output_version = if writer_v2 {
+                    KeyWrapVersion::V2
+                } else {
+                    KeyWrapVersion::V1
+                };
+                assert_eq!(response.alg, output_version.alg());
+                let empty = BTreeMap::new();
+                let expected = KeyWrapContext {
+                    purpose: KeyWrapPurpose::ReceiverKey,
+                    metadata: Some(&empty),
+                    ..context
+                };
+                assert_eq!(
+                    open_wrapped_key(
+                        &ctx.receiver_secret,
+                        &STANDARD.decode(response.wrapped_key).unwrap(),
+                        &expected
+                    )
+                    .unwrap(),
+                    ctx.symmetric,
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn standalone_decrypt_reads_both_versions_and_uses_writer_flag() {
+    use super::backend::{
+        open_wrapped_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
+        KeyWrapVersion,
+    };
+    for (writer_v2, require_v2) in [(false, false), (true, false), (false, true), (true, true)] {
+        for incoming in [KeyWrapVersion::V1, KeyWrapVersion::V2] {
+            let svc = make_service(fresh_db().await)
+                .with_key_wrap_v2(writer_v2)
+                .with_key_wrap_require_v2(require_v2);
+            create_network(&svc).await;
+            let net = network_id();
+            let public = svc.get_network(&net).await.unwrap().public_encryption_key;
+            let network = net.to_string();
+            let empty = BTreeMap::new();
+            let context = KeyWrapContext {
+                purpose: KeyWrapPurpose::NetworkKey,
+                network_id: &network,
+                key_path: "",
+                key_version: 1,
+                metadata: Some(&empty),
+            };
+            let mut ctx = make_client_request(&public);
+            ctx.wrapped_key =
+                wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                    .unwrap();
+            let (mut body, _) = build_body(&ctx, &net);
+            body.alg = incoming.alg().into();
+            let body_value = serde_json::to_value(body).unwrap();
+            let inv = build_invocation(&net, &body_value, &ctx, |inv| {
+                inv.facts.alg = incoming.alg().into()
+            });
+            let result = svc.decrypt(&net, &inv, &body_value).await;
+            if require_v2 && incoming == KeyWrapVersion::V1 {
+                assert!(matches!(
+                    result,
+                    Err(EncryptionServiceError::KeyUnwrapFailed(_))
+                ));
+                continue;
+            }
+            let response = result.unwrap().response;
+            assert_eq!(
+                response.alg,
+                if writer_v2 {
+                    KeyWrapVersion::V2.alg()
+                } else {
+                    KeyWrapVersion::V1.alg()
+                }
+            );
+            let expected = KeyWrapContext {
+                purpose: KeyWrapPurpose::ReceiverKey,
+                ..context
+            };
+            assert_eq!(
+                open_wrapped_key(
+                    &ctx.receiver_secret,
+                    &STANDARD.decode(response.wrapped_key).unwrap(),
+                    &expected
+                )
+                .unwrap(),
+                ctx.symmetric
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_decrypt_checks_wrap_context_and_outer_algorithm() {
+    use super::backend::{
+        wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose, KeyWrapVersion,
+    };
+    for path in ["", "docs/alpha", "apps/notes/alpha"] {
+        for mismatch in [
+            "network",
+            "path",
+            "version",
+            "purpose",
+            "algorithm",
+            "algorithm-v1",
+        ] {
+            let svc = make_service(fresh_db().await);
+            create_network(&svc).await;
+            let net = network_id();
+            let network = net.to_string();
+            let public = if path.is_empty() {
+                svc.get_network(&net).await.unwrap().public_encryption_key
+            } else {
+                svc.create_key(&key_loc(path), path.starts_with("apps/"))
+                    .await
+                    .unwrap()
+                    .public_encryption_key
+            };
+            let context = KeyWrapContext {
+                purpose: if mismatch == "purpose" {
+                    KeyWrapPurpose::ReceiverKey
+                } else {
+                    KeyWrapPurpose::NetworkKey
+                },
+                network_id: if mismatch == "network" {
+                    "urn:tinycloud:encryption:did:key:z6Mk:other"
+                } else {
+                    &network
+                },
+                key_path: if mismatch == "path" {
+                    "docs/beta"
+                } else {
+                    path
+                },
+                key_version: if mismatch == "version" { 2 } else { 1 },
+                metadata: None,
+            };
+            let mut ctx = make_client_request(&public);
+            let incoming = if mismatch == "algorithm-v1" {
+                KeyWrapVersion::V1
+            } else {
+                KeyWrapVersion::V2
+            };
+            ctx.wrapped_key =
+                wrap_to_public_key_with_context(&public, &ctx.symmetric, &context, incoming)
+                    .unwrap();
+            let (mut body, _) = build_body(&ctx, &net);
+            body.key_path = (!path.is_empty()).then(|| path.to_string());
+            body.alg = if mismatch == "algorithm" {
+                KeyWrapVersion::V1
+            } else {
+                KeyWrapVersion::V2
+            }
+            .alg()
+            .into();
+            let body_value = serde_json::to_value(&body).unwrap();
+            let facts = serde_json::to_value(DecryptFacts {
+                ty: DECRYPT_REQUEST_TYPE.into(),
+                target_node: NODE_DID.into(),
+                network_id: net.clone(),
+                body_hash: canonical_hash(&body_value),
+                encrypted_symmetric_key_hash: body.encrypted_symmetric_key_hash.clone(),
+                receiver_public_key_hash: body.receiver_public_key_hash.clone(),
+                alg: body.alg.clone(),
+                key_version: 1,
+                key_path: body.key_path.clone(),
+            })
+            .unwrap();
+            let resource = if path.is_empty() {
+                network.clone()
+            } else {
+                canonical_key_urn(&key_loc(path))
+            };
+            let target = DecryptTarget::from_resource(&resource).unwrap();
+            let invocation =
+                build_session_invocation_for(&resource, DECRYPT_ACTION, vec![facts], NODE_DID);
+            assert!(
+                svc.decrypt_authorized(&target, &invocation, &body_value)
+                    .await
+                    .is_err(),
+                "{path}: {mismatch}"
+            );
+        }
     }
 }

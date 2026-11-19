@@ -93,7 +93,8 @@ async fn a_256_mib_artifact_hydrates_with_a_bounded_heap() {
     .await
     .unwrap();
 
-    let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+    // The TC-2961 read cap is off to measure the streaming path.
+    let repo = SeaOrmDatabaseArtifactRepository::new(conn).with_max_read_bytes(0);
     let cache = tempfile::tempdir().unwrap();
     let mut sink = CacheFileSink::new(
         "sql",

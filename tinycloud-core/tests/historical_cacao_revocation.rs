@@ -59,12 +59,12 @@ fn copy_database(fixture: &Fixture) -> (tempfile::TempDir, PathBuf) {
     (directory, path)
 }
 
-// Snapshot only immutable signed records and edges; new alias/migration rows
-// and ordinary new invocation events are deliberately outside this snapshot.
+// Snapshot immutable signed-record fields and edges, independently of additive
+// storage metadata. New alias/migration rows and invocation events are excluded.
 fn signed_snapshot(path: &Path) -> Vec<Vec<Vec<SqlValue>>> {
     let db = rusqlite::Connection::open(path).unwrap();
     [
-        "SELECT * FROM delegation ORDER BY id",
+        "SELECT id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization FROM delegation ORDER BY id",
         "SELECT * FROM parent_delegation WHERE child IN (SELECT id FROM delegation) OR child IN (SELECT id FROM revocation) ORDER BY child, parent",
         "SELECT * FROM revocation ORDER BY id",
     ].into_iter().map(|sql| {
@@ -105,13 +105,29 @@ async fn assert_signed_rows_untouched(db: &TestDb, fixture: &Fixture) {
             .await
             .unwrap()
             .unwrap();
-        let root_bytes =
-            tinycloud_core::encryption::maybe_decrypt(encryption.as_ref(), &root.serialization)
-                .unwrap();
+        let root_bytes = tinycloud_core::encryption::maybe_decrypt(
+            encryption.as_ref(),
+            &root.serialization,
+            tinycloud_core::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(root.id)],
+            ),
+            root.serialization_format,
+        )
+        .unwrap();
         assert_eq!(root_bytes, URL_SAFE.decode(&row.header).unwrap());
-        let child_bytes =
-            tinycloud_core::encryption::maybe_decrypt(encryption.as_ref(), &child.serialization)
-                .unwrap();
+        let child_bytes = tinycloud_core::encryption::maybe_decrypt(
+            encryption.as_ref(),
+            &child.serialization,
+            tinycloud_core::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(child.id)],
+            ),
+            child.serialization_format,
+        )
+        .unwrap();
         assert_eq!(child_bytes, row.child_header.as_bytes());
         let parents = parent_delegations::Entity::find()
             .filter(parent_delegations::Column::Child.eq(child.id))
@@ -396,12 +412,34 @@ async fn unstored_canonical_status_resolves_historical_grant() {
     let (_directory, path) = copy_database(&fixture);
     let db = open(&path).await;
     assert_eq!(
+        db.delegation_effective_expiry(hash_from_cid(&canonical), 0)
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap(),
+        Some(4_102_444_800),
+    );
+    assert_eq!(
         db.delegation_status(hash_from_cid(&canonical), &fixture.issuer, &[])
             .await
             .map_err(|error| error.to_string())
             .unwrap(),
         Some(tinycloud_core::db::DelegationStatus::Active),
     );
+    for cid in [&canonical, &fixture.rows[0].raw_cid] {
+        assert!(db
+            .delegation_status_snapshot(
+                hash_from_cid(cid),
+                &fixture.issuer,
+                &[],
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
 }
 
 #[tokio::test]

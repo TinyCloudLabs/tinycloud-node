@@ -482,7 +482,7 @@ impl Account {
         let address: [u8; 20] = digest[12..].try_into()?;
         let did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&address));
         let name = format!("tc887{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-        let space = SpaceId::new(did.parse::<DIDBuf>()?, name.parse()?);
+        let space = SpaceId::new(did.parse::<DIDBuf>()?, name.parse()?)?;
         Ok(Self {
             key,
             address,

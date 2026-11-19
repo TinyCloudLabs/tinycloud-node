@@ -455,7 +455,7 @@ impl Account {
         let digest = Keccak256::digest(&public.as_bytes()[1..]);
         let address: [u8; 20] = digest[12..].try_into()?;
         let did = format!("did:pkh:eip155:1:0x{}", eip55(&address));
-        let space = SpaceId::new(did.parse::<DIDBuf>()?, "account".parse()?);
+        let space = SpaceId::new(did.parse::<DIDBuf>()?, "account".parse()?)?;
         Ok(Self {
             key,
             address,

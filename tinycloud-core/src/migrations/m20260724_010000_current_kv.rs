@@ -199,14 +199,15 @@ mod tests {
     ) -> kv_write::Model {
         let invocation_id = hash(format!("invocation-{label}").as_bytes());
         let epoch_id = hash(format!("epoch-{label}").as_bytes());
-        invocation::ActiveModel {
+        invocation::Entity::insert(invocation::ActiveModel {
             id: Set(invocation_id),
             invoker: Set("did:key:migration".to_string()),
             issued_at: Set(OffsetDateTime::now_utc()),
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
-        }
-        .insert(db)
+            serialization_format: Default::default(),
+        })
+        .exec(db)
         .await
         .unwrap();
         epoch::ActiveModel {
@@ -257,7 +258,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        let space_id = SpaceId::new(did, "migration".parse().unwrap());
+        let space_id = SpaceId::new(did, "migration".parse().unwrap()).unwrap();
         actor::ActiveModel {
             id: Set("did:key:migration".to_string()),
         }
@@ -286,14 +287,15 @@ mod tests {
             ("delete-old", "old-tombstone", &tombstoned_old),
         ] {
             let delete_invocation = hash(label.as_bytes());
-            invocation::ActiveModel {
+            invocation::Entity::insert(invocation::ActiveModel {
                 id: Set(delete_invocation),
                 invoker: Set("did:key:migration".to_string()),
                 issued_at: Set(OffsetDateTime::now_utc()),
                 facts: Set(None),
                 serialization: Set(label.as_bytes().to_vec()),
-            }
-            .insert(&db)
+                serialization_format: Default::default(),
+            })
+            .exec(&db)
             .await
             .unwrap();
             kv_delete::ActiveModel {
@@ -373,7 +375,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        let space_id = SpaceId::new(did, "migration".parse().unwrap());
+        let space_id = SpaceId::new(did, "migration".parse().unwrap()).unwrap();
         actor::ActiveModel {
             id: Set("did:key:migration".to_string()),
         }

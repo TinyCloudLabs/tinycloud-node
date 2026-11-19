@@ -104,7 +104,53 @@ impl CandidateShare {
     pub fn index(&self) -> MemberIndex {
         self.index
     }
+    /// Secret bytes: version(1) ‖ transcript hash(32) ‖ index u16be(2) ‖ scalar(32). Details: TC-2221
+    ///
+    /// The caller owns the returned buffer's erasure; it is wrapped in
+    /// [`zeroize::Zeroizing`] so a dropped copy clears itself. [`CandidateShare::from_bytes`]
+    /// restores the candidate for [`KeyShare::bind`] against the pinned certificate.
+    /// The encoding is written directly into the guarded output and the raw
+    /// scalar is guarded; no unguarded secret copy is produced.
+    pub fn to_bytes(&self) -> zeroize::Zeroizing<[u8; 67]> {
+        let mut out = zeroize::Zeroizing::new([0u8; 67]);
+        let scalar = zeroize::Zeroizing::new(self.scalar.to_bytes());
+        let (version, rest) = out.split_at_mut(1);
+        version.copy_from_slice(&[1u8]);
+        let (transcript, rest) = rest.split_at_mut(32);
+        transcript.copy_from_slice(self.transcript.as_bytes());
+        let (index, scalar_slot) = rest.split_at_mut(2);
+        index.copy_from_slice(&self.index.get().to_be_bytes());
+        scalar_slot.copy_from_slice(&*scalar);
+        out
+    }
+
+    /// Canonical decode only: version 1, index 1..=16, scalar < r and != 0, exact length. Details: TC-2221
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != 67 || bytes.first() != Some(&1) {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut transcript = [0u8; 32];
+        transcript.copy_from_slice(bytes.get(1..33).ok_or(Error::InvalidEncoding)?);
+        let index = MemberIndex::new(u16::from_be_bytes([
+            *bytes.get(33).ok_or(Error::InvalidEncoding)?,
+            *bytes.get(34).ok_or(Error::InvalidEncoding)?,
+        ]))?;
+        let raw = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(bytes.get(35..67).ok_or(Error::InvalidEncoding)?)
+                .map_err(|_| Error::InvalidEncoding)?,
+        );
+        let scalar = Scalar::from_bytes(&*raw)?;
+        if scalar.is_zero() {
+            return Err(Error::InvalidScalar);
+        }
+        Ok(Self {
+            transcript: TranscriptHash::new(transcript),
+            index,
+            scalar,
+        })
+    }
 }
+
 impl fmt::Debug for CandidateShare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CandidateShare([REDACTED])")
@@ -401,6 +447,10 @@ impl CertificateBody {
     pub fn owner_statement(&self) -> Vec<u8> {
         dst::tagged_hash(dst::CERT_STATEMENT, self.digest().as_bytes()).to_vec()
     }
+    /// Threshold of the genesis or re-key ceremony that created this master key. Details: TC-2223
+    pub fn genesis_t(&self) -> u16 {
+        self.genesis_t
+    }
     /// Ordered node identity directory. Details: TC-2222
     pub fn members(&self) -> &[CertMember] {
         &self.members
@@ -412,6 +462,18 @@ impl CertificateBody {
     /// Transcript committed by this certificate. Details: TC-2222
     pub fn transcript_hash(&self) -> TranscriptHash {
         self.transcript
+    }
+    /// Pinned predecessor digest, absent only at genesis. Details: TC-2221
+    pub fn previous(&self) -> Option<&CertDigest> {
+        self.previous.as_ref()
+    }
+    /// Certificate epoch. Details: TC-2221
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    /// Re-key counter. Details: TC-2221
+    pub fn rekey(&self) -> RekeyCounter {
+        self.rekey
     }
 }
 
@@ -739,7 +801,7 @@ pub(crate) mod tests {
             bytes[threshold_offset + 2..threshold_offset + 4].copy_from_slice(&n.to_be_bytes());
             assert!(CertificateBody::decode(&bytes).is_err());
         }
-        for mutation in 0..9 {
+        for mutation in 0..8 {
             let mut body = cert.body.clone();
             match mutation {
                 0 => body.members.swap(0, 1),
@@ -749,8 +811,7 @@ pub(crate) mod tests {
                 4 => body.public.commitments[1] = G2::identity(),
                 5 => body.epoch = Epoch::new(1),
                 6 => body.rekey = RekeyCounter::new(1),
-                7 => body.genesis_t = 1,
-                _ => body.previous_mpk = Some(body.public.mpk.clone()),
+                _ => body.genesis_t = 1,
             }
             assert!(CertificateBody::decode(&body.encode()).is_err());
         }
@@ -787,6 +848,42 @@ pub(crate) mod tests {
             verify_certificate(&signers.anchor(), &sign(impostor, &signers), &signers),
             Err(CertError::AnchorMismatch)
         ));
+    }
+
+    #[test]
+    fn a_rekey_must_change_the_master_key_at_every_certificate_layer() {
+        let signers = Signers::new();
+        let (prev, _) = genesis(&signers);
+        let threshold = Threshold::new(2, 3).unwrap();
+        let (valid, _, ceremony) = successor(&signers, &prev, CeremonyKind::Rekey, threshold, 12);
+        assert_ne!(valid.body.public.mpk, prev.body.public.mpk);
+        verify_successor(&prev, &valid, &signers).unwrap();
+        let kept = prev.body.public.clone();
+        assert_eq!(kept.mpk, prev.body.public.mpk);
+
+        // Building: the successor constructor refuses a re-key output that keeps mpk.
+        assert_eq!(
+            CertificateBody::successor(&prev, &ceremony, &kept, &TranscriptHash::new([53; 32]))
+                .err(),
+            Some(Error::ContextMismatch)
+        );
+
+        // Decoding: a re-key body naming its own master key as the previous one.
+        let mut body = valid.body.clone();
+        body.public = kept.clone();
+        assert_eq!(
+            CertificateBody::decode(&body.encode()).err(),
+            Some(Error::InvalidEncoding)
+        );
+
+        // Pinned succession: every other re-key field is correct, only mpk is kept.
+        assert_eq!(body.previous_mpk, Some(prev.body.public.mpk.clone()));
+        assert_eq!(body.rekey, prev.body.rekey.checked_next().unwrap());
+        assert_eq!(body.genesis_t, body.public.threshold.t());
+        assert_eq!(
+            verify_successor(&prev, &sign(body, &signers), &signers).err(),
+            Some(CertError::InvalidLineage)
+        );
     }
 
     #[test]

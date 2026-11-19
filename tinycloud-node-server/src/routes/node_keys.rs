@@ -22,29 +22,34 @@ use rocket::{serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use tinycloud_core::keys::StaticSecret;
 
-/// The node's published public key material. Public halves only — nothing in
-/// this struct can be used to sign.
+/// Public key material safe for unauthenticated discovery.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NodePublicKeys {
-    /// The node's stable identity DID (`did:key`), also used as the share-v2
-    /// enforcer DID and the encryption-module audience.
     pub node_did: String,
-    /// Unpadded base64url of the 32-byte ed25519 public half of the Share
-    /// invitation signing key. This is exactly the value that
-    /// `shareEmail.invitationPublicKey` (and the trust bundle's
-    /// `nodeInvitationPublicKey`) must carry for this node.
     pub share_invitation_public_key: String,
+    pub renewer_did: String,
+    pub renewer_public_key: String,
+    pub renewer_epoch: u64,
 }
 
 impl NodePublicKeys {
     pub fn derive(secret: &StaticSecret) -> Self {
+        Self::derive_at_epoch(secret, 1)
+    }
+
+    pub fn derive_at_epoch(secret: &StaticSecret, epoch: u64) -> Self {
+        let (renewer_did, _, renewer_public_key) =
+            tinycloud_core::renewal::renewal_identity_at_epoch(secret, epoch);
         Self {
             node_did: secret.node_did(),
             share_invitation_public_key: encode_config(
                 secret.share_invitation_public_key(),
                 URL_SAFE_NO_PAD,
             ),
+            renewer_did,
+            renewer_public_key: encode_config(renewer_public_key, URL_SAFE_NO_PAD),
+            renewer_epoch: epoch,
         }
     }
 }
@@ -92,15 +97,34 @@ mod tests {
     }
 
     #[test]
+    fn discovery_publishes_the_dedicated_renewer_identity_and_verification_key() {
+        let secret = secret();
+        let published = serde_json::to_value(NodePublicKeys::derive(&secret)).expect("serialize");
+
+        assert_eq!(published.as_object().expect("JSON object").len(), 5);
+        assert_eq!(published["nodeDid"], secret.node_did());
+        assert_eq!(published["renewerDid"], secret.renewal_did());
+        assert_eq!(
+            published["renewerPublicKey"],
+            encode_config(
+                secret
+                    .renewal_keypair()
+                    .public()
+                    .try_into_ed25519()
+                    .unwrap()
+                    .to_bytes(),
+                URL_SAFE_NO_PAD
+            )
+        );
+        assert_ne!(published["renewerDid"], published["nodeDid"]);
+        assert!(published["renewerEpoch"].is_u64());
+    }
+
+    #[test]
     fn the_published_record_carries_no_secret_material() {
         let secret = secret();
         let rendered = serde_json::to_value(NodePublicKeys::derive(&secret)).expect("serialize");
 
-        assert_eq!(
-            rendered.as_object().expect("object").len(),
-            2,
-            "only nodeDid and shareInvitationPublicKey may be published"
-        );
         let body = rendered.to_string();
         assert!(!body.contains(&encode_config(secret.as_bytes(), URL_SAFE_NO_PAD)));
         assert!(!body.contains(&hex::encode(secret.as_bytes())));
@@ -108,6 +132,10 @@ mod tests {
         // it must never appear either.
         assert!(!body.contains(&encode_config(
             secret.derive_key(b"tinycloud/share-email/invitation-signing"),
+            URL_SAFE_NO_PAD
+        )));
+        assert!(!body.contains(&encode_config(
+            secret.derive_key(tinycloud_core::renewal::RENEWER_KEY_CONTEXT),
             URL_SAFE_NO_PAD
         )));
     }

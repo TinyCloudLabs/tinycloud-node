@@ -119,6 +119,28 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
             .await
     }
 
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.inner.chunked_checkpoints(service, space, name)
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        let saved = self
+            .inner
+            .save_snapshot(service, space, name, snapshot, expected)
+            .await?;
+        self.sizes
+            .update(service, space, name, saved.size_bytes.max(0) as u64)
+            .await;
+        Ok(saved)
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -173,7 +195,7 @@ mod tests {
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     async fn migrated_repo() -> (

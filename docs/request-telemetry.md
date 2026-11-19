@@ -88,7 +88,7 @@ SQLx query timing follows the execution/logger lifetime, including network I/O a
 | KV read/write/list/metadata/sync and public/signed access | Shared pool for graph, metadata, change feed and ticket work; block bytes are not SQL |
 | Policy-v3, hooks/tickets/subscriptions, encryption persistence, replay INSERT | Shared pool for all request-owned database operations |
 | Quota/admin | In-memory overrides and size mirrors do not invent queries; usage/hosted-space enumeration and any actual pool work are counted |
-| SQL/DuckDB identity/fence/alias resolution and durable artifact load/save/CAS/delta | Shared pool, including PostgreSQL bulk scopes; cache hits perform only their actual work |
+| SQL/DuckDB identity/fence/alias resolution and durable artifact load/save/CAS/delta | Shared pool; cache hits perform only their actual work |
 | Request-awaited read audit | Separate measured batch context, fanned out before durable receipts; details below |
 | User SQL rusqlite actor | Context on every work message; actual statement/schema/batch/growth-control SQL (a write request also counts the `SAVEPOINT` and `RELEASE`/`ROLLBACK` of its request transaction, TC-1491; the reservation's own PRAGMAs and checks are not counted), prepare/constraint errors, cold-open PRAGMAs, size/promotion/checkpoint SQL |
 | SQL publication | The current withdrawn publication handler executes no SQL; it is not an uninstrumented database path |

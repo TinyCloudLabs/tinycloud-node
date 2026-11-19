@@ -59,7 +59,16 @@ pub struct Config {
     #[serde(default)]
     pub encryption_network: EncryptionNetworkConfig,
     #[serde(default)]
+    pub column_encryption: ColumnEncryptionConfig,
+    #[serde(default)]
     pub sql: SqlConfig,
+}
+
+/// Recorded column reads may require encrypted storage when explicitly enabled.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct ColumnEncryptionConfig {
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -77,6 +86,12 @@ pub struct Config {
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
     pub named_keys_v1: bool,
+    /// Select v2 response wraps independently of incoming-wrap policy.
+    #[serde(default)]
+    pub key_wrap_v2: bool,
+    /// Require v2 incoming network-key wraps.
+    #[serde(default)]
+    pub key_wrap_require_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
 }
@@ -1591,6 +1606,13 @@ pub struct SpacesConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SqlStorageConfig {
+    /// Opt-in PostgreSQL checkpoint parts (TC-2917); requires explicit capacities.
+    #[serde(default)]
+    pub chunked_artifacts: bool,
+    #[serde(default)]
+    pub chunked_artifact_max_bytes: u64,
+    #[serde(default)]
+    pub chunked_account_max_bytes: u64,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default = "default_sql_memory_threshold")]
@@ -1638,6 +1660,21 @@ pub struct SqlStorageConfig {
     /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
     #[serde(default)]
     pub ddl_requires_schema: DdlPolicy,
+    /// The largest SQL or DuckDB artifact payload the node saves in one
+    /// statement (TC-2961). A larger whole checkpoint is refused before it is
+    /// sent (`507 sql_database_size_limit`): it travels as one parameter, and
+    /// the server needs a multiple of it in memory, so one tenant's database
+    /// could take down the shared primary. On by default, 64 MiB; 0 turns it
+    /// off, for local tests only.
+    #[serde(default = "default_sql_max_artifact_write_bytes")]
+    pub max_artifact_write_bytes: ByteUnit,
+    /// The largest stored SQL or DuckDB checkpoint or WAL delta the node
+    /// loads (TC-2961). A larger database is refused before any of it is
+    /// read (`507 sql_database_size_limit`) instead of being loaded whole.
+    /// On by default, 64 MiB; 0 turns it off. Otherwise `validate` refuses
+    /// it below `max_artifact_write_bytes`, or with that off.
+    #[serde(default = "default_sql_max_artifact_read_bytes")]
+    pub max_artifact_read_bytes: ByteUnit,
 }
 
 fn default_sql_max_database_bytes() -> ByteUnit {
@@ -1646,6 +1683,14 @@ fn default_sql_max_database_bytes() -> ByteUnit {
 
 fn default_sql_min_free_bytes() -> ByteUnit {
     ByteUnit::Byte(0)
+}
+
+fn default_sql_max_artifact_write_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_WRITE_BYTES)
+}
+
+fn default_sql_max_artifact_read_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_READ_BYTES)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1687,11 +1732,27 @@ impl SqlStorageConfig {
             hydration_max: Duration::from_millis(self.hydration_max_ms),
         }
     }
+
+    /// Refuse an artifact read limit below the write limit (TC-2961): the
+    /// databases between the two would be saved, then refused on every load.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let read = self.max_artifact_read_bytes.as_u64();
+        let write = self.max_artifact_write_bytes.as_u64();
+        if read != 0 && (write == 0 || read < write) {
+            return Err(
+                "storage.sql.max_artifact_read_bytes must be 0 (off) or at least storage.sql.max_artifact_write_bytes (and that must not be 0)",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for SqlStorageConfig {
     fn default() -> Self {
         Self {
+            chunked_artifacts: false,
+            chunked_artifact_max_bytes: 0,
+            chunked_account_max_bytes: 0,
             path: None,
             memory_threshold: default_sql_memory_threshold(),
             lock_wait_timeout_ms: default_sql_lock_wait_timeout_ms(),
@@ -1702,6 +1763,8 @@ impl Default for SqlStorageConfig {
             max_database_bytes: default_sql_max_database_bytes(),
             min_free_bytes: default_sql_min_free_bytes(),
             ddl_requires_schema: DdlPolicy::default(),
+            max_artifact_write_bytes: default_sql_max_artifact_write_bytes(),
+            max_artifact_read_bytes: default_sql_max_artifact_read_bytes(),
         }
     }
 }
@@ -1892,15 +1955,18 @@ pub struct DatabaseConfig {
     /// Zero disables it.
     #[serde(default = "default_database_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
-    /// `statement_timeout`, in milliseconds, for the statements on a whole
-    /// SQL or DuckDB artifact that may be larger than a WAL delta (hydration
-    /// loads and checkpoint saves over 8 MiB, or of unknown size): the
-    /// server's work on a ~100 MiB value (detoasting and decompressing it on
-    /// load; compressing, TOASTing and WAL-logging it on save) can outlast
-    /// the base limit. PostgreSQL does not cancel a statement while it is
-    /// writing a row to the client, so the download itself is not limited.
-    #[serde(default = "default_database_bulk_statement_timeout_ms")]
-    pub bulk_statement_timeout_ms: u64,
+    /// PostgreSQL `idle_in_transaction_session_timeout`, in milliseconds, set
+    /// once on every pooled connection (TC-2954): the server ends a session
+    /// that sits idle inside a transaction this long, so a leaked or stalled
+    /// transaction cannot hold its locks and pooled connection indefinitely.
+    /// It must exceed the longest legitimate hold, a protected legacy meeting
+    /// write's upload (`KV_UPLOAD_TIMEOUT`, 240 s); `validate` refuses less.
+    /// Zero disables it. Not set in `statement_timeout_mode = "local"`: a
+    /// session `SET` behind a transaction-pooling proxy would land on
+    /// whichever server connection served it and reach the proxy's other
+    /// clients.
+    #[serde(default = "default_database_idle_in_transaction_timeout_ms")]
+    pub idle_in_transaction_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
     /// sockets, so a connection the network silently drops fails within tens
     /// of seconds instead of the kernel's ~15 min retransmission timeout
@@ -1964,9 +2030,12 @@ fn default_database_statement_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_database_bulk_statement_timeout_ms() -> u64 {
-    120_000
+fn default_database_idle_in_transaction_timeout_ms() -> u64 {
+    300_000
 }
+
+/// PostgreSQL's largest millisecond timeout setting (`INT_MAX`).
+const POSTGRES_MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
@@ -2001,7 +2070,7 @@ impl Default for DatabaseConfig {
             max_lifetime_secs: default_database_max_lifetime_secs(),
             statement_timeout_mode: StatementTimeoutMode::default(),
             statement_timeout_ms: default_database_statement_timeout_ms(),
-            bulk_statement_timeout_ms: default_database_bulk_statement_timeout_ms(),
+            idle_in_transaction_timeout_ms: default_database_idle_in_transaction_timeout_ms(),
             tcp_keepalive: true,
             tcp_keepalive_idle_secs: default_database_tcp_keepalive_idle_secs(),
             tcp_keepalive_interval_secs: default_database_tcp_keepalive_interval_secs(),
@@ -2025,12 +2094,51 @@ pub struct DidResolutionConfig {
 
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero
-    /// read-audit wait would answer every authorized read `read_audit_busy`.
+    /// read-audit wait would answer every authorized read `read_audit_busy`,
+    /// an idle-in-transaction timeout within the legacy upload hold would
+    /// fail legitimate writes (TC-2954), and a timeout above PostgreSQL's
+    /// largest (`INT_MAX` ms) would fail every connection after startup.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.read_audit_wait_ms == 0 {
             return Err("database.read_audit_wait_ms must be greater than zero");
         }
+        if self.idle_in_transaction_timeout_ms != 0
+            && u128::from(self.idle_in_transaction_timeout_ms)
+                <= tinycloud_core::db::KV_UPLOAD_TIMEOUT.as_millis()
+        {
+            return Err(
+                "database.idle_in_transaction_timeout_ms must be 0 (off) or exceed the 240 s legacy upload hold",
+            );
+        }
+        for (value, error) in [
+            (
+                self.idle_in_transaction_timeout_ms,
+                "database.idle_in_transaction_timeout_ms must be at most 2147483647",
+            ),
+            (
+                self.statement_timeout_ms,
+                "database.statement_timeout_ms must be at most 2147483647",
+            ),
+        ] {
+            if value > POSTGRES_MAX_TIMEOUT_MS {
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+
+    /// The statement that sets the pool's idle-in-transaction timeout on a new
+    /// connection, or `None` when it is off or the statement timeout mode is
+    /// `local` (a transaction-pooling proxy).
+    pub fn idle_in_transaction_statement(&self) -> Option<String> {
+        (self.idle_in_transaction_timeout_ms > 0
+            && self.statement_timeout_mode != StatementTimeoutMode::Local)
+            .then(|| {
+                format!(
+                    "SET idle_in_transaction_session_timeout = {}",
+                    self.idle_in_transaction_timeout_ms
+                )
+            })
     }
 
     /// The pool's PostgreSQL `statement_timeout` policy.
@@ -2038,7 +2146,6 @@ impl DatabaseConfig {
         StatementTimeouts {
             mode: self.statement_timeout_mode,
             base: Duration::from_millis(self.statement_timeout_ms),
-            bulk: Duration::from_millis(self.bulk_statement_timeout_ms),
         }
     }
 
@@ -2145,6 +2252,64 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    #[test]
+    fn column_encryption_strict_defaults_off_and_accepts_opt_in() {
+        assert!(!Config::default().column_encryption.strict);
+        assert!(
+            !serde_json::from_str::<ColumnEncryptionConfig>("{}")
+                .unwrap()
+                .strict
+        );
+        assert!(
+            serde_json::from_str::<ColumnEncryptionConfig>(r#"{"strict":true}"#)
+                .unwrap()
+                .strict
+        );
+    }
+
+    #[test]
+    fn storage_keyrings_separate_purposes_and_apply_strict_mode() {
+        use tinycloud_core::encryption::RowBinding;
+
+        let root = tinycloud_core::keys::StaticSecret::new(vec![7; 32]).unwrap();
+        let binding = RowBinding::new("hook_subscription", "encrypted_secret", &[b"hook"]);
+        let config = Config::default();
+        let (columns, webhooks) = crate::storage_keyrings(&root, &config.column_encryption);
+        let sealed = columns.encrypt(b"stored bytes", binding);
+        assert!(webhooks.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy_seed = tinycloud_core::ColumnEncryption::for_purpose(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            tinycloud_core::encryption::EncryptionPurpose::Columns,
+        );
+        assert!(legacy_seed.decrypt_recorded(&sealed, binding, 2).is_err());
+        let sealed = webhooks.encrypt(b"stored bytes", binding);
+        assert!(columns.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy = tinycloud_core::ColumnEncryption::new(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+        )
+        .encrypt_legacy(b"legacy bytes");
+        for ring in [&columns, &webhooks] {
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+            assert_eq!(
+                ring.decrypt_recorded(b"plaintext", binding, 0).unwrap(),
+                b"plaintext"
+            );
+        }
+        let (columns, webhooks) =
+            crate::storage_keyrings(&root, &ColumnEncryptionConfig { strict: true });
+        for ring in [&columns, &webhooks] {
+            assert!(ring.decrypt_recorded(b"plaintext", binding, 0).is_err());
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+        }
+    }
+
     /// TC-1581: `[global.storage.sql] ddl_requires_schema` defaults to
     /// `enforce` and accepts only `off`, `log` and `enforce`.
     #[test]
@@ -2208,6 +2373,82 @@ mod tests {
         }
     }
 
+    /// TC-2954: the idle-in-transaction timeout is on by default (300 s) and,
+    /// when on, must outlast the 240 s a protected legacy write holds its
+    /// transaction.
+    #[test]
+    fn tc2954_startup_rejects_an_idle_in_transaction_timeout_within_the_upload_hold() {
+        assert_eq!(
+            Config::default().database.idle_in_transaction_timeout_ms,
+            300_000
+        );
+        for (timeout_ms, ok) in [
+            (0, true),
+            (1, false),
+            (240_000, false),
+            (240_001, true),
+            (2_147_483_647, true),
+            (2_147_483_648, false),
+        ] {
+            let mut config = Config::default();
+            config.database.idle_in_transaction_timeout_ms = timeout_ms;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{timeout_ms}"
+            );
+        }
+    }
+
+    /// TC-2961: a read limit below the write limit would make databases
+    /// between the two writable and then unloadable, so the node refuses to
+    /// start with it. 0 turns the read limit off.
+    #[test]
+    fn startup_refuses_an_artifact_read_limit_below_the_write_limit() {
+        let mib = |n: u64| ByteUnit::Byte(n * 1024 * 1024);
+        for (write, read, ok) in [
+            (mib(64), mib(64), true),
+            (mib(64), mib(128), true),
+            (mib(64), ByteUnit::Byte(0), true),
+            (ByteUnit::Byte(0), ByteUnit::Byte(0), true),
+            (mib(64), ByteUnit::Byte(64 * 1024 * 1024 - 1), false),
+            (ByteUnit::Byte(0), mib(64), false),
+        ] {
+            let mut config = Config::default();
+            config.storage.sql.max_artifact_write_bytes = write;
+            config.storage.sql.max_artifact_read_bytes = read;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "write {write:?} read {read:?}"
+            );
+        }
+    }
+
+    /// TC-2954: a statement timeout above PostgreSQL's largest is refused at
+    /// startup instead of failing every connection after the old node has
+    /// stopped.
+    #[test]
+    fn startup_rejects_a_statement_timeout_postgres_cannot_hold() {
+        for (base, ok) in [(2_147_483_647, true), (2_147_483_648, false)] {
+            let mut config = Config::default();
+            config.database.statement_timeout_ms = base;
+            assert_eq!(crate::resolve_runtime_config(&config).is_ok(), ok, "{base}");
+        }
+    }
+
+    /// TC-2954: behind a transaction-pooling proxy (`local` mode) the
+    /// session-level idle-in-transaction timeout is not set.
+    #[test]
+    fn the_idle_in_transaction_timeout_is_not_set_in_local_mode() {
+        let mut database = Config::default().database;
+        assert!(database.idle_in_transaction_statement().is_some());
+        database.statement_timeout_mode = StatementTimeoutMode::Local;
+        assert_eq!(database.idle_in_transaction_statement(), None);
+        database.statement_timeout_mode = StatementTimeoutMode::Off;
+        assert!(database.idle_in_transaction_statement().is_some());
+    }
+
     /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
     /// validated while the feature is off.
     #[test]
@@ -2238,6 +2479,28 @@ mod tests {
     }
 
     #[test]
+    fn encryption_network_wrap_v2_is_default_off_and_opt_in() {
+        assert!(!Config::default().encryption_network.key_wrap_v2);
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!default.key_wrap_v2);
+        let enabled: EncryptionNetworkConfig = toml::from_str("key_wrap_v2 = true").unwrap();
+        assert!(enabled.key_wrap_v2);
+        assert!(enabled.validate().is_ok());
+    }
+
+    #[test]
+    fn encryption_network_require_v2_is_default_off_and_independent() {
+        assert!(!Config::default().encryption_network.key_wrap_require_v2);
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!default.key_wrap_require_v2);
+        let enabled: EncryptionNetworkConfig =
+            toml::from_str("key_wrap_require_v2 = true").unwrap();
+        assert!(enabled.key_wrap_require_v2);
+        assert!(!enabled.key_wrap_v2);
+        assert!(enabled.validate().is_ok());
+    }
+
+    #[test]
     fn deletion_ledger_path_is_required_while_named_keys_are_on() {
         let off: EncryptionNetworkConfig = toml::from_str("").unwrap();
         assert!(off.validate().is_ok());
@@ -2260,6 +2523,8 @@ mod tests {
         for bad in ["", "ledger.jsonl", "/var/lib/", "/a/../b"] {
             let config = EncryptionNetworkConfig {
                 named_keys_v1: false,
+                key_wrap_v2: false,
+                key_wrap_require_v2: false,
                 deletion_ledger_path: Some(bad.into()),
             };
             assert!(config.validate().is_err(), "{bad:?}");

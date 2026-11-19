@@ -1,0 +1,95 @@
+[
+  {
+    "state": "stopped",
+    "action": "tinycloud.delegation/stop-renewal",
+    "body": {
+      "version": 1,
+      "leaseCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq",
+      "expectedGeneration": 1
+    },
+    "claims": {
+      "att": {
+        "urn:cid:bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq": {
+          "tinycloud.delegation/stop-renewal": [
+            {
+              "expectedGeneration": 1
+            }
+          ]
+        }
+      },
+      "aud": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7",
+      "exp": 1701000060,
+      "fct": [
+        {}
+      ],
+      "iss": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S#z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+      "nbf": 1701000000,
+      "nnc": "urn:uuid:00000000-0000-4000-8000-000000000001",
+      "prf": []
+    },
+    "authorization": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9zdG9wLXJlbmV3YWwiOlt7ImV4cGVjdGVkR2VuZXJhdGlvbiI6MX1dfX0sImF1ZCI6ImRpZDprZXk6ejZNa3BYdmVVeWpwQ0RlNlA4M3JOWXFBWm1vVGM5cW9wSjZHQnVSUVJvdHozekY3IiwiZXhwIjoxNzAxMDAwMDYwLCJmY3QiOlt7fV0sImlzcyI6ImRpZDprZXk6ejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTI3o2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyIsIm5iZiI6MTcwMTAwMDAwMCwibm5jIjoidXJuOnV1aWQ6MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwicHJmIjpbXX0.a7ep_-r1c0emPJJO0p1zQBu9ZGDAbTL1VU_P3GVINGQlwXwIQDkcFm1MWYHGUKGk6qPwGxVEu75FQlGdF5VYDQ",
+    "signedAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9zdG9wLXJlbmV3YWwiOlt7ImV4cGVjdGVkR2VuZXJhdGlvbiI6MX1dfX0sImF1ZCI6ImRpZDprZXk6ejZNa3BYdmVVeWpwQ0RlNlA4M3JOWXFBWm1vVGM5cW9wSjZHQnVSUVJvdHozekY3IiwiZXhwIjoxNzAxMDAwMDYwLCJmY3QiOlt7fV0sImlzcyI6ImRpZDprZXk6ejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTI3o2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyIsIm5iZiI6MTcwMTAwMDAwMCwibm5jIjoidXJuOnV1aWQ6MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwicHJmIjpbXX0",
+    "signatureHex": "6bb7a9ffeaf57347a63c924ed29d73401bbd6460c06d32f5554fcfdc6548346425c17c0840391c166d4c5981c650a1a4eaa3f01b1544bbbe4542519d1795580d"
+  },
+  {
+    "state": "active",
+    "action": "tinycloud.delegation/enable-renewal",
+    "body": {
+      "version": 1,
+      "leaseCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq",
+      "expectedGeneration": 2
+    },
+    "claims": {
+      "att": {
+        "urn:cid:bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq": {
+          "tinycloud.delegation/enable-renewal": [
+            {
+              "expectedGeneration": 2
+            }
+          ]
+        }
+      },
+      "aud": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7",
+      "exp": 1701000060,
+      "fct": [
+        {}
+      ],
+      "iss": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S#z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+      "nbf": 1701000000,
+      "nnc": "urn:uuid:00000000-0000-4000-8000-000000000002",
+      "prf": []
+    },
+    "authorization": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9lbmFibGUtcmVuZXdhbCI6W3siZXhwZWN0ZWRHZW5lcmF0aW9uIjoyfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rcFh2ZVV5anBDRGU2UDgzck5ZcUFabW9UYzlxb3BKNkdCdVJRUm90ejN6RjciLCJleHAiOjE3MDEwMDAwNjAsImZjdCI6W3t9XSwiaXNzIjoiZGlkOmtleTp6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMjejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTIiwibmJmIjoxNzAxMDAwMDAwLCJubmMiOiJ1cm46dXVpZDowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJwcmYiOltdfQ.RJwsIMaEuh9yMRyKvMhHj06BFANolxxan0a1qLEHAcLEXXTnxtXicyEiNgTp-AAS6m8Q4sX_kTN4rEDl2k1-Dg",
+    "signedAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9lbmFibGUtcmVuZXdhbCI6W3siZXhwZWN0ZWRHZW5lcmF0aW9uIjoyfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rcFh2ZVV5anBDRGU2UDgzck5ZcUFabW9UYzlxb3BKNkdCdVJRUm90ejN6RjciLCJleHAiOjE3MDEwMDAwNjAsImZjdCI6W3t9XSwiaXNzIjoiZGlkOmtleTp6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMjejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTIiwibmJmIjoxNzAxMDAwMDAwLCJubmMiOiJ1cm46dXVpZDowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDIiLCJwcmYiOltdfQ",
+    "signatureHex": "449c2c20c684ba1f72311c8abcc8478f4e81140368971c5a9f46b5a8b10701c2c45d74e7c6d5e27321223604e9f80012ea6f10e2c5ff913378ac40e5da4d7e0e"
+  },
+  {
+    "state": "read",
+    "action": "tinycloud.delegation/status",
+    "body": {
+      "version": 1,
+      "leaseCid": "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq"
+    },
+    "claims": {
+      "att": {
+        "urn:cid:bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq": {
+          "tinycloud.delegation/status": [
+            {}
+          ]
+        }
+      },
+      "aud": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7",
+      "exp": 1701000060,
+      "fct": [
+        {}
+      ],
+      "iss": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S#z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+      "nbf": 1701000000,
+      "nnc": "urn:uuid:00000000-0000-4000-8000-000000000003",
+      "prf": []
+    },
+    "authorization": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9zdGF0dXMiOlt7fV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rcFh2ZVV5anBDRGU2UDgzck5ZcUFabW9UYzlxb3BKNkdCdVJRUm90ejN6RjciLCJleHAiOjE3MDEwMDAwNjAsImZjdCI6W3t9XSwiaXNzIjoiZGlkOmtleTp6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMjejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTIiwibmJmIjoxNzAxMDAwMDAwLCJubmMiOiJ1cm46dXVpZDowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJwcmYiOltdfQ.hzLmQd4IObMUOwNXAfKTWnxhfeZ1KM2-ekzW7tyU6ruoPdyftqhjjz3QDblzgjzv8-LD-OkXJmXJI0ceH-b8AQ",
+    "signedAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidXJuOmNpZDpiYWZrcjRpZ25oM2lvd2E1Z3lzZ2VndHVvc2E2MnBka3c2bXB2cmhzcjN1bWpleTV4MnpvNGZ2amdxcSI6eyJ0aW55Y2xvdWQuZGVsZWdhdGlvbi9zdGF0dXMiOlt7fV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rcFh2ZVV5anBDRGU2UDgzck5ZcUFabW9UYzlxb3BKNkdCdVJRUm90ejN6RjciLCJleHAiOjE3MDEwMDAwNjAsImZjdCI6W3t9XSwiaXNzIjoiZGlkOmtleTp6Nk1rdFVMdWRUdEFzQWhSZWdZUGlaNjYzMVJWM3ZpdjEycWQ0R1FGOHoxeEIyMlMjejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTIiwibmJmIjoxNzAxMDAwMDAwLCJubmMiOiJ1cm46dXVpZDowMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDMiLCJwcmYiOltdfQ",
+    "signatureHex": "8732e641de0839b3143b035701f2935a7c617de67528cdbe7a4cd6eedc94eabba83ddc9fb6a8638f3dd00db973823ceff3e2c3f8e9172665c923471e1fe6fc01"
+  }
+]

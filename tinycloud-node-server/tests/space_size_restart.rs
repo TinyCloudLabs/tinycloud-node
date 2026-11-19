@@ -488,7 +488,7 @@ async fn an_unhosted_space_is_still_not_found() -> Result<()> {
     let owner = JWK::generate_ed25519()?;
     let did = DID_METHODS.generate(&owner, "key")?.to_string();
     let vm = format!("{did}#{}", did.rsplit_once(':').context("did")?.1);
-    let space = SpaceId::new(did.parse::<DIDBuf>()?, "nowhere".parse()?);
+    let space = SpaceId::new(did.parse::<DIDBuf>()?, "nowhere".parse()?)?;
     let mut capabilities = Capabilities::new();
     capabilities.with_action(
         space

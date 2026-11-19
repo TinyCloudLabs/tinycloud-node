@@ -9,6 +9,8 @@ TinyCloud Node is the server component of the TinyCloud Protocol — a framework
 
 TinyCloud Node hosts user data spaces, processes delegations, and serves the KV storage API. It is a descendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Spaces, where your data lives and who has access.
 
+Access control is not encryption. The node does not yet encrypt ordinary KV or SQL values itself, so whoever operates a node can read them unless the application encrypts them first; [docs/at-rest/INTERFACES.md](docs/at-rest/INTERFACES.md) tracks the at-rest work. A wallet you run keeps its signing key with you; OpenKey holds and uses its keys in its own service. See [Security and trust](https://docs.tinycloud.xyz/concepts/security-and-trust) for key custody, application encryption and authorized-client boundaries.
+
 ## Protocol Version
 
 TinyCloud Node v1.0.0 introduces a protocol version system for SDK-node compatibility. The node exposes a public `/version` endpoint:
@@ -270,6 +272,7 @@ The following common options are available:
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
+| column_encryption.strict | TINYCLOUD_COLUMN_ENCRYPTION__STRICT | Require authenticated envelopes for recorded legacy columns; default `false`. Recorded v2 columns always require v2. |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 | (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
 
@@ -300,8 +303,8 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | database.tcp_keepalive_retries | `3` | Unanswered probes before the connection is dropped (15 + 3 × 5 = 30 s). |
 | database.tcp_user_timeout_ms | `30000` | `TCP_USER_TIMEOUT`: how long sent data may go unacknowledged before the connection is dropped. `0` keeps the kernel default. |
 | database.statement_timeout_mode | `session` | How PostgreSQL's `statement_timeout` is applied: `session` sets it once on each new connection (no per-request cost; covers every statement); `local` sets it with `SET LOCAL` in each explicit transaction (safe behind a transaction-pooling proxy, but one more round trip per transaction, and autocommit statements are not covered); `off` disables it. |
-| database.statement_timeout_ms | `30000` | `statement_timeout` for every statement. `0` disables it. |
-| database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements on a whole SQL or DuckDB artifact larger than 8 MiB (or of unknown size): hydration loads and checkpoint saves, whose server-side work on a ~100 MiB value can outlast the base limit. PostgreSQL does not cancel a statement while it writes a row to the client, so the download itself is not limited by either value. |
+| database.statement_timeout_ms | `30000` | `statement_timeout` for every statement, whole-checkpoint saves and hydration slices included. `0` disables it. At most 2147483647 (PostgreSQL's largest); the node refuses to start with more. |
+| database.idle_in_transaction_timeout_ms | `300000` | PostgreSQL `idle_in_transaction_session_timeout`, set once on each new PostgreSQL connection (env `TINYCLOUD_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT_MS`): the server ends a session left idle inside a transaction this long, so a stalled or leaked transaction cannot keep holding its locks and pooled connection; the pool replaces the session. It must exceed the 240 s a protected legacy meeting write holds its transaction across its upload; the node refuses to start with a non-zero value of 240 s or less, or more than 2147483647. `0` disables it. Not set when `statement_timeout_mode` is `local`: behind a transaction-pooling proxy a session setting would reach the proxy's other clients. SQLite is unaffected; the operator tool `tinycloud-sql-identity` opens its own pool without it. |
 | database.retry_window_ms | `10000` | The time budget of one database operation's single retry. An operation (`/delegate`, the `/invoke` authorization step, a KV read, a read-audit batch, the metadata read that starts a SQL hydration) whose connection is lost is run once more only when nothing can have committed, and only if the first run leaves room in this budget for a short backoff and a second run; the second run is stopped when the budget ends. Statements, `BEGIN` and `COMMIT` are not retried on their own. A request timeout, pool timeout or statement timeout pauses all retries for 30 seconds. The budget does not bound the request or the per-database lock hold. |
 
 Schema migrations always run with no statement timeout. On PostgreSQL they wait at most 30 s for any lock (`lock_timeout`), so a session holding a conflicting table lock makes the node fail to start with an error naming the lock wait instead of hanging; the migrations roll back together and the next start applies them (TC-1176). Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
@@ -322,6 +325,15 @@ The keepalive options are set by a vendored, patched sqlx-core 0.8.6 (`vendor/sq
 #### Migrations
 
 TinyCloud Protocol will automatically apply the relevant migrations to your chosen SQL database. Use caution if you are sharing this database with another application.
+
+New encrypted delegation, invocation (including read-audit), share-policy and
+webhook-secret writes use the v2 column format with key ids and row-bound
+authentication. Columns and webhook secrets use separate derived keys. Format
+metadata is stored alongside each value; existing rows retain format `0`.
+Existing v1 values remain readable. Set `strict = true` in
+`[global.column_encryption]` to require authenticated legacy reads as well.
+Startup adds format metadata without rewriting existing values. Details:
+TC-2516, TC-2517.
 
 ### Staging Config
 

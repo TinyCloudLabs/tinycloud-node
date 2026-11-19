@@ -33,6 +33,16 @@ pub mod m20261021_000000_sql_store_manifest;
 pub mod m20261022_000000_encryption_network_key;
 pub mod m20261023_010000_kv_orphan_candidates;
 pub mod m20261026_000000_kv_write_space_value_index;
+pub mod m20261109_000000_column_encryption_format;
+pub mod m20261111_000000_delegation_renewals;
+pub mod m20261112_000000_renewal_identity;
+
+pub mod m20261113_000000_database_artifact_external;
+
+pub mod m20261113_010000_artifact_chunks;
+pub mod m20261117_000000_hook_subscription_headers;
+
+pub mod m20261117_000000_renewal_switch;
 pub mod m20261109_000000_hook_delivery_lease;
 
 pub struct Migrator;
@@ -75,6 +85,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261022_000000_encryption_network_key::Migration),
             Box::new(m20261023_010000_kv_orphan_candidates::Migration),
             Box::new(m20261026_000000_kv_write_space_value_index::Migration),
+            Box::new(m20261109_000000_column_encryption_format::Migration),
+            Box::new(m20261111_000000_delegation_renewals::Migration),
+            Box::new(m20261112_000000_renewal_identity::Migration),
+            Box::new(m20261113_000000_database_artifact_external::Migration),
+            Box::new(m20261113_010000_artifact_chunks::Migration),
+            Box::new(m20261117_000000_hook_subscription_headers::Migration),
+            Box::new(m20261117_000000_renewal_switch::Migration),
             Box::new(m20261109_000000_hook_delivery_lease::Migration),
         ]
     }

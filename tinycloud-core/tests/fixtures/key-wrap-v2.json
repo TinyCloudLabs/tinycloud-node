@@ -1,0 +1,89 @@
+{
+  "description": "Static public interoperability test material. Reference vectors use Node.js crypto; sdk-generated-v2 uses the SDK sealKeyV2 with scoped deterministic test randomness.",
+  "vectors": [
+    {
+      "name": "legacy-v1",
+      "version": 1,
+      "purpose": "network-key",
+      "recipientPrivateKey": "ERERERERERERERERERERERERERERERERERERERERERE=",
+      "recipientPublicKey": "e06Qm75//kTEZaIgA31gjuNYl9Me+XLwf3SJLLD3PxM=",
+      "ephemeralPrivateKey": "EhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhI=",
+      "ephemeralPublicKey": "BSpQdzrI2Rdz8tyWYuEvDe/pFeQVuKHI4gpaPWqyuEM=",
+      "plaintext": "ERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzA=",
+      "salt": "",
+      "nonce": "FBQUFBQUFBQUFBQU",
+      "context": {
+        "networkId": "urn:tinycloud:encryption:did:key:z6MkWrapFixture:default",
+        "keyPath": "",
+        "keyVersion": 1,
+        "metadata": {}
+      },
+      "wrappedKey": "BSpQdzrI2Rdz8tyWYuEvDe/pFeQVuKHI4gpaPWqyuEMBFBQUFBQUFBQUFBQUJ54pMnxu+ki2vhGwb6+s3rJpT9dZa3QISXbC/rfHwhxCGd1IGQPqmmYC1oB+PRSI"
+    },
+    {
+      "name": "sdk-generated-v2",
+      "version": 2,
+      "purpose": "network-key",
+      "recipientPrivateKey": "ISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISE=",
+      "recipientPublicKey": "fTSkgV+muYJTXmCvO9m0lVaBYIDxZB/4HSt8iugmikQ=",
+      "ephemeralPrivateKey": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+      "ephemeralPublicKey": "D6poTtKIZ7l/Smot7l34zpdOdrcBjj8iocTPJnhXDyA=",
+      "plaintext": "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=",
+      "salt": "IyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyM=",
+      "nonce": "JCQkJCQkJCQkJCQk",
+      "context": {
+        "networkId": "urn:tinycloud:encryption:did:key:z6MkWrapFixture:default",
+        "keyPath": "",
+        "keyVersion": 1,
+        "metadata": {
+          "app": "fixture",
+          "contentType": "application/octet-stream"
+        }
+      },
+      "wrappedKey": "VENXMgAAAdB7ImFlYWQiOiJhZXMtMjU2LWdjbSIsImFsZyI6IngyNTUxOS1oa2RmLWFlczI1NmdjbS92MiIsImVwaGVtZXJhbFB1YmxpY0tleSI6IkQ2cG9UdEtJWjdsL1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUE9Iiwia2RmIjoiaGtkZi1zaGEyNTYiLCJrZXlQYXRoIjoiIiwia2V5VmVyc2lvbiI6MSwibWV0YWRhdGEiOnsiYXBwIjoiZml4dHVyZSIsImNvbnRlbnRUeXBlIjoiYXBwbGljYXRpb24vb2N0ZXQtc3RyZWFtIn0sIm5ldHdvcmtJZCI6InVybjp0aW55Y2xvdWQ6ZW5jcnlwdGlvbjpkaWQ6a2V5Ono2TWtXcmFwRml4dHVyZTpkZWZhdWx0IiwicHVycG9zZSI6Im5ldHdvcmsta2V5IiwicmVjaXBpZW50UHVibGljS2V5IjoiZlRTa2dWK211WUpUWG1Ddk85bTBsVmFCWUlEeFpCLzRIU3Q4aXVnbWlrUT0iLCJzYWx0IjoiSXlNakl5TWpJeU1qSXlNakl5TWpJeU1qSXlNakl5TWpJeU1qSXlNakl5TT0iLCJ2IjoyfSQkJCQkJCQkJCQkJBPZw+o5yk+HWnNRCtR5QYtaVQEI0tZQgDttBu6zV40W4EGbPNZizXZzWmJBmH5FCA=="
+    },
+    {
+      "name": "named-v2",
+      "version": 2,
+      "purpose": "network-key",
+      "recipientPrivateKey": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=",
+      "recipientPublicKey": "BPXykWLDGo3voY5udCIk7oBvwXGKJ4voWbpWIEArjzo=",
+      "ephemeralPrivateKey": "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjI=",
+      "ephemeralPublicKey": "WdkiVHNFHv/+azbbyu/b97GJXeYghFCaf1tYvwHQZBg=",
+      "plaintext": "MTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1A=",
+      "salt": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+      "nonce": "NDQ0NDQ0NDQ0NDQ0",
+      "context": {
+        "networkId": "urn:tinycloud:encryption:did:key:z6MkWrapFixture:default",
+        "keyPath": "apps/fixture/key",
+        "keyVersion": 3,
+        "metadata": {
+          "label": "caf\u0000é",
+          "order": "✓",
+          "𐀀": "astral",
+          "": "bmp"
+        }
+      },
+      "wrappedKey": "VENXMgAAAed7ImFlYWQiOiJhZXMtMjU2LWdjbSIsImFsZyI6IngyNTUxOS1oa2RmLWFlczI1NmdjbS92MiIsImVwaGVtZXJhbFB1YmxpY0tleSI6Ildka2lWSE5GSHYvK2F6YmJ5dS9iOTdHSlhlWWdoRkNhZjF0WXZ3SFFaQmc9Iiwia2RmIjoiaGtkZi1zaGEyNTYiLCJrZXlQYXRoIjoiYXBwcy9maXh0dXJlL2tleSIsImtleVZlcnNpb24iOjMsIm1ldGFkYXRhIjp7ImxhYmVsIjoiY2FmXHUwMDAww6kiLCJvcmRlciI6IuKckyIsIvCQgIAiOiJhc3RyYWwiLCLugIAiOiJibXAifSwibmV0d29ya0lkIjoidXJuOnRpbnljbG91ZDplbmNyeXB0aW9uOmRpZDprZXk6ejZNa1dyYXBGaXh0dXJlOmRlZmF1bHQiLCJwdXJwb3NlIjoibmV0d29yay1rZXkiLCJyZWNpcGllbnRQdWJsaWNLZXkiOiJCUFh5a1dMREdvM3ZvWTV1ZENJazdvQnZ3WEdLSjR2b1dicFdJRUFyanpvPSIsInNhbHQiOiJNek16TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16TXpNek16TXpNPSIsInYiOjJ9NDQ0NDQ0NDQ0NDQ0owCQJmjuROmk8dl40gqCjKq6+2bteJ0dsA5BN3J99rDHn+RgUIf2vontFlU4K8Qc"
+    },
+    {
+      "name": "receiver-v2",
+      "version": 2,
+      "purpose": "receiver-key",
+      "recipientPrivateKey": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=",
+      "recipientPublicKey": "ehpOcJvwhaxJSroEabmx7aCrH3ixaqu3n/7akGI+hSI=",
+      "ephemeralPrivateKey": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=",
+      "ephemeralPublicKey": "EyxEK+AQ+9V+cmAzKKp25x/MwVA6riGTJ9FNnJmT9HI=",
+      "plaintext": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+      "salt": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=",
+      "nonce": "RERERERERERERERE",
+      "context": {
+        "networkId": "urn:tinycloud:encryption:did:key:z6MkWrapFixture:default",
+        "keyPath": "apps/fixture/key",
+        "keyVersion": 3,
+        "metadata": {}
+      },
+      "wrappedKey": "VENXMgAAAal7ImFlYWQiOiJhZXMtMjU2LWdjbSIsImFsZyI6IngyNTUxOS1oa2RmLWFlczI1NmdjbS92MiIsImVwaGVtZXJhbFB1YmxpY0tleSI6IkV5eEVLK0FRKzlWK2NtQXpLS3AyNXgvTXdWQTZyaUdUSjlGTm5KbVQ5SEk9Iiwia2RmIjoiaGtkZi1zaGEyNTYiLCJrZXlQYXRoIjoiYXBwcy9maXh0dXJlL2tleSIsImtleVZlcnNpb24iOjMsIm1ldGFkYXRhIjp7fSwibmV0d29ya0lkIjoidXJuOnRpbnljbG91ZDplbmNyeXB0aW9uOmRpZDprZXk6ejZNa1dyYXBGaXh0dXJlOmRlZmF1bHQiLCJwdXJwb3NlIjoicmVjZWl2ZXIta2V5IiwicmVjaXBpZW50UHVibGljS2V5IjoiZWhwT2NKdndoYXhKU3JvRWFibXg3YUNySDNpeGFxdTNuLzdha0dJK2hTST0iLCJzYWx0IjoiUTBORFEwTkRRME5EUTBORFEwTkRRME5EUTBORFEwTkRRME5EUTBORFEwTT0iLCJ2IjoyfURERERERERERERERFXmKeN/IoR0D5LDhXka5iOqjE0g6XLYhAI5yoSEm4nyYHVj7DnkNCCVhFwHwmFgXA=="
+    }
+  ]
+}

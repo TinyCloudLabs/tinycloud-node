@@ -69,13 +69,15 @@ test('schema refuses mistyped, duplicate, ambiguous and alternate-domain documen
   expect(() => checkTranscripts({})).toThrow('schema:');
 });
 
-test('real CLI checks all committed documents by default and a transcript document by path', () => {
+test('real CLI checks all six committed documents by default and a transcript document by path', () => {
   const run = (...args: string[]) => Bun.spawnSync([process.execPath, cli, ...args], { env: process.env, stdout: 'pipe', stderr: 'pipe', timeout: 60000 });
   const all = run();
   expect(all.exitCode).toBe(0);
   expect(all.stdout.toString()).toContain('Primitive vectors: 18/18');
   expect(all.stdout.toString()).toContain('DKG transcripts: 7/7');
   expect(all.stdout.toString()).toContain('Reshare transcripts: 5/5');
+  expect(all.stdout.toString()).toContain('Re-key transcripts: 14/14');
+  expect(all.stdout.toString()).toContain('Chain transcripts: 8/8');
   const one = run(new URL('../v1/reshare.json', import.meta.url).pathname);
   expect(one.exitCode).toBe(0);
   expect(one.stdout.toString()).not.toContain('Primitive vectors');
