@@ -194,6 +194,58 @@ pub struct PendingWebhookDelivery {
     pub space_id: String,
     pub target_service: String,
     pub path_prefix: Option<String>,
+    /// Token of the lease this claim holds; every mark must present it.
+    pub lease_token: String,
+}
+
+// The lease columns are deliberately not on the `hook_delivery` entity: older
+// migrations and rows are written through that entity on schemas that predate
+// the lease columns. They are addressed by name here only.
+fn webhook_lease_token_column() -> sea_orm::sea_query::Alias {
+    sea_orm::sea_query::Alias::new("lease_token")
+}
+
+fn webhook_lease_expires_column() -> sea_orm::sea_query::Alias {
+    sea_orm::sea_query::Alias::new("lease_expires_at")
+}
+
+/// Whole-second RFC 3339 so lease timestamps compare correctly as text.
+fn webhook_lease_timestamp(value: OffsetDateTime) -> String {
+    value
+        .replace_nanosecond(0)
+        .expect("zero is a valid nanosecond")
+        .format(&Rfc3339)
+        .expect("current timestamps should format as RFC3339")
+}
+
+/// Due for delivery and not held under an unexpired lease.
+fn webhook_claimable(now: &str, lease_now: &str) -> Condition {
+    Condition::all()
+        .add(
+            hook_delivery::Column::Status
+                .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
+        )
+        .add(
+            Condition::any()
+                .add(hook_delivery::Column::NextAttemptAt.is_null())
+                .add(hook_delivery::Column::NextAttemptAt.lte(now)),
+        )
+        .add(
+            Condition::any()
+                .add(Expr::col(webhook_lease_expires_column()).is_null())
+                .add(Expr::col(webhook_lease_expires_column()).lte(lease_now)),
+        )
+}
+
+/// The row is still open and `token` is its current lease.
+fn webhook_lease_held(delivery_id: &str, token: &str) -> Condition {
+    Condition::all()
+        .add(hook_delivery::Column::Id.eq(delivery_id))
+        .add(Expr::col(webhook_lease_token_column()).eq(token))
+        .add(
+            hook_delivery::Column::Status
+                .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
+        )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1088,30 +1140,56 @@ where
         })
     }
 
-    pub async fn list_due_webhook_deliveries(
+    /// Claims up to `limit` due deliveries for `lease`. One conditional UPDATE
+    /// sets a fresh lease token and expiry on each row that is still due and
+    /// unleased (or whose lease has expired), so two dispatchers never hold
+    /// the same delivery inside one lease.
+    pub async fn claim_due_webhook_deliveries(
         &self,
         limit: u64,
+        lease: std::time::Duration,
     ) -> Result<Vec<PendingWebhookDelivery>, DbErr> {
-        let now = OffsetDateTime::now_utc()
+        let now = OffsetDateTime::now_utc();
+        let now_text = now
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
+        let lease_now = webhook_lease_timestamp(now);
+        let lease_expires_at = webhook_lease_timestamp(now + lease);
+        let token = uuid::Uuid::new_v4().to_string();
 
-        hook_delivery::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(
-                        hook_delivery::Column::Status
-                            .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
-                    )
-                    .add(
-                        Condition::any()
-                            .add(hook_delivery::Column::NextAttemptAt.is_null())
-                            .add(hook_delivery::Column::NextAttemptAt.lte(now)),
-                    ),
-            )
+        // The `A_id` alias keeps this poll's SQL prefix, which the PostgreSQL
+        // round-trip budget test classifies as background dispatcher traffic.
+        let candidates: Vec<String> = hook_delivery::Entity::find()
+            .select_only()
+            .column_as(hook_delivery::Column::Id, "A_id")
+            .filter(webhook_claimable(&now_text, &lease_now))
             .order_by_asc(hook_delivery::Column::CreatedAt)
             .order_by_asc(hook_delivery::Column::Attempts)
             .limit(limit)
+            .into_tuple()
+            .all(&self.conn)
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The due/unleased predicate is re-evaluated by the UPDATE itself, so a
+        // row another dispatcher claimed after the SELECT is not taken.
+        hook_delivery::Entity::update_many()
+            .col_expr(webhook_lease_token_column(), Expr::value(token.clone()))
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(lease_expires_at),
+            )
+            .filter(hook_delivery::Column::Id.is_in(candidates))
+            .filter(webhook_claimable(&now_text, &lease_now))
+            .exec(&self.conn)
+            .await?;
+
+        hook_delivery::Entity::find()
+            .filter(Expr::col(webhook_lease_token_column()).eq(token.clone()))
+            .order_by_asc(hook_delivery::Column::CreatedAt)
+            .order_by_asc(hook_delivery::Column::Attempts)
             .find_also_related(hook_subscription::Entity)
             .all(&self.conn)
             .await
@@ -1132,68 +1210,151 @@ where
                             space_id: subscription.space_id,
                             target_service: subscription.target_service,
                             path_prefix: subscription.path_prefix,
+                            lease_token: token.clone(),
                         })
                     })
                     .collect()
             })
     }
 
+    /// Gives a claimed delivery back without changing its state, so it is
+    /// claimable again at once. Returns `false`, changing nothing, when
+    /// `lease_token` is no longer the row's current lease.
+    pub async fn release_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, DbErr> {
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Extends a claimed delivery's lease to `extend` from now. Succeeds only
+    /// while `lease_token` is still the row's current lease, the lease has not
+    /// expired and the delivery is open; returns `false`, changing nothing,
+    /// otherwise.
+    pub async fn renew_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        extend: std::time::Duration,
+    ) -> Result<bool, DbErr> {
+        let now = OffsetDateTime::now_utc();
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(webhook_lease_timestamp(now + extend)),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .filter(Expr::col(webhook_lease_expires_column()).gt(webhook_lease_timestamp(now)))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Marks a claimed delivery delivered. Returns `false`, changing nothing,
+    /// when `lease_token` is no longer the row's current lease.
     pub async fn mark_webhook_delivery_delivered(
         &self,
         delivery_id: &str,
+        lease_token: &str,
         attempts: i64,
-    ) -> Result<(), DbErr> {
-        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(());
-        };
-
+    ) -> Result<bool, DbErr> {
         let delivered_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
-        let mut active = delivery.into_active_model();
-        active.status = Set(HOOK_DELIVERY_STATUS_DELIVERED.to_string());
-        active.attempts = Set(attempts);
-        active.next_attempt_at = Set(None);
-        active.last_error = Set(None);
-        active.delivered_at = Set(Some(delivered_at));
-        active.update(&self.conn).await?;
-        Ok(())
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                hook_delivery::Column::Status,
+                Expr::value(HOOK_DELIVERY_STATUS_DELIVERED),
+            )
+            .col_expr(hook_delivery::Column::Attempts, Expr::value(attempts))
+            .col_expr(
+                hook_delivery::Column::NextAttemptAt,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                hook_delivery::Column::LastError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                hook_delivery::Column::DeliveredAt,
+                Expr::value(Some(delivered_at)),
+            )
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
+    /// Records a failed attempt on a claimed delivery. Returns `false`,
+    /// changing nothing, when `lease_token` is no longer the row's current
+    /// lease.
     pub async fn mark_webhook_delivery_failed(
         &self,
         delivery_id: &str,
+        lease_token: &str,
         attempts: i64,
         next_attempt_at: Option<OffsetDateTime>,
         last_error: String,
         dead_letter: bool,
-    ) -> Result<(), DbErr> {
-        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(());
-        };
-
-        let mut active = delivery.into_active_model();
-        active.status = Set(if dead_letter {
-            HOOK_DELIVERY_STATUS_DEAD_LETTER.to_string()
+    ) -> Result<bool, DbErr> {
+        let status = if dead_letter {
+            HOOK_DELIVERY_STATUS_DEAD_LETTER
         } else {
-            HOOK_DELIVERY_STATUS_RETRYING.to_string()
-        });
-        active.attempts = Set(attempts);
-        active.next_attempt_at = Set(next_attempt_at.map(|value| {
+            HOOK_DELIVERY_STATUS_RETRYING
+        };
+        let next_attempt_at = next_attempt_at.map(|value| {
             value
                 .format(&Rfc3339)
                 .expect("current timestamps should format as RFC3339")
-        }));
-        active.last_error = Set(Some(last_error));
-        active.delivered_at = Set(None);
-        active.update(&self.conn).await?;
-        Ok(())
+        });
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(hook_delivery::Column::Status, Expr::value(status))
+            .col_expr(hook_delivery::Column::Attempts, Expr::value(attempts))
+            .col_expr(
+                hook_delivery::Column::NextAttemptAt,
+                Expr::value(next_attempt_at),
+            )
+            .col_expr(
+                hook_delivery::Column::LastError,
+                Expr::value(Some(last_error)),
+            )
+            .col_expr(
+                hook_delivery::Column::DeliveredAt,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
     pub async fn count_active_hook_subscriptions(&self, space_id: &str) -> Result<u64, DbErr> {
