@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### Changes
-- Space purge: the purge ledger moves out of the block store into its own `[storage.purge_ledger]` store: an Object Lock bucket on S3, or `<datadir>/purge-ledger` by default on local storage. Startup refuses a ledger that shares the block bucket or directory. The data bucket never carries Object Lock; old versions of purged objects expire through a 7-day noncurrent lifecycle rule. Runbook: `docs/runbooks/space-purge-storage.md`. Details: TC-2871.
+- Space purge: the purge ledger moves out of the block store into its own `[storage.purge_ledger]` store: an Object Lock bucket on S3, or `<datadir>/purge-ledger` by default on local storage. Startup refuses a ledger that shares the block bucket or directory. The data bucket never carries Object Lock and is unversioned, so a purge's delete is final; if versioning is ever enabled, a 7-day noncurrent lifecycle rule must be added with it. Runbook: `docs/runbooks/space-purge-storage.md`. Details: TC-2871.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
