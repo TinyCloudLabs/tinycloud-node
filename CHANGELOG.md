@@ -3,6 +3,11 @@
 ## [Unreleased]
 ### Changes
 - PostgreSQL: the first `kv/sync` page (no cursor yet) is planned for its own prefix, also after the database starts reusing a generic plan. Without a position, the cheapest plan depends on how much of the space the prefix covers. A pooled connection's generic plan read a broad prefix whole on the key index and sorted it (935 buffer pages for 10,000 rows locally, against 9 for the ordered read). The first page now runs in its own transaction with `plan_cache_mode = force_custom_plan`: three more round trips, once per cursor. Caught-up polls are unchanged; their position already gives every plan a seek. Details: TC-3256.
+- DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
+- DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
+- The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
+- Revocation: the delegator of a delegation D can now give D's own delegatee the right to revoke exactly D. The delegator issues a parentless delegation, to D's delegatee only, carrying exactly one capability: `tinycloud.delegation/revoke` on exactly `urn:cid:<D>`. D must already be on the node, and the grant must expire no later than D. Any other audience, extra capability, wildcard, or `<space>/delegation` scope is still refused, as before. The delegatee then revokes D through the existing `/revoke`, presenting that grant as its one proof. The grant stops working when it is itself revoked, and when the chain D was issued under is revoked. It reaches no other delegation: not D's parent, not a sibling. Owner-issued grants are unchanged. No route, migration or config change. Details: TC-3150.
+- Read audits no longer write `parent_delegations` rows: about 370 bytes less per read for each delegation it cites (table plus indexes, PostgreSQL 18). A read citing one delegation with one capability goes from about 2,174 to about 1,800 bytes, about 17% less. Reads also stop growing `parent_delegations`, the table the permission check searches. A read's audit record (every `/invoke` that changes no KV data: KV get, list, metadata and sync, capabilities read, and SQL/DuckDB authorization) keeps its `actor`, `invocation` and `invoked_abilities` rows: the space purge (TC-2871) finds a space's reads through `invoked_abilities`, and the database migration inventory attributes SQL databases through them. The cited parents stay inside the signed `serialization`. KV writes still store all four. Existing rows are kept; no migration. On PostgreSQL a read-audit batch is still one statement, and one with more than 65,535 parameters still falls back to one transaction. Rollback: v1.26.9 and v1.26.10 read these records as they are, since the permission check walks parent edges upward from a delegation, never from a read. After a rollback the older node writes the parent rows again; mixed history is harmless. Details: TC-3259.
 - PostgreSQL: a batch KV read seeks each key, also after the database starts reusing a generic plan. The batch lookup of live `current_kv` rows used `key = ANY($3)`. After five runs of the prepared statement, PostgreSQL's generic plan walked the whole space on `idx_current_kv_space_order` and checked each row against the array. In production that read about 740 buffer pages for 44 rows, and it was 58% of query CPU. The lookup is now one `LIMIT 1` lateral probe per key over `unnest($3)`, and every plan seeks on `(space, deleted, key)` or the primary key. Same rows, same single statement; no migration and no database setting. Details: TC-3211.
 - A batch KV read (two or more `kv/get`, or two or more `kv/metadata`, in one `/invoke`) answers with an `ETag` (`"kv-batch-…"`) and `Cache-Control: private, no-cache`. The tag names the keys, the ability, and the write position and value digest of each key's live row (or its absence), taken from the rows the batch already looks up, so it costs no extra statement. Sent back in `If-None-Match`, it answers `304` with no body while none of those keys has been written or deleted. The invocation is still authorized and its read still audited, but no value is read. Writes to keys outside the batch leave the tag unchanged. A batch that answers a live key as not found because its stored value can't be read carries no `ETag`, so a client never caches that answer under the state of a present key. Previously a non-`*` `If-None-Match` on a batch read answered 400. Details: TC-3217.
 - Renewals: an operator can pause and resume all scheduled renewal stamps on a node with `PUT /admin/renewals` `{"paused":true|false}` (admin Bearer secret; `GET` reads the state). The switch is persisted in the node database (one migration, `m20261117_000000_renewal_switch`, seeded as running, so nothing changes on deploy) and is re-checked inside the stamp transaction. Lease registration and already-issued stamps are unchanged while paused; a grant that ends while paused is not revived on resume. Runbook: `docs/runbooks/renewal-leases.md`. Details: TC-3163.
@@ -28,6 +33,41 @@
 
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
+
+## [1.26.11] - 2026-11-19
+
+Ships the changes merged since 1.26.10 (#631, #642), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **No database migration.** The migration sources are byte-identical to 1.26.10 (a comment edit from #631 in `m20260725_000000_request_path_indexes` is restored to its 1.26.10 text), so the deploy workflow's audited rollback can return to 1.26.10.
+
+### Changes
+
+- Revocation: a delegator can give its own delegatee an exact-CID grant to revoke exactly that delegation through `/revoke` (TC-3150, #642).
+- Read audits no longer write `parent_delegations` rows; they keep `actor`, `invocation` and `invoked_abilities` (TC-3259, #631).
+
+## [1.26.10] - 2026-11-18
+
+Ships the changes merged since 1.26.9 (#611, #615, #622, #626, #627), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **Two database migrations, fix-forward only** (both run at boot and are additive):
+  - `m20261117_000000_hook_subscription_headers` adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged.
+  - `m20261117_000000_renewal_switch` adds the node-wide renewal switch, seeded as running, so nothing changes on deploy.
+
+  The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.10 is fixed forward, not rolled back to 1.26.9. Two older migration files change only inside their `#[cfg(test)]` modules (`m20260725_000000_request_path_indexes`, `m20261005_000000_deactivate_hook_subscriptions`: test fixtures gain the new `hook_subscription` columns); their migration code is unchanged.
+
+### Changes
+
+- PostgreSQL: a batch KV read seeks each key under a generic plan too (TC-3211, #627).
+- A batch KV read answers with an `ETag`, and `If-None-Match` answers `304` while none of its keys changed (TC-3217, #626).
+- Renewals: an operator can pause and resume all scheduled renewal stamps with `PUT /admin/renewals` (TC-3163, #622).
+- Hook tickets and signed KV URLs honour renewal stamps (the cited delegations' current effective end), and signed KV URLs re-check whole-chain revocation at every use (TC-3174, TC-3176, TC-3177, #622).
+- Metrics: the PostgreSQL pool's timeouts in effect are exported (TC-3178, #622).
+- Webhooks accept optional write-only custom `headers`, and SQL write events carry `rowId` for a single-row insert (TC-3123, #611).
+- Docs: `docs/releasing.md` and comments in `.github/workflows/docker.yml` say `PROD_TINYCLOUD_ADMIN_SECRET` is a production-environment secret (#615; comments only, no workflow change).
 
 ## [1.26.9] - 2026-11-17
 
