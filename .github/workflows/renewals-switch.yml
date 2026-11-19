@@ -1,0 +1,127 @@
+# Manual switch for scheduled renewal leases on the production nodes.
+#
+# Reads, pauses or resumes every scheduled renewal through the node's
+# GET/PUT /admin/renewals, using PROD_TINYCLOUD_ADMIN_SECRET from the
+# production environment, so no operator handles the secret. Runbook:
+# docs/runbooks/renewal-leases.md ("Renewals switch workflow").
+#
+#   gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node -f action=status
+#   gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node -f action=pause -f confirm=pause
+#   gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node -f action=resume -f confirm=resume
+#
+# The log shows only each host's HTTP status and its "paused" value.
+
+name: Renewals switch
+run-name: "Renewals switch: ${{ inputs.action }} (${{ inputs.host }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "status reads the switch; pause or resume sets it, then reads it back."
+        type: choice
+        options: [status, pause, resume]
+        default: status
+      host:
+        description: "Node to call."
+        type: choice
+        options: [both, node.tinycloud.xyz, tee.node.tinycloud.xyz]
+        default: both
+      confirm:
+        description: "For pause or resume, type the action again (pause or resume). Ignored for status."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One switch run at a time, in dispatch order.
+concurrency:
+  group: renewals-switch
+  cancel-in-progress: false
+
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The production environment admits main and v* tags only.
+    environment: production
+    steps:
+      - name: Call /admin/renewals
+        env:
+          ACTION: ${{ inputs.action }}
+          HOST_CHOICE: ${{ inputs.host }}
+          CONFIRM: ${{ inputs.confirm }}
+          # Production environment secret; never read by an agent or passed in argv.
+          ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+
+          case "${ACTION}" in
+            status) WANT="" ;;
+            pause) WANT=true ;;
+            resume) WANT=false ;;
+            *) echo "::error::action must be status, pause or resume"; exit 1 ;;
+          esac
+          if [ -n "${WANT}" ] && [ "${CONFIRM}" != "${ACTION}" ]; then
+            echo "::error::To ${ACTION} renewals, set confirm to '${ACTION}'. Nothing was changed."
+            exit 1
+          fi
+
+          case "${HOST_CHOICE}" in
+            both) HOSTS=(node.tinycloud.xyz tee.node.tinycloud.xyz) ;;
+            node.tinycloud.xyz | tee.node.tinycloud.xyz) HOSTS=("${HOST_CHOICE}") ;;
+            *) echo "::error::host must be both, node.tinycloud.xyz or tee.node.tinycloud.xyz"; exit 1 ;;
+          esac
+
+          if [ -z "${ADMIN_SECRET}" ]; then
+            echo "::error::PROD_TINYCLOUD_ADMIN_SECRET is not available to this job."
+            exit 1
+          fi
+          echo "::add-mask::${ADMIN_SECRET}"
+
+          BODY="$(mktemp)"
+          trap 'rm -f "${BODY}"' EXIT
+
+          # call METHOD HOST [JSON]: sets STATUS (HTTP code, 000 if none) and
+          # PAUSED (true, false or unknown); returns curl's exit code. The
+          # Authorization header reaches curl on stdin, never in argv. The
+          # response body is parsed, never printed.
+          call() {
+            local method="$1" host="$2" data="${3:-}" rc=0
+            local args=(--silent --show-error --fail-with-body --max-time 20
+              --header @- --output "${BODY}" --write-out '%{http_code}' --request "${method}")
+            if [ -n "${data}" ]; then
+              args+=(--header 'Content-Type: application/json' --data "${data}")
+            fi
+            : >"${BODY}"
+            STATUS="$(printf 'Authorization: Bearer %s\n' "${ADMIN_SECRET}" \
+              | curl "${args[@]}" "https://${host}/admin/renewals")" || rc=$?
+            STATUS="${STATUS:-000}"
+            PAUSED="$(jq -r 'if (.paused | type) == "boolean" then .paused | tostring else "unknown" end' \
+              "${BODY}" 2>/dev/null)" || PAUSED=unknown
+            PAUSED="${PAUSED:-unknown}"
+            echo "${host} ${method}: HTTP ${STATUS}, paused=${PAUSED}"
+            return "${rc}"
+          }
+
+          FAILED=()
+          for host in "${HOSTS[@]}"; do
+            if [ -n "${WANT}" ]; then
+              if ! call PUT "${host}" "{\"paused\":${WANT}}" || [ "${PAUSED}" != "${WANT}" ]; then
+                FAILED+=("${host}")
+                continue
+              fi
+            fi
+            if ! call GET "${host}" || { [ -n "${WANT}" ] && [ "${PAUSED}" != "${WANT}" ]; }; then
+              FAILED+=("${host}")
+            fi
+          done
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::${ACTION} did not complete on: ${FAILED[*]}"
+            exit 1
+          fi
