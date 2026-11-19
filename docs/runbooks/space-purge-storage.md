@@ -64,5 +64,20 @@ Read the report:
 - `purges_unresumable`: completed purges whose space is back but whose acceptance record has aged out of the ledger. The space stays fenced; escalate.
 - `prefixes_unavailable`: signed prefixes in a store this node does not run. They were not checked; escalate.
 - `prefixes_deferred`: prefixes still inside the upload grace. Run the command again after the grace, or let the node finish them.
+- `owners_erased_redeleted`: owners with an `erased` record whose encryption rows the restore brought back; the pass deleted them again.
+- `owners_pruned`: erased owners whose settled operations it dropped from `deletions.jsonl` (`[global.encryption_network] deletion_ledger_path`; the command opens it, which is one more reason the node must be stopped).
+- `blocked_rows_present`: erased owners whose key rows are still there, so `deletions.jsonl` keeps them. Run the command again; escalate if it stays above 0.
 
-A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. There is no node lock: never run it while the node is serving.
+### Owner erasure records
+
+Once a retired owner has no live space and every purge of the owner is complete, the purge worker erases the owner's encryption rows in this order:
+
+1. It writes a signed `("owner","erased")` record to the purge ledger, at `_purge-ledger/owners-erased/<key_id>/<owner HMAC>`, beside the owner's `retired` record.
+2. In one transaction, it deletes the owner's `encryption_network`, `encryption_network_key`, `encryption_network_member`, `encryption_ceremony` and `encryption_audit` rows.
+3. It drops the owner's settled operations from `deletions.jsonl`, but only when the record verifies and no key row remains.
+
+A crash between steps leaves the record in place; the worker's next pass and this command finish steps 2 and 3. After a restore, this command (step 7) deletes the rows again for every `erased` record.
+
+**No rollback below this release.** An earlier release refuses an `erased` record when it verifies the ledger, so it does not start. Once any node has written one (check for objects under `_purge-ledger/owners-erased/`), fix forward only. The record is locked; it cannot be removed to allow a rollback.
+
+A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. Only `deletions.jsonl` is locked (the command waits up to 60 seconds for it, then fails); nothing else stops it running beside a serving node, so never run it while the node is serving.

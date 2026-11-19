@@ -188,3 +188,141 @@ fn resource_records_are_domain_and_path_separated_from_space_records() {
         )
         .is_err());
 }
+
+const OWNER_DID: &str = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+
+/// Pinned `("owner","erased")` vector (TC-2871 S5, option A): the v1 MAC,
+/// domain and field order of a retirement, at its own sibling path.
+#[test]
+fn owner_erased_record_is_pinned_v1_at_its_own_path() {
+    let keys = keys();
+    let owner = keys.target_hmac("test", "owner", OWNER_DID).unwrap();
+    let retired = keys
+        .sign("test", "owner", &owner, OP, "retired", 100)
+        .unwrap();
+    // A timestamp before the retirement's is raised to it.
+    assert_eq!(
+        keys.erasure_from_retirement(&retired, 99)
+            .unwrap()
+            .timestamp,
+        100
+    );
+    let erased = keys.erasure_from_retirement(&retired, 200).unwrap();
+    assert_eq!(
+        erased,
+        keys.sign("test", "owner", &owner, OP, "erased", 200)
+            .unwrap()
+    );
+    let digest = hex::encode(&owner);
+    assert_eq!(
+        erased.object_key().unwrap(),
+        format!("_purge-ledger/owners-erased/test/{digest}")
+    );
+    assert_eq!(
+        retired.object_key().unwrap(),
+        format!("_purge-ledger/owners/test/{digest}")
+    );
+    assert_eq!(digest, PINNED_OWNER_HMAC);
+    assert_eq!(erased.mac, PINNED_ERASED_MAC);
+    assert_eq!(
+        String::from_utf8(erased.to_bytes().unwrap()).unwrap(),
+        format!(
+            r#"{{"version":1,"key_id":"test","kind":"owner","target_hmac":"{PINNED_OWNER_HMAC}","operation_id":"{OP}","state":"erased","timestamp":200,"mac":"{PINNED_ERASED_MAC}"}}"#
+        )
+    );
+    assert_eq!(
+        keys.verify(&erased.object_key().unwrap(), &erased.to_bytes().unwrap())
+            .unwrap(),
+        erased
+    );
+}
+
+// Computed outside this crate: HMAC-SHA256 under key [7; 32] over
+// `tinycloud-owner-tombstone-v1\0` + OWNER_DID, and over
+// `tinycloud-space-purge-ledger-v1\0` + the fixed-order v1 field JSON.
+const PINNED_OWNER_HMAC: &str = "993172355863edf59ea783b177ad40f6f0b219559b65b4368e9eb146aa669361";
+const PINNED_ERASED_MAC: &str = "716c439adc5f08d630ea0892e52c74f6ae6ab3aac7f0a55d79f99a93d17797e5";
+
+#[test]
+fn owner_erased_and_retired_records_do_not_verify_at_each_others_path() {
+    let keys = keys();
+    let owner = keys.target_hmac("test", "owner", OWNER_DID).unwrap();
+    let retired = keys
+        .sign("test", "owner", &owner, OP, "retired", 100)
+        .unwrap();
+    let erased = keys.erasure_from_retirement(&retired, 200).unwrap();
+    let (retired_path, erased_path) = (retired.object_key().unwrap(), erased.object_key().unwrap());
+    assert_ne!(retired_path, erased_path);
+    assert!(keys
+        .verify(&erased_path, &retired.to_bytes().unwrap())
+        .is_err());
+    assert!(keys
+        .verify(&retired_path, &erased.to_bytes().unwrap())
+        .is_err());
+    // Relabelling the state keeps the MAC from verifying at either path.
+    let mut relabelled: serde_json::Value =
+        serde_json::from_slice(&retired.to_bytes().unwrap()).unwrap();
+    relabelled["state"] = serde_json::json!("erased");
+    let relabelled = serde_json::to_vec(&relabelled).unwrap();
+    assert!(keys.verify(&erased_path, &relabelled).is_err());
+    assert!(keys.verify(&retired_path, &relabelled).is_err());
+}
+
+#[test]
+fn owner_erased_is_refused_for_any_other_kind_state_or_version() {
+    let keys = keys();
+    let owner = keys.target_hmac("test", "owner", OWNER_DID).unwrap();
+    let space = keys.target_hmac("test", "space", "synthetic").unwrap();
+    assert!(keys
+        .sign("test", "owner", &owner, OP, "complete", 100)
+        .is_err());
+    assert!(keys
+        .sign("test", "owner", &owner, OP, "purging", 100)
+        .is_err());
+    for kind in ["space", "resource"] {
+        assert!(keys.sign("test", kind, &space, OP, "erased", 100).is_err());
+    }
+    // Only a retirement yields an erasure, and an erasure is never upgraded.
+    let erased = keys
+        .sign("test", "owner", &owner, OP, "erased", 100)
+        .unwrap();
+    assert!(keys.erasure_from_retirement(&erased, 200).is_err());
+    let purging = keys
+        .sign("test", "space", &space, OP, "purging", 100)
+        .unwrap();
+    assert!(keys.erasure_from_retirement(&purging, 200).is_err());
+    assert!(keys
+        .with_retirement_snapshots(erased.clone(), Vec::new())
+        .is_err());
+    assert!(keys.with_prefixes(erased.clone(), Vec::new()).is_err());
+    for version in [2, 3] {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&erased.to_bytes().unwrap()).unwrap();
+        body["version"] = serde_json::json!(version);
+        assert!(serde_json::from_value::<LedgerRecord>(body)
+            .unwrap()
+            .object_key()
+            .is_err());
+    }
+}
+
+/// A reader that predates `("owner","erased")` accepts only the pairs it
+/// knew, so it refuses this record and its reconcile stays fail-closed. This
+/// is why a node that wrote one must not be rolled back below this release.
+#[test]
+fn older_reader_refuses_owner_erased_records() {
+    fn older_reader_accepts(record: &LedgerRecord) -> bool {
+        matches!(
+            (record.kind.as_str(), record.state.as_str()),
+            ("owner", "retired") | ("space" | "resource", "purging" | "complete")
+        )
+    }
+    let keys = keys();
+    let owner = keys.target_hmac("test", "owner", OWNER_DID).unwrap();
+    let retired = keys
+        .sign("test", "owner", &owner, OP, "retired", 100)
+        .unwrap();
+    let erased = keys.erasure_from_retirement(&retired, 200).unwrap();
+    assert!(older_reader_accepts(&retired));
+    assert!(!older_reader_accepts(&erased));
+}

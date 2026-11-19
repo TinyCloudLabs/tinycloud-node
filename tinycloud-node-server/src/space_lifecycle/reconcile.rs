@@ -3,7 +3,9 @@
 //! ledger write is unknown; `tinycloud node purge-ledger reconcile` runs the
 //! same pass after a restore. The ledger wins: every verified record re-creates
 //! its fence, retirement or tombstone, an accepted purge whose job is missing
-//! is resumed, and nothing is ever un-fenced or deleted from the ledger.
+//! is resumed, every owner with an `erased` record has its encryption rows
+//! deleted again and is pruned from `deletions.jsonl`, and nothing is ever
+//! un-fenced or deleted from the ledger.
 pub use crate::storage::purge_reconcile::{PrefixStoreKind, RestoreDrain, VerifiedPurgePrefix};
 
 use super::LifecycleRuntime;
@@ -63,6 +65,13 @@ pub struct ReconcileReport {
     pub prefixes_deferred: usize,
     /// Prefixes of a store kind this node does not run; never proved here.
     pub prefixes_unavailable: usize,
+    /// Owners with a verified `erased` record whose encryption rows were
+    /// present (after a restore, or a crash after the record) and deleted.
+    pub owners_erased_redeleted: usize,
+    /// Erased owners whose settled `deletions.jsonl` operations were removed.
+    pub owners_pruned: usize,
+    /// Erased owners whose key rows remain, so `deletions.jsonl` keeps them.
+    pub blocked_rows_present: usize,
 }
 
 impl ReconcileReport {
@@ -83,6 +92,9 @@ impl ReconcileReport {
             prefixes_absent = self.prefixes_absent,
             prefixes_deferred = self.prefixes_deferred,
             prefixes_unavailable = self.prefixes_unavailable,
+            owners_erased_redeleted = self.owners_erased_redeleted,
+            owners_pruned = self.owners_pruned,
+            blocked_rows_present = self.blocked_rows_present,
             "purge ledger reconciled"
         );
     }
@@ -151,6 +163,7 @@ impl LifecycleRuntime {
         let mut targets: BTreeMap<(&str, &str), Target<'_>> = BTreeMap::new();
         for record in records.values() {
             match record.kind.as_str() {
+                "owner" if record.state == "erased" => {}
                 "owner" => {
                     self.import_retirement(db, record).await?;
                     report.owner_retirements += 1;
@@ -198,6 +211,16 @@ impl LifecycleRuntime {
         }
         self.repair_prefixes(db, stores, &drain, &records, &mut report)
             .await?;
+        let erased = crate::space_purge_owner_erasure::redelete_erased_owners(
+            db,
+            &self.keys,
+            stores.deletions.as_ref(),
+            &records,
+        )
+        .await?;
+        report.owners_erased_redeleted = erased.owners_rows_deleted;
+        report.owners_pruned = erased.owners_pruned;
+        report.blocked_rows_present = erased.blocked_rows_present;
         drop(drain);
         Ok(report)
     }

@@ -15,6 +15,7 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tinycloud_core::{
     encryption::ColumnEncryption,
+    encryption_network::deletion_ledger::DeletionLedger,
     sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait},
     space_purge_fence::PurgeDrain,
     space_purge_ledger::{LedgerKeys, LedgerRecord},
@@ -106,6 +107,9 @@ pub struct PurgeStores {
     pub duckdb: Option<tinycloud_core::duckdb::DuckDbService>,
     pub sql_objects: PurgeSqlObjects,
     pub encryption: Option<ColumnEncryption>,
+    /// `deletions.jsonl`, the handle the encryption service appends to. The
+    /// owner-erasure step prunes erased owners from it (TC-2871 S5).
+    pub deletions: Option<Arc<DeletionLedger>>,
 }
 impl PurgeStores {
     /// The physical stores acceptance records sign, in executor order.
@@ -180,24 +184,28 @@ const WORKER_IDLE: Duration = Duration::from_secs(10);
 
 /// The process's purge worker: sweep one completed purge's residue, claim one
 /// due phase or batch, execute it, release it on failure, and back off when
-/// idle. One loop per process; claims are leased in PostgreSQL. It does no
-/// work while the ledger is unverified or a reconciliation failed.
+/// idle. After a purge completes, and whenever lifecycle work is requested
+/// (a retirement, a purge, a reconcile), it runs the owner-erasure pass,
+/// retrying it on every pass until it succeeds. One loop per process; claims
+/// are leased in PostgreSQL. It does no work while the ledger is unverified
+/// or a reconciliation failed.
 pub async fn run_purge_worker(
     runtime: LifecycleRuntime,
     stores: Arc<PurgeStores>,
     shutdown: rocket::Shutdown,
 ) {
     tokio::pin!(shutdown);
+    let mut erase_owners = true;
     loop {
         let worked = tokio::select! {
-            worked = purge_step(&runtime, &stores) => worked,
+            worked = purge_step(&runtime, &stores, &mut erase_owners) => worked,
             _ = &mut shutdown => break,
         };
         if worked {
             continue;
         }
         tokio::select! {
-            _ = runtime.work_requested.notified() => {}
+            _ = runtime.work_requested.notified() => erase_owners = true,
             _ = tokio::time::sleep(WORKER_IDLE) => {}
             _ = &mut shutdown => break,
         }
@@ -205,7 +213,11 @@ pub async fn run_purge_worker(
 }
 
 /// One bounded pass. True when it did work and another pass should follow.
-async fn purge_step(runtime: &LifecycleRuntime, stores: &PurgeStores) -> bool {
+async fn purge_step(
+    runtime: &LifecycleRuntime,
+    stores: &PurgeStores,
+    erase_owners: &mut bool,
+) -> bool {
     if !runtime.ledger_verified() {
         return false;
     }
@@ -224,41 +236,77 @@ async fn purge_step(runtime: &LifecycleRuntime, stores: &PurgeStores) -> bool {
                 false
             }
         };
-    let job = match space_purge_worker::claim(db, &uuid::Uuid::new_v4().to_string()).await {
-        Ok(Some(job)) => job,
-        Ok(None) => return swept,
+    let worked = match space_purge_worker::claim(db, &uuid::Uuid::new_v4().to_string()).await {
+        Ok(Some(job)) => {
+            match execute_job(runtime, stores, db, keys, &job).await {
+                Ok(outcome) => {
+                    ::tracing::info!(
+                        event = "space_purge_phase",
+                        phase = %job.phase,
+                        outcome = ?outcome,
+                        "space purge phase ran"
+                    );
+                    *erase_owners |= outcome == PhaseOutcome::Complete;
+                }
+                Err(code) => {
+                    // The purge ID and the fixed code only: never error text.
+                    ::tracing::warn!(
+                        event = "space_purge_phase_failed",
+                        purge_id = %job.purge_id,
+                        code,
+                        "space purge phase failed; retrying later"
+                    );
+                    if code != "lease_lost"
+                        && space_purge_worker::retry(db, &job, code).await.is_err()
+                    {
+                        ::tracing::warn!(
+                            event = "space_purge_release_failed",
+                            "space purge attempt release failed"
+                        );
+                    }
+                }
+            }
+            true
+        }
+        Ok(None) => swept,
         Err(_) => {
             ::tracing::warn!(
                 event = "space_purge_claim_failed",
                 "space purge claim failed"
             );
-            return false;
+            false
         }
     };
-    match execute_job(runtime, stores, db, keys, &job).await {
-        Ok(outcome) => ::tracing::info!(
-            event = "space_purge_phase",
-            phase = %job.phase,
-            outcome = ?outcome,
-            "space purge phase ran"
-        ),
-        Err(code) => {
-            // The purge ID and the fixed code only: never error text.
-            ::tracing::warn!(
-                event = "space_purge_phase_failed",
-                purge_id = %job.purge_id,
-                code,
-                "space purge phase failed; retrying later"
-            );
-            if code != "lease_lost" && space_purge_worker::retry(db, &job, code).await.is_err() {
-                ::tracing::warn!(
-                    event = "space_purge_release_failed",
-                    "space purge attempt release failed"
-                );
+    if *erase_owners {
+        match crate::space_purge_owner_erasure::erase_retired_owners(
+            db,
+            &*stores.ledger,
+            keys,
+            stores.deletions.as_ref(),
+        )
+        .await
+        {
+            Ok(report) => {
+                *erase_owners = false;
+                if report != Default::default() {
+                    ::tracing::info!(
+                        event = "space_purge_owner_erasure",
+                        owners_erased = report.owners_erased,
+                        owners_rows_deleted = report.owners_rows_deleted,
+                        owners_pruned = report.owners_pruned,
+                        blocked_rows_present = report.blocked_rows_present,
+                        "owner erasure pass ran"
+                    );
+                }
             }
+            // Fixed text only; the flag stays set, so the next pass retries.
+            Err(_) => ::tracing::warn!(
+                event = "space_purge_owner_erasure_failed",
+                "owner erasure pass failed; retrying later"
+            ),
         }
     }
-    true
+    worked
 }
 
 async fn execute_job(

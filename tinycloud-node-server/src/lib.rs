@@ -685,6 +685,20 @@ pub async fn reconcile_purge_ledger(
         }),
         sql_objects: space_purge_executor::PurgeSqlObjects::open(&config.storage).await?,
         encryption: None,
+        // The node holds the ledger's lock while it runs; this command is
+        // run with the node stopped.
+        deletions: match config.encryption_network.deletion_ledger_path.clone() {
+            Some(path) => Some(Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open(&path)
+                })
+                .await?
+                .map_err(|error| {
+                    anyhow::anyhow!("deletion ledger could not be opened: {}", error.kind())
+                })?,
+            )),
+            None => None,
+        },
     };
     let runtime = runtime.with_storage_layout(stores.layout().map_err(anyhow::Error::msg)?);
     runtime
@@ -1251,6 +1265,7 @@ pub async fn app_with_control(
                 sql_objects: space_purge_executor::PurgeSqlObjects::open(&tinycloud_config.storage)
                     .await?,
                 encryption: Some(column_encryption),
+                deletions: deletion_ledger.clone(),
             });
             let runtime = runtime.with_storage_layout(stores.layout().map_err(anyhow::Error::msg)?);
             let report = runtime
@@ -3214,3 +3229,4 @@ mod removed_settings_tests {
 }
 pub mod space_lifecycle;
 pub mod space_purge_executor;
+pub mod space_purge_owner_erasure;

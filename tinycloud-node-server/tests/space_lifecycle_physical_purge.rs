@@ -8,7 +8,10 @@ use tinycloud::{
     space_lifecycle::{
         list_my_spaces, purge_space, purge_status, retire_owner, LifecycleRuntime, PurgeResponse,
     },
-    space_purge_executor::{PhaseOutcome, SpacePurgeExecutor, SqlPurgeStore},
+    space_purge_executor::{
+        PhaseOutcome, PurgeSqlObjects, PurgeStores, SpacePurgeExecutor, SqlPurgeStore,
+    },
+    space_purge_owner_erasure::{erase_retired_owners, publish_erased, OwnerErasureReport},
     storage::{
         file_system::FileSystemConfig,
         purge_ledger::{FsPurgeLedger, PurgeLedger, PurgeLedgerStore},
@@ -25,14 +28,15 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     database_artifacts::SeaOrmDatabaseArtifactRepository,
+    encryption_network::deletion_ledger::{DeletionLedger, Intent, LedgerKey, Record},
     migrations::Migrator,
-    models::{space, space_purge_job},
+    models::{space, space_purge_job, space_retirement},
     sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DbBackend,
-        EntityTrait, Statement,
+        ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database,
+        DatabaseConnection, DbBackend, EntityTrait, Statement,
     },
     sea_orm_migration::MigratorTrait,
-    space_purge_ledger::LedgerKeys,
+    space_purge_ledger::{owner_object_key, LedgerKeys},
     space_purge_worker::claim_specific,
     sql::{SqlRequest, SqlService},
     storage::{either::Either, StorageConfig},
@@ -66,8 +70,114 @@ fn signed(
     (invocation.encode().unwrap(), id)
 }
 
+const ENCRYPTION_TABLES: [&str; 5] = [
+    "encryption_network",
+    "encryption_network_key",
+    "encryption_network_member",
+    "encryption_ceremony",
+    "encryption_audit",
+];
+
+/// One row per encryption table for `owner`'s `default` network.
+async fn insert_network(db: &DatabaseConnection, owner: &str) -> String {
+    let network = format!("urn:tinycloud:encryption:{owner}:default");
+    for (sql, owned) in [
+        ("INSERT INTO encryption_network(network_id,owner_did,name,alg,key_version,public_key,state,threshold_n,threshold_t,key_backend,created_at,updated_at)
+          VALUES($1,$2,'default','test',1,'\\x01','active',1,1,'local','now','now')", true),
+        ("INSERT INTO encryption_network_key(network_id,key_path,kind,state,public_key,created_at,updated_at)
+          VALUES($1,'key','test','active','\\x01','now','now')", false),
+        ("INSERT INTO encryption_network_member(network_id,node_id,role,share_index,joined_at)
+          VALUES($1,'node','member',1,'now')", false),
+        ("INSERT INTO encryption_ceremony(ceremony_id,network_id,kind,state,started_at)
+          VALUES($1||'#ceremony',$1,'test','complete','now')", false),
+        ("INSERT INTO encryption_audit(request_hash,requester,network_id,node_id,outcome,decided_at)
+          VALUES($1||'#audit',$2,$1,'node','ok','now')", true),
+    ] {
+        let mut values = vec![network.clone().into()];
+        if owned {
+            values.push(owner.into());
+        }
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap();
+    }
+    network
+}
+
+/// Rows of `network` per table, in [`ENCRYPTION_TABLES`] order.
+async fn network_rows(db: &DatabaseConnection, network: &str) -> [i64; 5] {
+    let mut rows = [0; 5];
+    for (n, table) in ENCRYPTION_TABLES.into_iter().enumerate() {
+        rows[n] = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table} WHERE network_id=$1"),
+                [network.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+    }
+    rows
+}
+
+/// A `deletions.jsonl` holding one settled key delete per network.
+fn deletions_with(dir: &std::path::Path, networks: &[&str]) -> Arc<DeletionLedger> {
+    let ledger = DeletionLedger::open(&dir.join("deletions.jsonl")).unwrap();
+    for (n, network) in networks.iter().enumerate() {
+        let op = format!("op-{n}");
+        ledger
+            .append(&Record::Intent(Intent {
+                op: op.clone(),
+                network_id: (*network).to_owned(),
+                keys: vec![LedgerKey {
+                    key_path: "key".into(),
+                    key_version: 1,
+                }],
+                deleted_at: "2026-11-19T00:00:00Z".into(),
+            }))
+            .unwrap();
+        ledger.append(&Record::committed(&op)).unwrap();
+    }
+    Arc::new(ledger)
+}
+
+fn ledger_names(ledger: &DeletionLedger, network: &str) -> bool {
+    String::from_utf8(std::fs::read(ledger.path()).unwrap())
+        .unwrap()
+        .contains(network)
+}
+
+/// The stores reconcile runs against, over the test's `blocks` and
+/// `sql-objects` directories.
+async fn reconcile_stores(
+    root: &std::path::Path,
+    sql: &SqlService,
+    ledger: &Arc<PurgeLedger>,
+    deletions: &Arc<DeletionLedger>,
+) -> PurgeStores {
+    let blocks_root = root.join("blocks");
+    PurgeStores {
+        blocks: Either::B(FileSystemConfig::new(&blocks_root).open().await.unwrap()),
+        ledger: ledger.clone(),
+        sql: sql.clone(),
+        #[cfg(feature = "duckdb")]
+        duckdb: None,
+        sql_objects: PurgeSqlObjects::FileSystem(
+            FsSqlObjectStore::open(root.join("sql-objects"), &blocks_root).unwrap(),
+        ),
+        encryption: None,
+        deletions: Some(deletions.clone()),
+    }
+}
+
 // test-ruling: TC-2871 ledger out of the data bucket (Naomi 11-18): the runtime
 // and the executor share one ledger in its own directory, apart from `blocks`.
+// test-ruling: TC-2871 option A (Naomi 11-19): a crash after the `erased`
+// record is published leaves the rows; reconcile deletes and prunes them,
+// and a neighbor that is not retired keeps its rows and gets no record.
 #[tokio::test]
 async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_target() {
     if std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").as_deref() != Ok("1")
@@ -168,6 +278,7 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
     .with_clock(Arc::new(move || accepted_time));
     runtime.verify_ledger().await.unwrap();
     let fence = runtime.fence.clone();
+    let reconciler = runtime.clone();
     let client = Client::tracked(rocket::build().manage(runtime).mount(
         "/",
         rocket::routes![retire_owner, list_my_spaces, purge_space, purge_status],
@@ -310,6 +421,74 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
         )
         .unwrap();
     }
+
+    // Crash after step (a): the `erased` record is published, the rows are
+    // not yet deleted. Reconcile deletes and prunes them through the record;
+    // the neighbor, never retired, keeps its rows and gets no record.
+    let canonical = canonicalize_did(&owner).unwrap();
+    let network = insert_network(&db, &canonical).await;
+    let neighbor_network = insert_network(
+        &db,
+        "did:pkh:eip155:1:0x2222222222222222222222222222222222222222",
+    )
+    .await;
+    let deletions = deletions_with(root.path(), &[&network, &neighbor_network]);
+    let retirement = space_retirement::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let retired_path = owner_object_key(
+        &retirement.hmac_key_id,
+        &hex::encode(&retirement.owner_hmac),
+        "retired",
+    )
+    .unwrap();
+    let retired = keys
+        .verify(
+            &retired_path,
+            &ledger
+                .read_purge_record(&retired_path)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let erased = keys
+        .erasure_from_retirement(&retired, OffsetDateTime::now_utc().unix_timestamp())
+        .unwrap();
+    publish_erased(&*ledger, &keys, &erased).await.unwrap();
+    assert_eq!(network_rows(&db, &network).await, [1; 5]);
+    let stores = reconcile_stores(root.path(), &sql, &purge_ledger, &deletions).await;
+    let report = reconciler.reconcile(&stores).await.unwrap();
+    assert_eq!(
+        report.owner_retirements, 1,
+        "an erased record is no retirement"
+    );
+    assert_eq!(
+        (
+            report.owners_erased_redeleted,
+            report.owners_pruned,
+            report.blocked_rows_present
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(network_rows(&db, &network).await, [0; 5]);
+    assert!(!ledger_names(&deletions, &network));
+    assert_eq!(network_rows(&db, &neighbor_network).await, [1; 5]);
+    assert!(ledger_names(&deletions, &neighbor_network));
+    assert_eq!(
+        erase_retired_owners(&db, &*purge_ledger, &keys, Some(&deletions))
+            .await
+            .unwrap(),
+        OwnerErasureReport::default()
+    );
+    assert_eq!(
+        ledger.list_purge_records().await.unwrap().len(),
+        4,
+        "one erased record, none for the neighbor"
+    );
+    drop(stores);
     sql.drain_and_evict_space(&neighbor).await.unwrap();
     drop(client);
     drop(sql);
@@ -324,6 +503,10 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
 // job's owner digest must cover the canonical owner DID. Otherwise it never
 // matches the retirement's, and a retired owner's encryption networks survive
 // the purge of their last space.
+// test-ruling: TC-2871 option A (Naomi 11-19): the purge keeps the networks;
+// the owner-erasure step publishes the `erased` record, deletes every
+// encryption row (audit included) and prunes `deletions.jsonl`, and reconcile
+// deletes restored rows again.
 #[tokio::test]
 async fn postgres_retired_owner_purge_of_lowercase_address_space_deletes_owner_networks() {
     if std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").as_deref() != Ok("1")
@@ -370,27 +553,10 @@ async fn postgres_retired_owner_purge_of_lowercase_address_space_deletes_owner_n
     .insert(&db)
     .await
     .unwrap();
-    let network = format!("urn:tinycloud:encryption:{canonical}:default");
-    for (sql, values) in [
-        (
-            "INSERT INTO encryption_network(network_id,owner_did,name,alg,key_version,public_key,state,threshold_n,threshold_t,key_backend,created_at,updated_at)
-             VALUES($1,$2,'default','test',1,'\\x01','active',1,1,'local','now','now')",
-            vec![network.clone().into(), canonical.clone().into()],
-        ),
-        (
-            "INSERT INTO encryption_network_key(network_id,key_path,kind,state,public_key,created_at,updated_at)
-             VALUES($1,'key','test','active','\\x01','now','now')",
-            vec![network.clone().into()],
-        ),
-    ] {
-        db.execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await
-        .unwrap();
-    }
+    let network = insert_network(&db, &canonical).await;
+    let other_network =
+        "urn:tinycloud:encryption:did:pkh:eip155:1:0x2222222222222222222222222222222222222222:default";
+    let deletions = deletions_with(root.path(), &[&network, other_network]);
     let keys = Arc::new(
         LedgerKeys::new(
             "test".into(),
@@ -403,20 +569,25 @@ async fn postgres_retired_owner_purge_of_lowercase_address_space_deletes_owner_n
     ));
     let ledger: Arc<dyn PurgeLedgerStore> = purge_ledger.clone();
     let accepted_time = OffsetDateTime::now_utc() - time::Duration::minutes(6);
-    let runtime =
-        LifecycleRuntime::new(db.clone().into(), keys.clone(), ledger, "host-test".into())
-            .unwrap()
-            .with_storage_layout(
-                tinycloud::space_lifecycle::PurgeStorageLayout::new(
-                    tinycloud::storage::purge_reconcile::PrefixStoreKind::KvFileSystem,
-                    tinycloud::storage::purge_reconcile::PrefixStoreKind::SqlFileSystem,
-                    false,
-                )
-                .unwrap(),
-            )
-            .with_clock(Arc::new(move || accepted_time));
+    let runtime = LifecycleRuntime::new(
+        db.clone().into(),
+        keys.clone(),
+        ledger.clone(),
+        "host-test".into(),
+    )
+    .unwrap()
+    .with_storage_layout(
+        tinycloud::space_lifecycle::PurgeStorageLayout::new(
+            tinycloud::storage::purge_reconcile::PrefixStoreKind::KvFileSystem,
+            tinycloud::storage::purge_reconcile::PrefixStoreKind::SqlFileSystem,
+            false,
+        )
+        .unwrap(),
+    )
+    .with_clock(Arc::new(move || accepted_time));
     runtime.verify_ledger().await.unwrap();
     let fence = runtime.fence.clone();
+    let reconciler = runtime.clone();
     let client = Client::tracked(
         rocket::build()
             .manage(runtime)
@@ -497,20 +668,70 @@ async fn postgres_retired_owner_purge_of_lowercase_address_space_deletes_owner_n
     }
     assert!(complete);
     drop(drain);
-    for table in ["encryption_network", "encryption_network_key"] {
-        let rows = db
-            .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                format!("SELECT count(*) AS n FROM {table} WHERE network_id=$1"),
-                [network.clone().into()],
-            ))
+    assert_eq!(
+        network_rows(&db, &network).await,
+        [1; 5],
+        "purges keep rows"
+    );
+
+    // (a) record, (b) rows, (c) prune: the owner is erased once.
+    let report = erase_retired_owners(&db, &*purge_ledger, &keys, Some(&deletions))
+        .await
+        .unwrap();
+    assert_eq!(
+        report,
+        OwnerErasureReport {
+            owners_erased: 1,
+            owners_rows_deleted: 1,
+            owners_pruned: 1,
+            blocked_rows_present: 0,
+        }
+    );
+    let erased_path = owner_object_key("test", &hex::encode(&job.owner_hmac), "erased").unwrap();
+    let erased = keys
+        .verify(
+            &erased_path,
+            &ledger
+                .read_purge_record(&erased_path)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        (erased.kind.as_str(), erased.state.as_str()),
+        ("owner", "erased")
+    );
+    assert_eq!(network_rows(&db, &network).await, [0; 5], "audit included");
+    assert!(!ledger_names(&deletions, &network));
+    assert!(ledger_names(&deletions, other_network), "other owner kept");
+    assert_eq!(
+        erase_retired_owners(&db, &*purge_ledger, &keys, Some(&deletions))
             .await
-            .unwrap()
-            .unwrap()
-            .try_get::<i64>("", "n")
-            .unwrap();
-        assert_eq!(rows, 0, "{table} of the retired owner");
-    }
+            .unwrap(),
+        OwnerErasureReport::default()
+    );
+
+    // A restore brings the rows back; reconcile deletes them again through
+    // the `erased` record, and a second pass finds nothing.
+    insert_network(&db, &canonical).await;
+    let stores = reconcile_stores(root.path(), &sql, &purge_ledger, &deletions).await;
+    let report = reconciler.reconcile(&stores).await.unwrap();
+    assert_eq!(
+        (report.owners_erased_redeleted, report.blocked_rows_present),
+        (1, 0)
+    );
+    assert_eq!(network_rows(&db, &network).await, [0; 5]);
+    let report = reconciler.reconcile(&stores).await.unwrap();
+    assert_eq!(
+        (
+            report.owners_erased_redeleted,
+            report.owners_pruned,
+            report.blocked_rows_present
+        ),
+        (0, 0, 0)
+    );
+    drop(stores);
     drop(client);
     drop(sql);
     db.close().await.unwrap();

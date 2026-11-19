@@ -119,3 +119,35 @@ async fn ledger_is_append_only_and_survives_reopen() {
         b"authenticated-protocol-bytes"
     );
 }
+
+// TC-2871 S5: an owner's `retired` record is a file at `owners/<kid>/<hmac>`,
+// so its `erased` record sits beside it under `owners-erased/`; both are
+// stored, listed and read back.
+#[tokio::test]
+async fn owner_retired_and_erased_records_are_stored_side_by_side() {
+    use crate::storage::purge_ledger::{FsPurgeLedger, PurgeLedgerStore};
+    use tinycloud_core::space_purge_ledger::owner_object_key;
+    let root = tempfile::tempdir().unwrap();
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
+    let digest = "ab".repeat(32);
+    let retired = owner_object_key("test-key", &digest, "retired").unwrap();
+    let erased = owner_object_key("test-key", &digest, "erased").unwrap();
+    store
+        .append_purge_record(&retired, b"retired")
+        .await
+        .unwrap();
+    store.append_purge_record(&erased, b"erased").await.unwrap();
+    drop(store);
+    let store = FsPurgeLedger::new(root.path().join("ledger")).unwrap();
+    let mut listed = store.list_purge_records().await.unwrap();
+    listed.sort();
+    assert_eq!(listed, vec![erased.clone(), retired.clone()]);
+    assert_eq!(
+        store.read_purge_record(&retired).await.unwrap().unwrap(),
+        b"retired"
+    );
+    assert_eq!(
+        store.read_purge_record(&erased).await.unwrap().unwrap(),
+        b"erased"
+    );
+}

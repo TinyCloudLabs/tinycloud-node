@@ -1,6 +1,16 @@
 //! Exact-space database leaves. Signed-record roots are handled at completion.
-use crate::space_purge_worker::{renew, ClaimedPurge};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, Statement};
+//! The owner-erasure step that follows a retired owner's last purge is here
+//! too, so every owner-keyed table's deleter sits next to its classification.
+use crate::{
+    encryption_network::NetworkId,
+    models::space_retirement,
+    space_purge_ledger::LedgerKeys,
+    space_purge_worker::{renew, ClaimedPurge},
+};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, Statement, TransactionTrait,
+};
+use std::collections::BTreeSet;
 
 /// Where a space purge erases a table's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,15 +62,17 @@ pub const PURGED_BY_SPACE: &[(&str, PurgePhase)] = &[
     ("space", PurgePhase::Completion),
 ];
 
-/// Rows keyed by the owner, and the condition under which a space purge
-/// deletes them: `artifact_account` in [`delete_verified_empty_inventory`],
-/// the encryption-network rows in [`delete_owner_encryption_networks`].
+/// Rows keyed by the owner, and the condition under which they are deleted:
+/// `artifact_account` in [`delete_verified_empty_inventory`], the
+/// encryption-network rows by the owner-erasure step after a space purge
+/// ([`erase_owner_encryption_rows`]).
 pub const PURGED_BY_OWNER: &[(&str, &str)] = &[
     ("artifact_account", "quota counters only, all zero once no artifact row remains and re-created on demand: when the owner has no other live space"),
-    ("encryption_network", "by owner, only after owner retirement, when the owner has no other live space"),
-    ("encryption_network_key", "by owner, only after owner retirement, when the owner has no other live space"),
-    ("encryption_network_member", "by owner, only after owner retirement, when the owner has no other live space"),
-    ("encryption_ceremony", "by owner, only after owner retirement, when the owner has no other live space"),
+    ("encryption_network", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
+    ("encryption_network_key", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
+    ("encryption_network_member", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
+    ("encryption_ceremony", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
+    ("encryption_audit", "owner erasure: the key-operation trail of an erased owner's networks; the signed `erased` record is the evidence that replaces it"),
 ];
 
 /// Tables a space purge does not delete by key, and why.
@@ -73,7 +85,6 @@ pub const RETAINED: &[(&str, &str)] = &[
     ("policy_v3_registration", "signed policy projection: removed with its proof closure by records GC, else shared residue"),
     ("policy_v3_session", "signed policy projection: removed with its proof closure by records GC, else shared residue"),
     ("policy_v3_challenge", "policy challenge: removed with its registration by records GC; expires_at-bounded"),
-    ("encryption_audit", "key-operation audit trail: key.delete keeps it as evidence; erase even after owner retirement awaits the deletion-ledger ruling"),
     ("encryption_nonce", "owner-delete replay nonce: expires_at-bounded, names no space"),
     ("renewal_identity", "this node's own renewer identity, not user data"),
     ("renewal_lease", "renewal state of a signed delegation, keyed by delegation CID, not by space"),
@@ -123,91 +134,232 @@ pub async fn delete_sql_and_hook_rows(
         deleted+=tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,sql,
             [job.space.clone().into()])).await?.rows_affected();
     }
-    deleted += delete_owner_encryption_networks(tx, job).await?;
     Ok(deleted)
 }
 
-/// Database phase: delete the owner's encryption networks with their keys,
-/// members and ceremonies, only when the owner is retired and this purge
-/// leaves them with no live space on this node. Purging an owner's last space
-/// is not account erasure: the owner keeps their DID, and their named keys may
-/// protect data elsewhere. Kept separate so it can be gated on its
-/// deletion-ledger evidence. No foreign key references these rows.
-///
-/// Retired means a `space_retirement` row whose `(owner_hmac, hmac_key_id)`
-/// equals this job's. Known limitations, both failing safe by keeping the
-/// networks: a key rotation that gave the retirement a different key id than
-/// the job; and a job whose owner digest covers the space's DID as written
-/// while retirement covers the canonical DID (EIP-55 case differences).
-///
-/// Live means a `space` row with no accepted, uncompleted purge: the target
-/// keeps its row until completion, and two concurrently purged last spaces
-/// must not each wait for the other. Network owners are canonical DIDs
-/// (`NetworkId::new`); a space DID may differ in EIP-55 case, so the SQL
-/// filter is case-insensitive and the final match is
-/// `did_principal_matches`. An unparseable candidate space counts as live.
-pub async fn delete_owner_encryption_networks(
-    tx: &DatabaseTransaction,
-    job: &ClaimedPurge,
-) -> Result<u64, DbErr> {
-    use tinycloud_auth::{
-        identity::{canonicalize_principal, did_principal_matches},
-        resource::SpaceId,
-    };
-    let retired = tx
-        .query_one(Statement::from_sql_and_values(
+// Owner erasure (TC-2871 S5, option A). Not a purge phase: it runs after a
+// space purge completes, from the purge worker, and again from reconcile.
+// The node publishes the signed `("owner","erased")` record first; only then
+// does [`erase_owner_encryption_rows`] delete the rows, so a crash between the
+// two leaves a record that reconcile acts on. Purging an owner's last space is
+// not by itself account erasure: the owner must also be retired.
+
+const NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
+
+/// Tables holding an owner's encryption-network rows, children first.
+const OWNER_ENCRYPTION_TABLES: [&str; 5] = [
+    "encryption_ceremony",
+    "encryption_network_member",
+    "encryption_network_key",
+    "encryption_audit",
+    "encryption_network",
+];
+
+/// The canonical owner of a stored network id or owner DID, if it parses.
+fn canonical_owner(value: &str) -> Option<String> {
+    if value.starts_with(NETWORK_PREFIX) {
+        value
+            .parse::<NetworkId>()
+            .ok()
+            .map(|network| network.owner_did().to_owned())
+    } else {
+        tinycloud_auth::identity::canonicalize_principal(value).ok()
+    }
+}
+
+/// Every canonical owner DID an encryption-network row names, by its
+/// `owner_did` or its network id. Rows that do not parse name no owner.
+pub async fn encryption_owners<C: ConnectionTrait>(conn: &C) -> Result<BTreeSet<String>, DbErr> {
+    let rows = conn
+        .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
-            "SELECT 1 FROM space_purge_job j JOIN space_retirement r
-               ON r.owner_hmac=j.owner_hmac AND r.hmac_key_id=j.hmac_key_id
-             WHERE j.purge_id=$1 AND j.space=$2",
-            [job.purge_id.clone().into(), job.space.clone().into()],
+            "SELECT owner_did AS id FROM encryption_network
+             UNION SELECT network_id FROM encryption_network
+             UNION SELECT network_id FROM encryption_network_key
+             UNION SELECT network_id FROM encryption_network_member
+             UNION SELECT network_id FROM encryption_ceremony
+             UNION SELECT network_id FROM encryption_audit",
         ))
         .await?;
-    if retired.is_none() {
-        return Ok(0);
+    let mut owners = BTreeSet::new();
+    for row in rows {
+        if let Some(owner) = canonical_owner(&row.try_get::<String>("", "id")?) {
+            owners.insert(owner);
+        }
     }
-    let space: SpaceId = job
-        .space
-        .parse()
-        .map_err(|_| DbErr::Custom("invalid purge space".into()))?;
-    let Ok(owner) = canonicalize_principal(space.did().as_str()) else {
-        // NetworkId::new rejects such an owner, so it cannot own a network.
-        return Ok(0);
-    };
-    let candidates = tx
+    Ok(owners)
+}
+
+/// The network ids, exactly as stored, of `owner`'s rows in any encryption
+/// table, including key rows whose network row is gone. The SQL prefilter is
+/// case-insensitive (a stored id may differ in EIP-55 case); the final match
+/// is on the parsed canonical owner, or the network row's `owner_did`.
+async fn owner_network_ids<C: ConnectionTrait>(
+    conn: &C,
+    owner: &str,
+) -> Result<BTreeSet<String>, DbErr> {
+    let prefix = format!("{NETWORK_PREFIX}{owner}:").to_lowercase();
+    let length = i32::try_from(prefix.chars().count())
+        .map_err(|_| DbErr::Custom("owner DID too long".into()))?;
+    let owned = conn
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT s.id FROM space s WHERE s.id<>$1
-             AND lower(artifact_owner(s.id))=lower(artifact_owner($1))
-             AND NOT EXISTS(SELECT 1 FROM space_purge_job j WHERE j.space=s.id AND j.phase<>'complete')",
-            [job.space.clone().into()],
+            "SELECT network_id FROM encryption_network WHERE owner_did=$1",
+            [owner.into()],
+        ))
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "network_id"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let rows = conn
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT network_id AS id FROM encryption_network WHERE left(lower(network_id),$2)=$1
+             UNION SELECT network_id FROM encryption_network_key WHERE left(lower(network_id),$2)=$1
+             UNION SELECT network_id FROM encryption_network_member WHERE left(lower(network_id),$2)=$1
+             UNION SELECT network_id FROM encryption_ceremony WHERE left(lower(network_id),$2)=$1
+             UNION SELECT network_id FROM encryption_audit WHERE left(lower(network_id),$2)=$1",
+            [prefix.into(), length.into()],
+        ))
+        .await?;
+    let mut ids = owned;
+    for row in rows {
+        let id: String = row.try_get("", "id")?;
+        if canonical_owner(&id).as_deref() == Some(owner) {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// `encryption_network_key` rows that remain for `owner`'s networks. The
+/// `deletions.jsonl` prune requires zero.
+pub async fn owner_key_rows<C: ConnectionTrait>(conn: &C, owner: &str) -> Result<u64, DbErr> {
+    let mut rows = 0;
+    for id in owner_network_ids(conn, owner).await? {
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS n FROM encryption_network_key WHERE network_id=$1",
+                [id.into()],
+            ))
+            .await?
+            .ok_or_else(|| DbErr::Custom("count returned no row".into()))?;
+        rows += u64::try_from(row.try_get::<i64>("", "n")?).unwrap_or(0);
+    }
+    Ok(rows)
+}
+
+/// The gate before the `erased` record is published: `owner` (a canonical
+/// DID) has a `space_retirement` row under some key id, at least one purge
+/// job of that owner digest, every such job complete, and no live space.
+/// Returns the retirement. Jobs and retirements are matched under every
+/// configured key id, so a key rotation between them does not block erasure.
+///
+/// Live means any `space` row of the owner: completed purges have deleted
+/// theirs. Network owners are canonical DIDs (`NetworkId::new`); a space DID
+/// may differ in EIP-55 case, so the SQL filter is case-insensitive and the
+/// final match is `did_principal_matches`. An unparseable candidate space
+/// counts as live.
+pub async fn owner_erasure_retirement<C: ConnectionTrait>(
+    conn: &C,
+    keys: &LedgerKeys,
+    owner: &str,
+) -> Result<Option<space_retirement::Model>, DbErr> {
+    use sea_orm::EntityTrait;
+    use tinycloud_auth::{identity::did_principal_matches, resource::SpaceId};
+    let unavailable = |_| DbErr::Custom("owner digest unavailable".into());
+    let mut retirement = None;
+    let (mut jobs, mut open) = (0_i64, 0_i64);
+    for key_id in keys.key_ids() {
+        let digest = keys
+            .target_hmac(key_id, "owner", owner)
+            .map_err(unavailable)?;
+        if retirement.is_none() {
+            retirement = space_retirement::Entity::find_by_id((digest.clone(), key_id.to_owned()))
+                .one(conn)
+                .await?;
+        }
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS jobs, count(*) FILTER (WHERE phase<>'complete') AS open
+                 FROM space_purge_job WHERE owner_hmac=$1 AND hmac_key_id=$2",
+                [digest.into(), key_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| DbErr::Custom("count returned no row".into()))?;
+        jobs += row.try_get::<i64>("", "jobs")?;
+        open += row.try_get::<i64>("", "open")?;
+    }
+    let Some(retirement) = retirement else {
+        return Ok(None);
+    };
+    if jobs == 0 || open != 0 {
+        return Ok(None);
+    }
+    let candidates = conn
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM space WHERE lower(artifact_owner(id))=lower($1)",
+            [owner.into()],
         ))
         .await?;
     for row in candidates {
         let live = match row.try_get::<String>("", "id")?.parse::<SpaceId>() {
-            Ok(other) => did_principal_matches(other.did().as_str(), &owner),
+            Ok(space) => did_principal_matches(space.did().as_str(), owner),
             Err(_) => true,
         };
         if live {
-            return Ok(0);
+            return Ok(None);
         }
     }
-    let mut deleted = 0;
-    for sql in [
-        "DELETE FROM encryption_ceremony WHERE network_id IN (SELECT network_id FROM encryption_network WHERE owner_did=$1)",
-        "DELETE FROM encryption_network_member WHERE network_id IN (SELECT network_id FROM encryption_network WHERE owner_did=$1)",
-        "DELETE FROM encryption_network_key WHERE network_id IN (SELECT network_id FROM encryption_network WHERE owner_did=$1)",
-        "DELETE FROM encryption_network WHERE owner_did=$1",
-    ] {
-        deleted += tx
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                [owner.clone().into()],
-            ))
-            .await?
-            .rows_affected();
+    Ok(Some(retirement))
+}
+
+/// Owner-erasure step (b): in one transaction, keep the database copy of the
+/// verified `erased` record (`space_purge_ledger_copy::retain`) and delete
+/// every `encryption_network*`, `encryption_ceremony` and `encryption_audit`
+/// row of `owner`'s networks. The record must be `("owner","erased")` and its
+/// digest must be `owner`'s under its key id, so the caller can only name the
+/// owner the record names; an HMAC is never reversed. Idempotent: reconcile
+/// runs it again for every verified `erased` record. No foreign key
+/// references these rows. Returns the rows deleted.
+pub async fn erase_owner_encryption_rows<C: TransactionTrait>(
+    db: &C,
+    keys: &LedgerKeys,
+    path: &str,
+    body: &[u8],
+    owner: &str,
+    now: time::OffsetDateTime,
+) -> Result<u64, DbErr> {
+    let invalid = || DbErr::Custom("owner erasure evidence mismatch".into());
+    let record = keys.verify(path, body).map_err(|_| invalid())?;
+    let digest = keys
+        .target_hmac(&record.key_id, "owner", owner)
+        .map_err(|_| invalid())?;
+    if record.kind != "owner"
+        || record.state != "erased"
+        || record.target_hmac != hex::encode(digest)
+    {
+        return Err(invalid());
     }
+    let tx = db.begin().await?;
+    crate::space_purge_ledger_copy::retain(&tx, keys, path, body, now).await?;
+    let mut deleted = 0;
+    for id in owner_network_ids(&tx, owner).await? {
+        for table in OWNER_ENCRYPTION_TABLES {
+            deleted += tx
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!("DELETE FROM {table} WHERE network_id=$1"),
+                    [id.clone().into()],
+                ))
+                .await?
+                .rows_affected();
+        }
+    }
+    tx.commit().await?;
     Ok(deleted)
 }
 

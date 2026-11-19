@@ -10,7 +10,10 @@ use tinycloud_core::{
         TransactionTrait, Value,
     },
     sea_orm_migration::MigratorTrait,
-    space_purge_database::{delete_sql_and_hook_rows, reap_artifact_parts},
+    space_purge_database::{
+        delete_sql_and_hook_rows, encryption_owners, erase_owner_encryption_rows,
+        owner_erasure_retirement, owner_key_rows, reap_artifact_parts,
+    },
     space_purge_ledger::LedgerKeys,
     space_purge_worker::{advance, claim, claim_specific, complete},
 };
@@ -581,13 +584,18 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
     assert_eq!(networks(&db, OWNER).await, [1; 5], "KEPT is still live");
 
     // Purging the owner's last space is not account erasure: without this
-    // owner's retirement (another owner's does not count) the networks stay.
-    // The artifact quota counters go; they are re-created on demand.
+    // owner's retirement (another owner's does not count) the networks stay
+    // and the erasure gate stays shut. The artifact quota counters go; they
+    // are re-created on demand.
     retire(&db, &keys, OTHER_OWNER).await;
     purge(&db, &keys, KEPT).await;
     assert_eq!(artifact_rows(&db, KEPT).await, (0, 0, 0));
     assert_eq!(account(&db, OWNER).await, None);
     assert_eq!(networks(&db, OWNER).await, [1; 5], "owner is not retired");
+    assert!(owner_erasure_retirement(&db, &keys, OWNER)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(artifact_rows(&db, OTHER).await, other);
     assert_eq!(account(&db, OTHER_OWNER).await, other_account);
     assert_eq!(
@@ -595,18 +603,87 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
         Some(usage(&db, OTHER_OWNER).await)
     );
     assert_eq!(networks(&db, OTHER_OWNER).await, [1; 5]);
+    assert!(
+        owner_erasure_retirement(&db, &keys, OTHER_OWNER)
+            .await
+            .unwrap()
+            .is_none(),
+        "OTHER is live and was never purged"
+    );
 
-    // A retired owner keeps the networks while a live space remains; the
-    // last space takes the owner-keyed rows with it. The key-operation audit
-    // trail stays (RETAINED).
+    // A space purge no longer deletes encryption rows (TC-2871 S5, option
+    // A). A retired owner's gate stays shut while a live space remains; after
+    // the last purge it opens, and the owner-erasure step deletes every
+    // encryption row, the audit trail included, under the signed `erased`
+    // record that names this owner only.
     for space in [LATER, LAST] {
         exec(&db, "INSERT INTO space(id) VALUES($1)", vec![space.into()]).await;
     }
     retire(&db, &keys, OWNER).await;
     purge(&db, &keys, LATER).await;
     assert_eq!(networks(&db, OWNER).await, [1; 5], "LAST is still live");
+    assert!(owner_erasure_retirement(&db, &keys, OWNER)
+        .await
+        .unwrap()
+        .is_none());
     purge(&db, &keys, LAST).await;
-    assert_eq!(networks(&db, OWNER).await, [0, 0, 0, 0, 1]);
+    assert_eq!(networks(&db, OWNER).await, [1; 5], "purges keep owner rows");
+    let retirement = owner_erasure_retirement(&db, &keys, OWNER)
+        .await
+        .unwrap()
+        .expect("retired owner with every purge complete and no live space");
+    let owners = encryption_owners(&db).await.unwrap();
+    assert!(owners.contains(OWNER) && owners.contains(OTHER_OWNER));
+    let erased = keys
+        .sign(
+            &retirement.hmac_key_id,
+            "owner",
+            &retirement.owner_hmac,
+            &retirement.retirement_id,
+            "erased",
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .unwrap();
+    let (path, body) = (erased.object_key().unwrap(), erased.to_bytes().unwrap());
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, OTHER_OWNER, now)
+            .await
+            .is_err(),
+        "the record names OWNER, not OTHER_OWNER"
+    );
+    assert_eq!(owner_key_rows(&db, OWNER).await.unwrap(), 1);
+    assert_eq!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, OWNER, now)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(networks(&db, OWNER).await, [0; 5]);
+    assert_eq!(owner_key_rows(&db, OWNER).await.unwrap(), 0);
+    assert_eq!(
+        int(
+            &db,
+            "SELECT count(*) AS n FROM space_purge_ledger_copy WHERE object_key=$1",
+            vec![path.clone().into()]
+        )
+        .await,
+        1
+    );
+    // Idempotent, and a restored row is deleted again.
+    assert_eq!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, OWNER, now)
+            .await
+            .unwrap(),
+        0
+    );
+    network(&db, OWNER).await;
+    assert_eq!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, OWNER, now)
+            .await
+            .unwrap(),
+        5
+    );
     assert_eq!(networks(&db, OTHER_OWNER).await, [1; 5], "OTHER is live");
     let spaces = int(
         &db,

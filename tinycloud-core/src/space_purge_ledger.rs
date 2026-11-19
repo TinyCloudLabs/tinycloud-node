@@ -89,6 +89,27 @@ fn hex_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+/// Object key of the owner record in `state` under `key_id` for the hex
+/// owner digest: `retired` at `_purge-ledger/owners/<key_id>/<hmac>`, and
+/// `erased` at the sibling `_purge-ledger/owners-erased/<key_id>/<hmac>`
+/// (`owners/<key_id>/<hmac>` is a file in the filesystem store, so it cannot
+/// also hold a child).
+pub fn owner_object_key(
+    key_id: &str,
+    target_hmac: &str,
+    state: &str,
+) -> Result<String, LedgerError> {
+    let dir = match state {
+        "retired" => "owners",
+        "erased" => "owners-erased",
+        _ => return Err(LedgerError),
+    };
+    if !safe_key_id(key_id) || !hex_digest(target_hmac) {
+        return Err(LedgerError);
+    }
+    Ok(format!("_purge-ledger/{dir}/{key_id}/{target_hmac}"))
+}
+
 impl LedgerRecord {
     fn fields(&self) -> SignedFields<'_> {
         SignedFields {
@@ -133,22 +154,27 @@ impl LedgerRecord {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
             || uuid::Uuid::parse_str(&self.operation_id).is_err()
-            || !matches!(
+            || (!matches!(
                 (self.kind.as_str(), self.state.as_str()),
                 ("owner", "retired") | ("space" | "resource", "purging" | "complete")
-            )
+            ) && !self.owner_erased())
+            // An erasure record is plain version 1: no prefixes, no snapshots.
+            || (self.owner_erased() && self.version != 1)
         {
             return Err(LedgerError);
         }
         Ok(())
     }
+    /// `("owner","erased")` (TC-2871 S5, option A): the owner's encryption rows
+    /// are erased on this node. Signed exactly like a version-1 retirement,
+    /// with the retirement's operation id; see [`owner_object_key`].
+    fn owner_erased(&self) -> bool {
+        self.kind == "owner" && self.state == "erased"
+    }
     pub fn object_key(&self) -> Result<String, LedgerError> {
         self.validate()?;
         if self.kind == "owner" {
-            Ok(format!(
-                "_purge-ledger/owners/{}/{}",
-                self.key_id, self.target_hmac
-            ))
+            owner_object_key(&self.key_id, &self.target_hmac, &self.state)
         } else {
             Ok(format!(
                 "_purge-ledger/{}/{}/{}/{}",
@@ -405,6 +431,28 @@ impl LedgerKeys {
         acceptance.state = "complete".into();
         acceptance.timestamp = timestamp;
         self.authenticate(acceptance)
+    }
+    /// The `("owner","erased")` record of a verified retirement: same key id,
+    /// owner digest and operation id (the retirement id), version 1, and a
+    /// timestamp no earlier than the retirement's.
+    pub fn erasure_from_retirement(
+        &self,
+        retirement: &LedgerRecord,
+        timestamp: i64,
+    ) -> Result<LedgerRecord, LedgerError> {
+        self.verify(&retirement.object_key()?, &retirement.to_bytes()?)?;
+        if retirement.kind != "owner" || retirement.state != "retired" {
+            return Err(LedgerError);
+        }
+        let target = hex::decode(&retirement.target_hmac).map_err(|_| LedgerError)?;
+        self.sign(
+            &retirement.key_id,
+            "owner",
+            &target,
+            &retirement.operation_id,
+            "erased",
+            timestamp.max(retirement.timestamp),
+        )
     }
     pub fn prefix_hmac(
         &self,

@@ -127,3 +127,46 @@ async fn minio_ledger_is_append_only_on_its_own_locked_bucket() {
     );
     assert!(head.object_lock_retain_until_date().is_some());
 }
+
+// TC-2871 S5: the owner's `erased` record sits beside its `retired` record
+// on the locked ledger bucket; both are stored, listed and read back. The
+// key id is fresh per run because locked records cannot be cleaned up.
+#[tokio::test]
+async fn minio_owner_retired_and_erased_records_are_stored_side_by_side() {
+    use crate::storage::purge_ledger::{PurgeLedgerStore, S3PurgeLedger, S3PurgeLedgerConfig};
+    use tinycloud_core::space_purge_ledger::owner_object_key;
+    let Ok(endpoint) = std::env::var("TC735_TEST_MINIO_ENDPOINT") else {
+        return;
+    };
+    let Ok(bucket) = std::env::var("TC735_TEST_MINIO_LEDGER_BUCKET") else {
+        return;
+    };
+    let config = S3PurgeLedgerConfig {
+        bucket,
+        endpoint: Some(endpoint.parse().unwrap()),
+        region: None,
+        access_key_id: None,
+        secret_access_key: None,
+    };
+    let store = S3PurgeLedger::new(&config).await;
+    let key_id = format!("test-{}", uuid::Uuid::new_v4().simple());
+    let digest = "cd".repeat(32);
+    let retired = owner_object_key(&key_id, &digest, "retired").unwrap();
+    let erased = owner_object_key(&key_id, &digest, "erased").unwrap();
+    store
+        .append_purge_record(&retired, b"retired")
+        .await
+        .unwrap();
+    store.append_purge_record(&erased, b"erased").await.unwrap();
+    let store = S3PurgeLedger::new(&config).await;
+    let listed = store.list_purge_records().await.unwrap();
+    assert!(listed.contains(&retired) && listed.contains(&erased));
+    assert_eq!(
+        store.read_purge_record(&retired).await.unwrap().unwrap(),
+        b"retired"
+    );
+    assert_eq!(
+        store.read_purge_record(&erased).await.unwrap().unwrap(),
+        b"erased"
+    );
+}
