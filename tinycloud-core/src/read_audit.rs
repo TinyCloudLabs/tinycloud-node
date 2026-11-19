@@ -5,6 +5,16 @@
 //! then wait for this pipeline to commit their immutable invocation record
 //! before the response is acknowledged. Concurrent records are drained into
 //! one transaction. Mutations and audit batches share the same writer lock.
+//!
+//! A read's record is its invoker's `actor` row, its `invocation` row, which
+//! holds the signed request, and one `invoked_abilities` row per capability
+//! (TC-3259). Unlike a mutation's record it has no `parent_delegations` rows:
+//! the parents are inside the signed `serialization`, and not writing them
+//! stops reads from growing that table, which the permission check searches.
+//! The `invoked_abilities` rows stay because they are how a read is found by
+//! its space: the TC-2871 space purge seeds a space's invocations from them,
+//! and the legacy-artifact inventory attributes databases from them.
+//! Records written before TC-3259 keep their parent edges.
 
 use crate::{
     db_pool::{is_transient_error, transient_error_class, RecoveringConnection},
@@ -12,7 +22,7 @@ use crate::{
     events::Invocation,
     hash::Hash,
     models::{actor, invocation},
-    relationships::{invoked_abilities, parent_delegations},
+    relationships::invoked_abilities,
     request_telemetry::{self, Metrics, RequestContext, Snapshot},
     types::{Ability, Resource},
 };
@@ -34,6 +44,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 const CHANNEL_CAPACITY: usize = 1024;
 const MAX_BATCH_SIZE: usize = 64;
 
+/// What a read's audit stores: the signed request, who sent it, and the
+/// capabilities it cites. The parents it cites are in `serialization`; see the
+/// module docs for why they get no rows of their own.
 #[derive(Debug)]
 struct ReadAuditRecord {
     id: Hash,
@@ -42,7 +55,6 @@ struct ReadAuditRecord {
     serialization: Vec<u8>,
     serialization_format: i16,
     abilities: Vec<(Resource, Ability)>,
-    parents: Vec<Hash>,
 }
 
 impl ReadAuditRecord {
@@ -63,13 +75,6 @@ impl ReadAuditRecord {
                 .capabilities
                 .iter()
                 .map(|capability| (capability.resource.clone(), capability.ability.clone()))
-                .collect(),
-            parents: invocation
-                .0
-                .parents
-                .iter()
-                .copied()
-                .map(Hash::from)
                 .collect(),
         }
     }
@@ -640,9 +645,11 @@ async fn commit_batch(
 }
 
 async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result<(), DbErr> {
-    let inserts = audit_inserts(batch);
+    let Some(inserts) = audit_inserts(batch) else {
+        return Ok(());
+    };
     if conn.get_database_backend() == DbBackend::Postgres {
-        if let Some(statement) = inserts.as_ref().and_then(postgres_single_statement) {
+        if let Some(statement) = postgres_single_statement(&inserts) {
             // Every INSERT in the statement is `ON CONFLICT DO NOTHING` on
             // keys fixed by the batch, and the readers wait only for "the
             // rows exist", so running it again after a lost connection is a
@@ -651,84 +658,64 @@ async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result
         }
     }
     let tx = conn.begin().await?;
-    if let Some(inserts) = inserts {
-        persist_inserts(&tx, inserts).await?;
-    }
+    persist_inserts(&tx, inserts).await?;
     tx.commit().await
 }
 
 /// PostgreSQL commits the batch's INSERTs as one statement instead of
-/// `BEGIN`, one statement per table and `COMMIT` (6 sequential round-trips
-/// for a typical read). The INSERTs are exactly those `persist_inserts` runs,
-/// with the same rows and `ON CONFLICT DO NOTHING` targets, as data-modifying
-/// CTEs of the invocation INSERT. One statement is atomic on its own, and
-/// PostgreSQL checks the foreign keys between these tables (invocation to
-/// actor, invoked ability to invocation, parent edge to delegation) at the end
-/// of the statement, so rows inserted by a sibling CTE satisfy them.
-/// PostgreSQL does not define the order in which the CTEs run, so their rows
-/// may be locked in a different order than the old transaction's; only two
+/// `BEGIN`, one statement per table and `COMMIT`. The INSERTs are exactly
+/// those `persist_inserts` runs, with the same rows and `ON CONFLICT DO
+/// NOTHING` targets, as data-modifying CTEs of the invocation INSERT. One
+/// statement is atomic on its own, and PostgreSQL checks the foreign keys
+/// between these tables (invocation to actor, invoked ability to invocation)
+/// at the end of the statement, so rows inserted by a sibling CTE satisfy
+/// them. PostgreSQL does not define the order in which the CTEs run, so their
+/// rows may be locked in a different order than the transaction's; only two
 /// writers of the same invocation id could notice, and the invocation replay
 /// guard admits an invocation once.
 ///
 /// `None` when the combined statement would bind more than the 65,535
-/// parameters PostgreSQL's protocol allows (each per-table statement had that
-/// limit on its own); `persist_batch` then takes the transactional path.
+/// parameters PostgreSQL's protocol allows (a read can cite any number of
+/// capabilities); `persist_batch` then takes the transactional path.
 fn postgres_single_statement(inserts: &AuditInserts) -> Option<Statement> {
     let mut ctes = WithClause::new();
-    let mut any_cte = false;
-    for (name, insert) in [
-        (
-            "read_audit_actor",
-            inserts.actors.as_ref().map(|i| i.as_query().clone()),
-        ),
-        (
-            "read_audit_invoked_abilities",
-            inserts.abilities.as_ref().map(|i| i.as_query().clone()),
-        ),
-        (
-            "read_audit_parent_delegation",
-            inserts.parents.as_ref().map(|i| i.as_query().clone()),
-        ),
-    ] {
-        if let Some(insert) = insert {
-            ctes.cte(
-                CommonTableExpression::new()
-                    .table_name(Alias::new(name))
-                    .query(insert)
-                    .to_owned(),
-            );
-            any_cte = true;
-        }
+    ctes.cte(
+        CommonTableExpression::new()
+            .table_name(Alias::new("read_audit_actor"))
+            .query(inserts.actors.as_query().clone())
+            .to_owned(),
+    );
+    if let Some(abilities) = &inserts.abilities {
+        ctes.cte(
+            CommonTableExpression::new()
+                .table_name(Alias::new("read_audit_invoked_abilities"))
+                .query(abilities.as_query().clone())
+                .to_owned(),
+        );
     }
     let mut statement = inserts.invocations.as_query().clone();
-    if any_cte {
-        statement.with_cte(ctes);
-    }
+    statement.with_cte(ctes);
     let statement = DbBackend::Postgres.build(&statement);
     let parameters = statement.values.as_ref().map_or(0, |values| values.0.len());
     (parameters <= usize::from(u16::MAX)).then_some(statement)
 }
 
-/// The INSERTs that persist one drained batch: at most one `insert_many` per
-/// table, instead of the previous ~4 statements per record.
+/// The INSERTs that persist one drained batch: one `insert_many` per table.
 ///
 /// Every VALUES list is deduplicated by its `ON CONFLICT` target before it is
 /// sent. This is mandatory once rows are batched: some backends (notably
 /// Postgres) reject a single `INSERT ... ON CONFLICT` whose VALUES contain the
 /// same conflict key twice, and a saturated batch can legitimately carry a
 /// repeated invoker (many reads by one principal) or even a repeated
-/// invocation (identical concurrent reads share a content hash). The old
-/// per-record path never hit this because each row was its own statement.
+/// invocation (identical concurrent reads share a content hash).
 ///
-/// Everything that the per-record path guaranteed is preserved: the same
-/// `ON CONFLICT DO NOTHING` targets, the already-encrypted `serialization`
-/// bytes carried verbatim from each record, and — because inserts stay
-/// conflict-idempotent — identical final table contents and no-op re-persists.
+/// The inserts stay conflict-idempotent, carry each record's
+/// already-encrypted `serialization` bytes verbatim, and re-persisting a
+/// batch is a no-op.
 struct AuditInserts {
-    actors: Option<Insert<actor::ActiveModel>>,
+    actors: Insert<actor::ActiveModel>,
     invocations: Insert<invocation::ActiveModel>,
     abilities: Option<Insert<invoked_abilities::ActiveModel>>,
-    parents: Option<Insert<parent_delegations::ActiveModel>>,
 }
 
 /// `None` for a batch with no records.
@@ -756,13 +743,11 @@ fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
             id: Set(record.invoker.clone()),
         })
         .collect();
-    let actors = (!actors.is_empty()).then(|| {
-        actor::Entity::insert_many(actors).on_conflict(
-            OnConflict::column(actor::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-    });
+    let actors = actor::Entity::insert_many(actors).on_conflict(
+        OnConflict::column(actor::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    );
 
     // 2. Invocations — one row per distinct invocation (records already deduped).
     let invocations: Vec<invocation::ActiveModel> = records
@@ -817,37 +802,10 @@ fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
         )
     });
 
-    // 4. Parent delegations — every (parent, child) across the batch,
-    //    deduplicated by the full primary key.
-    let mut seen_parents = HashSet::new();
-    let parents: Vec<parent_delegations::ActiveModel> = records
-        .iter()
-        .flat_map(|record| {
-            let child = record.id;
-            record.parents.iter().map(move |parent| (*parent, child))
-        })
-        .filter(|(parent, child)| seen_parents.insert((*parent, *child)))
-        .map(|(parent, child)| parent_delegations::ActiveModel {
-            parent: Set(parent),
-            child: Set(child),
-        })
-        .collect();
-    let parents = (!parents.is_empty()).then(|| {
-        parent_delegations::Entity::insert_many(parents).on_conflict(
-            OnConflict::columns([
-                parent_delegations::Column::Parent,
-                parent_delegations::Column::Child,
-            ])
-            .do_nothing()
-            .to_owned(),
-        )
-    });
-
     Some(AuditInserts {
         actors,
         invocations,
         abilities,
-        parents,
     })
 }
 
@@ -858,17 +816,11 @@ async fn persist_inserts<C: ConnectionTrait>(db: &C, inserts: AuditInserts) -> R
         actors,
         invocations,
         abilities,
-        parents,
     } = inserts;
-    if let Some(actors) = actors {
-        ignore_record_not_inserted(actors.exec(db).await)?;
-    }
+    ignore_record_not_inserted(actors.exec(db).await)?;
     ignore_record_not_inserted(invocations.exec(db).await)?;
     if let Some(abilities) = abilities {
         ignore_record_not_inserted(abilities.exec(db).await)?;
-    }
-    if let Some(parents) = parents {
-        ignore_record_not_inserted(parents.exec(db).await)?;
     }
     Ok(())
 }
@@ -883,7 +835,10 @@ fn ignore_record_not_inserted<T>(result: Result<T, DbErr>) -> Result<(), DbErr> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::Migrator;
+    use crate::{
+        migrations::Migrator,
+        relationships::{invoked_abilities, parent_delegations},
+    };
     use sea_orm::{ConnectOptions, Database, DatabaseConnection, PaginatorTrait};
     use sea_orm_migration::MigratorTrait;
 
@@ -895,7 +850,6 @@ mod tests {
             serialization: format!("serialized-{index}").into_bytes(),
             serialization_format: 0,
             abilities: Vec::new(),
-            parents: Vec::new(),
         }
     }
 
@@ -1064,20 +1018,18 @@ mod tests {
         uri.to_string().try_into().expect("valid ability")
     }
 
-    fn rich_record(
-        seed: &str,
-        invoker: &str,
-        abilities: Vec<(Resource, Ability)>,
-        parents: Vec<Hash>,
-    ) -> ReadAuditRecord {
+    /// A read citing one capability on a resource named after `seed`.
+    fn rich_record(seed: &str, invoker: &str) -> ReadAuditRecord {
         ReadAuditRecord {
             id: crate::hash::hash(seed.as_bytes()),
             invoker: invoker.to_string(),
             issued_at: OffsetDateTime::now_utc(),
             serialization: format!("serialized-{seed}").into_bytes(),
             serialization_format: 0,
-            abilities,
-            parents,
+            abilities: vec![(
+                resource(&format!("tinycloud:did:key:read-audit:files/kv/{seed}")),
+                ability("tinycloud.kv/get"),
+            )],
         }
     }
 
@@ -1250,36 +1202,27 @@ mod tests {
         })
     }
 
+    /// `invoked_abilities` and `parent_delegations` rows, in that order.
+    async fn derived_rows(conn: &DatabaseConnection) -> (u64, u64) {
+        (
+            invoked_abilities::Entity::find().count(conn).await.unwrap(),
+            parent_delegations::Entity::find()
+                .count(conn)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A batch leaves one actor per invoker, one invocation per read with its
+    /// serialization verbatim, one invoked ability per capability and no
+    /// parent edges (TC-3259). Persisting it again is a no-op.
     async fn assert_batched_persist_contents(conn: &DatabaseConnection, persist: Persist) {
         let conn = conn.clone();
 
-        let parent_one = crate::hash::hash(b"parent-one");
-        let parent_two = crate::hash::hash(b"parent-two");
-        insert_parent_delegation(&conn, parent_one).await;
-        insert_parent_delegation(&conn, parent_two).await;
-
-        let res_a = resource("tinycloud:did:key:ne-delegator:files/kv/a");
-        let res_b = resource("tinycloud:did:key:ne-delegator:files/kv/b");
-        let get = ability("tinycloud.kv/get");
-        let put = ability("tinycloud.kv/put");
-        let read = ability("tinycloud.capabilities/read");
-
-        // alice1: multiple abilities on one resource, two parents.
-        let alice1 = rich_record(
-            "alice-1",
-            "did:key:alice",
-            vec![(res_a.clone(), get.clone()), (res_a.clone(), put.clone())],
-            vec![parent_one, parent_two],
-        );
-        // alice2: DUPLICATE actor (did:key:alice), one ability, shares parent_one.
-        let alice2 = rich_record(
-            "alice-2",
-            "did:key:alice",
-            vec![(res_b.clone(), read.clone())],
-            vec![parent_one],
-        );
-        // bob: distinct actor, no abilities, no parents.
-        let bob = rich_record("bob-1", "did:key:bob", vec![], vec![]);
+        // Two reads by one invoker, one by another.
+        let alice1 = rich_record("alice-1", "did:key:alice");
+        let alice2 = rich_record("alice-2", "did:key:alice");
+        let bob = rich_record("bob-1", "did:key:bob");
 
         let alice1_id = alice1.id;
         let alice2_id = alice2.id;
@@ -1313,63 +1256,37 @@ mod tests {
         assert_eq!(by_id[&alice2_id].invoker, "did:key:alice");
         assert_eq!(by_id[&bob_id].invoker, "did:key:bob");
 
-        // Invoked abilities: exact (invocation, resource, ability) set.
-        let ability_rows: HashSet<(Hash, String, String)> = invoked_abilities::Entity::find()
+        // Read audits write their invoked abilities and no parent edges.
+        let abilities: HashSet<(Hash, String)> = invoked_abilities::Entity::find()
             .all(&conn)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| {
+            .map(|row| (row.invocation, row.resource.to_string()))
+            .collect();
+        assert_eq!(
+            abilities,
+            HashSet::from([
                 (
-                    row.invocation,
-                    row.resource.to_string(),
-                    row.ability.to_string(),
-                )
-            })
-            .collect();
-        let expected_abilities: HashSet<(Hash, String, String)> = [
-            (alice1_id, res_a.to_string(), get.to_string()),
-            (alice1_id, res_a.to_string(), put.to_string()),
-            (alice2_id, res_b.to_string(), read.to_string()),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(ability_rows, expected_abilities);
-
-        // Parent delegations: exact (parent, child) set.
-        let parent_rows: HashSet<(Hash, Hash)> = parent_delegations::Entity::find()
-            .all(&conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.parent, row.child))
-            .collect();
-        let expected_parents: HashSet<(Hash, Hash)> = [
-            (parent_one, alice1_id),
-            (parent_two, alice1_id),
-            (parent_one, alice2_id),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(parent_rows, expected_parents);
+                    alice1_id,
+                    "tinycloud:did:key:read-audit:files/kv/alice-1".to_string()
+                ),
+                (
+                    alice2_id,
+                    "tinycloud:did:key:read-audit:files/kv/alice-2".to_string()
+                ),
+                (
+                    bob_id,
+                    "tinycloud:did:key:read-audit:files/kv/bob-1".to_string()
+                ),
+            ])
+        );
+        assert_eq!(derived_rows(&conn).await, (3, 0));
 
         // Re-persisting the identical batch is a no-op (ON CONFLICT DO NOTHING).
         persist(&conn, &batch).await.unwrap();
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 3);
-        assert_eq!(
-            invoked_abilities::Entity::find()
-                .count(&conn)
-                .await
-                .unwrap(),
-            3
-        );
-        assert_eq!(
-            parent_delegations::Entity::find()
-                .count(&conn)
-                .await
-                .unwrap(),
-            3
-        );
+        assert_eq!(derived_rows(&conn).await, (3, 0));
     }
 
     async fn audit_rows(
@@ -1443,9 +1360,8 @@ mod tests {
         let Some(single) = PostgresTestSchema::new(TEST).await else {
             return;
         };
-        // The new actors in this batch exercise invocation -> actor, and its
-        // parents invoked_abilities -> invocation and parent -> delegation,
-        // all within one statement.
+        // The new actors in this batch exercise invocation -> actor within
+        // one statement.
         assert_batched_persist_contents(&transactional.conn, persist_in_transaction).await;
         assert_batched_persist_contents(&single.conn, persist_batch_boxed).await;
         assert_eq!(
@@ -1455,24 +1371,15 @@ mod tests {
 
         // One statement per batch on PostgreSQL; the transactional path ran
         // one per table (plus BEGIN and COMMIT on the wire).
-        let parent = crate::hash::hash(b"parent-one");
         let batch = || {
             vec![
-                command(rich_record(
-                    "count-1",
-                    "did:key:count",
-                    vec![(
-                        resource("tinycloud:did:key:ne-delegator:files/kv/count"),
-                        ability("tinycloud.kv/get"),
-                    )],
-                    vec![parent],
-                )),
-                command(rich_record("count-2", "did:key:count", vec![], vec![])),
+                command(rich_record("count-1", "did:key:count")),
+                command(rich_record("count-2", "did:key:count")),
             ]
         };
         for (conn, persist, expected) in [
             (&single.conn, persist_batch_boxed as Persist, 1),
-            (&transactional.conn, persist_in_transaction as Persist, 4),
+            (&transactional.conn, persist_in_transaction as Persist, 3),
         ] {
             let statements = Arc::new(AtomicUsize::new(0));
             let counter = statements.clone();
@@ -1488,24 +1395,22 @@ mod tests {
             audit_rows(&transactional.conn).await
         );
 
-        // A record citing a delegation that does not exist violates the parent
-        // edge's foreign key: the whole batch fails, including its new actor
-        // and the other record's rows.
+        // A record the schema rejects fails after the record before it went
+        // in: the whole batch fails, including its new actor and the other
+        // record's rows.
+        let rejected = rich_record("doomed-bad", "did:key:doomed");
         let doomed = vec![
-            command(rich_record("doomed-ok", "did:key:doomed", vec![], vec![])),
-            command(rich_record(
-                "doomed-bad",
-                "did:key:doomed",
-                vec![],
-                vec![crate::hash::hash(b"no-such-delegation")],
-            )),
+            command(rich_record("doomed-ok", "did:key:doomed")),
+            command(rich_record("doomed-bad", "did:key:doomed")),
         ];
         for (conn, persist) in [
             (&single.conn, persist_batch_boxed as Persist),
             (&transactional.conn, persist_in_transaction as Persist),
         ] {
+            reject_serialization(conn, &rejected).await;
             let before = audit_rows(conn).await;
-            assert!(persist(conn, &doomed).await.is_err());
+            let error = persist(conn, &doomed).await.expect_err("the batch fails");
+            assert!(error.to_string().contains("check constraint"), "{error}");
             assert_eq!(audit_rows(conn).await, before);
         }
 
@@ -1540,39 +1445,27 @@ mod tests {
 
     #[test]
     fn single_statement_audit_falls_back_past_the_parameter_limit() {
-        let single_statement = |batch: &[Command]| {
-            postgres_single_statement(&audit_inserts(batch).expect("a non-empty batch"))
+        let single_statement = |seed: &str, abilities: usize| {
+            let get = ability("tinycloud.kv/get");
+            let record = ReadAuditRecord {
+                abilities: (0..abilities)
+                    .map(|index| {
+                        (
+                            resource(&format!("tinycloud:did:key:read-audit:files/kv/{index}")),
+                            get.clone(),
+                        )
+                    })
+                    .collect(),
+                ..rich_record(seed, "did:key:limit")
+            };
+            postgres_single_statement(&audit_inserts(&[command(record)]).unwrap())
         };
-
-        let get = ability("tinycloud.kv/get");
 
         // 7 parameters for the actor and invocation, 3 per invoked ability:
         // past 65,535 the batch takes the transactional path instead.
         let fits = (65_535 - 7) / 3;
-        let abilities = |count: usize| {
-            (0..count)
-                .map(|index| {
-                    (
-                        resource(&format!("tinycloud:did:key:ne-delegator:files/kv/{index}")),
-                        get.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let at_limit = vec![command(rich_record(
-            "at-limit",
-            "did:key:limit",
-            abilities(fits),
-            vec![],
-        ))];
-        assert!(single_statement(&at_limit).is_some());
-        let past_limit = vec![command(rich_record(
-            "past-limit",
-            "did:key:limit",
-            abilities(fits + 1),
-            vec![],
-        ))];
-        assert!(single_statement(&past_limit).is_none());
+        assert!(single_statement("at-limit", fits).is_some());
+        assert!(single_statement("past-limit", fits + 1).is_none());
     }
 
     // PostgreSQL regressions for the read-audit pipeline as a whole (TC-951):
@@ -1598,8 +1491,8 @@ mod tests {
     }
 
     /// The rows `reads` must leave, derived from the records alone: every
-    /// invoker, one invocation per id, and every capability and parent edge
-    /// of every read.
+    /// invoker, one invocation per id, one invoked ability per capability and
+    /// no parent edges (TC-3259).
     fn expected_rows(reads: &[ReadAuditRecord]) -> RowSets {
         let mut rows = RowSets::default();
         for read in reads {
@@ -1609,9 +1502,6 @@ mod tests {
             for (resource, ability) in &read.abilities {
                 rows.2
                     .insert((read.id, resource.to_string(), ability.to_string()));
-            }
-            for parent in &read.parents {
-                rows.3.insert((*parent, read.id));
             }
         }
         rows
@@ -1780,7 +1670,7 @@ mod tests {
     }
 
     fn gate_read(name: &str) -> ReadAuditRecord {
-        rich_record(name, &format!("did:key:{name}"), vec![], vec![])
+        rich_record(name, &format!("did:key:{name}"))
     }
 
     async fn stall(
@@ -1824,37 +1714,11 @@ mod tests {
         receipts
     }
 
-    /// One read of the overlap workload: 7 invokers, 4 parent delegations,
-    /// 3 resources shared by every read, a capability listed twice, a parent
-    /// cited twice, and reads with no capability or parent.
-    fn overlapping_read(key: usize, parents: &[Hash]) -> ReadAuditRecord {
-        let resources = ["a", "b", "c"]
-            .map(|name| resource(&format!("tinycloud:did:key:ne-delegator:files/kv/{name}")));
-        let get = ability("tinycloud.kv/get");
-        let put = ability("tinycloud.kv/put");
-        let mut abilities = Vec::new();
-        let mut cited = Vec::new();
-        if !key.is_multiple_of(13) {
-            abilities.push((resources[key % 3].clone(), get.clone()));
-            cited.push(parents[key % 4]);
-        }
-        if key.is_multiple_of(2) {
-            abilities.push((resources[(key + 1) % 3].clone(), put));
-        }
-        if key.is_multiple_of(4) {
-            abilities.push((resources[key % 3].clone(), get));
-        }
-        if key.is_multiple_of(3) {
-            cited.push(parents[(key + 1) % 4]);
-        }
-        if key.is_multiple_of(11) {
-            cited.push(parents[key % 4]);
-        }
+    /// One read of the overlap workload, by one of 7 invokers.
+    fn overlapping_read(key: usize) -> ReadAuditRecord {
         rich_record(
             &format!("overlap-{key}"),
             &format!("did:key:reader-{}", key % 7),
-            abilities,
-            cited,
         )
     }
 
@@ -1874,9 +1738,9 @@ mod tests {
     /// rows the transactional path commits for the same batches (run in a
     /// second, isolated schema), and every waiting read gets Ok. 200 reads
     /// queue behind a stalled batch, so they commit as exactly 64 + 64 + 64 +
-    /// 8 with repeated invokers, parents and invocations inside each batch and
-    /// across batches; then 100 more run free, half of them repeating
-    /// committed reads.
+    /// 8 with repeated invokers and invocations inside each batch and across
+    /// batches; then 100 more run free, half of them repeating committed
+    /// reads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_read_audit_pipeline_commits_every_overlapping_read_like_the_transaction() {
         use crate::test_support::PostgresTestSchema;
@@ -1890,17 +1754,9 @@ mod tests {
         let Some(transactional) = PostgresTestSchema::new(TEST).await else {
             return;
         };
-        let parents: Vec<Hash> = (0..4)
-            .map(|index| crate::hash::hash(format!("overlap-parent-{index}").as_bytes()))
-            .collect();
-        for conn in [&pipelined.conn, &transactional.conn] {
-            for parent in &parents {
-                insert_parent_delegation(conn, *parent).await;
-            }
-        }
         let reads = |indexes: std::ops::Range<usize>| {
             indexes
-                .map(|index| overlapping_read(overlap_key(index), &parents))
+                .map(|index| overlapping_read(overlap_key(index)))
                 .collect::<Vec<_>>()
         };
 
@@ -1965,9 +1821,9 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum Failure {
-        /// A read cites a delegation that does not exist: the parent edge's
-        /// foreign key fails once the batch's INSERTs have run.
-        MissingParent,
+        /// A read in the middle of the batch fails a check constraint (see
+        /// `reject_serialization`) once the reads before it went in.
+        Rejected,
         /// The writer's backend is terminated while its INSERT of the
         /// batch's last invocation waits on another transaction's
         /// uncommitted row, after the earlier invocations went in.
@@ -1977,7 +1833,7 @@ mod tests {
     impl Failure {
         fn name(self) -> &'static str {
             match self {
-                Failure::MissingParent => "missing-parent",
+                Failure::Rejected => "rejected",
                 Failure::Terminated => "terminated",
             }
         }
@@ -1985,7 +1841,7 @@ mod tests {
         /// Text of the error every waiter must receive.
         fn error(self) -> &'static str {
             match self {
-                Failure::MissingParent => "foreign key constraint",
+                Failure::Rejected => "check constraint",
                 Failure::Terminated => "terminating connection",
             }
         }
@@ -1994,7 +1850,7 @@ mod tests {
         /// connection is a retryable failure, a constraint is not.
         fn waiter_error(self) -> &'static str {
             match self {
-                Failure::MissingParent => "foreign key constraint",
+                Failure::Rejected => "check constraint",
                 Failure::Terminated => "unavailable_retryable",
             }
         }
@@ -2004,217 +1860,169 @@ mod tests {
         }
     }
 
-    const COMMITTED_READ: &str = "already-committed";
-
-    fn committed_read(parent: Hash) -> ReadAuditRecord {
-        rich_record(
-            COMMITTED_READ,
-            "did:key:already-committed",
-            vec![(
-                resource("tinycloud:did:key:ne-delegator:files/kv/doomed"),
-                ability("tinycloud.kv/get"),
-            )],
-            vec![parent],
-        )
+    /// The read `Failure::Rejected` fails a batch with.
+    fn rejected_read() -> ReadAuditRecord {
+        rich_record("rejected-doomed", "did:key:rejected-doomed")
     }
 
-    /// Reads that commit on their own: new invokers, capabilities and parent
-    /// edges, a read repeated within the batch, and a repeat of
-    /// `committed_read`.
-    fn valid_reads(failure: Failure, parent: Hash) -> Vec<ReadAuditRecord> {
+    /// A test-only check constraint on `conn`'s schema that rejects an
+    /// invocation row with `record`'s serialization.
+    async fn reject_serialization(conn: &DatabaseConnection, record: &ReadAuditRecord) {
+        let bytes: String = record
+            .serialization
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "ALTER TABLE invocation ADD CONSTRAINT read_audit_test_reject \
+                 CHECK (serialization <> '\\x{bytes}'::bytea)"
+            ),
+        ))
+        .await
+        .unwrap();
+    }
+
+    const COMMITTED_READ: &str = "already-committed";
+
+    fn committed_read() -> ReadAuditRecord {
+        rich_record(COMMITTED_READ, "did:key:already-committed")
+    }
+
+    /// Reads that commit on their own: new invokers, a read repeated within
+    /// the batch, and a repeat of `committed_read`.
+    fn valid_reads(failure: Failure) -> Vec<ReadAuditRecord> {
         let name = failure.name();
-        let read = |seed: &str, invoker: &str, parents: Vec<Hash>| {
+        let read = |seed: &str, invoker: &str| {
             rich_record(
                 &format!("{name}-{seed}"),
                 &format!("did:key:{name}-{invoker}"),
-                vec![(
-                    resource("tinycloud:did:key:ne-delegator:files/kv/doomed"),
-                    ability("tinycloud.kv/get"),
-                )],
-                parents,
             )
         };
         vec![
-            read("a", "first", vec![parent]),
-            committed_read(parent),
-            read("b", "second", vec![]),
-            read("a", "first", vec![parent]),
+            read("a", "first"),
+            committed_read(),
+            read("b", "second"),
+            read("a", "first"),
         ]
     }
 
     /// `valid_reads` plus the read that makes the batch fail as `failure`
-    /// says: in the middle for `MissingParent`, last for `Terminated` (it is
-    /// `held_invocation`, whose row the test holds). With `oversized`, one
-    /// more read before the last has so many capabilities that the batch
-    /// exceeds the single statement's parameter limit (while each per-table
-    /// INSERT stays within it), so it takes the transactional path.
-    fn doomed_reads(failure: Failure, parent: Hash, oversized: bool) -> Vec<ReadAuditRecord> {
+    /// says: in the middle for `Rejected`, last for `Terminated` (it is
+    /// `held_invocation`, whose row the test holds).
+    fn doomed_reads(failure: Failure) -> Vec<ReadAuditRecord> {
         let name = failure.name();
-        let mut reads = valid_reads(failure, parent);
+        let mut reads = valid_reads(failure);
         match failure {
-            Failure::MissingParent => reads.insert(
-                2,
-                rich_record(
-                    &format!("{name}-orphan"),
-                    &format!("did:key:{name}-orphan"),
-                    vec![],
-                    vec![crate::hash::hash(b"no-such-delegation")],
-                ),
-            ),
+            Failure::Rejected => reads.insert(2, rejected_read()),
             Failure::Terminated => reads.push(ReadAuditRecord {
                 id: failure.held_invocation(),
-                ..rich_record(
-                    "held",
-                    &format!("did:key:{name}-second"),
-                    vec![(
-                        resource("tinycloud:did:key:ne-delegator:files/kv/held"),
-                        ability("tinycloud.kv/get"),
-                    )],
-                    vec![parent],
-                )
+                ..rich_record("held", &format!("did:key:{name}-second"))
             }),
         }
-        if oversized {
-            let ability_rows = expected_rows(&reads).2.len();
-            let capabilities = (ability_rows..21_840)
-                .map(|index| {
-                    (
-                        resource(&format!(
-                            "tinycloud:did:key:ne-delegator:files/kv/oversized/{index}"
-                        )),
-                        ability("tinycloud.kv/get"),
-                    )
-                })
-                .collect();
-            let last = reads.len() - 1;
-            reads.insert(
-                last,
-                rich_record(
-                    &format!("{name}-oversized"),
-                    &format!("did:key:{name}-oversized"),
-                    capabilities,
-                    vec![],
-                ),
-            );
-        }
-        let batch = commands(reads);
-        assert_eq!(
-            postgres_single_statement(&audit_inserts(&batch).unwrap()).is_some(),
-            !oversized,
-            "the batch takes the intended path"
-        );
-        batch.into_iter().map(|command| command.record).collect()
+        reads
     }
 
     /// A batch that fails part-way commits none of its rows on PostgreSQL,
-    /// and every read waiting on it gets the error, on the single statement
-    /// and on the transactional path (a batch past the parameter limit). The
-    /// batch carries new invokers, capabilities and parent edges, a read
-    /// repeated within it and one already committed. It fails either by a
-    /// foreign key or by the writer's backend being terminated while it
-    /// waits on a row lock after inserting earlier invocations. The next
-    /// batch commits, on a fresh connection after the termination. Both
-    /// paths end with identical rows. The single statement is retried once
-    /// after a termination (TC-951), so it fails only when the retry's
-    /// backend is terminated too.
+    /// and every read waiting on it gets the error. The batch carries new
+    /// invokers, a read repeated within it and one already committed. It
+    /// fails either by a check constraint or by the writer's backend being
+    /// terminated while it waits on a row lock after inserting earlier
+    /// invocations. The next batch commits, on a fresh connection after the
+    /// termination. The single statement is retried once after a
+    /// termination (TC-951), so it fails only when the retry's backend is
+    /// terminated too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_read_audit_failed_batch_commits_nothing_and_fails_every_waiter() {
         use crate::test_support::PostgresTestSchema;
 
         const TEST: &str =
             "postgres_read_audit_failed_batch_commits_nothing_and_fails_every_waiter";
-        let mut final_rows = Vec::new();
-        for oversized in [false, true] {
-            let Some(fixture) = PostgresTestSchema::new(TEST).await else {
-                return;
+        let Some(fixture) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let conn = &fixture.conn;
+        reject_serialization(conn, &rejected_read()).await;
+        persist_in_transaction(conn, &[command(committed_read())])
+            .await
+            .unwrap();
+        let pipeline = ReadAuditPipeline::start(schema_pool(TEST, conn, 4).await, None);
+        pipeline.set_wait(COMMIT_TEST_WAIT);
+        let locks = schema_pool(TEST, conn, 2).await;
+
+        for failure in [Failure::Terminated, Failure::Rejected] {
+            let gate = format!("gate-{}", failure.name());
+            let before = union(
+                audit_row_sets(conn).await,
+                expected_rows(&[gate_read(&gate)]),
+            );
+            let stats = pipeline.stats();
+
+            let stalled = stall(&pipeline, &locks, conn, &gate).await;
+            let held = match failure {
+                Failure::Terminated => Some(
+                    row_lock(
+                        &locks,
+                        "did:key:lock-holder",
+                        Some(failure.held_invocation()),
+                    )
+                    .await,
+                ),
+                Failure::Rejected => None,
             };
-            let conn = &fixture.conn;
-            let parent = crate::hash::hash(b"doomed-parent");
-            insert_parent_delegation(conn, parent).await;
-            persist_in_transaction(conn, &[command(committed_read(parent))])
-                .await
-                .unwrap();
-            let pipeline = ReadAuditPipeline::start(schema_pool(TEST, conn, 4).await, None);
-            pipeline.set_wait(COMMIT_TEST_WAIT);
-            let locks = schema_pool(TEST, conn, 2).await;
-
-            for failure in [Failure::Terminated, Failure::MissingParent] {
-                let gate = format!("gate-{}", failure.name());
-                let before = union(
-                    audit_row_sets(conn).await,
-                    expected_rows(&[gate_read(&gate)]),
-                );
-                let stats = pipeline.stats();
-
-                let stalled = stall(&pipeline, &locks, conn, &gate).await;
-                let held = match failure {
-                    Failure::Terminated => Some(
-                        row_lock(
-                            &locks,
-                            "did:key:lock-holder",
-                            Some(failure.held_invocation()),
-                        )
-                        .await,
-                    ),
-                    Failure::MissingParent => None,
-                };
-                let reads = doomed_reads(failure, parent, oversized);
-                let waiters = reads.len();
-                let receipts = enqueue_in_order(&pipeline, reads).await;
-                stalled.release().await;
-                if let Some(held) = &held {
-                    let writer = backend_blocked_by(conn, held.pid).await;
-                    terminate_backend(conn, writer).await;
-                    if !oversized {
-                        terminate_retry(conn, held.pid, writer).await;
-                    }
-                }
-                let mut failed = 0;
-                for receipt in receipts {
-                    let error = receipt
-                        .await
-                        .unwrap()
-                        .expect_err("a read of a failed batch is not acknowledged");
-                    assert!(
-                        error.to_string().contains(failure.waiter_error()),
-                        "{failure:?}: {error}"
-                    );
-                    failed += 1;
-                }
-                assert_eq!(failed, waiters);
-                if let Some(held) = held {
-                    held.tx.rollback().await.unwrap();
-                }
-                assert_eq!(audit_row_sets(conn).await, before, "{failure:?}");
-                assert_eq!(pipeline.stats(), (stats.0 + 1, stats.1 + 1));
-
-                // The next batch commits: the same reads without the one
-                // that failed them.
-                let receipts = valid_reads(failure, parent)
-                    .into_iter()
-                    .map(|read| {
-                        let pipeline = pipeline.clone();
-                        tokio::spawn(async move { pipeline.enqueue(read).await })
-                    })
-                    .collect::<Vec<_>>();
-                for receipt in receipts {
-                    receipt.await.unwrap().unwrap();
-                }
-                assert_eq!(
-                    audit_row_sets(conn).await,
-                    union(before, expected_rows(&valid_reads(failure, parent))),
-                    "{failure:?}"
-                );
+            let reads = doomed_reads(failure);
+            let waiters = reads.len();
+            let receipts = enqueue_in_order(&pipeline, reads).await;
+            stalled.release().await;
+            if let Some(held) = &held {
+                let writer = backend_blocked_by(conn, held.pid).await;
+                terminate_backend(conn, writer).await;
+                terminate_retry(conn, held.pid, writer).await;
             }
-            final_rows.push(audit_rows(conn).await);
+            let mut failed = 0;
+            for receipt in receipts {
+                let error = receipt
+                    .await
+                    .unwrap()
+                    .expect_err("a read of a failed batch is not acknowledged");
+                assert!(
+                    error.to_string().contains(failure.waiter_error()),
+                    "{failure:?}: {error}"
+                );
+                failed += 1;
+            }
+            assert_eq!(failed, waiters);
+            if let Some(held) = held {
+                held.tx.rollback().await.unwrap();
+            }
+            assert_eq!(audit_row_sets(conn).await, before, "{failure:?}");
+            assert_eq!(pipeline.stats(), (stats.0 + 1, stats.1 + 1));
+
+            // The next batch commits: the same reads without the one that
+            // failed them.
+            let receipts = valid_reads(failure)
+                .into_iter()
+                .map(|read| {
+                    let pipeline = pipeline.clone();
+                    tokio::spawn(async move { pipeline.enqueue(read).await })
+                })
+                .collect::<Vec<_>>();
+            for receipt in receipts {
+                receipt.await.unwrap().unwrap();
+            }
+            assert_eq!(
+                audit_row_sets(conn).await,
+                union(before, expected_rows(&valid_reads(failure))),
+                "{failure:?}"
+            );
         }
-        assert_eq!(final_rows[0], final_rows[1]);
     }
 
     /// The same failing batch through `persist_batch` (one statement) and
     /// through the transaction it replaced, each in its own schema: both
     /// return the same error and leave the same rows as before, whether a
-    /// foreign key fails or the backend is terminated mid-write.
+    /// check constraint fails or the backend is terminated mid-write.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_read_audit_failed_batch_fails_alike_on_both_paths() {
         use crate::test_support::PostgresTestSchema;
@@ -2229,16 +2037,15 @@ mod tests {
                 return;
             };
             let conn = &fixture.conn;
-            let parent = crate::hash::hash(b"doomed-parent");
-            insert_parent_delegation(conn, parent).await;
-            persist_in_transaction(conn, &[command(committed_read(parent))])
+            reject_serialization(conn, &rejected_read()).await;
+            persist_in_transaction(conn, &[command(committed_read())])
                 .await
                 .unwrap();
             let writer = schema_pool(TEST, conn, 1).await;
             let locks = schema_pool(TEST, conn, 1).await;
 
             let mut outcome = Vec::new();
-            for failure in [Failure::MissingParent, Failure::Terminated] {
+            for failure in [Failure::Rejected, Failure::Terminated] {
                 let before = audit_rows(conn).await;
                 let held = match failure {
                     Failure::Terminated => Some(
@@ -2249,9 +2056,9 @@ mod tests {
                         )
                         .await,
                     ),
-                    Failure::MissingParent => None,
+                    Failure::Rejected => None,
                 };
-                let batch = commands(doomed_reads(failure, parent, false));
+                let batch = commands(doomed_reads(failure));
                 let writer = writer.clone();
                 let persisted = tokio::spawn(async move {
                     persist(&writer, &batch).await.map_err(|e| e.to_string())
@@ -2760,24 +2567,8 @@ mod tests {
     /// the same record leaves exactly the rows a single commit would: no
     /// duplicates, no gaps. The same batch persisted twice is also a no-op.
     async fn assert_timed_out_commit_is_idempotent(conn: DatabaseConnection) {
-        let parent = crate::hash::hash(b"timeout-parent");
-        insert_parent_delegation(&conn, parent).await;
-        let get = ability("tinycloud.kv/get");
-        let first = rich_record(
-            "timeout-1",
-            "did:key:timeout",
-            vec![(
-                resource("tinycloud:did:key:ne-delegator:files/kv/a"),
-                get.clone(),
-            )],
-            vec![parent],
-        );
-        let second = rich_record(
-            "timeout-2",
-            "did:key:timeout-other",
-            vec![(resource("tinycloud:did:key:ne-delegator:files/kv/b"), get)],
-            vec![parent],
-        );
+        let first = rich_record("timeout-1", "did:key:timeout");
+        let second = rich_record("timeout-2", "did:key:timeout-other");
         // `enqueue` consumes a record; rebuild the same one by content.
         let again = |record: &ReadAuditRecord| ReadAuditRecord {
             id: record.id,
@@ -2786,7 +2577,6 @@ mod tests {
             serialization: record.serialization.clone(),
             serialization_format: record.serialization_format,
             abilities: record.abilities.clone(),
-            parents: record.parents.clone(),
         };
 
         let pipeline = ReadAuditPipeline::start(conn.clone(), None);
@@ -2821,20 +2611,6 @@ mod tests {
         assert_eq!(audit_row_sets(&conn).await, expected);
         // Raw counts, in case the sets hide duplicates the schema allowed.
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 2);
-        assert_eq!(
-            invoked_abilities::Entity::find()
-                .count(&conn)
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            parent_delegations::Entity::find()
-                .count(&conn)
-                .await
-                .unwrap(),
-            2
-        );
 
         // The same batch persisted twice directly: still a no-op.
         let batch = vec![command(again(&first)), command(again(&second))];
@@ -2860,5 +2636,214 @@ mod tests {
             return;
         };
         assert_timed_out_commit_is_idempotent(schema.conn.clone()).await;
+    }
+
+    // TC-3259: records written before read audits dropped their derived rows.
+
+    /// A signed read as a client sends it: one capability, citing `parent`.
+    fn signed_read(
+        resource: &str,
+        ability: &str,
+        parent: &tinycloud_auth::ipld_core::cid::Cid,
+    ) -> Invocation {
+        use tinycloud_auth::{
+            authorization::{make_invocation, InvocationOptions},
+            resolver::DID_METHODS,
+            resource::ResourceId,
+            ssi::jwk::JWK,
+        };
+
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let verification_method = format!("{did}#{}", did.rsplit(':').next().unwrap());
+        let signed = make_invocation(
+            vec![(
+                resource.parse::<ResourceId>().unwrap(),
+                vec![ability.parse().unwrap()],
+            )],
+            parent,
+            &jwk,
+            &verification_method,
+            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions::default(),
+        )
+        .unwrap();
+        let encoded = signed.encode().unwrap().into_bytes();
+        crate::events::SerializedEvent(
+            crate::util::InvocationInfo::try_from(signed).unwrap(),
+            encoded,
+        )
+    }
+
+    /// The rows v1.26.9 wrote for `read`: the record a read writes now (its
+    /// actor, invocation and one `invoked_abilities` row per capability) plus
+    /// one `parent_delegations` row per cited delegation.
+    async fn insert_full_record(conn: &DatabaseConnection, read: &Invocation) {
+        let id = read.content_hash();
+        persist_in_transaction(
+            conn,
+            &[command(ReadAuditRecord::from_invocation(read, None))],
+        )
+        .await
+        .unwrap();
+        parent_delegations::Entity::insert_many(read.0.parents.iter().map(|parent| {
+            parent_delegations::ActiveModel {
+                parent: Set(Hash::from(*parent)),
+                child: Set(id),
+            }
+        }))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    /// Every `invoked_abilities` and `parent_delegations` row.
+    async fn derived_row_sets(
+        conn: &DatabaseConnection,
+    ) -> (HashSet<(Hash, String, String)>, HashSet<(Hash, Hash)>) {
+        let (_, _, abilities, parents) = audit_row_sets(conn).await;
+        (abilities, parents)
+    }
+
+    /// A full record written before TC-3259 still reads after slim records
+    /// join it: replaying the same read through the pipeline leaves its
+    /// invocation row and derived rows as they were, a new read adds its
+    /// invocation and invoked ability but no parent edge, and the migration
+    /// inventory still attributes a legacy SQL artifact from the old record's
+    /// `invoked_abilities` row.
+    async fn assert_full_records_still_read(
+        conn: DatabaseConnection,
+        writer_lock: Option<Arc<Mutex<()>>>,
+    ) {
+        let parent = crate::hash::hash(b"legacy-parent").to_cid(0x55);
+        insert_parent_delegation(&conn, Hash::from(parent)).await;
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default";
+        let sql_resource = format!("{space}/sql/app/threads");
+        let old = signed_read(&sql_resource, "tinycloud.sql/read", &parent);
+        let new = signed_read(&format!("{space}/kv/notes"), "tinycloud.kv/get", &parent);
+        let (old_id, new_id) = (old.content_hash(), new.content_hash());
+
+        insert_full_record(&conn, &old).await;
+        let seeded = invocation::Entity::find_by_id(old_id)
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("the old record");
+        let derived = derived_row_sets(&conn).await;
+        assert_eq!(
+            derived,
+            (
+                HashSet::from([(
+                    old_id,
+                    sql_resource.clone(),
+                    "tinycloud.sql/read".to_string()
+                )]),
+                HashSet::from([(Hash::from(parent), old_id)]),
+            )
+        );
+
+        let pipeline = ReadAuditPipeline::start(conn.clone(), writer_lock);
+        pipeline.set_wait(COMMIT_TEST_WAIT);
+        let (replayed, fresh) =
+            tokio::join!(pipeline.record(&old, None), pipeline.record(&new, None));
+        replayed.unwrap();
+        fresh.unwrap();
+
+        assert_eq!(
+            invocation::Entity::find_by_id(old_id)
+                .one(&conn)
+                .await
+                .unwrap(),
+            Some(seeded),
+            "the replayed read leaves the old row as it was"
+        );
+        let added = invocation::Entity::find_by_id(new_id)
+            .one(&conn)
+            .await
+            .unwrap()
+            .expect("the new read's invocation row");
+        assert_eq!(added.serialization, new.serialized_bytes());
+        assert_eq!(added.serialization_format, 0);
+        assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 2);
+        let (mut abilities, parents) = derived;
+        abilities.insert((
+            new_id,
+            format!("{space}/kv/notes"),
+            "tinycloud.kv/get".to_string(),
+        ));
+        assert_eq!(
+            derived_row_sets(&conn).await,
+            (abilities, parents),
+            "the old record's derived rows are untouched and the new read adds no parent edge"
+        );
+
+        let datadir = tempfile::tempdir().unwrap();
+        let resource: crate::types::Resource = sql_resource.parse().unwrap();
+        let space_dir = datadir.path().join("sql").join(
+            resource
+                .tinycloud_resource()
+                .expect("a TinyCloud resource")
+                .space()
+                .to_string(),
+        );
+        std::fs::create_dir_all(&space_dir).unwrap();
+        std::fs::write(space_dir.join("threads.db"), b"").unwrap();
+        let items = crate::database_migration::inventory(&conn, datadir.path())
+            .await
+            .unwrap();
+        let threads = items
+            .iter()
+            .find(|item| item.service == "sql" && item.physical_name == "threads")
+            .expect("the cached legacy artifact is inventoried");
+        assert_eq!(threads.paths, vec![Some("app/threads".to_string())]);
+        assert_eq!(threads.classification, "unique");
+    }
+
+    #[tokio::test]
+    async fn full_records_written_before_tc3259_still_read() {
+        let conn = database("sqlite::memory:".to_string(), 1).await;
+        assert_full_records_still_read(conn, Some(Arc::new(Mutex::new(())))).await;
+    }
+
+    /// The TC-2871 space purge (#550) seeds a space's invocations with this
+    /// query and deletes what it finds. A slim read has no `event_order` row
+    /// and no parent edge, so its `invoked_abilities` row is how the purge
+    /// finds it: every read of the space, old or slim, must come back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_full_records_written_before_tc3259_still_read() {
+        use crate::test_support::PostgresTestSchema;
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        const TEST: &str = "postgres_full_records_written_before_tc3259_still_read";
+        let Some(schema) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        assert_full_records_still_read(schema.conn.clone(), None).await;
+
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default";
+        let seeds: HashSet<Hash> = schema
+            .conn
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT invocation AS id FROM invoked_abilities WHERE split_part(resource,'/',1)=$1",
+                [space.into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<Hash>("", "id").unwrap())
+            .collect();
+        let invocations: HashSet<Hash> = invocation::Entity::find()
+            .all(&schema.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            seeds, invocations,
+            "the space purge finds the slim read as it finds the full record"
+        );
     }
 }
