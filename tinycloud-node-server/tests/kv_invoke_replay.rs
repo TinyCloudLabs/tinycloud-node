@@ -5,6 +5,9 @@
 //! Driven through the real node with SDK-signed invocations on in-memory
 //! SQLite and, when an isolated PostgreSQL is configured (see
 //! `common::postgres_test_url`), on PostgreSQL in a throwaway schema.
+//!
+//! TC-3216: the `/invoke` fair-share limits, which a replay must not spend,
+//! and the per-account database-time budget, driven the same way.
 
 mod common;
 
@@ -332,4 +335,101 @@ async fn postgres_replay_row_follows_the_write() -> Result<()> {
         ))
         .await?;
     result
+}
+
+/// A node on in-memory SQLite with `invocation` as its `/invoke` limits.
+async fn limited_node(
+    invocation: tinycloud::config::InvocationConfig,
+) -> Result<(Client, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let mut config = tinycloud::config::Config::default();
+    config.storage.datadir = dir.path().into();
+    config.storage.database = Some("sqlite::memory:".into());
+    config.keys = serde_json::from_value(json!({
+        "type": "static",
+        "secret": base64::encode_config([109; 32], base64::URL_SAFE_NO_PAD),
+    }))?;
+    config.invocation = invocation;
+    let figment = Figment::from(rocket::Config {
+        log_level: rocket::config::LogLevel::Off,
+        ..rocket::Config::default()
+    })
+    .merge(Serialized::defaults(&config));
+    Ok((Client::tracked(tinycloud::app(&figment).await?).await?, dir))
+}
+
+/// TC-3216 (Bobbie on #625): a replayed copy of a committed request is refused
+/// 409 and its token given back, so whoever holds a leaked request cannot use
+/// it to drain its invoker's `/invoke` share once the limit is enforced.
+#[tokio::test]
+async fn a_replayed_request_does_not_spend_the_invokers_share() -> Result<()> {
+    // Two requests, then one a minute, refused past that.
+    let (client, _dir) = limited_node(tinycloud::config::InvocationConfig {
+        rate_limit_per_minute: 1,
+        rate_limit_burst: 2,
+        rate_limit_enforce: true,
+        ..Default::default()
+    })
+    .await?;
+    let session = sign_in(&client).await?;
+
+    let leaked = signed(&session, "tinycloud.kv/put", "share/a")?;
+    let (status, body) = send(&client, &leaked, b"one", &[]).await?;
+    ensure!(status == Status::Ok, "first put: {status} {body}");
+    for _ in 0..3 {
+        let (status, body) = send(&client, &leaked, b"one", &[]).await?;
+        ensure!(status == Status::Conflict, "replay: {status} {body}");
+    }
+    // The original spent one of the two; the replays spent none.
+    let next = signed(&session, "tinycloud.kv/put", "share/b")?;
+    let (status, body) = send(&client, &next, b"two", &[]).await?;
+    ensure!(status == Status::Ok, "after the replays: {status} {body}");
+    let over = signed(&session, "tinycloud.kv/put", "share/c")?;
+    let (status, body) = send(&client, &over, b"three", &[]).await?;
+    ensure!(
+        status == Status::TooManyRequests,
+        "over the share: {status} {body}"
+    );
+    Ok(())
+}
+
+/// TC-3216: the database time the node measures for an account's requests is
+/// debited from that account's budget, and once it is in debt an enforced
+/// budget refuses its next invocation, before any database work, with
+/// `429 rate_limited` and `Retry-After` until the debt is repaid.
+#[tokio::test]
+async fn an_account_over_its_database_time_budget_is_refused() -> Result<()> {
+    // One millisecond of query time a minute: a few requests spend it.
+    let (client, _dir) = limited_node(tinycloud::config::InvocationConfig {
+        account_db_ms_per_minute: 1,
+        account_db_burst_ms: 1,
+        account_limit_enforce: true,
+        ..Default::default()
+    })
+    .await?;
+    let session = sign_in(&client).await?;
+
+    for attempt in 0..20 {
+        let put = signed(&session, "tinycloud.kv/put", &format!("budget/{attempt}"))?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", put))
+            .header(ContentType::Plain)
+            .body("spend")
+            .dispatch()
+            .await;
+        let status = response.status();
+        let retry_after = response.headers().get_one("Retry-After").map(str::to_owned);
+        let body = response.into_string().await.unwrap_or_default();
+        if status == Status::TooManyRequests {
+            ensure!(body == "rate_limited", "429 body: {body}");
+            // The debt is capped at one bucket, 1 ms + 1/60 ms, repaid at
+            // 1/60 ms a second.
+            let retry_after: u64 = retry_after.context("429 carries Retry-After")?.parse()?;
+            ensure!((1..=62).contains(&retry_after), "Retry-After {retry_after}");
+            return Ok(());
+        }
+        ensure!(status == Status::Ok, "put {attempt}: {status} {body}");
+    }
+    Err(anyhow!("20 puts never spent one millisecond of query time"))
 }

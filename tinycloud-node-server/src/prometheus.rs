@@ -38,6 +38,19 @@ pub fn observe_delivery_rate_limited(scope: &str) {
     DELIVERY_RATE_LIMITED.with_label_values(&[scope]).inc();
 }
 
+/// Count one `/invoke` request over the per-invoker rate limit (TC-3216).
+/// `mode` is `shadow` (admitted) or `enforce` (refused with 429).
+pub fn observe_invoke_rate_limited(mode: &str) {
+    INVOKE_RATE_LIMITED.with_label_values(&[mode]).inc();
+}
+
+/// Count one `/invoke` request over a per-account limit (TC-3216). `limit` is
+/// `db_time` or `in_flight`; `mode` is `shadow` (admitted) or `enforce`
+/// (refused with 429).
+pub fn observe_account_limited(limit: &str, mode: &str) {
+    ACCOUNT_LIMITED.with_label_values(&[limit, mode]).inc();
+}
+
 /// Count one links API response whose `Date` is more than 60 seconds from the
 /// node clock.
 pub fn observe_links_read_clock_skew() {
@@ -63,6 +76,21 @@ lazy_static! {
         "tinycloud_delivery_rate_limited_total",
         "Delivery authorizations refused by the links-fetch rate limit, by scope.",
         &["scope"]
+    ).unwrap();
+    /// `/invoke` requests over the per-invoker rate limit (TC-3216). The one
+    /// label is the mode (`shadow` or `enforce`): never an invoker, a space
+    /// or an account.
+    pub static ref INVOKE_RATE_LIMITED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_invoke_rate_limited_total",
+        "Invocations over the per-invoker rate limit, by mode (shadow admits, enforce refuses).",
+        &["mode"]
+    ).unwrap();
+    /// `/invoke` requests over a per-account limit (TC-3216), by limit
+    /// (`db_time` or `in_flight`) and mode. Never an account or a space.
+    pub static ref ACCOUNT_LIMITED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_account_limited_total",
+        "Invocations over a per-account limit, by limit and mode (shadow admits, enforce refuses).",
+        &["limit", "mode"]
     ).unwrap();
     pub static ref REQUEST_HISTOGRAM: HistogramVec = register_histogram_vec!(
         "tinycloud_http_request_duration_seconds",

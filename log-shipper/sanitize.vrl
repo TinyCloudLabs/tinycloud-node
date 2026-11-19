@@ -59,6 +59,75 @@ if label == "tinycloud-node" {
       }
     }
   }
+  # TC-3216: the node's three fair-share report lines (`tinycloud::fair_share`, each at most once a minute) ship as
+  # individual events. The input must carry exactly the declared keys (the message, `event` and the line's fields) with
+  # exactly the declared types, enum values and bounds; account fields are copied only as 64-hex pseudonyms, and a rank
+  # or top account the node reports as absent (empty pseudonym, zero counts) is omitted. Anything else leaves fair null
+  # and the line falls back to the unclassified count below; the shipped object is built from literals and validated
+  # values only.
+  fair = null
+  if target == "tinycloud::fair_share" && level == "warn" && is_integer(f.window_s) && f.window_s == 60 {
+    fair_event = string(f.event) ?? ""
+    fair_limit_line = msg == "invocations over a per-account limit" && fair_event == "account_limited" && length(f) == 9
+    fair_rate_line = msg == "invocations over the per-invoker rate limit" && fair_event == "invoke_rate_limited" && length(f) == 8
+    if fair_limit_line || fair_rate_line {
+      fair_mode = string(f.mode) ?? ""
+      fair_limit = string(f.limit) ?? ""
+      fair_hash = string(f.top_account_hash) ?? "-"
+      fair_ok = includes(__FAIR_SHARE_MODES__, fair_mode) && is_integer(f.count) && is_integer(f.accounts) && is_integer(f.top_account_count)
+      if fair_ok && fair_limit_line { fair_ok = includes(__FAIR_SHARE_LIMITS__, fair_limit) }
+      fair_count = int(f.count) ?? 0
+      fair_accounts = int(f.accounts) ?? -1
+      fair_top_count = int(f.top_account_count) ?? -1
+      if fair_ok {
+        fair_ok = fair_count >= 1 && fair_count <= 9007199254740991 && fair_accounts >= 0 && fair_accounts <= 9007199254740991 && fair_top_count >= 0 && fair_top_count <= 9007199254740991
+      }
+      fair_has_top = fair_hash != ""
+      if fair_ok {
+        if fair_has_top { fair_ok = match(fair_hash, r'^[0-9a-f]{64}$') && fair_top_count >= 1 } else { fair_ok = fair_top_count == 0 }
+      }
+      if fair_ok {
+        fair = {"event": "node_warning", "svc": "api", "level": "warn", "event_code": fair_event, "mode": fair_mode, "count": fair_count, "accounts": fair_accounts, "window_s": 60}
+        if fair_limit_line { fair.limit = fair_limit }
+        if fair_has_top {
+          fair.top_account_hash = fair_hash
+          fair.top_account_count = fair_top_count
+        }
+      }
+    } else if msg == "accounts with the most database time" && fair_event == "node_top_talkers" && length(f) == 19 {
+      fair_ok = is_integer(f.db_ms) && is_integer(f.requests) && is_integer(f.unattributed_db_ms) && is_integer(f.accounts)
+      talkers = {}
+      for_each(["db_ms", "requests", "unattributed_db_ms", "accounts"]) -> |_index, key| {
+        value = int(get(f, [key]) ?? null) ?? -1
+        if value < 0 || value > 9007199254740991 { fair_ok = false }
+        talkers = set!(talkers, [key], value)
+      }
+      for_each(["1", "2", "3"]) -> |_index, rank| {
+        prefix = "top" + rank + "_"
+        rank_hash = string(get(f, [prefix + "account_hash"]) ?? null) ?? "-"
+        rank_db_ms = int(get(f, [prefix + "db_ms"]) ?? null) ?? -1
+        rank_requests = int(get(f, [prefix + "requests"]) ?? null) ?? -1
+        rank_share_value = get(f, [prefix + "share"]) ?? null
+        rank_share = -1.0
+        if is_float(rank_share_value) || is_integer(rank_share_value) { rank_share = to_float(rank_share_value) ?? -1.0 }
+        if rank_db_ms < 0 || rank_db_ms > 9007199254740991 || rank_requests < 0 || rank_requests > 9007199254740991 || rank_share < 0.0 || rank_share > 1.0 {
+          fair_ok = false
+        } else if rank_hash == "" {
+          if rank_db_ms != 0 || rank_requests != 0 || rank_share != 0.0 { fair_ok = false }
+        } else if match(rank_hash, r'^[0-9a-f]{64}$') {
+          talkers = set!(talkers, [prefix + "account_hash"], rank_hash)
+          talkers = set!(talkers, [prefix + "db_ms"], rank_db_ms)
+          talkers = set!(talkers, [prefix + "requests"], rank_requests)
+          talkers = set!(talkers, [prefix + "share"], rank_share)
+        } else {
+          fair_ok = false
+        }
+      }
+      if fair_ok {
+        fair = merge({"event": "node_warning", "svc": "api", "level": "warn", "event_code": "node_top_talkers", "window_s": 60}, talkers)
+      }
+    }
+  }
   if target == "tinycloud::request" && level == "info" && msg == "request" {
     method = string!(f.method)
     if includes(["TRACE", "CONNECT"], method) { method = "<other>" }
@@ -87,6 +156,8 @@ if label == "tinycloud-node" {
     out = db_event
   } else if is_object(headroom) {
     out = headroom
+  } else if is_object(fair) {
+    out = fair
   } else {
     if !includes(["warn", "error"], level) { abort }
     code = "unclassified"

@@ -34,6 +34,7 @@ pub mod delivery_link;
 pub mod dstack;
 pub mod egress;
 pub mod epoch_head_backfill;
+pub mod fair_share;
 pub mod hooks;
 pub mod invocation_replay;
 pub mod issuer_set;
@@ -1133,6 +1134,7 @@ pub async fn app_with_control(
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+    let fair_share = Arc::new(fair_share::FairShare::new(&tinycloud_config.invocation));
     let webhook_dispatcher = WebhookDispatcher::new(
         tinycloud.clone(),
         tinycloud_config.hooks.clone(),
@@ -1190,6 +1192,16 @@ pub async fn app_with_control(
                 let shutdown = rocket.shutdown();
                 Box::pin(async move {
                     tokio::spawn(delivery_limiter::run_report(limiter, shutdown));
+                })
+            }
+        }))
+        .attach(AdHoc::on_liftoff("fair-share-report", {
+            let fair_share = fair_share.clone();
+            move |rocket| {
+                let fair_share = fair_share.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(fair_share::run_report(fair_share, shutdown));
                 })
             }
         }))
@@ -1309,6 +1321,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(egress_policy)
         .manage(rate_limiter)
+        .manage(fair_share)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(policy_v3_runtime)

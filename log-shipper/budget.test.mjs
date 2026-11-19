@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { calculateBudget, representativeEvents, serializedEventBytes, INDIVIDUAL_EVENT_CODES, SHIPPER_EVENT_CODES, CAPPED_CLASSES, CAPPED_ALLOCATION_BYTES, CAP_WINDOW_SECONDS, MINUTES_30_DAYS, REQUEST_ALLOCATION_BYTES } from './budget.mjs';
+import { calculateBudget, representativeEvents, serializedEventBytes, INDIVIDUAL_EVENT_CODES, SHIPPER_EVENT_CODES, FAIR_SHARE_EVENT_CODES, FAIR_SHARE_EVENTS_PER_MINUTE, CAPPED_CLASSES, CAPPED_ALLOCATION_BYTES, CAP_WINDOW_SECONDS, MINUTES_30_DAYS, REQUEST_ALLOCATION_BYTES } from './budget.mjs';
 
 const fields = JSON.parse(await readFile(new URL('./fields.json', import.meta.url), 'utf8'));
 const nodeSchema = fields.services['tinycloud-node'];
@@ -82,7 +82,7 @@ test('diagnostic storm reserve covers every code at both severity levels', () =>
 });
 
 test('the 5xx diagnostic is an individual event: not an aggregated code, and its representative is worst-valid (TC-1840)', () => {
-  assert.deepEqual(INDIVIDUAL_EVENT_CODES, ['db_failure_5xx']);
+  assert.deepEqual(INDIVIDUAL_EVENT_CODES, ['db_failure_5xx', ...FAIR_SHARE_EVENT_CODES]);
   assert.ok(nodeSchema.fields.event_code.values.includes('db_failure_5xx'));
   assert.equal(calculateBudget({ requestsPerMinute: 0 }).diagnosticEventsPerMinute, (nodeSchema.fields.event_code.values.length - INDIVIDUAL_EVENT_CODES.length - SHIPPER_EVENT_CODES.length) * 2);
   assert.notEqual(representativeEvents.diagnostic.event_code, 'db_failure_5xx');
@@ -94,6 +94,34 @@ test('the 5xx diagnostic is an individual event: not an aggregated code, and its
   assert.match(row.db_hash, new RegExp(nodeSchema.fields.db_hash.regex));
   assert.equal(row.elapsed_ms, nodeSchema.fields.elapsed_ms.max);
   assert.equal(calculateBudget({ requestsPerMinute: 0 }).eventBytes.dbFailure, serializedEventBytes(row, 'ndjson'));
+});
+
+test('the fair-share events are individual events at a fixed rate of at most four a minute, each charged at its worst-valid line (TC-3216)', () => {
+  assert.deepEqual(FAIR_SHARE_EVENT_CODES, ['invoke_rate_limited', 'account_limited', 'node_top_talkers']);
+  for (const code of FAIR_SHARE_EVENT_CODES) assert.ok(nodeSchema.fields.event_code.values.includes(code), code);
+  // One invoker line, one account line per limit (db_time, in_flight) and one top-talker line per 60 s report window.
+  assert.equal(FAIR_SHARE_EVENTS_PER_MINUTE, 4);
+  const budget = calculateBudget({ requestsPerMinute: 0 });
+  const limited = representativeEvents.fairShareLimited;
+  const talkers = representativeEvents.topTalkers;
+  assert.deepEqual(Object.keys(limited).sort(), ['accounts', 'count', 'event', 'event_code', 'level', 'limit', 'mode', 'svc', 'top_account_count', 'top_account_hash', 'ts', 'window_s']);
+  assert.deepEqual(Object.keys(talkers).sort(), ['accounts', 'db_ms', 'event', 'event_code', 'level', 'requests', 'svc', 'ts', 'unattributed_db_ms', 'window_s', ...[1, 2, 3].flatMap(rank => ['account_hash', 'db_ms', 'requests', 'share'].map(name => `top${rank}_${name}`))].sort());
+  for (const row of [limited, talkers]) {
+    for (const [key, value] of Object.entries(row)) {
+      const field = nodeSchema.fields[key];
+      if (['level', 'ts', 'event', 'svc'].includes(key)) continue;
+      if (field.type === 'enum') assert.ok(field.values.includes(value), key);
+      else if (field.type === 'string') assert.match(value, new RegExp(field.regex), key);
+      else if (field.type === 'integer') assert.equal(value, field.max, key);
+      else assert.ok(value >= field.min && value <= field.max, key);
+    }
+  }
+  // The invoker line is the account line without `limit`, so the account representative bounds both.
+  const { limit: _limit, ...invoker } = limited;
+  assert.ok(serializedEventBytes({ ...invoker, event_code: 'invoke_rate_limited' }) <= budget.eventBytes.fairShareLimited);
+  assert.equal(budget.fairShareBytes30Days, (budget.eventBytes.topTalkers + 3 * budget.eventBytes.fairShareLimited) * MINUTES_30_DAYS);
+  // Additional to the request allocation and the capped reserve: not part of either, like the headroom event.
+  assert.equal(budget.totalBytes30Days, budget.requestBytes30Days + budget.diagnosticReserveBytes30Days);
 });
 
 test('the dropped-count event is emitted by the shipper: not an aggregated code, worst-valid, and no node log line maps to it (TC-1843)', async () => {

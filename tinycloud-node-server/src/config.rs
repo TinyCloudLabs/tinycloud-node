@@ -2186,6 +2186,60 @@ pub struct InvocationConfig {
     /// The default sits below the ingress's 60 s, so the node answers first.
     #[serde(default = "default_invocation_deadline_ms")]
     pub deadline_ms: u64,
+    /// Per-invoker `/invoke` rate: sustained requests per minute for one
+    /// verified invoker (session key); zero turns the limit off. A request
+    /// over it is counted (`tinycloud_invoke_rate_limited_total`, and at most
+    /// one `invoke_rate_limited` log line a minute) and, only when
+    /// `rate_limit_enforce` is set, answered `429 rate_limited` with
+    /// `Retry-After` before any database work. Defaults are at least twice the
+    /// busiest account's peaks over the 24 hours to 11-17 21:53Z (306 a minute,
+    /// 120 in 10 s; roci-xo 231 a minute, 85 in 10 s), counted per account,
+    /// which bounds any one session key. Those peaks come from the shipped
+    /// errors-and-slow request log, so they are a floor.
+    #[serde(default = "default_invocation_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+    /// Requests one invoker may send at once above the sustained rate.
+    #[serde(default = "default_invocation_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    /// Refuse requests over the per-invoker rate. Off by default: the limit
+    /// runs in shadow mode, counting and reporting only, until the counts
+    /// show first-party traffic stays under it.
+    #[serde(default)]
+    pub rate_limit_enforce: bool,
+    /// Per-account database-time budget for `/invoke`, in milliseconds of
+    /// query time a minute, sustained. The account is the owner of the
+    /// invocation's spaces. The measured query time of every response below
+    /// 400, on every route, is debited from it. A refused request is charged
+    /// to no account, so nobody can spend a stranger's budget by naming their
+    /// space. While an account is in debt, its next
+    /// invocation is counted (`tinycloud_account_limited_total{limit="db_time"}`
+    /// and the minute's `account_limited` line, which names the account's
+    /// pseudonym). Only when `account_limit_enforce` is set is it answered
+    /// `429 rate_limited`, with `Retry-After` until the debt is repaid, before
+    /// any database work. Zero turns the budget off. The default is
+    /// uncalibrated: no production record had per-account database time
+    /// before the `node_top_talkers` line (the shipped request log keeps only
+    /// wall time, and only for requests that failed or took over 1 s). It is
+    /// set from 24 hours of `node_top_talkers` and `account_limited` in
+    /// production before enforcement.
+    #[serde(default = "default_invocation_account_db_ms_per_minute")]
+    pub account_db_ms_per_minute: u32,
+    /// Query-time milliseconds one account may spend at once above the
+    /// sustained budget.
+    #[serde(default = "default_invocation_account_db_burst_ms")]
+    pub account_db_burst_ms: u32,
+    /// Most `/invoke` requests one account may have in flight at once. An
+    /// invocation over the cap is counted
+    /// (`tinycloud_account_limited_total{limit="in_flight"}`). Only when
+    /// `account_limit_enforce` is set is it refused, with `Retry-After: 1`.
+    /// Zero turns the cap off.
+    #[serde(default = "default_invocation_account_max_in_flight")]
+    pub account_max_in_flight: u32,
+    /// Refuse invocations over the per-account budget or cap. Off by default:
+    /// both run in shadow mode until the shadow counts and the top-talker line
+    /// show first-party traffic stays under them.
+    #[serde(default)]
+    pub account_limit_enforce: bool,
 }
 
 fn default_invocation_max_lifetime_secs() -> u64 {
@@ -2194,6 +2248,26 @@ fn default_invocation_max_lifetime_secs() -> u64 {
 
 fn default_invocation_deadline_ms() -> u64 {
     55_000
+}
+
+fn default_invocation_rate_limit_per_minute() -> u32 {
+    640
+}
+
+fn default_invocation_rate_limit_burst() -> u32 {
+    240
+}
+
+fn default_invocation_account_db_ms_per_minute() -> u32 {
+    20_000
+}
+
+fn default_invocation_account_db_burst_ms() -> u32 {
+    30_000
+}
+
+fn default_invocation_account_max_in_flight() -> u32 {
+    8
 }
 
 impl InvocationConfig {
@@ -2207,6 +2281,13 @@ impl Default for InvocationConfig {
         Self {
             max_lifetime_secs: default_invocation_max_lifetime_secs(),
             deadline_ms: default_invocation_deadline_ms(),
+            rate_limit_per_minute: default_invocation_rate_limit_per_minute(),
+            rate_limit_burst: default_invocation_rate_limit_burst(),
+            rate_limit_enforce: false,
+            account_db_ms_per_minute: default_invocation_account_db_ms_per_minute(),
+            account_db_burst_ms: default_invocation_account_db_burst_ms(),
+            account_max_in_flight: default_invocation_account_max_in_flight(),
+            account_limit_enforce: false,
         }
     }
 }
