@@ -229,6 +229,10 @@ pub async fn public_kv_get(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let key: Path = key
         .0
@@ -277,6 +281,10 @@ pub async fn public_kv_head(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let key: Path = key
         .0
@@ -324,6 +332,10 @@ pub async fn public_kv_list(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let prefix_path: Path = prefix
         .unwrap_or("")

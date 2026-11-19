@@ -336,6 +336,17 @@ pub async fn hook_events<'r>(
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
+    if let Some(registry) = tinycloud.registry_admission() {
+        for scope in &claims.scopes {
+            let space = scope.space.parse().map_err(|_| {
+                super::registry_failure(tinycloud_core::registry_admission::RegistryError::Denied)
+            })?;
+            registry
+                .authorize_space(&space, false)
+                .await
+                .map_err(super::registry_failure)?;
+        }
+    }
     for scope in &claims.scopes {
         if let Ok(space) = scope.space.parse() {
             tinycloud_core::request_telemetry::observe_space(&space);
@@ -420,6 +431,12 @@ pub async fn hook_events<'r>(
                     match message {
                         Ok(event) => {
                             if claims.scopes.iter().any(|scope| matches_scope(&event, scope)) {
+                                if let Some(registry) = tinycloud.registry_admission() {
+                                    let Ok(space) = event.space.parse() else { break };
+                                    if registry.authorize_space(&space, false).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 yield Event::json(&event)
                                     .id(event.id.clone())
                                     .event("write");

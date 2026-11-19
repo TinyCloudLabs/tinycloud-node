@@ -733,6 +733,7 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate()
         .map_err(anyhow::Error::msg)?;
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
+    resolved.spaces.validate().map_err(anyhow::Error::msg)?;
     resolved
         .encryption_network
         .validate()
@@ -1052,7 +1053,26 @@ pub async fn app_with_control(
     .await?
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
-    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
+    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1)
+    .with_registry_admission(
+        tinycloud_config
+            .spaces
+            .registry_v2
+            .as_deref()
+            .map(|origin| {
+                tinycloud_core::registry_admission::RegistryAdmission::new(
+                    origin,
+                    key_setup.node_did(),
+                )
+                .and_then(|admission| {
+                    admission.with_outage_cache(Duration::from_secs(
+                        tinycloud_config.spaces.registry_cache_max_age_seconds,
+                    ))
+                })
+                .map(Arc::new)
+            })
+            .transpose()?,
+    );
     // TC-2871: with lifecycle on, every space data path consults the fence,
     // and the fence refuses all space traffic until reconciliation succeeds.
     let tinycloud = match &lifecycle {

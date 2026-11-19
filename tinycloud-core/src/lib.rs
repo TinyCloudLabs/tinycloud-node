@@ -27,6 +27,7 @@ pub mod models;
 pub mod policy_authority;
 pub mod policy_capability;
 mod read_audit;
+pub mod registry_admission;
 pub mod relationships;
 pub mod renewal;
 pub mod request_cancel;

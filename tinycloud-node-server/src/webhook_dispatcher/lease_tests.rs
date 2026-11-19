@@ -311,7 +311,7 @@ async fn expired_and_reclaimed_lease_does_not_send_or_mark() -> Result<()> {
 
     let mut sent = false;
     dispatcher(&tinycloud, &encryption)?
-        .dispatch_delivery(stale, &mut HashMap::new(), &mut sent)
+        .dispatch_delivery(stale, &mut HashMap::new(), &mut HashMap::new(), &mut sent)
         .await?;
 
     assert!(!sent);
@@ -340,7 +340,12 @@ async fn expired_unreclaimed_lease_does_not_send_and_is_claimable_again() -> Res
 
     let mut sent = false;
     dispatcher(&tinycloud, &encryption)?
-        .dispatch_delivery(stale.clone(), &mut HashMap::new(), &mut sent)
+        .dispatch_delivery(
+            stale.clone(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut sent,
+        )
         .await?;
 
     assert!(!sent);
@@ -367,7 +372,12 @@ async fn live_lease_sends_once_and_renews() -> Result<()> {
 
     let mut sent = false;
     dispatcher(&tinycloud, &encryption)?
-        .dispatch_delivery(claimed.clone(), &mut HashMap::new(), &mut sent)
+        .dispatch_delivery(
+            claimed.clone(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut sent,
+        )
         .await?;
 
     assert!(sent);

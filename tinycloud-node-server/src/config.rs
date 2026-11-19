@@ -1680,6 +1680,36 @@ pub struct Tracing {
 pub struct SpacesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<SpaceAllowListService>,
+    /// Explicit registry v2 origin. When set, current owner-signed membership
+    /// authorizes hosting and data mode; ordinary capability checks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_v2: Option<String>,
+    /// How long the last confirmed registry record keeps admitting reads and
+    /// writes while the registry is unreachable (TC-2481). 0 (the default)
+    /// turns the cache off; at most 300; requires `registry_v2`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub registry_cache_max_age_seconds: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl SpacesConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.registry_cache_max_age_seconds == 0 {
+            return Ok(());
+        }
+        if self.registry_v2.is_none() {
+            return Err("spaces.registry_cache_max_age_seconds requires spaces.registry_v2");
+        }
+        if self.registry_cache_max_age_seconds
+            > tinycloud_core::registry_admission::MAX_OUTAGE_CACHE.as_secs()
+        {
+            return Err("spaces.registry_cache_max_age_seconds must be at most 300");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]

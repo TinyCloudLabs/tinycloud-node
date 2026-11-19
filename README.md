@@ -271,10 +271,74 @@ The following common options are available:
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
+| spaces.registry_v2  | TINYCLOUD_SPACES__REGISTRY_V2 | Optional signed registry v2 origin for current per-space hosting authorization and read/write mode |
+| spaces.registry_cache_max_age_seconds | TINYCLOUD_SPACES__REGISTRY_CACHE_MAX_AGE_SECONDS | Seconds the last confirmed registry record keeps admitting reads and writes during a registry outage; `0` (default) turns it off, at most `300`, requires `registry_v2` |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 | column_encryption.strict | TINYCLOUD_COLUMN_ENCRYPTION__STRICT | Require authenticated envelopes for recorded legacy columns; default `false`. Recorded v2 columns always require v2. |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 | (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
+
+### Signed registry v2 hosting
+
+Enable registry-based hosting explicitly on a node:
+
+```toml
+[global.spaces]
+registry_v2 = "http://127.0.0.1:48100"
+```
+
+Use an exact HTTPS origin, without a trailing slash or path. HTTP is accepted
+only for loopback `127.0.0.1` or `[::1]` lab origins. The node fetches
+`/v2/locations/<ownerKey>` and independently verifies the current owner-signed
+v2 record. EOA lookup uses the EIP-55 address independently of chain; Ed25519
+owners use their exact `did:key`.
+
+The signed space membership must list this node's DID. A listed read-only
+replica supports hosting/session registration and reads; ordinary data mutations
+require read-write membership. These checks also apply to previously hosted
+spaces, public and signed-URL reads, and hook streams. Missing or unavailable
+authorization is refused on a configured node. When `registry_v2` is unset,
+existing hosting and onboarding behavior is unchanged.
+
+Ordinary signatures, delegation chains, capability scopes, and revocation checks
+still apply. A valid data/session grant can activate a listed replica without a
+separate per-node hosting SIWE. A mixed grant is retained as its complete signed
+proof, but `/delegate` activates only this node's listed data spaces; its response
+keeps `cid`, `activated`, and `skipped`. Raw encryption-network grants and requests
+use the separately signed `encryptionNode` destination. Encryption-only
+registration returns a CID without activating an unlisted data space.
+
+Re-registering the same still-valid grant after membership expands activates
+newly admitted spaces without changing its CID or signed proof. Repeating that
+registration after activation does not append duplicate epochs or events.
+Registry unavailability returns HTTP `503`, including direct decrypt and hook
+authorization; it is not reported as invalid agent credentials.
+
+#### Registry outage cache
+
+`registry_cache_max_age_seconds` (default `0`, off; at most `300`) lets a node
+keep serving through a short registry outage. What the node knows then is the
+last record it fetched and verified successfully, and when that fetch began:
+
+- Only an outage uses it: the registry cannot be reached, times out, or answers
+  `502`, `503` or `504`. A refusal (`404`, an invalid, tampered or older record)
+  answers as without the cache and discards the cached record.
+- The cached record admits reads and writes exactly as the live one would: a
+  write needs the cached record to list this node read-write for the space.
+- It expires `registry_cache_max_age_seconds` after the last successful lookup
+  began. Requests it serves never extend it; past it, requests answer `503`
+  before any effect.
+- It lives in memory only: after a restart nothing is admitted until the
+  registry answers once.
+- Activating a replica for a new grant (`/delegate`) always needs the live
+  registry.
+
+Delegation revocation is enforced from the node's own database and needs no
+registry, so a revocation during an outage applies at once. A membership change
+published to the registry during an outage takes effect at most this window
+after the last successful lookup.
+
+Details: TC-2481
 
 ### Database Config
 
