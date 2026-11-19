@@ -16,7 +16,7 @@ use crate::request_telemetry::{self, QueryTimer};
 
 use super::{
     caveats::DuckDbCaveats,
-    database::{spawn_actor_with_parts, DatabaseHandle},
+    database::{cache_file_paths, remove_cache_entry, spawn_actor_with_parts, DatabaseHandle},
     storage,
     types::*,
 };
@@ -282,86 +282,98 @@ impl DuckDbService {
         let temp_path = staging_path(&final_path);
         let _live = StagingRelease(temp_path.clone());
 
-        // Write to temp file first
-        tokio::fs::write(&temp_path, data)
+        // Stage, validate and move the file into place. Any failure before the
+        // rename leaves the staged bytes behind, so it removes them.
+        let key = (space.to_string(), db_name.to_string());
+        let staged = async {
+            tokio::fs::write(&temp_path, data)
+                .await
+                .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+
+            // Validate with the same locked native policy as live and export connections.
+            let temp_path_clone = temp_path.clone();
+            let max_memory = self.max_memory_per_connection.clone();
+            let context = request_telemetry::current();
+            tokio::task::spawn_blocking(move || -> Result<(), DuckDbError> {
+                let _context = request_telemetry::enter(context);
+                let conn =
+                    storage::open_connection(Some(&temp_path_clone), &max_memory).map_err(|e| {
+                        match e {
+                            DuckDbError::Internal(message) => DuckDbError::ImportError(format!(
+                                "Invalid DuckDB file: {}",
+                                message
+                            )),
+                            other => other,
+                        }
+                    })?;
+                {
+                    let _timer = QueryTimer::new();
+                    conn.execute_batch("SELECT 1").map_err(|e| {
+                        DuckDbError::ImportError(format!("Database validation failed: {}", e))
+                    })?;
+                }
+                Ok(())
+            })
             .await
-            .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+            .map_err(|e| DuckDbError::Internal(format!("Validation task failed: {}", e)))??;
 
-        // Validate with the same locked native policy as live and export connections.
-        let temp_path_clone = temp_path.clone();
-        let max_memory = self.max_memory_per_connection.clone();
-        let context = request_telemetry::current();
-        let valid = tokio::task::spawn_blocking(move || -> Result<(), DuckDbError> {
-            let _context = request_telemetry::enter(context);
-            let conn = storage::open_connection(Some(&temp_path_clone), &max_memory).map_err(
-                |e| match e {
-                    DuckDbError::Internal(message) => {
-                        DuckDbError::ImportError(format!("Invalid DuckDB file: {}", message))
-                    }
-                    other => other,
-                },
-            )?;
-            {
-                let _timer = QueryTimer::new();
-                conn.execute_batch("SELECT 1").map_err(|e| {
-                    DuckDbError::ImportError(format!("Database validation failed: {}", e))
-                })?;
+            // Close the previous actor before replacing its files: connection
+            // shutdown may checkpoint its old WAL into that path.
+            if let Some((_, handle)) = self.databases.remove(&key) {
+                handle.shutdown().await?;
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| DuckDbError::Internal(format!("Validation task failed: {}", e)))?;
-
-        if let Err(e) = valid {
-            // Clean up temp file on validation failure
+            self.lineage.remove(&key);
+            tokio::fs::rename(&temp_path, &final_path)
+                .await
+                .map_err(|e| DuckDbError::ImportError(format!("Failed to finalize import: {}", e)))
+        }
+        .await;
+        if let Err(e) = staged {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(e);
         }
 
-        // Close the previous actor before replacing its files: connection
-        // shutdown may checkpoint its old WAL into that path.
-        let key = (space.to_string(), db_name.to_string());
-        if let Some((_, handle)) = self.databases.remove(&key) {
-            handle.shutdown().await?;
+        // From here the imported file is in the cache; a failure to persist it
+        // must not leave it there to be served.
+        let persisted = async {
+            if self
+                .artifact_repository
+                .chunked_checkpoints("duckdb", &key.0, db_name)
+            {
+                let snapshot = tempfile::NamedTempFile::new()
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+                tokio::fs::write(snapshot.path(), data)
+                    .await
+                    .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+                self.artifact_repository
+                    .save_snapshot(
+                        "duckdb",
+                        &key.0,
+                        db_name,
+                        snapshot,
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(artifact_error_to_duckdb)
+            } else {
+                self.artifact_repository
+                    .save(
+                        "duckdb",
+                        &key.0,
+                        db_name,
+                        data.to_vec(),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(artifact_error_to_duckdb)
+            }
         }
-        self.lineage.remove(&key);
-        tokio::fs::rename(&temp_path, &final_path)
-            .await
-            .map_err(|e| DuckDbError::ImportError(format!("Failed to finalize import: {}", e)))?;
-        let persisted = if self
-            .artifact_repository
-            .chunked_checkpoints("duckdb", &key.0, db_name)
-        {
-            let snapshot =
-                tempfile::NamedTempFile::new().map_err(|e| DuckDbError::Internal(e.to_string()))?;
-            tokio::fs::write(snapshot.path(), data)
-                .await
-                .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
-            self.artifact_repository
-                .save_snapshot(
-                    "duckdb",
-                    &key.0,
-                    db_name,
-                    snapshot,
-                    ArtifactExpectation::Any,
-                )
-                .await
-                .map(|_| ())
-        } else {
-            self.artifact_repository
-                .save(
-                    "duckdb",
-                    &key.0,
-                    db_name,
-                    data.to_vec(),
-                    ArtifactExpectation::Any,
-                )
-                .await
-                .map(|_| ())
-        };
+        .await;
         if let Err(error) = persisted {
             self.discard_local_state(&key).await?;
-            return Err(artifact_error_to_duckdb(error));
+            return Err(error);
         }
 
         Ok(())
@@ -759,18 +771,15 @@ fn validate_payload(
 }
 
 async fn remove_duckdb_cache_files(path: &Path) -> Result<(), DuckDbError> {
-    for candidate in [
-        path.to_path_buf(),
-        PathBuf::from(format!("{}.tmp", path.display())),
-        PathBuf::from(format!("{}.wal", path.display())),
-    ] {
-        match tokio::fs::remove_file(&candidate).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(DuckDbError::Internal(e.to_string())),
-        }
-    }
-    Ok(())
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        cache_file_paths(&path)
+            .iter()
+            .try_for_each(|candidate| remove_cache_entry(candidate))
+    })
+    .await
+    .map_err(|e| DuckDbError::Internal(e.to_string()))?
+    .map_err(|e| DuckDbError::Internal(e.to_string()))
 }
 
 fn duckdb_wal_path(path: &Path) -> PathBuf {
@@ -2203,5 +2212,319 @@ mod tests {
             .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, expected_count);
+    }
+
+    fn write_request(sql: &str, schema: Option<&str>) -> DuckDbRequest {
+        DuckDbRequest::Execute {
+            schema: schema.map(|schema| vec![schema.to_string()]),
+            sql: sql.into(),
+            params: vec![],
+        }
+    }
+
+    async fn query_rows(
+        service: &DuckDbService,
+        space: &SpaceId,
+        sql: &str,
+    ) -> Result<Vec<Vec<DuckDbValue>>, DuckDbError> {
+        let result = service
+            .execute(
+                space,
+                "main",
+                DuckDbRequest::Query {
+                    sql: sql.into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/read".into(),
+                false,
+            )
+            .await?;
+        let DuckDbResponse::Query(query) = result.response else {
+            panic!("query required");
+        };
+        Ok(query.rows)
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn chunked_repository(
+        conn: &sea_orm::DatabaseConnection,
+        artifact_bytes: u64,
+    ) -> Arc<SeaOrmDatabaseArtifactRepository> {
+        Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes,
+                    account_bytes: 128 << 20,
+                },
+            )),
+        )
+    }
+
+    /// A valid DuckDB file of more than 1 MiB, written under the node's policy.
+    fn large_duckdb_file() -> Vec<u8> {
+        let scratch = TempDir::new().unwrap();
+        let path = scratch.path().join("large.duckdb");
+        {
+            let conn = storage::open_connection(Some(&path), "128MB").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE big AS SELECT i, md5(i::VARCHAR) AS s FROM range(200000) r(i); \
+                 CHECKPOINT;",
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 1 << 20);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn duckdb_database_names_cannot_leave_the_cache_directory() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("cache");
+        std::fs::create_dir_all(&base).unwrap();
+        let service = DuckDbService::new(
+            base.to_string_lossy().into_owned(),
+            0,
+            300,
+            "128MB".into(),
+            artifact_repository().await,
+        );
+        let space = test_space_id("traversal");
+        for name in ["../../escape", "..", "a/b", "a\\b", "", "x\0y", "../escape"] {
+            let executed = service
+                .execute(
+                    &space,
+                    name,
+                    write_request(
+                        "INSERT INTO t VALUES (1)",
+                        Some("CREATE TABLE t(i INTEGER)"),
+                    ),
+                    None,
+                    "tinycloud.duckdb/admin".into(),
+                    false,
+                )
+                .await;
+            assert!(
+                matches!(executed, Err(DuckDbError::PermissionDenied(_))),
+                "{name:?}: {executed:?}"
+            );
+            let imported = service.import_db(&space, name, b"x").await;
+            assert!(
+                matches!(imported, Err(DuckDbError::PermissionDenied(_))),
+                "{name:?}: {imported:?}"
+            );
+        }
+        assert_eq!(dir_entries(root.path()), vec!["cache".to_string()]);
+        assert!(dir_entries(&base.join(space.to_string())).is_empty());
+    }
+
+    #[tokio::test]
+    async fn duckdb_leftover_spill_directories_do_not_block_the_database() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let service = service(&cache, repo);
+        let space = test_space_id("spill-leftover");
+        let key = (space.to_string(), "main".to_string());
+        service
+            .execute(
+                &space,
+                "main",
+                write_request(
+                    "INSERT INTO t VALUES (1)",
+                    Some("CREATE TABLE t(i INTEGER)"),
+                ),
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        service.discard_local_state(&key).await.unwrap();
+        // What a killed process leaves: DuckDB's own spill directory, and one
+        // an evicted actor had moved aside for deletion.
+        let path = service.cache_path(&space, "main");
+        let spill = PathBuf::from(format!("{}.tmp", path.display()));
+        let aside = PathBuf::from(format!("{}.tmp.999999999.0", path.display()));
+        for dir in [&spill, &aside] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("duckdb_temp_storage-0.tmp"), b"x").unwrap();
+        }
+        assert_eq!(
+            query_rows(&service, &space, "SELECT count(*) FROM t")
+                .await
+                .unwrap(),
+            vec![vec![DuckDbValue::Integer(1)]]
+        );
+        assert!(!spill.exists() && !aside.exists());
+
+        std::fs::create_dir_all(&spill).unwrap();
+        std::fs::write(spill.join("duckdb_temp_storage-0.tmp"), b"x").unwrap();
+        service.discard_local_state(&key).await.unwrap();
+        assert!(dir_entries(path.parent().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn duckdb_import_that_cannot_be_finalized_leaves_no_staging_file() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let service = service(&cache, repo.clone());
+        let space = test_space_id("import-finalize");
+        let path = service.cache_path(&space, "main");
+        // A non-empty directory at the final path makes the rename fail.
+        std::fs::create_dir_all(path.join("blocker")).unwrap();
+        let imported = service
+            .import_db(&space, "main", &large_duckdb_file())
+            .await;
+        assert!(
+            matches!(imported, Err(DuckDbError::ImportError(_))),
+            "{imported:?}"
+        );
+        assert_eq!(dir_entries(path.parent().unwrap()), vec!["main.duckdb"]);
+        assert!(repo
+            .load_meta("duckdb", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_refused_and_invalid_imports_leave_no_files() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_refused_and_invalid_imports_leave_no_files",
+        )
+        .await
+        else {
+            return;
+        };
+        let bytes = large_duckdb_file();
+        let repo = chunked_repository(&fixture.conn, 1 << 20);
+        let cache = TempDir::new().unwrap();
+        let service = service(&cache, repo.clone());
+        let space = test_space_id("chunked-import-refused");
+        let dir = cache.path().join(space.to_string());
+
+        let refused = service.import_db(&space, "main", &bytes).await;
+        assert!(
+            matches!(refused, Err(DuckDbError::DatabaseSizeLimit)),
+            "{refused:?}"
+        );
+        assert!(dir_entries(&dir).is_empty(), "{:?}", dir_entries(&dir));
+        assert!(repo
+            .load_meta("duckdb", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .is_none());
+
+        let invalid = service
+            .import_db(&space, "main", b"not a duckdb file")
+            .await;
+        assert!(
+            matches!(invalid, Err(DuckDbError::ImportError(_))),
+            "{invalid:?}"
+        );
+        assert!(dir_entries(&dir).is_empty(), "{:?}", dir_entries(&dir));
+
+        assert!(query_rows(&service, &space, "SELECT count(*) FROM big")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_substituted_part_is_refused_before_open() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_substituted_part_is_refused_before_open",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = chunked_repository(&fixture.conn, 64 << 20);
+        let cache = TempDir::new().unwrap();
+        let service = service(&cache, repo.clone());
+        let victim = test_space_id("victim");
+        let other = test_space_id("other");
+        for (space, value) in [(&victim, "victim-secret"), (&other, "other-secret")] {
+            service
+                .execute(
+                    space,
+                    "main",
+                    write_request(
+                        &format!("INSERT INTO t VALUES ('{value}')"),
+                        Some("CREATE TABLE t(v VARCHAR)"),
+                    ),
+                    None,
+                    "tinycloud.duckdb/admin".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let victim_meta = repo
+            .load_meta("duckdb", &victim.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let other_meta = repo
+            .load_meta("duckdb", &other.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            victim_meta.checkpoint_size_bytes,
+            other_meta.checkpoint_size_bytes
+        );
+        let key = (victim.to_string(), "main".to_string());
+        service.discard_local_state(&key).await.unwrap();
+
+        // Storage-level substitution: the victim's chunks get the other
+        // tenant's bytes of the same length.
+        fixture
+            .conn
+            .execute_unprepared("ALTER TABLE artifact_chunk DISABLE TRIGGER USER")
+            .await
+            .unwrap();
+        let substituted = fixture
+            .conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE artifact_chunk v SET payload = o.payload \
+                 FROM database_artifact dv, database_artifact do_, artifact_chunk o \
+                 WHERE dv.space = $1 AND dv.name = 'main' AND v.part_id = dv.checkpoint_part_id \
+                 AND do_.space = $2 AND do_.name = 'main' \
+                 AND o.part_id = do_.checkpoint_part_id AND o.ordinal = v.ordinal",
+                [victim.to_string().into(), other.to_string().into()],
+            ))
+            .await
+            .unwrap()
+            .rows_affected();
+        fixture
+            .conn
+            .execute_unprepared("ALTER TABLE artifact_chunk ENABLE TRIGGER USER")
+            .await
+            .unwrap();
+        assert!(substituted >= 1);
+
+        let outcome = query_rows(&service, &victim, "SELECT v FROM t").await;
+        assert!(
+            matches!(&outcome, Err(DuckDbError::Internal(message)) if message.contains("content hash")),
+            "{outcome:?}"
+        );
+        let dir = cache.path().join(victim.to_string());
+        assert!(dir_entries(&dir).is_empty(), "{:?}", dir_entries(&dir));
+        assert!(!service.databases.contains_key(&key));
     }
 }
