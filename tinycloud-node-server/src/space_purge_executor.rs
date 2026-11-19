@@ -225,7 +225,15 @@ impl SpacePurgeExecutor<'_> {
                         .map_err(|_| PurgeExecutionError::Storage)?,
                     None => return Err(PurgeExecutionError::SqlStorageUnavailable),
                 };
-                Ok(kv && sql)
+                // Chunked checkpoint bytes are in PostgreSQL; see
+                // reap_artifact_parts for why they are erased in this phase.
+                let artifacts = tinycloud_core::space_purge_database::reap_artifact_parts(
+                    self.db,
+                    job,
+                    ARTIFACT_CHUNKS_PER_BATCH,
+                )
+                .await?;
+                Ok(kv && sql && artifacts)
             })
             .await?;
         if !empty {
@@ -246,6 +254,9 @@ impl SpacePurgeExecutor<'_> {
         })
     }
 }
+
+/// One `artifact_reap_one` statement each, at most 1 MiB of payload per chunk.
+const ARTIFACT_CHUNKS_PER_BATCH: usize = 256;
 
 async fn release_batch(db: &DatabaseConnection, job: &ClaimedPurge) -> Result<bool, DbErr> {
     Ok(db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
