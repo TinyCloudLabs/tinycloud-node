@@ -33,6 +33,19 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.11] - 2026-11-19
+
+Ships the changes merged since 1.26.10 (#631, #642), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **No database migration.** The migration sources are byte-identical to 1.26.10 (a comment edit from #631 in `m20260725_000000_request_path_indexes` is restored to its 1.26.10 text), so the deploy workflow's audited rollback can return to 1.26.10.
+
+### Changes
+
+- Revocation: a delegator can give its own delegatee an exact-CID grant to revoke exactly that delegation through `/revoke` (TC-3150, #642).
+- Read audits no longer write `parent_delegations` rows; they keep `actor`, `invocation` and `invoked_abilities` (TC-3259, #631).
+
 ## [1.26.10] - 2026-11-18
 
 Ships the changes merged since 1.26.9 (#611, #615, #622, #626, #627), detailed under [Unreleased] above.
