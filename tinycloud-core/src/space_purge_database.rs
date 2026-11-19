@@ -275,8 +275,10 @@ pub async fn owner_key_rows<C: ConnectionTrait>(conn: &C, owner: &str) -> Result
 }
 
 /// The gate before the `erased` record is published: `owner` (a canonical
-/// DID) has a `space_retirement` row under some key id, at least one purge
-/// job of that owner digest, every such job complete, and no live space.
+/// DID) has a `space_retirement` row under some key id, every purge job of
+/// that owner digest is complete, and no live space remains. An owner with
+/// no purge job at all (encryption networks but never a space here) passes:
+/// the signed retirement alone asks for erasure (Naomi 11-19, review N1).
 /// Returns the retirement. Jobs and retirements are matched under every
 /// configured key id, so a key rotation between them does not block erasure.
 ///
@@ -294,7 +296,7 @@ pub async fn owner_erasure_retirement<C: ConnectionTrait>(
     use tinycloud_auth::{identity::did_principal_matches, resource::SpaceId};
     let unavailable = |_| DbErr::Custom("owner digest unavailable".into());
     let mut retirement = None;
-    let (mut jobs, mut open) = (0_i64, 0_i64);
+    let mut open = 0_i64;
     for key_id in keys.key_ids() {
         let digest = keys
             .target_hmac(key_id, "owner", owner)
@@ -307,19 +309,18 @@ pub async fn owner_erasure_retirement<C: ConnectionTrait>(
         let row = conn
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT count(*) AS jobs, count(*) FILTER (WHERE phase<>'complete') AS open
-                 FROM space_purge_job WHERE owner_hmac=$1 AND hmac_key_id=$2",
+                "SELECT count(*) AS open FROM space_purge_job
+                 WHERE owner_hmac=$1 AND hmac_key_id=$2 AND phase<>'complete'",
                 [digest.into(), key_id.into()],
             ))
             .await?
             .ok_or_else(|| DbErr::Custom("count returned no row".into()))?;
-        jobs += row.try_get::<i64>("", "jobs")?;
         open += row.try_get::<i64>("", "open")?;
     }
     let Some(retirement) = retirement else {
         return Ok(None);
     };
-    if jobs == 0 || open != 0 {
+    if open != 0 {
         return Ok(None);
     }
     let candidates = conn

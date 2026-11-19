@@ -793,3 +793,89 @@ async fn postgres_owner_erasure_covers_every_stored_owner_spelling() {
         .await
         .unwrap();
 }
+
+/// A retired owner with encryption networks but no space here has no purge
+/// job, and the signed retirement alone opens the erasure gate (Naomi 11-19,
+/// #650 review N1). An owner who has not retired stays shut, and so does a
+/// retired owner with an open purge.
+#[tokio::test]
+async fn postgres_network_only_retired_owner_is_erasable() {
+    let Ok(url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!("purge_netonly_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = Database::connect(options).await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let keys = LedgerKeys::new(
+        "test".into(),
+        BTreeMap::from([("test".into(), vec![7; 32])]),
+    )
+    .unwrap();
+
+    network(&db, OWNER).await;
+    network(&db, OTHER_OWNER).await;
+    assert!(
+        owner_erasure_retirement(&db, &keys, OWNER)
+            .await
+            .unwrap()
+            .is_none(),
+        "not retired"
+    );
+    retire(&db, &keys, OWNER).await;
+    let retirement = owner_erasure_retirement(&db, &keys, OWNER)
+        .await
+        .unwrap()
+        .expect("retired, no purge job, no live space");
+    let erased = keys
+        .sign(
+            &retirement.hmac_key_id,
+            "owner",
+            &retirement.owner_hmac,
+            &retirement.retirement_id,
+            "erased",
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .unwrap();
+    let (path, body) = (erased.object_key().unwrap(), erased.to_bytes().unwrap());
+    let now = time::OffsetDateTime::now_utc();
+    assert_eq!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, OWNER, now)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(networks(&db, OWNER).await, [0; 5]);
+    assert_eq!(owner_key_rows(&db, OWNER).await.unwrap(), 0);
+    assert_eq!(networks(&db, OTHER_OWNER).await, [1; 5]);
+
+    // An open purge of a retired owner keeps the gate shut.
+    retire(&db, &keys, OTHER_OWNER).await;
+    exec(
+        &db,
+        "INSERT INTO space_purge_job(purge_id,space,tombstone_hmac,hmac_key_id,owner_hmac,accepted_at,phase,fence_generation,updated_at,next_attempt_at,attempt_count)
+         VALUES($1,$2,$3,'test',$4,now(),'database',1,now(),now(),0)",
+        vec![
+            uuid::Uuid::new_v4().to_string().into(),
+            OTHER.into(),
+            keys.target_hmac("test", "space", OTHER).unwrap().into(),
+            keys.target_hmac("test", "owner", OTHER_OWNER).unwrap().into(),
+        ],
+    )
+    .await;
+    assert!(owner_erasure_retirement(&db, &keys, OTHER_OWNER)
+        .await
+        .unwrap()
+        .is_none());
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
