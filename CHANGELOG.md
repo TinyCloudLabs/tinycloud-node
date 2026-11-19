@@ -36,6 +36,22 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.12] - 2026-11-19
+
+Ships the changes merged since 1.26.11 (#654, #659, #660), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **No database migration.** The migration sources are byte-identical to 1.26.11, so the deploy workflow's audited rollback can return to 1.26.11.
+- DuckDB clients that send their own `BEGIN`, `COMMIT` or `ROLLBACK` now get 403. The SDK's `transactional` batches are unchanged.
+
+### Changes
+
+- DuckDB: client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused with 403 at every tier; the node opens and ends every transaction itself (TC-3430, #660).
+- DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. `nextval` and `setval` count as writes. Line comments are parsed more strictly (TC-3035, TC-3430, #660).
+- The 503 body of a request that reached its deadline before its write began now asks for a new signature: "request_timeout: no change was applied; retry the request with a new signature" (TC-1997, #654).
+- Operations: a manual `Renewals switch` workflow reads, pauses or resumes scheduled renewals on the production nodes without an operator handling the admin secret. Runbook: `docs/runbooks/renewal-leases.md` (TC-3275, #659).
+
 ## [1.26.11] - 2026-11-19
 
 Ships the changes merged since 1.26.10 (#631, #642), detailed under [Unreleased] above.
