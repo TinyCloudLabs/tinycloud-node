@@ -269,6 +269,10 @@ pub struct BatchResponse {
 pub struct SqlExecutionResult {
     pub response: SqlResponse,
     pub write_targets: Vec<TouchedTables>,
+    /// TC-3123: `write_row_ids[i]` is the rowid the statement behind
+    /// `write_targets[i]` provably inserted (one single-table INSERT that
+    /// changed exactly one row). `None`, or a missing entry, means unknown.
+    pub write_row_ids: Vec<Option<i64>>,
 }
 
 /// Which part of a delegated caveat refused a request (TC-1791). `Write`,
@@ -368,7 +372,7 @@ pub enum SqlError {
     Busy(SqlBusyStage),
     /// The request deadline was reached before the request's write began, so
     /// nothing was applied (TC-1274).
-    #[error("request_timeout: no change was applied; retry the request")]
+    #[error("request_timeout: no change was applied; retry the request with a new signature")]
     RequestTimeout,
 }
 

@@ -497,8 +497,13 @@ async fn validate_with<C: ConnectionTrait>(
         // An owner may grant revocation of one exact stored delegation that
         // targets their space, without holding the target's signed bytes:
         // every non-root capability must be such an exact-CID revoke grant.
-        // The target's delegatee or delegator alone cannot issue one.
+        // TC-3150: the target's delegator may grant its own delegatee
+        // revocation of exactly that target, and no one else. The target's
+        // delegatee alone cannot issue one.
         (false, true) => {
+            if revocation::delegator_hands_back_revoke(db, delegation).await? {
+                return Ok(());
+            }
             for cap in &dependant_caps {
                 if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
                     return Err(DelegationError::MissingParents.into());
@@ -889,7 +894,9 @@ pub(crate) async fn precheck<C: ConnectionTrait>(
         return Ok(());
     }
     if delegation.parents.is_empty() {
-        if is_policy_root(&delegation.delegation) {
+        if is_policy_root(&delegation.delegation)
+            || revocation::delegator_hands_back_revoke(db, delegation).await?
+        {
             return Ok(());
         }
         for cap in &dependant_caps {

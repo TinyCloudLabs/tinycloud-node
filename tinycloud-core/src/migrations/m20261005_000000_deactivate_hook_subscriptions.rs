@@ -78,6 +78,9 @@ mod tests {
             callback_url: "https://hooks.example/callback".to_string(),
             encrypted_secret: vec![1, 2, 3],
             encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             secret_key_id: "primary".to_string(),
             active,
             created_at: "2026-04-09T00:00:00Z".to_string(),
@@ -112,6 +115,9 @@ mod tests {
             ]
             .map(|model| hook_subscription::ActiveModel {
                 encrypted_secret_format: Default::default(),
+                header_names_json: Default::default(),
+                encrypted_headers: Default::default(),
+                encrypted_headers_format: Default::default(),
                 ..hook_subscription::ActiveModel::from(model)
             }),
         )
