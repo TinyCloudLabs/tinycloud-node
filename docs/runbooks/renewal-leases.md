@@ -35,7 +35,7 @@ A failed scheduler pass logs `internal renewal scheduler pass failed` with a fix
 
 ### Renewals switch workflow (production)
 
-Step 1 of the renewals emergency-off is pausing the production nodes with the `Renewals switch` GitHub Actions workflow (`.github/workflows/renewals-switch.yml`). It makes the calls above with `PROD_TINYCLOUD_ADMIN_SECRET` from the `production` environment, so nobody reads or handles the secret. Run it only on Naomi's or Holden's GO.
+To pause or resume renewals on the production nodes, use the `Renewals switch` GitHub Actions workflow (`.github/workflows/renewals-switch.yml`). It makes the calls above with `PROD_TINYCLOUD_ADMIN_SECRET` from the `production` environment, so nobody reads or handles the secret. Run it only with an engineering lead's approval.
 
 ```sh
 # Read the switch on both nodes (host defaults to both).
