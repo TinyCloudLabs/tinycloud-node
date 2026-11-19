@@ -1041,7 +1041,11 @@ impl AuthGraphSnapshot {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Whether one cited proof reaches a parentless or owner-issued authority
+    pub(crate) fn is_parentless(&self, id: &Hash) -> bool {
+        self.delegations.contains_key(id) && self.parents.get(id).is_none_or(Vec::is_empty)
+    }
+
+    /// Whether one cited proof reaches an explicitly recognized authority
     /// through nodes whose abilities all cover the invoked capability.
     /// Results are memoized across branches and cited proofs; cycles, missing
     /// rows and budget overflow fail closed.
@@ -1069,11 +1073,10 @@ impl AuthGraphSnapshot {
             let valid = if let Some(row) = graph.delegation(&id) {
                 graph.abilities(&id).iter().any(covers)
                     && (is_authority(row)
-                        || graph.parents.get(&id).is_none_or(|parents| {
-                            parents.is_empty()
-                                || parents.iter().any(|parent| {
-                                    visit(graph, *parent, covers, is_authority, memo, visiting)
-                                })
+                        || graph.parents.get(&id).is_some_and(|parents| {
+                            parents.iter().any(|parent| {
+                                visit(graph, *parent, covers, is_authority, memo, visiting)
+                            })
                         }))
             } else {
                 false
@@ -1586,7 +1589,7 @@ mod tests {
                 for suffix in ["z", "b", "a"] {
                     abilities::ActiveModel {
                         delegation: Set(id),
-                        resource: Set(format!("tinycloud:did:key:actor:files/kv/{suffix}")
+                        resource: Set(format!("tinycloud:key:actor:files/kv/{suffix}")
                             .parse()
                             .unwrap()),
                         ability: Set(format!("tinycloud.kv/{action}").try_into().unwrap()),
@@ -1657,10 +1660,10 @@ mod tests {
         );
         for (resource, caveats) in [
             (
-                "tinycloud:did:key:actor:files/kv",
+                "tinycloud:key:actor:files/kv",
                 Caveats([("tenant".to_string(), serde_json::json!("a"))].into()),
             ),
-            ("tinycloud:did:key:actor:files/kv/doc", sql_caveats.clone()),
+            ("tinycloud:key:actor:files/kv/doc", sql_caveats.clone()),
         ] {
             abilities::ActiveModel {
                 delegation: Set(id),
@@ -1681,7 +1684,7 @@ mod tests {
         );
 
         let capability = crate::util::Capability {
-            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
             ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
             caveats: Caveats::default(),
         };
@@ -1807,7 +1810,7 @@ mod tests {
         use rand::{rngs::StdRng, Rng, SeedableRng};
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let capability = crate::util::Capability {
-            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
             ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
             caveats: Caveats::default(),
         };
@@ -1846,7 +1849,7 @@ mod tests {
                 .unwrap();
                 abilities::ActiveModel {
                     delegation: Set(*id),
-                    resource: Set("tinycloud:did:key:actor:files/kv".parse().unwrap()),
+                    resource: Set("tinycloud:key:actor:files/kv".parse().unwrap()),
                     ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
                     caveats: Set(Caveats::default()),
                 }
