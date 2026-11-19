@@ -913,7 +913,7 @@ impl AuthGraphSnapshot {
                     };
                     let state: String = row.try_get("", "lease_state")?;
                     let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
-                    if state != "active"
+                    if !matches!(state.as_str(), "active" | "stopped")
                         || lease_expiry.unix_timestamp() <= verifier_now
                         || row.try_get::<bool>("", "lease_revoked")?
                         || row.try_get::<String>("", "renewer_did")? != renewer_did
@@ -999,7 +999,7 @@ impl AuthGraphSnapshot {
         for (node, leases) in grouped {
             let active: Vec<_> = leases
                 .values()
-                .filter(|rows| rows[0].state == "active")
+                .filter(|rows| matches!(rows[0].state.as_str(), "active" | "stopped"))
                 .collect();
             if active.len() == 1 {
                 candidate_map.insert(node, active[0].clone());
@@ -1086,6 +1086,72 @@ impl AuthGraphSnapshot {
         starts
             .into_iter()
             .any(|id| visit(self, id, &covers, &is_authority, &mut memo, &mut visiting))
+    }
+
+    /// Require an explicit positive endpoint; parentless authority is not an
+    /// outside-reader proof. Every selected node must be covered and allowed.
+    pub(crate) fn has_covering_path_to(
+        &self,
+        starts: impl IntoIterator<Item = Hash>,
+        covers: impl Fn(&abilities::Model) -> bool,
+        allowed: impl Fn(&delegation::Model) -> bool,
+        endpoint: impl Fn(&delegation::Model) -> bool,
+    ) -> bool {
+        fn visit<
+            F: Fn(&abilities::Model) -> bool,
+            A: Fn(&delegation::Model) -> bool,
+            E: Fn(&delegation::Model) -> bool,
+        >(
+            graph: &AuthGraphSnapshot,
+            id: Hash,
+            covers: &F,
+            allowed: &A,
+            endpoint: &E,
+            memo: &mut HashMap<Hash, bool>,
+            visiting: &mut HashSet<Hash>,
+        ) -> Option<bool> {
+            if visiting.contains(&id) || memo.len() + visiting.len() >= MAX_CHAIN_TRAVERSAL_NODES {
+                return None;
+            }
+            if let Some(result) = memo.get(&id) {
+                return Some(*result);
+            }
+            let row = graph.delegation(&id)?;
+            if graph.is_revoked(&id) || !allowed(row) || !graph.abilities(&id).iter().any(covers) {
+                return Some(false);
+            }
+            if endpoint(row) {
+                return Some(true);
+            }
+            visiting.insert(id);
+            let mut found = false;
+            for parent in graph.parents.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+                // Evaluate every eligible branch so a cycle cannot be hidden
+                // by an earlier successful branch.
+                found |= visit(graph, *parent, covers, allowed, endpoint, memo, visiting)?;
+            }
+            visiting.remove(&id);
+            memo.insert(id, found);
+            Some(found)
+        }
+        let mut memo = HashMap::new();
+        let mut visiting = HashSet::new();
+        let mut found = false;
+        for start in starts {
+            match visit(
+                self,
+                start,
+                &covers,
+                &allowed,
+                &endpoint,
+                &mut memo,
+                &mut visiting,
+            ) {
+                Some(result) => found |= result,
+                None => return false,
+            }
+        }
+        found
     }
 
     pub(crate) fn is_revoked(&self, id: &Hash) -> bool {
@@ -2198,3 +2264,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod retirement_path_tests;

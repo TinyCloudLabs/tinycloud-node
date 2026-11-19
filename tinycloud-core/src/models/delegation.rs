@@ -805,7 +805,7 @@ async fn validate_with<C: ConnectionTrait>(
     }
 }
 
-fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
+pub(crate) fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
     let TinyCloudDelegation::Ucan(ucan) = delegation else {
         return false;
     };

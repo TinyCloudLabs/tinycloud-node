@@ -1,6 +1,8 @@
 #[cfg(all(feature = "renewal-test-clock", not(debug_assertions)))]
 compile_error!("renewal-test-clock is restricted to debug harness builds");
 
+pub mod control;
+
 #[cfg(test)]
 #[path = "renewal/registration_tests.rs"]
 mod registration_tests;
@@ -982,7 +984,7 @@ async fn register_lease_at<C: ConnectionTrait>(
                     ],
                 )).await?;
             }
-        } else if old_state == "active" {
+        } else if matches!(old_state.as_str(), "active" | "stopped") {
             return Err(RenewalStoreError::LeaseUnavailable);
         } else if old_state != "expired" {
             return Err(RenewalStoreError::InvalidInput);
@@ -1043,7 +1045,9 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
                 "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
                 [
                     Value::Bytes(Some(Box::new(Vec::<u8>::from(request.replay_hash)))),
-                    Value::TimeDateTime(Some(Box::new(db_datetime(request.replay_expires_at)?))),
+                    Value::TimeDateTimeWithTimeZone(Some(Box::new(unix_time(
+                        request.replay_expires_at,
+                    )?))),
                 ],
             ))
             .await

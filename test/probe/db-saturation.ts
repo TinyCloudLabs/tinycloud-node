@@ -26,8 +26,10 @@ export const LAG_SEC = 90;
 
 export type PoolRule = {
   metric: string;
-  /** Every key must equal the series label; {} matches every series of the metric. */
+  /** Every key must equal the series' `labels` map entry; {} matches every series of the metric. */
   series_labels: Record<string, string>;
+  /** Optional: must equal the series' top-level `label` string (usw reports the connection state there, e.g. "active"). */
+  series_label?: string;
   op: "gt" | "gte";
   threshold: number;
 };
@@ -50,7 +52,13 @@ export type Target = {
 
 /** [unix seconds, value or null when PlanetScale has no sample for that minute]. */
 export type Point = [number, number | null];
-export type Series = { metric: string; labels: Record<string, string>; points: Point[] };
+export type Series = {
+  metric: string;
+  /** Top-level `label` string of the series, when PlanetScale sends one. */
+  label?: string;
+  labels: Record<string, string>;
+  points: Point[];
+};
 
 export type Status = "ok" | "breach" | "unknown" | "config";
 export type Verdict = { status: Status; detail: string };
@@ -77,6 +85,9 @@ function parsePool(v: unknown, at: string): PoolRule {
     throw new ConfigFault(`${at}: pool.series_labels must map strings to strings`);
   }
   if (v.op !== "gt" && v.op !== "gte") throw new ConfigFault(`${at}: pool.op must be "gt" or "gte"`);
+  if (v.series_label !== undefined && (typeof v.series_label !== "string" || v.series_label.trim() === "")) {
+    throw new ConfigFault(`${at}: pool.series_label must be a non-empty string`);
+  }
   const threshold = num(v, "threshold", `${at}.pool`);
   if (threshold < 0 || (v.op === "gte" && threshold === 0)) {
     throw new ConfigFault(`${at}: pool.threshold must be >= 0, and > 0 under gte (0 breaches an idle database)`);
@@ -84,6 +95,7 @@ function parsePool(v: unknown, at: string): PoolRule {
   return {
     metric: str(v, "metric", `${at}.pool`),
     series_labels: labels as Record<string, string>,
+    ...(v.series_label === undefined ? {} : { series_label: v.series_label }),
     op: v.op,
     threshold,
   };
@@ -125,6 +137,11 @@ export function loadTargets(raw: unknown): Target[] {
   });
 }
 
+/** Names of the target's secrets that are unset or blank. Any missing secret is a failure: a silent skip would hide saturation. */
+export function missingSecrets(t: Target, env: Record<string, string | undefined>): string[] {
+  return [t.token_secret, t.heartbeat_secret].filter((name) => !env[name]?.trim());
+}
+
 /** Branch list endpoint. Called once per run to find the production branch. */
 export function branchesUrl(t: Target): string {
   const enc = encodeURIComponent;
@@ -163,15 +180,15 @@ export function parseSeries(body: unknown): Series[] {
       return [p[0], typeof value === "number" && Number.isFinite(value) ? value : null];
     });
     const labels = Object.fromEntries(Object.entries(s.labels).map(([k, v]) => [k, String(v)]));
-    return { metric: s.metric, labels, points };
+    return { metric: s.metric, ...(typeof s.label === "string" ? { label: s.label } : {}), labels, points };
   });
 }
 
 type RuleResult = { status: "ok" | "breach" | "unknown"; detail: string };
 
 function labelText(s: Series): string {
-  const entries = Object.entries(s.labels);
-  return entries.length === 0 ? "all" : entries.map(([k, v]) => `${k}=${v}`).join(",");
+  const parts = [...(s.label ? [s.label] : []), ...Object.entries(s.labels).map(([k, v]) => `${k}=${v}`)];
+  return parts.length === 0 ? "all" : parts.join(",");
 }
 
 function evaluateRule(args: {
@@ -224,7 +241,10 @@ export function evaluateTarget(t: Target, series: Series[], nowSec: number): Ver
   const poolRes = evaluateRule({
     name: `pool${comparator}${pool.threshold}`,
     series: series.filter(
-      (s) => s.metric === pool.metric && Object.entries(pool.series_labels).every(([k, v]) => s.labels[k] === v),
+      (s) =>
+        s.metric === pool.metric &&
+        (pool.series_label === undefined || s.label === pool.series_label) &&
+        Object.entries(pool.series_labels).every(([k, v]) => s.labels[k] === v),
     ),
     above: (v) => (pool.op === "gt" ? v > pool.threshold : v >= pool.threshold),
     t,
