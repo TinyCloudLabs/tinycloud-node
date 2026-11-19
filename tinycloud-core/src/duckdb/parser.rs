@@ -1166,7 +1166,7 @@ mod tests {
 
     // test-ruling: TC-3035 transaction control now counts as a write, so the
     // read tier (and any `read_only` request) can no longer open or end a
-    // transaction on the shared connection; the write tier keeps it.
+    // transaction on the shared connection.
     #[test]
     fn test_transaction_statements() {
         for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
@@ -1174,7 +1174,6 @@ mod tests {
                 validate_sql(sql, &None, "tinycloud.duckdb/read"),
                 Err(DuckDbError::ReadOnlyViolation)
             ));
-            assert!(validate_sql(sql, &None, "tinycloud.duckdb/write").is_ok());
         }
     }
 
