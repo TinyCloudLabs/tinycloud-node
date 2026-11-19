@@ -376,8 +376,8 @@ pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
     .await
 }
 
-/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
-#[cfg(test)]
+/// `authorize_holder`'s checks against a caller-loaded snapshot: the per-key
+/// read check for KV value details (TC-2492), and a test oracle.
 pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     db: &C,
     holder: &str,

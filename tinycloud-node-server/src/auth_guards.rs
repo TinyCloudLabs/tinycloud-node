@@ -104,12 +104,15 @@ struct KvListResponse(
     Option<Vec<KvValueDetails>>,
 );
 
-/// One `kv/list` entry when the request asked for entries (TC-2492).
+/// One `kv/list` entry when the request asked for entries (TC-2492). Size
+/// and write time are absent when unknown or not visible to the caller.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KvListEntry {
     key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
 }
 

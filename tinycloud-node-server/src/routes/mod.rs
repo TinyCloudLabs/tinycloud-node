@@ -4656,6 +4656,7 @@ mod tests {
     mod delegation_issued_query;
     mod encryption_keys;
     mod key_delete;
+    mod kv_value_details_visibility;
     mod operation_retry;
     mod revocation_codes;
     mod revocation_scope;
@@ -12841,10 +12842,10 @@ mod tests {
         Ok(())
     }
 
-    /// TC-2492: list entries under a prefix-restricted, list-only grant stay
+    /// TC-2492: list entries under a prefix-restricted list+get grant stay
     /// inside the grant, the returned page and the space, and stay aligned
-    /// with the keys across cursor pages. A list grant answers no head, and a
-    /// batch head carries no size header.
+    /// with the keys across cursor pages. A grant without `kv/metadata`
+    /// answers no head, and a batch head carries no size header.
     #[tokio::test]
     async fn kv_list_entries_stay_in_the_grant_page_and_space() -> Result<()> {
         use rocket::http::{Header, Status};
@@ -12892,7 +12893,10 @@ mod tests {
         }
 
         let grant = fixture
-            .device_grant("tc2492-list-only", &["tinycloud.kv/list"])
+            .device_grant(
+                "tc2492-list-get",
+                &["tinycloud.kv/list", "tinycloud.kv/get"],
+            )
             .await?;
 
         let mut entries = Vec::new();
@@ -12954,7 +12958,7 @@ mod tests {
             );
         }
 
-        // A list-only grant answers no head.
+        // A grant without kv/metadata answers no head.
         let header = fixture.device_invocation(&[("notes/a", "tinycloud.kv/metadata")], grant)?;
         let reply = fixture.dispatch(header, &[]).await;
         assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);

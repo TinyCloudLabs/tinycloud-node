@@ -3581,11 +3581,11 @@ where
                         options.list_cursor.as_ref(),
                     )
                     .await?;
-                    let details = if options.list_entries {
-                        Some(kv_list_details(&self.conn, &space, &list).await?)
-                    } else {
-                        None
-                    };
+                    // A list in a write's invocation (which `/invoke` refuses)
+                    // reports no size or write time (TC-2492).
+                    let details = options
+                        .list_entries
+                        .then(|| vec![KvValueDetails::default(); list.len()]);
                     InvocationOutcome::KvList(list, truncated, None, details)
                 }
                 PendingOutcome::CapabilitiesRead(space) => {
@@ -3871,7 +3871,26 @@ where
                     )
                     .await?;
                     let details = if options.list_entries {
-                        Some(kv_list_details(&self.conn, space, &list).await?)
+                        let visible = kv_details_visible(
+                            &self.conn,
+                            &invocation.0,
+                            &auth_graph,
+                            now,
+                            space,
+                            &list,
+                        )
+                        .await?;
+                        let mut details = if visible.contains(&true) {
+                            kv_list_details(&self.conn, space, &list).await?
+                        } else {
+                            vec![KvValueDetails::default(); list.len()]
+                        };
+                        for (details, visible) in details.iter_mut().zip(visible) {
+                            if !visible {
+                                *details = KvValueDetails::default();
+                            }
+                        }
+                        Some(details)
                     } else {
                         None
                     };
@@ -3882,8 +3901,21 @@ where
                         Some((rows, _)) => rows.next().flatten(),
                         None => kv_lookup.entity(&self.conn, space, path).await?,
                     };
+                    let visible = match row {
+                        Some(_) if lone_capability => kv_details_visible(
+                            &self.conn,
+                            &invocation.0,
+                            &auth_graph,
+                            now,
+                            space,
+                            std::slice::from_ref(path),
+                        )
+                        .await?
+                        .contains(&true),
+                        _ => false,
+                    };
                     let metadata = match row {
-                        Some(entry) if lone_capability => Some(
+                        Some(entry) if visible => Some(
                             kv_metadata_details(&self.conn, &self.storage, space, entry).await?,
                         ),
                         Some(entry) => {
@@ -5533,6 +5565,57 @@ async fn kv_list_details<C: ConnectionTrait>(
             None => KvValueDetails::default(),
         })
         .collect())
+}
+
+/// Whether the invoker may see each of `paths`' size and write time
+/// (TC-2492): only as the space's owner, or holding an unexpired, unrevoked
+/// `tinycloud.kv/get` that covers that key through the delegations the
+/// invocation cites. Checked per key against `graph`, the snapshot the
+/// invocation was authorized on, by the rules `/invoke` authorizes with: a
+/// `kv/list` or `kv/metadata` grant alone reveals neither.
+async fn kv_details_visible<C: ConnectionTrait>(
+    db: &C,
+    invocation: &crate::util::InvocationInfo,
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    now: OffsetDateTime,
+    space: &SpaceId,
+    paths: &[Path],
+) -> Result<Vec<bool>, DbErr> {
+    let ability: crate::types::Ability = "tinycloud.kv/get"
+        .to_string()
+        .try_into()
+        .expect("tinycloud.kv/get is a valid ability");
+    let service: tinycloud_auth::resource::Service = "kv".parse().expect("kv is a valid service");
+    let mut visible = Vec::with_capacity(paths.len());
+    for path in paths {
+        let capability = crate::util::Capability {
+            resource: Resource::TinyCloud(space.clone().to_resource(
+                service.clone(),
+                Some(path.clone()),
+                None,
+                None,
+            )),
+            ability: ability.clone(),
+            caveats: Default::default(),
+        };
+        visible.push(
+            match invocation::authorize_holder_with_graph(
+                db,
+                &invocation.invoker,
+                std::slice::from_ref(&capability),
+                &invocation.parents,
+                now,
+                graph,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(invocation::Error::Db(error)) => return Err(error),
+                Err(invocation::Error::InvalidInvocation(_)) => false,
+            },
+        );
+    }
+    Ok(visible)
 }
 
 async fn get_kv_entity<C: ConnectionTrait>(
