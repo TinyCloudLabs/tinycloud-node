@@ -1,3 +1,27 @@
+#[cfg(all(feature = "renewal-test-clock", not(debug_assertions)))]
+compile_error!("renewal-test-clock is restricted to debug harness builds");
+
+pub mod control;
+
+#[cfg(test)]
+#[path = "renewal/registration_tests.rs"]
+mod registration_tests;
+
+/// Renewal verifier time. The optional file clock is only compiled into harness builds.
+pub fn verifier_now() -> time::OffsetDateTime {
+    #[cfg(feature = "renewal-test-clock")]
+    if let Some(path) = std::env::var_os("TINYCLOUD_RENEWAL_TEST_CLOCK") {
+        let seconds = std::fs::read_to_string(path)
+            .expect("read renewal test clock")
+            .trim()
+            .parse::<i64>()
+            .expect("renewal test clock is Unix seconds");
+        return time::OffsetDateTime::from_unix_timestamp(seconds)
+            .expect("renewal test clock timestamp is representable");
+    }
+    time::OffsetDateTime::now_utc()
+}
+
 use crate::hash::Hash;
 use crate::keys::StaticSecret;
 use sea_orm::sea_query::Value;
@@ -52,6 +76,84 @@ pub enum RenewalStoreError {
     Unauthorized,
     #[error("renewal input is invalid")]
     InvalidInput,
+    #[error("renewals are paused node-wide")]
+    Paused,
+}
+
+/// The node-wide renewal STOP-ALL switch (`renewal_switch`, one row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenewalSwitch {
+    pub paused: bool,
+    /// Unix seconds of the last change; `None` until first set.
+    pub changed_at: Option<i64>,
+}
+
+/// Read the switch. Inside a stamp transaction pass `lock = true`: on
+/// PostgreSQL the row is held `FOR SHARE` until commit, so a concurrent pause
+/// waits for an in-flight stamp, and no stamp commits after a pause commits.
+/// SQLite write transactions already hold the database write lock.
+async fn read_renewal_switch<C: ConnectionTrait>(
+    db: &C,
+    lock: bool,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    let backend = db.get_database_backend();
+    let query = match (backend, lock) {
+        (DatabaseBackend::Postgres, true) => {
+            "SELECT paused, changed_at FROM renewal_switch WHERE id = 1 FOR SHARE"
+        }
+        (DatabaseBackend::MySql, _) => return Err(RenewalStoreError::InvalidInput),
+        _ => "SELECT paused, changed_at FROM renewal_switch WHERE id = 1",
+    };
+    let row = db
+        .query_one(Statement::from_string(backend, query))
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    Ok(RenewalSwitch {
+        paused: row.try_get("", "paused")?,
+        changed_at: row.try_get("", "changed_at")?,
+    })
+}
+
+/// Current state of the node-wide renewal switch.
+pub async fn renewal_switch<C: ConnectionTrait>(
+    db: &C,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    read_renewal_switch(db, false).await
+}
+
+/// Pause or resume all scheduled renewals. Lease rows are untouched;
+/// `changed_at` moves only when the state actually changes.
+pub async fn set_renewals_paused<C: TransactionTrait + ConnectionTrait>(
+    conn: &C,
+    paused: bool,
+    now: i64,
+) -> Result<RenewalSwitch, RenewalStoreError> {
+    let tx = crate::db::begin_write_transaction(conn, None).await?;
+    let result = async {
+        tx.execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            "UPDATE renewal_switch SET paused = $1, changed_at = $2 WHERE id = 1 AND paused <> $3",
+            [
+                Value::Bool(Some(paused)),
+                Value::BigInt(Some(now)),
+                Value::Bool(Some(paused)),
+            ],
+        ))
+        .await?;
+        read_renewal_switch(&tx, false).await
+    }
+    .await;
+    match result {
+        Ok(switch) => {
+            tx.commit().await?;
+            Ok(switch)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 /// Stamp issue request identity; signed content and bounds are computed in core.
@@ -434,13 +536,7 @@ pub async fn lease_for_original<C: ConnectionTrait>(
     original_cid: &str,
     identity: &RenewalNodeIdentity,
 ) -> Result<Option<LeaseRecord>, RenewalStoreError> {
-    lease_for_original_at(
-        db,
-        original_cid,
-        OffsetDateTime::now_utc().unix_timestamp(),
-        identity,
-    )
-    .await
+    lease_for_original_at(db, original_cid, verifier_now().unix_timestamp(), identity).await
 }
 
 async fn lease_for_original_at<C: ConnectionTrait>(
@@ -498,7 +594,7 @@ pub async fn active_leases_for_current_epoch<C: ConnectionTrait>(
     identity: &RenewalNodeIdentity,
 ) -> Result<Vec<LeaseRecord>, RenewalStoreError> {
     let backend = db.get_database_backend();
-    let verifier_now = OffsetDateTime::now_utc().unix_timestamp();
+    let verifier_now = verifier_now().unix_timestamp();
     let now = db_datetime(verifier_now)?;
     let epoch = i64::try_from(identity.epoch).map_err(|_| RenewalStoreError::InvalidInput)?;
     let rows = db
@@ -537,7 +633,7 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
         invocation,
         original_cid,
         identity,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verifier_now().unix_timestamp(),
     )
     .await
 }
@@ -736,6 +832,9 @@ fn live_chain_effective_ends(
     Ok(ends)
 }
 
+/// Register a renewal lease inside the caller's transaction. Signatures in
+/// `verified` (the lease's, its stored original's) were checked before the
+/// transaction by [`preverify_lease`] and are not checked again (TC-2986).
 pub(crate) async fn register_lease<C: ConnectionTrait>(
     tx: &C,
     lease_event: &crate::events::Delegation,
@@ -743,19 +842,22 @@ pub(crate) async fn register_lease<C: ConnectionTrait>(
     renewer_epoch: u64,
     stable_node_did: &str,
     encryption: Option<&crate::encryption::ColumnEncryption>,
+    verified: &crate::db::PreVerified,
 ) -> Result<(), RenewalStoreError> {
-    register_lease_at(
+    register_lease_checked(
         tx,
         lease_event,
         renewal_seed,
         renewer_epoch,
         stable_node_did,
         encryption,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verified,
+        verifier_now().unix_timestamp(),
     )
     .await
 }
 
+#[cfg(test)]
 async fn register_lease_at<C: ConnectionTrait>(
     tx: &C,
     lease_event: &crate::events::Delegation,
@@ -765,21 +867,52 @@ async fn register_lease_at<C: ConnectionTrait>(
     encryption: Option<&crate::encryption::ColumnEncryption>,
     now: i64,
 ) -> Result<(), RenewalStoreError> {
-    let lease_bytes = lease_event.serialized_bytes();
-    let lease = signed_delegation_info(lease_bytes)?;
-    verify_signed_signature(&lease).await?;
+    register_lease_checked(
+        tx,
+        lease_event,
+        renewal_seed,
+        renewer_epoch,
+        stable_node_did,
+        encryption,
+        &crate::db::PreVerified::default(),
+        now,
+    )
+    .await
+}
+
+/// Check the stored original a renewal lease renews, on `db`, before the
+/// lease's transaction (TC-2986): it must be stored, match its address and
+/// verify, as the transaction requires. Returns its content hash. The
+/// lease's own signature is checked by the caller.
+pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
+    db: &C,
+    lease_event: &crate::events::Delegation,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<Hash, RenewalStoreError> {
     let original_cid =
         lease_original_from_signed(lease_event)?.ok_or(RenewalStoreError::Unauthorized)?;
-    let (original_cid, original) = canonical_cid(&original_cid)?;
-    let lease_hash = crate::hash::hash(lease_bytes);
+    let (_, original) = canonical_cid(&original_cid)?;
+    let (original_bytes, _) = stored_original(db, original, encryption)
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
+    verify_signed_signature(&signed_delegation_info(&original_bytes)?).await?;
+    Ok(original)
+}
 
-    let lease = &lease;
-
-    let original_row = tx.query_one(Statement::from_sql_and_values(
-        tx.get_database_backend(),
+/// The stored original delegation `original` addresses, decrypted and checked
+/// against its address, with its graph row; `None` when it is not stored.
+async fn stored_original<C: ConnectionTrait>(
+    db: &C,
+    original: Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<Option<(Vec<u8>, sea_orm::QueryResult)>, RenewalStoreError> {
+    let Some(original_row) = db.query_one(Statement::from_sql_and_values(
+        db.get_database_backend(),
         "SELECT serialization, serialization_format, delegator, delegatee, expiry FROM delegation WHERE id = $1",
         [Value::Bytes(Some(Box::new(Vec::<u8>::from(original))))],
-    )).await?.ok_or(RenewalStoreError::InvalidInput)?;
+    )).await? else {
+        return Ok(None);
+    };
     let stored_bytes: Vec<u8> = original_row.try_get("", "serialization")?;
     let stored_format: i16 = original_row.try_get("", "serialization_format")?;
     let original_id_bytes = Vec::<u8>::from(original);
@@ -793,8 +926,39 @@ async fn register_lease_at<C: ConnectionTrait>(
     if crate::hash::hash(&original_bytes) != original {
         return Err(RenewalStoreError::InvalidInput);
     }
+    Ok(Some((original_bytes, original_row)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_lease_checked<C: ConnectionTrait>(
+    tx: &C,
+    lease_event: &crate::events::Delegation,
+    renewal_seed: [u8; 32],
+    renewer_epoch: u64,
+    stable_node_did: &str,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+    verified: &crate::db::PreVerified,
+    now: i64,
+) -> Result<(), RenewalStoreError> {
+    let lease_bytes = lease_event.serialized_bytes();
+    let lease = signed_delegation_info(lease_bytes)?;
+    let lease_hash = crate::hash::hash(lease_bytes);
+    if !verified.contains(&lease_hash) {
+        verify_signed_signature(&lease).await?;
+    }
+    let original_cid =
+        lease_original_from_signed(lease_event)?.ok_or(RenewalStoreError::Unauthorized)?;
+    let (original_cid, original) = canonical_cid(&original_cid)?;
+
+    let lease = &lease;
+
+    let (original_bytes, original_row) = stored_original(tx, original, encryption)
+        .await?
+        .ok_or(RenewalStoreError::InvalidInput)?;
     let original_info = signed_delegation_info(&original_bytes)?;
-    verify_signed_signature(&original_info).await?;
+    if !verified.contains(&original) {
+        verify_signed_signature(&original_info).await?;
+    }
     let graph_delegator: String = original_row.try_get("", "delegator")?;
     let graph_delegatee: String = original_row.try_get("", "delegatee")?;
     let graph_expiry: Option<OffsetDateTime> = original_row.try_get("", "expiry")?;
@@ -905,11 +1069,18 @@ async fn register_lease_at<C: ConnectionTrait>(
         ],
     )).await?;
     if let Some(row) = existing {
+        // Renewal metadata is stored at whole-second precision.
         let same = row.try_get::<String>("", "grantor")? == lease.delegator
             && row.try_get::<String>("", "renewer_did")? == renewer_did
             && row.try_get::<i64>("", "renewer_epoch")? == renewer_epoch as i64
-            && row.try_get::<OffsetDateTime>("", "lease_expiry")? == lease_expiry
-            && row.try_get::<OffsetDateTime>("", "original_expiry")? == original_expiry
+            && row
+                .try_get::<OffsetDateTime>("", "lease_expiry")?
+                .unix_timestamp()
+                == lease_expiry.unix_timestamp()
+            && row
+                .try_get::<OffsetDateTime>("", "original_expiry")?
+                .unix_timestamp()
+                == original_expiry.unix_timestamp()
             && row.try_get::<i64>("", "period_seconds")? == period
             && row.try_get::<Vec<u8>>("", "audience_public_key")? == audience_public_key;
         return if same {
@@ -959,7 +1130,7 @@ async fn register_lease_at<C: ConnectionTrait>(
                     ],
                 )).await?;
             }
-        } else if old_state == "active" {
+        } else if matches!(old_state.as_str(), "active" | "stopped") {
             return Err(RenewalStoreError::LeaseUnavailable);
         } else if old_state != "expired" {
             return Err(RenewalStoreError::InvalidInput);
@@ -995,7 +1166,7 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
         request,
         secret,
         identity,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        verifier_now().unix_timestamp(),
     )
     .await
 }
@@ -1010,6 +1181,9 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
     let (_, original) = canonical_cid(&request.original_cid)?;
     let tx = crate::db::begin_write_transaction(conn, None).await?;
     let result = async {
+        if read_renewal_switch(&tx, true).await?.paused {
+            return Err(RenewalStoreError::Paused);
+        }
         lock_original(&tx, &original).await?;
         if request.replay_expires_at <= now {
             return Err(RenewalStoreError::InvalidInput);
@@ -1020,7 +1194,9 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
                 "INSERT INTO invocation_replay (content_hash, expires_at) VALUES ($1, $2)",
                 [
                     Value::Bytes(Some(Box::new(Vec::<u8>::from(request.replay_hash)))),
-                    Value::TimeDateTime(Some(Box::new(db_datetime(request.replay_expires_at)?))),
+                    Value::TimeDateTimeWithTimeZone(Some(Box::new(unix_time(
+                        request.replay_expires_at,
+                    )?))),
                 ],
             ))
             .await
@@ -1105,8 +1281,17 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         now,
     )
     .await?;
-    if snapshot.delegation(&original).and_then(|row| row.expiry) != Some(original_expiry)
-        || snapshot.delegation(&lease).and_then(|row| row.expiry) != Some(lease_expiry)
+    // Compare with the precision stored by register_lease_at; caps remain floored.
+    if snapshot
+        .delegation(&original)
+        .and_then(|row| row.expiry)
+        .map(|expiry| expiry.unix_timestamp())
+        != Some(original_expiry.unix_timestamp())
+        || snapshot
+            .delegation(&lease)
+            .and_then(|row| row.expiry)
+            .map(|expiry| expiry.unix_timestamp())
+            != Some(lease_expiry.unix_timestamp())
     {
         return Err(RenewalStoreError::InvalidInput);
     }
@@ -1324,8 +1509,10 @@ async fn status_authorized<C: ConnectionTrait>(
     )
 }
 
-/// Read-only, non-authoritative history guarded by per-delegation status rules.
-pub async fn renewal_history<C: ConnectionTrait>(
+/// Read-only, non-authoritative history guarded by original status rights.
+/// Call only inside the status snapshot after evaluating the original's status
+/// decision, including its revocation state, on the same connection.
+pub(crate) async fn renewal_history<C: ConnectionTrait>(
     db: &C,
     original_cid: &str,
     invoker: &str,
@@ -1337,6 +1524,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
     if !status_authorized(db, invoker, proofs, original_id).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
+    let canonical_original_cid = original_id.to_cid(0x55).to_string();
     let rows = db.query_all(Statement::from_sql_and_values(
         db.get_database_backend(),
         "SELECT s.cid, s.lease_cid, s.generation, s.previous_stamp_cid, s.new_end, s.signed_bytes, s.signature FROM renewal_stamp s WHERE s.original_canonical = $1 ORDER BY s.lease_cid, s.generation",
@@ -1347,7 +1535,14 @@ pub async fn renewal_history<C: ConnectionTrait>(
         let cid = Hash::try_from(row.try_get::<Vec<u8>>("", "cid")?).map_err(DbErr::from)?;
         let lease =
             Hash::try_from(row.try_get::<Vec<u8>>("", "lease_cid")?).map_err(DbErr::from)?;
-        if !status_authorized(db, invoker, proofs, lease).await? {
+        // The enclosing status snapshot authorizes the original, including
+        // its revocation state. Lease-party rights do not gate its stamps.
+        let signed_bytes: Vec<u8> = row.try_get("", "signed_bytes")?;
+        let Ok(signed) = serde_ipld_dagcbor::from_slice::<CanonicalRenewalStamp<'_>>(&signed_bytes)
+        else {
+            continue;
+        };
+        if signed.unsigned.original_cid != canonical_original_cid {
             continue;
         }
         let previous = Hash::try_from(row.try_get::<Vec<u8>>("", "previous_stamp_cid")?)
@@ -1359,7 +1554,7 @@ pub async fn renewal_history<C: ConnectionTrait>(
             new_end: new_end.unix_timestamp(),
             previous_stamp_cid: previous.to_cid(0x55).to_string(),
             generation: row.try_get::<i64>("", "generation")? as u64,
-            signed_bytes: row.try_get("", "signed_bytes")?,
+            signed_bytes,
             signature: row.try_get("", "signature")?,
         });
     }
@@ -2197,5 +2392,176 @@ mod tests {
             Some((original, renewed_end))
         );
         tx.rollback().await.unwrap();
+    }
+
+    /// Node identity plus a stamp request for the frozen lease fixture. The
+    /// switch is the first statement of the stamp transaction, so a paused
+    /// refusal needs no lease rows.
+    async fn switch_test_stamp<C: TransactionTrait + ConnectionTrait>(
+        db: &C,
+        now: i64,
+    ) -> (StaticSecret, RenewalNodeIdentity, StampIssue) {
+        let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+        let (renewer_did, epoch, _) =
+            initialize_renewal_identity(db, secret.derive_key(RENEWER_KEY_CONTEXT))
+                .await
+                .unwrap();
+        let identity = RenewalNodeIdentity {
+            stable_node_did: secret.node_did(),
+            renewer_did,
+            epoch,
+        };
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+        ))
+        .unwrap();
+        let token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
+            fixture["originalToken"].as_str().unwrap(),
+        )
+        .unwrap();
+        let request = StampIssue {
+            invocation: crate::util::InvocationInfo::try_from(token).unwrap(),
+            original_cid: "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4".to_owned(),
+            lease_cid: "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq".to_owned(),
+            replay_hash: hash(b"paused switch request"),
+            replay_expires_at: now + 60,
+        };
+        (secret, identity, request)
+    }
+
+    async fn row_count<C: ConnectionTrait>(db: &C, table: &str) -> i64 {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT COUNT(*) AS n FROM {table}"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn paused_switch_refuses_stamps_inside_the_transaction() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
+            .await
+            .unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        assert_eq!(
+            renewal_switch(&db).await.unwrap(),
+            RenewalSwitch {
+                paused: false,
+                changed_at: None
+            },
+            "a migrated node starts with renewals running"
+        );
+        let now = 1_000;
+        let (secret, identity, request) = switch_test_stamp(&db, now).await;
+        let replay_rows = || row_count(&db, "invocation_replay");
+
+        let paused = set_renewals_paused(&db, true, 500).await.unwrap();
+        assert_eq!(
+            paused,
+            RenewalSwitch {
+                paused: true,
+                changed_at: Some(500)
+            }
+        );
+        assert_eq!(
+            set_renewals_paused(&db, true, 600).await.unwrap(),
+            paused,
+            "a repeated pause keeps the original change time"
+        );
+        assert!(matches!(
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
+            Err(RenewalStoreError::Paused)
+        ));
+        assert_eq!(replay_rows().await, 0, "a paused refusal spends no replay");
+
+        assert_eq!(
+            set_renewals_paused(&db, false, 700).await.unwrap(),
+            RenewalSwitch {
+                paused: false,
+                changed_at: Some(700)
+            }
+        );
+        let resumed = issue_stamp_at(&db, request, &secret, &identity, now).await;
+        assert!(
+            !matches!(resumed, Err(RenewalStoreError::Paused)),
+            "resume lets the request through the switch: {resumed:?}"
+        );
+    }
+
+    /// PostgreSQL: the pause and the stamp transaction serialize on the
+    /// switch row, so no stamp commits after a pause call returns.
+    ///
+    /// A stamp cannot be held open mid-`issue_stamp_at` deterministically, so
+    /// part 1 holds the transaction at its first statement, the same
+    /// `FOR SHARE` read: a pause then waits until that transaction ends, so
+    /// the pause cannot return while a stamp that read "running" is uncommitted.
+    /// Part 2 holds a pause uncommitted: a real `issue_stamp_at` waits on the
+    /// row, then sees the pause and saves nothing. Without `FOR SHARE` both
+    /// waits disappear and the test fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_pause_and_stamp_transactions_serialize_on_the_switch_row() {
+        const TEST: &str = "postgres_pause_and_stamp_transactions_serialize_on_the_switch_row";
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let db = fixture.conn.clone();
+        let now = 1_000;
+        let (secret, identity, request) = switch_test_stamp(&db, now).await;
+        let waits = std::time::Duration::from_millis(500);
+        let bound = std::time::Duration::from_secs(20);
+
+        // 1. Stamp transaction in flight → the pause waits for it.
+        let stamp_tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        assert!(!read_renewal_switch(&stamp_tx, true).await.unwrap().paused);
+        let pause = tokio::spawn({
+            let db = db.clone();
+            async move { set_renewals_paused(&db, true, 500).await }
+        });
+        tokio::time::sleep(waits).await;
+        assert!(
+            !pause.is_finished(),
+            "a pause must wait for the in-flight stamp transaction"
+        );
+        stamp_tx.commit().await.unwrap();
+        let paused = tokio::time::timeout(bound, pause)
+            .await
+            .expect("pause finishes once the stamp transaction ends")
+            .unwrap()
+            .unwrap();
+        assert!(paused.paused);
+
+        // 2. Pause in flight → a stamp waits for it, then refuses and saves nothing.
+        set_renewals_paused(&db, false, 600).await.unwrap();
+        let pause_tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        pause_tx
+            .execute_unprepared(
+                "UPDATE renewal_switch SET paused = TRUE, changed_at = 700 WHERE id = 1",
+            )
+            .await
+            .unwrap();
+        let stamp = tokio::spawn({
+            let db = db.clone();
+            async move { issue_stamp_at(&db, request, &secret, &identity, now).await }
+        });
+        tokio::time::sleep(waits).await;
+        assert!(
+            !stamp.is_finished(),
+            "a stamp transaction must wait for the in-flight pause"
+        );
+        pause_tx.commit().await.unwrap();
+        let refused = tokio::time::timeout(bound, stamp)
+            .await
+            .expect("stamp finishes once the pause commits")
+            .unwrap();
+        assert!(
+            matches!(refused, Err(RenewalStoreError::Paused)),
+            "{refused:?}"
+        );
+        assert_eq!(row_count(&db, "renewal_stamp").await, 0);
+        assert_eq!(row_count(&db, "invocation_replay").await, 0);
     }
 }

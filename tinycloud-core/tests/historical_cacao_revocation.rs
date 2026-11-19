@@ -426,16 +426,19 @@ async fn unstored_canonical_status_resolves_historical_grant() {
         Some(tinycloud_core::db::DelegationStatus::Active),
     );
     for cid in [&canonical, &fixture.rows[0].raw_cid] {
-        assert!(tinycloud_core::renewal::renewal_history(
-            db.connection(),
-            cid,
-            &fixture.issuer,
-            &[],
-        )
-        .await
-        .map_err(|error| error.to_string())
-        .unwrap()
-        .is_empty());
+        assert!(db
+            .delegation_status_snapshot(
+                hash_from_cid(cid),
+                &fixture.issuer,
+                &[],
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
     }
 }
 

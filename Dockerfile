@@ -30,6 +30,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG CARGO_FEATURES=""
+RUN case "$CARGO_FEATURES" in *renewal-test-clock*) echo "renewal-test-clock is forbidden in container builds" >&2; exit 1;; esac
 COPY --from=planner /app/recipe.json recipe.json
 COPY --from=planner /app/rust-toolchain.toml ./
 # The [patch]ed sqlx-core (TC-1054) is a path dependency outside the

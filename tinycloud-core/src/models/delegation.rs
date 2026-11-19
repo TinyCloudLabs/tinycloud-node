@@ -222,12 +222,16 @@ pub(crate) async fn process<C: ConnectionTrait>(
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    process_with(db, delegation, encryption, false, true, None).await
+    process_with(db, delegation, encryption, false, true, None, false).await
 }
 
 /// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
 /// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
-/// `named_keys` a capability on a key or key prefix is refused.
+/// `named_keys` a capability on a key or key prefix is refused. With
+/// `signature_verified` the caller checked these exact signed bytes with
+/// [`check_signature`] before its transaction (TC-2986); only the time
+/// window is checked here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_with<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
@@ -235,8 +239,12 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     delegated_sql_caveats: bool,
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
+    signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
-    verify(&delegation.0.delegation).await?;
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
@@ -251,10 +259,34 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
-// verify signatures and time
-async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+/// Save only the graph portion of a proofless renewal lease. The transaction
+/// dispatcher must run locked renewal::register_lease before committing: that
+/// validates the signed original's owner, lease bounds, identity and cardinality.
+/// This path grants no generic delegation or control authority.
+pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    signature_verified: bool,
+) -> Result<DelegationRegistration, Error> {
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
+    if !delegation.0.parents.is_empty()
+        || !crate::renewal::lease_original_from_signed(delegation)
+            .is_ok_and(|original| original.is_some())
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
+    save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+}
+
+/// Check a delegation's signature: CPU, or a DID resolution when network
+/// methods are on. Runs before any lock (TC-2986).
+pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
-        TinyCloudDelegation::Ucan(ref ucan) => {
+        TinyCloudDelegation::Ucan(ucan) => {
             verify_ucan_signature(ucan)
                 .await
                 .map_err(|error| match error {
@@ -266,21 +298,28 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
                         DelegationError::InvalidSignature
                     }
                 })?;
-            ucan.payload()
-                .validate_time(None)
-                .map_err(|_| DelegationError::InvalidTime)?;
         }
-        TinyCloudDelegation::Cacao(ref cacao) => {
+        TinyCloudDelegation::Cacao(cacao) => {
             cacao
                 .verify()
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
-            if !cacao.payload().valid_now() {
-                return Err(DelegationError::InvalidTime.into());
-            }
         }
     };
     Ok(())
+}
+
+/// Check that a delegation is within its signed time window now.
+fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+    let valid = match delegation {
+        TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_ok(),
+        TinyCloudDelegation::Cacao(cacao) => cacao.payload().valid_now(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DelegationError::InvalidTime.into())
+    }
 }
 
 // TC-1791: refusal reason for a SQL or DuckDB capability whose caveats are
@@ -408,6 +447,24 @@ fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), 
     Ok(())
 }
 
+/// The end a child delegation's expiry is held to: the parent's effective end
+/// from the authorization graph (renewals and ancestors applied), which the
+/// graph keeps in whole seconds (TC-3076). When that end is the parent's own
+/// signed expiry, use the signed expiry at full precision instead. Otherwise
+/// a child expiring at the parent's exact instant, or anywhere in its last
+/// partial second, would be refused. A renewed end (later than that second)
+/// or an ancestor's cap (earlier) is used as it is.
+fn parent_end_for_child(
+    effective_end: Option<i64>,
+    signed_expiry: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    match (effective_end, signed_expiry) {
+        (Some(end), Some(signed)) if end == signed.unix_timestamp() => Some(signed),
+        (Some(end), signed) => OffsetDateTime::from_unix_timestamp(end).ok().or(signed),
+        (None, signed) => signed,
+    }
+}
+
 // verify parenthood and authorization
 #[cfg(test)]
 async fn validate<C: ConnectionTrait>(
@@ -492,8 +549,13 @@ async fn validate_with<C: ConnectionTrait>(
         // An owner may grant revocation of one exact stored delegation that
         // targets their space, without holding the target's signed bytes:
         // every non-root capability must be such an exact-CID revoke grant.
-        // The target's delegatee or delegator alone cannot issue one.
+        // TC-3150: the target's delegator may grant its own delegatee
+        // revocation of exactly that target, and no one else. The target's
+        // delegatee alone cannot issue one.
         (false, true) => {
+            if revocation::delegator_hands_back_revoke(db, delegation).await? {
+                return Ok(());
+            }
             for cap in &dependant_caps {
                 if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
                     return Err(DelegationError::MissingParents.into());
@@ -654,10 +716,8 @@ async fn validate_with<C: ConnectionTrait>(
                 .filter(|p| {
                     // valid time bounds: child's validity must be within parent's validity
                     // expiry: child must expire at or before parent (None = no expiry)
-                    let parent_effective_expiry = graph
-                        .effective_expiry(&p.id)
-                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
-                        .or(p.expiry);
+                    let parent_effective_expiry =
+                        parent_end_for_child(graph.effective_expiry(&p.id), p.expiry);
                     let expiry_valid = match (parent_effective_expiry, delegation.expiry) {
                         (None, _) => true,
                         (Some(_), None) => false,
@@ -2922,5 +2982,89 @@ mod tests {
             }
         }
         assert_eq!((decided, skipped), (20, 3));
+    }
+
+    /// TC-3076: a child may expire at its parent's exact instant, milliseconds
+    /// included, as node-sdk's useDelegation asks; one millisecond later is
+    /// refused.
+    #[tokio::test]
+    async fn a_child_may_expire_at_its_parents_millisecond_but_not_after() {
+        use sea_orm::sea_query::Expr;
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let db = database().await;
+        let parent = crate::hash::hash(b"tc3076-parent");
+        let prefix = "tinycloud:did:key:other:files/kv";
+        insert_parent_grant(
+            &db,
+            parent,
+            "did:key:other",
+            "did:key:actor",
+            prefix,
+            "tinycloud.kv/get",
+        )
+        .await;
+        let parent_expiry = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        Entity::update_many()
+            .col_expr(Column::Expiry, Expr::value(parent_expiry))
+            .filter(Column::Id.eq(parent))
+            .exec(&db)
+            .await
+            .unwrap();
+        let child_at = |expiry: &str| {
+            let mut child = key_grant_info(
+                "did:key:actor",
+                "tinycloud:did:key:other:files/kv/doc",
+                "tinycloud.kv/get",
+                &[parent],
+            );
+            child.expiry = Some(OffsetDateTime::parse(expiry, &Rfc3339).unwrap());
+            child
+        };
+        for accepted in ["2027-11-15T23:12:08.000Z", "2027-11-15T23:12:08.053Z"] {
+            validate(&db, &child_at(accepted))
+                .await
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+        }
+        let refused = validate(&db, &child_at("2027-11-15T23:12:08.054Z")).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::InvalidDelegation(
+                    DelegationError::ExpiryExceedsParent
+                ))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// TC-3076: only the parent's own signed second is read at full
+    /// precision; a renewed end and an ancestor's cap are used as the graph
+    /// computed them.
+    #[test]
+    fn the_parent_end_is_exact_only_where_it_is_the_signed_expiry() {
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let signed = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        let second = signed.unix_timestamp();
+        let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+        // No renewal: the graph's end is the signed second; the signed instant counts.
+        assert_eq!(
+            parent_end_for_child(Some(second), Some(signed)),
+            Some(signed)
+        );
+        // Renewed past the signed expiry: the renewed end, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second + 600), Some(signed)),
+            Some(at(second + 600))
+        );
+        // Capped by an ancestor before it: the cap, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second - 1), Some(signed)),
+            Some(at(second - 1))
+        );
+        // No graph end: the signed expiry; no expiry at all: none.
+        assert_eq!(parent_end_for_child(None, Some(signed)), Some(signed));
+        assert_eq!(parent_end_for_child(None, None), None);
+        // No signed expiry and an unbounded graph end: no expiry, as before.
+        assert_eq!(parent_end_for_child(Some(i64::MAX), None), None);
     }
 }

@@ -98,7 +98,7 @@ jobs:
   test:
     name: test (workspace, PostgreSQL-backed, ${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -200,7 +200,17 @@ jobs:
     - name: Run the workspace integration tests (everything outside a-o)
       if: matrix.group == 'integration-rest'
       timeout-minutes: 25
+      env:
+        TINYCLOUD_HISTORY_SDK_FIXTURE_DIR: ${{ runner.temp }}/holder-renewal-history
       run: cargo test --workspace --test '[!a-o]*'
+
+    - name: Retain holder history for SDK verification
+      if: always() && matrix.group == 'integration-rest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: holder-renewal-history-sdk
+        path: ${{ runner.temp }}/holder-renewal-history
+        if-no-files-found: ignore
 
     # The workspace suite does not enable tinycloud-core's DuckDB feature.
     # Run its unit tests with that feature so SQL/DuckDB identity parity is
@@ -212,9 +222,12 @@ jobs:
       timeout-minutes: 20
       run: cargo test -p tinycloud-core --features duckdb
 
+    # The node feature graph rebuilds bundled DuckDB from cold: in PR #582 that
+    # compile took about 14.5m, and the 15m cap stopped the step while its tests ran.
+    # The job's 60m cap covers this step after the 20m core step and setup.
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
-      timeout-minutes: 15
+      timeout-minutes: 25
       run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart
 
     # A hung PostgreSQL test holds row locks until its step is killed by the

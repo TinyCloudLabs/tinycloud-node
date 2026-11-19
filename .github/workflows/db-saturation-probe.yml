@@ -6,12 +6,13 @@
 # Healthy -> GET the heartbeat (ping). Unknown or transient API error -> no call,
 # so the missed-heartbeat alert covers it.
 #
-# A target is skipped with a notice until its two secrets are set, so this
-# workflow stays green while unconfigured.
+# A target whose two secrets are not both set FAILS the run (::error::, exit 1),
+# so a missing secret cannot silently disable monitoring (TC-2912). Set both
+# secrets before adding or keeping a target.
 #
 # SECRETS (Settings -> Secrets and variables -> Actions):
 #   PLANETSCALE_METRICS_TOKEN_NODE_DB     PlanetScale service token ID:TOKEN,
-#                                         read_branch on all branches of tinycloud-node-production.
+#                                         read_branch on all branches of tinycloud-node-production-usw.
 #   BETTERSTACK_HEARTBEAT_URL_NODE_DB     "Node DB saturation" heartbeat URL.
 #   PLANETSCALE_METRICS_TOKEN_OPENKEY_DB  Added after the 2026-10-22 DB move.
 #   BETTERSTACK_HEARTBEAT_URL_OPENKEY_DB  "OpenKey DB saturation" heartbeat URL.

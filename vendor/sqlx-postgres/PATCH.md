@@ -47,3 +47,22 @@ one BEGIN after this patch. See `docs/request-telemetry.md` for complete semanti
 Remove this vendored driver and its overrides once upstream SQLx provides an
 equivalent driver-level request execution hook; removing only the generic wrapper
 instrumentation is not an equivalent replacement.
+
+## BEGIN cancelled in flight, and the server transaction status (TC-2954)
+
+`src/transaction.rs`, `PgTransactionManager::begin`, raises `transaction_depth`
+before awaiting the BEGIN/SAVEPOINT reply instead of after it, and lowers it again
+when the reply shows no transaction began (`BeginFailed`). This is upstream sqlx
+#4394 (issues #4385/#4393/#4423). Before it, a future dropped during that await
+(the node's request deadline) left the server inside a transaction while the depth
+was still zero, so both drop guards' `start_rollback` queued nothing; the pool then
+handed that session to the next borrower, whose acknowledged autocommit writes ran
+inside the leftover transaction and were lost when it ended.
+
+`src/connection/mod.rs` implements sqlx-core's hidden
+`Connection::in_server_transaction_block` from the `ReadyForQuery` transaction
+status (anything but idle). sqlx-core's pool release uses it to close a session
+still inside a transaction after the release ping (see sqlx-core `PATCH.md`).
+
+Regressions: `db_pool::release_tests` in `tinycloud-core` (both `postgres_*`).
+Drop the `begin` hunk once the vendored version includes #4394.
