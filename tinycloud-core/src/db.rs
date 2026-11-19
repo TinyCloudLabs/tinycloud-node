@@ -6699,6 +6699,7 @@ mod test {
             value: crate::hash::hash(b"a1"),
             generation: 0,
             metadata: Metadata(Default::default()),
+            size: None,
             deleted: false,
         };
         let get = "tinycloud.kv/get";
@@ -8136,7 +8137,7 @@ mod test {
                     assert_eq!(body, b"seeded");
                     read = true;
                 }
-                InvocationOutcome::KvList(keys, false, _) => {
+                InvocationOutcome::KvList(keys, false, _, _) => {
                     let keys = keys.iter().map(Path::as_str).collect::<Vec<_>>();
                     assert!(keys.contains(&"docs/a"), "its own write: {keys:?}");
                     assert!(keys.contains(&"docs/b"), "{keys:?}");
