@@ -56,7 +56,11 @@ async fn postgres_every_space_or_owner_table_is_classified() {
     for (table, _) in PURGED_BY_SPACE {
         lists.entry(table).or_default().push("PURGED_BY_SPACE");
     }
-    for table in PURGED_BY_OWNER {
+    for (table, reason) in PURGED_BY_OWNER {
+        assert!(
+            !reason.is_empty(),
+            "{table} is owner-purged without a reason"
+        );
         lists.entry(table).or_default().push("PURGED_BY_OWNER");
     }
     for (table, reason) in RETAINED {

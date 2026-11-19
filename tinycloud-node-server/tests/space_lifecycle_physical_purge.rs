@@ -18,6 +18,7 @@ use tinycloud::{
 };
 use tinycloud_auth::{
     authorization::{make_invocation_from_uris, Cid, InvocationOptions},
+    identity::canonicalize_did,
     resolver::DID_METHODS,
     resource::SpaceId,
     ssi::jwk::{Algorithm, JWK},
@@ -27,7 +28,8 @@ use tinycloud_core::{
     migrations::Migrator,
     models::{space, space_purge_job},
     sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, EntityTrait,
+        ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database, DbBackend,
+        EntityTrait, Statement,
     },
     sea_orm_migration::MigratorTrait,
     space_purge_ledger::LedgerKeys,
@@ -309,6 +311,206 @@ async fn postgres_owner_http_retirement_and_purge_physically_remove_only_the_tar
         .unwrap();
     }
     sql.drain_and_evict_space(&neighbor).await.unwrap();
+    drop(client);
+    drop(sql);
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+// Regression: a space ID keeps its creator's address casing, so the purge
+// job's owner digest must cover the canonical owner DID. Otherwise it never
+// matches the retirement's, and a retired owner's encryption networks survive
+// the purge of their last space.
+#[tokio::test]
+async fn postgres_retired_owner_purge_of_lowercase_address_space_deletes_owner_networks() {
+    if std::env::var("TINYCLOUD_ALLOW_LOCAL_PG").as_deref() != Ok("1")
+        && std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+    {
+        return;
+    }
+    let url = std::env::var("TINYCLOUD_TEST_POSTGRES_URL").unwrap();
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!("lifecycle_owner_case_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = Database::connect(options).await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let blocks_root = root.path().join("blocks");
+    let sql_root = root.path().join("sql-objects");
+    let blocks: BlockStores = Either::B(FileSystemConfig::new(&blocks_root).open().await.unwrap());
+    let sql_store = FsSqlObjectStore::open(sql_root.clone(), &blocks_root).unwrap();
+    let sql = SqlService::new(
+        root.path().join("cache").to_string_lossy().into_owned(),
+        0,
+        Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+    );
+    let mut owner_key = JWK::generate_secp256k1();
+    owner_key.algorithm = Some(Algorithm::ES256KR);
+    let owner = DID_METHODS
+        .generate(&owner_key, "pkh:eip155")
+        .unwrap()
+        .to_string();
+    let canonical = canonicalize_did(&owner).unwrap();
+    let lowercase = canonical.to_lowercase();
+    assert_ne!(lowercase, canonical, "the address must carry EIP-55 case");
+    let target: SpaceId = format!("tinycloud:{}:app", &lowercase[4..])
+        .parse()
+        .unwrap();
+    space::ActiveModel {
+        id: Set(target.clone().into()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    let network = format!("urn:tinycloud:encryption:{canonical}:default");
+    for (sql, values) in [
+        (
+            "INSERT INTO encryption_network(network_id,owner_did,name,alg,key_version,public_key,state,threshold_n,threshold_t,key_backend,created_at,updated_at)
+             VALUES($1,$2,'default','test',1,'\\x01','active',1,1,'local','now','now')",
+            vec![network.clone().into(), canonical.clone().into()],
+        ),
+        (
+            "INSERT INTO encryption_network_key(network_id,key_path,kind,state,public_key,created_at,updated_at)
+             VALUES($1,'key','test','active','\\x01','now','now')",
+            vec![network.clone().into()],
+        ),
+    ] {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    let keys = Arc::new(
+        LedgerKeys::new(
+            "test".into(),
+            BTreeMap::from([("test".into(), vec![19; 32])]),
+        )
+        .unwrap(),
+    );
+    let purge_ledger = Arc::new(PurgeLedger::Local(
+        FsPurgeLedger::new(root.path().join("purge-ledger")).unwrap(),
+    ));
+    let ledger: Arc<dyn PurgeLedgerStore> = purge_ledger.clone();
+    let accepted_time = OffsetDateTime::now_utc() - time::Duration::minutes(6);
+    let runtime =
+        LifecycleRuntime::new(db.clone().into(), keys.clone(), ledger, "host-test".into())
+            .unwrap()
+            .with_storage_layout(
+                tinycloud::space_lifecycle::PurgeStorageLayout::new(
+                    tinycloud::storage::purge_reconcile::PrefixStoreKind::KvFileSystem,
+                    tinycloud::storage::purge_reconcile::PrefixStoreKind::SqlFileSystem,
+                    false,
+                )
+                .unwrap(),
+            )
+            .with_clock(Arc::new(move || accepted_time));
+    runtime.verify_ledger().await.unwrap();
+    let fence = runtime.fence.clone();
+    let client = Client::tracked(
+        rocket::build()
+            .manage(runtime)
+            .mount("/", rocket::routes![retire_owner, purge_space]),
+    )
+    .await
+    .unwrap();
+    let (jwt, id) = signed(
+        &owner_key,
+        &owner,
+        "tinycloud.space/retire-owner",
+        &owner,
+        accepted_time,
+    );
+    let response = client
+        .post("/space/retire-owner")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", jwt))
+        .header(Header::new("Idempotency-Key", id))
+        .json(&serde_json::json!({"version":1,"owner_did":owner}))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Accepted);
+    drop(response);
+    let (jwt, id) = signed(
+        &owner_key,
+        &owner,
+        "tinycloud.space/delete",
+        &format!("{target}/space"),
+        accepted_time,
+    );
+    let response = client
+        .post("/space/purge")
+        .header(ContentType::JSON)
+        .header(Header::new("Authorization", jwt))
+        .header(Header::new("Idempotency-Key", id))
+        .json(&serde_json::json!({"version":1,"space_id":target.to_string()}))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Accepted);
+    let accepted = response.into_json::<PurgeResponse>().await.unwrap();
+    let job = space_purge_job::Entity::find_by_id(&accepted.purge_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        job.owner_hmac,
+        keys.target_hmac(&job.hmac_key_id, "owner", &canonical)
+            .unwrap()
+    );
+    let drain = fence.drain(&db, &target).await.unwrap();
+    let executor = SpacePurgeExecutor {
+        db: &db,
+        blocks: &blocks,
+        ledger: &purge_ledger,
+        sql: &sql,
+        #[cfg(feature = "duckdb")]
+        duckdb: None,
+        sql_objects: Some(SqlPurgeStore::FileSystem(&sql_store)),
+        keys: &keys,
+        encryption: None,
+    };
+    let mut complete = false;
+    for _ in 0..12 {
+        let job = claim_specific(&db, &uuid::Uuid::new_v4().to_string(), &accepted.purge_id)
+            .await
+            .unwrap()
+            .unwrap();
+        match executor.execute_claimed(&job, &drain).await.unwrap() {
+            PhaseOutcome::Advanced | PhaseOutcome::MoreObjects => {}
+            PhaseOutcome::Complete => {
+                complete = true;
+                break;
+            }
+            other => panic!("unexpected purge phase outcome: {other:?}"),
+        }
+    }
+    assert!(complete);
+    drop(drain);
+    for table in ["encryption_network", "encryption_network_key"] {
+        let rows = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table} WHERE network_id=$1"),
+                [network.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(rows, 0, "{table} of the retired owner");
+    }
     drop(client);
     drop(sql);
     db.close().await.unwrap();

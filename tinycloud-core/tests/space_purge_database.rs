@@ -154,6 +154,8 @@ const TARGET: &str = "tinycloud:pkh:eip155:1:0x000000000000000000000000000000000
 const KEPT: &str = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:kept";
 const OTHER_OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000002";
 const OTHER: &str = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000002:other";
+const LATER: &str = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:later";
+const LAST: &str = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:last";
 
 fn snapshot(bytes: &[u8]) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -345,22 +347,46 @@ async fn part(
     }
 }
 
+/// Accept owner retirement as `retire_owner` records it: the owner digest
+/// under the job's key id.
+async fn retire(db: &DatabaseConnection, keys: &LedgerKeys, owner: &str) {
+    exec(
+        db,
+        "INSERT INTO space_retirement(owner_hmac,hmac_key_id,retirement_id,accepted_at)
+         VALUES($1,'test',$2,now())",
+        vec![
+            keys.target_hmac("test", "owner", owner).unwrap().into(),
+            uuid::Uuid::new_v4().to_string().into(),
+        ],
+    )
+    .await;
+}
+
 /// Drive one space through database, access and objects to completion,
 /// repeating each step to show it is idempotent. Returns the reap batches.
 async fn purge(db: &DatabaseConnection, keys: &LedgerKeys, space: &str) -> usize {
     let purge_id = uuid::Uuid::new_v4().to_string();
     let digest = keys.target_hmac("test", "space", space).unwrap();
+    // Space acceptance digests the space's DID under the job's key id.
+    let (did, _) = space
+        .strip_prefix("tinycloud:")
+        .unwrap()
+        .rsplit_once(':')
+        .unwrap();
+    let owner = keys
+        .target_hmac("test", "owner", &format!("did:{did}"))
+        .unwrap();
     exec(db,
         "INSERT INTO space_purge_job(purge_id,space,tombstone_hmac,hmac_key_id,owner_hmac,accepted_at,phase,fence_generation,updated_at,next_attempt_at,attempt_count)
-         VALUES($1,$2,$3,'test',$3,now(),'database',1,now(),now(),0)",
-        vec![purge_id.clone().into(), space.into(), digest.clone().into()]).await;
+         VALUES($1,$2,$3,'test',$4,now(),'database',1,now(),now(),0)",
+        vec![purge_id.clone().into(), space.into(), digest.clone().into(), owner.into()]).await;
     let lease = || uuid::Uuid::new_v4().to_string();
     let job = claim_specific(db, &lease(), &purge_id)
         .await
         .unwrap()
         .unwrap();
     let tx = db.begin().await.unwrap();
-    assert!(delete_sql_and_hook_rows(&tx, &job).await.unwrap() > 0);
+    delete_sql_and_hook_rows(&tx, &job).await.unwrap();
     assert_eq!(delete_sql_and_hook_rows(&tx, &job).await.unwrap(), 0);
     assert!(advance(&tx, &job).await.unwrap());
     tx.commit().await.unwrap();
@@ -554,12 +580,14 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
     assert_eq!(account(&db, OTHER_OWNER).await, other_account);
     assert_eq!(networks(&db, OWNER).await, [1; 5], "KEPT is still live");
 
-    // The owner's last live space takes its owner-keyed rows with it. The
-    // key-operation audit trail stays (RETAINED).
+    // Purging the owner's last space is not account erasure: without this
+    // owner's retirement (another owner's does not count) the networks stay.
+    // The artifact quota counters go; they are re-created on demand.
+    retire(&db, &keys, OTHER_OWNER).await;
     purge(&db, &keys, KEPT).await;
     assert_eq!(artifact_rows(&db, KEPT).await, (0, 0, 0));
     assert_eq!(account(&db, OWNER).await, None);
-    assert_eq!(networks(&db, OWNER).await, [0, 0, 0, 0, 1]);
+    assert_eq!(networks(&db, OWNER).await, [1; 5], "owner is not retired");
     assert_eq!(artifact_rows(&db, OTHER).await, other);
     assert_eq!(account(&db, OTHER_OWNER).await, other_account);
     assert_eq!(
@@ -567,10 +595,23 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
         Some(usage(&db, OTHER_OWNER).await)
     );
     assert_eq!(networks(&db, OTHER_OWNER).await, [1; 5]);
+
+    // A retired owner keeps the networks while a live space remains; the
+    // last space takes the owner-keyed rows with it. The key-operation audit
+    // trail stays (RETAINED).
+    for space in [LATER, LAST] {
+        exec(&db, "INSERT INTO space(id) VALUES($1)", vec![space.into()]).await;
+    }
+    retire(&db, &keys, OWNER).await;
+    purge(&db, &keys, LATER).await;
+    assert_eq!(networks(&db, OWNER).await, [1; 5], "LAST is still live");
+    purge(&db, &keys, LAST).await;
+    assert_eq!(networks(&db, OWNER).await, [0, 0, 0, 0, 1]);
+    assert_eq!(networks(&db, OTHER_OWNER).await, [1; 5], "OTHER is live");
     let spaces = int(
         &db,
-        "SELECT count(*) AS n FROM space WHERE id IN ($1,$2)",
-        vec![TARGET.into(), KEPT.into()],
+        "SELECT count(*) AS n FROM space WHERE id IN ($1,$2,$3,$4)",
+        vec![TARGET.into(), KEPT.into(), LATER.into(), LAST.into()],
     )
     .await;
     assert_eq!(spaces, 0);
