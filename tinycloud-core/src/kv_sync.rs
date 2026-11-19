@@ -45,8 +45,9 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Expr, Order, Query, SelectStatement},
-    Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect, Statement,
+    sea_query::{Asterisk, Expr, Order, Query, SelectStatement, UnionType},
+    AccessMode, Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -690,12 +691,49 @@ pub(crate) fn kv_sync_statement(
     pos: Option<&KvSyncAnchor>,
     floor: Option<&KvSyncAnchor>,
 ) -> Statement {
-    let mut query = feed_select(backend, space, prefix, floor);
+    let first_page_floor = floor.filter(|_| backend == DbBackend::Postgres && pos.is_none());
+    let mut query = feed_select(
+        backend,
+        space,
+        prefix,
+        if first_page_floor.is_some() {
+            None
+        } else {
+            floor
+        },
+    );
     if let Some(pos) = pos {
         query
             .and_where(col(current_kv::Column::Seq).gte(pos.seq))
             .and_where(position_columns().gt(position_value(pos)));
     }
+    query = order_feed_select(query, limit);
+    if let Some(floor) = first_page_floor {
+        // Constrain the middle `deleted` column of the prefix index in each
+        // branch. Before PostgreSQL 18, a custom plan still scans the whole
+        // space's index when that column is unconstrained by the floor's OR.
+        // The branches are disjoint; each needs at most the final page's
+        // limit + 1 rows before their position-ordered merge.
+        let mut tombstones = query.clone();
+        query.and_where(col(current_kv::Column::Deleted).eq(false));
+        tombstones
+            .and_where(col(current_kv::Column::Deleted).eq(true))
+            .and_where(col(current_kv::Column::Seq).gt(floor.seq));
+        let mut union = Query::select();
+        union
+            .column(Asterisk)
+            .from_subquery(query, current_kv::Entity)
+            .union(UnionType::All, tombstones);
+        query = Query::select()
+            .column(Asterisk)
+            .from_subquery(union, current_kv::Entity)
+            .to_owned();
+        query = order_feed_select(query, limit);
+    }
+    backend.build(&query)
+}
+
+fn order_feed_select(mut query: SelectStatement, limit: usize) -> SelectStatement {
     query
         .order_by((current_kv::Entity, current_kv::Column::Seq), Order::Asc)
         .order_by((current_kv::Entity, current_kv::Column::Epoch), Order::Asc)
@@ -704,7 +742,7 @@ pub(crate) fn kv_sync_statement(
             Order::Asc,
         )
         .limit(limit.saturating_add(1) as u64);
-    backend.build(&query)
+    query
 }
 
 /// Every row of one event (`group`) inside `prefix`.
@@ -757,6 +795,43 @@ async fn feed_rows<C: ConnectionTrait>(
         .collect()
 }
 
+/// TC-3256: the first page's feed rows (no position yet) on PostgreSQL,
+/// planned for this request's own values.
+///
+/// Without a position, the cheapest plan depends on how much of the space the
+/// prefix covers. A prefix holding most of the space should read
+/// `idx_current_kv_space_order` in order and stop at the page limit (9 pages
+/// of 10,000 rows locally). A narrow prefix should read its keys on
+/// `idx_current_kv_space_deleted_key_c` and sort the few it finds. The first
+/// page merges live rows with post-floor tombstones in separate bounded
+/// branches, so both can seek through the prefix index's `deleted` column
+/// without requiring PostgreSQL 18's index skip scans.
+/// A pooled connection's prepared statement switches to one generic plan
+/// after five executions. For this statement that plan is the key index plus
+/// a sort of the whole prefix (935 pages for the broad prefix), and no one
+/// statement shape is right for both prefixes in a generic plan. So the first
+/// page is planned per execution. That costs one transaction's extra round
+/// trips, on a page each client reads once per cursor.
+///
+/// The transaction is read-only: PostgreSQL enforces it, and the request's
+/// write tracking stays clear, so a failed first page still counts as safe to
+/// retry. Its BEGIN is retried on a connection-class error like any
+/// statement. The feed statement inside it is not retried here (the
+/// transaction is gone with its connection), unlike a statement on the pool.
+async fn first_page_rows<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    statement: Statement,
+) -> Result<Vec<FeedRow>, DbErr> {
+    let tx = db
+        .begin_with_config(None, Some(AccessMode::ReadOnly))
+        .await?;
+    tx.execute_unprepared("SET LOCAL plan_cache_mode = force_custom_plan")
+        .await?;
+    let rows = feed_rows(&tx, statement).await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
 /// Read one page of the feed for `prefix` (non-empty) in `space`.
 ///
 /// `state` is `None` on the first page, which anchors a fresh floor at the
@@ -769,7 +844,7 @@ async fn feed_rows<C: ConnectionTrait>(
 /// past it, the rest of that event joins the page (see the module docs). If
 /// every row of that event moves to a newer position between the two reads,
 /// the page can come back empty with `more` set; the next poll progresses.
-pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
+pub(crate) async fn kv_sync_page<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     space: &SpaceId,
     prefix: &Path,
@@ -795,11 +870,12 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     };
     let backend = db.get_database_backend();
     let floor = state.floor.as_ref();
-    let mut rows = feed_rows(
-        db,
-        kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
-    )
-    .await?;
+    let statement = kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor);
+    let mut rows = if state.pos.is_none() && backend == DbBackend::Postgres {
+        first_page_rows(db, statement).await?
+    } else {
+        feed_rows(db, statement).await?
+    };
     let more = if rows.len() <= limit {
         false
     } else {
@@ -864,7 +940,7 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
 /// Serve one `kv/sync` page for an already-authorized request: open its
 /// cursor, read the page, and mint the next cursor (or echo the request's
 /// own, byte for byte, when nothing changed).
-pub(crate) async fn kv_sync_read<C: ConnectionTrait>(
+pub(crate) async fn kv_sync_read<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     space: &SpaceId,
     prefix: &Path,
@@ -1126,7 +1202,7 @@ pub(crate) mod tests {
     pub(crate) type Delivered = (String, Option<Hash>);
 
     /// Read the feed from `state` until it reports no more changes.
-    pub(crate) async fn drain<C: ConnectionTrait>(
+    pub(crate) async fn drain<C: ConnectionTrait + TransactionTrait>(
         conn: &C,
         space: &SpaceId,
         prefix: &str,
@@ -3305,5 +3381,241 @@ pub(crate) mod tests {
             run(&db, &owner, ops).await;
             assert_eq!(locks.load(Ordering::SeqCst) - before, 1, "{label}");
         }
+    }
+
+    /// Buffer pages `conn`'s backend has read from `current_kv` and its
+    /// indexes. The backend's pending statistics are flushed first, so the
+    /// count includes its own last statement.
+    async fn current_kv_pages(conn: &DatabaseConnection) -> i64 {
+        conn.execute_unprepared("SELECT pg_stat_force_next_flush()")
+            .await
+            .unwrap();
+        conn.query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT (coalesce(heap_blks_hit, 0) + coalesce(heap_blks_read, 0) \
+             + coalesce(idx_blks_hit, 0) + coalesce(idx_blks_read, 0))::bigint AS pages \
+             FROM pg_statio_user_tables \
+             WHERE schemaname = current_schema() AND relname = 'current_kv'",
+        ))
+        .await
+        .unwrap()
+        .expect("current_kv statistics")
+        .try_get::<i64>("", "pages")
+        .unwrap()
+    }
+
+    /// TC-3256: a first page (no position) reads only about a page's worth of
+    /// `current_kv` on PostgreSQL, for a prefix covering most of the space and
+    /// for a narrow one, even on a connection whose prepared statements use
+    /// their generic plan, as a pooled connection's do after five executions.
+    /// That generic plan reads the broad prefix's every row on the key index
+    /// and sorts them; reading the order index from the start instead would
+    /// walk the whole space for the narrow prefix. The first page's own
+    /// transaction leaves the request's write tracking clear.
+    #[tokio::test]
+    async fn postgres_first_sync_page_reads_a_page_for_broad_and_narrow_prefixes() {
+        const ROWS: usize = 4000;
+        const LIMIT: usize = 100;
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_first_sync_page_reads_a_page_for_broad_and_narrow_prefixes",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = Owner::generate().space;
+        let epoch = crate::hash::hash(b"tc3256-epoch");
+        let value = crate::hash::hash(b"tc3256-value");
+        // Ten keys, at seq 40..50, sit under their own narrow prefix.
+        let key = |index: usize| match index {
+            40..50 => format!("app/few/{index:04}"),
+            _ => format!("app/items/{index:04}"),
+        };
+        let row = |space: &SpaceId, key: String, seq: usize| current_kv::ActiveModel {
+            space: Set(SpaceIdWrap(space.clone())),
+            key: Set(key.parse::<Path>().unwrap().into()),
+            invocation: Set(crate::hash::hash(
+                format!("tc3256-{space}-{seq}").as_bytes(),
+            )),
+            seq: Set(seq as i64),
+            epoch: Set(epoch),
+            epoch_seq: Set(0),
+            value: Set(value),
+            generation: Set(0),
+            metadata: Set(Metadata(BTreeMap::new())),
+            deleted: Set(false),
+        };
+        let mut rows = (0..ROWS)
+            .map(|index| row(&space, key(index), index))
+            .collect::<Vec<_>>();
+        // Production holds many small spaces besides a few large ones. The
+        // generic plan then estimates `space = $1` at a handful of rows and
+        // sorts the prefix's rows rather than read them in order.
+        for _ in 0..800 {
+            let small = Owner::generate().space;
+            rows.extend((0..5).map(|index| row(&small, format!("profile/{index}"), index)));
+        }
+        for chunk in rows.chunks(500) {
+            current_kv::Entity::insert_many(chunk.to_vec())
+                .exec(&fixture.conn)
+                .await
+                .unwrap();
+        }
+        // The space's newest event, the first page's floor; its statement
+        // then has the `(deleted = false OR seq > floor)` condition a
+        // written-to space always has.
+        let floor = KvSyncAnchor {
+            seq: (ROWS - 1) as i64,
+            epoch,
+            epoch_seq: 0,
+        };
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        crate::models::epoch::ActiveModel {
+            seq: Set(floor.seq),
+            id: Set(epoch),
+            space: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        event_order::ActiveModel {
+            seq: Set(floor.seq),
+            epoch: Set(epoch),
+            epoch_seq: Set(0),
+            event: Set(crate::hash::hash(format!("tc3256-{}", ROWS - 1).as_bytes())),
+            space: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        fixture
+            .conn
+            .execute_unprepared("ANALYZE current_kv")
+            .await
+            .unwrap();
+
+        let conn = fixture.connect(1).await;
+        conn.execute_unprepared("SET plan_cache_mode = force_generic_plan")
+            .await
+            .unwrap();
+        // The node's own connection type, which marks a request's writes.
+        let node_conn = crate::db_pool::RecoveringConnection::new(conn.clone());
+        let broad: Path = "app".parse().unwrap();
+        let narrow: Path = "app/few".parse().unwrap();
+
+        // The statement alone, on the generic plan: the broad prefix is read
+        // whole.
+        let before = current_kv_pages(&conn).await;
+        let generic = feed_rows(
+            &conn,
+            kv_sync_statement(
+                DbBackend::Postgres,
+                &space,
+                &broad,
+                LIMIT,
+                None,
+                Some(&floor),
+            ),
+        )
+        .await
+        .unwrap();
+        let generic_pages = current_kv_pages(&conn).await - before;
+        assert_eq!(generic.len(), LIMIT + 1);
+
+        for (prefix, expected) in [(&broad, LIMIT), (&narrow, 10)] {
+            let before = current_kv_pages(&conn).await;
+            let (page, write_may_have_applied) =
+                crate::db_pool::track_writes(kv_sync_page(&node_conn, &space, prefix, LIMIT, None))
+                    .await;
+            let (changes, more, next) = page.unwrap();
+            assert!(
+                !write_may_have_applied,
+                "{prefix}: a first page is a read, safe to retry"
+            );
+            let pages = current_kv_pages(&conn).await - before;
+            println!(
+                "TC-3256 first page {prefix}: {pages} pages (generic plan, broad: {generic_pages})"
+            );
+            let keys = changes
+                .iter()
+                .map(|change| change.key.to_string())
+                .collect::<Vec<_>>();
+            let first = if prefix == &broad { 0 } else { 40 };
+            assert_eq!(
+                keys,
+                (first..first + expected).map(key).collect::<Vec<_>>(),
+                "{prefix}"
+            );
+            assert_eq!(more, prefix == &broad, "{prefix}");
+            assert_eq!(
+                next.pos.map(|pos| pos.seq),
+                Some((first + expected - 1) as i64)
+            );
+            assert!(pages <= 40, "{prefix}: {pages} pages");
+        }
+        assert!(
+            generic_pages >= 100,
+            "the generic plan reads the broad prefix whole: {generic_pages} pages"
+        );
+
+        // Retain old-tombstone exclusion and new-tombstone delivery when
+        // merging the two first-page branches, including an event split
+        // across live and deleted rows at the page boundary.
+        for (index, seq, deleted) in [
+            (40, 39, true),
+            (41, 4001, true),
+            (42, 4000, false),
+            (43, 4000, true),
+        ] {
+            current_kv::Entity::update_many()
+                .col_expr(current_kv::Column::Seq, Expr::value(seq))
+                .col_expr(current_kv::Column::EpochSeq, Expr::value(seq))
+                .col_expr(current_kv::Column::Deleted, Expr::value(deleted))
+                .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .filter(current_kv::Column::Key.eq(key(index)))
+                .exec(&conn)
+                .await
+                .unwrap();
+        }
+        for seq in [4000, 4001] {
+            event_order::ActiveModel {
+                seq: Set(seq),
+                epoch: Set(epoch),
+                epoch_seq: Set(seq),
+                event: Set(crate::hash::hash(format!("tc3256-new-{seq}").as_bytes())),
+                space: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&conn)
+            .await
+            .unwrap();
+        }
+        let state = KvSyncState {
+            pos: None,
+            floor: Some(floor),
+        };
+        let (changes, more, next) = kv_sync_page(&node_conn, &space, &narrow, 7, Some(&state))
+            .await
+            .unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.key.to_string())
+                .collect::<Vec<_>>(),
+            [44, 45, 46, 47, 48, 49, 42, 43].map(key)
+        );
+        assert!(!changes[6].deleted());
+        assert!(changes[7].deleted());
+        assert!(more);
+        let (changes, more, _) = kv_sync_page(&node_conn, &space, &narrow, 1, Some(&next))
+            .await
+            .unwrap();
+        assert_eq!(changes[0].key.to_string(), key(41));
+        assert!(changes[0].deleted());
+        assert!(!more);
     }
 }
