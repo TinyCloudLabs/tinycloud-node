@@ -1648,32 +1648,17 @@ async fn write_private_text(
     mode: u32,
     ownership: Option<(u32, u32)>,
 ) -> Result<()> {
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_permissions(path, mode).await?;
-    set_private_ownership(path, ownership).await?;
-    Ok(())
+    let path = path.to_path_buf();
+    let contents = contents.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::private_file::write_file_atomic(&path, &contents, mode, ownership)
+    })
+    .await
+    .context("private file write task failed")?
 }
 
 async fn remove_if_exists(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
-}
-
-async fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(mode);
-        tokio::fs::set_permissions(path, permissions)
-            .await
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
-    Ok(())
 }
 
 async fn set_private_ownership(path: &Path, ownership: Option<(u32, u32)>) -> Result<()> {
