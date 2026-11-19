@@ -53,7 +53,7 @@ const FAR_FUTURE_SECONDS: f64 = 4_102_444_800.0; // 2100-01-01
 fn test_space_id(name: &str) -> SpaceId {
     let jwk = JWK::generate_ed25519().unwrap();
     let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-    SpaceId::new(did, name.parse().unwrap())
+    SpaceId::new(did, name.parse().unwrap()).unwrap()
 }
 
 fn holder_identity() -> Result<(JWK, String, String)> {
@@ -91,6 +91,7 @@ async fn persist_grant(
         not_before: Set(None),
         facts: Set(None),
         serialization: Set(format!("tc119-test-row:{ability}").into_bytes()),
+        serialization_format: Set(0),
     }
     .insert(conn)
     .await?;

@@ -5,6 +5,7 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
+renewal-test-clock = []
 default = ["sqlite", "postgres", "mysql", "tokio"]
 
 sqlite = ["sea-orm/sqlx-sqlite", "sea-orm-migration/sqlx-sqlite"]
@@ -17,8 +18,9 @@ duckdb = ["dep:arrow", "dep:duckdb"]
 # dev-dependency so their own tests can assert exactly-once verification.
 verification-count-test-hook = []
 # TC-887: `at_rest::FixedKeyProvider`, a deterministic test key provider.
-# Never part of a production build; downstream crates enable it only on their
-# `tinycloud-core` dev-dependency.
+# TC-2346: `db_pool::fault`, connection-loss injection for route tests. Both
+# are inert without a test that uses them. Never part of a production build;
+# downstream crates enable it only on their `tinycloud-core` dev-dependency.
 test-util = []
 
 tokio = [
@@ -32,6 +34,8 @@ async-std = [
 
 [dependencies]
 dashmap = "5.5"
+blake3 = "1"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 async-trait.workspace = true
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-time", "with-json", "postgres-array"] }
 sea-orm-migration = { version = "1.1", default-features = false }

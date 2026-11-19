@@ -14,7 +14,7 @@ use sea_orm::{
 use crate::db::begin_write_transaction;
 use crate::models::{encryption_network, encryption_network_key};
 
-use super::backend::{KeyBackendError, KeySeed};
+use super::backend::{KeyBackendError, KeySeed, KeyWrapContext, KeyWrapPurpose};
 use super::key_id::{app_id_of, is_apps_path, EncryptionResource, KeyKind, KeyLocation};
 use super::network_id::NetworkId;
 use super::service::{is_unique_violation, now_rfc3339, EncryptionService, EncryptionServiceError};
@@ -257,6 +257,34 @@ impl EncryptionService {
                 // lost the connection, which ends the transaction anyway.
                 let _ = tx.rollback().await;
                 Err(err)
+            }
+        }
+    }
+
+    /// Records the deterministic key at `loc` inside the caller's write
+    /// transaction, as `key.create` would, for a caller that has already
+    /// authorized it. A missing row is created under the network row lock and
+    /// the key caps; an existing row is left as it is, whatever its state, so a
+    /// blocked key stays blocked. The network must be active. A deletable key
+    /// path is refused: its seed is made only by `key.create`.
+    pub async fn record_deterministic_key_in(
+        &self,
+        tx: &DatabaseTransaction,
+        loc: &KeyLocation,
+    ) -> Result<(), EncryptionServiceError> {
+        if loc.kind() != KeyKind::Deterministic {
+            return Err(EncryptionServiceError::KeyPathInvalid(
+                "only a deterministic key is recorded here".to_string(),
+            ));
+        }
+        let network = network_of(loc)?;
+        match self.create_key_in(tx, &network, loc).await? {
+            CreateStep::Inserted(_) | CreateStep::Existing(_) => Ok(()),
+            // A deterministic row is never reinstalled. The network row lock
+            // (PostgreSQL) or the writer lock (SQLite) serializes key writes,
+            // so a lost insert race means another writer bypassed them.
+            CreateStep::Reinstalled(_) | CreateStep::Raced => {
+                Err(EncryptionServiceError::KeyExists)
             }
         }
     }
@@ -536,12 +564,10 @@ impl EncryptionService {
         })
     }
 
-    /// Release-guard state read and unwrap. Order: network ACTIVE, then key row
-    /// exists and is ACTIVE, then (deletable keys) the requested key version
-    /// equals the row's, then strict unwrap. Callers must invoke this after
-    /// replay reservation. Any ECIES unwrap failure is `KeyUnwrapFailed`; a
-    /// failure to unseal the network key is `Backend`; a seed that does not
-    /// open strictly is `CorruptKeyRow`.
+    /// Release-guard state read and unwrap. Checks the network, key state and
+    /// authoritative key version before opening. Call after replay reservation.
+    /// Wrap failures are `KeyUnwrapFailed`; network unsealing is `Backend`;
+    /// a seed that does not open strictly is `CorruptKeyRow`.
     pub async fn unwrap_named_key(
         &self,
         loc: &KeyLocation,
@@ -562,6 +588,9 @@ impl EncryptionService {
         if kind == KeyKind::Deletable && row.key_version != requested_key_version {
             return Err(EncryptionServiceError::KeyDeleted);
         }
+        if row.key_version != requested_key_version {
+            return Err(EncryptionServiceError::AlgKeyVersionMismatch);
+        }
         let sealed = net
             .sealed_private_key
             .as_deref()
@@ -581,6 +610,14 @@ impl EncryptionService {
                 )
             }
         };
+        let network_urn = network.to_string();
+        let context = KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: &network_urn,
+            key_path: loc.path(),
+            key_version: row.key_version,
+            metadata: None,
+        };
         let symmetric = self
             .backend
             .unwrap_named(
@@ -588,6 +625,7 @@ impl EncryptionService {
                 &canonical_key_urn(loc),
                 seed.as_ref(),
                 wrapped_key,
+                &context,
             )
             .map_err(EncryptionServiceError::KeyUnwrapFailed)?;
         Ok((row.key_version, symmetric))

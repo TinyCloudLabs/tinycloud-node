@@ -4273,6 +4273,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hpke"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4917627a14198c3603282c5158b815ad5534795451d3c074b53cf3cee0960b11"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "chacha20poly1305",
+ "digest 0.10.7",
+ "generic-array",
+ "hkdf",
+ "hmac 0.12.1",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9889,9 +9909,11 @@ dependencies = [
  "async-std",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "chacha20poly1305",
  "dashmap",
  "duckdb",
+ "ed25519-dalek",
  "futures",
  "hex",
  "hkdf",
@@ -9933,7 +9955,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.25.2"
+version = "1.26.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10087,6 +10109,25 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "x25519-dalek",
+]
+
+[[package]]
+name = "tinycloud-threshold"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "ed25519-dalek",
+ "hex",
+ "hpke",
+ "proptest",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

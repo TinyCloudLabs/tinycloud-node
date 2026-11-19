@@ -1334,7 +1334,7 @@ mod tests {
     fn space() -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did = DID_METHODS.generate(&jwk, "key").unwrap();
-        SpaceId::new(did, "files".parse().unwrap())
+        SpaceId::new(did, "files".parse().unwrap()).unwrap()
     }
 
     async fn upload(store: &MemoryStore, space: &SpaceId, bytes: &[u8]) -> Hash {
@@ -2798,6 +2798,7 @@ mod tests {
             issued_at: sea_orm::ActiveValue::Set(time::OffsetDateTime::now_utc()),
             facts: sea_orm::ActiveValue::Set(None),
             serialization: sea_orm::ActiveValue::Set(vec![1]),
+            serialization_format: Default::default(),
         })
         .exec(&fixture.conn)
         .await

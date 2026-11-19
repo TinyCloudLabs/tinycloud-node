@@ -106,6 +106,8 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     let key = marker("tc961key");
     let hook_ticket = marker("tc961hookticket");
     let bearer = marker("tc961bearer");
+    let webhook_secret = marker("tc3123secret");
+    let header_value = marker("tc3123header");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_tinycloud"));
     // Start from no inherited node configuration, so the child can only touch
@@ -202,6 +204,51 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
         );
     }
 
+    // TC-3123: webhook registrations whose bodies fail to parse. Rocket's
+    // route code logs a failed data guard with the whole raw body, which here
+    // holds the webhook secret and custom header values. The body is only
+    // parsed once the Authorization header decodes, so each request carries
+    // a well-formed (never delegated) invocation; a 422 shows the data guard
+    // itself refused the body.
+    let invocation = webhook_invocation();
+    let webhook_bodies = [
+        serde_json::json!({
+            "space": space,
+            "service": "kv",
+            "callbackUrl": "https://example.com/hook",
+            "secret": webhook_secret,
+            "headers": format!("Bearer {header_value}"),
+        }),
+        serde_json::json!({
+            "space": space,
+            "service": "kv",
+            "callbackUrl": "https://example.com/hook",
+            "secret": webhook_secret,
+            "headers": {"Authorization": 5, "X-Api-Key": header_value},
+        }),
+        serde_json::json!({
+            "space": space,
+            "service": "kv",
+            "abilities": "tinycloud.kv/put",
+            "callbackUrl": "https://example.com/hook",
+            "secret": webhook_secret,
+            "headers": {"Authorization": format!("Bearer {header_value}")},
+        }),
+    ];
+    for body in &webhook_bodies {
+        let response = client
+            .post(format!("{base}/hooks/webhooks"))
+            .header("Authorization", &invocation)
+            .json(body)
+            .send()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "the webhook body must reach the data guard and fail there"
+        );
+    }
+
     // Rocket and the request-logging fairing both write before the response
     // is sent; a short pause covers any stdout buffering.
     std::thread::sleep(Duration::from_millis(200));
@@ -215,6 +262,8 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
         ("wallet address", wallet.as_str()),
         ("KV key", key.as_str()),
         ("Authorization header", bearer.as_str()),
+        ("webhook secret", webhook_secret.as_str()),
+        ("webhook header value", header_value.as_str()),
     ] {
         let leaked: Vec<&str> = logs.lines().filter(|line| line.contains(needle)).collect();
         assert!(
@@ -241,9 +290,106 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
             "missing {method} {route} event for {path}: {request_events:?}"
         );
     }
+    let webhook_events = request_events
+        .iter()
+        .filter(|event| {
+            event["method"] == "POST"
+                && event["route"] == "/hooks/webhooks"
+                && event["status"] == 422
+        })
+        .count();
+    assert_eq!(
+        webhook_events,
+        webhook_bodies.len(),
+        "missing POST /hooks/webhooks events: {request_events:?}"
+    );
     assert_eq!(
         request_events.len(),
-        requests.len(),
+        requests.len() + webhook_bodies.len(),
         "expected one event per request: {request_events:?}"
     );
+}
+
+/// A well-formed `Authorization` invocation from a fixed synthetic key. Only
+/// the request guard decodes it, so the node never needs its delegation.
+fn webhook_invocation() -> String {
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+    use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
+    use tinycloud_sdk_wasm::session::{
+        complete_session_setup, prepare_session, SessionConfig, SignedSession,
+    };
+
+    let key = SigningKey::from_bytes(&[7; 32].into()).unwrap();
+    let public = key.verifying_key().to_encoded_point(false);
+    let address: [u8; 20] = Keccak256::digest(&public.as_bytes()[1..])[12..]
+        .try_into()
+        .unwrap();
+    let lower = hex::encode(address);
+    let hash = Keccak256::digest(lower.as_bytes());
+    let checksummed: String = lower
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let nibble = (hash[i / 2] >> if i % 2 == 0 { 4 } else { 0 }) & 0x0f;
+            if c.is_ascii_alphabetic() && nibble >= 8 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    let did: DIDBuf = format!("did:pkh:eip155:1:0x{checksummed}").parse().unwrap();
+    let space = SpaceId::new(did, "default".parse().unwrap()).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let prepared = prepare_session(SessionConfig {
+        abilities: std::collections::HashMap::from([(
+            "kv".parse().unwrap(),
+            std::collections::HashMap::from([(
+                "".parse().unwrap(),
+                vec!["tinycloud.kv/get".parse().unwrap()],
+            )]),
+        )]),
+        space_abilities: None,
+        raw_abilities: std::collections::HashMap::new(),
+        address,
+        chain_id: 1,
+        domain: "localhost".parse().unwrap(),
+        issued_at: now.into(),
+        space_id: space,
+        additional_spaces: None,
+        not_before: None,
+        expiration_time: (now + time::Duration::hours(1)).into(),
+        parents: None,
+        jwk: None,
+        delegate_uri: None,
+        nonce: None,
+        invocation_ttl_secs: None,
+    })
+    .unwrap();
+    let (signature, recovery) = key
+        .sign_prehash_recoverable(&prepared.siwe.eip191_hash().unwrap())
+        .unwrap();
+    let mut bytes = [0; 65];
+    bytes[..64].copy_from_slice(signature.to_bytes().as_ref());
+    bytes[64] = u8::from(recovery) + 27;
+    let session = complete_session_setup(SignedSession {
+        session: prepared,
+        signature: bytes.into(),
+    })
+    .unwrap();
+    session
+        .invoke(
+            [(
+                "kv".parse().unwrap(),
+                "".parse().unwrap(),
+                None,
+                None,
+                ["tinycloud.kv/get".parse().unwrap()],
+            )],
+            None,
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
 }

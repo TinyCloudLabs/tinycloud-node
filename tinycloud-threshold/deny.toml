@@ -1,0 +1,31 @@
+# Selected explicitly by the threshold CI job; only this crate is a graph root.
+[graph]
+all-features = true
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+include-dev = true
+include-build = true
+confidence-threshold = 0.95
+unused-allowed-license = "allow"
+
+
+[[licenses.clarify]]
+name = "tinycloud-threshold"
+expression = "LicenseRef-TinyCloud-EGPL-1.5"
+license-files = [{ path = "../LICENSE.md", hash = 0x2a86e8e4 }]
+
+[[licenses.exceptions]]
+name = "tinycloud-threshold"
+allow = ["LicenseRef-TinyCloud-EGPL-1.5"]
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+version = 2

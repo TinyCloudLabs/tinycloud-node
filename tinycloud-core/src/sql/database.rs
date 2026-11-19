@@ -14,6 +14,7 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::request_telemetry::{self, QueryTimer, RequestContext};
+use crate::write_hooks::TouchedTables;
 
 use super::{
     authority::{record_ddl_without_schema, SqlAuthority},
@@ -47,6 +48,9 @@ enum DbMessage {
     },
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
+    },
+    Snapshot {
+        response_tx: oneshot::Sender<Result<tempfile::NamedTempFile, SqlError>>,
     },
     Checkpoint {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
@@ -172,6 +176,20 @@ impl DatabaseHandle {
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
 
+    pub async fn snapshot(&self) -> Result<tempfile::NamedTempFile, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::Snapshot { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".into()))?
+    }
+
     pub async fn checkpoint(&self) -> Result<Vec<u8>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -282,6 +300,7 @@ pub fn spawn_actor_with_policy(
                                     row_count: 1,
                                 }),
                                 write_targets: vec![],
+                                write_row_ids: vec![],
                             }
                         });
                     let _ = response_tx.send(result);
@@ -407,6 +426,13 @@ pub fn spawn_actor_with_policy(
                     let result = handle_export(&conn, &mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::Snapshot { response_tx } => {
+                    let result = handle_snapshot(&conn, &mode);
+                    if result.is_ok() {
+                        policy.budget.forget(&key);
+                    }
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Checkpoint { response_tx } => {
                     let result = handle_checkpoint(&conn, &mode, &file_path);
                     if result.is_ok() {
@@ -495,6 +521,28 @@ fn handle_export(
     drop(dest);
 
     std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
+}
+
+fn handle_snapshot(
+    conn: &rusqlite::Connection,
+    mode: &StorageMode,
+) -> Result<tempfile::NamedTempFile, SqlError> {
+    if matches!(mode, StorageMode::File(_)) {
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        if busy != 0 {
+            return Err(SqlError::Internal("Database checkpoint is busy".into()));
+        }
+    }
+    let snapshot = tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
+    let mut dest = rusqlite::Connection::open(snapshot.path())
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    rusqlite::backup::Backup::new(conn, &mut dest)
+        .and_then(|backup| backup.run_to_completion(i32::MAX, std::time::Duration::ZERO, None))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    drop(dest);
+    Ok(snapshot)
 }
 
 fn handle_checkpoint(
@@ -1140,6 +1188,7 @@ fn handle_request_authorized(
 
             result.map(|response| SqlExecutionResult {
                 response: SqlResponse::Query(response),
+                write_row_ids: vec![None; parsed.write_targets.len()],
                 write_targets: parsed.write_targets,
             })
         }
@@ -1149,6 +1198,7 @@ fn handle_request_authorized(
             schema,
         } => {
             let mut write_targets = Vec::new();
+            let mut write_row_ids = Vec::new();
             // Schema init. Each entry is judged like any other statement: a
             // schema-changing entry needs a schema-conferring ability.
             if let Some(schema_stmts) = schema {
@@ -1156,6 +1206,7 @@ fn handle_request_authorized(
                     let parsed = parser::validate_sql_authorized(stmt_sql, caveats, authority)?;
                     ddl_log.note(&parsed);
                     write_targets.extend(parsed.write_targets.iter().cloned());
+                    write_row_ids.resize(write_targets.len(), None);
                     conn.authorizer(Some(authorizer(&parsed)));
                     {
                         let _timer = QueryTimer::new();
@@ -1174,17 +1225,21 @@ fn handle_request_authorized(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            let response = result.map(SqlResponse::Execute)?;
+            let (response, row_id) = result?;
+            write_row_ids.extend(event_row_ids(&parsed.write_targets, row_id));
             write_targets.extend(parsed.write_targets);
             Ok(SqlExecutionResult {
-                response,
+                response: SqlResponse::Execute(response),
                 write_targets,
+                write_row_ids,
             })
         }
         SqlRequest::Batch { statements } => {
             let mut write_targets = Vec::new();
+            let mut write_row_ids = Vec::new();
             let mut insert_statements = Vec::with_capacity(statements.len());
             let mut scopes = Vec::with_capacity(statements.len());
+            let mut statement_targets = Vec::with_capacity(statements.len());
             // Hooks are emitted only after this branch returns Ok to the caller.
             // If a later statement fails after some earlier statements applied,
             // MVP intentionally under-emits rather than guessing partial success.
@@ -1193,11 +1248,16 @@ fn handle_request_authorized(
                 ddl_log.note(&parsed);
                 insert_statements.push(is_insert_statement(&parsed));
                 scopes.push(StatementScope::of(&parsed));
-                write_targets.extend(parsed.write_targets);
+                statement_targets.push(parsed.write_targets);
             }
 
             let mut results = Vec::new();
-            for ((stmt, is_insert), scope) in statements.iter().zip(insert_statements).zip(scopes) {
+            for (((stmt, is_insert), scope), targets) in statements
+                .iter()
+                .zip(insert_statements)
+                .zip(scopes)
+                .zip(statement_targets)
+            {
                 let auth = super::authorizer::create_authorizer_tracked(
                     caveats.clone(),
                     authority,
@@ -1207,12 +1267,16 @@ fn handle_request_authorized(
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-                results.push(result?);
+                let (response, row_id) = result?;
+                write_row_ids.extend(event_row_ids(&targets, row_id));
+                write_targets.extend(targets);
+                results.push(response);
             }
 
             Ok(SqlExecutionResult {
                 response: SqlResponse::Batch(BatchResponse { results }),
                 write_targets,
+                write_row_ids,
             })
         }
         SqlRequest::ExecuteStatement { name, params } => {
@@ -1232,16 +1296,18 @@ fn handle_request_authorized(
             conn.authorizer(Some(authorizer(&parsed)));
 
             let result = if is_query_statement(&parsed) {
-                execute_query(conn, &prepared.sql, params, None, None).map(SqlResponse::Query)
+                execute_query(conn, &prepared.sql, params, None, None)
+                    .map(|response| (SqlResponse::Query(response), None))
             } else {
                 execute_statement(conn, &prepared.sql, params, is_insert_statement(&parsed))
-                    .map(SqlResponse::Execute)
+                    .map(|(response, row_id)| (SqlResponse::Execute(response), row_id))
             };
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            result.map(|response| SqlExecutionResult {
+            result.map(|(response, row_id)| SqlExecutionResult {
                 response,
+                write_row_ids: event_row_ids(&parsed.write_targets, row_id),
                 write_targets: parsed.write_targets,
             })
         }
@@ -1480,12 +1546,18 @@ fn validate_query_limits(
     Ok(())
 }
 
+/// Runs one statement. The second value is the rowid this statement provably
+/// inserted (TC-3123 hook events): an INSERT that changed exactly one row and
+/// moved the connection's last-insert rowid. An upsert that updated, an
+/// ignored row or a WITHOUT ROWID table leaves the rowid unmoved, so those
+/// (and the rare new rowid equal to the previous one) report nothing rather
+/// than a stale id.
 fn execute_statement(
     conn: &rusqlite::Connection,
     sql: &str,
     params: &[SqlValue],
     is_insert: bool,
-) -> Result<ExecuteResponse, SqlError> {
+) -> Result<(ExecuteResponse, Option<i64>), SqlError> {
     let rusqlite_params: Vec<rusqlite::types::Value> =
         params.iter().map(sql_value_to_rusqlite).collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = rusqlite_params
@@ -1493,16 +1565,37 @@ fn execute_statement(
         .map(|p| p as &dyn rusqlite::types::ToSql)
         .collect();
 
+    let before = is_insert.then(|| conn.last_insert_rowid());
     {
         let _timer = QueryTimer::new();
         conn.execute(sql, param_refs.as_slice())
             .map_err(|e| SqlError::Sqlite(e.to_string()))?;
     }
 
-    Ok(ExecuteResponse {
-        changes: conn.changes(),
-        last_insert_row_id: is_insert.then(|| conn.last_insert_rowid()),
-    })
+    let changes = conn.changes();
+    let last_insert_row_id = is_insert.then(|| conn.last_insert_rowid());
+    let inserted = match (before, last_insert_row_id) {
+        (Some(before), Some(after)) if changes == 1 && after != before => Some(after),
+        _ => None,
+    };
+    Ok((
+        ExecuteResponse {
+            changes,
+            last_insert_row_id,
+        },
+        inserted,
+    ))
+}
+
+/// One entry per write target. Only a statement naming exactly one table can
+/// attribute its inserted rowid.
+fn event_row_ids(targets: &[TouchedTables], inserted: Option<i64>) -> Vec<Option<i64>> {
+    match (targets, inserted) {
+        ([TouchedTables::Supported(tables)], Some(row_id)) if tables.len() == 1 => {
+            vec![Some(row_id)]
+        }
+        _ => vec![None; targets.len()],
+    }
 }
 
 #[cfg(test)]

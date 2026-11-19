@@ -1,0 +1,34 @@
+{
+  "schema": "tinycloud/node/renewal-stamp-vector/v1",
+  "renewAbility": "tinycloud.delegation/renew",
+  "renewResourcePrefix": "urn:cid:",
+  "renewerKeyContext": "tinycloud/node/renewer/v1",
+  "stampDomain": "tinycloud/node/renewal-stamp/v1",
+  "testOnlyMasterSecretHex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "originalArtifact": {
+    "type": "RenewalVectorOriginalDelegation",
+    "version": 1
+  },
+  "leaseArtifact": {
+    "type": "RenewalVectorLease",
+    "version": 1
+  },
+  "stamp": {
+    "domain": "tinycloud/node/renewal-stamp/v1",
+    "unsigned": {
+      "type": "TinyCloudRenewalStamp",
+      "version": 1,
+      "originalCid": "bafkr4ifaiwrq52xkndrm7jbwqvywq3tkilydyxrj24oofckit6ink7f6hy",
+      "leaseCid": "bafkr4iaiwsgu3x5bvuigtms3hrlhrwpshbv5lxar5oj7uhh5dfg2sbcl4q",
+      "leaseGeneration": 3,
+      "previousStampCid": "bafkr4iaiwsgu3x5bvuigtms3hrlhrwpshbv5lxar5oj7uhh5dfg2sbcl4q",
+      "nodeDid": "did:key:z6MkpXveUyjpCDe6P83rNYqAZmoTc9qopJ6GBuRQRotz3zF7",
+      "renewerEpoch": 7,
+      "newEnd": "2030-01-02T03:04:05Z"
+    }
+  },
+  "canonicalDagCborHex": "a266646f6d61696e781f74696e79636c6f75642f6e6f64652f72656e6577616c2d7374616d702f763168756e7369676e6564a964747970657554696e79436c6f756452656e6577616c5374616d70666e6577456e6474323033302d30312d30325430333a30343a30355a676e6f646544696478386469643a6b65793a7a364d6b7058766555796a7043446536503833724e5971415a6d6f546339716f704a364742755251526f747a337a46376776657273696f6e01686c65617365436964783b6261666b7234696169777367753378356276756967746d733368726c6872777073686276356c786172356f6a3775686835646667327362636c34716b6f726967696e616c436964783b6261666b7234696661697772713532786b6e64726d376a6277717679777133746b696c79647978726a32346f6f66636b697436696e6b37663668796c72656e6577657245706f6368076f6c6561736547656e65726174696f6e037070726576696f75735374616d70436964783b6261666b7234696169777367753378356276756967746d733368726c6872777073686276356c786172356f6a3775686835646667327362636c3471",
+  "stampCid": "bafkr4ibtywvyzwld56wljgytygpis2dddualt6h6b343e52rzmsegyw5nq",
+  "signerPublicKeyHex": "49fd44f3fe8930b0e89f61c51333195578deacaf22105a78f647d8c05afc7c5d",
+  "signatureHex": "34caf6cc60615a4c0d4f4e934c0263dde1c17fdd5becfa0f693337987b0250f0b430d7fe4518db41a882cc26ee979603736b883798fb83bbc95fb61af077020d"
+}

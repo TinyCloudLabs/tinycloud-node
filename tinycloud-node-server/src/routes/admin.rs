@@ -10,6 +10,7 @@ use subtle::ConstantTimeEq;
 
 use crate::quota::QuotaCache;
 use crate::TinyCloud;
+use tinycloud_core::renewal::{self, RenewalSwitch};
 
 /// Request guard that validates `Authorization: Bearer <TINYCLOUD_ADMIN_SECRET>`.
 pub struct AdminAuth;
@@ -220,6 +221,62 @@ fn sort_usage_desc_nulls_last(spaces: &mut [SpaceUsage]) {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetRenewalsRequest {
+    pub paused: bool,
+}
+
+/// Node-wide renewal STOP-ALL switch state.
+#[get("/admin/renewals")]
+pub async fn get_renewals(
+    _auth: AdminAuth,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<RenewalSwitch>, (Status, String)> {
+    renewal::renewal_switch(tinycloud.connection())
+        .await
+        .map(Json)
+        .map_err(|_| switch_unavailable())
+}
+
+/// Pause (`{"paused":true}`) or resume all scheduled renewals. Persisted in
+/// the node database: survives restarts and applies to every node on it.
+/// While paused no stamp is issued; lease registration and existing stamps
+/// are unchanged. See `docs/runbooks/renewal-leases.md`.
+#[put("/admin/renewals", data = "<body>")]
+pub async fn set_renewals(
+    _auth: AdminAuth,
+    body: Json<SetRenewalsRequest>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<RenewalSwitch>, (Status, String)> {
+    let switch = tinycloud
+        .set_renewals_paused(body.paused)
+        .await
+        .map_err(|_| switch_unavailable())?;
+    // Fixed text per state: the log shipper keys warnings by message.
+    if switch.paused {
+        ::tracing::warn!(
+            event = "renewal_scheduler_switch",
+            paused = true,
+            "renewals paused node-wide"
+        );
+    } else {
+        ::tracing::warn!(
+            event = "renewal_scheduler_switch",
+            paused = false,
+            "renewals resumed node-wide"
+        );
+    }
+    Ok(Json(switch))
+}
+
+fn switch_unavailable() -> (Status, String) {
+    (
+        Status::ServiceUnavailable,
+        "renewal switch unavailable".to_owned(),
+    )
 }
 
 #[cfg(test)]

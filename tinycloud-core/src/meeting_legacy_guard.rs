@@ -130,6 +130,7 @@ mod tests {
                 .unwrap(),
             name.parse().unwrap(),
         )
+        .unwrap()
     }
 
     #[test]

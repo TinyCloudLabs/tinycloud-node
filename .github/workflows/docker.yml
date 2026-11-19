@@ -53,6 +53,16 @@ on:
         required: false
         type: boolean
         default: false
+      rollback_release:
+        description: 'Explicitly restore a prior released dstack image on N0; requires a recorded digest and reason.'
+        required: false
+        type: boolean
+        default: false
+      rollback_reason:
+        description: 'Single-line incident reason recorded in the workflow run and summary for rollback_release.'
+        required: false
+        type: string
+        default: ''
       rollback_privacy_mode:
         description: 'Explicit rollback-only policy; stop-future-local-logs does NOT delete existing files. No production default.'
         required: false
@@ -157,6 +167,9 @@ jobs:
           INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
           AUTHORIZE_QUOTA_VALUES: ${{ inputs.authorize_quota_values }}
           ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
+          ROLLBACK_RELEASE: ${{ inputs.rollback_release }}
+          ROLLBACK_REASON: ${{ inputs.rollback_reason }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
           ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
           APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
@@ -173,6 +186,27 @@ jobs:
               echo "::error::Every deployment requires explicit authorize_quota_values=true before any mutation"
               exit 1
             fi
+          fi
+          if [ "${ROLLBACK_RELEASE:-false}" = "true" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${GITHUB_REF}" != "refs/heads/main" ] \
+              || [ "${INPUT_DEPLOY_PHALA}" != "true" ] || [ -z "${INPUT_DEPLOY_DIGEST}" ] \
+              || [ -z "${INPUT_IMAGE_VERSION}" ] || [ -z "${ROLLBACK_VERSION}" ] || [ -z "${ROLLBACK_REVISION}" ]; then
+              echo "::error::Audited release rollback requires a main dispatch, Phala deployment, exact image digest, version and revision"
+              exit 1
+            fi
+            if [ "${ROLLBACK_PRE_N0:-false}" = "true" ] \
+              || [ "${ROLLBACK_PRIVACY_MODE:-unselected}" != "unselected" ] \
+              || [ "${ALLOW_NON_DESCENDANT:-false}" = "true" ]; then
+              echo "::error::Audited release rollback cannot use rollback_pre_n0, rollback_privacy_mode, or allow_non_descendant=true"
+              exit 1
+            fi
+            if [ -z "${ROLLBACK_REASON:-}" ]; then
+              echo "::error::rollback_reason is required for an audited release rollback"
+              exit 1
+            fi
+          elif [ -n "${ROLLBACK_REASON:-}" ]; then
+            echo "::error::rollback_reason requires rollback_release=true"
+            exit 1
           fi
           python3 scripts/ci/reconcile-quota.py --validate-only
 
@@ -274,7 +308,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only
+    if: inputs.deploy_image_digest == '' && !inputs.rollback_audit_only
     permissions:
       contents: read
       packages: write
@@ -305,6 +339,9 @@ jobs:
             FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
+          case "$FEATURES" in
+            *renewal-test-clock*) echo "::error::renewal-test-clock is forbidden in container builds"; exit 1 ;;
+          esac
           {
             echo "cargo_features=${FEATURES}"
             echo "image_suffix=${IMAGE_SUFFIX}"
@@ -327,11 +364,40 @@ jobs:
             type=raw,value=edge,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') }}
 
+      # Pull requests only: keep the Dockerfile's `--mount=type=cache` dirs
+      # (cargo registry, /app/target) between pushes of the same PR. On a hosted
+      # runner those mounts start empty and are never part of the exported layer
+      # cache, so the cargo-chef cook layer caches nothing and every PR push
+      # rebuilt all dependencies plus the app in release. The cache is restored
+      # from actions/cache, injected into BuildKit here, and extracted again
+      # after the build. The Dockerfile, the image, the target and every
+      # push / tag / release / dispatch path are unchanged. A PR's cache is
+      # private to that PR (and main), so the first push of a PR is still cold.
+      - name: Restore cargo build mounts (pull requests)
+        if: github.event_name == 'pull_request'
+        id: cargo_mounts
+        uses: actions/cache@v4
+        with:
+          path: docker-cache-mounts
+          # One entry per commit, restored from the newest earlier one: a run
+          # whose layers were all cached from main compiles nothing and would
+          # otherwise freeze an empty cache under a fixed key.
+          key: docker-pr-cargo-mounts-${{ github.sha }}
+          restore-keys: docker-pr-cargo-mounts-
+
+      - name: Inject cargo build mounts into BuildKit (pull requests)
+        if: github.event_name == 'pull_request'
+        uses: reproducible-containers/buildkit-cache-dance@1b8ab18fbda5ad3646e3fcc9ed9dd41ce2f297b4 # v3.3.2
+        with:
+          dockerfile: Dockerfile
+          cache-dir: docker-cache-mounts
+          skip-extraction: ${{ steps.cargo_mounts.outputs.cache-hit }}
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ vars.TC780_CUTOVER_READY == 'true' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
@@ -341,7 +407,7 @@ jobs:
   build-dstack:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     permissions:
@@ -376,6 +442,9 @@ jobs:
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
             SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
+          case "$FEATURES" in
+            *renewal-test-clock*) echo "::error::renewal-test-clock is forbidden in container builds"; exit 1 ;;
+          esac
           {
             echo "cargo_features=${FEATURES}"
             echo "image_suffix=${IMAGE_SUFFIX}"
@@ -416,7 +485,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'pull_request' ||
-      (vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')))
+      (inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')))
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     permissions:
@@ -467,12 +536,12 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
-    # TC-971: production-environment policy admits main and v* tags. Most deploy
-    # secrets live there; PROD_TINYCLOUD_ADMIN_SECRET is repository-scoped.
+    # TC-971: production-environment policy admits main and v* tags. Deploy
+    # secrets, including PROD_TINYCLOUD_ADMIN_SECRET, live there only.
     # Digest promotion additionally requires main, not a release tag.
     environment: production
     if: >-
-      ${{ vars.TC780_CUTOVER_READY == 'true' && !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
+      ${{ !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
         github.event_name == 'workflow_dispatch' && inputs.deploy_phala &&
         ((inputs.deploy_image_digest != '' && github.ref == 'refs/heads/main' && needs.build.result == 'skipped' && needs.build-dstack.result == 'skipped') ||
           (inputs.deploy_image_digest == '' && needs.build.result == 'success' && needs.build-dstack.result == 'success')) }}
@@ -646,6 +715,9 @@ jobs:
           ROLLBACK_PRE_N0: ${{ inputs.rollback_pre_n0 }}
           ROLLBACK_PRIVACY_MODE: ${{ inputs.rollback_privacy_mode }}
           APPROVED_ROLLBACK_PRIVACY_MODE: ${{ vars.TC959_ROLLBACK_PRIVACY_MODE }}
+          ROLLBACK_RELEASE: ${{ inputs.rollback_release }}
+          ROLLBACK_REASON: ${{ inputs.rollback_reason }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
         run: |
           set -euo pipefail
           DIGEST="${INPUT_DEPLOY_DIGEST:-${BUILD_DIGEST}}"
@@ -692,9 +764,11 @@ jobs:
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
-          # env lines + deletion-ledger volume (raw 298ea356…; 192dfb7e… before TC-1777),
+          # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes and the TC-2917
+          # storage-headroom event in the Vector config
+          # (raw 5419a6fb…; d703d69b… before TC-2917, 298ea356… before TC-2346, 192dfb7e… before TC-1777),
           # its single node digest normalized to 64 zeros.
-          n0_template_hash = 'c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028'
+          n0_template_hash = '90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -703,22 +777,39 @@ jobs:
               normalized = raw[:pins[0].start(1)] + b'0' * 64 + raw[pins[0].end(1):]
               return hashlib.sha256(normalized).hexdigest() == n0_template_hash
 
-          def require_release():
-              # Only a recorded, released main image may replace the N0 pin:
-              # its labels, vX.Y.Z tag and crate version must all agree.
-              refuse = '::error::Reviewed N0 compose accepts only a recorded released main image; deployment not attempted'
+          def require_recorded_release():
+              # A rollback target must still be a genuine released main image:
+              # its OCI labels, vX.Y.Z tag and crate version must all agree.
+              refuse = '::error::N0 image must be a recorded released main image; deployment not attempted'
               label = re.fullmatch(r'([0-9]+\.[0-9]+\.[0-9]+)-dstack', os.environ['LABEL_VERSION'])
               revision = os.environ['LABEL_REVISION']
               if (not label or not re.fullmatch(r'[0-9a-f]{40}', revision) or not os.environ.get('INPUT_DEPLOY_DIGEST')
                       or os.environ['RESOLVED_IMAGE'] != native + '@' + os.environ['INPUT_DEPLOY_DIGEST']
                       or os.environ.get('ROLLBACK_VERSION') != label[1] or os.environ.get('ROLLBACK_REVISION') != revision):
                   raise SystemExit(refuse)
-              if git('rev-parse', '--verify', '--quiet', f'refs/tags/v{label[1]}^{{commit}}').strip() != revision:
-                  raise SystemExit(refuse)
+              tag_commit = git('rev-parse', '--verify', '--quiet', f'refs/tags/v{label[1]}^{{commit}}').strip()
+              if tag_commit != revision:
+                  raise SystemExit('::error::Image tag does not resolve to the labeled release revision')
               crate = re.search(r'(?m)^version = "([^"]*)"$', git('show', f'{revision}:tinycloud-node-server/Cargo.toml'))
               if not crate or crate[1] != label[1]:
-                  raise SystemExit(refuse)
-              require_release_descends(revision)
+                  raise SystemExit('::error::Image crate version does not match its release tag')
+
+          def require_release():
+              require_recorded_release()
+              require_release_descends(os.environ['LABEL_REVISION'])
+
+          def require_rollback_release():
+              require_recorded_release()
+              revision = os.environ['LABEL_REVISION']
+              if (not re.fullmatch(r'[0-9a-f]{40}', running) or revision == running
+                      or not is_ancestor(revision, running)):
+                  raise SystemExit('::error::Rollback target must be a strictly older released ancestor of the running image')
+              migration_diff = subprocess.run(
+                  ['git', 'diff', '--quiet', revision, running, '--', 'tinycloud-core/src/migrations'],
+                  capture_output=True,
+              )
+              if migration_diff.returncode != 0:
+                  raise SystemExit('::error::Rollback target migration sources differ from the running image; database compatibility is not established')
 
           def is_ancestor(older, newer):
               return subprocess.run(['git', 'merge-base', '--is-ancestor', older, newer], capture_output=True).returncode == 0
@@ -738,6 +829,18 @@ jobs:
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
           rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
           mode = os.environ.get('ROLLBACK_PRIVACY_MODE') or 'unselected'
+          release_rollback = os.environ.get('ROLLBACK_RELEASE') == 'true'
+          rollback_reason = os.environ.get('ROLLBACK_REASON', '')
+          if rollback and release_rollback:
+              raise SystemExit('::error::rollback_pre_n0 and rollback_release are mutually exclusive')
+          if release_rollback:
+              if os.environ.get('ALLOW_NON_DESCENDANT') == 'true':
+                  raise SystemExit('::error::Audited rollback cannot bypass the production ancestry guard')
+              if (len(rollback_reason) < 12 or len(rollback_reason) > 300 or rollback_reason != rollback_reason.strip()
+                      or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 .,;:()/_+-]{11,299}', rollback_reason)):
+                  raise SystemExit('::error::rollback_reason must be a 12-300 character single-line ASCII reason')
+          elif rollback_reason:
+              raise SystemExit('::error::rollback_reason requires rollback_release=true')
           if rollback:
               raw = read_artifact('ops/rollback/pre-n0-compose.yaml')
               if os.environ['RESOLVED_IMAGE'] != reviewed or hashlib.sha256(raw).hexdigest() != pre_n0_hash:
@@ -755,7 +858,11 @@ jobs:
               raw = read_artifact(str(path))
               digest = hashlib.sha256(raw).hexdigest()
               n0_configuration = n0_template(raw)
-              if os.environ['RESOLVED_IMAGE'] == reviewed:
+              if release_rollback:
+                  if not n0_configuration:
+                      raise SystemExit('::error::rollback_release is available only for the reviewed N0 compose')
+                  require_rollback_release()
+              elif os.environ['RESOLVED_IMAGE'] == reviewed:
                   if not n0_configuration and digest not in (pre_n0_hash, pre_n0_template_hash):
                       raise SystemExit('::error::Same-image recovery requires the exact current pre-N0 or reviewed N0 compose')
                   require_not_older_than_running(os.environ['LABEL_REVISION'])
@@ -785,6 +892,15 @@ jobs:
               print(message)
               with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
                   summary.write(message + '\n')
+          elif release_rollback:
+              message = (
+                  f"Authorized N0 release rollback: {os.environ['RESOLVED_IMAGE']}; "
+                  f"version {os.environ['LABEL_VERSION']}; revision {os.environ['LABEL_REVISION']}; "
+                  f"reason: {rollback_reason}"
+              )
+              print(message)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write("### Authorized N0 release rollback\n\n" + message + "\n")
           PY
           {
             echo "image=${RESOLVED_IMAGE}"
@@ -1176,7 +1292,7 @@ jobs:
         timeout-minutes: 5
         if: ${{ success() && inputs.authorize_quota_values }}
         env:
-          # Repository-scoped; never read by an agent or passed in argv.
+          # Production environment secret; never read by an agent or passed in argv.
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}

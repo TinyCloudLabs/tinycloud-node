@@ -33,6 +33,7 @@ pub struct Model {
     pub issued_at: OffsetDateTime,
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
+    pub serialization_format: i16,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -70,6 +71,16 @@ pub enum Error {
     InvalidInvocation(#[from] InvocationError),
 }
 
+impl Error {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        match self {
+            Self::InvalidInvocation(error) => error.revocation_code(),
+            Self::Db(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
     #[error("Invocation expired or not yet valid")]
@@ -98,6 +109,9 @@ pub enum InvocationError {
     DelegationAncestorRevoked {
         ancestor_cid: String,
         invoked_cid: String,
+        /// A direct parent of the invoked delegation is among the revoked
+        /// ancestors (TC-2381); it only selects the stable revocation code.
+        direct_parent: bool,
     },
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
@@ -115,6 +129,22 @@ pub enum InvocationError {
     /// Code: `encryption-prefix-not-invocable`.
     #[error("encryption-prefix-not-invocable")]
     EncryptionPrefixNotInvocable,
+}
+
+impl InvocationError {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        use super::revocation::RevocationCode;
+        match self {
+            Self::DelegationRevoked(_) => Some(RevocationCode::DelegationRevoked),
+            Self::DelegationAncestorRevoked {
+                direct_parent: true,
+                ..
+            } => Some(RevocationCode::ParentRevoked),
+            Self::DelegationAncestorRevoked { .. } => Some(RevocationCode::AncestorRevoked),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -170,7 +200,8 @@ pub(crate) async fn process_internal<C: ConnectionTrait>(
 /// then the full authorization graph, caveat containment, revocation
 /// ordering, chain limits, and persistence proceed unchanged. Reachable
 /// only via `Event::AdmittedInvocation`, which is itself only constructed
-/// from a consumed `AdmittedInvocation` — this function does not, and
+/// from an `AdmittedInvocation` (consumed, or copied from a reference by the
+/// read-only authorization step) — this function does not, and
 /// must not, accept a bare invocation from any other caller.
 pub(crate) async fn process_admitted<C: ConnectionTrait>(
     db: &C,
@@ -462,6 +493,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
+                        direct_parent: graph.has_revoked_parent(&p.id),
                     }
                     .into());
                 }
@@ -476,8 +508,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     let Some(ancestor) = graph.delegation(&chain_id) else {
                         return Err(InvocationError::MissingParents.into());
                     };
-                    if ancestor
-                        .expiry
+                    let effective_expiry = graph
+                        .effective_expiry(&chain_id)
+                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .or(ancestor.expiry);
+                    if effective_expiry
                         .map(|expiry| chain_now >= expiry)
                         .unwrap_or(false)
                         || ancestor
@@ -503,7 +538,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
             let parents: Vec<_> = parents
                 .into_iter()
                 .filter(|(p, _)| {
-                    p.expiry.map(|pexp| now < pexp).unwrap_or(true)
+                    let effective_expiry = graph
+                        .effective_expiry(&p.id)
+                        .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .or(p.expiry);
+                    effective_expiry.map(|pexp| now < pexp).unwrap_or(true)
                         && p.not_before.map(|pnbf| now >= pnbf).unwrap_or(true)
                 })
                 .collect();
@@ -728,7 +767,15 @@ async fn save<C: ConnectionTrait>(
     let invoker = invocation.invoker.clone();
 
     // Encrypt for storage if encryption is configured
-    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
+    let stored_serialization = crate::encryption::maybe_encrypt(
+        encryption,
+        &serialization,
+        crate::encryption::RowBinding::new(
+            "invocation",
+            "serialization",
+            &[&Vec::<u8>::from(hash)],
+        ),
+    );
 
     // Ensure the invoker actor exists before inserting the invocation
     match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
@@ -752,6 +799,7 @@ async fn save<C: ConnectionTrait>(
         id: hash,
         issued_at,
         serialization: stored_serialization,
+        serialization_format: if encryption.is_some() { 2 } else { 0 },
         facts: None,
         invoker,
     }))
@@ -1205,7 +1253,7 @@ mod tests {
         let did: DIDBuf = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        SpaceId::new(did, name.parse().unwrap())
+        SpaceId::new(did, name.parse().unwrap()).unwrap()
     }
 
     #[test]
@@ -1485,6 +1533,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -1665,6 +1714,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db)
         .await
@@ -2083,6 +2133,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -2250,6 +2301,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
             }
             .insert(&db)
             .await
@@ -2337,6 +2389,7 @@ mod tests {
                 )],
             )))),
             serialization: Set(parent.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(&db)
         .await

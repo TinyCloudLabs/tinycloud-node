@@ -16,7 +16,7 @@ use rocket::{
     Build, Rocket, Route,
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -44,6 +44,7 @@ pub mod node_control;
 pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
+pub mod renewal;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
@@ -68,6 +69,7 @@ pub mod tee;
 mod tracing;
 pub mod tunnel;
 pub mod webhook_dispatcher;
+pub mod webhook_headers;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -255,7 +257,9 @@ use routes::tc_bench::{
     kv_put as tc_bench_kv_put, BenchState,
 };
 use routes::{
-    admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
+    admin::{
+        delete_quota, get_quota, get_renewals, get_usage, list_quotas, set_quota, set_renewals,
+    },
     admin_stats::get_stats,
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
@@ -271,7 +275,7 @@ use routes::{
     node_keys::{node_keys, NodePublicKeys},
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    revoke, signed_kv_get,
+    renewal_state_control, revoke, signed_kv_get,
     util_routes::*,
     version,
 };
@@ -298,6 +302,23 @@ use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
 pub type BlockStage = Either<TempFileSystemStage, MemoryStaging>;
+
+/// Builds the serving storage rings, retaining the prior key for legacy reads.
+pub fn storage_keyrings(
+    key_setup: &StaticSecret,
+    config: &config::ColumnEncryptionConfig,
+) -> (ColumnEncryption, ColumnEncryption) {
+    use tinycloud_core::encryption::EncryptionPurpose;
+
+    let root = key_setup.derive_key(b"tinycloud/column-encryption/root");
+    let legacy_key = key_setup.derive_key(b"tinycloud/hooks/webhook-secrets");
+    (
+        ColumnEncryption::for_purpose(root, legacy_key, EncryptionPurpose::Columns)
+            .with_strict(config.strict),
+        ColumnEncryption::for_purpose(root, legacy_key, EncryptionPurpose::Webhooks)
+            .with_strict(config.strict),
+    )
+}
 
 impl From<BlockStorage> for BlockConfig {
     fn from(c: BlockStorage) -> BlockConfig {
@@ -450,9 +471,8 @@ pub fn postgres_connections_opened() -> u64 {
 ///   seconds instead of hanging for up to ~15 min. A connect whose options
 ///   cannot be set fails;
 /// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
-///   statement stuck on a live connection fails server-side. Migrations and
-///   whole-artifact transfers scope their own limits
-///   ([`tinycloud_core::db::migrate`], [`RecoveringConnection::begin_bulk`]).
+///   statement stuck on a live connection fails server-side. Migrations
+///   lift it for their own transaction ([`tinycloud_core::db::migrate`]).
 ///
 /// sea-orm's `Database::connect` cannot install these hooks, so the pool is
 /// built here with the same connect options it would have applied: the URL,
@@ -498,6 +518,13 @@ pub async fn postgres_pool_with_recovery(
     );
     let statement_timeouts = database.statement_timeouts();
     let session_statement = statement_timeouts.session_statement();
+    let idle_in_transaction_statement = database.idle_in_transaction_statement();
+    // The value in effect: 0 when off or in `local` statement-timeout mode.
+    let idle_in_transaction_timeout_ms = if idle_in_transaction_statement.is_some() {
+        database.idle_in_transaction_timeout_ms
+    } else {
+        0
+    };
     let pool = recovery
         .install(
             connect_opts
@@ -506,9 +533,13 @@ pub async fn postgres_pool_with_recovery(
         )
         .after_connect(move |conn, _meta| {
             let session_statement = session_statement.clone();
+            let idle_in_transaction_statement = idle_in_transaction_statement.clone();
             Box::pin(async move {
                 POSTGRES_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
-                if let Some(statement) = session_statement {
+                for statement in [session_statement, idle_in_transaction_statement]
+                    .into_iter()
+                    .flatten()
+                {
                     conn.execute(statement.as_str()).await?;
                 }
                 Ok(())
@@ -522,7 +553,7 @@ pub async fn postgres_pool_with_recovery(
     ::tracing::info!(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
-        bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        idle_in_transaction_timeout_ms,
         retry_window_ms = database.retry_window_ms,
         tcp_keepalive = keepalive.is_some(),
         tcp_keepalive_idle_secs = keepalive.map(|k| k.idle.as_secs()),
@@ -535,6 +566,7 @@ pub async fn postgres_pool_with_recovery(
         connections_opened = postgres_connections_opened(),
         "PostgreSQL pool connection limits"
     );
+    prometheus::set_db_pool_timeouts(statement_timeouts, idle_in_transaction_timeout_ms);
     Ok(RecoveringConnection::with_recovery(
         SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         recovery,
@@ -565,6 +597,11 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     resolved.hooks.validate().map_err(anyhow::Error::msg)?;
     resolved.database.validate().map_err(anyhow::Error::msg)?;
     resolved
+        .storage
+        .sql
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    resolved
         .epoch_head_backfill
         .validate()
         .map_err(anyhow::Error::msg)?;
@@ -576,6 +613,20 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     tracing::RequestIdOrigins::new(&resolved.log.request_id_first_party_origins)
         .map_err(anyhow::Error::msg)?;
     resolved.storage.resolve();
+    if resolved.storage.sql.chunked_artifacts {
+        anyhow::ensure!(
+            resolved.storage.database().starts_with("postgres"),
+            "chunked artifacts require PostgreSQL"
+        );
+        anyhow::ensure!(
+            resolved.storage.sql.chunked_artifact_max_bytes > 0
+                && resolved.storage.sql.chunked_account_max_bytes > 0
+                && resolved.storage.sql.chunked_artifact_max_bytes <= i64::MAX as u64
+                && resolved.storage.sql.chunked_account_max_bytes <= i64::MAX as u64,
+            "chunked artifacts require explicit positive capacities within int64"
+        );
+    }
+
     resolved
         .sql_store
         .validate_for_database(resolved.storage.database())
@@ -628,6 +679,7 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         delegate,
         delegation_query,
         delegation_status,
+        renewal_state_control,
         revoke,
         create_signed_kv_url,
         signed_kv_get,
@@ -646,6 +698,8 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         get_quota,
         list_quotas,
         get_usage,
+        get_renewals,
+        set_renewals,
         get_stats,
         create_encryption_network,
         get_encryption_network,
@@ -665,6 +719,19 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         routes.extend(named_key_routes());
     }
     routes
+}
+
+/// Settings the node no longer reads that a deployment may still set, in
+/// its file or environment. Configuration extraction ignores unknown keys,
+/// so each is named once at startup instead of being dropped silently.
+const REMOVED_SETTINGS: &[&str] = &["database.bulk_statement_timeout_ms"];
+
+fn removed_settings(config: &Figment) -> Vec<&'static str> {
+    REMOVED_SETTINGS
+        .iter()
+        .copied()
+        .filter(|setting| config.find_value(setting).is_ok())
+        .collect()
 }
 
 pub async fn app_with_control(
@@ -713,6 +780,12 @@ pub async fn app_with_control(
     if tinycloud_config.did_resolution.network_methods {
         ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
     }
+    for setting in removed_settings(config) {
+        ::tracing::warn!(
+            setting,
+            "removed setting is set and ignored; delete it from the configuration (TC-2961)"
+        );
+    }
 
     let key_setup: StaticSecret =
         match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
@@ -744,9 +817,8 @@ pub async fn app_with_control(
     );
     // TC-359: publish the derived public halves so an operator can read the
     // invitation key a dstack-keyed node actually signs with.
-    let node_public_keys = NodePublicKeys::derive(&key_setup);
-    let webhook_encryption =
-        ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
+    let (column_encryption, webhook_encryption) =
+        storage_keyrings(&key_setup, &tinycloud_config.column_encryption);
     let hook_runtime = HookRuntime::new(
         tinycloud_config.hooks.clone(),
         key_setup.derive_key(hooks::HOOK_TICKET_KEY_CONTEXT),
@@ -818,7 +890,9 @@ pub async fn app_with_control(
         database_connection.clone(),
         node_keypair,
         encryption_backend,
-    );
+    )
+    .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
+    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2);
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.
@@ -838,12 +912,17 @@ pub async fn app_with_control(
         database_connection,
         block_store,
         key_setup.setup(()).await?,
-        Some(webhook_encryption.clone()),
+        Some(column_encryption),
     )
     .await?
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
     .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
+    let renewer_epoch = tinycloud
+        .renewal_identity()
+        .map(|identity| identity.epoch)
+        .ok_or_else(|| anyhow::anyhow!("node renewal identity is not initialized"))?;
+    let node_public_keys = NodePublicKeys::derive_at_epoch(&key_setup, renewer_epoch);
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
@@ -931,11 +1010,35 @@ pub async fn app_with_control(
         tc_bench_block_get,
         tc_bench_health,
     ]);
-    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
-        Arc::new(SizeTrackingArtifactRepository::new(
-            Arc::new(node_artifact_repository(&tinycloud)),
-            sql_sizes.clone(),
+    let raw_artifact_repository = node_artifact_repository(&tinycloud)
+        .with_max_write_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_write_bytes
+                .as_u64(),
+        )
+        .with_max_read_bytes(
+            tinycloud_config
+                .storage
+                .sql
+                .max_artifact_read_bytes
+                .as_u64(),
+        )
+        .with_chunk_limits(tinycloud_config.storage.sql.chunked_artifacts.then_some(
+            tinycloud_core::database_artifacts::chunks::ChunkLimits {
+                artifact_bytes: tinycloud_config.storage.sql.chunked_artifact_max_bytes,
+                account_bytes: tinycloud_config.storage.sql.chunked_account_max_bytes,
+            },
         ));
+    raw_artifact_repository.configure_chunked_storage().await?;
+    let artifact_collector = raw_artifact_repository
+        .chunk_storage_active()
+        .await?
+        .then_some(raw_artifact_repository.clone());
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SizeTrackingArtifactRepository::new(Arc::new(raw_artifact_repository), sql_sizes.clone()),
+    );
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -1039,8 +1142,31 @@ pub async fn app_with_control(
     let telemetry_enabled = tinycloud_config.telemetry.enabled;
     let telemetry_tinycloud = tinycloud.clone();
     let backfill_tinycloud = tinycloud.clone();
-
+    let renewal_scheduler_tinycloud = tinycloud.clone();
+    let renewal_scheduler_secret = key_setup.clone();
     let rocket = rocket::custom(config)
+        .attach(AdHoc::on_liftoff("artifact-part-collector", move |rocket| {
+            let collector=artifact_collector.clone();
+            let shutdown=rocket.shutdown();
+            Box::pin(async move {
+                if let Some(collector)=collector {
+                    tokio::spawn(async move {
+                        let mut interval=tokio::time::interval(Duration::from_secs(10));
+                        tokio::pin!(shutdown);
+                        loop {
+                            tokio::select! {
+                                _=interval.tick()=> {
+                                    if !matches!(tokio::time::timeout(Duration::from_secs(1), collector.reap_unused_parts(128)).await, Ok(Ok(()))) {
+                                        ::tracing::warn!(event="artifact_part_collection_failed", "Artifact part collection deferred");
+                                    }
+                                },
+                                _=&mut shutdown=>break,
+                            }
+                        }
+                    });
+                }
+            })
+        }))
         .attach(AdHoc::on_liftoff("webhook-egress-refresh", {
             let policy = egress_policy.clone();
             move |rocket| {
@@ -1070,6 +1196,40 @@ pub async fn app_with_control(
         )
         .attach(AdHoc::config::<Config>())
         .attach(tracing_fairing)
+        .attach(AdHoc::on_liftoff("renewal-scheduler", move |rocket| {
+            let tinycloud = renewal_scheduler_tinycloud.clone();
+            let secret = renewal_scheduler_secret.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let period = renewal::scheduler_interval();
+                    if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
+                        ::tracing::warn!(
+                            event = "renewal_scheduler_tick_failed",
+                            code = renewal::tick_failure_code(&error),
+                            "internal renewal scheduler pass failed"
+                        );
+                    }
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if let Err(error) = renewal::scheduler_tick(&tinycloud, &secret).await {
+                                    ::tracing::warn!(
+                                        event = "renewal_scheduler_tick_failed",
+                                        code = renewal::tick_failure_code(&error),
+                                        "internal renewal scheduler pass failed"
+                                    );
+                                }
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
         .attach(AdHoc::on_liftoff(
             "invocation-replay-cleanup",
             move |rocket| {
@@ -1236,6 +1396,27 @@ pub async fn app_with_control(
         rocket
     };
 
+    // TC-2917: every 5 minutes, report the free bytes behind each local store
+    // as a log event (shipped by the log sidecar) and as a gauge. Operators
+    // have no shell on the node; this is how they see disk headroom.
+    let headroom_stores = local_stores(&tinycloud_config.storage);
+    let rocket = rocket.attach(AdHoc::on_liftoff("storage-headroom", move |rocket| {
+        let stores = headroom_stores.clone();
+        let shutdown = rocket.shutdown();
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(STORAGE_HEADROOM_PERIOD);
+                tokio::pin!(shutdown);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => report_storage_headroom(&stores),
+                        _ = &mut shutdown => break,
+                    }
+                }
+            });
+        })
+    }));
+
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
         let control_stopping = control.clone();
@@ -1256,13 +1437,7 @@ pub async fn app_with_control(
         rocket
     };
 
-    let share_allowed_origin = tinycloud_config
-        .share_email
-        .allowed_origins
-        .first()
-        .cloned()
-        .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = attach_response_fairings(rocket, share_allowed_origin);
+    let rocket = attach_response_fairings(rocket);
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
@@ -1275,9 +1450,9 @@ pub async fn app_with_control(
 ///
 /// [`no_transform_fairing`] runs after [`share_security_fairing`] because that
 /// fairing replaces `Cache-Control` on the share paths.
-fn attach_response_fairings(rocket: Rocket<Build>, share_allowed_origin: String) -> Rocket<Build> {
+fn attach_response_fairings(rocket: Rocket<Build>) -> Rocket<Build> {
     rocket
-        .attach(share_security_fairing(share_allowed_origin))
+        .attach(share_security_fairing())
         .attach(retry_after_fairing())
         .attach(no_transform_fairing())
 }
@@ -1374,9 +1549,12 @@ fn retry_after_fairing() -> AdHoc {
 fn cors_fairing() -> AdHoc {
     AdHoc::on_response("CORS", |request, resp| {
         Box::pin(async move {
-            if is_mounted_share_path(request.uri().path().as_str()) {
-                return;
-            }
+            // No `/policy/v3/` handler authenticates with cookies or ambient
+            // credentials (Authorization header, signed invocations, or public
+            // endpoints), so these paths get the same wildcard CORS as
+            // `/invoke`, minus `Allow-Credentials`, which a wildcard origin
+            // cannot use anyway (TC-2192).
+            let is_policy_path = is_mounted_share_path(request.uri().path().as_str());
             resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
             resp.set_header(Header::new(
                 // allow these methods for requests
@@ -1393,7 +1571,9 @@ fn cors_fairing() -> AdHoc {
                 "Access-Control-Allow-Headers",
                 "*, Authorization, X-Request-Id",
             ));
-            resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            if !is_policy_path {
+                resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            }
             if request.method() == Method::Options {
                 // only meaningful on a preflight response; lets the browser
                 // skip the OPTIONS round trip on subsequent requests
@@ -1406,24 +1586,13 @@ fn cors_fairing() -> AdHoc {
     })
 }
 
-fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
+fn share_security_fairing() -> AdHoc {
     AdHoc::on_response("share-email-security-headers", move |request, response| {
-        let share_allowed_origin = share_allowed_origin.clone();
         Box::pin(async move {
             if is_mounted_share_path(request.uri().path().as_str()) {
                 response.set_header(Header::new("Cache-Control", "no-store"));
                 response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
                 response.set_header(Header::new("Referrer-Policy", "no-referrer"));
-                response.set_header(Header::new(
-                    "Access-Control-Allow-Origin",
-                    share_allowed_origin,
-                ));
-                response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
-                response.set_header(Header::new(
-                    "Access-Control-Allow-Headers",
-                    "Content-Type, Authorization, X-Request-Id",
-                ));
-                response.set_header(Header::new("Access-Control-Expose-Headers", "X-Request-Id"));
             }
         })
     })
@@ -1551,6 +1720,51 @@ async fn sample_db_telemetry(
     let read_audit = tinycloud.read_audit_health();
     crate::prometheus::observe_read_audit(last_read_audit, &read_audit);
     *last_read_audit = read_audit;
+}
+
+/// How often [`report_storage_headroom`] runs.
+const STORAGE_HEADROOM_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The local stores whose filesystem headroom is reported, by the label they
+/// are reported under.
+fn local_stores(storage: &config::Storage) -> Vec<(&'static str, PathBuf)> {
+    let mut stores = Vec::new();
+    if let Some(path) = &storage.sql.path {
+        stores.push(("sql", PathBuf::from(path)));
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(path) = &storage.duckdb.path {
+        stores.push(("duckdb", PathBuf::from(path)));
+    }
+    stores
+}
+
+/// The granularity of the free bytes in the shipped headroom event: exact
+/// values every 5 minutes would let a quiet node's write volume be inferred
+/// by whoever reads the logs; 64 MiB steps still show headroom.
+const STORAGE_HEADROOM_STEP_BYTES: u64 = 64 << 20;
+
+/// The log target of the headroom event. It is not a module path, so no other
+/// line in the node can carry it by accident.
+const STORAGE_HEADROOM_TARGET: &str = "tinycloud::disk_headroom";
+
+/// One `statvfs` per store: the exact free bytes go to the gauge, and one
+/// `storage headroom` event per store carries them rounded down to
+/// [`STORAGE_HEADROOM_STEP_BYTES`]; the log sidecar ships it with only these
+/// two fields. A store that cannot be read is skipped.
+fn report_storage_headroom(stores: &[(&'static str, PathBuf)]) {
+    use tinycloud_core::sql::durability::{FreeSpace, StatvfsFreeSpace};
+    for (store, path) in stores {
+        if let Ok(free_bytes) = StatvfsFreeSpace.free_bytes(path) {
+            crate::prometheus::set_storage_free_bytes(store, free_bytes);
+            ::tracing::info!(
+                target: STORAGE_HEADROOM_TARGET,
+                store = *store,
+                free_bytes = free_bytes - free_bytes % STORAGE_HEADROOM_STEP_BYTES,
+                "storage headroom"
+            );
+        }
+    }
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed
@@ -1903,6 +2117,7 @@ mod sqlite_tuning_tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"synthetic database race fixture".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&transaction)
         .await
@@ -1939,14 +2154,14 @@ mod share_security_fairing_tests {
     fn non_share_preflight() {}
 
     #[tokio::test]
-    async fn chromium_policy_admission_preflight_allows_authorization() {
+    async fn policy_admission_preflight_keeps_security_headers() {
         let client = Client::tracked(
             rocket::build()
                 .mount(
                     "/",
                     routes![policy_admission_preflight, non_share_preflight],
                 )
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+                .attach(share_security_fairing()),
         )
         .await
         .expect("valid Rocket instance");
@@ -1965,37 +2180,20 @@ mod share_security_fairing_tests {
 
             assert_eq!(response.status(), rocket::http::Status::Ok, "{path}");
             assert_eq!(
-                response.headers().get_one("Access-Control-Allow-Origin"),
-                Some("https://share.tinycloud.xyz"),
+                response.headers().get_one("Cache-Control"),
+                Some("no-store"),
                 "{path}"
             );
-            let methods: std::collections::BTreeSet<_> = response
-                .headers()
-                .get_one("Access-Control-Allow-Methods")
-                .unwrap()
-                .split(',')
-                .map(str::trim)
-                .collect();
-            assert_eq!(methods, std::collections::BTreeSet::from(["GET", "POST"]));
-            let allowed = response
-                .headers()
-                .get_one("Access-Control-Allow-Headers")
-                .unwrap()
-                .to_ascii_lowercase();
-            let allowed: std::collections::BTreeSet<_> =
-                allowed.split(',').map(str::trim).collect();
             assert_eq!(
-                allowed,
-                std::collections::BTreeSet::from(
-                    ["authorization", "content-type", "x-request-id",]
-                )
+                response.headers().get_one("X-Content-Type-Options"),
+                Some("nosniff"),
+                "{path}"
             );
-            assert!(response
-                .headers()
-                .get_one("Access-Control-Expose-Headers")
-                .unwrap()
-                .split(',')
-                .any(|name| name.trim().eq_ignore_ascii_case("x-request-id")));
+            assert_eq!(
+                response.headers().get_one("Referrer-Policy"),
+                Some("no-referrer"),
+                "{path}"
+            );
         }
     }
 
@@ -2007,7 +2205,7 @@ mod share_security_fairing_tests {
                     "/",
                     routes![policy_admission_preflight, non_share_preflight],
                 )
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+                .attach(share_security_fairing()),
         )
         .await
         .expect("valid Rocket instance");
@@ -2045,7 +2243,7 @@ mod cors_fairing_tests {
         Client::tracked(
             rocket::build()
                 .mount("/", routes![util_routes::cors, invoke])
-                .attach(share_security_fairing("https://share.tinycloud.xyz".into()))
+                .attach(share_security_fairing())
                 .attach(cors_fairing()),
         )
         .await
@@ -2101,7 +2299,7 @@ mod cors_fairing_tests {
     }
 
     #[tokio::test]
-    async fn max_age_is_not_sent_on_actual_or_share_responses() {
+    async fn max_age_is_not_sent_on_actual_responses() {
         let client = client().await;
 
         let response = client
@@ -2119,7 +2317,7 @@ mod cors_fairing_tests {
             .get_one("Access-Control-Max-Age")
             .is_none());
 
-        // the share fairing owns /policy/v3/* and is left untouched
+        // `/policy/v3/*` gets the generic CORS policy, same as `/invoke`
         let response = client
             .options("/policy/v3/challenges")
             .header(Header::new("Origin", "https://share.tinycloud.xyz"))
@@ -2128,12 +2326,110 @@ mod cors_fairing_tests {
             .await;
         assert_eq!(
             response.headers().get_one("Access-Control-Allow-Origin"),
-            Some("https://share.tinycloud.xyz")
+            Some("*")
         );
-        assert!(response
-            .headers()
-            .get_one("Access-Control-Max-Age")
-            .is_none());
+        assert_eq!(
+            response.headers().get_one("Access-Control-Max-Age"),
+            Some("7200")
+        );
+    }
+
+    #[post("/policy/v3/enforcer-bindings")]
+    fn enforcer_bindings() {}
+
+    #[post("/policy/v3/challenges")]
+    fn challenges() {}
+
+    /// Like [`client`], plus real `POST` handlers under `/policy/v3/`.
+    async fn policy_client() -> Client {
+        Client::tracked(
+            rocket::build()
+                .mount(
+                    "/",
+                    routes![util_routes::cors, invoke, enforcer_bindings, challenges],
+                )
+                .attach(share_security_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance")
+    }
+
+    fn assert_policy_cors(response: &rocket::local::asynchronous::LocalResponse<'_>, what: &str) {
+        let headers = response.headers();
+        assert_eq!(
+            headers.get_one("Access-Control-Allow-Origin"),
+            Some("*"),
+            "{what}"
+        );
+        assert!(
+            headers
+                .get_one("Access-Control-Allow-Credentials")
+                .is_none(),
+            "{what}: credentials must not be allowed"
+        );
+        assert_eq!(headers.get_one("Cache-Control"), Some("no-store"), "{what}");
+        assert_eq!(
+            headers.get_one("X-Content-Type-Options"),
+            Some("nosniff"),
+            "{what}"
+        );
+        assert_eq!(
+            headers.get_one("Referrer-Policy"),
+            Some("no-referrer"),
+            "{what}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_v3_preflight_and_post_match_invoke_for_any_origin() {
+        let client = policy_client().await;
+        for origin in ["https://tinycloud.chat", "tauri://localhost"] {
+            for path in ["/policy/v3/enforcer-bindings", "/policy/v3/challenges"] {
+                let response = client
+                    .options(path)
+                    .header(Header::new("Origin", origin))
+                    .header(Header::new("Access-Control-Request-Method", "POST"))
+                    .header(Header::new(
+                        "Access-Control-Request-Headers",
+                        "authorization,content-type,x-request-id",
+                    ))
+                    .dispatch()
+                    .await;
+                assert_eq!(response.status(), Status::Ok, "{origin} {path}");
+                assert_policy_cors(&response, &format!("preflight {origin} {path}"));
+                let headers = response.headers();
+                assert_eq!(
+                    headers.get_one("Access-Control-Max-Age"),
+                    Some("7200"),
+                    "{origin} {path}"
+                );
+                let allowed = headers
+                    .get_one("Access-Control-Allow-Headers")
+                    .unwrap()
+                    .to_ascii_lowercase();
+                let allowed: std::collections::BTreeSet<_> =
+                    allowed.split(',').map(str::trim).collect();
+                assert_eq!(
+                    allowed,
+                    std::collections::BTreeSet::from(["*", "authorization", "x-request-id"]),
+                    "{origin} {path}"
+                );
+                assert!(headers
+                    .get_one("Access-Control-Allow-Methods")
+                    .unwrap()
+                    .split(',')
+                    .any(|m| m.trim() == "POST"));
+
+                let response = client
+                    .post(path)
+                    .header(Header::new("Origin", origin))
+                    .dispatch()
+                    .await;
+                assert_eq!(response.status(), Status::Ok, "{origin} {path}");
+                assert_policy_cors(&response, &format!("POST {origin} {path}"));
+            }
+        }
     }
 }
 
@@ -2355,7 +2651,8 @@ mod retry_after_fairing_tests {
         };
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
-        let space = tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap());
+        let space =
+            tinycloud_auth::resource::SpaceId::new(did, "default".parse().unwrap()).unwrap();
         let cache = tempfile::TempDir::new().unwrap();
         let sql = tinycloud_core::sql::SqlService::new(
             cache.path().to_string_lossy().into_owned(),
@@ -2531,28 +2828,25 @@ mod no_transform_fairing_tests {
     }
 
     async fn client() -> Client {
-        Client::tracked(attach_response_fairings(
-            rocket::build().mount(
-                "/",
-                routes![
-                    etag_only,
-                    etag_private,
-                    etag_no_store,
-                    etag_two_headers,
-                    etag_already,
-                    etag_empty_cache_control,
-                    etag_not_modified,
-                    etag_precondition_failed,
-                    plain,
-                    plain_cache,
-                    share_path_etag,
-                    share_path_plain,
-                    kv,
-                    signed,
-                ],
-            ),
-            "https://share.tinycloud.xyz".into(),
-        ))
+        Client::tracked(attach_response_fairings(rocket::build().mount(
+            "/",
+            routes![
+                etag_only,
+                etag_private,
+                etag_no_store,
+                etag_two_headers,
+                etag_already,
+                etag_empty_cache_control,
+                etag_not_modified,
+                etag_precondition_failed,
+                plain,
+                plain_cache,
+                share_path_etag,
+                share_path_plain,
+                kv,
+                signed,
+            ],
+        )))
         .await
         .expect("valid Rocket instance")
     }
@@ -2688,5 +2982,28 @@ mod no_transform_fairing_tests {
                 "{path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod removed_settings_tests {
+    use super::*;
+    use rocket::figment::providers::Serialized;
+
+    /// TC-2961: `database.bulk_statement_timeout_ms` is gone; a deployment
+    /// that still sets it is told so, and a default one is not.
+    #[test]
+    fn a_set_removed_setting_is_named() {
+        let defaults = Figment::from(Serialized::defaults(Config::default()));
+        assert!(removed_settings(&defaults).is_empty());
+        let old = defaults.merge(("database.bulk_statement_timeout_ms", 120_000));
+        assert_eq!(
+            removed_settings(&old),
+            ["database.bulk_statement_timeout_ms"]
+        );
+        assert!(
+            old.extract::<Config>().is_ok(),
+            "still ignored, not refused"
+        );
     }
 }

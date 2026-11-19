@@ -39,7 +39,7 @@ async fn owner_space_revoke_proof_cannot_revoke_another_space_of_same_owner() ->
     use tinycloud_core::types::SpaceIdWrap;
 
     let fixture = scoped_fixture().await?;
-    let other_space = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other_space = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other_space.clone())),
     }
@@ -105,7 +105,7 @@ async fn owner_space_revoke_proof_cannot_revoke_another_space_of_same_owner() ->
     }
     .insert(&fixture.conn)
     .await?;
-    let outside_space = SpaceId::new(outside_did.parse()?, "files".parse()?);
+    let outside_space = SpaceId::new(outside_did.parse()?, "files".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(outside_space.clone())),
     }
@@ -365,7 +365,7 @@ async fn space_control_cannot_revoke_a_grant_with_an_uncovered_space() -> Result
     use tinycloud_core::models::space as space_model;
     use tinycloud_core::types::SpaceIdWrap;
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -556,7 +556,7 @@ async fn signed_import_and_reimport_do_not_widen_control_scope() -> Result<()> {
     use tinycloud_core::types::SpaceIdWrap;
     let fixture = scoped_fixture().await?;
     let owner = fixture.space.did().to_string();
-    let other = SpaceId::new(owner.parse()?, "other".parse()?);
+    let other = SpaceId::new(owner.parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -611,7 +611,7 @@ async fn historical_out_of_scope_revocation_replay_is_denied_without_rewriting_h
     use tinycloud_auth::authorization::TinyCloudRevocation;
     use tinycloud_core::{events::Revocation, models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -732,7 +732,7 @@ async fn exact_cid_control_cannot_revoke_another_target() -> Result<()> {
 async fn status_control_preserves_the_full_granted_space() -> Result<()> {
     use tinycloud_core::{db::DelegationStatus, models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
-    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?);
+    let other = SpaceId::new(fixture.space.did().to_string().parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -789,7 +789,7 @@ async fn owner_signed_target_revocation_preserves_cross_space_account_control() 
     use tinycloud_core::{models::space as space_model, types::SpaceIdWrap};
     let fixture = scoped_fixture().await?;
     let owner = fixture.space.did().to_string();
-    let other = SpaceId::new(owner.parse()?, "other".parse()?);
+    let other = SpaceId::new(owner.parse()?, "other".parse()?)?;
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(other.clone())),
     }
@@ -1065,6 +1065,242 @@ async fn issuing_delegator_and_owner_revoke_a_descendant_its_recipient_cannot() 
     Ok(())
 }
 
+/// The share-link shape: the owner grants a session key read on `notes/`,
+/// the session delegates that read to another did, and revokes that
+/// sub-delegation with its own session delegation as a proof that grants no
+/// revoke ability. The recipient reads before the revoke and is refused after
+/// it, while the owner and device keep reading.
+#[tokio::test]
+async fn session_delegator_revokes_its_sub_delegation_with_grantless_proof() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    fixture.owner_write("notes/a", Some(b"a1")).await?;
+    let uri = fixture.kv_resource("notes/a")?.as_uri().to_string();
+    let device_read = fixture
+        .device_grant("device-read", &["tinycloud.kv/get"])
+        .await?;
+    let (session, session_vm, session_did) = registered_key(&fixture).await?;
+    let (recipient, recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let owner_did = fixture.space.did().to_string();
+    let session_grant = fixture
+        .grant(
+            "session-read-no-revoke",
+            &owner_did,
+            &session_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let sub_delegation = fixture
+        .grant(
+            "session-sub-delegation",
+            &session_did,
+            &recipient_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[session_grant],
+        )
+        .await?;
+    // Each call signs a fresh nonce, so a repeated read is not a replay.
+    let read_header = || {
+        fixture.signed_caps_token(
+            &recipient,
+            &recipient_vm,
+            &recipient_did,
+            &[(uri.as_str(), "tinycloud.kv/get")],
+            whole_seconds_from_now(120),
+            &[sub_delegation.to_cid(0x55)],
+        )
+    };
+    let before = fixture.dispatch(read_header()?, &[]).await;
+    assert_eq!(
+        before.status,
+        Status::Ok,
+        "recipient read before revoke: {}",
+        before.body
+    );
+    assert_eq!(before.body, "a1");
+
+    let revoke = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[session_grant.to_cid(0x55)],
+    )?;
+    assert_revoked_ok(&fixture, sub_delegation, revoke).await?;
+
+    let after = fixture.dispatch(read_header()?, &[]).await;
+    assert_eq!(
+        after.status,
+        Status::Unauthorized,
+        "recipient read after revoke: {}",
+        after.body
+    );
+
+    let owner = fixture
+        .dispatch(
+            fixture.owner_invocation(&[(uri.clone(), "tinycloud.kv/get")])?,
+            &[],
+        )
+        .await;
+    assert_eq!(owner.status, Status::Ok, "owner read: {}", owner.body);
+    assert_eq!(owner.body, "a1");
+    let device = fixture
+        .dispatch(
+            fixture.device_invocation(&[("notes/a", "tinycloud.kv/get")], device_read)?,
+            &[],
+        )
+        .await;
+    assert_eq!(device.status, Status::Ok, "device read: {}", device.body);
+    assert_eq!(device.body, "a1");
+    Ok(())
+}
+
+/// Owner -> session -> recipient: `(session_grant, sub_delegation)`, the
+/// shared shape of the refusal tests below.
+async fn session_sub_delegation(
+    fixture: &KvSyncFixture,
+    session_did: &str,
+    recipient_did: &str,
+    session_grant_expiry: OffsetDateTime,
+) -> Result<(Hash, Hash)> {
+    let owner_did = fixture.space.did().to_string();
+    let session_grant = fixture
+        .grant(
+            "refusal-session-grant",
+            &owner_did,
+            session_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(session_grant_expiry),
+            &[],
+        )
+        .await?;
+    let sub_delegation = fixture
+        .grant(
+            "refusal-sub-delegation",
+            session_did,
+            recipient_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[session_grant],
+        )
+        .await?;
+    Ok((session_grant, sub_delegation))
+}
+
+/// The recipient of D presents D itself as its proof. D grants no revoke, so
+/// the proof is Ungranted and only the recipient's own party authority is
+/// left, which excludes revoking what it received.
+#[tokio::test]
+async fn recipient_presenting_the_target_as_its_proof_cannot_revoke_it() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (_session, _session_vm, session_did) = registered_key(&fixture).await?;
+    let (recipient, recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (_, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(3600),
+    )
+    .await?;
+    let header = fixture.signed_scope_token(
+        &recipient,
+        &recipient_vm,
+        &recipient_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[sub_delegation.to_cid(0x55)],
+    )?;
+    fixture.assert_scope_denied(sub_delegation, header).await
+}
+
+/// The delegator's own session proof has expired, so the proof is Denied, not
+/// Ungranted: the with-proof form is refused. The proofless form, which needs
+/// no proof, still works for the same signer.
+#[tokio::test]
+async fn delegator_presenting_an_expired_proof_cannot_revoke_with_it() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (session, session_vm, session_did) = registered_key(&fixture).await?;
+    let (_recipient, _recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (session_grant, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(-60),
+    )
+    .await?;
+    let with_proof = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[session_grant.to_cid(0x55)],
+    )?;
+    fixture
+        .assert_scope_denied(sub_delegation, with_proof)
+        .await?;
+
+    let proofless = fixture.signed_scope_token(
+        &session,
+        &session_vm,
+        &session_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    assert_revoked_ok(&fixture, sub_delegation, proofless).await
+}
+
+/// The space owner presents a valid proof that grants no revoke for a
+/// delegation it did not issue. Ungranted carries only party authority, and
+/// the owner is not the delegator, so the revocation is refused.
+#[tokio::test]
+async fn owner_with_a_grantless_proof_cannot_revoke_a_delegation_it_did_not_issue() -> Result<()> {
+    let fixture = scoped_fixture().await?;
+    let (_session, _session_vm, session_did) = registered_key(&fixture).await?;
+    let (_recipient, _recipient_vm, recipient_did) = registered_key(&fixture).await?;
+    let (_, sub_delegation) = session_sub_delegation(
+        &fixture,
+        &session_did,
+        &recipient_did,
+        whole_seconds_from_now(3600),
+    )
+    .await?;
+    let owner_did = fixture.space.did().to_string();
+    let owner_proof = fixture
+        .grant(
+            "refusal-owner-grantless-proof",
+            &session_did,
+            &owner_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    let header = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &owner_did,
+        &format!("urn:cid:{}", sub_delegation.to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        whole_seconds_from_now(3600),
+        &[owner_proof.to_cid(0x55)],
+    )?;
+    fixture.assert_scope_denied(sub_delegation, header).await
+}
+
 /// POST `/delegate` and return the status, body and receipt CID.
 async fn activate(fixture: &KvSyncFixture, header: String) -> (Status, String, Option<Hash>) {
     let response = fixture
@@ -1153,6 +1389,7 @@ async fn only_an_owner_of_the_target_space_activates_a_parentless_exact_cid_revo
     let unknown = tinycloud_core::hash::hash(b"owner-only-cid-unknown");
     let foreign = JWK::generate_ed25519()?;
     let foreign_vm = tc341_verification_method(&foreign)?;
+    let foreign_did = KvSyncFixture::did_of(&foreign_vm);
     for (label, key, vm, cid) in [
         ("unrelated signer", &foreign, foreign_vm.as_str(), target),
         (
@@ -1162,12 +1399,6 @@ async fn only_an_owner_of_the_target_space_activates_a_parentless_exact_cid_revo
             target,
         ),
         ("re-share delegatee", &helper, helper_vm.as_str(), reshare),
-        (
-            "intermediate delegator, not an owner",
-            &fixture.device,
-            fixture.device_vm.as_str(),
-            reshare,
-        ),
         (
             "owner, unknown target",
             &fixture.owner,
@@ -1193,10 +1424,340 @@ async fn only_an_owner_of_the_target_space_activates_a_parentless_exact_cid_revo
         let (status, body, _) = activate(&fixture, header).await;
         assert_eq!(status, Status::Unauthorized, "{label}: {body}");
     }
+    // test-ruling: TC-3150 delegator revoke control. The intermediate
+    // delegator, not an owner, is still refused for every audience other
+    // than the re-share's own delegatee; that one case is admitted by
+    // `delegator_hands_its_delegatee_an_exact_cid_revoke_grant`. The expiry
+    // is within the re-share's, so only the audience decides.
+    for (label, audience) in [
+        (
+            "intermediate delegator, unrelated audience",
+            foreign_did.as_str(),
+        ),
+        ("intermediate delegator, owner audience", owner_did.as_str()),
+        (
+            "intermediate delegator, itself as audience",
+            device_did.as_str(),
+        ),
+    ] {
+        let header = fixture.signed_scope_token(
+            &fixture.device,
+            fixture.device_vm.as_str(),
+            audience,
+            &format!("urn:cid:{}", reshare.to_cid(0x55)),
+            "tinycloud.delegation/revoke",
+            whole_seconds_from_now(1700),
+            &[],
+        )?;
+        let (status, body, _) = activate(&fixture, header).await;
+        assert_eq!(status, Status::Unauthorized, "{label}: {body}");
+    }
     for cid in [target, reshare, empty] {
         assert!(!stored_revoked(&fixture.conn, &cid).await?);
     }
     Ok(())
+}
+
+/// TC-3150: owner -> device (`parent`), then device re-shares to a helper
+/// twice (`reshare`, `sibling`), each ending in 1800 s. A hand-back revoke
+/// grant from the device to the helper on exactly `reshare` must end no
+/// later than `reshare`, so the tests sign it for 1700 s.
+struct HandBack {
+    fixture: KvSyncFixture,
+    parent: Hash,
+    reshare: Hash,
+    sibling: Hash,
+    helper: JWK,
+    helper_vm: String,
+    helper_did: String,
+}
+
+impl HandBack {
+    async fn new(prefix: &str) -> Result<Self> {
+        let fixture = scoped_fixture().await?;
+        let device_did = fixture.device_did();
+        let parent = fixture
+            .device_grant(&format!("{prefix}-parent"), &["tinycloud.kv/get"])
+            .await?;
+        let (helper, helper_vm, helper_did) = registered_key(&fixture).await?;
+        let mut children = Vec::new();
+        for child in ["reshare", "sibling"] {
+            children.push(
+                fixture
+                    .grant(
+                        &format!("{prefix}-{child}"),
+                        &device_did,
+                        &helper_did,
+                        &[("notes/", "tinycloud.kv/get")],
+                        None,
+                        Some(whole_seconds_from_now(1800)),
+                        &[parent],
+                    )
+                    .await?,
+            );
+        }
+        Ok(Self {
+            parent,
+            reshare: children[0],
+            sibling: children[1],
+            fixture,
+            helper,
+            helper_vm,
+            helper_did,
+        })
+    }
+
+    /// The device signs revoke on exactly `target` to `audience`.
+    fn device_grant_to(&self, audience: &str, target: Hash, expiry: i64) -> Result<String> {
+        self.fixture.signed_scope_token(
+            &self.fixture.device,
+            &self.fixture.device_vm,
+            audience,
+            &format!("urn:cid:{}", target.to_cid(0x55)),
+            REVOKE,
+            whole_seconds_from_now(expiry),
+            &[],
+        )
+    }
+
+    /// Activate the device's hand-back grant on `target` to the helper.
+    async fn activate_hand_back(&self, target: Hash) -> Result<Hash> {
+        let header = self.device_grant_to(&self.helper_did, target, 1700)?;
+        let (status, body, control) = activate(&self.fixture, header).await;
+        assert_eq!(status, Status::Ok, "hand-back grant: {body}");
+        Ok(control.expect("hand-back receipt CID"))
+    }
+
+    /// `key` revokes `target` presenting `control` as its one proof.
+    fn revoke_with(
+        &self,
+        key: &JWK,
+        vm: &str,
+        did: &str,
+        target: Hash,
+        control: Hash,
+    ) -> Result<String> {
+        self.fixture.signed_scope_token(
+            key,
+            vm,
+            did,
+            &format!("urn:cid:{}", target.to_cid(0x55)),
+            REVOKE,
+            whole_seconds_from_now(3600),
+            &[control.to_cid(0x55)],
+        )
+    }
+
+    fn helper_revokes(&self, target: Hash, control: Hash) -> Result<String> {
+        self.revoke_with(
+            &self.helper,
+            &self.helper_vm,
+            &self.helper_did,
+            target,
+            control,
+        )
+    }
+}
+
+/// TC-3150: the delegator of D hands D's delegatee revocation of exactly D.
+/// The delegatee revokes D with it, and it reaches neither D's parent nor a
+/// sibling; nor can another key use it.
+#[tokio::test]
+async fn delegator_hands_its_delegatee_an_exact_cid_revoke_grant() -> Result<()> {
+    let hand = HandBack::new("handback").await?;
+    let control = hand.activate_hand_back(hand.reshare).await?;
+    let fixture = &hand.fixture;
+    // It reaches neither the re-share's parent nor its sibling.
+    for other in [hand.parent, hand.sibling] {
+        fixture
+            .assert_scope_denied(other, hand.helper_revokes(other, control)?)
+            .await?;
+    }
+    // A key other than its audience can't present it.
+    let (thief, thief_vm, thief_did) = registered_key(fixture).await?;
+    fixture
+        .assert_scope_denied(
+            hand.reshare,
+            hand.revoke_with(&thief, &thief_vm, &thief_did, hand.reshare, control)?,
+        )
+        .await?;
+    // Its audience, the re-share's delegatee, revokes the re-share.
+    assert_revoked_ok(
+        fixture,
+        hand.reshare,
+        hand.helper_revokes(hand.reshare, control)?,
+    )
+    .await?;
+    assert!(!stored_revoked(&fixture.conn, &hand.parent).await?);
+    assert!(!stored_revoked(&fixture.conn, &hand.sibling).await?);
+    Ok(())
+}
+
+/// TC-3150 admission: only the exact hand-back form is admitted.
+#[tokio::test]
+async fn delegator_revoke_grant_admission_refuses_every_other_form() -> Result<()> {
+    let hand = HandBack::new("handback-refusals").await?;
+    let fixture = &hand.fixture;
+    let device_did = fixture.device_did();
+    let reshare_urn = format!("urn:cid:{}", hand.reshare.to_cid(0x55));
+    let sibling_urn = format!("urn:cid:{}", hand.sibling.to_cid(0x55));
+    let space_delegation = fixture
+        .resource_in(&fixture.space, "delegation", "")?
+        .as_uri()
+        .to_string();
+    let device_caps = |grants: &[(&str, &str)], expiry: i64| {
+        fixture.signed_caps_token(
+            &fixture.device,
+            &fixture.device_vm,
+            &hand.helper_did,
+            grants,
+            whole_seconds_from_now(expiry),
+            &[],
+        )
+    };
+    // A key that delegated a sibling grant to the same helper is not the
+    // re-share's delegator.
+    let (other, other_vm, other_did) = registered_key(fixture).await?;
+    fixture
+        .grant(
+            "handback-refusals-other-sibling",
+            &other_did,
+            &hand.helper_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[],
+        )
+        .await?;
+    let other_issuer = fixture.signed_scope_token(
+        &other,
+        &other_vm,
+        &hand.helper_did,
+        &reshare_urn,
+        REVOKE,
+        whole_seconds_from_now(1700),
+        &[],
+    )?;
+    for (label, header) in [
+        (
+            "expires after the target",
+            hand.device_grant_to(&hand.helper_did, hand.reshare, 3600)?,
+        ),
+        (
+            "a second capability on the same target",
+            device_caps(&[(&reshare_urn, REVOKE), (&reshare_urn, STATUS)], 1700)?,
+        ),
+        (
+            "a second target",
+            device_caps(&[(&reshare_urn, REVOKE), (&sibling_urn, REVOKE)], 1700)?,
+        ),
+        (
+            "a wildcard ability",
+            device_caps(&[(&reshare_urn, "tinycloud.delegation/*")], 1700)?,
+        ),
+        (
+            "the delegator's space delegation root",
+            device_caps(&[(&space_delegation, REVOKE)], 1700)?,
+        ),
+        ("a sibling's delegator as issuer", other_issuer),
+    ] {
+        let (status, body, _) = activate(fixture, header).await;
+        assert_eq!(status, Status::Unauthorized, "{label}: {body}");
+    }
+
+    // A grant naming a delegation the node doesn't hold yet is refused; once
+    // that delegation is stored, the same grant shape is admitted.
+    let late = tinycloud_core::hash::hash(b"tc732-handback-refusals-late");
+    let (status, body, _) =
+        activate(fixture, hand.device_grant_to(&hand.helper_did, late, 1700)?).await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "target not yet stored: {body}"
+    );
+    let stored = fixture
+        .grant(
+            "handback-refusals-late",
+            &device_did,
+            &hand.helper_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[hand.parent],
+        )
+        .await?;
+    assert_eq!(stored, late);
+    hand.activate_hand_back(late).await?;
+
+    for cid in [hand.parent, hand.reshare, hand.sibling, late] {
+        assert!(!stored_revoked(&fixture.conn, &cid).await?);
+    }
+    Ok(())
+}
+
+/// TC-3150: a hand-back grant ends when the chain the target was issued
+/// under is revoked.
+#[tokio::test]
+async fn delegator_revoke_grant_ends_with_the_targets_chain() -> Result<()> {
+    let hand = HandBack::new("handback-ends").await?;
+    let fixture = &hand.fixture;
+    // The owner revokes the parent the sibling was issued under.
+    let sibling_control = hand.activate_hand_back(hand.sibling).await?;
+    let owner = fixture.signed_scope_token(
+        &fixture.owner,
+        &fixture.owner_vm,
+        &fixture.space.did().to_string(),
+        &format!("urn:cid:{}", hand.parent.to_cid(0x55)),
+        REVOKE,
+        whole_seconds_from_now(3600),
+        &[],
+    )?;
+    assert_revoked_ok(fixture, hand.parent, owner).await?;
+    fixture
+        .assert_scope_denied(
+            hand.sibling,
+            hand.helper_revokes(hand.sibling, sibling_control)?,
+        )
+        .await
+}
+
+/// TC-3150 (Bobbie N1): a hand-back grant presented after its own expiry is
+/// refused at `/revoke`. As in `expired_control_retry_does_not_reapply_a_revocation`,
+/// the stored expiry is moved into the past rather than waiting it out.
+#[tokio::test]
+async fn delegator_revoke_grant_presented_after_its_expiry_is_refused() -> Result<()> {
+    let hand = HandBack::new("handback-expired").await?;
+    let fixture = &hand.fixture;
+    let control = hand.activate_hand_back(hand.reshare).await?;
+    delegation::Entity::update_many()
+        .col_expr(
+            delegation::Column::Expiry,
+            tinycloud_core::sea_orm::sea_query::Expr::value(whole_seconds_from_now(-1)),
+        )
+        .filter(delegation::Column::Id.eq(control))
+        .exec(&fixture.conn)
+        .await?;
+    fixture
+        .assert_scope_denied(hand.reshare, hand.helper_revokes(hand.reshare, control)?)
+        .await
+}
+
+/// TC-3150 (Bobbie N1): a hand-back grant used after its issuer, the
+/// target's delegator, revoked the grant itself is refused at `/revoke`.
+#[tokio::test]
+async fn delegator_revoke_grant_used_after_its_issuer_revokes_it_is_refused() -> Result<()> {
+    let hand = HandBack::new("handback-withdrawn").await?;
+    let fixture = &hand.fixture;
+    let control = hand.activate_hand_back(hand.reshare).await?;
+    assert_revoked_ok(
+        fixture,
+        control,
+        fixture.scoped_revoke_header(control, None)?,
+    )
+    .await?;
+    fixture
+        .assert_scope_denied(hand.reshare, hand.helper_revokes(hand.reshare, control)?)
+        .await
 }
 
 // N4': revoke and status controls that name an encryption network (TC-1423).
@@ -1806,6 +2367,49 @@ async fn network_status_control_follows_the_revoke_scope() -> Result<()> {
     );
     assert_eq!(
         fixture.status_with(agent_root, &device, &[control]).await?,
+        None
+    );
+    Ok(())
+}
+
+/// A non-party carrying a valid proof that grants no status ability gets no
+/// status: the proof is Ungranted for Status, and Ungranted is refused.
+#[tokio::test]
+async fn non_party_with_grantless_proof_gets_no_delegation_status() -> Result<()> {
+    use tinycloud_core::db::DelegationStatus;
+    let fixture = scoped_fixture().await?;
+    let device_did = fixture.device_did();
+    let (_, _, other_did) = registered_key(&fixture).await?;
+    let (_, _, recipient_did) = registered_key(&fixture).await?;
+    let target = fixture
+        .grant(
+            "status-target",
+            &device_did,
+            &recipient_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(1800)),
+            &[],
+        )
+        .await?;
+    let proof = fixture
+        .grant(
+            "status-proof-read-only",
+            &device_did,
+            &other_did,
+            &[("notes/", "tinycloud.kv/get")],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        fixture.status_with(target, &device_did, &[]).await?,
+        Some(DelegationStatus::Active),
+        "delegator status control"
+    );
+    assert_eq!(
+        fixture.status_with(target, &other_did, &[proof]).await?,
         None
     );
     Ok(())

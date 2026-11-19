@@ -819,7 +819,8 @@ impl ExactKvStore for TinyCloudKvStore {
     async fn get_exact(&self, space: &Did, path: &Path) -> Result<Option<Vec<u8>>, PortError> {
         let did = space.as_str().parse().map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space_id = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space_id =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         let auth_path = path.as_str().parse().map_err(|_| PortError::Denied)?;
         let Some((_, _, content)) = self
             .tinycloud
@@ -850,7 +851,8 @@ impl TinyCloudKvStore {
     ) -> Result<Option<(Vec<u8>, String)>, PortError> {
         let did = space.as_str().parse().map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space_id = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space_id =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         let auth_path = path.as_str().parse().map_err(|_| PortError::Denied)?;
         let Some((metadata, _, content)) = self
             .tinycloud
@@ -890,7 +892,8 @@ impl TinyCloudKvStore {
     async fn current_etag(&self, space: &Did, path: &Path) -> Result<Option<String>, PortError> {
         let did = space.as_str().parse().map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space_id = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space_id =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         let auth_path = path.as_str().parse().map_err(|_| PortError::Denied)?;
         Ok(self
             .tinycloud
@@ -909,7 +912,8 @@ impl TinyCloudKvStore {
     ) -> Result<(Vec<NativeListEntry>, bool, Option<Path>), PortError> {
         let did = space.as_str().parse().map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space_id = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space_id =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         let prefix: tinycloud_auth::resource::Path =
             prefix.as_str().parse().map_err(|_| PortError::Denied)?;
         let after = after
@@ -939,7 +943,8 @@ impl TinyCloudKvStore {
     async fn entry_kind(&self, space: &Did, path: &Path) -> Result<&'static str, PortError> {
         let did = space.as_str().parse().map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space_id = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space_id =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         let auth_path = path.as_str().parse().map_err(|_| PortError::Denied)?;
         Ok(
             if self
@@ -1024,7 +1029,8 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .parse()
             .map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
-        let space = tinycloud_auth::resource::SpaceId::new(did, name);
+        let space =
+            tinycloud_auth::resource::SpaceId::new(did, name).map_err(|_| PortError::Denied)?;
         // Validate the pinned source path before resolving its physical artifact.
         sql_source_db_name(&space, source.path.as_str())?;
         let physical = tinycloud_core::database_migration::resolve(
@@ -2142,7 +2148,8 @@ pub async fn native_invoke(
                     .parse()
                     .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?,
                 name,
-            );
+            )
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
             let auth_path = path
                 .as_str()
                 .parse()
@@ -3019,7 +3026,8 @@ mod tests {
         let space = tinycloud_auth::resource::SpaceId::new(
             did.to_string().parse().unwrap(),
             "test".parse().unwrap(),
-        );
+        )
+        .unwrap();
         let physical = SqlService::legacy_db_name_from_path(Some("web/threads"));
         let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
         repo.save(

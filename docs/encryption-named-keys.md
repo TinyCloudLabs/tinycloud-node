@@ -7,6 +7,32 @@ are refused.
 A key is named by `urn:tinycloud:encryption:<owner>:<network>/<path>`. A prefix
 grant is the same URN with one trailing `/`.
 
+## Key-wrap formats
+
+Root and named keys accept both `x25519-aes256gcm/v1` wraps and TCW2
+`x25519-hkdf-aes256gcm/v2` wraps. Network and key descriptors keep the v1
+algorithm identifier because their key material supports either format.
+Request `alg` identifies the incoming wrap; response `alg` identifies the
+returned receiver wrap independently.
+
+`[global.encryption_network] key_wrap_v2 = false` keeps response writes on v1.
+Set it to `true` (or `TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_V2=true`) only when
+receiving clients support v2. Independently, `key_wrap_require_v2 = true` (or
+`TINYCLOUD_ENCRYPTION_NETWORK__KEY_WRAP_REQUIRE_V2=true`) rejects v1 incoming
+network-key wraps for root and named-key decrypt. This reader policy defaults
+to `false` and does not require v2 receiver responses: v2 requests may still
+receive signed v1 responses while `key_wrap_v2` remains off.
+TCW2 uses X25519, HKDF-SHA256 and AES-256-GCM with a canonical authenticated
+header binding the recipient, purpose, network, exact key path, key version
+and string metadata. Receiver wraps use empty metadata. Key version is checked
+against the network or named-key row before opening.
+V1 writers reroll ephemeral public keys whose prefix is `TCW2`, keeping format
+detection unambiguous. Header strings must be valid Unicode; malformed escaped
+surrogates are rejected by JSON parsing. Stored network secrets and named-key
+seeds require versioned encrypted seals, never plaintext.
+
+Details: TC-2518
+
 ## Key paths
 
 A path is 1 to 8 segments of `[a-z0-9][a-z0-9._-]{0,63}` joined by `/`, at most
@@ -50,6 +76,26 @@ reused.
   changed.
 - A `deleted` deletable row is reused: new seed, state `active`, `keyVersion` + 1.
 - A `deleted` deterministic row answers `key_deleted` (403).
+
+### Share keys recorded by a policy registration
+
+A Policy/v3 registration (`POST /policy/v3/policies`) whose `contentSource`
+names `encryptionKeyPath` `share/<shareId>` records that key on the source's
+`default` network in the registration's own transaction, under the network
+row lock, so a publisher encrypts to the public key and never calls create.
+The registration already requires its owner to hold `decrypt` on that exact
+key as the network owner or through the owner's own delegations (a policy
+session is never that authority).
+
+- A missing key is created as `create` would (`keyVersion` 1, state
+  `active`) and counts toward the same per-network limit. At the limit the
+  registration answers 403 `key_limit_exceeded` and stores nothing.
+- An existing key is left as it is, whatever its state: a `blocked` key stays
+  blocked.
+- The network must exist and be active (`network_not_found` 404,
+  `network_not_active` 409); otherwise nothing is stored.
+- A registration the node already stores answers as before and records
+  nothing.
 
 ## State guards
 
@@ -172,6 +218,8 @@ opened or replayed, the named-key routes stay off, as with `named_keys_v1` off,
 the node logs the event `deletion_ledger_open_failed` or
 `deletion_ledger_replay_failed` with an `error_kind`, and the rest of the node
 serves.
+
+**When restoring the node DB from a PlanetScale backup, keep the node's existing disk (and its ledger) in place and boot normally, so the ledger replay re-shreds keys deleted after the backup. Never restore the DB onto a fresh disk without the ledger unless you accept that later deletions are undone.**
 
 Before restoring a database, stop the node and disable its automatic restart.
 After the restore, before the node starts, run

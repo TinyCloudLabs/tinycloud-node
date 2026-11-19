@@ -96,6 +96,72 @@ serves without it, so its migration never builds it on a non-empty table and
 never fails the boot over it. It logs a typed warning and keeps serving; an
 index built later is picked up by the planner with no restart.
 
+### Backup retention limit (TC-2869)
+
+No PlanetScale backup of the production database
+(`tinycloud-node-production-usw`) may be kept longer than **14 days**. TinyChat's
+consent copy tells users that backups of our database clear within 14 days of
+a deletion, and the TinyChat backend keeps its data in this database.
+
+- **Manual backups** (pre- or post-release, before a cutover, any other
+  reason): set an expiry of 14 days or less when you take the backup.
+- **Scheduled backup policies**: retention of 14 days or less.
+- **Any change to backup retention** (a new policy, a longer expiry on an
+  existing backup, a restored copy kept around) needs a check against the
+  TinyChat consent copy before it is made.
+
+Policies on 2026-11-12: "Production daily" (every 12 hours, kept 2 days),
+"Production daily, kept 7 days" (daily, kept 7 days), and "Development daily"
+(every 12 hours, kept 2 days, development branches).
+
+### Column encryption cutover (TC-2682)
+
+Before changing stored values, stop writers and take a **fresh, consistent
+backup**. Record the matching release and key configuration. Use the v2 column
+release and its corresponding maintenance tooling.
+
+Keep this order:
+
+1. Re-encrypt **every format-0 cell** to bound v2 under the correct purpose ring,
+   setting its `*_format=2` in the **same UPDATE** as the ciphertext. Verify that
+   no format-0 cells remain in the affected columns.
+2. Remove the legacy v1 storage key from the serving column and webhook rings.
+   The serving API must support constructing these rings without that key
+   before proceeding.
+3. **Only then** enable `[global.column_encryption] strict = true`
+   (`TINYCLOUD_COLUMN_ENCRYPTION__STRICT=true`). Verify startup, reads and writes
+   before resuming writers.
+
+Keep strict mode off until the first two steps are complete. Enabling it while
+format-0 plaintext remains can fail startup during legacy-record checks.
+
+Treat this as a **one-way cutover**. For rollback, stop the service and restore
+the fresh pre-cutover backup with its matching prior release and key
+configuration. Do not use a binary-only rollback on the converted database.
+
+### Gate: out-of-band steps before a node release (TC-2062)
+
+Before a node release whose `docs/releasing.md` lists an out-of-band step (an
+operator-built index, or a database plan or size change), the release record
+must show that step's validity query output (the `SELECT` in its section), or
+the release waits. An out-of-band prerequisite listed only in a ticket or a
+note is not a gate.
+
+### Verify out-of-band indexes after every node deploy (TC-2062)
+
+Because these indexes are performance-only, a missing one raises no error: the
+node boots, serves and logs one warning, and the affected queries stay slow. Run
+this read-only check after **every** node deploy, on the PlanetScale primary:
+
+```sql
+SELECT c.relname, i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname IN ('idx_current_kv_space_deleted_key_c','idx_kv_write_space_value');
+```
+
+Expect **two rows, every flag `t`**. A missing row, or any `f`, is fixed with
+the statement in that index's own section below (build, or drop and redo for an
+invalid one), **before the next deploy**. Add a row to the `IN (...)` list
+whenever a section here introduces another operator-built index.
+
 ### `idx_current_kv_space_deleted_key_c` (TC-1274, `m20261020_000000_current_kv_key_c_index`)
 
 Ships in the release after 1.21.2. It lets the KV list range select seek on
@@ -174,6 +240,92 @@ a binary rollback also needs
 `DELETE FROM seaql_migrations WHERE version = 'm20261020_000000_current_kv_key_c_index';`
 first. The migration's `down` keeps the index.
 
+### `idx_kv_write_space_value` (TC-2062, `m20261026_000000_kv_write_space_value_index`)
+
+The blob reference probe that ends every KV write carrying a blob
+(`finish_candidates`, `kv_orphans.rs`) asks whether `kv_write` has a row for
+`(space, value, generation)`. No index contains `value`, so without this index
+the probe reads every `kv_write` row of the space and filters. In production
+(PlanetScale Insights, 2026-10-26) that statement was about 20% of database
+execution time, at about 14.7k rows read per call. With the index it is one
+index-only lookup. **Performance-only:** the node boots and serves without the
+index, and blob-carrying KV writes stay slow until it exists. When it is
+missing on a non-empty `kv_write`, the node logs `kv_write_value_index_missing`
+(WARN) and keeps serving.
+
+**Run step 1 BEFORE the deploy that carries this migration.** The statement
+can also be run now, on the running release: the planner uses the index as soon
+as it is valid, with no restart.
+
+1. On the PlanetScale primary, as the role that owns `kv_write`, **outside any
+   transaction** (the console, or `psql` without `BEGIN`; never through the node
+   or a migration runner). Lift the console's statement timeout for the
+   session first:
+
+   ```sql
+   SET statement_timeout = 0;
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_kv_write_space_value ON kv_write (space, value, generation);
+   ```
+
+   Writes to `kv_write` continue during the build. It waits for transactions
+   that were open when it started, so it can sit in "waiting for old
+   transactions" while one is open; it does not block them. Every later insert
+   into `kv_write` maintains one more index entry. Size and time scale with the
+   row count of `kv_write`: about 152 bytes per row (measured with 73-character
+   space ids and 34-byte values) and about 4.6 µs per row. Measured locally on an
+   unthrottled PostgreSQL 14: 6.3 s for 1,360,000 rows, 198 MB. As an estimate,
+   not a measurement of production: 10 million rows is about 1.5 GB and 1 minute
+   on that setup, so expect several times that on the primary. The build's WAL
+   is replicated to the replicas.
+
+2. Check the result. All three columns must be `t`:
+
+   ```sql
+   SELECT i.indisvalid, i.indisready, i.indislive FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'idx_kv_write_space_value';
+   ```
+
+3. If the build was cancelled or failed, the index is left INVALID, and
+   `IF NOT EXISTS` would skip it. Drop it and redo step 1:
+
+   ```sql
+   DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;
+   ```
+
+4. Deploy the node. At boot the migration reads `pg_index` for that exact name
+   and **never takes a lock on `kv_write` for a build and never fails the boot
+   over the index**:
+   - a valid, ready, live btree of that name on `kv_write` with columns
+     `space, value, generation`, ascending, default operator classes, each in
+     its column's own collation, no predicate, expression or INCLUDE: **no DDL,
+     no lock, no warning**, and the index keeps its OID;
+   - no such index and `kv_write` **empty** (a fresh or test database): the
+     migration builds it, which is instant;
+   - no such index and `kv_write` **not empty**: nothing is built. The node logs
+     one `kv_write_value_index_missing` warning, boots and serves, and the
+     migration is recorded as applied. Run step 1 whenever convenient; a restart
+     is not needed;
+   - the right shape but INVALID, not ready or not live (a failed or still
+     running `CREATE INDEX CONCURRENTLY`): one `kv_write_value_index_invalid`
+     warning. The index is left alone. If no build is running, follow step 3
+     and redo step 1;
+   - the name with another shape (another column list or order, DESC, another
+     operator class or collation, INCLUDE, a predicate, another table, or a
+     non-index relation): one `kv_write_value_index_wrong_shape` error-level
+     log. The object is left alone and the node serves. Run
+     `DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;` and then
+     step 1.
+
+   The log text is constant (no key, space or value; production logs are
+   public, TC-961), so look for the event name in the node's own container log.
+
+Rollback: `DROP INDEX CONCURRENTLY IF EXISTS idx_kv_write_space_value;` is safe
+at any time; the reference probe goes back to reading the space's rows, and
+nothing else uses the index. A node image from before this migration refuses to
+start while `seaql_migrations` lists a migration it does not ship, so a binary
+rollback also needs
+`DELETE FROM seaql_migrations WHERE version = 'm20261026_000000_kv_write_space_value_index';`
+first. The migration's `down` keeps the index.
+
 ## Promoting to production (main-only)
 
 Production is built and promoted **only from `main`** (TC-940, 2026-10-13).
@@ -198,9 +350,9 @@ The ref check above runs inside the workflow file of the dispatched ref, so it
 only protects refs whose `docker.yml` already has it. `workflow_dispatch` runs
 the workflow file at the selected ref, and repository or organization secrets
 are readable by every ref. To close that, every job that reads production
-secrets runs in GitHub's `production` environment. Most deploy secrets
-exist only there; `PROD_TINYCLOUD_ADMIN_SECRET` is the approved repository-
-scoped exception and is consumed only inside the deploy job.
+secrets runs in GitHub's `production` environment. All deploy secrets,
+including `PROD_TINYCLOUD_ADMIN_SECRET`, exist only there and are consumed
+only inside the deploy job.
 
 | Workflow | Job | Production secrets |
 | --- | --- | --- |
@@ -221,8 +373,8 @@ Environment settings (Settings → Environments → `production`):
   `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
   `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN`,
   `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`,
-  `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
-- Except for the explicit node admin exception, none may also exist as a repository secret; this repository
+  `PROD_TINYCLOUD_ADMIN_SECRET`, `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
+- None of these may also exist as a repository secret; this repository
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
@@ -251,17 +403,22 @@ Deselecting this repository doesn't stop those repositories from using the
 key. A production-only Phala key that is stored only in this environment
 closes that gap.
 
-`TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
-no environment, read it too. `GITHUB_TOKEN` is the automatic token.
+`TC780_CUTOVER_READY` is a repository variable kept for the TC-780 rollback
+runbook only: the frozen release line
+`Codex/roman/rollback-meeting-node-20260915` still gates its `docker.yml`
+jobs on it. The `docker.yml` on `main` no longer reads it; delete it once
+the rollback window closes (the runbook has its own `TC780_ROLLBACK_ARMED`
+check). `GITHUB_TOKEN` is the automatic token.
 
 The quota steps send `PROD_TINYCLOUD_ADMIN_SECRET` to billing's
 `/api/admin/storage-comp/:space_id` as well as to the node's admin API.
 Billing's storage-comp guard checks the Worker secret
 `TINYCLOUD_ADMIN_SECRET`, which is the node/billing shared admin value:
 billing uses it for its own calls to the node's `/admin/*` routes, and a
-rotation sets the GitHub secret and the `tinycloud-billing` Worker secret
-to one new value. No separate billing runner secret exists; rotating the
-shared value must update both holders together, or the quota steps fail
+rotation updates three holders together: the `production` environment secret,
+the `tinycloud-billing` Worker secret and the internal Pages project secret.
+Then redeploy the node. No separate billing runner secret exists; rotating the
+shared value must update all holders together, or the quota steps fail
 closed with `quota API rejected the request`. The value is never passed in
 argv/logs and never added to the CVM env or `allowed_envs` under a billing
 name. A missing credential or an incompatible billing URL fails before
@@ -430,6 +587,12 @@ its branch policy before any workflow that names it runs.
      Compare `features` with the previous release (1.20.1 reports `kv`,
      `delegation`, `sharing`, `sql`, `hooks`, `signed-urls`, `encryption`,
      `kv-sync-v1`, `kv-sync-root`, `tee`).
+     A release that includes TC-2132 also reports `delegation-issued-query-v1`;
+     without it `POST /delegation/query` answers `direction: "issued"` with 400.
+     A release that includes TC-3174 also reports `hooks-effective-end-v1`:
+     hook tickets and stream opens use the current effective end (renewal
+     stamps included); without it a renewed grant's hooks stop at its signed
+     expiry.
    - Every PostgreSQL connection got its TCP keepalive options (TC-1054,
      1.20.5 on). The production logs are private, so this is read from
      `/info`, which carries two counts (no hosts or errors):
@@ -499,8 +662,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`c9bcbea9dac90fc2b74d8439146596ba802796a211d1b6d65aeda2286d7ed028`**
-  (raw `298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765` normalized; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
+  **`90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51`**
+  (raw `5419a6fbb73efe8b4430e4ab76d5e2970b2c9204525854e23f59dbdc01f4e250` normalized; before the TC-2917 `node_storage_headroom` event (the node's disk headroom line shipped as an individual event) in the Vector config the template was `9d0cd8a2…`, raw `d703d69b…`; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
   TC-1317's and TC-1482's route and warning codes (TC-1274 and TC-1317 were template `7fabba70…`, raw `1228d819…`); TC-1274 alone was template `00938226…`, raw
@@ -548,6 +711,9 @@ The same general quota authority/reconciliation gate runs after the final
 env operation plus version/ingress health, before ancillary Policy probes.
 The downstream watcher cannot skip quota restoration.
 
+For column encryption cutovers, use the backup-based rollback in
+[Column encryption cutover](#column-encryption-cutover-tc-2682).
+
 ### A compose-only change ships as a release
 
 The production compose is the reviewed N0 template (locked by the template
@@ -569,9 +735,60 @@ strict descendant of the running production revision").
 3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
    promotion command above with that digest, version and revision.
 
-A rollback of such a change follows the same path: a revert plus a new
-release. The same-image recovery command below is for the reviewed 1.20.6
-image only and is refused once a later release is running.
+A rollback of a compose-only change still follows the same path: revert plus a
+new release. To restore an earlier node image while retaining the current N0
+compose, use the explicit audited rollback below. The same-image recovery
+command below is for the reviewed 1.20.6 image only and is refused once a later
+release is running.
+
+### Audited rollback to a prior N0 release
+
+Use this only when the earlier image is compatible with the production
+database and stored data. `rollback_release=true` requires the current
+reviewed N0 compose, a named digest, matching OCI version/revision labels, the
+matching `vX.Y.Z` tag and crate version, and a target revision that is a
+strict ancestor of the currently running image. The normal guard still
+requires the running revision to be an ancestor of dispatched `main`; do not
+set `allow_non_descendant`.
+
+The workflow also requires the migration source tree under
+`tinycloud-core/src/migrations` to be identical at the target and running
+revisions. A target missing migrations present in the running binary is refused
+before deployment. The 1.25.13 to 1.25.17 migration-tree diff is empty, so that
+rollback remains eligible; older releases with a different migration tree do
+not. This is a conservative compatibility check, not a substitute for checking
+other stored-data compatibility. Before dispatch, verify the digest and OCI
+labels against the `Deployment image:` line in the summary of the successful
+run that deployed that release.
+
+The one-line `rollback_reason` must be 12–300 characters: the first character
+is an ASCII letter or digit; later characters may be ASCII letters or digits,
+spaces, or `. , ; : ( ) / _ + -`. It is retained in the workflow inputs and
+run summary with the digest, version and revision. The explicit quota
+authorization is still required for each dispatch. Keep
+`rollback_pre_n0=false` and `rollback_privacy_mode=unselected`; this does not
+use the captured 1.20.6 compose rollback.
+
+Example using the recorded 1.25.13 image, when it is an ancestor of the
+currently running release:
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f authorize_quota_values=true \
+  -f rollback_release=true \
+  -f rollback_reason="Incident: restore the last known-good node release" \
+  -f image_version=1.25.13 \
+  -f deploy_image_digest=sha256:55c26f455f793cb3d23d1675db566d7ecf4020c3156028ee61190c8e14d59be3 \
+  -f rollback_image_version=1.25.13 \
+  -f rollback_image_revision=50b0986a969af818a658ec92461cce7007e3b0a1 \
+  -f sql_identity_fence=false \
+  -f named_keys_v1=true \
+  -f include_duckdb=false \
+  -f allow_non_descendant=false \
+  -f rollback_pre_n0=false \
+  -f rollback_privacy_mode=unselected
+```
 
 ### Emergency same-image recovery (12c)
 
@@ -594,8 +811,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`298ea356adf8d5e562557ab18bd3f5d8cdb816de82b1eaf6e6e50bf888e22765`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps and `errors_dropped` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
+`5419a6fbb73efe8b4430e4ab76d5e2970b2c9204525854e23f59dbdc01f4e250`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
 main's template currently pins. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config

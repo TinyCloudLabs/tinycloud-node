@@ -135,8 +135,10 @@ use tokio::{
 /// on PostgreSQL before the pre-persist write path:
 ///
 /// - sign-in 71 = peer key 0 plus host `/delegate` 18 plus session
-///   `/delegate` 19 plus account-space SQL write 34, including TC-1274's
-///   `epoch_head` cache write on each epoch-writing commit;
+///   `/delegate` 19 plus account-space SQL write 34, including the `epoch_head`
+///   cache writes and post-commit `hook_subscription` SELECT and release ping.
+///   The hook lookup runs asynchronously and can fall outside the measured
+///   window, so a run may print 2 fewer. Details: TC-2214
 /// - kv get 16, including its durable read-audit commit.
 ///
 /// TC-1274: a batch of 100 `kv/get` or `kv/metadata` capabilities is one
@@ -163,15 +165,20 @@ use tokio::{
 /// precondition read and write rows. All claims of one put share one
 /// preparatory transaction.
 ///
-/// Each value is the count measured on PostgreSQL in CI, used as a ceiling.
+/// Full-flow ceilings, including asynchronous sign-in work. Details: TC-2214.
+/// Quota-aware KV puts include the TC-2389 `/invoke` `authorize_admitted`
+/// check before quota/hosting lookup (`WITH RECURSIVE "proof_roots"`); its
+/// net round trip is included in the put ceilings. Renewal identity is loaded
+/// once at node startup and reused on requests, so it adds no per-request
+/// database round trips. Fusion follow-up: TC-2426.
 const BUDGETS: [(&str, u64); 7] = [
     ("sign-in", 71),
-    ("kv put", 42),
+    ("kv put", 43),
     ("kv get", 16),
     ("kv batch get", 16),
     ("kv batch head", 16),
-    ("kv put 2 blobs", 48),
-    ("kv put 1 blob 2 keys", 45),
+    ("kv put 2 blobs", 49),
+    ("kv put 1 blob 2 keys", 46),
 ];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
@@ -331,18 +338,19 @@ impl FrontendParser {
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut observed = Vec::new();
         self.buf.extend_from_slice(bytes);
         loop {
             if !self.started {
                 // Untyped startup-phase message: SSLRequest, GSSENCRequest,
                 // CancelRequest or the StartupMessage itself.
                 if self.buf.len() < 8 {
-                    return;
+                    return observed;
                 }
                 let len = be_i32(&self.buf[0..4]).max(8) as usize;
                 if self.buf.len() < len {
-                    return;
+                    return observed;
                 }
                 if be_i32(&self.buf[4..8]) == PROTOCOL_V3 {
                     self.started = true;
@@ -351,21 +359,31 @@ impl FrontendParser {
                 self.buf.drain(..len);
             } else {
                 if self.buf.len() < 5 {
-                    return;
+                    return observed;
                 }
                 let len = be_i32(&self.buf[1..5]).max(4) as usize;
                 if self.buf.len() < 1 + len {
-                    return;
+                    return observed;
                 }
                 let tag = self.buf[0];
                 let body = self.buf[5..1 + len].to_vec();
                 self.buf.drain(..1 + len);
-                self.message(tag, &body);
+                if let Some(bytes) = self.message(tag, &body) {
+                    observed.push(bytes);
+                }
             }
         }
     }
 
-    fn message(&mut self, tag: u8, body: &[u8]) {
+    fn message(&mut self, tag: u8, body: &[u8]) -> Option<Vec<u8>> {
+        // Bind parameter bytes select a request for the existing value/COMMIT
+        // cuts. Execution markers use resolved SQL, including cache hits.
+        let observed = match tag {
+            b'B' => Some(body.to_vec()),
+            b'E' => Some(self.portal.as_bytes().to_vec()),
+            b'Q' => Some(cstr(body).0.into_bytes()),
+            _ => None,
+        };
         match tag {
             b'P' => {
                 let (name, rest) = cstr(body);
@@ -398,6 +416,7 @@ impl FrontendParser {
             b'C' if body.first() == Some(&b'S') => self.cache_traffic = true,
             _ => {}
         }
+        observed
     }
 
     fn finish(&mut self) {
@@ -440,7 +459,7 @@ impl FrontendParser {
 /// Listens on an ephemeral loopback port and relays every connection to
 /// `upstream`. Client bytes are parsed before they are forwarded, so a reply
 /// from PostgreSQL implies the request that caused it is already logged.
-/// Cut the connection that forwards every one of `markers`, in order (TC-1054
+/// Cut the connection that executes/binds every one of `markers`, in order (TC-1054
 /// route tests): the server receives the last one, the node never sees a
 /// reply to it, and the connection is reset. Armed for `times` connections.
 #[derive(Clone, Default)]
@@ -463,7 +482,7 @@ impl Cut {
     }
 
     /// Advance a connection's `progress` through the armed markers over
-    /// `bytes`; whether the connection must now be cut.
+    /// a framed Bind body or resolved executed SQL; whether to cut.
     fn observe(&self, progress: &mut usize, bytes: &[u8]) -> bool {
         let mut armed = self.0.lock();
         let Some((markers, times)) = armed.as_mut() else {
@@ -485,6 +504,18 @@ impl Cut {
         }
         true
     }
+}
+
+fn observe_frontend_cut(
+    parser: &mut FrontendParser,
+    cut: &Cut,
+    progress: &mut usize,
+    bytes: &[u8],
+) -> bool {
+    parser
+        .feed(bytes)
+        .iter()
+        .any(|message| cut.observe(progress, message))
 }
 
 async fn start_proxy(upstream: (String, u16), wire: Wire, cut: Cut) -> Result<SocketAddr> {
@@ -532,8 +563,7 @@ async fn start_proxy(upstream: (String, u16), wire: Wire, cut: Cut) -> Result<So
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
-                    parser.feed(&buf[..n]);
-                    let sever = cut.observe(&mut progress, &buf[..n]);
+                    let sever = observe_frontend_cut(&mut parser, &cut, &mut progress, &buf[..n]);
                     if sever {
                         // Before forwarding: no reply may reach the node.
                         severed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -747,7 +777,7 @@ impl Account {
         let digest = Keccak256::digest(&public.as_bytes()[1..]);
         let address: [u8; 20] = digest[12..].try_into()?;
         let did = format!("did:pkh:eip155:1:0x{}", eip55(&address));
-        let space = SpaceId::new(did.parse::<DIDBuf>()?, ACCOUNT_SPACE.parse()?);
+        let space = SpaceId::new(did.parse::<DIDBuf>()?, ACCOUNT_SPACE.parse()?)?;
         Ok(Self {
             key,
             address,
@@ -1726,9 +1756,11 @@ async fn kv_put(
 /// failure before any write as `503 unavailable_retryable` with
 /// `Retry-After`, and one after the `COMMIT` was sent as `500
 /// outcome_unknown` without it, through the real node and its pool. The
-/// proxy cuts a connection: both `BEGIN` attempts (the one retry
-/// included), or a `COMMIT` that the server receives and commits but whose
-/// reply never arrives.
+/// proxy cuts a connection: both `BEGIN` attempts of a KV put (the one retry
+/// included), all four of a delegation (its operation is run once more after
+/// a loss before any write, TC-2346, so both runs lose both attempts), or a
+/// `COMMIT` that the server receives and commits but whose reply never
+/// arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
     let Some(url) =
@@ -1807,17 +1839,18 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
             "reading back finds the committed put: {status} {read}"
         );
 
-        // Delegation: no connection survives BEGIN.
+        // Delegation: no connection survives BEGIN. Two attempts per run (the
+        // pool's one retry included), and the route runs the operation twice.
         let retryable = authorization(&new_session(&account)?.delegation_header)?;
         node.settle().await?;
-        cut.arm(&[b"BEGIN"], 2);
+        cut.arm(&[b"BEGIN"], 4);
         let (status, body, retry_after) = dispatch(
             node.client
                 .post("/delegate")
                 .header(Header::new("Authorization", retryable)),
         )
         .await;
-        ensure!(!cut.armed(), "both BEGIN attempts were cut");
+        ensure!(!cut.armed(), "all four BEGIN attempts were cut");
         ensure!(
             status == Status::ServiceUnavailable && body.starts_with("unavailable_retryable:"),
             "delegate before any write: {status} {body}"
@@ -1879,6 +1912,87 @@ async fn postgres_write_routes_tell_retryable_failures_from_unknown_outcomes() {
         .await
         .expect("drop the isolated schema");
     result.expect("route outcomes");
+}
+
+/// The stored delegation rows of the node's schema.
+async fn stored_delegations(node: &Node) -> Result<i64> {
+    Ok(
+        tinycloud_core::sea_orm::sqlx::query_scalar::<_, i64>("SELECT count(*) FROM delegation")
+            .fetch_one(node.pool())
+            .await?,
+    )
+}
+
+/// TC-2346: when no connection survives the first run's `BEGIN` (the
+/// attempt and the pool's one retry are both cut), nothing was written, so
+/// the route runs the delegation once more and answers `200`. The
+/// delegation is stored once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_delegate_is_retried_when_no_connection_survives_its_first_begin() {
+    let Some(url) = postgres_test_url(
+        "postgres_delegate_is_retried_when_no_connection_survives_its_first_begin",
+    ) else {
+        return;
+    };
+    let admin = Database::connect(url.as_str())
+        .await
+        .expect("connect to PostgreSQL");
+    let schema = format!(
+        "tc2346_routes_{}_{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create the isolated schema");
+    let cut = Cut::default();
+    let (node, _datadir) = start_node(&url, &schema, cut.clone(), None)
+        .await
+        .expect("start the node");
+
+    let result = async {
+        let account = Account::new(44)?;
+        sign_in(&node, &account).await?;
+        let before = stored_delegations(&node).await?;
+
+        let header = authorization(&new_session(&account)?.delegation_header)?;
+        node.settle().await?;
+        cut.arm(&[b"BEGIN"], 2);
+        let (status, body, _) = dispatch(
+            node.client
+                .post("/delegate")
+                .header(Header::new("Authorization", header)),
+        )
+        .await;
+        ensure!(
+            !cut.armed(),
+            "both BEGIN attempts of the first run were cut"
+        );
+        ensure!(
+            status == Status::Ok,
+            "delegate retried after a loss before any write: {status} {body}"
+        );
+        let after = stored_delegations(&node).await?;
+        ensure!(
+            after == before + 1,
+            "the delegation is stored once: {before} rows before, {after} after"
+        );
+        Ok(())
+    }
+    .await;
+    node.pool().close().await;
+    admin
+        .execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA {schema} CASCADE"),
+        ))
+        .await
+        .expect("drop the isolated schema");
+    result.expect("delegate retry");
 }
 
 /// TC-735: a KV put's preparatory `BEGIN` is retried a bounded number of times
@@ -2170,4 +2284,69 @@ async fn postgres_info_reports_connection_counters() {
         .await
         .expect("drop the isolated schema");
     result.expect("postgres counters in /info");
+}
+
+#[cfg(test)]
+mod cut_regressions {
+    use super::*;
+    const FENCE: &[u8] = b"SELECT 1 FOR UPDATE OF fence";
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+    fn parser() -> FrontendParser {
+        let mut parser = FrontendParser::new(Wire::default(), 1);
+        parser.started = true;
+        parser
+    }
+    #[test]
+    fn cut_observes_cached_fence_execution() {
+        let mut parser = parser();
+        let mut parse = b"cached\0".to_vec();
+        parse.extend_from_slice(FENCE);
+        parse.extend_from_slice(&[0, 0, 0]);
+        assert!(parser.feed(&frame(b'P', &parse)).is_empty());
+        let cut = Cut::default();
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let mut progress = 0;
+        assert!(!observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &frame(b'B', b"\0cached\0")
+        ));
+        assert!(observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &frame(b'E', &[0, 0, 0, 0, 0])
+        ));
+        assert!(!cut.armed());
+    }
+    #[test]
+    fn cut_observes_fence_sql_split_across_reads() {
+        let mut parser = parser();
+        let cut = Cut::default();
+        cut.arm(&[b"FOR UPDATE OF fence"], 1);
+        let mut progress = 0;
+        let mut query = FENCE.to_vec();
+        query.push(0);
+        let query = frame(b'Q', &query);
+        let split = query.len() - 8;
+        assert!(!observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &query[..split]
+        ));
+        assert!(observe_frontend_cut(
+            &mut parser,
+            &cut,
+            &mut progress,
+            &query[split..]
+        ));
+        assert!(!cut.armed());
+    }
 }

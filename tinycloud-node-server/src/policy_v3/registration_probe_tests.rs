@@ -13,6 +13,7 @@
 //! main as well. PostgreSQL only; the probe runs in CI, not locally.
 
 use super::test_harness::*;
+use super::unbound_source_tests::{boot, bound_source, grant_owner_key};
 use super::*;
 use std::future::Future;
 use tinycloud_core::sea_orm::{
@@ -106,15 +107,18 @@ fn key_free_and_rows(url: String, key: i64) -> anyhow::Result<(bool, Rows)> {
 #[tokio::test]
 async fn postgres_refused_registration_releases_its_space_lock() -> anyhow::Result<()> {
     let test = "postgres_refused_registration_releases_its_space_lock";
-    let Some(h) = Harness::new(Backend::Postgres, Shape::KeySession, test).await? else {
+    // TC-2242: the route refuses a pathless registration before it opens the
+    // transaction, so the registration is path-bound (this needs named keys).
+    let Some((h, _ledger)) = boot(Backend::Postgres, test).await? else {
         return Ok(());
     };
-    h.grant_owner(policy_window()).await?;
+    let (source, leaf) = bound_source(&h, "immutable", Some(&"aa".repeat(32)));
+    grant_owner_key(&h, &leaf).await?;
     let url = h.database_url().to_owned();
     install_refusal(url.clone())?;
     let before = rows(url.clone())?;
 
-    let (status, body, _) = h.register(policy_window()).await?;
+    let (status, body, _) = h.register_source(policy_window(), source, &leaf).await?;
     anyhow::ensure!(
         status == Status::Conflict,
         "refused register: {status} {body}"

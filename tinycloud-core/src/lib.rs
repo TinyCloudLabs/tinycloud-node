@@ -27,6 +27,7 @@ pub mod policy_authority;
 pub mod policy_capability;
 mod read_audit;
 pub mod relationships;
+pub mod renewal;
 pub mod request_cancel;
 pub mod request_telemetry;
 pub mod share_email;
@@ -40,13 +41,14 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
-pub use admission::{AdmissionError, AdmittedInvocation};
+pub use admission::{AdmissionError, AdmittedInput, AdmittedInvocation};
 pub use db::{
-    Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
-    KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError, TxStoreError,
+    kv_mixes_writes_and_reads, kv_mutation_keys, Commit, DelegationStatus, InvocationOutcome,
+    KvBatchReadItem, KvBatchReadValue, KvInvokeOptions, KvPrecondition, SpaceDatabase,
+    TransactResult, TxError, TxStoreError,
 };
 pub use db_pool::RecoveringConnection;
-pub use encryption::ColumnEncryption;
+pub use encryption::{ColumnEncryption, RowBinding};
 pub use libp2p;
 pub use read_audit::{ReadAuditError, ReadAuditHealth, DEFAULT_READ_AUDIT_WAIT};
 pub use sea_orm;

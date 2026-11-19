@@ -19,7 +19,9 @@ pub struct Model {
     #[sea_orm(unique)]
     pub enforcement_delegation_cid: String,
     pub policy_bytes: Vec<u8>,
+    pub policy_bytes_format: i16,
     pub enforcement_delegation_bytes: Vec<u8>,
+    pub enforcement_delegation_bytes_format: i16,
     pub policy_proof: String,
     pub policy_digest: String,
     pub matcher_digest: String,

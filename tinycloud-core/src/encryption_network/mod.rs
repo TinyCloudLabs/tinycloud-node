@@ -42,5 +42,5 @@ pub use service::{
 };
 pub use types::{
     InlineEnvelope, KeyBackendKind, NetworkDescriptor, NetworkState, Threshold,
-    ALG_X25519_AES256GCM,
+    ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM,
 };

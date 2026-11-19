@@ -26,7 +26,7 @@ async fn generate_historical_fixtures() {
         let path = output.join(format!("{name}.sqlite"));
         assert!(!path.exists(), "never overwrite historical fixture {}", path.display());
         let db = open(&path).await.with_encryption(encrypted.then(|| ColumnEncryption::new(ENCRYPTION_KEY)));
-        let resource = SpaceId::new(issuer.parse().unwrap(), name.parse().unwrap())
+        let resource = SpaceId::new(issuer.parse().unwrap(), name.parse().unwrap()).unwrap()
             .to_resource("kv".parse().unwrap(), None, None, None).to_string();
         let cacao = signed_cacao(&audience, Some(&resource), &format!("tc1071-{name}"));
         let canonical_header = TinyCloudDelegation::Cacao(Box::new(cacao.clone())).encode().unwrap();
@@ -87,7 +87,7 @@ async fn generate_single_historical_fixture() {
     let (_, _, issuer) = owner();
     let (jwk, audience, vm) = session(11);
     let (child_jwk, _, child_vm) = session(12);
-    let resource = SpaceId::new(issuer.parse().unwrap(), "single-v0".parse().unwrap()).to_resource("kv".parse().unwrap(), None, None, None).to_string();
+    let resource = SpaceId::new(issuer.parse().unwrap(), "single-v0".parse().unwrap()).unwrap().to_resource("kv".parse().unwrap(), None, None, None).to_string();
     let cacao = signed_cacao(&audience, Some(&resource), "tc1071-single-v0");
     let canonical_header = TinyCloudDelegation::Cacao(Box::new(cacao.clone())).encode().unwrap();
     let (encoding, header) = variants(&cacao).into_iter().find(|(encoding, _)| encoding == "v0").unwrap();

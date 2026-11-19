@@ -12,6 +12,7 @@ use serde_with::{
     serde_as, FromInto,
 };
 use std::{fs, path::PathBuf, time::Duration};
+use time::OffsetDateTime;
 use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::sql::DdlPolicy;
@@ -58,7 +59,16 @@ pub struct Config {
     #[serde(default)]
     pub encryption_network: EncryptionNetworkConfig,
     #[serde(default)]
+    pub column_encryption: ColumnEncryptionConfig,
+    #[serde(default)]
     pub sql: SqlConfig,
+}
+
+/// Recorded column reads may require encrypted storage when explicitly enabled.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub struct ColumnEncryptionConfig {
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// Release gates for the encryption network routes. `named_keys_v1`
@@ -76,6 +86,12 @@ pub struct Config {
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
     pub named_keys_v1: bool,
+    /// Select v2 response wraps independently of incoming-wrap policy.
+    #[serde(default)]
+    pub key_wrap_v2: bool,
+    /// Require v2 incoming network-key wraps.
+    #[serde(default)]
+    pub key_wrap_require_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
 }
@@ -164,11 +180,15 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
+    /// Hard stop for the legacy issuer while a same-DID next key overlaps.
+    /// Must be paired with exactly one same-DID `credential_issuers` entry.
+    #[serde(default)]
+    pub issuer_not_after: Option<String>,
     /// The pinned per-policy issuer set (TC-1452): the explicit entries, each
     /// `{issuerDid, kid, alg, publicKey, vcts, profiles, notBefore, retiredAt?,
     /// notAfter?}`. The legacy single issuer above, when its public key is
-    /// set, joins as one more entry. A violation of a set-load rule stops the
-    /// node from starting. Nothing here is fetched or resolved.
+    /// set, joins as one more entry. A same-DID second key requires an explicit
+    /// future `issuer_not_after`.
     #[serde(default)]
     pub credential_issuers: Vec<crate::issuer_set::CredentialIssuerConfig>,
     /// Operator-delivered owner-signed authority material. A missing or
@@ -322,6 +342,7 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
+            issuer_not_after: None,
             credential_issuers: Vec::new(),
             authority_material_path: None,
             trust_bundle_path: None,
@@ -408,12 +429,49 @@ impl ShareEmailConfig {
     }
 
     /// Builds the pinned issuer set: the explicit `credential_issuers` plus the
-    /// legacy single issuer as one entry. Applies every set-load rule; the
-    /// caller refuses to start on an error.
+    /// legacy single issuer as one entry. A same-DID additional key is allowed
+    /// only with a future hard stop for the legacy key.
     pub fn credential_issuer_set(&self) -> anyhow::Result<crate::issuer_set::IssuerSet> {
         use anyhow::Context as _;
         self.validate_issuer_pin()
             .map_err(|error| anyhow::anyhow!(error))?;
+        let same_did: Vec<_> = self
+            .credential_issuers
+            .iter()
+            .filter(|entry| entry.issuer_did == self.issuer_did)
+            .collect();
+        let legacy_not_after = match (self.issuer_not_after.as_deref(), same_did.as_slice()) {
+            (None, []) => None,
+            (Some(end), [next]) => {
+                let end_time = crate::issuer_set::parse_utc(end)
+                    .ok_or_else(|| anyhow::anyhow!("issuer overlap end must be UTC RFC 3339"))?;
+                if end_time <= OffsetDateTime::now_utc() {
+                    anyhow::bail!("issuer overlap end time has already passed");
+                }
+                let next_start = crate::issuer_set::parse_utc(&next.not_before)
+                    .ok_or_else(|| anyhow::anyhow!("next issuer notBefore must be UTC RFC 3339"))?;
+                if next_start > end_time
+                    || next.retired_at.is_some()
+                    || next.not_after.is_some()
+                    || next.vcts != [self.issuer_vct.clone()]
+                    || next.profiles.len() != 2
+                    || !next
+                        .profiles
+                        .iter()
+                        .any(|profile| profile == "tinycloud.email-proof/v1")
+                    || !next
+                        .profiles
+                        .iter()
+                        .any(|profile| profile == "tinycloud.email-domain-proof/v1")
+                {
+                    anyhow::bail!("issuer overlap entry is invalid");
+                }
+                Some(end)
+            }
+            _ => anyhow::bail!(
+                "same-DID issuer overlap requires exactly one next key and a bounded end"
+            ),
+        };
         let legacy = self
             .issuer_public_key
             .as_deref()
@@ -433,8 +491,12 @@ impl ShareEmailConfig {
                 ))
             })
             .transpose()?;
-        crate::issuer_set::IssuerSet::load_with_legacy(&self.credential_issuers, legacy.as_ref())
-            .context("credential issuer set is invalid")
+        crate::issuer_set::IssuerSet::load_with_legacy_not_after(
+            &self.credential_issuers,
+            legacy.as_ref(),
+            legacy_not_after,
+        )
+        .context("credential issuer set is invalid")
     }
 
     pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
@@ -466,6 +528,10 @@ impl ShareEmailConfig {
         resolved.issuer_kid = bundle.issuer_kid;
         resolved.issuer_key_version = bundle.issuer_key_version as u64;
         resolved.issuer_public_key = Some(bundle.issuer_public_key);
+        resolved.issuer_not_after = bundle.issuer_not_after;
+        if let Some(next_issuer) = bundle.next_issuer {
+            resolved.credential_issuers.push(next_issuer);
+        }
         Ok(resolved)
     }
 
@@ -669,6 +735,10 @@ struct ShareEmailTrustBundle {
     issuer_public_key: String,
     issuer_key_version: u32,
     issuer_enabled: bool,
+    #[serde(default)]
+    issuer_not_after: Option<String>,
+    #[serde(default)]
+    next_issuer: Option<crate::issuer_set::CredentialIssuerConfig>,
 }
 
 impl ShareEmailTrustBundle {
@@ -677,6 +747,37 @@ impl ShareEmailTrustBundle {
             && canonical_https_origin_with_optional_port(&self.share_origin);
         let fixture_node_origin = allows_hermetic_fixture()
             && canonical_https_origin_with_optional_port(&self.node_origin);
+        let overlap_valid = match (self.issuer_not_after.as_deref(), self.next_issuer.as_ref()) {
+            (None, None) => true,
+            (Some(end), Some(next)) => {
+                let end_time = crate::issuer_set::parse_utc(end);
+                let next_start = crate::issuer_set::parse_utc(&next.not_before);
+                end_time.is_some_and(|end| end > OffsetDateTime::now_utc())
+                    && next_start
+                        .zip(end_time)
+                        .is_some_and(|(start, end)| start <= end)
+                    && next.issuer_did == self.issuer_did
+                    && next.kid != self.issuer_kid
+                    && canonical_kid_matches(&next.kid, &next.issuer_did)
+                    && next.alg == "EdDSA"
+                    && next.vcts.len() == 1
+                    && next.vcts[0] == self.issuer_vct
+                    && next.profiles.len() == 2
+                    && next
+                        .profiles
+                        .iter()
+                        .any(|v| v == "tinycloud.email-proof/v1")
+                    && next
+                        .profiles
+                        .iter()
+                        .any(|v| v == "tinycloud.email-domain-proof/v1")
+                    && next.retired_at.is_none()
+                    && next.not_after.is_none()
+                    && canonical_key(&next.public_key)
+                    && next.public_key != self.issuer_public_key
+            }
+            _ => false,
+        };
         if self.version != "tinycloud.share-email-trust-bundle/v1"
             || (!fixture_origin && self.share_origin != "https://share.tinycloud.xyz")
             || self.return_origin != self.share_origin
@@ -705,6 +806,7 @@ impl ShareEmailTrustBundle {
             || !self.issuer_enabled
             || !canonical_key(&self.node_invitation_public_key)
             || !canonical_key(&self.issuer_public_key)
+            || !overlap_valid
             || (!allows_hermetic_fixture() && self.contains_fixture_material())
         {
             return Err("share email trust bundle is inconsistent");
@@ -775,6 +877,10 @@ impl ShareEmailTrustBundle {
             || contains_placeholder(&self.email_origin)
             || is_fixture_public_key(&self.node_invitation_public_key)
             || is_fixture_public_key(&self.issuer_public_key)
+            || self
+                .next_issuer
+                .as_ref()
+                .is_some_and(|next| is_fixture_public_key(&next.public_key))
     }
 }
 
@@ -1500,6 +1606,13 @@ pub struct SpacesConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SqlStorageConfig {
+    /// Opt-in PostgreSQL checkpoint parts (TC-2917); requires explicit capacities.
+    #[serde(default)]
+    pub chunked_artifacts: bool,
+    #[serde(default)]
+    pub chunked_artifact_max_bytes: u64,
+    #[serde(default)]
+    pub chunked_account_max_bytes: u64,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default = "default_sql_memory_threshold")]
@@ -1547,6 +1660,21 @@ pub struct SqlStorageConfig {
     /// `"off"` keeps the earlier behaviour, where `write` also sufficed.
     #[serde(default)]
     pub ddl_requires_schema: DdlPolicy,
+    /// The largest SQL or DuckDB artifact payload the node saves in one
+    /// statement (TC-2961). A larger whole checkpoint is refused before it is
+    /// sent (`507 sql_database_size_limit`): it travels as one parameter, and
+    /// the server needs a multiple of it in memory, so one tenant's database
+    /// could take down the shared primary. On by default, 64 MiB; 0 turns it
+    /// off, for local tests only.
+    #[serde(default = "default_sql_max_artifact_write_bytes")]
+    pub max_artifact_write_bytes: ByteUnit,
+    /// The largest stored SQL or DuckDB checkpoint or WAL delta the node
+    /// loads (TC-2961). A larger database is refused before any of it is
+    /// read (`507 sql_database_size_limit`) instead of being loaded whole.
+    /// On by default, 64 MiB; 0 turns it off. Otherwise `validate` refuses
+    /// it below `max_artifact_write_bytes`, or with that off.
+    #[serde(default = "default_sql_max_artifact_read_bytes")]
+    pub max_artifact_read_bytes: ByteUnit,
 }
 
 fn default_sql_max_database_bytes() -> ByteUnit {
@@ -1555,6 +1683,14 @@ fn default_sql_max_database_bytes() -> ByteUnit {
 
 fn default_sql_min_free_bytes() -> ByteUnit {
     ByteUnit::Byte(0)
+}
+
+fn default_sql_max_artifact_write_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_WRITE_BYTES)
+}
+
+fn default_sql_max_artifact_read_bytes() -> ByteUnit {
+    ByteUnit::Byte(tinycloud_core::database_artifacts::DEFAULT_MAX_ARTIFACT_READ_BYTES)
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -1596,11 +1732,27 @@ impl SqlStorageConfig {
             hydration_max: Duration::from_millis(self.hydration_max_ms),
         }
     }
+
+    /// Refuse an artifact read limit below the write limit (TC-2961): the
+    /// databases between the two would be saved, then refused on every load.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let read = self.max_artifact_read_bytes.as_u64();
+        let write = self.max_artifact_write_bytes.as_u64();
+        if read != 0 && (write == 0 || read < write) {
+            return Err(
+                "storage.sql.max_artifact_read_bytes must be 0 (off) or at least storage.sql.max_artifact_write_bytes (and that must not be 0)",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for SqlStorageConfig {
     fn default() -> Self {
         Self {
+            chunked_artifacts: false,
+            chunked_artifact_max_bytes: 0,
+            chunked_account_max_bytes: 0,
             path: None,
             memory_threshold: default_sql_memory_threshold(),
             lock_wait_timeout_ms: default_sql_lock_wait_timeout_ms(),
@@ -1611,6 +1763,8 @@ impl Default for SqlStorageConfig {
             max_database_bytes: default_sql_max_database_bytes(),
             min_free_bytes: default_sql_min_free_bytes(),
             ddl_requires_schema: DdlPolicy::default(),
+            max_artifact_write_bytes: default_sql_max_artifact_write_bytes(),
+            max_artifact_read_bytes: default_sql_max_artifact_read_bytes(),
         }
     }
 }
@@ -1801,15 +1955,18 @@ pub struct DatabaseConfig {
     /// Zero disables it.
     #[serde(default = "default_database_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
-    /// `statement_timeout`, in milliseconds, for the statements on a whole
-    /// SQL or DuckDB artifact that may be larger than a WAL delta (hydration
-    /// loads and checkpoint saves over 8 MiB, or of unknown size): the
-    /// server's work on a ~100 MiB value (detoasting and decompressing it on
-    /// load; compressing, TOASTing and WAL-logging it on save) can outlast
-    /// the base limit. PostgreSQL does not cancel a statement while it is
-    /// writing a row to the client, so the download itself is not limited.
-    #[serde(default = "default_database_bulk_statement_timeout_ms")]
-    pub bulk_statement_timeout_ms: u64,
+    /// PostgreSQL `idle_in_transaction_session_timeout`, in milliseconds, set
+    /// once on every pooled connection (TC-2954): the server ends a session
+    /// that sits idle inside a transaction this long, so a leaked or stalled
+    /// transaction cannot hold its locks and pooled connection indefinitely.
+    /// It must exceed the longest legitimate hold, a protected legacy meeting
+    /// write's upload (`KV_UPLOAD_TIMEOUT`, 240 s); `validate` refuses less.
+    /// Zero disables it. Not set in `statement_timeout_mode = "local"`: a
+    /// session `SET` behind a transaction-pooling proxy would land on
+    /// whichever server connection served it and reach the proxy's other
+    /// clients.
+    #[serde(default = "default_database_idle_in_transaction_timeout_ms")]
+    pub idle_in_transaction_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
     /// sockets, so a connection the network silently drops fails within tens
     /// of seconds instead of the kernel's ~15 min retransmission timeout
@@ -1872,9 +2029,12 @@ fn default_database_statement_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_database_bulk_statement_timeout_ms() -> u64 {
-    120_000
+fn default_database_idle_in_transaction_timeout_ms() -> u64 {
+    300_000
 }
+
+/// PostgreSQL's largest millisecond timeout setting (`INT_MAX`).
+const POSTGRES_MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 fn default_database_tcp_keepalive_idle_secs() -> u64 {
     15
@@ -1909,7 +2069,7 @@ impl Default for DatabaseConfig {
             max_lifetime_secs: default_database_max_lifetime_secs(),
             statement_timeout_mode: StatementTimeoutMode::default(),
             statement_timeout_ms: default_database_statement_timeout_ms(),
-            bulk_statement_timeout_ms: default_database_bulk_statement_timeout_ms(),
+            idle_in_transaction_timeout_ms: default_database_idle_in_transaction_timeout_ms(),
             tcp_keepalive: true,
             tcp_keepalive_idle_secs: default_database_tcp_keepalive_idle_secs(),
             tcp_keepalive_interval_secs: default_database_tcp_keepalive_interval_secs(),
@@ -1933,12 +2093,51 @@ pub struct DidResolutionConfig {
 
 impl DatabaseConfig {
     /// Reject settings that would make the node unusable (TC-1317): a zero
-    /// read-audit wait would answer every authorized read `read_audit_busy`.
+    /// read-audit wait would answer every authorized read `read_audit_busy`,
+    /// an idle-in-transaction timeout within the legacy upload hold would
+    /// fail legitimate writes (TC-2954), and a timeout above PostgreSQL's
+    /// largest (`INT_MAX` ms) would fail every connection after startup.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.read_audit_wait_ms == 0 {
             return Err("database.read_audit_wait_ms must be greater than zero");
         }
+        if self.idle_in_transaction_timeout_ms != 0
+            && u128::from(self.idle_in_transaction_timeout_ms)
+                <= tinycloud_core::db::KV_UPLOAD_TIMEOUT.as_millis()
+        {
+            return Err(
+                "database.idle_in_transaction_timeout_ms must be 0 (off) or exceed the 240 s legacy upload hold",
+            );
+        }
+        for (value, error) in [
+            (
+                self.idle_in_transaction_timeout_ms,
+                "database.idle_in_transaction_timeout_ms must be at most 2147483647",
+            ),
+            (
+                self.statement_timeout_ms,
+                "database.statement_timeout_ms must be at most 2147483647",
+            ),
+        ] {
+            if value > POSTGRES_MAX_TIMEOUT_MS {
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+
+    /// The statement that sets the pool's idle-in-transaction timeout on a new
+    /// connection, or `None` when it is off or the statement timeout mode is
+    /// `local` (a transaction-pooling proxy).
+    pub fn idle_in_transaction_statement(&self) -> Option<String> {
+        (self.idle_in_transaction_timeout_ms > 0
+            && self.statement_timeout_mode != StatementTimeoutMode::Local)
+            .then(|| {
+                format!(
+                    "SET idle_in_transaction_session_timeout = {}",
+                    self.idle_in_transaction_timeout_ms
+                )
+            })
     }
 
     /// The pool's PostgreSQL `statement_timeout` policy.
@@ -1946,7 +2145,6 @@ impl DatabaseConfig {
         StatementTimeouts {
             mode: self.statement_timeout_mode,
             base: Duration::from_millis(self.statement_timeout_ms),
-            bulk: Duration::from_millis(self.bulk_statement_timeout_ms),
         }
     }
 
@@ -2053,6 +2251,64 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    #[test]
+    fn column_encryption_strict_defaults_off_and_accepts_opt_in() {
+        assert!(!Config::default().column_encryption.strict);
+        assert!(
+            !serde_json::from_str::<ColumnEncryptionConfig>("{}")
+                .unwrap()
+                .strict
+        );
+        assert!(
+            serde_json::from_str::<ColumnEncryptionConfig>(r#"{"strict":true}"#)
+                .unwrap()
+                .strict
+        );
+    }
+
+    #[test]
+    fn storage_keyrings_separate_purposes_and_apply_strict_mode() {
+        use tinycloud_core::encryption::RowBinding;
+
+        let root = tinycloud_core::keys::StaticSecret::new(vec![7; 32]).unwrap();
+        let binding = RowBinding::new("hook_subscription", "encrypted_secret", &[b"hook"]);
+        let config = Config::default();
+        let (columns, webhooks) = crate::storage_keyrings(&root, &config.column_encryption);
+        let sealed = columns.encrypt(b"stored bytes", binding);
+        assert!(webhooks.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy_seed = tinycloud_core::ColumnEncryption::for_purpose(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+            tinycloud_core::encryption::EncryptionPurpose::Columns,
+        );
+        assert!(legacy_seed.decrypt_recorded(&sealed, binding, 2).is_err());
+        let sealed = webhooks.encrypt(b"stored bytes", binding);
+        assert!(columns.decrypt_recorded(&sealed, binding, 2).is_err());
+        let legacy = tinycloud_core::ColumnEncryption::new(
+            root.derive_key(b"tinycloud/hooks/webhook-secrets"),
+        )
+        .encrypt_legacy(b"legacy bytes");
+        for ring in [&columns, &webhooks] {
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+            assert_eq!(
+                ring.decrypt_recorded(b"plaintext", binding, 0).unwrap(),
+                b"plaintext"
+            );
+        }
+        let (columns, webhooks) =
+            crate::storage_keyrings(&root, &ColumnEncryptionConfig { strict: true });
+        for ring in [&columns, &webhooks] {
+            assert!(ring.decrypt_recorded(b"plaintext", binding, 0).is_err());
+            assert_eq!(
+                ring.decrypt_recorded(&legacy, binding, 0).unwrap(),
+                b"legacy bytes"
+            );
+        }
+    }
+
     /// TC-1581: `[global.storage.sql] ddl_requires_schema` defaults to
     /// `enforce` and accepts only `off`, `log` and `enforce`.
     #[test]
@@ -2116,6 +2372,82 @@ mod tests {
         }
     }
 
+    /// TC-2954: the idle-in-transaction timeout is on by default (300 s) and,
+    /// when on, must outlast the 240 s a protected legacy write holds its
+    /// transaction.
+    #[test]
+    fn tc2954_startup_rejects_an_idle_in_transaction_timeout_within_the_upload_hold() {
+        assert_eq!(
+            Config::default().database.idle_in_transaction_timeout_ms,
+            300_000
+        );
+        for (timeout_ms, ok) in [
+            (0, true),
+            (1, false),
+            (240_000, false),
+            (240_001, true),
+            (2_147_483_647, true),
+            (2_147_483_648, false),
+        ] {
+            let mut config = Config::default();
+            config.database.idle_in_transaction_timeout_ms = timeout_ms;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "{timeout_ms}"
+            );
+        }
+    }
+
+    /// TC-2961: a read limit below the write limit would make databases
+    /// between the two writable and then unloadable, so the node refuses to
+    /// start with it. 0 turns the read limit off.
+    #[test]
+    fn startup_refuses_an_artifact_read_limit_below_the_write_limit() {
+        let mib = |n: u64| ByteUnit::Byte(n * 1024 * 1024);
+        for (write, read, ok) in [
+            (mib(64), mib(64), true),
+            (mib(64), mib(128), true),
+            (mib(64), ByteUnit::Byte(0), true),
+            (ByteUnit::Byte(0), ByteUnit::Byte(0), true),
+            (mib(64), ByteUnit::Byte(64 * 1024 * 1024 - 1), false),
+            (ByteUnit::Byte(0), mib(64), false),
+        ] {
+            let mut config = Config::default();
+            config.storage.sql.max_artifact_write_bytes = write;
+            config.storage.sql.max_artifact_read_bytes = read;
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                ok,
+                "write {write:?} read {read:?}"
+            );
+        }
+    }
+
+    /// TC-2954: a statement timeout above PostgreSQL's largest is refused at
+    /// startup instead of failing every connection after the old node has
+    /// stopped.
+    #[test]
+    fn startup_rejects_a_statement_timeout_postgres_cannot_hold() {
+        for (base, ok) in [(2_147_483_647, true), (2_147_483_648, false)] {
+            let mut config = Config::default();
+            config.database.statement_timeout_ms = base;
+            assert_eq!(crate::resolve_runtime_config(&config).is_ok(), ok, "{base}");
+        }
+    }
+
+    /// TC-2954: behind a transaction-pooling proxy (`local` mode) the
+    /// session-level idle-in-transaction timeout is not set.
+    #[test]
+    fn the_idle_in_transaction_timeout_is_not_set_in_local_mode() {
+        let mut database = Config::default().database;
+        assert!(database.idle_in_transaction_statement().is_some());
+        database.statement_timeout_mode = StatementTimeoutMode::Local;
+        assert_eq!(database.idle_in_transaction_statement(), None);
+        database.statement_timeout_mode = StatementTimeoutMode::Off;
+        assert!(database.idle_in_transaction_statement().is_some());
+    }
+
     /// TC-1491: off by default, 60 s / 8 MiB for every tier, and nothing is
     /// validated while the feature is off.
     #[test]
@@ -2146,6 +2478,28 @@ mod tests {
     }
 
     #[test]
+    fn encryption_network_wrap_v2_is_default_off_and_opt_in() {
+        assert!(!Config::default().encryption_network.key_wrap_v2);
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!default.key_wrap_v2);
+        let enabled: EncryptionNetworkConfig = toml::from_str("key_wrap_v2 = true").unwrap();
+        assert!(enabled.key_wrap_v2);
+        assert!(enabled.validate().is_ok());
+    }
+
+    #[test]
+    fn encryption_network_require_v2_is_default_off_and_independent() {
+        assert!(!Config::default().encryption_network.key_wrap_require_v2);
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert!(!default.key_wrap_require_v2);
+        let enabled: EncryptionNetworkConfig =
+            toml::from_str("key_wrap_require_v2 = true").unwrap();
+        assert!(enabled.key_wrap_require_v2);
+        assert!(!enabled.key_wrap_v2);
+        assert!(enabled.validate().is_ok());
+    }
+
+    #[test]
     fn deletion_ledger_path_is_required_while_named_keys_are_on() {
         let off: EncryptionNetworkConfig = toml::from_str("").unwrap();
         assert!(off.validate().is_ok());
@@ -2168,6 +2522,8 @@ mod tests {
         for bad in ["", "ledger.jsonl", "/var/lib/", "/a/../b"] {
             let config = EncryptionNetworkConfig {
                 named_keys_v1: false,
+                key_wrap_v2: false,
+                key_wrap_require_v2: false,
                 deletion_ledger_path: Some(bad.into()),
             };
             assert!(config.validate().is_err(), "{bad:?}");
@@ -2605,6 +2961,190 @@ mod tests {
             .expect("trust bundle write");
         config.trust_bundle_path = Some(file.path().display().to_string());
         file
+    }
+
+    fn overlap_bundle(
+        config: &ShareEmailConfig,
+        old_not_after: &str,
+        next_public_key: &str,
+    ) -> serde_json::Value {
+        let mut bundle = bundle_document(config);
+        bundle["issuerNotAfter"] = serde_json::json!(old_not_after);
+        bundle["nextIssuer"] = serde_json::json!({
+            "issuerDid": "did:web:issuer.credentials.org",
+            "kid": "did:web:issuer.credentials.org#email-signing-key-2",
+            "alg": "EdDSA",
+            "publicKey": next_public_key,
+            "vcts": ["opencredentials.email/v1"],
+            "profiles": ["tinycloud.email-proof/v1", "tinycloud.email-domain-proof/v1"],
+            "notBefore": "2026-10-01T00:00:00Z",
+            "retiredAt": null,
+            "notAfter": null
+        });
+        bundle
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[test]
+    fn trust_bundle_accepts_legacy_single_key_unchanged_and_bounded_same_did_overlap() {
+        let old_config = enabled_config();
+        let mut old_only = old_config.clone();
+        let _old_file = install_bundle(&mut old_only);
+        assert!(old_only.resolve_trust_bundle().is_ok());
+
+        let next_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes();
+        let next_key = base64::encode_config(next_key, URL_SAFE_NO_PAD);
+        let mut overlap = old_config;
+        let bundle = overlap_bundle(&overlap, "2100-01-01T00:00:00Z", &next_key);
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(file.path(), serde_json::to_vec(&bundle).unwrap()).expect("trust bundle write");
+        overlap.trust_bundle_path = Some(file.path().display().to_string());
+
+        let resolved = overlap.resolve_trust_bundle().expect("bounded overlap");
+        let set = resolved
+            .credential_issuer_set()
+            .expect("overlap issuer set");
+        assert_eq!(set.len(), 2);
+        let old = set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-1",
+            )
+            .expect("old issuer");
+        let next = set
+            .resolve_pinned_issuer(
+                "did:web:issuer.credentials.org",
+                "did:web:issuer.credentials.org#email-signing-key-2",
+            )
+            .expect("next issuer");
+        assert!(old.not_after.is_some());
+        assert!(next.not_after.is_none());
+        let end = crate::issuer_set::parse_utc("2100-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            old.check_now(end),
+            Err(crate::issuer_set::IssuerWindowError::Stopped)
+        );
+        assert!(next.check_now(end).is_ok());
+        let preflight = Config {
+            share_email: overlap,
+            ..Config::default()
+        };
+        assert!(
+            crate::resolve_runtime_config(&preflight).is_ok(),
+            "valid bounded overlap must pass the same preflight used at startup"
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[test]
+    fn trust_bundle_rejects_unbounded_expired_malformed_and_duplicate_overlap_keys() {
+        let config = enabled_config();
+        let next_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes();
+        let next_key = base64::encode_config(next_key, URL_SAFE_NO_PAD);
+        let next_entry = || {
+            serde_json::json!({
+                "issuerDid": "did:web:issuer.credentials.org",
+                "kid": "did:web:issuer.credentials.org#email-signing-key-2",
+                "alg": "EdDSA",
+                "publicKey": next_key,
+                "vcts": ["opencredentials.email/v1"],
+                "profiles": ["tinycloud.email-proof/v1", "tinycloud.email-domain-proof/v1"],
+                "notBefore": "2026-10-01T00:00:00Z",
+                "retiredAt": null,
+                "notAfter": null
+            })
+        };
+        let mut duplicate_key = next_entry();
+        duplicate_key["publicKey"] =
+            serde_json::json!("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA");
+        let mut duplicate_kid = next_entry();
+        duplicate_kid["kid"] =
+            serde_json::json!("did:web:issuer.credentials.org#email-signing-key-1");
+        let mut wrong_did = next_entry();
+        wrong_did["issuerDid"] = serde_json::json!("did:web:other.example");
+        wrong_did["kid"] = serde_json::json!("did:web:other.example#email-signing-key-2");
+        let mut after_end = next_entry();
+        after_end["notBefore"] = serde_json::json!("2101-01-01T00:00:00Z");
+        let mut malformed = next_entry();
+        malformed["publicKey"] = serde_json::json!("AQID");
+        let mut next_expiry = next_entry();
+        next_expiry["notAfter"] = serde_json::json!("2101-01-01T00:00:00Z");
+
+        let cases = [
+            ("overlap without end", None, Some(next_entry())),
+            ("end without next key", Some("2100-01-01T00:00:00Z"), None),
+            (
+                "expired overlap",
+                Some("2000-01-01T00:00:00Z"),
+                Some(next_entry()),
+            ),
+            ("malformed end", Some("not-a-time"), Some(next_entry())),
+            (
+                "duplicate public key",
+                Some("2100-01-01T00:00:00Z"),
+                Some(duplicate_key),
+            ),
+            (
+                "duplicate kid",
+                Some("2100-01-01T00:00:00Z"),
+                Some(duplicate_kid),
+            ),
+            (
+                "different DID",
+                Some("2100-01-01T00:00:00Z"),
+                Some(wrong_did),
+            ),
+            (
+                "empty overlap window",
+                Some("2100-01-01T00:00:00Z"),
+                Some(after_end),
+            ),
+            (
+                "next key has another end",
+                Some("2100-01-01T00:00:00Z"),
+                Some(next_expiry),
+            ),
+            (
+                "malformed key",
+                Some("2100-01-01T00:00:00Z"),
+                Some(malformed),
+            ),
+        ];
+        for (label, end, next) in cases {
+            let mut bundle = bundle_document(&config);
+            if let Some(end) = end {
+                bundle["issuerNotAfter"] = serde_json::json!(end);
+            }
+            if let Some(next) = next {
+                bundle["nextIssuer"] = next;
+            }
+            let file = NamedTempFile::new().expect("temporary trust bundle");
+            fs::write(file.path(), serde_json::to_vec(&bundle).unwrap())
+                .expect("trust bundle write");
+            let mut candidate = config.clone();
+            candidate.trust_bundle_path = Some(file.path().display().to_string());
+            assert!(
+                candidate
+                    .resolve_trust_bundle()
+                    .and_then(|resolved| resolved
+                        .credential_issuer_set()
+                        .map_err(|_| "issuer set invalid"))
+                    .is_err(),
+                "{label}"
+            );
+            let preflight = Config {
+                share_email: candidate,
+                ..Config::default()
+            };
+            assert!(
+                crate::resolve_runtime_config(&preflight).is_err(),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]

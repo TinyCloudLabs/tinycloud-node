@@ -140,7 +140,7 @@ mod tests {
         let did = DID_METHODS
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
-        let space = SpaceIdWrap(SpaceId::new(did, "files".parse().unwrap()));
+        let space = SpaceIdWrap(SpaceId::new(did, "files".parse().unwrap()).unwrap());
         let value = hash(b"rerun");
         let now = OffsetDateTime::now_utc();
         kv_blob_generation::ActiveModel {

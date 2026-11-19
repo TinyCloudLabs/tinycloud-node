@@ -120,6 +120,7 @@ async fn tc1132_mixed_dns_exposes_only_vetted_addresses_to_reqwest() {
         denied,
         addresses: destination.addresses,
         scope: destination.scope,
+        deny_set_exempt: destination.deny_set_exempt,
         policy,
     };
     let addresses: Vec<_> = resolver
@@ -163,6 +164,108 @@ async fn tc1132_database_and_other_endpoint_aliases_are_denied_on_every_port() {
             "{url}"
         );
     }
+}
+
+#[tokio::test]
+async fn tc1737_links_origin_exempts_only_internal_address_overlap() -> anyhow::Result<()> {
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("quota.test", &["1.1.1.1"]).await;
+    lookup.set("links.test", &["1.1.1.1"]).await;
+    lookup.set("other.test", &["8.8.8.8"]).await;
+    let policy = EgressPolicy::for_test(vec!["quota.test".into()], lookup, false);
+    policy.refresh().await?;
+    let origin = crate::links_fetch::LinksOrigin::parse("https://links.test").unwrap();
+    let links = Url::parse("https://links.test/v1/links/record")?;
+    assert!(matches!(
+        policy
+            .resolve_url_scoped(&links, AddressScope::PublicOnly)
+            .await,
+        Err(EgressError::Forbidden)
+    ));
+    let destination = policy
+        .resolve_links_origin(&origin, &links, AddressScope::PublicOnly)
+        .await?;
+    assert!(destination.deny_set_exempt);
+    assert_eq!(destination.addresses.as_ref(), &["1.1.1.1:443".parse()?]);
+    let other = Url::parse("https://other.test/")?;
+    assert!(!policy.resolve_url(&other).await?.deny_set_exempt);
+    assert!(
+        !policy
+            .resolve_url_scoped(&other, AddressScope::AllowPrivate)
+            .await?
+            .deny_set_exempt
+    );
+    assert!(matches!(
+        policy
+            .resolve_links_origin(&origin, &other, AddressScope::PublicOnly)
+            .await,
+        Err(EgressError::Forbidden)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1737_links_exemption_still_refuses_special_use_addresses() -> anyhow::Result<()> {
+    let lookup = Arc::new(TestLookup::default());
+    for (host, ip) in [
+        ("private.test", "10.0.0.1"),
+        ("loopback.test", "127.0.0.1"),
+        ("cgnat.test", "100.64.0.1"),
+        ("metadata.test", "169.254.169.254"),
+    ] {
+        lookup.set(host, &[ip]).await;
+    }
+    let policy = EgressPolicy::for_test(Vec::new(), lookup, false);
+    for host in [
+        "private.test",
+        "loopback.test",
+        "cgnat.test",
+        "metadata.test",
+    ] {
+        let origin = crate::links_fetch::LinksOrigin::parse(&format!("https://{host}")).unwrap();
+        let url = Url::parse(&format!("https://{host}/v1/links/record"))?;
+        assert!(
+            matches!(
+                policy
+                    .resolve_links_origin(&origin, &url, AddressScope::PublicOnly)
+                    .await,
+                Err(EgressError::Forbidden)
+            ),
+            "{host}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tc1737_exempt_destination_remains_vetted_at_connect_time() -> anyhow::Result<()> {
+    let mut server = test_support::callback_server_for_host("links.test", 200, None).await?;
+    let lookup = Arc::new(TestLookup::default());
+    lookup.set("quota.test", &["127.0.0.1"]).await;
+    lookup.set("links.test", &["127.0.0.1"]).await;
+    let policy = Arc::new(
+        EgressPolicy::for_test(vec!["quota.test".into()], lookup.clone(), true)
+            .with_test_root(server.certificate.clone()),
+    );
+    policy.refresh().await?;
+    let origin = crate::links_fetch::LinksOrigin::parse(
+        &Url::parse(&server.url)?.origin().ascii_serialization(),
+    )
+    .unwrap();
+    let url = Url::parse(&server.url)?;
+    let destination = policy
+        .resolve_links_origin(&origin, &url, AddressScope::PublicOnly)
+        .await?;
+    let denied = policy.deny.read().await.addresses.clone();
+    let (client, pinned_url) =
+        pinned_client(&policy, destination, &denied, Duration::from_secs(3))?;
+    assert_eq!(
+        client.get(pinned_url).send().await?.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(server.requests.recv().await.unwrap().0, b"");
+    assert_eq!(lookup.call_count(), 2, "no second links lookup at connect");
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]

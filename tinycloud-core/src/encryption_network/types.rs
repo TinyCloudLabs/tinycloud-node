@@ -6,6 +6,7 @@ use std::fmt;
 use super::network_id::NetworkId;
 
 pub const ALG_X25519_AES256GCM: &str = "x25519-aes256gcm/v1";
+pub const ALG_X25519_HKDF_AES256GCM: &str = "x25519-hkdf-aes256gcm/v2";
 
 /// Lifecycle state of a network. V1 transitions: Pending → Generating → Active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

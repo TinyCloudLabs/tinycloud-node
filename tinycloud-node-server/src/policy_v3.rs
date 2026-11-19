@@ -27,6 +27,8 @@ use tinycloud_auth::{
     resource::{ResourceId, SpaceId},
 };
 use tinycloud_core::{
+    encryption_network::key_id::{self, EncryptionResource, KeyLocation},
+    encryption_network::{EncryptionService, EncryptionServiceError, NetworkId},
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
@@ -51,6 +53,30 @@ use crate::{
     delivery_link::{open_link_record, utc_millis, ShortLink},
     links_fetch::{LinkFetchError, LinkRecordFetcher},
 };
+
+type AuthorizationError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Preserve the database source until the HTTP boundary, where the node's
+/// existing classifier distinguishes a retryable outage from a refusal.
+pub(crate) fn authorization_failure(error: AuthorizationError) -> (Status, String) {
+    match error.downcast_ref::<tinycloud_core::sea_orm::DbErr>() {
+        Some(db) => crate::routes::database_failure(
+            tinycloud_core::failure_diagnostic::Service::Other,
+            db,
+            false,
+            error.to_string(),
+        ),
+        None => (Status::Forbidden, error.to_string()),
+    }
+}
+
+fn policy_refusal(error: AuthorizationError, reason: &'static str) -> AuthorizationError {
+    if error.is::<tinycloud_core::sea_orm::DbErr>() {
+        error
+    } else {
+        reason.into()
+    }
+}
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
@@ -194,80 +220,73 @@ impl PolicyV3Runtime {
         Ok(self)
     }
 
-    async fn is_registered_policy_root(&self, cid: &str) -> Result<bool, &'static str> {
-        policy_v3_root::Entity::find_by_id(cid.to_owned())
+    async fn is_registered_policy_root(&self, cid: &str) -> Result<bool, AuthorizationError> {
+        Ok(policy_v3_root::Entity::find_by_id(cid.to_owned())
             .one(&self.conn)
-            .await
-            .map(|root| root.is_some())
-            .map_err(|_| "policy-root-unavailable")
+            .await?
+            .is_some())
     }
 
     pub async fn first_admission_allowed(
         &self,
         tinycloud: &crate::TinyCloud,
         event: &Delegation,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), AuthorizationError> {
         if !is_policy_session(&event.0) {
             return Ok(());
         }
         let Ok(encoded) = std::str::from_utf8(event.serialized_bytes()) else {
-            return Err("policy-session-bytes-invalid");
+            return Err("policy-session-bytes-invalid".into());
         };
         let Ok(reparsed) = decode_delegation(encoded) else {
-            return Err("policy-session-decode-invalid");
+            return Err("policy-session-decode-invalid".into());
         };
         if reparsed.serialized_bytes() != event.serialized_bytes()
             || reparsed.content_hash() != event.content_hash()
             || !is_policy_session(&reparsed.0)
             || reparsed.0.parents.len() != 2
         {
-            return Err("policy-session-roundtrip-invalid");
+            return Err("policy-session-roundtrip-invalid".into());
         }
         let policy_cid = fact(&event.0.delegation, "policyCid").unwrap_or_default();
         let Some(registration) = policy_v3_registration::Entity::find_by_id(policy_cid)
             .one(&self.conn)
-            .await
-            .ok()
-            .flatten()
+            .await?
         else {
-            return Err("policy-session-registration-missing");
+            return Err("policy-session-registration-missing".into());
         };
-        let proofs: Vec<String> = event.0.parents.iter().map(ToString::to_string).collect();
+        let proofs: Vec<String> = event.0.parents.iter().copied().map(stored_cid).collect();
         if proofs
             != [
                 registration.policy_root_cid.clone(),
                 registration.enforcement_root_cid.clone(),
             ]
         {
-            return Err("policy-session-proof-order-invalid");
+            return Err("policy-session-proof-order-invalid".into());
         }
-        let Ok(enforcer_did) = self
+        let enforcer_did = self
             .authenticated_registration_enforcer(&registration, OffsetDateTime::now_utc())
             .await
-        else {
-            return Err("policy-session-enforcer-invalid");
-        };
+            .map_err(|error| policy_refusal(error, "policy-session-enforcer-invalid"))?;
         if fact(&event.0.delegation, "recipientDid") != Some(event.0.delegate.as_str())
             || fact(&event.0.delegation, "enforcerDid") != Some(enforcer_did.as_str())
             || fact(&event.0.delegation, "nodeAudience") != Some(self.node_did.as_str())
         {
-            return Err("policy-session-facts-invalid");
+            return Err("policy-session-facts-invalid".into());
         }
         let session_cid = event.content_hash().to_cid(0x55).to_string();
         let Some(session) = policy_v3_session::Entity::find_by_id(session_cid.clone())
             .one(&self.conn)
-            .await
-            .ok()
-            .flatten()
+            .await?
         else {
-            return Err("policy-session-admission-missing");
+            return Err("policy-session-admission-missing".into());
         };
         if session.state != "admitted"
             || session.session_cid != session_cid
             || session.authorization_bytes != event.serialized_bytes()
             || session.recipient_did != event.0.delegate
         {
-            return Err("policy-session-admission-mismatch");
+            return Err("policy-session-admission-mismatch".into());
         }
         for cid in [
             &registration.policy_root_cid,
@@ -275,41 +294,36 @@ impl PolicyV3Runtime {
         ] {
             let Some(root) = policy_v3_root::Entity::find_by_id(cid.clone())
                 .one(&self.conn)
-                .await
-                .ok()
-                .flatten()
+                .await?
             else {
-                return Err("policy-session-root-missing");
+                return Err("policy-session-root-missing".into());
             };
-            if validate_persisted_root(&root, cid, &registration.policy_cid, &self.node_did)
+            validate_persisted_root(&root, cid, &registration.policy_cid, &self.node_did)
                 .await
-                .is_err()
-                || validate_root_liveness(
-                    &self.conn,
-                    &root,
-                    cid,
-                    &self.node_did,
-                    OffsetDateTime::now_utc(),
-                    true,
-                )
-                .await
-                .is_err()
-            {
-                return Err("policy-session-root-status-invalid");
-            }
+                .map_err(|_| "policy-session-root-status-invalid")?;
+            validate_root_liveness(
+                &self.conn,
+                &root,
+                cid,
+                &self.node_did,
+                OffsetDateTime::now_utc(),
+                true,
+            )
+            .await
+            .map_err(|error| policy_refusal(error, "policy-session-root-status-invalid"))?;
             let parsed_cid = match tinycloud_auth::ipld_core::cid::Cid::try_from(cid.as_str()) {
                 Ok(cid) => cid,
-                Err(_) => return Err("policy-session-root-cid-invalid"),
+                Err(_) => return Err("policy-session-root-cid-invalid".into()),
             };
             let Some((_, graph_root)) = tinycloud
                 .load_signed_delegation(parsed_cid)
                 .await
-                .map_err(|_| "policy-session-root-graph-unavailable")?
+                .map_err(|error| policy_refusal(error, "policy-session-root-graph-unavailable"))?
             else {
-                return Err("policy-session-root-graph-missing");
+                return Err("policy-session-root-graph-missing".into());
             };
             if graph_root.serialized_bytes() != root.authorization_bytes {
-                return Err("policy-session-root-graph-mismatch");
+                return Err("policy-session-root-graph-mismatch".into());
             }
         }
         Ok(())
@@ -324,7 +338,7 @@ impl PolicyV3Runtime {
         &self,
         tinycloud: &crate::TinyCloud,
         event: &Delegation,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), AuthorizationError> {
         if is_policy_session(&event.0) {
             if event.0.parents.len() == 2 {
                 return self.first_admission_allowed(tinycloud, event).await;
@@ -334,21 +348,20 @@ impl PolicyV3Runtime {
             // only below an already admitted S0; roots can never be used as
             // a one-parent substitute for the conjunctive mint.
             if event.0.parents.len() != 1 {
-                return Err("policy-session-parent-count-invalid");
+                return Err("policy-session-parent-count-invalid".into());
             }
             // Validate the whole chain up to the admitted S0, then compare the
             // child with its *immediate* parent (S0 for a first hop, an
             // earlier descendant for deeper hops).
-            if self
-                .validate_policy_chain(tinycloud, event.0.parents[0])
+            self.validate_policy_chain(tinycloud, event.0.parents[0])
                 .await
-                .is_err()
-            {
-                return Err("policy-session-parent-invalid");
-            }
-            let Ok(Some((_, parent))) = tinycloud.load_signed_delegation(event.0.parents[0]).await
+                .map_err(|error| policy_refusal(error, "policy-session-parent-invalid"))?;
+            let Some((_, parent)) = tinycloud
+                .load_signed_delegation(event.0.parents[0])
+                .await
+                .map_err(|error| policy_refusal(error, "policy-session-parent-invalid"))?
             else {
-                return Err("policy-session-parent-invalid");
+                return Err("policy-session-parent-invalid".into());
             };
             return (event.0.delegator == parent.0.delegate
                 && descendant_time_is_narrower(&event.0, &parent.0)
@@ -356,68 +369,79 @@ impl PolicyV3Runtime {
                 && capabilities_are_contained(&event.0.capabilities, &parent.0.capabilities)
                 && verify_signed_delegation(&event.0.delegation).await.is_ok())
             .then_some(())
-            .ok_or("policy-session-descendant-invalid");
+            .ok_or_else(|| "policy-session-descendant-invalid".into());
         }
         if event.0.parents.is_empty() && is_policy_root(&event.0.delegation) {
-            return Err("policy-root-requires-registration");
+            return Err("policy-root-requires-registration".into());
         }
         for parent in &event.0.parents {
-            // The same persisted-root predicate guards both ordinary
-            // delegation import and invocation fallback. A database error is
-            // fail-closed because it is not safe to classify the parent as
-            // ordinary graph authority when root registration is unknown.
-            if self
-                .is_registered_policy_root(&parent.to_string())
-                .await
-                .unwrap_or(true)
-            {
-                return Err("policy-root-cannot-be-ordinary-parent");
+            // Unknown registration must fail closed, preserving database
+            // failures as retryable rather than refusing valid authority.
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
+                return Err("policy-root-cannot-be-ordinary-parent".into());
             }
         }
         Ok(())
     }
 
+    /// Sibling roots are stored in the ordinary graph only so S0 can have
+    /// normal proof edges. Neither root is invocation authority, cited alone
+    /// or beside other proofs: a registered policy's conditions hold only
+    /// through a session minted from both roots.
+    pub(crate) async fn refuse_policy_root_proofs(
+        &self,
+        parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    ) -> Result<(), AuthorizationError> {
+        for parent in parents {
+            if self.is_registered_policy_root(&stored_cid(*parent)).await? {
+                return Err("policy-root-cannot-authorize-invocation".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Authorize a policy-session invocation against its registered policy.
+    /// Decrypt callers must supply the request body before any key release.
     pub async fn authorize_invocation(
         &self,
         tinycloud: &crate::TinyCloud,
         invocation: &InvocationInfo,
+        decrypt_body: Option<&Value>,
         now: OffsetDateTime,
-    ) -> Result<bool, &'static str> {
+    ) -> Result<bool, AuthorizationError> {
+        // Reject before ordinary fallback: D_enforce's audience is the
+        // enforcer, so an enforcer-signed invocation would otherwise collapse AND.
+        self.refuse_policy_root_proofs(&invocation.parents).await?;
         if invocation.parents.len() != 1 {
             for parent in invocation.parents.iter().copied() {
-                if tinycloud
-                    .load_signed_delegation(parent)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(_, event)| is_policy_session(&event.0))
-                {
-                    return Err("policy-session-requires-one-immediate-parent");
+                let loaded = match tinycloud.load_signed_delegation(parent).await {
+                    Ok(parent) => parent,
+                    Err(error) if error.is::<tinycloud_core::sea_orm::DbErr>() => {
+                        return Err(error)
+                    }
+                    Err(_) if self.is_policy_protected_parent(parent).await? => {
+                        return Err("policy-session-invalid".into());
+                    }
+                    Err(_) => None,
+                };
+                if loaded.is_some_and(|(_, event)| is_policy_session(&event.0)) {
+                    return Err("policy-session-requires-one-immediate-parent".into());
                 }
             }
             return Ok(false);
         }
         let parent_cid = invocation.parents[0];
-        let loaded = tinycloud.load_signed_delegation(parent_cid).await;
-        let Some((immediate_row, immediate)) = (match loaded {
+        let loaded = match tinycloud.load_signed_delegation(parent_cid).await {
             Ok(parent) => parent,
+            Err(error) if error.is::<tinycloud_core::sea_orm::DbErr>() => return Err(error),
             Err(_) if self.is_policy_protected_parent(parent_cid).await? => {
-                return Err("policy-session-invalid");
+                return Err("policy-session-invalid".into());
             }
-            Err(_) => return Ok(false),
-        }) else {
+            Err(_) => None,
+        };
+        let Some((immediate_row, immediate)) = loaded else {
             return Ok(false);
         };
-        // Sibling roots are stored in the ordinary graph only so S0 can have
-        // normal proof edges. Neither root is invocation authority by itself.
-        // Reject before ordinary fallback: D_enforce's audience is the node,
-        // so an enforcer-signed invocation would otherwise collapse AND.
-        if self
-            .is_registered_policy_root(&invocation.parents[0].to_string())
-            .await?
-        {
-            return Err("policy-root-cannot-authorize-invocation");
-        }
         if !is_policy_session(&immediate.0) {
             return Ok(false);
         }
@@ -430,9 +454,9 @@ impl PolicyV3Runtime {
             return Ok(false);
         }
         if !capabilities_are_contained(&invocation.capabilities, &immediate.0.capabilities) {
-            return Err("policy-invocation-capability-widening");
+            return Err("policy-invocation-capability-widening".into());
         }
-        let (row, session) = self
+        let (row, session, policy) = self
             .validate_policy_chain(tinycloud, invocation.parents[0])
             .await?;
         let payload = invocation.invocation.payload();
@@ -444,7 +468,7 @@ impl PolicyV3Runtime {
             .and_then(|value| OffsetDateTime::from_unix_timestamp(value.as_seconds() as i64).ok())
             .ok_or("policy-invocation-not-before-missing")?;
         if invocation_expiry - invocation_not_before > Duration::seconds(60) {
-            return Err("policy-invocation-lifetime-too-long");
+            return Err("policy-invocation-lifetime-too-long".into());
         }
         // Long-lived sessions are bounded at mint by the policy and root
         // expiries (also re-checked through the roots on every invocation);
@@ -452,14 +476,13 @@ impl PolicyV3Runtime {
         let expires = session.0.expiry.ok_or("policy-session-invalid")?;
         let not_before = session.0.not_before.ok_or("policy-session-invalid")?;
         if now < not_before || now >= expires {
-            return Err("policy-session-expired");
+            return Err("policy-session-expired".into());
         }
         let registration = policy_v3_registration::Entity::find_by_id(row.policy_cid.clone())
             .one(&self.conn)
-            .await
-            .map_err(|_| "policy-registration-unavailable")?
+            .await?
             .ok_or("policy-registration-missing")?;
-        let proof_cids: Vec<String> = session.0.parents.iter().map(ToString::to_string).collect();
+        let proof_cids: Vec<String> = session.0.parents.iter().copied().map(stored_cid).collect();
         if proof_cids
             != [
                 registration.policy_root_cid.clone(),
@@ -471,18 +494,16 @@ impl PolicyV3Runtime {
             || fact(&session.0.delegation, "enforcementDelegationCid")
                 != Some(registration.enforcement_root_cid.as_str())
         {
-            return Err("policy-session-proof-index-mismatch");
+            return Err("policy-session-proof-index-mismatch".into());
         }
         let policy_root = policy_v3_root::Entity::find_by_id(registration.policy_root_cid.clone())
             .one(&self.conn)
-            .await
-            .map_err(|_| "policy-root-unavailable")?
+            .await?
             .ok_or("policy-root-missing")?;
         let enforcement_root =
             policy_v3_root::Entity::find_by_id(registration.enforcement_root_cid.clone())
                 .one(&self.conn)
-                .await
-                .map_err(|_| "enforcement-root-unavailable")?
+                .await?
                 .ok_or("enforcement-root-missing")?;
         let policy_root = decode_delegation(
             std::str::from_utf8(&policy_root.authorization_bytes)
@@ -505,7 +526,7 @@ impl PolicyV3Runtime {
             if fact(&session.0.delegation, key) != fact(&policy_root.0.delegation, key)
                 || fact(&session.0.delegation, key) != fact(&enforcement_root.0.delegation, key)
             {
-                return Err("policy-session-fact-index-mismatch");
+                return Err("policy-session-fact-index-mismatch".into());
             }
         }
         let authenticated_enforcer = self
@@ -517,7 +538,7 @@ impl PolicyV3Runtime {
             || fact(&session.0.delegation, "nodeAudience") != Some(self.node_did.as_str())
             || fact(&session.0.delegation, "recipientDid") != Some(session.0.delegate.as_str())
         {
-            return Err("policy-session-principal-binding-mismatch");
+            return Err("policy-session-principal-binding-mismatch".into());
         }
         for root_cid in [
             registration.policy_root_cid,
@@ -525,8 +546,7 @@ impl PolicyV3Runtime {
         ] {
             let root = policy_v3_root::Entity::find_by_id(root_cid.clone())
                 .one(&self.conn)
-                .await
-                .map_err(|_| "policy-root-unavailable")?
+                .await?
                 .ok_or("policy-root-missing")?;
             validate_persisted_root(&root, &root_cid, &registration.policy_cid, &self.node_did)
                 .await?;
@@ -535,39 +555,36 @@ impl PolicyV3Runtime {
             let (_, graph_root) = tinycloud
                 .load_signed_delegation(root_hash)
                 .await
-                .map_err(|_| "policy-root-unavailable")?
+                .map_err(|error| policy_refusal(error, "policy-root-unavailable"))?
                 .ok_or("policy-root-graph-missing")?;
             if graph_root.serialized_bytes() != root.authorization_bytes {
-                return Err("policy-root-graph-mismatch");
+                return Err("policy-root-graph-mismatch".into());
             }
             validate_root_liveness(&self.conn, &root, &root_cid, &self.node_did, now, true).await?;
         }
+        validate_registered_decrypt_source(&policy, invocation, decrypt_body)?;
         Ok(true)
     }
 
     async fn is_policy_protected_parent(
         &self,
         cid: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<bool, &'static str> {
-        let cid_string = cid.to_string();
+    ) -> Result<bool, AuthorizationError> {
+        let cid_string = stored_cid(cid);
         if policy_v3_session::Entity::find_by_id(cid_string.clone())
             .one(&self.conn)
-            .await
-            .map_err(|_| "policy-session-unavailable")?
+            .await?
             .is_some()
             || policy_v3_root::Entity::find_by_id(cid_string)
                 .one(&self.conn)
-                .await
-                .map_err(|_| "policy-root-unavailable")?
+                .await?
                 .is_some()
         {
             return Ok(true);
         }
-
         let row = delegation_model::Entity::find_by_id(tinycloud_core::hash::Hash::from(cid))
             .one(&self.conn)
-            .await
-            .map_err(|_| "policy-session-unavailable")?;
+            .await?;
         Ok(row.and_then(|row| row.facts).is_some_and(|facts| {
             facts.0.contains_key("xyz.tinycloud.policy/session-fact")
                 || facts.0.contains_key("xyz.tinycloud.policy/root-profile")
@@ -582,27 +599,27 @@ impl PolicyV3Runtime {
         &self,
         tinycloud: &crate::TinyCloud,
         start: tinycloud_auth::ipld_core::cid::Cid,
-    ) -> Result<(policy_v3_session::Model, Delegation), &'static str> {
+    ) -> Result<(policy_v3_session::Model, Delegation, Value), AuthorizationError> {
         let mut current_cid = start;
         let mut child: Option<Delegation> = None;
         let mut visited = std::collections::HashSet::new();
         for _ in 0..=8 {
-            if !visited.insert(current_cid.to_string()) {
-                return Err("policy-session-cycle");
+            if !visited.insert(stored_cid(current_cid)) {
+                return Err("policy-session-cycle".into());
             }
             let Some((row, event)) = tinycloud
                 .load_signed_delegation(current_cid)
                 .await
-                .map_err(|_| "policy-session-invalid")?
+                .map_err(|error| policy_refusal(error, "policy-session-invalid"))?
             else {
-                return Err("policy-session-parent-missing");
+                return Err("policy-session-parent-missing".into());
             };
             verify_signed_delegation(&event.0.delegation)
                 .await
                 .map_err(|_| "policy-session-signature-invalid")?;
             self.validate_graph_projection(&row, &event).await?;
             if !is_policy_session(&event.0) {
-                return Err("policy-session-protected-fact-missing");
+                return Err("policy-session-protected-fact-missing".into());
             }
             if let Some(child) = child.as_ref() {
                 if child.0.delegator != event.0.delegate
@@ -610,15 +627,14 @@ impl PolicyV3Runtime {
                     || !descendant_profile_is_inherited(&child.0, &event.0)
                     || !capabilities_are_contained(&child.0.capabilities, &event.0.capabilities)
                 {
-                    return Err("policy-session-descendant-invalid");
+                    return Err("policy-session-descendant-invalid".into());
                 }
             }
             if event.0.parents.len() == 2 {
                 let session_cid = event.content_hash().to_cid(0x55).to_string();
                 let index = policy_v3_session::Entity::find_by_id(session_cid.clone())
                     .one(&self.conn)
-                    .await
-                    .map_err(|_| "policy-session-unavailable")?
+                    .await?
                     .ok_or("policy-session-index-missing")?;
                 if index.state != "admitted"
                     || index.session_cid != session_cid
@@ -633,21 +649,21 @@ impl PolicyV3Runtime {
                         != Some(index.not_before.as_str())
                     || event.0.expiry.map(format_time).as_deref() != Some(index.expires_at.as_str())
                 {
-                    return Err("policy-session-index-mismatch");
+                    return Err("policy-session-index-mismatch".into());
                 }
                 let registration =
                     policy_v3_registration::Entity::find_by_id(index.policy_cid.clone())
                         .one(&self.conn)
-                        .await
-                        .map_err(|_| "policy-registration-unavailable")?
+                        .await?
                         .ok_or("policy-registration-missing")?;
-                validate_registration_projection(&registration)
+                let policy = validate_registration_projection(&registration)
                     .map_err(|_| "policy-registration-projection-mismatch")?;
                 let proofs = event
                     .0
                     .parents
                     .iter()
-                    .map(ToString::to_string)
+                    .copied()
+                    .map(stored_cid)
                     .collect::<Vec<_>>();
                 if proofs
                     != [
@@ -657,7 +673,7 @@ impl PolicyV3Runtime {
                     || fact(&event.0.delegation, "policyCid")
                         != Some(registration.policy_cid.as_str())
                 {
-                    return Err("policy-session-proof-index-mismatch");
+                    return Err("policy-session-proof-index-mismatch".into());
                 }
                 self.authorize_roots(&registration, OffsetDateTime::now_utc())
                     .await?;
@@ -665,36 +681,36 @@ impl PolicyV3Runtime {
                     let Some((_, root)) = tinycloud
                         .load_signed_delegation(root_cid)
                         .await
-                        .map_err(|_| "policy-root-invalid")?
+                        .map_err(|error| policy_refusal(error, "policy-root-invalid"))?
                     else {
-                        return Err("policy-root-missing");
+                        return Err("policy-root-missing".into());
                     };
                     if !capabilities_are_contained(&event.0.capabilities, &root.0.capabilities) {
-                        return Err("policy-session-capability-widening");
+                        return Err("policy-session-capability-widening".into());
                     }
                 }
-                return Ok((index, event));
+                return Ok((index, event, policy));
             }
             if event.0.parents.len() != 1 {
-                return Err("policy-session-parent-count-invalid");
+                return Err("policy-session-parent-count-invalid".into());
             }
             child = Some(event);
             current_cid = child.as_ref().unwrap().0.parents[0];
         }
-        Err("policy-session-depth-exceeded")
+        Err("policy-session-depth-exceeded".into())
     }
 
     async fn validate_graph_projection(
         &self,
         row: &delegation_model::Model,
         event: &Delegation,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), AuthorizationError> {
         if row.delegator != event.0.delegator
             || row.delegatee != event.0.delegate
             || row.expiry != event.0.expiry
             || row.not_before != event.0.not_before
         {
-            return Err("policy-session-row-projection-mismatch");
+            return Err("policy-session-row-projection-mismatch".into());
         }
         let expected_fact = match &event.0.delegation {
             TinyCloudDelegation::Ucan(ucan) => {
@@ -708,13 +724,12 @@ impl PolicyV3Runtime {
             .and_then(|facts| facts.0.get("xyz.tinycloud.policy/session-fact"))
             != expected_fact
         {
-            return Err("policy-session-fact-projection-mismatch");
+            return Err("policy-session-fact-projection-mismatch".into());
         }
         let stored = abilities::Entity::find()
             .filter(abilities::Column::Delegation.eq(row.id))
             .all(&self.conn)
-            .await
-            .map_err(|_| "policy-session-unavailable")?;
+            .await?;
         let mut stored = stored
             .into_iter()
             .map(|ability| {
@@ -734,13 +749,12 @@ impl PolicyV3Runtime {
         stored.sort();
         signed.sort();
         if stored != signed {
-            return Err("policy-session-ability-projection-mismatch");
+            return Err("policy-session-ability-projection-mismatch".into());
         }
         let mut stored_parents = parent_delegations::Entity::find()
             .filter(parent_delegations::Column::Child.eq(row.id))
             .all(&self.conn)
-            .await
-            .map_err(|_| "policy-session-unavailable")?
+            .await?
             .into_iter()
             .map(|link| link.parent.to_cid(0x55).to_string())
             .collect::<Vec<_>>();
@@ -748,12 +762,13 @@ impl PolicyV3Runtime {
             .0
             .parents
             .iter()
-            .map(ToString::to_string)
+            .copied()
+            .map(stored_cid)
             .collect::<Vec<_>>();
         stored_parents.sort();
         signed_parents.sort();
         if stored_parents != signed_parents {
-            return Err("policy-session-edge-projection-mismatch");
+            return Err("policy-session-edge-projection-mismatch".into());
         }
         Ok(())
     }
@@ -772,7 +787,7 @@ async fn owner_holds_capabilities<C: ConnectionTrait>(
     owner_did: &str,
     capabilities: &[tinycloud_core::util::Capability],
     at: OffsetDateTime,
-) -> Result<(), &'static str> {
+) -> Result<(), AuthorizationError> {
     let rows = delegation_model::Entity::find()
         .filter(
             Condition::any()
@@ -791,8 +806,7 @@ async fn owner_holds_capabilities<C: ConnectionTrait>(
         )
         .limit(MAX_OWNER_AUTHORITY_ROWS)
         .all(conn)
-        .await
-        .map_err(|_| "policy-owner-authority-unavailable")?;
+        .await?;
     let candidates = rows
         .into_iter()
         .filter(|row| {
@@ -805,24 +819,33 @@ async fn owner_holds_capabilities<C: ConnectionTrait>(
         .collect::<Vec<_>>();
     'capabilities: for capability in capabilities {
         let capability = std::slice::from_ref(capability);
-        if invocation_model::authorize_holder(conn, owner_did, capability, &[], at)
-            .await
-            .is_ok()
-        {
-            continue;
+        match invocation_model::authorize_holder(conn, owner_did, capability, &[], at).await {
+            Ok(()) => continue,
+            Err(invocation_model::Error::Db(error)) => return Err(error.into()),
+            Err(invocation_model::Error::InvalidInvocation(_)) => {}
         }
         for candidate in &candidates {
             let proof = [candidate.id.to_cid(0x55)];
-            if invocation_model::authorize_holder(conn, owner_did, capability, &proof, at)
-                .await
-                .is_ok()
+            match invocation_model::authorize_holder(conn, owner_did, capability, &proof, at).await
             {
-                continue 'capabilities;
+                Ok(()) => continue 'capabilities,
+                Err(invocation_model::Error::Db(error)) => return Err(error.into()),
+                Err(invocation_model::Error::InvalidInvocation(_)) => {}
             }
         }
-        return Err("policy-owner-not-authorized");
+        return Err("policy-owner-not-authorized".into());
     }
     Ok(())
+}
+
+/// The CID a cited proof names a delegation by, in the form the graph and the
+/// policy tables store: its multihash under the raw codec. The graph resolves
+/// a proof by its multihash alone, so another codec or multibase spelling of
+/// the same proof names the same delegation and must match the same rows.
+fn stored_cid(cid: tinycloud_auth::ipld_core::cid::Cid) -> String {
+    tinycloud_core::hash::Hash::from(cid)
+        .to_cid(0x55)
+        .to_string()
 }
 
 /// Expiry of a newly minted policy session: the holder's requested expiry
@@ -872,6 +895,14 @@ fn capabilities_are_contained(
                     ceiling.ability.as_ref().as_ref(),
                     candidate.ability.as_ref().as_ref(),
                 )
+                // A copied selector is not authority for a descendant of an
+                // exact resource, even if the caveat itself is unchanged.
+                && ceiling.caveats.0.values().all(|value| {
+                    value.get("type").and_then(Value::as_str)
+                        != Some("xyz.tinycloud.resource/selector")
+                        || value.get("kind").and_then(Value::as_str) != Some("exact")
+                        || candidate.resource == ceiling.resource
+                })
                 && tinycloud_core::policy_capability::selector_caveats_contain(
                     &ceiling.caveats.0,
                     &candidate.caveats.0,
@@ -881,12 +912,141 @@ fn capabilities_are_contained(
     })
 }
 
+fn validate_registered_decrypt_source(
+    policy: &Value,
+    invocation: &InvocationInfo,
+    body: Option<&Value>,
+) -> Result<(), &'static str> {
+    use subtle::ConstantTimeEq;
+    const MISMATCH: &str = "policy-decrypt-content-source-mismatch";
+    let mut decrypts = invocation
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.ability.as_ref().as_ref()
+                == tinycloud_core::encryption_network::DECRYPT_ACTION
+        })
+        .peekable();
+    if decrypts.peek().is_none() {
+        return Ok(());
+    }
+    // `policy` comes from the validated registration bytes, never request
+    // facts or caller-supplied contentSource metadata.
+    let source = policy.get("contentSource").ok_or(MISMATCH)?;
+    let body = body.ok_or(MISMATCH)?;
+    let network = source
+        .get("encryptionNetwork")
+        .and_then(Value::as_str)
+        .ok_or(MISMATCH)?;
+    let key_path = source.get("encryptionKeyPath").and_then(Value::as_str);
+    for capability in decrypts {
+        let resource = capability.resource.to_string();
+        let matches_source = match key_path {
+            Some(path) => {
+                resource
+                    .strip_prefix(network)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    == Some(path)
+            }
+            None => resource == network,
+        };
+        if !matches_source {
+            return Err(MISMATCH);
+        }
+    }
+    // Network equality also binds the owner DID; a delegated policy owner
+    // need not be the owner of the source's encryption network.
+    if body.get("networkId").and_then(Value::as_str) != Some(network)
+        || body.get("keyPath").and_then(Value::as_str) != key_path
+    {
+        return Err(MISMATCH);
+    }
+    // Path-scoped shares bind raw wrapped bytes and always require a digest.
+    // Legacy immutable sources use the signed wire digest when present; older
+    // digest-less policies retain their prior readable behavior.
+    let immutable = source.get("mode").and_then(Value::as_str) == Some("immutable");
+    if key_path.is_some() || immutable {
+        if body.get("keyVersion").and_then(Value::as_u64)
+            != source.get("keyVersion").and_then(Value::as_u64)
+        {
+            return Err(MISMATCH);
+        }
+        if let Some(digest) = source
+            .get("encryptedSymmetricKeyDigestHex")
+            .and_then(Value::as_str)
+        {
+            let mut expected = [0_u8; 32];
+            hex::decode_to_slice(digest, &mut expected).map_err(|_| MISMATCH)?;
+            let actual = if key_path.is_some() {
+                let wrapped = base64::decode(
+                    body.get("encryptedSymmetricKey")
+                        .and_then(Value::as_str)
+                        .ok_or(MISMATCH)?,
+                )
+                .map_err(|_| MISMATCH)?;
+                Sha256::digest(&wrapped)
+            } else {
+                let wrapped = body.get("encryptedSymmetricKey").ok_or(MISMATCH)?;
+                if !wrapped.is_string() {
+                    return Err(MISMATCH);
+                }
+                Sha256::digest(canonical_json_value(wrapped))
+            };
+            if !bool::from(actual[..].ct_eq(&expected)) {
+                return Err(MISMATCH);
+            }
+        } else if key_path.is_some() {
+            return Err(MISMATCH);
+        }
+    }
+    Ok(())
+}
+
 async fn validate_persisted_root(
     root: &policy_v3_root::Model,
     root_cid: &str,
     policy_cid: &str,
     node_did: &str,
 ) -> Result<(), &'static str> {
+    let event = persisted_root_projection(root, root_cid, policy_cid, node_did)?;
+    verify_signed_delegation(&event.0.delegation)
+        .await
+        .map_err(|_| "policy-root-signature-invalid")?;
+    for space in event.0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
+    Ok(())
+}
+
+/// [`validate_persisted_root`] for a root whose signature was verified before
+/// the caller's transaction (TC-2986): everything but the signature, which
+/// `root_cid` binds to those same bytes, plus the time window.
+fn validate_verified_persisted_root(
+    root: &policy_v3_root::Model,
+    root_cid: &str,
+    policy_cid: &str,
+    node_did: &str,
+) -> Result<(), &'static str> {
+    let event = persisted_root_projection(root, root_cid, policy_cid, node_did)?;
+    let TinyCloudDelegation::Ucan(ucan) = &event.0.delegation else {
+        return Err("policy-root-signature-invalid");
+    };
+    ucan.payload()
+        .validate_time(None)
+        .map_err(|_| "policy-root-signature-invalid")?;
+    for space in event.0.spaces() {
+        tinycloud_core::request_telemetry::observe_space(space);
+    }
+    Ok(())
+}
+
+/// The stored root, checked against its CID, policy, node and role.
+fn persisted_root_projection(
+    root: &policy_v3_root::Model,
+    root_cid: &str,
+    policy_cid: &str,
+    node_did: &str,
+) -> Result<tinycloud_core::events::Delegation, &'static str> {
     let encoded =
         std::str::from_utf8(&root.authorization_bytes).map_err(|_| "policy-root-invalid")?;
     let event = decode_delegation(encoded).map_err(|_| "policy-root-invalid")?;
@@ -908,13 +1068,7 @@ async fn validate_persisted_root(
     if fact(&event.0.delegation, "role") != Some(expected_role) {
         return Err("policy-root-role-invalid");
     }
-    verify_signed_delegation(&event.0.delegation)
-        .await
-        .map_err(|_| "policy-root-signature-invalid")?;
-    for space in event.0.spaces() {
-        tinycloud_core::request_telemetry::observe_space(space);
-    }
-    Ok(())
+    Ok(event)
 }
 
 /// Observe only content-addressed root bytes already authenticated by durable
@@ -1401,10 +1555,11 @@ fn build_delivery_authorization_receipt(
 pub async fn authorize_delivery(
     request: DeliveryBody,
     runtime: &State<PolicyV3Runtime>,
+    tinycloud: &State<crate::TinyCloud>,
     invocation: AuthHeaderGetter<InvocationInfo>,
 ) -> Result<Json<Value>, DeliveryFailure> {
     let mut retry_after = None;
-    authorize_delivery_inner(request, runtime, invocation, &mut retry_after)
+    authorize_delivery_inner(request, runtime, tinycloud, invocation, &mut retry_after)
         .await
         .map_err(|(status, body)| DeliveryFailure {
             status,
@@ -1413,58 +1568,119 @@ pub async fn authorize_delivery(
         })
 }
 
+/// Log the check that refused a delivery authorization and return the answer
+/// unchanged. The line holds a fixed reason name and the status and nothing
+/// else: never a link, key, address, DID, identifier or error text.
+fn refuse(reason: &'static str, status: Status, body: &str) -> (Status, String) {
+    tracing::warn!(
+        error_class = "delivery_refused",
+        reason,
+        status = status.code,
+        "delivery authorization refused"
+    );
+    (status, body.to_owned())
+}
+
+/// As [`refuse`] for a storage failure, whose answer carries the error's own
+/// text (unchanged) while the log line does not.
+fn refuse_db(reason: &'static str, error: impl std::fmt::Display) -> (Status, String) {
+    let (status, body) = db_error(error);
+    refuse(reason, status, &body)
+}
+
 async fn authorize_delivery_inner(
     request: DeliveryBody,
     runtime: &PolicyV3Runtime,
+    tinycloud: &crate::TinyCloud,
     invocation: AuthHeaderGetter<InvocationInfo>,
     retry_after: &mut Option<u64>,
 ) -> Result<Json<Value>, (Status, String)> {
-    let delivery = runtime
-        .delivery
-        .as_ref()
-        .ok_or((Status::ServiceUnavailable, "delivery-unavailable".into()))?;
+    let delivery = runtime.delivery.as_ref().ok_or_else(|| {
+        refuse(
+            "runtime_delivery_none",
+            Status::ServiceUnavailable,
+            "delivery-unavailable",
+        )
+    })?;
     invocation_model::verify_and_authorize(
         &runtime.conn,
         &invocation.0 .0,
         OffsetDateTime::now_utc(),
     )
     .await
-    .map_err(|_| {
-        (
+    .map_err(|error| match error {
+        invocation_model::Error::Db(error) => authorization_failure(error.into()),
+        invocation_model::Error::InvalidInvocation(_) => refuse(
+            "invocation_unauthorized",
             Status::Unauthorized,
-            "delivery-authorization-invalid".into(),
-        )
+            "delivery-authorization-invalid",
+        ),
     })?;
-    let request = request.0;
-    let invalid = || {
-        (
-            Status::BadRequest,
-            "delivery-authorization-invalid".to_owned(),
-        )
+    // The same policy gate as `/invoke`: a registered root never authorizes,
+    // and a policy session holds every condition of its policy.
+    let invocation_refused = |error: AuthorizationError| {
+        if error.is::<tinycloud_core::sea_orm::DbErr>() {
+            authorization_failure(error)
+        } else {
+            refuse(
+                "policy_invocation_refused",
+                Status::Forbidden,
+                "delivery-authorization-invalid",
+            )
+        }
     };
-    if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str())
-        || decode_config(&request.jti, URL_SAFE_NO_PAD)
-            .ok()
-            .is_none_or(|value| value.len() != 16)
+    let session_policy_cid = if runtime
+        .authorize_invocation(tinycloud, &invocation.0 .0, None, OffsetDateTime::now_utc())
+        .await
+        .map_err(invocation_refused)?
     {
-        return Err(invalid());
+        let (_, session) = tinycloud
+            .load_signed_delegation(invocation.0 .0.parents[0])
+            .await
+            .map_err(invocation_refused)?
+            .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?;
+        Some(
+            fact(&session.0.delegation, "policyCid")
+                .ok_or_else(|| invocation_refused("policy-session-invalid".into()))?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let request = request.0;
+    let invalid =
+        |reason: &'static str| refuse(reason, Status::BadRequest, "delivery-authorization-invalid");
+    if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str()) {
+        return Err(invalid("request_digest_mismatch"));
+    }
+    if decode_config(&request.jti, URL_SAFE_NO_PAD)
+        .ok()
+        .is_none_or(|value| value.len() != 16)
+    {
+        return Err(invalid("jti_length"));
     }
     // Only the short `v=4` form on the share path, at the configured share
     // origin. The link is never logged or echoed from here on.
-    let link = ShortLink::parse(&request.share_url, &delivery.return_origin).ok_or_else(invalid)?;
+    let link = ShortLink::parse(&request.share_url, &delivery.return_origin)
+        .ok_or_else(|| invalid("share_url_not_short_form"))?;
     let sender_key_did = invocation.0 .0.invoker.as_str();
     let replay = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?;
+        .map_err(|error| refuse_db("db_error_jti_lookup", error))?;
     if replay.as_ref().is_some_and(|existing| {
         !delivery_replay_request_matches(existing, &request, sender_key_did)
     }) {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(refuse(
+            "replay_request_mismatch",
+            Status::Conflict,
+            "delivery-authorization-replayed",
+        ));
     }
     // The request's own `expiresAt` is checked before anything costs a token
     // or a fetch: a malformed, expired or too distant value is refused here.
-    delivery_request_expiry(&request.expires_at, OffsetDateTime::now_utc()).ok_or_else(invalid)?;
+    delivery_request_expiry(&request.expires_at, OffsetDateTime::now_utc())
+        .ok_or_else(|| invalid("expiry_invalid"))?;
     // The links API limits reads per client address and the node reads from
     // one: a request that reaches the fetch first passes the per-invoker and
     // node-wide limits. Nothing was fetched, opened or stored for a request
@@ -1474,6 +1690,8 @@ async fn authorize_delivery_inner(
         .check(sender_key_did, std::time::Instant::now())
     {
         *retry_after = Some(refused.retry_after_secs);
+        // Reported by the limiter's own aggregated line (one per scope per
+        // minute); a line per refused request would be an unbounded flood.
         return Err((Status::TooManyRequests, "delivery-rate-limited".to_owned()));
     }
     // One read of the record, no retries, no other source. The API's 404 and
@@ -1484,40 +1702,62 @@ async fn authorize_delivery_inner(
         .fetch(link.id())
         .await
         .map_err(|error| match error {
-            LinkFetchError::NotFound => (Status::NotFound, "delivery-link-unavailable".to_owned()),
-            LinkFetchError::Unavailable => (
-                Status::ServiceUnavailable,
-                "delivery-links-unavailable".to_owned(),
+            LinkFetchError::NotFound => refuse(
+                "links_not_found",
+                Status::NotFound,
+                "delivery-link-unavailable",
             ),
-            LinkFetchError::RecordHeaderInvalid => invalid(),
+            LinkFetchError::Unavailable => refuse(
+                "links_unavailable",
+                Status::ServiceUnavailable,
+                "delivery-links-unavailable",
+            ),
+            LinkFetchError::RecordHeaderInvalid => invalid("links_record_header_invalid"),
         })?;
     let now = OffsetDateTime::now_utc();
-    let opened = open_link_record(&link, &fetched, now).map_err(|_| invalid())?;
+    let opened =
+        open_link_record(&link, &fetched, now).map_err(|_| invalid("record_open_failed"))?;
     // The envelope is the plaintext of the record, in its canonical form.
-    let envelope_value: Value = serde_json::from_slice(&opened.plaintext).map_err(|_| invalid())?;
+    let envelope_value: Value =
+        serde_json::from_slice(&opened.plaintext).map_err(|_| invalid("envelope_not_json"))?;
     if canonical_json_value(&envelope_value) != opened.plaintext {
-        return Err(invalid());
+        return Err(invalid("envelope_not_canonical"));
     }
     let policy_cid = envelope_value
         .get("policyCid")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid("policy_cid_missing"))?;
     let registration = policy_v3_registration::Entity::find_by_id(policy_cid.to_owned())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?
-        .ok_or((Status::NotFound, "delivery-authorization-invalid".into()))?;
+        .map_err(|error| refuse_db("db_error_registration", error))?
+        .ok_or_else(|| {
+            refuse(
+                "registration_not_found",
+                Status::NotFound,
+                "delivery-authorization-invalid",
+            )
+        })?;
+    // A policy session delivers only a share under its own policy.
+    if session_policy_cid.is_some_and(|cid| cid != registration.policy_cid) {
+        return Err(refuse(
+            "policy_session_other_policy",
+            Status::Forbidden,
+            "delivery-authorization-invalid",
+        ));
+    }
     // The link cannot outlive the share, and one key issued the record, signed
     // the envelope and owns the registration.
     let share_expires = parse_time(&registration.expires_at).map_err(|_| {
-        (
+        refuse(
+            "registration_expiry_unparsable",
             Status::Forbidden,
-            "delivery-authorization-invalid".to_owned(),
+            "delivery-authorization-invalid",
         )
     })?;
     opened
         .within_share_expiry(share_expires)
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("share_expiry"))?;
     opened
         .bind_issuer(
             envelope_value
@@ -1525,17 +1765,20 @@ async fn authorize_delivery_inner(
                 .and_then(Value::as_str),
             &registration.owner_did,
         )
-        .map_err(|_| invalid())?;
+        .map_err(|_| invalid("issuer_binding"))?;
+    let forbidden =
+        |reason: &'static str| refuse(reason, Status::Forbidden, "delivery-authorization-invalid");
     if !v3_registration_is_live(&registration, now) {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("registration_not_live"));
     }
     let (envelope, _, actions) =
         v3_envelope_delivery_projection(&envelope_value, &registration, delivery, &request)
-            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|_| forbidden("envelope_projection_failed"))?;
     if !normal_invocation_allows_v3_delivery(&invocation.0 .0, envelope) {
-        return Err((
+        return Err(refuse(
+            "invocation_not_allowed",
             Status::Unauthorized,
-            "delivery-authorization-invalid".into(),
+            "delivery-authorization-invalid",
         ));
     }
     for cid in [
@@ -1545,26 +1788,32 @@ async fn authorize_delivery_inner(
         let root = policy_v3_root::Entity::find_by_id(cid.to_owned())
             .one(&runtime.conn)
             .await
-            .map_err(db_error)?
-            .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|error| refuse_db("db_error_root", error))?
+            .ok_or_else(|| forbidden("root_missing"))?;
         validate_root_liveness(&runtime.conn, &root, cid, &runtime.node_did, now, true)
             .await
-            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+            .map_err(|error| {
+                if error.is::<tinycloud_core::sea_orm::DbErr>() {
+                    authorization_failure(error)
+                } else {
+                    forbidden("root_not_live")
+                }
+            })?;
     }
     let resource = envelope
         .get("contentSource")
         .and_then(Value::as_object)
         .and_then(|value| value.get("kvResource"))
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("content_resource_missing"))?;
     let policy = envelope
         .get("policy")
         .and_then(Value::as_object)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("policy_missing"))?;
     let share_expires_at = envelope
         .get("expiry")
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("envelope_expiry_missing"))?;
     let credential_type = policy
         .get("credentialRequirement")
         .and_then(Value::as_object)
@@ -1572,12 +1821,12 @@ async fn authorize_delivery_inner(
         .and_then(Value::as_object)
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        .ok_or_else(|| forbidden("credential_type_missing"))?;
     if !v3_delivery_terms_allowed(envelope, &actions, sender_key_did, &registration.owner_did) {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("delivery_terms_not_allowed"));
     }
     if share_expires_at != registration.expires_at {
-        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+        return Err(forbidden("envelope_expiry_mismatch"));
     }
     // Digests and ids only: no link, no key, no recipient.
     let binding_json = serde_json::json!({
@@ -1598,6 +1847,10 @@ async fn authorize_delivery_inner(
         sender_key_did,
         audience: &delivery.invitation_origin,
     };
+    let replayed =
+        |reason: &'static str| refuse(reason, Status::Conflict, "delivery-authorization-replayed");
+    let signing_failed =
+        |(status, body): (Status, String)| refuse("receipt_signing_failed", status, &body);
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
@@ -1607,7 +1860,7 @@ async fn authorize_delivery_inner(
         None => share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
             .one(&runtime.conn)
             .await
-            .map_err(db_error)?,
+            .map_err(|error| refuse_db("db_error_jti_relookup", error))?,
     };
     if let Some(existing) = replay {
         if !delivery_replay_request_matches(&existing, &request, sender_key_did)
@@ -1617,23 +1870,25 @@ async fn authorize_delivery_inner(
             || !parse_time(&existing.issued_at)
                 .is_ok_and(|issued_at| format_time(issued_at) == existing.issued_at)
         {
-            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+            return Err(replayed("replay_binding_mismatch"));
         }
         let receipt = build_delivery_authorization_receipt(
             &source,
             &existing.issued_at,
             &signer,
             &runtime.node_did,
-        )?;
+        )
+        .map_err(signing_failed)?;
         if receipt.authorization_digest != existing.authorization_digest {
-            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+            return Err(replayed("replay_digest_mismatch"));
         }
         return Ok(Json(receipt.value));
     }
 
     let issued_at = format_time(now);
     let receipt =
-        build_delivery_authorization_receipt(&source, &issued_at, &signer, &runtime.node_did)?;
+        build_delivery_authorization_receipt(&source, &issued_at, &signer, &runtime.node_did)
+            .map_err(signing_failed)?;
     let insert = share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
         authorization_digest: Set(receipt.authorization_digest.clone()),
@@ -1654,23 +1909,30 @@ async fn authorize_delivery_inner(
     let existing = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
         .one(&runtime.conn)
         .await
-        .map_err(db_error)?
-        .ok_or((Status::InternalServerError, "delivery-unavailable".into()))?;
+        .map_err(|error| refuse_db("db_error_jti_recovery", error))?
+        .ok_or_else(|| {
+            refuse(
+                "jti_insert_unrecovered",
+                Status::InternalServerError,
+                "delivery-unavailable",
+            )
+        })?;
     if !delivery_replay_request_matches(&existing, &request, sender_key_did)
         || existing.binding_json != binding_json
         || existing.expires_at != request.expires_at
         || existing.consumed_at.is_none()
     {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(replayed("replay_recovered_binding_mismatch"));
     }
     let recovered = build_delivery_authorization_receipt(
         &source,
         &existing.issued_at,
         &signer,
         &runtime.node_did,
-    )?;
+    )
+    .map_err(signing_failed)?;
     if recovered.authorization_digest != existing.authorization_digest {
-        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        return Err(replayed("replay_recovered_digest_mismatch"));
     }
     Ok(Json(recovered.value))
 }
@@ -1884,6 +2146,7 @@ pub async fn register_policy(
     request: Json<RegisterRequest>,
     runtime: &State<PolicyV3Runtime>,
     tinycloud: &State<crate::TinyCloud>,
+    encryption: &State<EncryptionService>,
 ) -> Result<Json<RegisterResponse>, (Status, String)> {
     let request = request.into_inner();
     let policy_bytes = canonical_json(&request.policy)?;
@@ -1896,17 +2159,18 @@ pub async fn register_policy(
     }
     let (policy_root_cid, policy_root) = decode_root(&request.policy_root)?;
     let (enforcement_root_cid, enforcement_root) = decode_root(&request.enforcement_root)?;
-    verify_signed_delegation(&policy_root.0.delegation)
-        .await
-        .map_err(|_| (Status::Forbidden, "policy-root-signature-invalid".into()))?;
-    verify_signed_delegation(&enforcement_root.0.delegation)
-        .await
-        .map_err(|_| {
-            (
-                Status::Forbidden,
-                "enforcement-root-signature-invalid".into(),
+    // TC-2986: verified once, before any lock; the registration's
+    // transaction does not verify them again.
+    let verified = preverify_root(tinycloud, &policy_root, "policy-root-signature-invalid")
+        .await?
+        .union(
+            preverify_root(
+                tinycloud,
+                &enforcement_root,
+                "enforcement-root-signature-invalid",
             )
-        })?;
+            .await?,
+        );
     if !is_policy_root(&policy_root.0.delegation) || !is_policy_root(&enforcement_root.0.delegation)
     {
         return Err((Status::Forbidden, "root-fact-schema-invalid".into()));
@@ -1953,7 +2217,7 @@ pub async fn register_policy(
             OffsetDateTime::now_utc(),
         )
         .await
-        .map_err(|error| (Status::Forbidden, error.into()))?;
+        .map_err(authorization_failure)?;
     }
     for root in [&policy_root, &enforcement_root] {
         for space in root.0.spaces() {
@@ -1977,6 +2241,11 @@ pub async fn register_policy(
         }
         return Err((Status::Conflict, "policy-registration-conflict".into()));
     }
+    // A registration the node already stores answered above. A new one must
+    // bind its content source to one share key, which the node records in
+    // the registration's transaction.
+    require_bound_content_source(&request.policy)?;
+    let share_key = share_key_location(&request.policy)?;
 
     let now = OffsetDateTime::now_utc();
     let policy_status = initial_status_checkpoint(
@@ -2048,7 +2317,7 @@ pub async fn register_policy(
             enforcement_status,
         ),
     ];
-    let written = register_policy_writes(
+    let written = register_policy_writes_verified(
         &txn,
         tinycloud,
         &sequence_spaces,
@@ -2056,8 +2325,18 @@ pub async fn register_policy(
         registration,
         &request.policy_cid,
         roots,
+        &verified,
     )
     .await;
+    // The owner was shown above to hold decrypt on this exact key, so the
+    // registration records it; a full key limit refuses the registration.
+    let written = match written {
+        Ok(()) => encryption
+            .record_deterministic_key_in(&txn, &share_key)
+            .await
+            .map_err(share_key_error),
+        Err(err) => Err(err),
+    };
     match written {
         Ok(()) => txn.commit().await.map_err(db_error)?,
         Err(err) => {
@@ -2074,6 +2353,7 @@ pub async fn register_policy(
 
 /// The writes of `register_policy`, inside the transaction its caller opened.
 /// The caller commits when this returns `Ok` and rolls back on `Err`.
+#[cfg(test)]
 async fn register_policy_writes(
     txn: &DatabaseTransaction,
     tinycloud: &crate::TinyCloud,
@@ -2083,13 +2363,39 @@ async fn register_policy_writes(
     policy_cid: &str,
     roots: [(String, &'static str, Vec<u8>, Vec<u8>); 2],
 ) -> Result<(), (Status, String)> {
+    register_policy_writes_verified(
+        txn,
+        tinycloud,
+        sequence_spaces,
+        root_delegations,
+        registration,
+        policy_cid,
+        roots,
+        &tinycloud_core::db::PreVerified::default(),
+    )
+    .await
+}
+
+/// As `register_policy_writes`, with the roots' signatures in `verified`
+/// checked before `txn` opened (TC-2986).
+#[allow(clippy::too_many_arguments)]
+async fn register_policy_writes_verified(
+    txn: &DatabaseTransaction,
+    tinycloud: &crate::TinyCloud,
+    sequence_spaces: &[SpaceId],
+    root_delegations: Vec<Delegation>,
+    registration: policy_v3_registration::ActiveModel,
+    policy_cid: &str,
+    roots: [(String, &'static str, Vec<u8>, Vec<u8>); 2],
+    verified: &tinycloud_core::db::PreVerified,
+) -> Result<(), (Status, String)> {
     tinycloud_core::kv_sync::lock_space_sequences(txn, sequence_spaces)
         .await
         .map_err(db_error)?;
     // The normal graph rows, abilities, and signed-byte projections share one
     // SQL transaction. A failure in either side leaves no partial authority.
     tinycloud
-        .delegate_batch_in_transaction(txn, root_delegations)
+        .delegate_batch_in_transaction_verified(txn, root_delegations, verified)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     registration
@@ -2137,7 +2443,7 @@ pub async fn challenge(
     runtime
         .authorize_roots(&registration, OffsetDateTime::now_utc())
         .await
-        .map_err(|error| (Status::Forbidden, error.into()))?;
+        .map_err(authorization_failure)?;
     request
         .recipient_did
         .parse::<DIDBuf>()
@@ -2262,7 +2568,7 @@ pub async fn mint(
     runtime
         .authorize_roots(&registration, now)
         .await
-        .map_err(|e| (Status::Forbidden, e.into()))?;
+        .map_err(authorization_failure)?;
     // Policies registered before owners had to hold what they grant are
     // checked here too: the owner must have held every root capability when
     // the policy was registered. (Owner sessions may since have expired.)
@@ -2276,7 +2582,7 @@ pub async fn mint(
             registered_at,
         )
         .await
-        .map_err(|error| (Status::Forbidden, error.into()))?;
+        .map_err(authorization_failure)?;
     }
     for (cid, expected) in [
         (&registration.policy_root_cid, &policy_root),
@@ -2285,10 +2591,13 @@ pub async fn mint(
         let parsed_cid = cid
             .parse()
             .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?;
-        let Some((_, graph_root)) = tinycloud
-            .load_signed_delegation(parsed_cid)
-            .await
-            .map_err(|_| (Status::Forbidden, "policy-root-graph-invalid".into()))?
+        let Some((_, graph_root)) =
+            tinycloud
+                .load_signed_delegation(parsed_cid)
+                .await
+                .map_err(|error| {
+                    authorization_failure(policy_refusal(error, "policy-root-graph-invalid"))
+                })?
         else {
             return Err((Status::Forbidden, "policy-root-graph-missing".into()));
         };
@@ -2505,7 +2814,17 @@ pub async fn mint(
             Value::String(presentation_jti_digest),
         );
     }
-    facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
+    // Only path-scoped Share sources are terminal sessions. Other policy
+    // profiles retain their existing descendant-delegation contract.
+    let depth = if registered_policy["contentSource"]
+        .get("encryptionKeyPath")
+        .is_some()
+    {
+        0_u64
+    } else {
+        8_u64
+    };
+    facts.insert("remainingRedelegationDepth".to_owned(), Value::from(depth));
     let not_before = now.unix_timestamp();
     let expires = session_expiry(
         now,
@@ -2592,6 +2911,11 @@ pub async fn mint(
     // TC-732: per-space sequence locks before the row locks below; see
     // `register_policy`.
     let sequence_spaces = event.0.spaces().cloned().collect::<Vec<_>>();
+    // TC-2986: the node-signed session is verified before the locks below.
+    let verified = tinycloud
+        .preverify_delegation(&event)
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;
@@ -2633,7 +2957,7 @@ pub async fn mint(
             .await
             .map_err(db_error)?
             .ok_or((Status::Conflict, "policy-registration-changed".into()))?;
-    let locked_policy = validate_registration_projection(&locked_registration)?;
+    validate_registration_projection(&locked_registration)?;
     if locked_registration.policy_bytes != registration.policy_bytes
         || locked_registration.policy_root_cid != registration.policy_root_cid
         || locked_registration.enforcement_root_cid != registration.enforcement_root_cid
@@ -2642,7 +2966,6 @@ pub async fn mint(
     {
         return Err((Status::Conflict, "policy-registration-changed".into()));
     }
-    let mut locked_root_events = Vec::with_capacity(2);
     for root_cid in [
         &registration.policy_root_cid,
         &registration.enforcement_root_cid,
@@ -2653,17 +2976,19 @@ pub async fn mint(
             .await
             .map_err(db_error)?
             .ok_or((Status::Forbidden, "policy-root-missing".into()))?;
-        validate_persisted_root(&root, root_cid, &registration.policy_cid, &runtime.node_did)
-            .await
-            .map_err(|error| (Status::Forbidden, error.into()))?;
+        // TC-2986: `authorize_roots` verified this CID's signature before
+        // BEGIN, and the CID binds the bytes; only the projection, time
+        // window and liveness are checked under the locks.
+        validate_verified_persisted_root(
+            &root,
+            root_cid,
+            &registration.policy_cid,
+            &runtime.node_did,
+        )
+        .map_err(|error| (Status::Forbidden, error.into()))?;
         validate_root_liveness(&txn, &root, root_cid, &runtime.node_did, now, true)
             .await
-            .map_err(|error| (Status::Forbidden, error.into()))?;
-        let current_event = decode_delegation(
-            std::str::from_utf8(&root.authorization_bytes)
-                .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?,
-        )?;
-        locked_root_events.push(current_event);
+            .map_err(authorization_failure)?;
         if root.revoked_at.is_some()
             || root.revocation_bytes.is_some()
             || root
@@ -2691,95 +3016,12 @@ pub async fn mint(
             return Err((Status::Conflict, "policy-root-state-changed".into()));
         }
     }
-    let locked_claim_context = ClaimPresentationContext {
-        challenge_id: &request.challenge_id,
-        nonce: &request.nonce,
-        policy_cid: &request.policy_cid,
-        owner_did: fact(&locked_root_events[0].0.delegation, "ownerDid")
-            .ok_or((Status::Forbidden, "policy-owner-missing".into()))?,
-        recipient_did: &locked_challenge.recipient_did,
-        authenticated_account_owner: account_owner_proof
-            .as_ref()
-            .map(|proof| proof.owner_did.as_str()),
-        now,
-    };
-    let locked_credential_admission_result = if credential_admission {
-        let locked_requested = locked_challenge
-            .requested_capabilities
-            .as_array()
-            .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
-        Some(if accountless_credential_admission {
-            validate_credential_admission_v4(
-                &request.requirement,
-                &request.credential,
-                &request.presentation,
-                &locked_policy,
-                &locked_claim_context,
-                runtime,
-                locked_requested,
-            )?
-        } else {
-            validate_credential_admission_v3(
-                &request.requirement,
-                &request.credential,
-                &request.presentation,
-                &locked_policy,
-                &locked_claim_context,
-                runtime,
-                locked_requested,
-            )?
-        })
-    } else {
-        validate_claim_and_presentation(
-            &request.claim,
-            &request.presentation,
-            &locked_claim_context,
-        )?;
-        None
-    };
-    if credential_admission_result
-        .as_ref()
-        .zip(locked_credential_admission_result.as_ref())
-        .is_some_and(|(before, after)| {
-            before.claim_jti != after.claim_jti
-                || before.credential_id != after.credential_id
-                || before.presentation_jti != after.presentation_jti
-                || before.credential_digest != after.credential_digest
-                || before.envelope_digest_hex != after.envelope_digest_hex
-                || before.presentation_digest_hex != after.presentation_digest_hex
-                || before.credential_space_owner_did != after.credential_space_owner_did
-        })
-    {
-        return Err((Status::Conflict, "credential-evaluation-changed".into()));
-    }
-    validate_requested_policy_capabilities(
-        locked_challenge
-            .requested_capabilities
-            .as_array()
-            .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?,
-        locked_policy
-            .get("capabilityCeiling")
-            .and_then(Value::as_array)
-            .ok_or((Status::Forbidden, "policy-registration-corrupt".into()))?,
-    )?;
-    let final_allow = evaluate_current_allow(
-        (!credential_admission).then_some(&request.claim),
-        &request.presentation,
-        &CurrentAllowContext {
-            challenge: &locked_challenge,
-            policy_root: &locked_root_events[0].0.delegation,
-            enforcement_root: &locked_root_events[1].0.delegation,
-            policy_root_cid: &locked_registration.policy_root_cid,
-            enforcement_root_cid: &locked_registration.enforcement_root_cid,
-            node_did: &runtime.node_did,
-            now,
-        },
-    )?;
-    if canonical_value_set(&final_allow.approved_capabilities)
-        != canonical_value_set(&allow.approved_capabilities)
-    {
-        return Err((Status::Conflict, "policy-evaluation-changed".into()));
-    }
+    // TC-2986: the claim, presentation and credential admission, the
+    // requested capabilities and the allow decision were evaluated before
+    // BEGIN, at this same `now`, from inputs shown equal under the locks
+    // above: the challenge's fields, the registration's policy bytes and
+    // root CIDs, and the roots those CIDs content-address. Their result
+    // cannot differ here, so they are not run again while holding the locks.
     let reserved = policy_v3_challenge::Entity::update_many()
         .col_expr(
             policy_v3_challenge::Column::ConsumedAt,
@@ -2801,7 +3043,7 @@ pub async fn mint(
         )
     })?;
     tinycloud
-        .delegate_batch_in_transaction(&txn, vec![event])
+        .delegate_batch_in_transaction_verified(&txn, vec![event], &verified)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     txn.commit().await.map_err(db_error)?;
@@ -2817,11 +3059,10 @@ impl PolicyV3Runtime {
         &self,
         registration: &policy_v3_registration::Model,
         now: OffsetDateTime,
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, AuthorizationError> {
         let root = policy_v3_root::Entity::find_by_id(registration.enforcement_root_cid.clone())
             .one(&self.conn)
-            .await
-            .map_err(|_| "enforcement-root-unavailable")?
+            .await?
             .ok_or("enforcement-root-missing")?;
         let event = decode_delegation(
             std::str::from_utf8(&root.authorization_bytes)
@@ -2848,7 +3089,7 @@ impl PolicyV3Runtime {
         &self,
         registration: &policy_v3_registration::Model,
         now: OffsetDateTime,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), AuthorizationError> {
         let policy = validate_registration_projection(registration)
             .map_err(|_| "policy-registration-projection-mismatch")?;
         let mut roots = Vec::new();
@@ -2858,8 +3099,7 @@ impl PolicyV3Runtime {
         ] {
             let root = policy_v3_root::Entity::find_by_id(cid.clone())
                 .one(&self.conn)
-                .await
-                .map_err(|_| "root-unavailable")?
+                .await?
                 .ok_or("root-missing")?;
             validate_persisted_root(&root, cid, &registration.policy_cid, &self.node_did).await?;
             validate_root_liveness(&self.conn, &root, cid, &self.node_did, now, true).await?;
@@ -3048,10 +3288,10 @@ async fn validate_root_liveness<C: ConnectionTrait>(
     node_did: &str,
     now: OffsetDateTime,
     require_fresh: bool,
-) -> Result<(), &'static str> {
+) -> Result<(), AuthorizationError> {
     validate_stored_root_status(root, root_cid, node_did, now, require_fresh)?;
     if is_root_generically_revoked(db, root_cid).await? {
-        return Err("root-revoked");
+        return Err("root-revoked".into());
     }
     Ok(())
 }
@@ -3059,12 +3299,10 @@ async fn validate_root_liveness<C: ConnectionTrait>(
 async fn is_root_generically_revoked<C: ConnectionTrait>(
     db: &C,
     root_cid: &str,
-) -> Result<bool, &'static str> {
+) -> Result<bool, AuthorizationError> {
     let cid = tinycloud_auth::ipld_core::cid::Cid::try_from(root_cid)
         .map_err(|_| "policy-root-invalid")?;
-    revocation::is_revoked(db, &tinycloud_core::hash::Hash::from(cid))
-        .await
-        .map_err(|_| "root-revocation-unavailable")
+    Ok(revocation::is_revoked(db, &tinycloud_core::hash::Hash::from(cid)).await?)
 }
 
 fn root_advertised_expiry(root: &policy_v3_root::Model) -> Result<OffsetDateTime, &'static str> {
@@ -3197,7 +3435,7 @@ async fn ingest_status_checkpoint_unmounted(
     }
     if is_root_generically_revoked(&runtime.conn, &request.root_cid)
         .await
-        .map_err(|error| (Status::ServiceUnavailable, error.into()))?
+        .map_err(authorization_failure)?
     {
         return Err((Status::Conflict, "root-revoked".into()));
     }
@@ -3534,7 +3772,7 @@ pub async fn status(
     }
     if is_root_generically_revoked(&runtime.conn, &request.root_cid)
         .await
-        .map_err(|error| (Status::ServiceUnavailable, error.into()))?
+        .map_err(authorization_failure)?
     {
         return Err((Status::Conflict, "root-revoked".into()));
     }
@@ -3640,7 +3878,7 @@ pub async fn get_status(
         .ok_or((Status::NotFound, "policy-root-missing".into()))?;
     let generic_revocation = is_root_generically_revoked(&runtime.conn, root_cid)
         .await
-        .map_err(|error| (Status::ServiceUnavailable, error.into()))?;
+        .map_err(authorization_failure)?;
     if root.revoked_at.is_none() {
         validate_stored_root_status(
             &root,
@@ -4460,11 +4698,77 @@ async fn verify_signed_delegation(delegation: &TinyCloudDelegation) -> Result<()
     ucan.payload().validate_time(None).map_err(|_| ())
 }
 
+/// Verify a policy root before any lock (TC-2986): a UCAN within its time
+/// window, whose signature the core checks and records so the root's
+/// registration transaction does not check it again.
+async fn preverify_root(
+    tinycloud: &crate::TinyCloud,
+    root: &Delegation,
+    refusal: &'static str,
+) -> Result<tinycloud_core::db::PreVerified, (Status, String)> {
+    let refused = || (Status::Forbidden, refusal.to_owned());
+    let TinyCloudDelegation::Ucan(ucan) = &root.0.delegation else {
+        return Err(refused());
+    };
+    ucan.payload().validate_time(None).map_err(|_| refused())?;
+    tinycloud
+        .preverify_delegation(root)
+        .await
+        .map_err(|_| refused())
+}
+
 struct RegistrationProjections {
     content_source_digest_hex: String,
     capability_ceiling_hash_hex: String,
     native_projection_hash_hex: String,
     attenuation: Value,
+}
+
+/// A new registration's content source names the one share key it opens
+/// (`encryptionKeyPath`) and that key's digest (`encryptedSymmetricKeyDigestHex`),
+/// mutable or immutable. This runs only when a registration is stored;
+/// `registration_projections` also validates stored registrations, which keep
+/// their original shape.
+fn require_bound_content_source(policy: &Value) -> Result<(), (Status, String)> {
+    let source = policy
+        .get("contentSource")
+        .and_then(Value::as_object)
+        .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
+    if !source.contains_key("encryptionKeyPath") {
+        return Err((
+            Status::BadRequest,
+            "content-source-key-path-required".into(),
+        ));
+    }
+    if !source.contains_key("encryptedSymmetricKeyDigestHex") {
+        return Err((
+            Status::BadRequest,
+            "content-source-key-digest-required".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The share key a new registration's content source names, as
+/// `registration_projections` validated it: `<encryptionNetwork>/<encryptionKeyPath>`.
+fn share_key_location(policy: &Value) -> Result<KeyLocation, (Status, String)> {
+    let source = policy.get("contentSource");
+    let field = |name| source.and_then(|s| s.get(name)).and_then(Value::as_str);
+    let (Some(network), Some(path)) = (field("encryptionNetwork"), field("encryptionKeyPath"))
+    else {
+        return Err((Status::BadRequest, "content-source-invalid".into()));
+    };
+    match key_id::parse(&format!("{network}/{path}")) {
+        Ok(EncryptionResource::Key(loc)) => Ok(loc),
+        _ => Err((Status::BadRequest, "content-source-invalid".into())),
+    }
+}
+
+fn share_key_error(err: EncryptionServiceError) -> (Status, String) {
+    match err {
+        EncryptionServiceError::Db(err) => db_error(err),
+        other => crate::routes::encryption::map_service_err(other),
+    }
 }
 
 fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (Status, String)> {
@@ -4480,6 +4784,7 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         "kvResource",
         "selector",
         "encryptionNetwork",
+        "encryptionKeyPath",
         "encryptedSymmetricKeyDigestHex",
         "keyVersion",
         "mode",
@@ -4502,6 +4807,8 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         )
         || source.get("mode").and_then(Value::as_str) == Some("immutable")
             && source.get("initialCiphertextDigestHex").is_none()
+        || source.contains_key("encryptionKeyPath")
+            && !source.contains_key("encryptedSymmetricKeyDigestHex")
     {
         return Err((Status::BadRequest, "content-source-invalid".into()));
     }
@@ -4529,7 +4836,25 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
         .get("encryptionNetwork")
         .and_then(Value::as_str)
         .ok_or((Status::BadRequest, "content-source-invalid".into()))?;
-    validate_policy_encryption_resource(encryption_network)?;
+    validate_policy_encryption_network(encryption_network)?;
+    let encryption_resource = if let Some(key_path) = source.get("encryptionKeyPath") {
+        let share_id = source.get("shareId").and_then(Value::as_str).unwrap();
+        let expected_path = format!("share/{share_id}");
+        let network = encryption_network
+            .parse::<NetworkId>()
+            .map_err(|_| (Status::BadRequest, "content-source-invalid".into()))?;
+        let leaf = format!("{encryption_network}/{expected_path}");
+        if key_path.as_str() != Some(expected_path.as_str())
+            || network.name() != "default"
+            || network.to_string() != encryption_network
+            || !matches!(key_id::parse(&leaf), Ok(EncryptionResource::Key(_)))
+        {
+            return Err((Status::BadRequest, "content-source-invalid".into()));
+        }
+        leaf
+    } else {
+        encryption_network.to_owned()
+    };
 
     let capabilities = object
         .get("capabilityCeiling")
@@ -4604,10 +4929,20 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     .get("resource")
                     .and_then(Value::as_str)
                     .ok_or((Status::BadRequest, "capability-invalid".into()))?;
-                validate_policy_encryption_resource(resource)?;
+                if source.contains_key("encryptionKeyPath") {
+                    validate_policy_encryption_resource(resource)?;
+                } else {
+                    validate_policy_encryption_network(resource)?;
+                }
                 if cap.get("action").and_then(Value::as_str) != Some("tinycloud.encryption/decrypt")
                 {
                     return Err((Status::BadRequest, "capability-invalid".into()));
+                }
+                if source.contains_key("encryptionKeyPath") && resource != encryption_resource {
+                    return Err((
+                        Status::Forbidden,
+                        "content-source-capability-mismatch".into(),
+                    ));
                 }
                 if attenuation
                     .insert(
@@ -4624,7 +4959,7 @@ fn registration_projections(policy: &Value) -> Result<RegistrationProjections, (
                     "path": resource,
                     "actions": ["tinycloud.encryption/decrypt"],
                 }));
-                saw_source_encryption |= resource == encryption_network;
+                saw_source_encryption |= resource == encryption_resource;
             }
             _ => return Err((Status::BadRequest, "capability-invalid".into())),
         }
@@ -4725,6 +5060,16 @@ fn parse_policy_kv_resource(value: &str) -> Result<(String, String), (Status, St
 }
 
 fn validate_policy_encryption_resource(value: &str) -> Result<(), (Status, String)> {
+    if validate_policy_encryption_network(value).is_ok()
+        || matches!(key_id::parse(value), Ok(EncryptionResource::Key(_)))
+    {
+        Ok(())
+    } else {
+        Err((Status::BadRequest, "encryption-resource-invalid".into()))
+    }
+}
+
+fn validate_policy_encryption_network(value: &str) -> Result<(), (Status, String)> {
     let rest = value
         .strip_prefix("urn:tinycloud:encryption:")
         .ok_or((Status::BadRequest, "encryption-resource-invalid".into()))?;
@@ -5524,7 +5869,9 @@ async fn authenticate_account_owner(
     let (row, event) = tinycloud
         .load_signed_delegation(cid)
         .await
-        .map_err(|_| (Status::Forbidden, "account-authorization-invalid".into()))?
+        .map_err(|error| {
+            authorization_failure(policy_refusal(error, "account-authorization-invalid"))
+        })?
         .ok_or((Status::Forbidden, "account-authorization-missing".into()))?;
     if !holder_did.starts_with("did:key:") {
         return Err((Status::Forbidden, "account-holder-invalid".into()));
@@ -6789,6 +7136,7 @@ mod tests {
             not_before: Set(Some(now)),
             facts: Set(None),
             serialization: Set(authorization.as_bytes().to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&runtime.conn)
         .await?;
@@ -6871,8 +7219,9 @@ mod tests {
                 after_five_minutes,
                 true,
             )
-            .await,
-            Err("root-revoked")
+            .await
+            .map_err(authorization_failure),
+            Err((Status::Forbidden, "root-revoked".into()))
         );
         Ok(())
     }
@@ -7325,6 +7674,15 @@ mod tests {
             credential: &Value,
             set: &IssuerSet,
         ) -> Result<VerifiedOpenCredential, (Status, String)> {
+            self.verify_at(credential, set, self.issued + Duration::seconds(30))
+        }
+
+        fn verify_at(
+            &self,
+            credential: &Value,
+            set: &IssuerSet,
+            now: OffsetDateTime,
+        ) -> Result<VerifiedOpenCredential, (Status, String)> {
             let projection = validate_policy_credential_requirement(&self.projection_value)?;
             verify_opencredentials_credential(
                 credential,
@@ -7332,7 +7690,7 @@ mod tests {
                 projection,
                 set,
                 self.holder,
-                self.issued + Duration::seconds(30),
+                now,
             )
         }
 
@@ -7384,6 +7742,134 @@ mod tests {
 
     fn forbidden(code: &str) -> Option<(Status, String)> {
         Some((Status::Forbidden, code.into()))
+    }
+
+    #[test]
+    fn bounded_issuer_overlap_verifies_only_pinned_keys_until_deadline() {
+        let issuer_did = "did:web:issuer.credentials.org";
+        let old_key = keypair();
+        let next_key = keypair();
+        let wrong_key = keypair();
+        let other_did_key = keypair();
+        let old_kid = format!("{issuer_did}#email-signing-key-1");
+        let next_kid = format!("{issuer_did}#email-signing-key-2");
+        let old_issuer = tinycloud_auth::share_email_evidence::IssuerKey::new(
+            issuer_did,
+            "opencredentials.email/v1",
+            1,
+            old_kid.clone(),
+            old_key.public().to_bytes(),
+        );
+        let mut next_config = issuer_config(issuer_did, "email-signing-key-2", &next_key);
+        next_config.not_before = "2099-12-31T23:00:00Z".into();
+        let end = "2100-01-01T00:05:00Z";
+        let old_only = IssuerSet::from_legacy(&old_issuer);
+        let new_only = IssuerSet::load(std::slice::from_ref(&next_config)).unwrap();
+        let overlap = IssuerSet::load_with_legacy_not_after(
+            std::slice::from_ref(&next_config),
+            Some(&old_issuer),
+            Some(end),
+        )
+        .unwrap();
+
+        let issued = parse_time("2100-01-01T00:01:00Z").unwrap();
+        let before_end = parse_time("2100-01-01T00:04:59Z").unwrap();
+        let at_end = parse_time(end).unwrap();
+        let old_fixture = {
+            let mut fixture = SetFixture::new(issuer_did, Some(&old_kid), DOMAIN_PROFILE);
+            fixture.issued = issued;
+            fixture
+        };
+        let new_fixture = {
+            let mut fixture = SetFixture::new(issuer_did, Some(&next_kid), DOMAIN_PROFILE);
+            fixture.issued = issued;
+            fixture
+        };
+        let old_credential = old_fixture.mint(
+            &old_key,
+            json!({"alg": "EdDSA", "kid": old_kid.clone()}),
+            &old_kid,
+        );
+        let new_credential = new_fixture.mint(
+            &next_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": next_kid.clone()}),
+            &next_kid,
+        );
+
+        assert!(old_fixture
+            .verify_at(&old_credential, &old_only, before_end)
+            .is_ok());
+        assert_eq!(
+            new_fixture
+                .verify_at(&new_credential, &old_only, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert!(new_fixture
+            .verify_at(&new_credential, &new_only, before_end)
+            .is_ok());
+        assert_eq!(
+            old_fixture
+                .verify_at(&old_credential, &new_only, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+        assert!(old_fixture
+            .verify_at(&old_credential, &overlap, before_end)
+            .is_ok());
+        assert!(new_fixture
+            .verify_at(&new_credential, &overlap, before_end)
+            .is_ok());
+        assert_eq!(
+            old_fixture
+                .verify_at(&old_credential, &overlap, at_end)
+                .err(),
+            forbidden("credential-issuer-stopped")
+        );
+        assert!(new_fixture
+            .verify_at(&new_credential, &overlap, at_end)
+            .is_ok());
+
+        let unknown_kid = format!("{issuer_did}#unknown");
+        let unknown_fixture = SetFixture::new(issuer_did, Some(&unknown_kid), DOMAIN_PROFILE);
+        let unknown = unknown_fixture.mint(
+            &next_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": unknown_kid.clone()}),
+            &unknown_kid,
+        );
+        assert_eq!(
+            unknown_fixture
+                .verify_at(&unknown, &overlap, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
+
+        let wrong_signature = old_fixture.mint(
+            &wrong_key,
+            json!({"alg": "EdDSA", "kid": old_kid.clone()}),
+            &old_kid,
+        );
+        assert_eq!(
+            old_fixture
+                .verify_at(&wrong_signature, &overlap, before_end)
+                .err(),
+            forbidden("credential-signature-invalid")
+        );
+
+        let other_did = "did:web:other.credentials.org";
+        let other_kid = format!("{other_did}#email-signing-key-1");
+        let other_fixture = SetFixture::new(other_did, Some(&other_kid), DOMAIN_PROFILE);
+        let other_credential = other_fixture.mint(
+            &other_did_key,
+            json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": other_kid.clone()}),
+            &other_kid,
+        );
+        assert_eq!(
+            other_fixture
+                .verify_at(&other_credential, &overlap, before_end)
+                .err(),
+            forbidden("credential-issuer-untrusted")
+        );
     }
 
     #[test]
@@ -8562,7 +9048,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::SpaceOwner)).await
     }
 
     /// The real Share and CLI shape: the policy owner is a session key the
@@ -8570,7 +9056,7 @@ mod tests {
     /// space owner revokes that delegation, no new session can be minted.
     #[tokio::test]
     async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::DelegatedSession)).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -8578,7 +9064,7 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+        Box::pin(run_policy_v2_flow(PolicyOwner::Unauthorized)).await
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8591,6 +9077,7 @@ mod tests {
         Unauthorized,
     }
 
+    #[derive(Clone, Copy)]
     struct MatrixContext<'a> {
         client: &'a rocket::local::asynchronous::Client,
         resource: &'a ResourceId,
@@ -9209,6 +9696,142 @@ mod tests {
         Ok(())
     }
 
+    /// A refused delivery authorization logs one `delivery_refused` line that
+    /// names the check and holds no link, address, identifier or DID; the
+    /// answer is the same as without the line.
+    async fn delivery_refusal_reasons(ctx: MatrixContext<'_>) -> anyhow::Result<()> {
+        use crate::delivery_link::test_support as ts;
+        ctx.client
+            .rocket()
+            .state::<PolicyV3Runtime>()
+            .unwrap()
+            .fetch_limiter()
+            .set_limits(1000, 1000, 1000);
+        const INVALID: &str = "delivery-authorization-invalid";
+        let mut bodies = vec![];
+        let valid_url = ctx.success_request.share_url.clone();
+        let jti = |n: u8| encode_config([100 + n; 16], URL_SAFE_NO_PAD);
+        let host = ts::ORIGIN.trim_start_matches("https://");
+        let key = ts::b64(&ts::TEST_KEY);
+        let forbidden_in_line = |extra_jti: &str| {
+            vec![
+                host.to_owned(),
+                "/s/".to_owned(),
+                ts::LINK_ID.to_owned(),
+                key.clone(),
+                extra_jti.to_owned(),
+                "alice@example.test".to_owned(),
+                "did:".to_owned(),
+            ]
+        };
+        let refusal_line = |before: usize, reason: &str, status: Status, jti: &str| {
+            let log = String::from_utf8(ctx.log.0.lock()[before..].to_vec()).unwrap();
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|line| line.contains("delivery_refused"))
+                .collect();
+            assert_eq!(lines.len(), 1, "{reason}: exactly one line in {log}");
+            let line = lines[0];
+            assert!(
+                line.contains(&format!("reason={reason:?}")),
+                "{reason}: {line}"
+            );
+            assert!(
+                line.contains(&format!("status={}", status.code)),
+                "{reason}: {line}"
+            );
+            for secret in forbidden_in_line(jti) {
+                assert!(!line.contains(&secret), "{reason}: line holds {secret}");
+            }
+        };
+        let mark = || ctx.log.0.lock().len();
+
+        // The request body's digest does not match its fields.
+        let mut request = DeliveryAuthorizationRequest {
+            share_url: valid_url.clone(),
+            recipient_email: "alice@example.test".into(),
+            document_name: "document.txt".into(),
+            jti: jti(140),
+            expires_at: ts::millis(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            request_body_digest: String::new(),
+        };
+        request.request_body_digest = delivery_request_digest(&request)
+            .map_err(|_| anyhow::anyhow!("refusal request digest"))?;
+        // Always a different first character: the digest covers a
+        // time-dependent `expiresAt`, so 1 run in 64 it already starts
+        // with `_`, and writing `_` over it would leave it valid.
+        let tampered = if request.request_body_digest.starts_with('_') {
+            "A"
+        } else {
+            "_"
+        };
+        request.request_body_digest.replace_range(..1, tampered);
+        let before = mark();
+        let (status, body) = ctx
+            .post("tc2047-digest", serde_json::to_string(&request)?)
+            .await?;
+        assert_eq!((status, body.as_str()), (Status::BadRequest, INVALID));
+        refusal_line(before, "request_digest_mismatch", status, &request.jti);
+
+        // A link that is not the short form.
+        let before = mark();
+        ctx.deliver(
+            141,
+            "retired link form",
+            valid_url.replace("#v=4", "#v=3"),
+            (Status::BadRequest, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(
+            before,
+            "share_url_not_short_form",
+            Status::BadRequest,
+            &jti(141),
+        );
+
+        // An `expiresAt` already past.
+        let before = mark();
+        ctx.deliver_expiring(
+            142,
+            "expired request",
+            valid_url.clone(),
+            ts::millis(OffsetDateTime::now_utc() - Duration::minutes(1)),
+            (Status::BadRequest, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(before, "expiry_invalid", Status::BadRequest, &jti(142));
+
+        // A record whose envelope names a policy nobody registered.
+        let mut unregistered = ctx.envelope.clone();
+        unregistered["policyCid"] =
+            Value::String("bafkreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let built = ts::build(
+            &canonical_json_value(&unregistered),
+            ctx.owner_key,
+            ctx.link_expires,
+        );
+        let link_id = format!("{}55", "2".repeat(24));
+        ctx.links.put(&link_id, &built);
+        let before = mark();
+        ctx.deliver(
+            143,
+            "unknown registration",
+            built.href.replace(ts::LINK_ID, &link_id),
+            (Status::NotFound, INVALID),
+            &mut bodies,
+        )
+        .await?;
+        refusal_line(
+            before,
+            "registration_not_found",
+            Status::NotFound,
+            &jti(143),
+        );
+        Ok(())
+    }
+
     async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
@@ -9245,7 +9868,7 @@ mod tests {
         let account_address: [u8; 20] = account_digest[12..].try_into()?;
         let account_owner_did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&account_address));
         let credentials_space =
-            SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
+            SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?)?;
         let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let victim_did = did(&victim_key);
         let content_owner_did = if policy_owner != PolicyOwner::SpaceOwner {
@@ -9256,7 +9879,7 @@ mod tests {
         let content_space = SpaceId::new(
             content_owner_did.parse::<DIDBuf>()?,
             "applications".parse()?,
-        );
+        )?;
         let content_resource = content_space.clone().to_resource(
             "kv".parse()?,
             Some("shares/tc-470/document.txt".parse()?),
@@ -9995,28 +10618,44 @@ mod tests {
                 &StaticSecret::new(vec![29; 32]).unwrap(),
             )),
         );
-        let register_request = client
-            .post("/policy/v3/policies")
-            .header(ContentType::JSON)
-            .body(
-                json!({
-                    "policyCid": policy_cid,
-                    "policy": policy,
-                    "policyRoot": policy_root_authorization,
-                    "enforcementRoot": enforcement_root_authorization,
-                    "contentSourceDigestHex": projections.content_source_digest_hex,
-                    "nativeProjectionHashHex": projections.native_projection_hash_hex,
-                    "attestedEnforcerBinding": live_binding,
-                })
-                .to_string(),
-            );
-        let register_response = tinycloud_core::request_telemetry::scope(
-            telemetry.clone(),
-            register_request.dispatch(),
-        )
-        .await;
-        let register_status = register_response.status();
-        let register_body = register_response.into_string().await.unwrap_or_default();
+        let registration = json!({
+            "policyCid": policy_cid,
+            "policy": policy,
+            "policyRoot": policy_root_authorization,
+            "enforcementRoot": enforcement_root_authorization,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "nativeProjectionHashHex": projections.native_projection_hash_hex,
+            "attestedEnforcerBinding": live_binding,
+        });
+        let (register_status, register_body) = if policy_owner == PolicyOwner::Unauthorized {
+            let register_response = tinycloud_core::request_telemetry::scope(
+                telemetry.clone(),
+                client
+                    .post("/policy/v3/policies")
+                    .header(ContentType::JSON)
+                    .body(registration.to_string())
+                    .dispatch(),
+            )
+            .await;
+            (
+                register_response.status(),
+                register_response.into_string().await.unwrap_or_default(),
+            )
+        } else {
+            // TC-2242: this policy has no `encryptionKeyPath`, a shape the
+            // route refuses for a new registration. What follows is about a
+            // registration that is already stored, so it is stored as one.
+            // Boxed: this test's future is already near the test thread's stack.
+            let stored = tinycloud_core::request_telemetry::scope(
+                telemetry.clone(),
+                Box::pin(super::test_harness::Harness::store_registration_on(
+                    &client,
+                    registration,
+                )),
+            )
+            .await?;
+            (Status::Ok, serde_json::to_string(&stored)?)
+        };
         if policy_owner == PolicyOwner::Unauthorized {
             assert_eq!(
                 register_status,
@@ -10287,7 +10926,7 @@ mod tests {
         // The node's error table, and the rule that neither the link nor its
         // key reaches a log line, a response body or a stored row. It runs as
         // a boxed future of its own so this test's stack frame stays small.
-        Box::pin(delivery_error_matrix(MatrixContext {
+        let matrix_context = MatrixContext {
             client: &client,
             resource: &content_resource,
             sender_cid: &sender_cid,
@@ -10306,8 +10945,10 @@ mod tests {
                 jwk: &second_holder_jwk,
                 did: &second_holder_did,
             },
-        }))
-        .await?;
+        };
+        Box::pin(delivery_error_matrix(matrix_context)).await?;
+        // Each refusal logs the check that refused it, as a fixed reason.
+        Box::pin(delivery_refusal_reasons(matrix_context)).await?;
 
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();
@@ -10915,8 +11556,9 @@ mod tests {
                 &chain_tip.0.capabilities,
                 OffsetDateTime::now_utc(),
             )
-            .await,
-            Err("policy-owner-not-authorized")
+            .await
+            .map_err(authorization_failure),
+            Err((Status::Forbidden, "policy-owner-not-authorized".into()))
         );
 
         // A duplicate presentation remains a replay even while the roots are
@@ -11331,6 +11973,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn share_key_policy_projects_only_its_exact_decrypt_leaf() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-405-compact-authorization.json"
+        ))
+        .unwrap();
+        let legacy = &vector["policy"]["value"];
+        let legacy_projection = registration_projections(legacy).unwrap();
+        let legacy_network = legacy["contentSource"]["encryptionNetwork"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            legacy_projection.attenuation[legacy_network],
+            json!({"tinycloud.encryption/decrypt": [{}]})
+        );
+        assert!(validate_requested_policy_capabilities(
+            &[legacy["capabilityCeiling"][1].clone()],
+            legacy["capabilityCeiling"].as_array().unwrap(),
+        )
+        .is_ok());
+        let mut legacy_leaf = legacy.clone();
+        legacy_leaf["capabilityCeiling"][1]["resource"] =
+            json!(format!("{legacy_network}/share/share-405-vector"));
+        assert!(registration_projections(&legacy_leaf).is_err());
+
+        let mut policy = legacy.clone();
+        let owner = policy["ownerDid"].as_str().unwrap().to_owned();
+        let root = format!("urn:tinycloud:encryption:{owner}:default");
+        let leaf = format!("{root}/share/share-405-vector");
+        policy["contentSource"]["encryptionNetwork"] = json!(root);
+        policy["contentSource"]["encryptionKeyPath"] = json!("share/share-405-vector");
+        policy["capabilityCeiling"][1]["resource"] = json!(leaf);
+
+        let projection = registration_projections(&policy).expect("exact share key projects");
+        let mut delegated_owner = policy.clone();
+        delegated_owner["ownerDid"] = json!("did:key:zDelegatedPolicyOwner");
+        assert!(registration_projections(&delegated_owner).is_ok());
+        assert_eq!(
+            projection.attenuation[&leaf],
+            json!({"tinycloud.encryption/decrypt": [{}]})
+        );
+        let requested = json!({
+            "kind": "encryption",
+            "resource": leaf,
+            "action": "tinycloud.encryption/decrypt"
+        });
+        assert!(validate_requested_policy_capabilities(
+            &[requested],
+            policy["capabilityCeiling"].as_array().unwrap(),
+        )
+        .is_ok());
+
+        for (case, resource) in [
+            ("root default", root.clone()),
+            ("other share", format!("{root}/share/other")),
+            ("other path", format!("{root}/secrets/share-405-vector")),
+            ("app key", format!("{root}/apps/example/secret")),
+            ("network prefix", format!("{root}/share/")),
+        ] {
+            let mut changed = policy.clone();
+            changed["capabilityCeiling"][1]["resource"] = json!(resource);
+            assert!(
+                registration_projections(&changed).is_err(),
+                "accepted {case} as the source decrypt capability"
+            );
+            let requested = json!({
+                "kind": "encryption",
+                "resource": resource,
+                "action": "tinycloud.encryption/decrypt"
+            });
+            assert!(
+                validate_requested_policy_capabilities(
+                    &[requested],
+                    policy["capabilityCeiling"].as_array().unwrap(),
+                )
+                .is_err(),
+                "accepted {case} under the exact share ceiling"
+            );
+        }
+        let mut extra_root = policy.clone();
+        extra_root["capabilityCeiling"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind": "encryption",
+                "resource": root,
+                "action": "tinycloud.encryption/decrypt"
+            }));
+        assert!(registration_projections(&extra_root).is_err());
+
+        let wrong_network = format!("urn:tinycloud:encryption:{owner}:other");
+        for (case, network, path) in [
+            (
+                "wrong owner",
+                "urn:tinycloud:encryption:did:key:zOther:default",
+                "share/share-405-vector",
+            ),
+            (
+                "wrong network",
+                wrong_network.as_str(),
+                "share/share-405-vector",
+            ),
+            ("leaf as network", leaf.as_str(), "share/share-405-vector"),
+            ("wrong source path", root.as_str(), "share/other"),
+            (
+                "nested source path",
+                root.as_str(),
+                "share/share-405-vector/child",
+            ),
+            (
+                "encoded source path",
+                root.as_str(),
+                "share/share%2d405-vector",
+            ),
+        ] {
+            let mut changed = policy.clone();
+            changed["contentSource"]["encryptionNetwork"] = json!(network);
+            changed["contentSource"]["encryptionKeyPath"] = json!(path);
+            assert!(
+                registration_projections(&changed).is_err(),
+                "accepted {case}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn challenge_and_session_rows_roll_back_together_and_jti_is_unique() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -11544,3 +12311,19 @@ mod registration_probe_tests;
 #[cfg(test)]
 #[path = "policy_v3/delivery_admission_tests.rs"]
 mod delivery_admission_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/unbound_source_tests.rs"]
+mod unbound_source_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/share_key_record_tests.rs"]
+mod share_key_record_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/policy_root_proof_tests.rs"]
+mod policy_root_proof_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/mint_locked_inputs_tests.rs"]
+mod mint_locked_inputs_tests;

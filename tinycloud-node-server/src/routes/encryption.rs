@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 use super::public::{ClientIp, RateLimiter};
+use super::InvokeError;
 use crate::{authorization::AuthHeaderGetter, BlockStage, TinyCloud};
 use tinycloud_core::encryption_network::{
     delete_auth::DeleteTarget,
@@ -68,13 +69,15 @@ pub async fn create_network(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Json<DescriptorView>, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Json<DescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.create.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -173,41 +176,84 @@ pub async fn decrypt(
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
-) -> Result<Json<DecryptResponseBody>, (Status, String)> {
-    let invocation = authorization.0;
-    let invocation_info = invocation.0.clone();
-    verify_auth(
-        "server.encryption.decrypt.auth",
-        invocation,
-        tinycloud,
-        service.node_did(),
-    )
-    .await?;
-    // Same policy gate as `/invoke`: a policy-session chain must still be
-    // live (roots, session, descendants) to decrypt through this route.
-    policy_v3
-        .authorize_invocation(tinycloud, &invocation_info, time::OffsetDateTime::now_utc())
-        .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
-
+) -> Result<Json<DecryptResponseBody>, InvokeError> {
     let net: NetworkId =
         network_id
             .parse()
             .map_err(|e: tinycloud_core::encryption_network::NetworkIdError| {
                 (Status::BadRequest, e.to_string())
             })?;
+    let network = net.to_string();
     let body = body.into_inner();
     if body.get("keyPath").is_some() {
         return Err((
             Status::BadRequest,
             "key_path_invalid: keyPath is not accepted on the network decrypt route; use /invoke with a key capability"
                 .to_string(),
-        ));
+        )
+            .into());
     }
-    let target = tinycloud_core::encryption_network::DecryptTarget::Root(net.clone());
+    let invocation_info = &authorization.0 .0;
+    let capability = match invocation_info.capabilities.as_slice() {
+        [capability]
+            if capability.ability.as_ref().as_ref()
+                == tinycloud_core::encryption_network::DECRYPT_ACTION =>
+        {
+            capability
+        }
+        _ => {
+            return Err((
+                Status::Forbidden,
+                "direct decrypt requires exactly one decrypt capability".into(),
+            )
+                .into());
+        }
+    };
+    if capability.resource.to_string() != network {
+        return Err(map_service_err(EncryptionServiceError::NetworkMismatch).into());
+    }
+    if invocation_info.invocation.payload().audience != service.node_did() {
+        return Err(map_service_err(EncryptionServiceError::AudienceMismatch).into());
+    }
+    // Authorization must be read-only: `verify_auth` invokes every submitted
+    // capability and could commit a KV mutation before a later refusal.
+    let now = time::OffsetDateTime::now_utc();
+    let auth_start = Instant::now();
+    let auth_result = tinycloud.authorize_invocation(invocation_info, now).await;
+    crate::prometheus::observe_span(
+        "server.encryption.decrypt.auth",
+        if auth_result.is_ok() { "ok" } else { "error" },
+        auth_start.elapsed(),
+    );
+    auth_result.map_err(|error| {
+        if let Some(code) = error.revocation_code() {
+            return InvokeError::Revoked(code, error.to_string());
+        }
+        match &error {
+            tinycloud_core::models::invocation::Error::Db(db_error) => super::database_failure(
+                tinycloud_core::failure_diagnostic::Service::Other,
+                db_error,
+                false,
+                error.to_string(),
+            ),
+            _ => (Status::Unauthorized, error.to_string()),
+        }
+        .into()
+    })?;
+    // Same policy gate as `/invoke`: a policy-session chain must still be
+    // live (roots, session, descendants) to decrypt through this route.
+    policy_v3
+        .authorize_invocation(tinycloud, invocation_info, Some(&body), now)
+        .await
+        .map_err(crate::policy_v3::authorization_failure)?;
+
+    if body.get("networkId").and_then(serde_json::Value::as_str) != Some(network.as_str()) {
+        return Err(map_service_err(EncryptionServiceError::NetworkMismatch).into());
+    }
+    let target = tinycloud_core::encryption_network::DecryptTarget::Root(net);
     let decrypt_start = Instant::now();
     let decrypt_result = service
-        .decrypt_authorized(&target, &invocation_info, &body)
+        .decrypt_authorized(&target, invocation_info, &body)
         .await;
     crate::prometheus::observe_span(
         "server.encryption.decrypt_authorized",
@@ -228,13 +274,15 @@ pub async fn revoke_network(
     authorization: AuthHeaderGetter<InvocationInfo>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Status, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Status, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.revoke.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -406,13 +454,15 @@ pub async fn create_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.key_create.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -453,13 +503,15 @@ pub async fn describe_encryption_key(
     authorization: AuthHeaderGetter<InvocationInfo>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.key_describe.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -515,13 +567,15 @@ pub async fn block_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.key_block.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -562,13 +616,15 @@ pub async fn unblock_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
-) -> Result<Json<KeyDescriptorView>, (Status, String)> {
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
     verify_auth(
         "server.encryption.key_unblock.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -638,7 +694,7 @@ pub async fn delete_encryption_key(
     authorization: RawAuthorization,
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
-) -> Result<Json<KeyDeleteView>, (Status, String)> {
+) -> Result<Json<KeyDeleteView>, InvokeError> {
     let body_value = body.into_inner();
     let body: DeleteKeyBody = serde_json::from_value(body_value.clone()).map_err(|err| {
         (
@@ -653,7 +709,8 @@ pub async fn delete_encryption_key(
         return Err((
             Status::BadRequest,
             "network id is not in canonical form".to_string(),
-        ));
+        )
+            .into());
     }
     let target = DeleteTarget::parse(&network, &body.key_path).map_err(map_key_service_err)?;
     let verified = service
@@ -677,14 +734,22 @@ async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
     node_did: &str,
-) -> Result<(), (Status, String)> {
+) -> Result<(), InvokeError> {
     if invocation.0.invocation.payload().audience != node_did {
         return Err((
             Status::Unauthorized,
             EncryptionServiceError::AudienceMismatch.to_string(),
-        ));
+        )
+            .into());
     }
+    // Before the invocation is recorded: a registered policy root never
+    // authorizes these routes, cited alone or beside other proofs.
+    policy_v3
+        .refuse_policy_root_proofs(&invocation.0.parents)
+        .await
+        .map_err(crate::policy_v3::authorization_failure)?;
     let start = Instant::now();
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
@@ -693,19 +758,26 @@ async fn verify_auth(
         // Infrastructure failures are not authorization failures (TC-1317):
         // a read-audit or transient database failure is retryable, and must
         // not tell the client its credentials were refused.
-        .map_err(|err| match &err {
-            TxStoreError::Tx(TxError::ReadAudit(error)) => {
-                super::read_audit_failure(tinycloud_core::failure_diagnostic::Service::Other, error)
+        .map_err(|err| {
+            if let Some(code) = err.revocation_code() {
+                return InvokeError::Revoked(code, err.to_string());
             }
-            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                super::database_failure(
+            match &err {
+                TxStoreError::Tx(TxError::ReadAudit(error)) => super::read_audit_failure(
                     tinycloud_core::failure_diagnostic::Service::Other,
                     error,
-                    false,
-                    err.to_string(),
-                )
+                ),
+                TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                    super::database_failure(
+                        tinycloud_core::failure_diagnostic::Service::Other,
+                        error,
+                        false,
+                        err.to_string(),
+                    )
+                }
+                _ => (Status::Unauthorized, err.to_string()),
             }
-            _ => (Status::Unauthorized, err.to_string()),
+            .into()
         });
     crate::prometheus::observe_span(
         span,
@@ -728,7 +800,7 @@ fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
     }
 }
 
-fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
+pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
     let status = match err {
         EncryptionServiceError::NetworkNotFound => Status::NotFound,
         EncryptionServiceError::NetworkAlreadyExists => Status::Conflict,
@@ -766,6 +838,25 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::Base64(_) => Status::BadRequest,
     };
     (status, err.to_string())
+}
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_duplicate_maps_to_conflict_but_other_database_errors_stay_internal() {
+        assert_eq!(
+            map_service_err(EncryptionServiceError::NetworkAlreadyExists).0,
+            Status::Conflict
+        );
+        assert_eq!(
+            map_service_err(EncryptionServiceError::Db(
+                tinycloud_core::sea_orm::DbErr::Custom("database failure".to_string())
+            ))
+            .0,
+            Status::InternalServerError
+        );
+    }
 }
 
 #[cfg(feature = "dstack")]

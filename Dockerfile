@@ -16,6 +16,7 @@ COPY ./rust-toolchain.toml ./
 COPY ./tinycloud-node-server/ ./tinycloud-node-server/
 COPY ./tinycloud-auth/ ./tinycloud-auth/
 COPY ./tinycloud-core/ ./tinycloud-core/
+COPY ./tinycloud-threshold/ ./tinycloud-threshold/
 COPY ./tinycloud-sdk-rs/ ./tinycloud-sdk-rs/
 COPY ./tinycloud-sdk-wasm/ ./tinycloud-sdk-wasm/
 COPY ./tinycloud-verifier-wasm/ ./tinycloud-verifier-wasm/
@@ -29,6 +30,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG CARGO_FEATURES=""
+RUN case "$CARGO_FEATURES" in *renewal-test-clock*) echo "renewal-test-clock is forbidden in container builds" >&2; exit 1;; esac
 COPY --from=planner /app/recipe.json recipe.json
 COPY --from=planner /app/rust-toolchain.toml ./
 # The [patch]ed sqlx-core (TC-1054) is a path dependency outside the

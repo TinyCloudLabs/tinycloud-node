@@ -10,7 +10,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
-    ConnectionTrait, DbBackend, QueryTrait,
+    ConnectionTrait, DbBackend, QueryTrait, Statement,
 };
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -29,6 +29,7 @@ pub struct Model {
     pub not_before: Option<OffsetDateTime>,
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
+    pub serialization_format: i16,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -198,6 +199,18 @@ pub enum DelegationError {
     AppIdNotBound,
 }
 
+impl DelegationError {
+    /// The stable code of a revocation refusal, `None` for any other error.
+    pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
+        use super::revocation::RevocationCode;
+        match self {
+            Self::ParentRevoked(_) => Some(RevocationCode::ParentRevoked),
+            Self::AncestorRevoked { .. } => Some(RevocationCode::AncestorRevoked),
+            _ => None,
+        }
+    }
+}
+
 /// Verify, validate, and register a delegation inside the caller's transaction.
 ///
 /// Returns `New` when the exact serialization was inserted (and actors,
@@ -209,31 +222,71 @@ pub(crate) async fn process<C: ConnectionTrait>(
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    process_with(db, delegation, encryption, false, true).await
+    process_with(db, delegation, encryption, false, true, None, false).await
 }
 
 /// As `process`; with `delegated_sql_caveats` a SQL capability may carry the
 /// delegated `tables` / `columns` / `readOnly` caveat form (TC-1791). Without
-/// `named_keys` a capability on a key or key prefix is refused.
+/// `named_keys` a capability on a key or key prefix is refused. With
+/// `signature_verified` the caller checked these exact signed bytes with
+/// [`check_signature`] before its transaction (TC-2986); only the time
+/// window is checked here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_with<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
     delegated_sql_caveats: bool,
     named_keys: bool,
+    renewal_identity: Option<(&str, &str, u64)>,
+    signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
-    verify(&delegation.0.delegation).await?;
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(db, &delegation.0, delegated_sql_caveats, named_keys).await?;
+    validate_with(
+        db,
+        &delegation.0,
+        delegated_sql_caveats,
+        named_keys,
+        renewal_identity,
+    )
+    .await?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
-// verify signatures and time
-async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+/// Save only the graph portion of a proofless renewal lease. The transaction
+/// dispatcher must run locked renewal::register_lease before committing: that
+/// validates the signed original's owner, lease bounds, identity and cardinality.
+/// This path grants no generic delegation or control authority.
+pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    signature_verified: bool,
+) -> Result<DelegationRegistration, Error> {
+    if !signature_verified {
+        check_signature(&delegation.0.delegation).await?;
+    }
+    verify_time(&delegation.0.delegation)?;
+    if !delegation.0.parents.is_empty()
+        || !crate::renewal::lease_original_from_signed(delegation)
+            .is_ok_and(|original| original.is_some())
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
+    save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+}
+
+/// Check a delegation's signature: CPU, or a DID resolution when network
+/// methods are on. Runs before any lock (TC-2986).
+pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
-        TinyCloudDelegation::Ucan(ref ucan) => {
+        TinyCloudDelegation::Ucan(ucan) => {
             verify_ucan_signature(ucan)
                 .await
                 .map_err(|error| match error {
@@ -245,21 +298,28 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
                         DelegationError::InvalidSignature
                     }
                 })?;
-            ucan.payload()
-                .validate_time(None)
-                .map_err(|_| DelegationError::InvalidTime)?;
         }
-        TinyCloudDelegation::Cacao(ref cacao) => {
+        TinyCloudDelegation::Cacao(cacao) => {
             cacao
                 .verify()
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
-            if !cacao.payload().valid_now() {
-                return Err(DelegationError::InvalidTime.into());
-            }
         }
     };
     Ok(())
+}
+
+/// Check that a delegation is within its signed time window now.
+fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+    let valid = match delegation {
+        TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_ok(),
+        TinyCloudDelegation::Cacao(cacao) => cacao.payload().valid_now(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DelegationError::InvalidTime.into())
+    }
 }
 
 // TC-1791: refusal reason for a SQL or DuckDB capability whose caveats are
@@ -387,13 +447,31 @@ fn check_app_id_domain_binding(delegation: &util::DelegationInfo) -> Result<(), 
     Ok(())
 }
 
+/// The end a child delegation's expiry is held to: the parent's effective end
+/// from the authorization graph (renewals and ancestors applied), which the
+/// graph keeps in whole seconds (TC-3076). When that end is the parent's own
+/// signed expiry, use the signed expiry at full precision instead. Otherwise
+/// a child expiring at the parent's exact instant, or anywhere in its last
+/// partial second, would be refused. A renewed end (later than that second)
+/// or an ancestor's cap (earlier) is used as it is.
+fn parent_end_for_child(
+    effective_end: Option<i64>,
+    signed_expiry: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
+    match (effective_end, signed_expiry) {
+        (Some(end), Some(signed)) if end == signed.unix_timestamp() => Some(signed),
+        (Some(end), signed) => OffsetDateTime::from_unix_timestamp(end).ok().or(signed),
+        (None, signed) => signed,
+    }
+}
+
 // verify parenthood and authorization
 #[cfg(test)]
 async fn validate<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
 ) -> Result<(), Error> {
-    validate_with(db, delegation, false, true).await
+    validate_with(db, delegation, false, true, None).await
 }
 
 async fn validate_with<C: ConnectionTrait>(
@@ -401,7 +479,26 @@ async fn validate_with<C: ConnectionTrait>(
     delegation: &util::DelegationInfo,
     delegated_sql_caveats: bool,
     named_keys: bool,
+    renewal_identity: Option<(&str, &str, u64)>,
 ) -> Result<(), Error> {
+    if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
+        return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
+    }
+    for parent in &delegation.parents {
+        let parent_id = Hash::from(*parent);
+        let is_renewal_lease = db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
+                [sea_orm::sea_query::Value::Bytes(Some(Box::new(
+                    parent_id.as_ref().to_vec(),
+                )))],
+            ))
+            .await?;
+        if is_renewal_lease.is_some() {
+            return Err(DelegationError::MissingParents.into());
+        }
+    }
     // Without named keys, a capability on a key or key prefix is refused for
     // every delegation, before the root-authority filter, so a delegation
     // issued by the key's owner is covered too.
@@ -452,8 +549,13 @@ async fn validate_with<C: ConnectionTrait>(
         // An owner may grant revocation of one exact stored delegation that
         // targets their space, without holding the target's signed bytes:
         // every non-root capability must be such an exact-CID revoke grant.
-        // The target's delegatee or delegator alone cannot issue one.
+        // TC-3150: the target's delegator may grant its own delegatee
+        // revocation of exactly that target, and no one else. The target's
+        // delegatee alone cannot issue one.
         (false, true) => {
+            if revocation::delegator_hands_back_revoke(db, delegation).await? {
+                return Ok(());
+            }
             for cap in &dependant_caps {
                 if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
                     return Err(DelegationError::MissingParents.into());
@@ -471,10 +573,43 @@ async fn validate_with<C: ConnectionTrait>(
             // Resolve in the signed proof order.  A set-based query is not
             // sufficient here: database row order must never become the
             // authority for the ordered policy/enforcer conjunction.
+            // Load one graph snapshot for all signed proofs, retaining proof order below.
+            let parent_ids: Vec<Hash> =
+                delegation.parents.iter().copied().map(Hash::from).collect();
+            let verifier_now = OffsetDateTime::now_utc().unix_timestamp();
+            let loaded_graph;
+            let graph = if let Some((stable_node_did, renewer_did, epoch)) = renewal_identity {
+                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                    db,
+                    &parent_ids,
+                    stable_node_did,
+                    renewer_did,
+                    epoch,
+                    verifier_now,
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                    crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                        Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+                    }
+                })?;
+                &loaded_graph
+            } else {
+                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &parent_ids)
+                    .await
+                    .map_err(|error| match error {
+                        crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                        crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                            Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+                        }
+                    })?;
+                &loaded_graph
+            };
             let mut all_parents = Vec::with_capacity(delegation.parents.len());
             for parent_cid in &delegation.parents {
-                let Some(parent) = Entity::find_by_id(Hash::from(*parent_cid)).one(db).await?
-                else {
+                let id = Hash::from(*parent_cid);
+                let Some(parent) = graph.delegation(&id).cloned() else {
                     return Err(DelegationError::MissingParents.into());
                 };
                 if !policy_session && parent.delegatee != delegation.delegator {
@@ -496,8 +631,36 @@ async fn validate_with<C: ConnectionTrait>(
             // A revoked grant cannot authorize new descendants. Check both
             // the directly cited parents and their transitive ancestors on
             // every registration so revocation takes effect immediately.
+            let verifier_now = OffsetDateTime::now_utc();
             for parent in &all_parents {
-                ensure_parent_active(db, &parent.id).await?;
+                if graph.is_revoked(&parent.id) {
+                    return Err(
+                        DelegationError::ParentRevoked(parent.id.to_cid(0x55).to_string()).into(),
+                    );
+                }
+                if let Some(ancestor_cid) = graph.first_revoked_ancestor(&parent.id) {
+                    return Err(DelegationError::AncestorRevoked {
+                        ancestor_cid,
+                        parent_cid: parent.id.to_cid(0x55).to_string(),
+                    }
+                    .into());
+                }
+                for chain_id in graph.chain_ids_from(&parent.id) {
+                    if graph.delegation(&chain_id).is_none() {
+                        return Err(DelegationError::MissingParents.into());
+                    }
+                }
+                let effective_expiry = graph
+                    .effective_expiry(&parent.id)
+                    .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
+                    .or(parent.expiry);
+                if effective_expiry.is_some_and(|expiry| verifier_now >= expiry)
+                    || parent
+                        .not_before
+                        .is_some_and(|not_before| verifier_now < not_before)
+                {
+                    return Err(DelegationError::InvalidTime.into());
+                }
             }
 
             let policy_root_parent = all_parents.iter().any(|parent| {
@@ -553,10 +716,12 @@ async fn validate_with<C: ConnectionTrait>(
                 .filter(|p| {
                     // valid time bounds: child's validity must be within parent's validity
                     // expiry: child must expire at or before parent (None = no expiry)
-                    let expiry_valid = match (&p.expiry, &delegation.expiry) {
-                        (None, _) => true,        // parent never expires, any child expiry is valid
-                        (Some(_), None) => false, // parent expires but child doesn't - invalid
-                        (Some(pe), Some(de)) => *de <= *pe, // child must expire at or before parent
+                    let parent_effective_expiry =
+                        parent_end_for_child(graph.effective_expiry(&p.id), p.expiry);
+                    let expiry_valid = match (parent_effective_expiry, delegation.expiry) {
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(parent_end), Some(child_end)) => child_end <= parent_end,
                     };
                     // not_before: child must become valid at or after parent (None = valid immediately)
                     let not_before_valid = match (&p.not_before, &delegation.not_before) {
@@ -1012,6 +1177,7 @@ fn parent_is_terminal(p: &Model) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 async fn ensure_parent_active<C: ConnectionTrait>(db: &C, parent_id: &Hash) -> Result<(), Error> {
     if revocation::is_revoked(db, parent_id).await? {
         return Err(DelegationError::ParentRevoked(parent_id.to_cid(0x55).to_string()).into());
@@ -1060,7 +1226,15 @@ async fn save<C: ConnectionTrait>(
     let hash: Hash = crate::hash::hash(&serialization);
 
     // Encrypt for storage if encryption is configured
-    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
+    let stored_serialization = crate::encryption::maybe_encrypt(
+        encryption,
+        &serialization,
+        crate::encryption::RowBinding::new(
+            "delegation",
+            "serialization",
+            &[&Vec::<u8>::from(hash)],
+        ),
+    );
 
     // Persist the signed-in `delegationMode` marker. We store ONLY the
     // marker we recognize natively (not the full UCAN facts), keeping the
@@ -1097,6 +1271,7 @@ async fn save<C: ConnectionTrait>(
         not_before: delegation.not_before,
         facts,
         serialization: stored_serialization,
+        serialization_format: if encryption.is_some() { 2 } else { 0 },
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
     if db.get_database_backend() == DbBackend::Postgres {
@@ -1267,6 +1442,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -1304,6 +1480,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(ser_a.clone()),
+            serialization_format: Set(0),
         };
 
         // First insert → row is new.
@@ -1396,6 +1573,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(ser),
+                serialization_format: Set(0),
             })
             .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
             .exec(&db)
@@ -1773,7 +1951,7 @@ mod tests {
         for delegator in [KEY_OWNER, OTHER_DID] {
             for resource in [&key, &prefix] {
                 let info = key_grant_info(delegator, resource, KEY_DECRYPT, &[]);
-                let refused = validate_with(&db, &info, false, false).await;
+                let refused = validate_with(&db, &info, false, false, None).await;
                 assert!(
                     matches!(
                         refused,
@@ -1790,13 +1968,173 @@ mod tests {
             "named_keys_unavailable: named keys are not enabled on this node"
         );
         let info = key_grant_info(KEY_OWNER, &network, KEY_DECRYPT, &[]);
-        validate_with(&db, &info, false, false)
+        validate_with(&db, &info, false, false, None)
             .await
             .expect("the owner's bare network grant is not a named-key grant");
         let info = key_grant_info(KEY_OWNER, &key, KEY_DECRYPT, &[]);
-        validate_with(&db, &info, false, true)
+        validate_with(&db, &info, false, true, None)
             .await
             .expect("the same grant is admitted with named keys on");
+    }
+
+    #[tokio::test]
+    async fn child_delegation_uses_renewed_parent_effective_expiry() {
+        use crate::keys::Secrets;
+        use sea_orm::sea_query::Value;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        use time::OffsetDateTime;
+
+        fn db_datetime(value: OffsetDateTime) -> time::PrimitiveDateTime {
+            let utc = value.to_offset(time::UtcOffset::UTC);
+            utc.date().with_time(utc.time())
+        }
+
+        let db = database().await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let original = crate::hash::hash(b"renewal-child-original");
+        let lease = crate::hash::hash(b"renewal-child-lease");
+        let ancestor = crate::hash::hash(b"renewal-child-ancestor");
+        let original_expiry = OffsetDateTime::from_unix_timestamp(now - 60).unwrap();
+        let lease_expiry = OffsetDateTime::from_unix_timestamp(now + 86_400).unwrap();
+        let ancestor_expiry = OffsetDateTime::from_unix_timestamp(now + 7_200).unwrap();
+        let prefix = "tinycloud:did:key:other:files/kv";
+        insert_parent_grant(
+            &db,
+            ancestor,
+            "did:key:other",
+            "did:key:other",
+            prefix,
+            "tinycloud.kv/get",
+        )
+        .await;
+        insert_parent_grant(
+            &db,
+            original,
+            "did:key:other",
+            "did:key:actor",
+            prefix,
+            "tinycloud.kv/get",
+        )
+        .await;
+        insert_delegation(&db, lease, "did:key:other", "did:key:lease").await;
+        for (id, expiry) in [
+            (original, original_expiry),
+            (lease, lease_expiry),
+            (ancestor, ancestor_expiry),
+        ] {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE delegation SET expiry = $1 WHERE id = $2",
+                [
+                    Value::TimeDateTime(Some(Box::new(db_datetime(expiry)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(id)))),
+                ],
+            ))
+            .await
+            .unwrap();
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1,$1,FALSE)",
+                [Value::Bytes(Some(Box::new(Vec::<u8>::from(id))))],
+            ))
+            .await
+            .unwrap();
+        }
+        for child in [original, lease] {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO parent_delegation (parent, child) VALUES ($1,$2)",
+                [
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(ancestor)))),
+                    Value::Bytes(Some(Box::new(Vec::<u8>::from(child)))),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        let secret = crate::keys::StaticSecret::new(vec![7; 32]).unwrap();
+        let stable_did = secret.renewal_node_did().unwrap();
+        let (renewer_did, epoch, audience) = crate::renewal::renewal_identity(&secret);
+        let original_cid = original.to_cid(0x55).to_string();
+        let lease_cid = lease.to_cid(0x55).to_string();
+        let end = now + 1_800;
+        let end_text = OffsetDateTime::from_unix_timestamp(end)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let signer = crate::renewal::RenewalSigner::from_seed(
+            secret.derive_key(crate::renewal::RENEWER_KEY_CONTEXT),
+            stable_did.clone(),
+            epoch,
+        );
+        let (signed_bytes, signature, stamp_cid) = signer
+            .sign_stamp(&original_cid, &lease_cid, 1, &lease_cid, &end_text)
+            .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:other',$3,$4,$5,$6,2592000,$7)",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                Value::String(Some(Box::new(renewer_did.clone()))),
+                Value::BigInt(Some(epoch as i64)),
+                Value::TimeDateTime(Some(Box::new(db_datetime(lease_expiry)))),
+                Value::TimeDateTime(Some(Box::new(db_datetime(original_expiry)))),
+                Value::Bytes(Some(Box::new(audience.to_vec()))),
+            ],
+        )).await.unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO renewal_stamp (cid, original_canonical, lease_cid, generation, previous_stamp_cid, renewer_epoch, new_end, signed_bytes, signature, replay_hash) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9)",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(crate::hash::hash(&signed_bytes))))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                Value::BigInt(Some(epoch as i64)),
+                Value::TimeDateTime(Some(Box::new(db_datetime(OffsetDateTime::from_unix_timestamp(end).unwrap())))),
+                Value::Bytes(Some(Box::new(signed_bytes.to_vec()))),
+                Value::Bytes(Some(Box::new(signature))),
+                Value::Bytes(Some(Box::new(vec![1; 32]))),
+            ],
+        )).await.unwrap();
+
+        let child_resource = "tinycloud:did:key:other:files/kv/doc";
+        let mut child = key_grant_info(
+            "did:key:actor",
+            child_resource,
+            "tinycloud.kv/get",
+            &[original],
+        );
+        child.expiry = Some(OffsetDateTime::from_unix_timestamp(now + 1_200).unwrap());
+        assert!(validate_with(&db, &child, false, true, None).await.is_err());
+        validate_with(
+            &db,
+            &child,
+            false,
+            true,
+            Some((&stable_did, &renewer_did, epoch)),
+        )
+        .await
+        .unwrap();
+        let renewer_grant = key_grant_info(&renewer_did, child_resource, "tinycloud.kv/get", &[]);
+        assert!(matches!(
+            validate_with(
+                &db,
+                &renewer_grant,
+                false,
+                true,
+                Some((&stable_did, &renewer_did, epoch)),
+            )
+            .await,
+            Err(Error::InvalidDelegation(
+                DelegationError::UnauthorizedDelegator(_)
+            ))
+        ));
+        assert_eq!(
+            stamp_cid,
+            crate::hash::hash(&signed_bytes).to_cid(0x55).to_string()
+        );
     }
 
     /// key.delete is refused even when the owner issues it.
@@ -2076,6 +2414,7 @@ mod tests {
                 serde_json::json!("terminal"),
             )])))),
             serialization: Set(id.as_ref().to_vec()),
+            serialization_format: Set(0),
         }
         .insert(db)
         .await
@@ -2284,7 +2623,7 @@ mod tests {
         for delegator in [KEY_OWNER, OTHER_DID] {
             for resource in [app_key(), app_prefix()] {
                 let info = key_grant_info(delegator, &resource, KEY_DECRYPT, &[]);
-                let refused = validate_with(&db, &info, false, false).await;
+                let refused = validate_with(&db, &info, false, false, None).await;
                 assert!(
                     matches!(
                         refused,
@@ -2643,5 +2982,89 @@ mod tests {
             }
         }
         assert_eq!((decided, skipped), (20, 3));
+    }
+
+    /// TC-3076: a child may expire at its parent's exact instant, milliseconds
+    /// included, as node-sdk's useDelegation asks; one millisecond later is
+    /// refused.
+    #[tokio::test]
+    async fn a_child_may_expire_at_its_parents_millisecond_but_not_after() {
+        use sea_orm::sea_query::Expr;
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let db = database().await;
+        let parent = crate::hash::hash(b"tc3076-parent");
+        let prefix = "tinycloud:did:key:other:files/kv";
+        insert_parent_grant(
+            &db,
+            parent,
+            "did:key:other",
+            "did:key:actor",
+            prefix,
+            "tinycloud.kv/get",
+        )
+        .await;
+        let parent_expiry = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        Entity::update_many()
+            .col_expr(Column::Expiry, Expr::value(parent_expiry))
+            .filter(Column::Id.eq(parent))
+            .exec(&db)
+            .await
+            .unwrap();
+        let child_at = |expiry: &str| {
+            let mut child = key_grant_info(
+                "did:key:actor",
+                "tinycloud:did:key:other:files/kv/doc",
+                "tinycloud.kv/get",
+                &[parent],
+            );
+            child.expiry = Some(OffsetDateTime::parse(expiry, &Rfc3339).unwrap());
+            child
+        };
+        for accepted in ["2027-11-15T23:12:08.000Z", "2027-11-15T23:12:08.053Z"] {
+            validate(&db, &child_at(accepted))
+                .await
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+        }
+        let refused = validate(&db, &child_at("2027-11-15T23:12:08.054Z")).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::InvalidDelegation(
+                    DelegationError::ExpiryExceedsParent
+                ))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// TC-3076: only the parent's own signed second is read at full
+    /// precision; a renewed end and an ancestor's cap are used as the graph
+    /// computed them.
+    #[test]
+    fn the_parent_end_is_exact_only_where_it_is_the_signed_expiry() {
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+        let signed = OffsetDateTime::parse("2027-11-15T23:12:08.053Z", &Rfc3339).unwrap();
+        let second = signed.unix_timestamp();
+        let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+        // No renewal: the graph's end is the signed second; the signed instant counts.
+        assert_eq!(
+            parent_end_for_child(Some(second), Some(signed)),
+            Some(signed)
+        );
+        // Renewed past the signed expiry: the renewed end, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second + 600), Some(signed)),
+            Some(at(second + 600))
+        );
+        // Capped by an ancestor before it: the cap, unchanged.
+        assert_eq!(
+            parent_end_for_child(Some(second - 1), Some(signed)),
+            Some(at(second - 1))
+        );
+        // No graph end: the signed expiry; no expiry at all: none.
+        assert_eq!(parent_end_for_child(None, Some(signed)), Some(signed));
+        assert_eq!(parent_end_for_child(None, None), None);
+        // No signed expiry and an unbounded graph end: no expiry, as before.
+        assert_eq!(parent_end_for_child(Some(i64::MAX), None), None);
     }
 }

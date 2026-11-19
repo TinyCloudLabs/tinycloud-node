@@ -12,12 +12,13 @@
  *
  * Heartbeat: ok -> ping; breach or config fault -> /fail; unknown or transient
  * API error -> nothing (the missed-heartbeat alert handles it). A target whose
- * token or heartbeat env is unset is skipped, like write-probe. Logs never
+ * token or heartbeat env is unset fails the run (exit 1, ::error::) so a
+ * missing secret cannot silently disable monitoring (TC-2912). Logs never
  * contain the token, the heartbeat URL, or query text.
  */
 import { readFileSync } from "node:fs";
 import { classify, detail, heartbeatUrl, redact, report, type Delivery, type Fetch } from "./probe-core";
-import { ConfigFault, branchesUrl, evaluateTarget, loadTargets, metricsUrl, parseSeries, productionBranch, type Target, type Verdict } from "./db-saturation";
+import { ConfigFault, branchesUrl, evaluateTarget, loadTargets, metricsUrl, missingSecrets, parseSeries, productionBranch, type Target, type Verdict } from "./db-saturation";
 
 const TIMEOUT_MS = 10_000;
 const TARGETS_FILE = new URL("./db-saturation-targets.json", import.meta.url);
@@ -62,8 +63,9 @@ async function main(): Promise<number> {
     const token = process.env[target.token_secret]?.trim();
     const heartbeatRaw = process.env[target.heartbeat_secret]?.trim();
     if (!token || !heartbeatRaw) {
-      const missing = !token ? target.token_secret : target.heartbeat_secret;
-      console.log(`${target.label}: skipped (${missing} not set)`);
+      // Fail loudly: a silent skip would leave DB saturation unmonitored while the run stays green.
+      console.log(`::error title=DB saturation probe misconfigured::${target.label}: required secret(s) not set: ${missingSecrets(target, process.env).join(", ")}. Saturation is NOT being monitored.`);
+      deliveryFailed = true;
       continue;
     }
     let heartbeat: URL | undefined;

@@ -3,12 +3,20 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::Caveats;
+use crate::hash::Hash;
+use tinycloud_auth::ipld_core::cid::Cid;
+
+const RAW_CODEC: u64 = 0x55;
+const BLAKE3_256_CODE: u64 = 0x1e;
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationQueryDirection {
     Granted,
     Received,
+    /// Delegations whose delegator is the invoking principal itself. Has its
+    /// own authorization path and keyset cursor (TC-2132).
+    Issued,
     #[default]
     All,
 }
@@ -21,6 +29,18 @@ pub enum DelegationQueryStatus {
     Expired,
     Revoked,
     AncestorRevoked,
+}
+
+impl DelegationQueryStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+            Self::AncestorRevoked => "ancestor_revoked",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -78,6 +98,66 @@ impl DelegationQuery {
 
     pub fn encode_cursor(cid: &str) -> String {
         URL_SAFE_NO_PAD.encode(cid.as_bytes())
+    }
+
+    /// Digest of everything an `issued` cursor is bound to: the invoker and
+    /// the `status` / `space` filters. A cursor minted under another invoker
+    /// or filter does not decode.
+    fn issued_binding(&self, invoker: &str) -> String {
+        let binding = serde_json::to_vec(&(
+            "delegation-issued-query-v1",
+            invoker,
+            self.status.map(DelegationQueryStatus::label),
+            self.space.as_deref(),
+        ))
+        .expect("a tuple of strings serializes");
+        URL_SAFE_NO_PAD.encode(crate::hash::hash(&binding).as_ref())
+    }
+
+    /// Cursor for the `issued` direction: the last scanned row id plus the
+    /// binding of invoker and filters.
+    pub fn encode_issued_cursor(&self, invoker: &str, last: Hash) -> String {
+        URL_SAFE_NO_PAD.encode(format!(
+            "i1.{}.{}",
+            last.to_cid(RAW_CODEC),
+            self.issued_binding(invoker)
+        ))
+    }
+
+    /// Decode an `issued` cursor into the row id to continue after. The id is
+    /// only ever a key position inside the invoker's own rows; it is never
+    /// looked up. Anything that is not a cursor minted for this invoker and
+    /// these filters is `InvalidCursor`.
+    pub fn decoded_issued_cursor(
+        &self,
+        invoker: &str,
+    ) -> Result<Option<Hash>, DelegationQueryValidationError> {
+        let Some(cursor) = self.cursor.as_deref() else {
+            return Ok(None);
+        };
+        let invalid = || DelegationQueryValidationError::InvalidCursor;
+        let text = URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(invalid)?;
+        let mut parts = text.split('.');
+        let (Some("i1"), Some(cid), Some(binding), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid());
+        };
+        if binding != self.issued_binding(invoker) {
+            return Err(invalid());
+        }
+        let cid = Cid::try_from(cid).map_err(|_| invalid())?;
+        if cid.codec() != RAW_CODEC
+            || cid.hash().code() != BLAKE3_256_CODE
+            || cid.hash().digest().len() != 32
+        {
+            return Err(invalid());
+        }
+        Ok(Some(Hash::from(cid)))
     }
 }
 

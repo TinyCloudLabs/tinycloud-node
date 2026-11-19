@@ -938,7 +938,8 @@ pub(crate) mod tests {
             let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
             let fragment = did.rsplit_once(':').unwrap().1.to_owned();
             let verification_method = format!("{did}#{fragment}");
-            let space = SpaceId::new(did.parse::<DIDBuf>().unwrap(), "files".parse().unwrap());
+            let space =
+                SpaceId::new(did.parse::<DIDBuf>().unwrap(), "files".parse().unwrap()).unwrap();
             Self {
                 jwk,
                 verification_method,
@@ -949,7 +950,7 @@ pub(crate) mod tests {
 
         /// Another space of this owner: it is the root authority there too.
         fn space_named(&self, name: &str) -> SpaceId {
-            SpaceId::new(self.did.parse::<DIDBuf>().unwrap(), name.parse().unwrap())
+            SpaceId::new(self.did.parse::<DIDBuf>().unwrap(), name.parse().unwrap()).unwrap()
         }
 
         /// One owner-root invocation of `ops`, each in the space it names.

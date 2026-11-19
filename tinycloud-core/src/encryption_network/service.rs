@@ -9,12 +9,18 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
+use sea_orm::{
+    error::{RuntimeErr, SqlxError},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, DbErr, EntityTrait, QueryFilter,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::identity::did_principal_matches;
+use zeroize::Zeroizing;
 
 use crate::db_pool::RecoveringConnection;
 use crate::hash::hash;
@@ -25,7 +31,10 @@ use crate::models::{
 };
 use crate::util::InvocationInfo;
 
-use super::backend::{validate_receiver_public_key, KeyBackend, KeyBackendError};
+use super::backend::{
+    validate_receiver_public_key, wrapped_key_version, KeyBackend, KeyBackendError, KeyWrapContext,
+    KeyWrapPurpose, KeyWrapVersion,
+};
 use super::canonical::{canonical_hash, canonical_json_bytes, hash_hex};
 use super::deletion_ledger::DeletionLedger;
 use super::key_id::{self, EncryptionResource, KeyLocation};
@@ -41,6 +50,7 @@ use super::protocol::{
 };
 use super::types::{
     KeyBackendKind, NetworkDescriptor, NetworkMemberDescriptor, NetworkState, Threshold,
+    ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM,
 };
 
 const DEFAULT_INVOCATION_TTL_SECONDS: i64 = 300;
@@ -134,22 +144,37 @@ fn check_decrypt_scope(
     }
 }
 
-/// Checks alg and key version. Root keys are versioned by the network and
-/// checked here; named keys are versioned by their own row and checked
-/// against the body after unwrap in `decrypt_authorized`.
+/// Accept both wrap algorithms independently of the response writer flag.
+/// Root versions come from the network; named versions are checked against
+/// the key row before opening in `unwrap_named_key`.
 fn check_alg_and_version(
     target: &DecryptTarget,
     descriptor: &NetworkDescriptor,
     body: &DecryptRequestBody,
     facts: &DecryptFacts,
 ) -> Result<(), EncryptionServiceError> {
-    if descriptor.alg != body.alg || descriptor.alg != facts.alg {
+    if descriptor.alg != ALG_X25519_AES256GCM
+        || !matches!(
+            body.alg.as_str(),
+            ALG_X25519_AES256GCM | ALG_X25519_HKDF_AES256GCM
+        )
+        || body.alg != facts.alg
+        || body.key_version <= 0
+        || body.key_version != facts.key_version
+    {
         return Err(EncryptionServiceError::AlgKeyVersionMismatch);
     }
     if matches!(target, DecryptTarget::Root(_))
         && (descriptor.key_version != body.key_version
             || descriptor.key_version != facts.key_version)
     {
+        return Err(EncryptionServiceError::AlgKeyVersionMismatch);
+    }
+    Ok(())
+}
+
+fn check_wrapped_algorithm(alg: &str, wrapped: &[u8]) -> Result<(), EncryptionServiceError> {
+    if wrapped_key_version(wrapped).alg() != alg {
         return Err(EncryptionServiceError::AlgKeyVersionMismatch);
     }
     Ok(())
@@ -162,6 +187,7 @@ fn key_denial_outcome(err: &EncryptionServiceError) -> &'static str {
         EncryptionServiceError::KeyDeleted => "denied:key-deleted",
         EncryptionServiceError::KeyNotFound => "denied:key-not-found",
         EncryptionServiceError::KeyUnwrapFailed(_) => "denied:key-unwrap",
+        EncryptionServiceError::AlgKeyVersionMismatch => "denied:key-version",
         EncryptionServiceError::NetworkNotActive(_) | EncryptionServiceError::NetworkNotFound => {
             "denied:state"
         }
@@ -247,6 +273,8 @@ pub struct EncryptionService {
     node_keypair: Option<Keypair>,
     pub(super) backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
+    key_wrap_version: KeyWrapVersion,
+    key_wrap_require_v2: bool,
     pub(super) sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     pub(super) key_cap_per_network: u64,
     pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
@@ -281,6 +309,8 @@ impl EncryptionService {
             node_keypair: None,
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
+            key_wrap_version: KeyWrapVersion::V1,
+            key_wrap_require_v2: false,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
@@ -302,6 +332,8 @@ impl EncryptionService {
             node_keypair: Some(node_keypair),
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
+            key_wrap_version: KeyWrapVersion::V1,
+            key_wrap_require_v2: false,
             sqlite_writer_lock: None,
             key_cap_per_network: DEFAULT_KEY_CAP_PER_NETWORK,
             deletion_ledger: None,
@@ -309,6 +341,31 @@ impl EncryptionService {
             delete_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
         }
+    }
+
+    /// Select v2 for response wraps only, independently of request policy.
+    pub fn with_key_wrap_v2(mut self, enabled: bool) -> Self {
+        self.key_wrap_version = if enabled {
+            KeyWrapVersion::V2
+        } else {
+            KeyWrapVersion::V1
+        };
+        self
+    }
+
+    /// Require v2 incoming network-key wraps without restricting receiver responses.
+    pub fn with_key_wrap_require_v2(mut self, enabled: bool) -> Self {
+        self.key_wrap_require_v2 = enabled;
+        self
+    }
+
+    fn check_key_wrap_policy(&self, wrapped: &[u8]) -> Result<(), EncryptionServiceError> {
+        if self.key_wrap_require_v2 && wrapped_key_version(wrapped) != KeyWrapVersion::V2 {
+            return Err(EncryptionServiceError::KeyUnwrapFailed(
+                KeyBackendError::InvalidWrappedKey,
+            ));
+        }
+        Ok(())
     }
 
     pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
@@ -398,7 +455,43 @@ impl EncryptionService {
             created_at: Set(now.clone()),
             updated_at: Set(now.clone()),
         };
-        model.insert(&self.db).await?;
+        if let Err(err) = model.insert(&self.db).await {
+            if is_supported_unique_violation(&err) {
+                let finalize_result: Result<bool, DbErr> = async {
+                    let Some(ceremony) =
+                        encryption_ceremony::Entity::find_by_id(ceremony_id.clone())
+                            .one(&self.db)
+                            .await?
+                    else {
+                        return Ok(false);
+                    };
+                    let mut ceremony_active: encryption_ceremony::ActiveModel = ceremony.into();
+                    ceremony_active.state = Set("failed".to_string());
+                    ceremony_active.failure = Set(Some("network_already_exists".to_string()));
+                    ceremony_active.completed_at = Set(Some(now_rfc3339()));
+                    ceremony_active.update(&self.db).await?;
+                    Ok(true)
+                }
+                .await;
+                match finalize_result {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        target: "tinycloud::encryption_network",
+                        event = "network_create_conflict_ceremony_update_failed",
+                        failure_kind = "missing_record",
+                        "could not mark losing network create ceremony as failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        target: "tinycloud::encryption_network",
+                        event = "network_create_conflict_ceremony_update_failed",
+                        failure_kind = "database_error",
+                        "could not mark losing network create ceremony as failed"
+                    ),
+                }
+                return Err(EncryptionServiceError::NetworkAlreadyExists);
+            }
+            return Err(err.into());
+        }
 
         encryption_network_member::ActiveModel {
             network_id: Set(network_id.to_string()),
@@ -444,10 +537,21 @@ impl EncryptionService {
         &self,
         network_id: &NetworkId,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
-        let model = encryption_network::Entity::find_by_id(network_id.to_string())
+        Ok(self.load_network(network_id).await?.0)
+    }
+
+    /// One `encryption_network` lookup, returning the descriptor together with
+    /// the row's sealed private key so a caller that needs both reads the row
+    /// once.
+    async fn load_network(
+        &self,
+        network_id: &NetworkId,
+    ) -> Result<(NetworkDescriptor, Option<Vec<u8>>), EncryptionServiceError> {
+        let mut model = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
             .await?
             .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        let sealed_private_key = model.sealed_private_key.take();
 
         let members = encryption_network_member::Entity::find()
             .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
@@ -466,7 +570,7 @@ impl EncryptionService {
         let backend =
             KeyBackendKind::parse(&model.key_backend).unwrap_or(KeyBackendKind::LocalOneOfOne);
 
-        Ok(NetworkDescriptor {
+        let descriptor = NetworkDescriptor {
             network_id: network_id.clone(),
             owner_did: model.owner_did,
             name: model.name,
@@ -482,7 +586,8 @@ impl EncryptionService {
             key_backend: backend,
             created_at: model.created_at,
             updated_at: model.updated_at,
-        })
+        };
+        Ok((descriptor, sealed_private_key))
     }
 
     pub async fn get_network_by_name(
@@ -756,6 +861,12 @@ impl EncryptionService {
         if !network_id_matches(&cap.with, network_id) {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
+        check_decrypt_scope(
+            &DecryptTarget::Root(network_id.clone()),
+            &cap.with,
+            &body,
+            &invocation.facts,
+        )?;
         if !did_principal_matches(&invocation.issuer, network_id.owner_did()) {
             return Err(EncryptionServiceError::OwnerMismatch);
         }
@@ -777,14 +888,12 @@ impl EncryptionService {
                 ));
             }
         }
-        if descriptor.alg != body.alg || descriptor.key_version != body.key_version {
-            return Err(EncryptionServiceError::AlgKeyVersionMismatch);
-        }
-        if descriptor.alg != invocation.facts.alg
-            || descriptor.key_version != invocation.facts.key_version
-        {
-            return Err(EncryptionServiceError::AlgKeyVersionMismatch);
-        }
+        check_alg_and_version(
+            &DecryptTarget::Root(network_id.clone()),
+            &descriptor,
+            &body,
+            &invocation.facts,
+        )?;
 
         // ---- Time bounds ----
         self.validate_invocation_time(invocation.not_before, invocation.exp)?;
@@ -794,6 +903,9 @@ impl EncryptionService {
             decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
         let wrapped_key_bytes =
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
+        check_receiver_public_key(&receiver_key_bytes)?;
+        check_wrapped_algorithm(&body.alg, &wrapped_key_bytes)?;
+        self.check_key_wrap_policy(&wrapped_key_bytes)?;
 
         let expected_receiver_hash =
             canonical_hash(&Value::String(body.receiver_public_key.clone()));
@@ -842,8 +954,6 @@ impl EncryptionService {
         }
 
         // ---- Unwrap + rewrap ----
-        let sealed = descriptor.key_backend; // unused but documents the choice
-        let _ = sealed;
         let network_row = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
             .await?
@@ -855,12 +965,29 @@ impl EncryptionService {
                 .ok_or(EncryptionServiceError::Backend(
                     KeyBackendError::SealedKeyMissing,
                 ))?;
-        let symmetric = self
-            .backend
-            .unwrap(sealed_private_key, &wrapped_key_bytes)?;
-        let rewrapped = self.backend.rewrap(&symmetric, &receiver_key_bytes)?;
-        // Best-effort: zeroize the transient symmetric key copy.
-        drop(symmetric);
+        let network_urn = network_id.to_string();
+        let context = KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: &network_urn,
+            key_path: "",
+            key_version: descriptor.key_version,
+            metadata: None,
+        };
+        let symmetric = Zeroizing::new(self.backend.unwrap(
+            sealed_private_key,
+            &wrapped_key_bytes,
+            &context,
+        )?);
+        let response_context = KeyWrapContext {
+            purpose: KeyWrapPurpose::ReceiverKey,
+            ..context
+        };
+        let rewrapped = self.backend.rewrap(
+            &symmetric,
+            &receiver_key_bytes,
+            &response_context,
+            self.key_wrap_version,
+        )?;
 
         let mut response = DecryptResponseBody {
             ty: DECRYPT_RESULT_TYPE.to_string(),
@@ -870,7 +997,7 @@ impl EncryptionService {
             encrypted_symmetric_key_hash: expected_key_hash,
             receiver_public_key_hash: expected_receiver_hash,
             wrapped_key: encode_base64(&rewrapped),
-            alg: descriptor.alg.clone(),
+            alg: self.key_wrap_version.alg().to_string(),
             key_version: descriptor.key_version,
             request_hash: request_hash.clone(),
             node_id: self.node_did.clone(),
@@ -931,7 +1058,10 @@ impl EncryptionService {
         let receiver_key =
             decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
         check_receiver_public_key(&receiver_key)?;
-        decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
+        let wrapped =
+            decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
+        check_wrapped_algorithm(&body.alg, &wrapped)?;
+        self.check_key_wrap_policy(&wrapped)?;
         let receiver_hash = canonical_hash(&Value::String(body.receiver_public_key.clone()));
         let key_hash = canonical_hash(&Value::String(body.encrypted_symmetric_key.clone()));
         if receiver_hash != body.receiver_public_key_hash
@@ -980,7 +1110,7 @@ impl EncryptionService {
             .ok_or(EncryptionServiceError::Unauthorized)?;
         check_decrypt_scope(target, &cap.resource.to_string(), &body, &facts)?;
 
-        let descriptor = self.get_network(network_id).await?;
+        let (descriptor, sealed_private_key) = self.load_network(network_id).await?;
         match descriptor.state {
             NetworkState::Active => {}
             NetworkState::Revoked => {
@@ -1006,6 +1136,8 @@ impl EncryptionService {
         check_receiver_public_key(&receiver_key_bytes)?;
         let wrapped_key_bytes =
             decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
+        check_wrapped_algorithm(&body.alg, &wrapped_key_bytes)?;
+        self.check_key_wrap_policy(&wrapped_key_bytes)?;
 
         let expected_receiver_hash =
             canonical_hash(&Value::String(body.receiver_public_key.clone()));
@@ -1046,18 +1178,25 @@ impl EncryptionService {
         // encryption_nonce table a second time. The direct encryption route also reaches this
         // helper without a reservation of its own; that gap is unchanged here.
 
+        let network_urn = network_id.to_string();
+        let context = KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: &network_urn,
+            key_path: body.key_path.as_deref().unwrap_or(""),
+            key_version: body.key_version,
+            metadata: None,
+        };
         let (key_version, symmetric) = match target {
             DecryptTarget::Root(_) => {
-                let network_row = encryption_network::Entity::find_by_id(network_id.to_string())
-                    .one(&self.db)
-                    .await?
-                    .ok_or(EncryptionServiceError::NetworkNotFound)?;
-                let sealed_private_key = network_row.sealed_private_key.as_deref().ok_or(
-                    EncryptionServiceError::Backend(KeyBackendError::SealedKeyMissing),
-                )?;
+                let sealed_private_key =
+                    sealed_private_key
+                        .as_deref()
+                        .ok_or(EncryptionServiceError::Backend(
+                            KeyBackendError::SealedKeyMissing,
+                        ))?;
                 let symmetric = self
                     .backend
-                    .unwrap(sealed_private_key, &wrapped_key_bytes)
+                    .unwrap(sealed_private_key, &wrapped_key_bytes, &context)
                     .map_err(|err| {
                         if matches!(
                             err,
@@ -1090,16 +1229,21 @@ impl EncryptionService {
                         return Err(err);
                     }
                 };
-                if key_version != body.key_version || key_version != facts.key_version {
-                    self.record_native_audit(invocation, target, &facts, "denied:key-version")
-                        .await?;
-                    return Err(EncryptionServiceError::AlgKeyVersionMismatch);
-                }
                 (key_version, symmetric)
             }
         };
-        let rewrapped = self.backend.rewrap(&symmetric, &receiver_key_bytes)?;
-        drop(symmetric);
+        let symmetric = Zeroizing::new(symmetric);
+        let response_context = KeyWrapContext {
+            purpose: KeyWrapPurpose::ReceiverKey,
+            key_version,
+            ..context
+        };
+        let rewrapped = self.backend.rewrap(
+            &symmetric,
+            &receiver_key_bytes,
+            &response_context,
+            self.key_wrap_version,
+        )?;
 
         let mut response = DecryptResponseBody {
             ty: DECRYPT_RESULT_TYPE.to_string(),
@@ -1109,7 +1253,7 @@ impl EncryptionService {
             encrypted_symmetric_key_hash: expected_key_hash,
             receiver_public_key_hash: expected_receiver_hash,
             wrapped_key: encode_base64(&rewrapped),
-            alg: descriptor.alg.clone(),
+            alg: self.key_wrap_version.alg().to_string(),
             key_version,
             request_hash: request_hash.clone(),
             node_id: self.node_did.clone(),
@@ -1423,10 +1567,20 @@ pub(super) fn now_rfc3339() -> String {
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
-
 pub(super) fn is_unique_violation(err: &DbErr) -> bool {
     let s = err.to_string().to_lowercase();
     s.contains("unique") || s.contains("primary") || s.contains("duplicate")
+}
+
+fn is_supported_unique_violation(err: &DbErr) -> bool {
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database)))) = err
+    else {
+        return false;
+    };
+
+    matches!(database.code().as_deref(), Some("23505" | "1555" | "2067"))
 }
 
 fn encode_base64(bytes: &[u8]) -> String {

@@ -1,3 +1,4 @@
+use super::InvokeError;
 use crate::{
     authorization::AuthHeaderGetter,
     config::Config,
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
+    encryption::RowBinding,
     events::Invocation,
     hash::Blake3Hasher,
     hash::Hash,
@@ -91,13 +93,14 @@ async fn authorize_hook_request(
     tinycloud: &TinyCloud,
     policy_v3: &PolicyV3Runtime,
     config: &Config,
-) -> Result<VerifiedHookInvocation, (Status, String)> {
+) -> Result<VerifiedHookInvocation, InvokeError> {
     let capabilities = &invocation.0.capabilities;
     if capabilities.is_empty() || !capabilities.iter().all(is_hook_capability) {
         return Err((
             Status::Forbidden,
             "hooks requests may only invoke tinycloud.hooks capabilities".to_string(),
-        ));
+        )
+            .into());
     }
     let now = OffsetDateTime::now_utc();
     let start = Instant::now();
@@ -109,9 +112,9 @@ async fn authorize_hook_request(
     );
     let admitted = admitted?;
     let policy_session = policy_v3
-        .authorize_invocation(tinycloud, &admitted.invocation().0, now)
+        .authorize_invocation(tinycloud, &admitted.invocation().0, None, now)
         .await
-        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        .map_err(crate::policy_v3::authorization_failure)?;
     Ok(VerifiedHookInvocation {
         admitted,
         policy_session,
@@ -123,7 +126,7 @@ async fn authorize_admitted(
     tinycloud: &TinyCloud,
     config: &Config,
     now: OffsetDateTime,
-) -> Result<AdmittedInvocation, (Status, String)> {
+) -> Result<AdmittedInvocation, InvokeError> {
     let admitted = AdmittedInvocation::admit(invocation, config.invocation.max_lifetime_secs)
         .await
         .map_err(|error| (Status::Unauthorized, error.to_string()))?;
@@ -133,7 +136,13 @@ async fn authorize_admitted(
     tinycloud
         .authorize_admitted(&admitted, now)
         .await
-        .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+        .map_err(|error| {
+            super::authorization_refusal(
+                "server.hooks.auth",
+                &tinycloud_core::db::TxStoreError::Tx(error.into()),
+                false,
+            )
+        })?;
     Ok(admitted)
 }
 
@@ -156,7 +165,7 @@ pub async fn create_hook_ticket(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Json<HookTicketResponse>, (Status, String)> {
+) -> Result<Json<HookTicketResponse>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.ticket.auth",
         invocation.0,
@@ -220,7 +229,9 @@ async fn mint_hook_ticket(
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation)?;
-    let parent_exp = find_parent_expiry(invocation, tinycloud)
+    // The current effective end of the cited delegations (renewal stamps
+    // included), never a projected one: see `find_parent_expiry`.
+    let parent_exp = find_parent_expiry(&invocation.parents, tinycloud, now.unix_timestamp())
         .await?
         .unwrap_or(invocation_exp);
     let requested_ttl = request
@@ -321,7 +332,7 @@ pub async fn hook_events<'r>(
     ticket: &'r str,
     hooks: &'r State<HookRuntime>,
     tinycloud: &'r State<TinyCloud>,
-) -> Result<HookEventStream<EventStream![Event + 'r]>, (Status, String)> {
+) -> Result<HookEventStream<EventStream![Event + 'r]>, InvokeError> {
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
@@ -330,26 +341,59 @@ pub async fn hook_events<'r>(
             tinycloud_core::request_telemetry::observe_space(&space);
         }
     }
+    // Each open (and reopen) re-checks the ticket's authority: the whole
+    // delegation chain for revocation (the cited delegations and every
+    // ancestor), and the chain's current effective end, recomputed now. The
+    // stream ends at the earliest of the ticket's `exp`, its `parent_exp`,
+    // that current end and `max_ticket_ttl_seconds` from now. A stream open
+    // when a delegation in the chain is revoked, or when stamping stops, is
+    // not re-checked: it ends at its deadline, at most
+    // `hooks.max_ticket_ttl_seconds` (300 s by default) later, and the reopen
+    // is refused. Hooks only signal; content is read through KV, which checks
+    // revocation and the effective end per request.
+    let revoked = std::sync::Mutex::new(None);
+    let current_end = std::sync::Mutex::new(None);
     let stream_deadline = hook_stream_deadline(
         &claims,
         hooks.config().max_ticket_ttl_seconds,
         || async {
-            if tinycloud
-                .delegation_chains_unrevoked(&claims.authorizing_delegations)
+            if let Some(code) = tinycloud
+                .delegation_chains_revocation(&claims.authorizing_delegations)
                 .await
                 .map_err(|error| (Status::InternalServerError, error.to_string()))?
             {
-                Ok(())
-            } else {
-                Err((
+                *revoked.lock().unwrap() = Some(code);
+                return Err((
                     Status::Unauthorized,
                     "hook ticket authority revoked".to_string(),
-                ))
+                ));
             }
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let end = find_parent_expiry(&claims.authorizing_delegations, tinycloud, now).await?;
+            if end.is_some_and(|end| end <= now) {
+                return Err((Status::Unauthorized, "hook ticket expired".to_string()));
+            }
+            *current_end.lock().unwrap() = end;
+            Ok(())
         },
         OffsetDateTime::now_utc,
     )
-    .await?;
+    .await
+    .map_err(|(status, message)| match *revoked.lock().unwrap() {
+        Some(code) => InvokeError::Revoked(code, message),
+        None => InvokeError::Text(status, message),
+    })?;
+    let stream_deadline = match current_end
+        .lock()
+        .unwrap()
+        .and_then(|end| OffsetDateTime::from_unix_timestamp(end).ok())
+    {
+        Some(end) => stream_deadline.min(
+            rocket::tokio::time::Instant::now()
+                + Duration::try_from(end - OffsetDateTime::now_utc()).unwrap_or_default(),
+        ),
+        None => stream_deadline,
+    };
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
@@ -358,6 +402,11 @@ pub async fn hook_events<'r>(
 
     let stream = EventStream! {
         let _lease = lease;
+        // `receiver` was subscribed only after ticket and authority checks above.
+        if rocket::tokio::time::Instant::now() >= stream_deadline {
+            return;
+        }
+        yield Event::json(&serde_json::json!({"type": "ready"})).event("ready");
         let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
 
@@ -377,7 +426,7 @@ pub async fn hook_events<'r>(
                             }
                         }
                         Err(rocket::tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            continue;
+                            break;
                         }
                         Err(rocket::tokio::sync::broadcast::error::RecvError::Closed) => {
                             break;
@@ -403,6 +452,9 @@ pub struct HookWebhookRequest {
     pub abilities: Vec<String>,
     pub callback_url: String,
     pub secret: String,
+    /// TC-3123: write-only custom delivery headers. `null`/absent/`{}` = none.
+    #[serde(default)]
+    pub headers: Option<crate::webhook_headers::WebhookHeaders>,
 }
 
 #[derive(Debug, Clone, FromForm)]
@@ -423,6 +475,8 @@ pub struct HookWebhookResponse {
     pub abilities: Vec<String>,
     pub callback_url: String,
     pub secret_key_id: String,
+    /// TC-3123: registered custom header names; values are never returned.
+    pub header_names: Vec<String>,
     pub active: bool,
     pub created_at: String,
 }
@@ -441,7 +495,7 @@ pub async fn create_webhook(
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
     egress: &State<std::sync::Arc<EgressPolicy>>,
-) -> Result<Json<HookWebhookResponse>, (Status, String)> {
+) -> Result<Json<HookWebhookResponse>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.webhook_register.auth",
         invocation.0,
@@ -455,7 +509,8 @@ pub async fn create_webhook(
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
-        ));
+        )
+            .into());
     }
     // Resolve the callback host only for an authorized caller.
     let (callback_url, _) = validate_webhook_callback_url(&request.callback_url, egress)
@@ -470,27 +525,55 @@ pub async fn create_webhook(
         return Err((
             Status::TooManyRequests,
             "webhook subscription limit reached for space".to_string(),
-        ));
+        )
+            .into());
     }
     invocation.consume(replay, config).await?;
 
     let created_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current timestamps should format as RFC3339");
-    let model = hook_subscription::Model {
-        id: hook_subscription_id(
-            &invocation.info().invoker,
-            &normalized,
-            callback_url.as_str(),
-            &created_at,
+    let id = hook_subscription_id(
+        &invocation.info().invoker,
+        &normalized,
+        callback_url.as_str(),
+        &created_at,
+    );
+    let encrypted_secret = webhook_encryption.encrypt(
+        request.secret.as_bytes(),
+        RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+    );
+    let (header_names_json, encrypted_headers, encrypted_headers_format) = match request
+        .headers
+        .as_ref()
+        .filter(|headers| !headers.is_empty())
+    {
+        None => (None, None, 0),
+        Some(headers) => (
+            Some(
+                serde_json::to_string(&headers.names())
+                    .expect("serializing header names cannot fail"),
+            ),
+            Some(webhook_encryption.encrypt(
+                &headers.sealed_plaintext(),
+                crate::webhook_headers::binding(&[id.as_bytes()]),
+            )),
+            2,
         ),
+    };
+    let model = hook_subscription::Model {
+        encrypted_secret_format: 2,
+        header_names_json,
+        encrypted_headers,
+        encrypted_headers_format,
+        id,
         subscriber_did: invocation.info().invoker.clone(),
         space_id: normalized.space.clone(),
         target_service: normalized.service.clone(),
         path_prefix: normalized.path_prefix.clone(),
         abilities_json: hook_subscription::Model::set_abilities(&normalized.abilities),
         callback_url: callback_url.to_string(),
-        encrypted_secret: webhook_encryption.encrypt(request.secret.as_bytes()),
+        encrypted_secret,
         secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
         active: true,
         created_at,
@@ -501,7 +584,7 @@ pub async fn create_webhook(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    webhook_response_from_model(&saved).map(Json)
+    Ok(webhook_response_from_model(&saved).map(Json)?)
 }
 
 #[get("/hooks/webhooks?<query..>")]
@@ -512,7 +595,7 @@ pub async fn list_webhooks(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Json<Vec<HookWebhookResponse>>, (Status, String)> {
+) -> Result<Json<Vec<HookWebhookResponse>>, InvokeError> {
     let invocation = authorize_hook_request(
         "server.hooks.webhook_list.auth",
         invocation.0,
@@ -534,7 +617,8 @@ pub async fn list_webhooks(
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
-        ));
+        )
+            .into());
     }
     invocation.consume(replay, config).await?;
 
@@ -567,6 +651,7 @@ pub async fn list_webhooks(
         .map(|row| webhook_response_from_model(&row))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
+        .map_err(InvokeError::from)
 }
 
 #[delete("/hooks/webhooks/<subscription_id>")]
@@ -577,7 +662,7 @@ pub async fn delete_webhook(
     policy_v3: &State<PolicyV3Runtime>,
     replay: &State<InvocationReplayCache>,
     config: &State<Config>,
-) -> Result<Status, (Status, String)> {
+) -> Result<Status, InvokeError> {
     // Authenticate before the lookup so an unauthenticated caller cannot probe
     // which subscription ids exist.
     let invocation = authorize_hook_request(
@@ -611,7 +696,7 @@ pub async fn delete_webhook(
             .map_err(|e| (Status::InternalServerError, e.to_string()))?,
     };
     if !is_hook_action_authorized(&invocation, &requested_scope, "tinycloud.hooks/unregister") {
-        return Err(not_found());
+        return Err(not_found().into());
     }
     invocation.consume(replay, config).await?;
 
@@ -737,6 +822,11 @@ pub fn normalize_webhook_request(
     }
     if request.secret.len() > 256 {
         return Err((Status::BadRequest, "secret exceeds 256 bytes".to_string()));
+    }
+    if let Some(headers) = &request.headers {
+        headers
+            .validate()
+            .map_err(|message| (Status::BadRequest, message))?;
     }
     validate_callback_length(&request.callback_url)?;
 
@@ -869,6 +959,9 @@ pub fn webhook_response_from_model(
     let abilities = model
         .abilities()
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let header_names = model
+        .header_names()
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     Ok(HookWebhookResponse {
         id: model.id.clone(),
@@ -879,6 +972,7 @@ pub fn webhook_response_from_model(
         abilities,
         callback_url: model.callback_url.clone(),
         secret_key_id: model.secret_key_id.clone(),
+        header_names,
         active: model.active,
         created_at: model.created_at.clone(),
     })
@@ -911,11 +1005,22 @@ fn hook_subscription_id(
     hasher.finalize().to_cid(0x55).to_string()
 }
 
+/// The current effective end of the delegations that authorize a hook ticket:
+/// the earliest, over the cited delegations, of the end `/invoke` reads use.
+/// That is the authorization graph's effective end
+/// (`SpaceDatabase::delegation_effective_expiry`): the latest admitted
+/// renewal stamp of this node's current renewer epoch (stamps of older epochs
+/// or that fail verification are ignored), capped by every ancestor's
+/// effective end. Without one, as for `/invoke`, the signed expiry applies. It
+/// is never a projected end: a stamp counts only once it is stored, so when
+/// stamping stops the end stays at the last stamp's end. `None` when nothing
+/// in the chain expires.
 async fn find_parent_expiry(
-    invocation: &InvocationInfo,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
     tinycloud: &TinyCloud,
+    now: i64,
 ) -> Result<Option<i64>, (Status, String)> {
-    if invocation.parents.is_empty() {
+    if parents.is_empty() {
         return Ok(None);
     }
 
@@ -924,22 +1029,31 @@ async fn find_parent_expiry(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    let parent_ids: Vec<Hash> = invocation
-        .parents
-        .iter()
-        .map(|cid| Hash::from(*cid))
-        .collect();
+    let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
 
-    let expiries = delegation::Entity::find()
+    let signed = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
         .all(&tx)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    drop(tx);
 
-    Ok(expiries
-        .into_iter()
-        .filter_map(|delegation| delegation.expiry.map(|expiry| expiry.unix_timestamp()))
-        .min())
+    let mut end = None;
+    for parent in signed {
+        let effective = tinycloud
+            .delegation_effective_expiry(parent.id, now)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        // A chain with no expiry anywhere resolves to `i64::MAX`.
+        let parent_end = effective
+            .or(parent.expiry.map(|expiry| expiry.unix_timestamp()))
+            .filter(|parent_end| *parent_end != i64::MAX);
+        end = match (end, parent_end) {
+            (Some(end), Some(parent_end)) => Some(std::cmp::min(end, parent_end)),
+            (end, parent_end) => end.or(parent_end),
+        };
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
@@ -1059,6 +1173,7 @@ mod tests {
             path: Some("documents/1".to_string()),
             database_path: None,
             table_name: None,
+            row_id: None,
             actor: "did:key:actor".to_string(),
             epoch: "epoch".to_string(),
             event_index: 1,
@@ -1072,6 +1187,161 @@ mod tests {
                 "queued events must not be emitted after the ticket deadline"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_emits_ready_before_queued_write_events() -> Result<()> {
+        let hooks = test_hook_runtime();
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(tinycloud),
+        )
+        .await?;
+        rocket::tokio::time::pause();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 1,
+                parent_exp: now + 1,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let response = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        hooks.bus().publish(crate::hooks::WriteEvent {
+            event_type: "write".to_string(),
+            id: "epoch:1".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("documents/1".to_string()),
+            database_path: None,
+            table_name: None,
+            row_id: None,
+            actor: "did:key:actor".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+        let body_future = response.into_string();
+        rocket::tokio::pin!(body_future);
+        let advance = async {
+            rocket::tokio::task::yield_now().await;
+            rocket::tokio::time::advance(Duration::from_secs(2)).await;
+        };
+        let (body, ()) = rocket::tokio::join!(&mut body_future, advance);
+        let body = body.unwrap_or_default();
+
+        let ready = body
+            .find("event:ready\ndata:{\"type\":\"ready\"}\n\n")
+            .expect("the authorized stream starts with a ready control event");
+        let write = body
+            .find("event:write\n")
+            .expect("the prequeued write event is delivered");
+        assert!(ready < write, "ready precedes write: {body}");
+
+        let write_data = body[write..]
+            .lines()
+            .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .expect("write event contains JSON data");
+        let event: crate::hooks::WriteEvent = serde_json::from_str(write_data)?;
+        assert_eq!(event.id, "epoch:1");
+        assert_eq!(event.event_type, "write");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_closes_when_broadcast_receiver_lags() -> Result<()> {
+        let config = HooksConfig {
+            sse_broadcast_capacity: 1,
+            ..HooksConfig::default()
+        };
+        let hooks = HookRuntime::new(config, [7u8; 32]);
+        let (_tempdir, tinycloud) = test_tinycloud().await?;
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(tinycloud),
+        )
+        .await?;
+        rocket::tokio::time::pause();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 1,
+                parent_exp: now + 1,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let response = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        for index in 1..=2 {
+            hooks.bus().publish(crate::hooks::WriteEvent {
+                event_type: "write".to_string(),
+                id: format!("epoch:{index}"),
+                space: "tinycloud:space".to_string(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/put".to_string(),
+                path: Some(format!("documents/{index}")),
+                database_path: None,
+                table_name: None,
+                row_id: None,
+                actor: "did:key:actor".to_string(),
+                epoch: "epoch".to_string(),
+                event_index: index,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            });
+        }
+
+        let body_future = response.into_string();
+        rocket::tokio::pin!(body_future);
+        let advance = async {
+            rocket::tokio::task::yield_now().await;
+            rocket::tokio::time::advance(Duration::from_secs(2)).await;
+        };
+        let (body, ()) = rocket::tokio::join!(&mut body_future, advance);
+        let body = body.unwrap_or_default();
+
+        assert!(
+            body.contains("event:ready\ndata:{\"type\":\"ready\"}\n\n"),
+            "authorized stream emits readiness before closing: {body}"
+        );
+        assert!(
+            !body.contains("event:write\n"),
+            "a lagged stream closes rather than skipping missing writes: {body}"
+        );
         Ok(())
     }
 
@@ -1133,7 +1403,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let space_string = space.to_string();
         let hook_resource: ResourceId = space.clone().to_resource(
             "hooks".parse::<Service>()?,
@@ -1167,6 +1437,7 @@ mod tests {
             abilities: vec!["tinycloud.kv/put".to_string()],
             callback_url: "https://example.com/hooks".to_string(),
             secret: "dev-secret".to_string(),
+            headers: None,
         };
 
         let policy = EgressPolicy::from_config(&Config::default(), None).unwrap();
@@ -1192,6 +1463,7 @@ mod tests {
                 abilities: vec!["tinycloud.kv/put".to_string()],
                 callback_url: callback_url.to_string(),
                 secret: "dev-secret".to_string(),
+                headers: None,
             };
             assert!(
                 normalize_webhook_request(
@@ -1364,6 +1636,10 @@ mod tests {
             fixture
                 .tinycloud
                 .create_hook_subscription(hook_subscription::Model {
+                    encrypted_secret_format: 2,
+                    header_names_json: None,
+                    encrypted_headers: None,
+                    encrypted_headers_format: 0,
                     id: id.clone(),
                     subscriber_did: did_of(&fixture.session.1).into(),
                     space_id: fixture.space.to_string(),
@@ -1371,7 +1647,10 @@ mod tests {
                     path_prefix: Some("documents".into()),
                     abilities_json: None,
                     callback_url: (*callback).into(),
-                    encrypted_secret: ColumnEncryption::new([3; 32]).encrypt(b"secret"),
+                    encrypted_secret: ColumnEncryption::new([3; 32]).encrypt(
+                        b"secret",
+                        RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+                    ),
                     secret_key_id: "primary".into(),
                     active: true,
                     created_at: "2026-10-14T00:00:00Z".into(),
@@ -1476,8 +1755,17 @@ mod tests {
                 .await?
                 .unwrap();
             assert_eq!(stored.callback_url, callback);
+            assert_eq!(stored.encrypted_secret_format, 2);
             assert_eq!(
-                ColumnEncryption::new([3; 32]).decrypt(&stored.encrypted_secret)?,
+                ColumnEncryption::new([3; 32]).decrypt_recorded(
+                    &stored.encrypted_secret,
+                    RowBinding::new(
+                        "hook_subscription",
+                        "encrypted_secret",
+                        &[stored.id.as_bytes()]
+                    ),
+                    stored.encrypted_secret_format,
+                )?,
                 secret.as_bytes()
             );
         }
@@ -1571,6 +1859,221 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    const TC3123_AUTH: &str = "Bearer tc3123-value-marker";
+    const TC3123_KEY: &str = "tc3123-key-marker";
+
+    async fn tc3123_register(
+        fixture: &HookRouteFixture,
+        callback: &str,
+        headers: serde_json::Value,
+    ) -> Result<(Status, String)> {
+        let header = fixture.session_header(&[(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"],
+        )])?;
+        let response = fixture
+            .client
+            .post("/hooks/webhooks")
+            .header(rocket::http::Header::new("Authorization", header))
+            .header(rocket::http::ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "space": fixture.space.to_string(), "service": "kv", "pathPrefix": "documents",
+                    "callbackUrl": callback, "secret": "secret", "headers": headers,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        Ok((
+            response.status(),
+            response.into_string().await.unwrap_or_default(),
+        ))
+    }
+
+    /// TC-3123: registered headers are write-only (names on create and list),
+    /// sealed and row-bound at rest, and sent byte-exact with the HMAC intact.
+    #[tokio::test]
+    async fn tc3123_custom_headers_round_trip_names_only_and_sealed() -> Result<()> {
+        use crate::egress::test_support::{callback_server, TestLookup};
+        use tinycloud_core::models::hook_delivery;
+        let mut callback = callback_server(200, None).await?;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        lookup.set("callback.test", &["127.0.0.1"]).await;
+        let policy = std::sync::Arc::new(
+            EgressPolicy::for_test(vec![], lookup.clone(), true)
+                .with_test_root(callback.certificate.clone()),
+        );
+        let fixture = hook_route_fixture_with_policy(
+            &[
+                ("hooks", "kv/documents", "tinycloud.hooks/register"),
+                ("hooks", "kv/documents", "tinycloud.hooks/list"),
+            ],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) = tc3123_register(
+            &fixture,
+            &callback.url,
+            serde_json::json!({"X-Api-Key": TC3123_KEY, "Authorization": TC3123_AUTH}),
+        )
+        .await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(!body.contains("marker"), "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            created["headerNames"],
+            serde_json::json!(["Authorization", "X-Api-Key"])
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let (status, body) =
+            fixture
+                .list(fixture.session_header(&[(
+                    fixture.hooks("kv/documents")?,
+                    &["tinycloud.hooks/list"],
+                )])?)
+                .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(!body.contains("marker"), "{body}");
+        let listed: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            listed[0]["headerNames"],
+            serde_json::json!(["Authorization", "X-Api-Key"])
+        );
+
+        // At rest: no column holds a value; the sealed bytes open only under
+        // this row's binding.
+        let stored = fixture
+            .tinycloud
+            .find_hook_subscription(&id)
+            .await?
+            .unwrap();
+        let sealed = stored.encrypted_headers.clone().unwrap();
+        assert_eq!(stored.encrypted_headers_format, 2);
+        for marker in [TC3123_AUTH, TC3123_KEY, "marker"] {
+            let marker = marker.as_bytes();
+            for bytes in [&sealed, &stored.encrypted_secret] {
+                assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+            }
+        }
+        // Every column is a Model field: bytes above, text columns via Debug.
+        assert!(!format!("{stored:?}").contains("marker"));
+        let encryption = ColumnEncryption::new([3; 32]);
+        assert!(encryption
+            .decrypt_recorded(
+                &sealed,
+                crate::webhook_headers::binding(&[b"sub_other".as_slice()]),
+                2,
+            )
+            .is_err());
+        assert!(encryption
+            .decrypt_recorded(
+                &sealed,
+                RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+                2
+            )
+            .is_err());
+
+        tc1132_queue(&fixture, &id, "delivery_tc3123").await?;
+        crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            crate::config::HooksConfig::default(),
+            encryption,
+            policy,
+        )?
+        .dispatch_due_once()
+        .await?;
+        let (body, headers) =
+            tokio::time::timeout(Duration::from_secs(2), callback.requests.recv())
+                .await?
+                .unwrap();
+        assert_eq!(headers["Authorization"], TC3123_AUTH);
+        assert_eq!(headers["X-Api-Key"], TC3123_KEY);
+        assert_eq!(headers.get_all("Authorization").iter().count(), 1);
+        let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(b"secret")?;
+        hmac::Mac::update(&mut mac, &body);
+        let signature = format!(
+            "sha256={}",
+            hex::encode(hmac::Mac::finalize(mac).into_bytes())
+        );
+        assert_eq!(headers["X-TinyCloud-Signature"], signature);
+        assert_eq!(headers["X-TinyCloud-Subscription-Id"], id);
+        assert_eq!(headers["Content-Type"], "application/json");
+        let delivery = hook_delivery::Entity::find_by_id("delivery_tc3123")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        Ok(())
+    }
+
+    /// TC-3123: injection and reserved names are refused before anything is
+    /// stored, and no refusal echoes a value.
+    #[tokio::test]
+    async fn tc3123_header_refusals_store_nothing_and_never_echo_values() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")]).await?;
+        let long = "v".repeat(1025);
+        for (headers, expected) in [
+            (
+                serde_json::json!({"Authorization": "Bearer marker\r\nX-Evil: 1"}),
+                "headers: invalid value for header \"Authorization\"",
+            ),
+            (
+                serde_json::json!({"Authorization": "marker\u{0}"}),
+                "headers: invalid value for header \"Authorization\"",
+            ),
+            (
+                serde_json::json!({"X-TinyCloud-Signature": "sha256=marker"}),
+                "headers: header \"X-TinyCloud-Signature\" is reserved",
+            ),
+            (
+                serde_json::json!({"hOsT": "marker.example"}),
+                "headers: header \"hOsT\" is reserved",
+            ),
+            (
+                serde_json::json!({"Bad Name": "marker"}),
+                "headers: invalid header name",
+            ),
+            (
+                serde_json::json!({"X-Key": "marker", "x-KEY": "marker"}),
+                "headers: duplicate header \"x-KEY\"",
+            ),
+            (
+                serde_json::json!({"X-Long": format!("marker{long}")}),
+                "headers: value for header \"X-Long\" exceeds 1024 bytes",
+            ),
+        ] {
+            let (status, body) =
+                tc3123_register(&fixture, "https://1.1.1.1/hooks", headers).await?;
+            assert_eq!(status, Status::BadRequest, "{body}");
+            assert_eq!(body, expected);
+        }
+        assert_eq!(fixture.persisted_rows().await?[4], 0);
+
+        // Absent, null and empty headers register with no names and no sealed column.
+        for headers in [serde_json::Value::Null, serde_json::json!({})] {
+            let (status, body) =
+                tc3123_register(&fixture, "https://1.1.1.1/hooks", headers).await?;
+            assert_eq!(status, Status::Ok, "{body}");
+            let created: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(created["headerNames"], serde_json::json!([]));
+            let stored = fixture
+                .tinycloud
+                .find_hook_subscription(created["id"].as_str().unwrap())
+                .await?
+                .unwrap();
+            assert_eq!(stored.header_names_json, None);
+            assert_eq!(stored.encrypted_headers, None);
+            assert_eq!(stored.encrypted_headers_format, 0);
+        }
         Ok(())
     }
 
@@ -1724,6 +2227,10 @@ mod tests {
     #[tokio::test]
     async fn converts_subscription_model_without_secret() {
         let model = hook_subscription::Model {
+            encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: "sub_01".to_string(),
             subscriber_did: "did:key:test".to_string(),
             space_id: "tinycloud:space".to_string(),
@@ -1762,7 +2269,7 @@ mod tests {
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing did"))?
             .parse()?;
-        let space = SpaceId::new(did, "alpha".parse()?);
+        let space = SpaceId::new(did, "alpha".parse()?)?;
         let space_string = space.to_string();
         let hook_resource: ResourceId = space.clone().to_resource(
             "hooks".parse::<Service>()?,
@@ -2004,7 +2511,7 @@ mod tests {
         Ok(SpaceId::new(
             did_of(verification_method).parse::<DIDBuf>()?,
             "alpha".parse()?,
-        ))
+        )?)
     }
 
     /// `path == ""` is the whole service, as in the node SDK's default session
@@ -2087,6 +2594,7 @@ mod tests {
             not_before: Set(None),
             facts: Set(None),
             serialization: Set(b"hooks-session".to_vec()),
+            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
         }
         .insert(&db)
         .await?;
@@ -2419,6 +2927,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tc2514_hook_list_authorization_database_failure_is_retryable() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/list")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/list"][..],
+        )];
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_eq!(status, Status::Ok, "{body}");
+
+        // Fail the first authorization-graph lookup, before the policy gate,
+        // replay insertion, or subscription query can run.
+        fixture.db.clone().close().await?;
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_eq!(status, Status::ServiceUnavailable, "{body}");
+        assert!(
+            body.starts_with(super::super::UNAVAILABLE_RETRYABLE),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn refuses_hook_tickets_without_a_verified_delegation() -> Result<()> {
         let fixture =
             hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
@@ -2638,6 +3169,10 @@ mod tests {
         let existing = fixture
             .tinycloud
             .create_hook_subscription(hook_subscription::Model {
+                encrypted_secret_format: 0,
+                header_names_json: None,
+                encrypted_headers: None,
+                encrypted_headers_format: 0,
                 id: "sub_existing".to_string(),
                 subscriber_did: "did:key:someone-else".to_string(),
                 space_id: fixture.space.to_string(),
@@ -2794,6 +3329,8 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::Unauthorized, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(body["code"], "delegation_revoked");
         Ok(())
     }
 
@@ -2856,10 +3393,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-        assert_eq!(
-            response.into_string().await.as_deref(),
-            Some("hook ticket authority revoked")
-        );
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+        assert_eq!(body["code"], "delegation_revoked");
         Ok(())
     }
 
@@ -2929,6 +3465,7 @@ mod tests {
                 not_before: Set(None),
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
+                serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
             }
             .insert(&fixture.db)
             .await?;
@@ -2979,10 +3516,9 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Unauthorized);
-        assert_eq!(
-            response.into_string().await.as_deref(),
-            Some("hook ticket authority revoked")
-        );
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+        assert_eq!(body["code"], "parent_revoked");
         Ok(())
     }
 
@@ -3157,6 +3693,10 @@ mod tests {
             hook_route_fixture(&[("hooks", "kv/my_docs", "tinycloud.hooks/list")]).await?;
         let space = fixture.space.to_string();
         let row = |id: &str, path_prefix: &str| hook_subscription::Model {
+            encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: id.to_string(),
             subscriber_did: "did:key:other-subscriber".to_string(),
             space_id: space.clone(),
@@ -3195,5 +3735,74 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["exact", "nested"]);
         Ok(())
+    }
+
+    /// TC-2381: a revoked grant is refused on every hooks route with the
+    /// stable `delegation_revoked` code.
+    async fn revoke_session_proof(fixture: &HookRouteFixture) -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"tc2381-revoke-hooks")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(Hash::from(fixture.session_proof)),
+            serialization: Set(b"tc2381-revoke-hooks".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+        Ok(())
+    }
+
+    fn assert_delegation_revoked(status: Status, body: &str) -> Result<()> {
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        let json: serde_json::Value = serde_json::from_str(body)?;
+        assert_eq!(json["code"], "delegation_revoked", "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_register_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture
+            .register(fixture.session_header(&claim)?, &fixture.space)
+            .await;
+        assert_delegation_revoked(status, &body)
+    }
+
+    #[tokio::test]
+    async fn webhook_list_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/list")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/list"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture.list(fixture.session_header(&claim)?).await;
+        assert_delegation_revoked(status, &body)
+    }
+
+    #[tokio::test]
+    async fn webhook_unregister_under_a_revoked_grant_is_delegation_revoked() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/unregister")]).await?;
+        let claim = [(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/unregister"][..],
+        )];
+        revoke_session_proof(&fixture).await?;
+        let (status, body) = fixture
+            .unregister(fixture.session_header(&claim)?, "some-subscription")
+            .await;
+        assert_delegation_revoked(status, &body)
     }
 }
