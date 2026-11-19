@@ -54,7 +54,7 @@ use tinycloud_core::{
     sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement},
     space_purge_database::{PURGED_BY_OWNER, PURGED_BY_SPACE},
     space_purge_fence::FenceError,
-    space_purge_ledger::{LedgerKeys, LedgerRecord},
+    space_purge_ledger::{owner_object_key, LedgerKeys, LedgerRecord},
     sql::{SqlRequest, SqlService},
     storage::{either::Either, StorageConfig},
 };
@@ -760,6 +760,61 @@ async fn assert_erased(
     assert!(!datadir.join("sql").join(space.to_string()).exists());
 }
 
+/// Encryption rows of `network`: network, key, member, ceremony, audit.
+async fn encryption_rows(db: &DatabaseConnection, network: &str) -> [i64; 5] {
+    let mut rows = [0; 5];
+    for (n, table) in [
+        "encryption_network",
+        "encryption_network_key",
+        "encryption_network_member",
+        "encryption_ceremony",
+        "encryption_audit",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[n] = count(
+            db,
+            &format!("SELECT count(*) FROM {table} WHERE network_id=$1"),
+            vec![network.into()],
+        )
+        .await;
+    }
+    rows
+}
+
+/// The owner-erasure pass runs after the purge completes: wait for its
+/// signed `("owner","erased")` record and its row delete.
+async fn wait_owner_erased(
+    db: &DatabaseConnection,
+    ledger: &dyn PurgeLedgerStore,
+    keys: &LedgerKeys,
+    canonical: &str,
+    network: &str,
+) {
+    let path = owner_object_key(
+        KEY_ID,
+        &hex::encode(keys.target_hmac(KEY_ID, "owner", canonical).unwrap()),
+        "erased",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(body) = ledger.read_purge_record(&path).await.unwrap() {
+            if encryption_rows(db, network).await == [0; 5] {
+                let record = keys.verify(&path, &body).unwrap();
+                assert_eq!(
+                    (record.kind.as_str(), record.state.as_str()),
+                    ("owner", "erased")
+                );
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "the owner was never erased");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn start(figment: &Figment) -> Client {
     Client::tracked(tinycloud::app(figment).await.unwrap())
         .await
@@ -882,6 +937,21 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
              VALUES($1,'key','test','active','\\x01','now','now')",
             vec![network.clone().into()],
         ),
+        (
+            "INSERT INTO encryption_network_member(network_id,node_id,role,share_index,joined_at)
+             VALUES($1,'node','member',1,'now')",
+            vec![network.clone().into()],
+        ),
+        (
+            "INSERT INTO encryption_ceremony(ceremony_id,network_id,kind,state,started_at)
+             VALUES($1||'#ceremony',$1,'test','complete','now')",
+            vec![network.clone().into()],
+        ),
+        (
+            "INSERT INTO encryption_audit(request_hash,requester,network_id,node_id,outcome,decided_at)
+             VALUES($1||'#audit',$2,$1,'node','ok','now')",
+            vec![network.clone().into(), canonical.clone().into()],
+        ),
     ] {
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -918,9 +988,11 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
         "artifact_account",
         "encryption_network",
         "encryption_network_key",
+        "encryption_audit",
     ] {
         assert!(owned[table] > 0, "{table}: {owned:?}");
     }
+    assert_eq!(encryption_rows(&db, &network).await, [1; 5]);
 
     // The pre-purge backup: the whole database and the data bucket.
     snapshot_database(&db, &schema, &snapshot).await;
@@ -951,13 +1023,17 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
     assert_eq!(space_objects(&s3, &stores.data, &b).await, b_objects);
     assert_eq!(owner_rows(&db, owner.address()).await, owned);
 
-    // 4. B is the owner's last space: its purge also removes the owner rows.
+    // 4. B is the owner's last space: once it is purged, the owner-erasure
+    //    pass writes the signed `erased` record and then deletes the owner's
+    //    encryption rows, `encryption_audit` included (TC-2871 option A).
     let purge_b = purge(&client, ledger, &keys, &owner, &b).await;
     wait_complete(&db, &[&purge_b]).await;
     assert_erased(&db, &s3, &stores.data, datadir, &b).await;
     assert_eq!(ledger_records(ledger, &keys, &b, "complete").await, 1);
+    wait_owner_erased(&db, ledger, &keys, &canonical, &network).await;
     let gone = owner_rows(&db, owner.address()).await;
     assert!(gone.values().all(|n| *n == 0), "owner rows left: {gone:?}");
+    assert_eq!(gone["encryption_audit"], 0);
     stop(client).await;
 
     // 5. Restore the pre-purge backup: A's (and B's) rows and objects return,
@@ -975,9 +1051,12 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
 
     // 6. `tinycloud node purge-ledger reconcile` (node stopped): from the
     //    ledger alone it re-fences both spaces and the owner, re-creates the
-    //    tombstones, resumes both purges and erases the signed prefixes.
+    //    tombstones, resumes both purges, erases the signed prefixes, and
+    //    deletes the owner's restored encryption rows again through the
+    //    `erased` record.
+    assert_eq!(encryption_rows(&db, &network).await, [1; 5], "restored");
     let first = tinycloud::reconcile_purge_ledger(&config).await.unwrap();
-    assert_eq!(first.records, 5, "{first:?}");
+    assert_eq!(first.records, 6, "{first:?}");
     assert_eq!(first.owner_retirements, 1, "{first:?}");
     assert_eq!(first.space_fences, 2, "{first:?}");
     assert_eq!(first.tombstones_created, 2, "{first:?}");
@@ -986,6 +1065,9 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
     // sign its KV and SQL prefixes.
     assert_eq!(first.prefixes_purged, 8, "{first:?}");
     assert_eq!(first.prefixes_deferred, 0, "{first:?}");
+    assert_eq!(first.owners_erased_redeleted, 1, "{first:?}");
+    assert_eq!(first.blocked_rows_present, 0, "{first:?}");
+    assert_eq!(encryption_rows(&db, &network).await, [0; 5]);
     for space in [&a, &b] {
         assert!(space_objects(&s3, &stores.data, space).await.is_empty());
     }
@@ -1036,6 +1118,7 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
             .cloned(),
         sql_objects: PurgeSqlObjects::open(&config.storage).await.unwrap(),
         encryption: None,
+        deletions: None,
     });
     let held = runtime.fence.lifecycle_operation().await;
     let pass = tokio::spawn({
@@ -1063,6 +1146,7 @@ async fn erase30_owner_spaces_purge_and_restore_reconcile_on_postgres_and_minio(
     assert_eq!(in_process.repaired_copies, 0, "{in_process:?}");
     assert_eq!(in_process.purges_in_progress, 0, "{in_process:?}");
     assert_eq!(in_process.prefixes_purged, 0, "{in_process:?}");
+    assert_eq!(in_process.owners_erased_redeleted, 0, "{in_process:?}");
     drop(node_stores);
     stop(client).await;
 
