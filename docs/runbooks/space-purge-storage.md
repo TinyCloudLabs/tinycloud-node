@@ -19,7 +19,9 @@ The ledger bucket:
 
 ## 2. Old versions in the data bucket
 
-The data bucket is versioned. A purge deletes current objects, and S3 keeps each deleted object as a noncurrent version. The node does not delete versions and needs no `s3:DeleteObjectVersion` permission. A lifecycle rule on the data bucket expires noncurrent versions 7 days after they become noncurrent, and removes expired delete markers. Purged bytes are therefore gone from the bucket at most 7 days after the purge (plus the provider's lifecycle lag).
+The production data bucket is `tinycloud-production-blocks` (us-west-1). Per Amos's read-only check on 11-19, versioning has never been enabled on it and it has no lifecycle rules. In that state a purge's deletes are final and no old version remains. The node never deletes versions and needs no `s3:DeleteObjectVersion` permission. This is a dated readback, not a guarantee: restore runbook step 2 reads the state again at every restore (`get-bucket-versioning`, `get-bucket-lifecycle-configuration`).
+
+If versioning is ever turned on, the same change must add a lifecycle rule that expires noncurrent versions 7 days after they become noncurrent and removes expired delete markers. With that rule, purged bytes leave the bucket at most 7 days after the purge, plus the provider's lifecycle lag. Without it, a purge leaves every old version behind.
 
 ## 3. Never Object Lock on the data bucket
 

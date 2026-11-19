@@ -9,7 +9,7 @@ Storage rules it relies on: `docs/runbooks/space-purge-storage.md`.
 | Store | On restore |
 |---|---|
 | Node Postgres (backup or point-in-time) | Restored. Holds deleted spaces and keys again. |
-| Data bucket (`tinycloud-production-blocks`, us-west-1; KV blocks, SQL objects) | Not restored. It is unversioned and has no lifecycle rules, so purged prefixes stay purged and no old version remains. If versioning is ever turned on, a 7-day noncurrent-version rule must be added with it. |
+| Data bucket (`tinycloud-production-blocks`, us-west-1; KV blocks and SQL objects) | Not restored. Purged prefixes stay purged. Whether old versions of purged objects remain depends on the bucket's versioning and lifecycle state. Step 2 reads that state at every restore; the rule is in `space-purge-storage.md` §2. |
 | Purge ledger (`[storage.purge_ledger]`: `tinycloud-node-purge-ledger`, us-west-1; Object Lock COMPLIANCE, 365 days) | Not restored. It is read live and is the record of every accepted and completed purge. |
 | Encryption-network key-deletion log (`encryption_network.deletion_ledger_path`, `deletions.jsonl`) | Not restored. It lives on the node's volume and has no backup (Sam, 10-25). If the volume is lost, so is the log. |
 
@@ -18,11 +18,28 @@ The database is the only store that goes back in time. Every step below re-appli
 ## Before restore
 
 1. Fence the node: no ingress, no route served, no worker running. Reads, writes, `space/create`, `space/host` and sync all stay off until step 9. Once the operator purge path (S12) exists: its window is off (`[lifecycle.operator_purge] enabled_until` absent) and `TINYCLOUD_PURGE_OPERATOR_SECRET` is unset.
-2. Check the purge ledger bucket `tinycloud-node-purge-ledger`:
+2. Check both buckets, read-only. Keep each command's output with the restore record.
+
+   Ledger bucket `tinycloud-node-purge-ledger`:
    - Object Lock is on, with a COMPLIANCE default retention of 365 days; versioning is on; public access is blocked.
    - The bucket policy denies `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` and any request without TLS.
-   - The node IAM user's policy (the node uses a static IAM user key, not a role) allows only `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on the bucket. It explicitly denies `s3:DeleteObject`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold` and `s3:PutBucketObjectLockConfiguration`. This grant is a Sam step and is not applied yet; until it is, this check fails by design.
-   - No lifecycle rule expires ledger objects.
+   - The node authenticates with a static IAM user key (`AWS_KEY` / `AWS_SECRET`), not a role, and the data bucket uses the same key. That user's policy:
+     - allows `s3:PutObject` and `s3:GetObject` on the ledger objects (`arn:aws:s3:::tinycloud-node-purge-ledger/_purge-ledger/*`, plus `_operator-audit/*` once S12 exists), and `s3:ListBucket` on `arn:aws:s3:::tinycloud-node-purge-ledger`;
+     - denies `s3:DeleteObject`, `s3:PutObjectRetention` and `s3:PutObjectLegalHold` on those same ledger objects;
+     - denies `s3:PutBucketObjectLockConfiguration` and `s3:PutLifecycleConfiguration` on the bucket ARN `arn:aws:s3:::tinycloud-node-purge-ledger` itself (bucket-level, not `/*`).
+     - None of these denies names the data bucket or a wildcard resource.
+
+     This grant is a Sam step and has not been applied yet. Until it is, this check fails by design.
+   - `aws s3api get-bucket-lifecycle-configuration --bucket tinycloud-node-purge-ledger` shows no rule that expires ledger objects.
+
+   Data bucket `tinycloud-production-blocks`:
+   - `aws s3api get-bucket-versioning --bucket tinycloud-production-blocks` returns no `Status`, meaning versioning has never been enabled.
+   - `aws s3api get-bucket-lifecycle-configuration --bucket tinycloud-production-blocks` returns `NoSuchLifecycleConfiguration`.
+   - Together, these two results mean a purge's deletes are final and no old version of a purged object remains. That is the state Amos read on 11-19.
+   - If `Status` is `Enabled` or `Suspended`, old versions of purged objects can still exist. The lifecycle configuration must then hold a rule that expires noncurrent versions 7 days after they become noncurrent and removes expired delete markers.
+     - Without that rule, stop: purged bytes are still in the bucket.
+     - With it, write in the restore record that old versions of purged objects last up to 7 days plus the provider's lifecycle lag.
+   - `aws s3api get-object-lock-configuration --bucket tinycloud-production-blocks` returns `ObjectLockConfigurationNotFoundError` (storage doc §3).
 3. Check that every integrity key named by a ledger record's `keyId` is available. Never regenerate or guess a missing key.
 4. Check that `deletions.jsonl` is present and its lock file is not held by another process.
 
@@ -38,7 +55,12 @@ If any check in steps 2-4 fails, stop. Keep the node fenced and alert with count
 7. Reconcile the purge ledger against the restored database:
    - Verify every record's HMAC before using it. An invalid record is an alert; do not skip it and do not serve.
    - Re-apply every owner retirement to the registry and to each configured TinyCloud-operated host. Every host must import the retirement before `space/create` or `space/host` is allowed.
-   - Re-create the fence of every accepted purge and resume it. The worker lists the exact `{SpaceId}/` prefix, deletes, and lists again until empty. A purge is never un-fenced.
+   - Re-create the fence of every accepted purge and resume it. A purge is never un-fenced. A record authenticates each prefix it purges by an HMAC tied to a store kind. The worker lists candidate prefixes in each store and acts only on a candidate whose HMAC is in the record (`VerifiedPurgePrefix::verify_candidate` in `tinycloud-node-server/src/storage/purge_reconcile.rs`; `purge_restore_prefix_batch` in `purge_restore.rs`). The prefixes, by store:
+     - KV blocks: `{SpaceId}/` in the block store (S3 or filesystem).
+     - SQL objects: the space's namespace `sql/v1/{enc(SpaceId)}/`, or the hashed form `sql/v1/~{sha256}/` when the encoded ID is too long. A hashed namespace is purged as it is. No space ID or owner is recovered from it.
+     - The space's SQLite and DuckDB caches: drained and evicted.
+
+     Each prefix is listed from the start, deleted, and listed again until empty. A provider cursor never counts as progress.
    - Re-create the completion tombstone of every completed purge. A completed space ID stays unavailable; no new space is created under it.
    - Where the database and the ledger disagree, the ledger wins: resume or re-run the purge. Never delete a ledger record or treat a database-only state as authoritative.
    - Ledger records lock for 365 days, and a record older than that may legally be gone. A missing record never means "never purged". For a space purged more than a year before the backup was taken, the restored database still carries its tombstone, and that tombstone stays even with no ledger record behind it.
@@ -61,4 +83,4 @@ If any check in steps 2-4 fails, stop. Keep the node fenced and alert with count
 
 ## What this runbook does not erase
 
-It removes deleted data from live storage after a restore. Copies outside live storage are bounded by their own expiry, not by this runbook: database backups and point-in-time history (14-day cap) and logs. The data bucket holds no old versions while it stays unversioned; if versioning is ever turned on, old versions last up to 7 days under the rule that must be added with it.
+It removes deleted data from live storage after a restore. Copies outside live storage are bounded by their own expiry, not by this runbook: database backups and point-in-time history (14-day cap) and logs. Old versions in the data bucket are bounded by whatever step 2 found: none while the bucket is unversioned; up to 7 days plus the provider's lifecycle lag under the noncurrent rule if versioning is on.
