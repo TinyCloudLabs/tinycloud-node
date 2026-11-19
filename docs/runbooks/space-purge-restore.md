@@ -1,6 +1,7 @@
-# Space purge restore runbook v1.5 (TC-2871)
+# Space purge restore runbook v1.6 (TC-2871)
 
-Restoring a node database backup brings back every space and key that was deleted after the backup was taken. This runbook keeps those deletions deleted. It replaces two earlier versions:
+Restoring a node database backup brings back every space and key that was deleted after the backup was taken. This runbook keeps those deletions deleted. It replaces three earlier versions:
+- v1.5 (#645 head `58980fde`, never frozen). Its review found the node user's ledger policy had lost "allows only", so a broad allow on the shared key could reach the ledger, and the filesystem KV prefix was wrong.
 - v1.4 (`tc-2871-space-delete-restore-runbook-v1.4.md`, SHA-256 `a09c01bf…9eeb`). Its freeze was voided on review: its data-bucket facts went unchecked, its re-purge covered only `{SpaceId}/`, and it lacked the lifecycle deny.
 - v1.3 (`tc-2871-space-delete-restore-runbook-v1.3.md`, SHA-256 `73059c50…5bef`). It assumed the purge ledger lived under `_purge-ledger/` in the data bucket.
 
