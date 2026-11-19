@@ -19,3 +19,13 @@ RUN sed -i \
     && grep -q '^error_log  /dev/stderr notice;$' /etc/nginx/nginx.conf \
     && mkdir -p /var/log/nginx \
     && ln -sf /dev/stderr /var/log/nginx/error.log
+
+# The base entrypoint generates the nginx server block with
+# `ssl_ecdh_curve secp384r1;`, so X25519-first clients (browsers, curl, Bun)
+# pay a HelloRetryRequest round trip on every new connection. Offer X25519 and
+# P-256 first; P-384 stays allowed, so this is not a security downgrade. The
+# checks fail the build if the base image changes this line.
+RUN test "$(grep -cF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh)" = 1 \
+    && sed -i 's#ssl_ecdh_curve secp384r1;#ssl_ecdh_curve X25519:prime256v1:secp384r1;#' /scripts/entrypoint.sh \
+    && test "$(grep -cF 'ssl_ecdh_curve X25519:prime256v1:secp384r1;' /scripts/entrypoint.sh)" = 1 \
+    && ! grep -qF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh
