@@ -74,6 +74,15 @@ fn main() {
         }
         return;
     }
+    // TC-887: take the at-rest root variables out of the environment while
+    // this is the only thread, before the config loader reads `TINYCLOUD_*`.
+    match tinycloud::at_rest::RootEnv::take() {
+        Ok(root_env) => root_env.stash(),
+        Err(error) => {
+            eprintln!("\n✗ Failed to start tinycloud-node:\n\n  {error:#}");
+            std::process::exit(1);
+        }
+    }
     // The runtime `#[rocket::main]` used to set up: worker and blocking
     // thread counts come from ROCKET_WORKERS / ROCKET_MAX_BLOCKING.
     rocket::execute(start_server());
@@ -87,8 +96,12 @@ async fn start_server() {
         .skip(1)
         .any(|arg| arg == "--validate-config")
     {
-        match resolve_runtime_config(&tinycloud_config) {
-            Ok(_) => {
+        let checked = resolve_runtime_config(&tinycloud_config).and_then(|resolved| {
+            let root_env = tinycloud::at_rest::RootEnv::for_boot()?;
+            tinycloud::validate_at_rest(&resolved, &root_env)
+        });
+        match checked {
+            Ok(()) => {
                 eprintln!("tinycloud-node runtime configuration is valid");
                 return;
             }

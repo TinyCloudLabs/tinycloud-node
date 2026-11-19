@@ -37,9 +37,26 @@ def context(ident: dict) -> bytes:
         c += lp(struct.pack(">q", ident["revision"]))
         for f in ("checkpoint_content_hash", "delta_content_hash"):
             c += lp(ident[f].encode())
+    elif p == "sql-manifest":
+        for f in ("service", "space", "name"):
+            c += lp(ident[f].encode())
+        c += lp(struct.pack(">q", ident["revision"]))
+        c += lp(ident["content_hash"].encode())
+        c += lp(struct.pack(">q", ident["size_bytes"]))
+        c += manifest_part(ident["checkpoint"])
+        if ident["delta"] is None:
+            c += lp(b"\x00")
+        else:
+            c += lp(b"\x01") + manifest_part(ident["delta"])
     else:
         raise ValueError(p)
     return c
+
+
+def manifest_part(part: dict) -> bytes:
+    enc = b"" if part["encoding"] is None else struct.pack(">h", part["encoding"])
+    return (lp(part["content_hash"].encode()) + lp(struct.pack(">q", part["size_bytes"]))
+            + lp(enc))
 
 
 def header(dek_id: int, plen: int, salt: bytes) -> bytes:
@@ -85,6 +102,17 @@ CKPT = {"purpose": "sql-checkpoint", "service": "sqlite", "space": SPACE, "name"
 WAL = {"purpose": "sql-wal", "service": "sqlite", "space": SPACE, "name": "notes", "revision": 42,
        "checkpoint_content_hash": "bafkreiexamplecheckpoint",
        "delta_content_hash": "bafkreiexampledelta"}
+MANIFEST = {"purpose": "sql-manifest", "service": "sqlite", "space": SPACE, "name": "notes",
+            "revision": 42, "content_hash": "bafkreiexamplelogical", "size_bytes": 200015,
+            "checkpoint": {"content_hash": "bafkreiexamplecheckpoint", "size_bytes": 200000,
+                           "encoding": 1},
+            "delta": {"content_hash": "bafkreiexampledelta", "size_bytes": 15, "encoding": 1}}
+MANIFEST_NO_DELTA = {"purpose": "sql-manifest", "service": "sqlite", "space": SPACE,
+                     "name": "notes", "revision": 41,
+                     "content_hash": "bafkreiexamplecheckpoint", "size_bytes": 200000,
+                     "checkpoint": {"content_hash": "bafkreiexamplecheckpoint",
+                                    "size_bytes": 200000, "encoding": None},
+                     "delta": None}
 
 CASES = [
     ("kv-empty", 1, KV, {"hex": ""}),
@@ -95,6 +123,8 @@ CASES = [
     ("kv-segment-plus-one", 1, KV, {"pattern_len": SEG + 1}),
     ("sql-checkpoint-multi-segment", 3, CKPT, {"pattern_len": 200000}),
     ("sql-wal-short", 0xFFFFFFFF, WAL, {"hex": b"wal frame bytes".hex()}),
+    ("sql-manifest-with-delta", 3, MANIFEST, {"hex": ""}),
+    ("sql-manifest-no-delta", 3, MANIFEST_NO_DELTA, {"hex": ""}),
 ]
 MAX_PLAIN = (1 << 32) * SEG  # 2^48: the largest plaintext TCE1 can hold
 U64_MAX = (1 << 64) - 1

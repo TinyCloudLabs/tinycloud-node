@@ -73,6 +73,7 @@ use tinycloud_core::{
 
 pub mod admin;
 pub mod admin_stats;
+pub mod at_rest;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;
@@ -235,6 +236,36 @@ pub(crate) fn database_failure(
     (status, body)
 }
 
+/// TC-887: the status for an invocation whose block-store step failed for
+/// at-rest reasons (503 keys unavailable, 500 integrity/unsupported), if so.
+pub(crate) fn at_rest_invoke_status(
+    e: &TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+) -> Option<Status> {
+    match e {
+        TxStoreError::StoreRead(err) | TxStoreError::StoreWrite(err) => {
+            crate::storage::sealed::block_store_at_rest_error(err).map(|e| e.status())
+        }
+        _ => None,
+    }
+}
+
+/// A KV read failure: 503/500 for at-rest causes (TC-887), 500 otherwise.
+pub(crate) fn kv_read_failure(
+    e: tinycloud_core::storage::either::EitherError<
+        DbErr,
+        <BlockStores as ImmutableReadStore>::Error,
+    >,
+) -> (Status, String) {
+    use tinycloud_core::storage::either::EitherError;
+    let status = match &e {
+        EitherError::B(err) => crate::storage::sealed::block_store_at_rest_error(err)
+            .map(|e| e.status())
+            .unwrap_or(Status::InternalServerError),
+        EitherError::A(_) => Status::InternalServerError,
+    };
+    (status, e.to_string())
+}
+
 /// The database error inside a [`TxError`], for [`track_writes_retrying`].
 fn tx_database_error<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> Option<&DbErr> {
     match error {
@@ -343,6 +374,18 @@ pub struct NodeInfo {
     /// when the node's database is not PostgreSQL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresInfo>,
+    /// Encryption at rest (TC-887): omitted unless the node is configured
+    /// for it. Details at `/at-rest/status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_rest: Option<AtRestInfo>,
+}
+
+#[derive(Serialize)]
+pub struct AtRestInfo {
+    pub mode: &'static str,
+    /// `locked` means encrypted data is unavailable until recovery.
+    pub state: &'static str,
+    pub encrypting: bool,
 }
 
 /// Process-wide PostgreSQL connection counters in [`NodeInfo`].
@@ -360,6 +403,7 @@ fn build_info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     database: Option<&tinycloud_core::RecoveringConnection>,
+    at_rest: Option<&crate::at_rest::AtRestRuntime>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -405,6 +449,13 @@ fn build_info(
                 sockets_configured: sqlx_core::net::tcp_keepalive::sockets_configured(),
                 connections_opened: crate::postgres_connections_opened(),
             }),
+        at_rest: at_rest
+            .filter(|r| r.keyring().is_some())
+            .map(|r| AtRestInfo {
+                mode: r.mode_name(),
+                state: r.state_name(),
+                encrypting: r.encrypting(),
+            }),
     }
 }
 
@@ -434,8 +485,16 @@ pub fn info(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    at_rest: crate::at_rest::AtRestState<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        at_rest.0,
+    ))
 }
 
 #[get("/version")]
@@ -445,8 +504,16 @@ pub fn version(
     encryption: &State<EncryptionService>,
     config: &State<crate::config::Config>,
     pool: NodePool<'_>,
+    at_rest: crate::at_rest::AtRestState<'_>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, config, pool.0))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        config,
+        pool.0,
+        at_rest.0,
+    ))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -553,7 +620,7 @@ pub async fn signed_kv_get(
             if kv_result.is_ok() { "ok" } else { "error" },
             kv_start.elapsed(),
         );
-        return match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+        return match kv_result.map_err(kv_read_failure)? {
             Some((metadata, hash, content)) => {
                 validate_signed_kv_hash_binding(&ticket, &hash)?;
                 Ok(SignedKvReadResponse::from_range(metadata, hash, content))
@@ -568,7 +635,7 @@ pub async fn signed_kv_get(
         if kv_result.is_ok() { "ok" } else { "error" },
         kv_start.elapsed(),
     );
-    match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+    match kv_result.map_err(kv_read_failure)? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
             Ok(SignedKvReadResponse::Full {
@@ -2703,6 +2770,9 @@ async fn invoke_impl(
                             .into()
                     );
                 }
+                if let Some(status) = at_rest_invoke_status(&e) {
+                    return Err((status, e.to_string()).into());
+                }
                 if let Some(code) = e.revocation_code() {
                     return Err(InvokeError::Revoked(code, e.to_string()));
                 }
@@ -4222,6 +4292,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
         DuckDbError::Internal(_) => Status::InternalServerError,
+        DuckDbError::Unavailable => Status::ServiceUnavailable,
     }
 }
 

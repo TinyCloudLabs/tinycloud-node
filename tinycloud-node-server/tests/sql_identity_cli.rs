@@ -4,7 +4,10 @@ use tinycloud_auth::{resolver::DID_METHODS, resource::SpaceId, ssi::jwk::JWK};
 use tinycloud_core::{
     migrations::Migrator,
     models::database_artifact,
-    sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
+    sea_orm::{
+        ActiveValue::{NotSet, Set},
+        Database, EntityTrait,
+    },
     sea_orm_migration::MigratorTrait,
 };
 
@@ -47,7 +50,9 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
         .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('existing-web-row');")
         .unwrap();
     drop(sqlite);
-    database_artifact::ActiveModel {
+    // Insert only the columns a snapshot of that age has: the newest
+    // migrations are not applied yet.
+    database_artifact::Entity::insert(database_artifact::ActiveModel {
         service: Set("sql".into()),
         space: Set(space.clone()),
         name: Set("threads".into()),
@@ -64,8 +69,11 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
         delta_payload: Set(None),
         delta_content_hash: Set(None),
         delta_size_bytes: Set(0),
-    }
-    .insert(&conn)
+        payload_encoding: NotSet,
+        delta_encoding: NotSet,
+        manifest: NotSet,
+    })
+    .exec_without_returning(&conn)
     .await
     .unwrap();
     drop(conn);

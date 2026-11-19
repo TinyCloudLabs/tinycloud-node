@@ -25,6 +25,7 @@ use std::{
 };
 
 pub mod allow_list;
+pub mod at_rest;
 pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
@@ -261,6 +262,10 @@ use routes::{
         delete_quota, get_quota, get_renewals, get_usage, list_quotas, set_quota, set_renewals,
     },
     admin_stats::get_stats,
+    at_rest::{
+        at_rest_escrow, at_rest_escrow_record, at_rest_recovery, at_rest_recovery_share,
+        at_rest_status,
+    },
     attestation::attestation,
     create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
@@ -580,9 +585,16 @@ fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
 }
 
-fn node_artifact_repository(tinycloud: &TinyCloud) -> SeaOrmDatabaseArtifactRepository {
+/// The node's artifact repository. It seals SQL and DuckDB artifacts by the
+/// node's at-rest state, so building it declares that seal path (TC-887).
+fn node_artifact_repository(
+    tinycloud: &TinyCloud,
+    at_rest: &Arc<at_rest::AtRestRuntime>,
+) -> SeaOrmDatabaseArtifactRepository {
+    at_rest.declare_seal_path(at_rest::SealPath::SqlArtifacts);
     SeaOrmDatabaseArtifactRepository::new(tinycloud.connection().clone())
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_at_rest(at_rest.clone())
 }
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
@@ -651,6 +663,25 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     Ok(resolved)
 }
 
+/// The at-rest part of `--validate-config`: the same [`at_rest::check_config`]
+/// the node runs at startup, with the root variables `main` took
+/// ([`at_rest::RootEnv::take`]). It opens no key, database or socket, so the
+/// guest agent counts as absent: with a TEE indicated, at-rest is refused
+/// here, because its TEE checks run only at boot inside the TEE.
+pub fn validate_at_rest(tinycloud_config: &Config, root_env: &at_rest::RootEnv) -> Result<()> {
+    let roots = at_rest::Roots::read(&tinycloud_config.at_rest, &[], root_env)?;
+    at_rest::check_config(
+        &tinycloud_config.at_rest,
+        &roots,
+        at_rest::STORAGE_SEALS_EVERY_WRITE,
+        tinycloud_config.storage.sql.chunked_artifacts,
+        at_rest::TeeState {
+            indicated: dstack_indication(&tinycloud_config.tee),
+            present: false,
+        },
+    )
+}
+
 /// The named-key routes. Mounted only while `named_keys_v1` is on, so with it
 /// off these paths answer as any unmounted path does.
 fn named_key_routes() -> Vec<Route> {
@@ -693,6 +724,11 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         public_kv_list,
         public_kv_options,
         attestation,
+        at_rest_status,
+        at_rest_escrow,
+        at_rest_escrow_record,
+        at_rest_recovery,
+        at_rest_recovery_share,
         set_quota,
         delete_quota,
         get_quota,
@@ -739,6 +775,9 @@ pub async fn app_with_control(
     tinycloud_config: &Config,
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
+    // TC-887: the at-rest root variables, out of the environment before
+    // anything else reads it (`main` already took them; tests haven't).
+    let root_env = at_rest::RootEnv::for_boot()?;
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
     let request_id_origins =
         tracing::RequestIdOrigins::new(&tinycloud_config.log.request_id_first_party_origins)
@@ -846,6 +885,9 @@ pub async fn app_with_control(
                         })
                     }
                     Err(e) => {
+                        // TC-887: at-rest must not boot as non-TEE when it
+                        // can't tell; that would skip its TEE checks.
+                        at_rest::refuse_unknown_tee(&tinycloud_config.at_rest, &e)?;
                         ::tracing::warn!("dstack socket available but get_info failed: {}", e);
                         None
                     }
@@ -894,6 +936,10 @@ pub async fn app_with_control(
     .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
     .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2);
 
+    // TC-887: at-rest state, before block storage opens so storage can hold
+    // it; the keyring is installed after migrations (`at_rest::setup`).
+    let at_rest_runtime = at_rest::AtRestRuntime::new(&tinycloud_config.at_rest);
+
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.
     // Object sizes come from that listing; a separate HEAD afterwards could
@@ -903,10 +949,12 @@ pub async fn app_with_control(
     // before any request is served.
     tinycloud_core::db::migrate(&database_connection).await?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
-    let block_store: BlockStores = match &tinycloud_config.storage.blocks {
+    let mut block_store: BlockStores = match &tinycloud_config.storage.blocks {
         Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
         Either::B(local) => Either::B(local.open().await?),
     };
+    // TC-887: before the orphan collector's clone, so it names sealed copies.
+    storage::attach_at_rest(&mut block_store, &at_rest_runtime);
     let orphan_store = block_store.clone();
     let tinycloud = TinyCloud::new_with_encryption(
         database_connection,
@@ -1010,7 +1058,7 @@ pub async fn app_with_control(
         tc_bench_block_get,
         tc_bench_health,
     ]);
-    let raw_artifact_repository = node_artifact_repository(&tinycloud)
+    let raw_artifact_repository = node_artifact_repository(&tinycloud, &at_rest_runtime)
         .with_max_write_bytes(
             tinycloud_config
                 .storage
@@ -1049,6 +1097,21 @@ pub async fn app_with_control(
     // space in the table one (existing byte counts are kept).
     let seeded_spaces = tinycloud.seed_store_sizes().await?;
     ::tracing::info!(spaces = seeded_spaces, "seeded block-store space sizes");
+    // TC-887: at-rest keys (after migrations). Off unless configured; an
+    // `encrypt`/`strict` mode whose escrow gate fails stops the boot here.
+    at_rest::setup(
+        &at_rest_runtime,
+        &tinycloud_config.at_rest,
+        &tinycloud_config.storage,
+        key_setup.as_bytes(),
+        &root_env,
+        seed_conn.clone(),
+        tinycloud.sqlite_writer_lock(),
+        tee_context.as_ref(),
+        dstack_indication(&tinycloud_config.tee),
+    )
+    .await?;
+    at_rest_runtime.spawn_gate_retry(std::time::Duration::from_secs(30));
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,
@@ -1304,6 +1367,7 @@ pub async fn app_with_control(
         .manage(egress_policy)
         .manage(rate_limiter)
         .manage(tee_context)
+        .manage(at_rest_runtime)
         .manage(encryption_service)
         .manage(policy_v3_runtime)
         .manage(seed_conn.clone())
@@ -2055,7 +2119,10 @@ mod sqlite_tuning_tests {
         .await
         .unwrap();
         // Exercise the production repository wiring as well as its write path.
-        let repository = node_artifact_repository(&node);
+        let repository = node_artifact_repository(
+            &node,
+            &at_rest::AtRestRuntime::new(&config::AtRestConfig::default()),
+        );
         let actor_id = "did:key:artifact-snapshot-fixture";
         actor::ActiveModel {
             id: Set(actor_id.to_owned()),

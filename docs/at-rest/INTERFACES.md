@@ -1,9 +1,9 @@
 # Encryption at rest: interfaces (TC-887)
 
-> **Status (TC-887):** on `main` today: the envelope, key types, `DataKeyProvider` and the
-> harness. Not on `main` yet: key continuity (`docs/at-rest-escrow.md`, `at_rest::keyring`,
-> node wiring) and sealed KV storage (§7). They land with PRs #325–#327 and #329/#333/#336
-> (#336: the S3 store seals KV blocks).
+> **Status (TC-887):** the envelope, key types, `DataKeyProvider`, the keyring
+> (`at_rest::keyring`), the node wiring (`docs/at-rest-escrow.md`), the storage view
+> (`at_rest::{AtRestMode, AtRestView, AtRestSource}`), sealed KV storage (§7) and sealed SQL
+> artifacts (§8) are in. Both declare their seal path, so `encrypt` and `strict` can be configured.
 
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
@@ -69,6 +69,10 @@ pub trait DataKeyProvider: Send + Sync {
     fn object_name_key(&self) -> Result<ObjectNameKey, DataKeyError>;
 }
 
+/// Runs `f` as work under the invoke write lock: providers make no key-store
+/// writes there; a key that would need creating or restoring is `NotPrepared`.
+pub async fn write_locked<F: Future>(f: F) -> F::Output;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DataKeyError {
     /// Node booted locked (W cannot unseal ARK). Callers map to HTTP 503.
@@ -81,6 +85,9 @@ pub enum DataKeyError {
     /// PG/S3/unwrap failure (incl. a wrapped DEK failing AEAD). Opaque, no key bytes.
     #[error("data key backend: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A key needed creating or restoring inside `write_locked`. Callers map to 503.
+    #[error("the space's data key was not prepared before the write lock")]
+    NotPrepared,
 }
 ```
 
@@ -97,7 +104,12 @@ pub enum BlobIdentity<'a> {                      // what the ciphertext is bound
                     checkpoint_content_hash: &'a str, checkpoint_size_bytes: u64 },
     SqlWal        { service: &'a str, space: &'a str, name: &'a str, revision: i64,
                     checkpoint_content_hash: &'a str, delta_content_hash: &'a str },
+    SqlManifest   { service: &'a str, space: &'a str, name: &'a str, revision: i64,
+                    content_hash: &'a str, size_bytes: i64,
+                    checkpoint: SqlManifestPart<'a>, delta: Option<SqlManifestPart<'a>> },
 }
+pub struct SqlManifestPart<'a> { pub content_hash: &'a str, pub size_bytes: i64,
+                                 pub encoding: Option<i16> }   // §8
 
 /// Parsed, validated 64-byte header (unknown version/alg/flags/padding refused).
 pub struct Header { /* raw bytes, dek_id, plaintext_len */ }
@@ -216,10 +228,13 @@ Header, 64 bytes, all integers big-endian:
 Context (identity) bytes, every variable field `u32 BE len ‖ bytes`:
 ```
 ctx = lp("tinycloud/at-rest/v1") ‖ lp(purpose) ‖ lp(field_1) ‖ … ‖ lp(field_n)
-purpose ∈ {"kv-block","sql-checkpoint","sql-wal"}
+purpose ∈ {"kv-block","sql-checkpoint","sql-wal","sql-manifest"}
 kv-block:       space, content_hash (multihash bytes)
 sql-checkpoint: service, space, name, checkpoint_content_hash, u64 BE checkpoint_size_bytes
 sql-wal:        service, space, name, i64 BE revision, checkpoint_content_hash, delta_content_hash
+sql-manifest:   service, space, name, i64 BE revision, content_hash, i64 BE size_bytes,
+                part(checkpoint), then [0x00] (no delta) or [0x01], part(delta)
+part(p):        p.content_hash, i64 BE p.size_bytes, p.encoding (empty = NULL, else i16 BE)
 ```
 Keys and nonces:
 ```
@@ -269,6 +284,14 @@ pub fn sealed_object_name(nk: &ObjectNameKey, space: &str, hash: &Hash) -> Strin
 back to plaintext. Whether a blob is legacy is decided by the caller from the name or the
 column, before any bytes are read.
 
+**Generation suffix.** A KV blob lifetime is `(space, content hash, generation)` (TC-735): the
+legacy name of generation `N > 0` is `{space}/{b64url(digest)}@N`, generation 0 has no suffix.
+The sealed name follows the same rule: `sealed_object_name(nk, space, hash)` plus `@N` for
+`N > 0`. The suffix is appended outside the HMAC, so the HMAC inputs (and the KAT vectors) are
+unchanged, and the AEAD identity (`BlobIdentity::KvBlock { space, content_hash }`) does not
+include the generation. On disk the sealed name is the path `v1/{space_tag}/{object_tag}[@N]`
+under the block directory.
+
 ## 6. Test helper
 `at_rest::FixedKeyProvider` — in-memory `DataKeyProvider` with fixed DEKs per
 (space, dek_id) and a `locked()` constructor. No persistence. **Compiled only under
@@ -284,14 +307,144 @@ redacted.
 - **Accepted residual (header trust):** `Content-Length`/`Content-Range`/416 totals come from the
   unverified header. A forged header can only produce a wrong total or a body that aborts with
   no unauthenticated bytes (test `storage::sealed::tests::forged_header_length_aborts_without_extra_bytes`),
-  never wrong bytes.
+  never wrong bytes. On S3 a range read's segment GET is pinned to the header GET's ETag
+  (`If-Match`) and its `Content-Range` must equal the computed ciphertext span: if the object is
+  replaced or removed in between, the read starts over once, then answers 503. It never falls back
+  to the legacy name once a sealed header was read.
+- **S3 deletion charges:** a lost DELETE response is settled per copy (legacy and sealed are
+  tracked apart). The boot listing can't name sealed objects (keys arrive after storage opens), so
+  a sealed object whose DELETE lands after a restart's listing stays counted until the next
+  restart (a conservative over-count, never an under-count).
 - **Quota:** plaintext bytes. Sealed objects are scanned by `space_tag` and joined to a space when
   the object-name key is unlocked (lazily, per lookup), so the first quota check after an unlock
   counts legacy + sealed. While locked, a space reports legacy bytes only (writes are 503 then).
   A sealed object with an invalid TCE1 length counts 0 bytes; the warning is rate-limited and
-  carries only the length.
-- **Errors:** at-rest causes map explicitly to 503 (keys unavailable / key store) or 500
-  (integrity, unsupported, legacy refused in strict) on `/invoke` and the KV GET routes. The
-  general "store error → 401" catch-all is tracked separately (TC-1347).
+  carries only the length. The S3 boot scan lists `v1/` separately from the KV prefix; the FS
+  scan reads `{blocks}/v1/` (not a DID directory). A `.tc-stage-` file under `v1/` is charged its
+  stored bytes, like a stage in a space directory. Seeding a hosted space's entry (TC-1578) never
+  resets or hides the bytes counted under its tag.
+- **Errors:** at-rest causes map explicitly to 503 (keys unavailable, key store unavailable, key
+  not prepared) or 500 (integrity, unsupported, legacy refused in strict, inconsistent key store)
+  on `/invoke` and the KV GET routes (signed and public). Bodies carry reason codes only; backend
+  detail goes to the server log. Integrity and unsupported failures are logged (typed,
+  rate-limited, named by the sealed name only), including ones that abort a response
+  mid-stream. The general "store error → 401" catch-all is tracked separately (TC-1347).
+- **Prepare before the write lock:** a writing invocation's spaces are prepared after the
+  preupload transaction (TC-735) authorized it and checked its spaces are hosted, and before any
+  upload, sequence or writer lock, or transaction: written spaces get their current data key
+  (created if new). A request refused by its authorization or hosting checks therefore creates no
+  data key or mirror object; no separate pre-authorization is needed (the preupload transaction
+  already authorizes before any key work). Work under the writer lock (the upload of a protected
+  legacy meeting path) runs in `at_rest::write_locked`, where the provider only looks keys up and
+  a key that would need creating or restoring is `NotPrepared` (503), never a key-store write that
+  would wait on the lock the request holds. Block reads hold no writer lock (a `kv/get` is
+  answered after COMMIT, TC-2986, and a KV write mixed with a read is refused before any work),
+  so a key the database lost is restored on first use there.
+- **Accepted residual (late refusals prepare keys):** a refusal that comes after the spaces were
+  prepared, in the write's own transaction (a failed `If-Match`/`If-None-Match` precondition, 412,
+  or a replayed invocation, 409), can leave a new data key and its mirror object for a space it
+  wrote nothing to. It is the key that space's first write would create; nothing is sealed under it.
+- **Accepted residual (generation not in the AEAD identity):** a block's AAD binds its space and
+  content hash but not its `@N` generation (§5), so a sealed object of one generation opens in
+  place of another generation of the same block. Every generation holds the same plaintext (the
+  content hash), so only same-content replay is possible.
+- **Accepted residual (linkability during the transition):** in `encrypt`, a read of a
+  legacy-only block asks for the sealed name first, then the legacy name (`strict` probes the legacy
+  name to answer "legacy refused"). A storage provider's access logs can therefore link a
+  `space_tag` to its space id (and an object tag to its content hash) for every space read before
+  the backfill, for the life of the object-name key.
+- **Downgrade window until `strict`:** legacy objects are served without a hash check. In `off` or
+  `encrypt`, someone who can write the bucket and delete sealed objects can serve any bytes under the
+  legacy names they know. `strict` (after the backfill) closes this.
+- **Removal (orphan collection, TC-735):** `remove` deletes both copies of the generation, the
+  sealed name and the legacy name, and `cleanup_stages` reclaims incomplete stages beside both.
+  While keys are set up but locked the sealed name cannot be computed, so both refuse (503) and the
+  collector retries later; a sealed object is never left behind unnamed while its candidate is
+  retired. On disk a crashed sealed write leaves `v1/{space_tag}/.tc-stage-{object}-*`, charged its
+  stored bytes at boot like a stage in a space directory.
 - **Reserved names:** The key-continuity key mirror lives under `_tc/` in the block bucket (`datadir/at-rest` on
   FS). The block boot scan skips it.
+
+## 8. SQL artifacts
+External authoritative payloads are sealed: the durable copy of each SQL and DuckDB database is a
+`database_artifact` row, `payload` (the checkpoint) and `delta_payload` (the WAL delta).
+`SeaOrmDatabaseArtifactRepository` seals and opens them; it reads a fresh `AtRestView` per
+operation (`with_at_rest`), and the node's repository declares `SealPath::SqlArtifacts`.
+- **Local working files are not sealed (known limitation, a later phase).** Local working files
+  (SQL and DuckDB working and cache files, upload staging, exports) rely on the CVM's encrypted
+  storage; operators without a TEE must protect the node's local paths, swap and file-level
+  backups themselves (for example, `node.sh`'s `data.tar.gz` is not encrypted). They are: KV
+  ingress staging (`TempFileSystemStage`, a `NamedTempFile` in the system temp directory,
+  `tinycloud-node-server/src/storage/file_system.rs`); the SQL and DuckDB working databases and
+  WAL files under `{datadir}/sql` and `{datadir}/duckdb`, and the hydration staging files a cold
+  read writes beside them (`CacheFileSink` in `database_artifacts.rs`, `sql/service.rs`,
+  `sql/database.rs`, `duckdb/database.rs`).
+- **Columns:** `payload_encoding` and `delta_encoding` (SMALLINT, `NULL` = legacy plaintext; §5)
+  and `manifest` (BLOB/BYTEA, `NULL` = no tag), migration
+  `m20261118_010000_artifact_payload_encoding`. Each encoding is written with its part: a full
+  save sets `payload_encoding` and clears the delta with its `delta_encoding`; a delta save sets
+  `delta_encoding` only, so a legacy checkpoint can carry a sealed delta. Every save rewrites
+  `manifest`.
+- **Plaintext metadata:** `size_bytes`, `checkpoint_size_bytes`, `delta_size_bytes` and the three
+  content hashes stay those of the plaintext database file. They are part of the identity (§4),
+  and quota (`SqlSizes`) and the SQL growth check read them unchanged. Accepted residual: as
+  before, anyone who can read the table sees each database's size and content hash.
+- **Identity:** checkpoint `SqlCheckpoint { service, space, name, checkpoint_content_hash,
+  checkpoint_size_bytes }`; delta `SqlWal { service, space, name, revision, checkpoint_content_hash,
+  delta_content_hash }`, where `revision` is the row revision the delta was written at (always the
+  row's current revision). A part moved to another row, space, name, revision or checkpoint is
+  an integrity failure.
+- **Manifest (what the row holds, authenticated):** the part identities alone don't say which
+  parts a row must have. A checkpoint opens whatever the revision and whether or not a delta
+  belongs with it, so someone who can write the table could drop a sealed delta (clear the delta
+  columns, reset the unkeyed `content_hash` and `size_bytes`) and a cold read would serve the
+  checkpoint alone, silently losing committed rows. So every sealed save also stores a tag in
+  `manifest`: a TCE1 seal of an empty plaintext under the space's current data key with
+  `SqlManifest { service, space, name, revision, content_hash, size_bytes, checkpoint:
+  (checkpoint_content_hash, checkpoint_size_bytes, payload_encoding), delta: None | Some(
+  (delta_content_hash, delta_size_bytes, delta_encoding)) }` (§4). That is a keyed MAC over the
+  row's manifest, 80 bytes, naming its data key in its header like any sealed part, so it survives
+  key rotation. A full save writes it with `delta: None`, a delta save with the delta; both
+  rewrite it in the same `UPDATE` as the parts. Every read (`read_chunks`, and `open_row` for the
+  offline tool) checks it before any part reaches the sink: a dropped or added delta, a part or
+  metadata from another revision, a changed revision, or a changed encoding fails as integrity
+  (`AtRestIntegrity { part: "manifest" }`, 500), never a partial read. Unknown or invalid
+  encoding columns keep their own errors. Mode `off` writes no tag and clears it (its writes stay
+  plaintext and need no key), so a row without a tag is accepted only if it has no sealed part, or
+  if its only sealed part is a checkpoint under a delta mode `off` wrote; a row with any other
+  sealed part and no tag fails as integrity.
+  Whether a row has a WAL is the authenticated metadata's answer (`delta_content_hash`): a
+  streamed read reads `delta_payload` only when the metadata names one, and `open_row` refuses
+  a stored WAL column that disagrees with it, missing or extra (`AtRestIntegrity { part: "wal" }`).
+  **Not protected:** a whole-row rollback, i.e. replacing the row with an older, valid,
+  self-consistent snapshot of itself (parts, metadata and tag all from the same earlier
+  revision), opens. So do rows with no tag: legacy parts are unauthenticated, as in §5, including
+  a delta written in mode `off` over a sealed checkpoint (`strict` refuses that legacy delta).
+- **Stored length and reads:** a TCE1 part stores exactly `ciphertext_len(size)` bytes. The
+  streamed read slices the stored bytes (`substr`, 4 MiB) and opens them one 64 KiB segment at a
+  time (`SegmentOpener`); the last slice of a sealed part asks for one byte past that length, so
+  bytes appended to the part, or a part cut short, fail as integrity. The content hashes are
+  checked over the plaintext, and sinks receive plaintext, so the cache sink still checks the
+  SQLite/DuckDB file header. At most one segment is buffered beyond what the sink keeps.
+- **Writes:** mode `off` stores plaintext exactly as before. Any other mode seals with
+  `provider.current_key(space)` or fails (`AtRestUnavailable`), never plaintext. `current_key`
+  runs before the SQLite writer lock, since it may create the space's key; sealing runs in
+  `spawn_blocking`.
+- **Errors:** keys locked, missing or the encrypt gate closed → 503 (`SqlError::Unavailable`,
+  `DuckDbError::Unavailable`). `UnknownKey`, a malformed header, a header length that disagrees
+  with the row, a stored length that disagrees with it, a manifest tag that doesn't match the row
+  (or is missing where one is required), and any AEAD failure → 500 integrity; `Unsupported`
+  (header or column `2..=9`) → 500 "upgrade the node"; a legacy part in `strict` → 500. A sealed
+  part whose column says `NULL` fails the manifest check; it is never served.
+- **Accepted residual (legacy injection in `encrypt`):** someone who can write the table can
+  replace a row with legacy plaintext parts and no tag (any content, with matching hashes), and
+  `encrypt` serves it, as it serves any legacy row. `strict` (after the backfill) refuses it.
+- **Offline tool:** `tinycloud-sql-identity offline-fingerprint` has no keys and refuses sealed
+  rows (`database_migration::offline_inventory` takes the provider). `open_row` checks the
+  manifest tag first, like a streamed read.
+- **Rollback:** a build without this change ignores the columns. It cannot hydrate a sealed part
+  (the file-header check fails), and a save it makes over a sealed row without reading it
+  (DuckDB `import_db`) leaves `payload_encoding = 1` on plaintext and a `manifest` tag for the
+  previous contents, which this build then refuses as integrity. Roll back below this change only
+  with no sealed rows; a row an older build overwrote that way needs its encoding columns and
+  `manifest` set back to `NULL`.

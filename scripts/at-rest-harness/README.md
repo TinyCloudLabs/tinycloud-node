@@ -69,10 +69,10 @@ exits 0 only if every check matches:
 | 4 | a check errored: compile failure, harness failure, a precondition (`harness no-op`/`harness gap`) or a node error, i.e. not a RED finding (per check; wins over 3) |
 
 Defaults: `test green` expects `kv=green,sql=green`. `test red` expects
-`kv=red,sql=red`, or `kv=green,sql=red` if the run was started with
-`TC887_AT_REST_MODE=encrypt` or `strict`, because S3 seals KV before S4 seals
-SQL. When S4 lands, the SQL default flips to green (`default_expect` in
-`harness.sh`). CI runs `test red --expect red` until S3 lands.
+`kv=red,sql=red`, or `kv=green,sql=green` if the run was started with
+`TC887_AT_REST_MODE=encrypt` or `strict` (KV blocks and SQL artifacts both
+seal). CI runs both: a plaintext leg with `--expect red` and an encrypt leg
+(root from the environment) with `--expect green`.
 
 ## At-rest mode
 
@@ -83,11 +83,15 @@ the top of `harness.sh`:
 |---|---|
 | `TC887_AT_REST_MODE` (`off`/`encrypt`/`strict`) | `TINYCLOUD_AT_REST__MODE` |
 | `TC887_AT_REST_ESCROW_NONE` (`true`/`false`: the Static self-host acknowledgement that no escrow exists, plan §5) | `TINYCLOUD_AT_REST__ESCROW_NONE` |
+| `TC887_AT_REST_ROOT_SOURCE` (`escrow`/`env`) | `TINYCLOUD_AT_REST__ROOT_SOURCE`; with `env`, also `TINYCLOUD_AT_REST_ROOT_KEY` from a per-run key in `secrets/at-rest-root-key` |
 
-If either is unset, the harness sets nothing and the node runs its default
-(today: no encryption at rest). Other values are refused before anything
-starts. The simplest encrypting node is the harness's Static root plus
-`TC887_AT_REST_MODE=encrypt TC887_AT_REST_ESCROW_NONE=true`.
+If one is unset, the harness sets nothing for it and the node runs its default
+(no encryption at rest). Other values are refused before anything starts. The
+checks re-derive the key hierarchy from the root the node seals under: the
+Static node root, or with `env` the per-run root key (`TC887_NODE_ROOT_FILE`
+and `TC887_NODE_ROOT_ENCODING` in `harness.env`). Simplest encrypting nodes:
+`TC887_AT_REST_MODE=encrypt` with `TC887_AT_REST_ESCROW_NONE=true`, or with
+`TC887_AT_REST_ROOT_SOURCE=env`.
 
 ## Checks
 
@@ -108,7 +112,7 @@ then insert (a WAL delta).
 | `green_kv_put_reaches_minio` | every put round-trips through the node and adds a non-empty object to the bucket | pass |
 | `green_sql_write_reaches_postgres` | the writes round-trip, and `database_artifact` has a `payload` and a non-NULL `delta_payload` | pass |
 | `red_kv_blocks_are_sealed_in_minio` | object keys contain no identity of any space the harness created (space id or wallet address: raw, lowercase, hex, base64 and base64url at any alignment, of the text and of the bytes) and no blake3 fingerprint of the value (b64url padded/unpadded, base64 padded/unpadded, hex; raw digest and multihash); raw bytes hold no marker; each put's objects together are at least as large as the value; the 64 KiB object doesn't compress (zlib ratio > 0.95); every object of a put in one space shares no 32-byte run with every object of the same put in the other (equal object counts required); every `_tc/` key-mirror object passes the checks below | **fail** |
-| `red_sql_artifacts_are_sealed_in_postgres` | `payload` doesn't start with `SQLite format 3\0` and `delta_payload` doesn't start with the WAL magic; neither holds a marker, compresses (ratio > 0.95) or is smaller than the 64 KiB value it holds; the two spaces' payloads and deltas share no 32-byte run | **fail** |
+| `red_sql_artifacts_are_sealed_in_postgres` | `payload` doesn't start with `SQLite format 3\0` and `delta_payload` doesn't start with the WAL magic; neither holds a marker, compresses (ratio > 0.95) or is smaller than the 64 KiB value it holds; the two spaces' payloads and deltas share no 32-byte run; and an authenticated cold read of every row succeeds (below) | **fail** |
 
 The RED checks re-run the green preconditions first, so a RED result is never
 a harness no-op. The 32-byte limit: two sealed blobs of the same plaintext
@@ -122,6 +126,22 @@ across writes once a per-write salt (SQLite's WAL salts) is mixed in.
 `cargo test` and checks the predicates offline: base64, XOR and zlib are
 flagged, a salted deflate-9 blob is flagged by the size floor, and sealed-like
 random blobs pass.
+
+**SQL cold read.** The payload checks above are heuristics: random bytes
+appended to a sealed part, or a dropped WAL delta, still look like
+ciphertext. So the SQL check also opens every `database_artifact` row of the
+harness spaces the way a node hydrating it would, with keys the harness
+re-derived itself (root → ARK → KEK → each space's DEK from its
+authenticated `_tc/` mirror, as the KV check does): the row must be sealed
+(`payload_encoding`/`delta_encoding` 1 and a `manifest` tag),
+`database_artifacts::open_row` must authenticate the manifest tag and every
+part (AEAD and exact stored length), and the checkpoint plus WAL must be a
+SQLite database that passes `PRAGMA integrity_check` and holds exactly the
+four `probe` rows the harness wrote. Anything else is a finding (RED).
+`selftest_sql_check_flags_appended_and_omitted_sealed_parts` runs in plain
+`cargo test`: a sealed fixture row passes, and random bytes appended to its
+checkpoint or delta, or its delta dropped (with the unkeyed hash and size
+reset), each turn the SQL check RED.
 
 ### At-rest key mirror (`_tc/…` objects)
 
@@ -230,3 +250,8 @@ bypass), `selftest_key_mirror_refuses_escrow_contents_and_derived_keys`,
   installed here, so the node runs with a per-run Static root; S1 adds a
   Dstack-root variant.
 - DuckDB artifacts (`service=duckdb`, an opt-in feature): S4 follow-up.
+- The node's local working files (SQL and DuckDB working and cache files,
+  upload staging, exports) are not scanned: they are plaintext by design and
+  rely on the CVM's encrypted storage (`docs/at-rest/INTERFACES.md` §8).
+- A row replaced by an older, self-consistent copy of itself passes the SQL
+  cold read, as it passes the node's own read (INTERFACES §8).

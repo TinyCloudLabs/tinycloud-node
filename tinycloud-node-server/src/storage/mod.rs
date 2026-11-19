@@ -1,16 +1,35 @@
+pub mod at_rest_mirror;
 pub mod file_system;
 pub mod s3;
+pub mod sealed;
 pub mod size;
 pub mod sql_object;
 
 use tinycloud_auth::resource::SpaceId;
-use tinycloud_core::hash::Hash;
+use tinycloud_core::{hash::Hash, storage::either::Either};
 
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
+
+use crate::{
+    at_rest::{AtRestRuntime, SealPath},
+    BlockStores,
+};
+
+/// Links the opened block store to the node's at-rest state (TC-887). Both
+/// stores seal KV blocks when the mode and keys allow, so attaching either
+/// declares the blocks seal path.
+pub fn attach_at_rest(stores: &mut BlockStores, runtime: &Arc<AtRestRuntime>) {
+    let handle = sealed::AtRestHandle::new(runtime.clone());
+    match stores {
+        Either::A(s3) => s3.attach_at_rest(handle),
+        Either::B(fs) => fs.attach_at_rest(handle),
+    }
+    runtime.declare_seal_path(SealPath::Blocks);
+}
 
 /// One physical blob lifetime; a later generation must never share its
 /// quota reservation or deletion target with an earlier generation.
