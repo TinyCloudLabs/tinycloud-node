@@ -459,6 +459,101 @@ jobs:
           bash scripts/at-rest-harness/harness.sh down --purge "$TC887_STATE"
         fi
 
+  # TC-2871 erase-30 proof: the space purge end to end on native PostgreSQL
+  # and MinIO, started by the at-rest harness from its pinned, sha256-verified
+  # binaries. `harness.sh up` also starts a lifecycle-off node on the harness
+  # bucket and database; the tests below use isolated schemas and buckets of
+  # their own beside it. The ledger bucket has Object Lock with a default
+  # COMPLIANCE retention, as in production (the ledger tests check a record
+  # lands locked); the runner's MinIO is thrown away with the run dir.
+  # Credentials stay in harness.env: each step maps them inside a subshell, so
+  # none reaches argv or the log.
+  erase30-proof:
+    name: erase-30 proof (native PostgreSQL + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      ERASE30_DATA_BUCKET: erase30-data
+      ERASE30_LEDGER_BUCKET: erase30-purge-ledger
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-erase30-proof
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Harness paths
+      run: |
+        {
+          echo "TC887_SCRATCH_ROOT=$RUNNER_TEMP/tc887"
+          echo "TC887_BIN_DIR=$RUNNER_TEMP/tc887/bin"
+          echo "TC887_RUN_DIR=$RUNNER_TEMP/tc887/harness-run-erase30"
+          echo "TC887_STATE=$RUNNER_TEMP/tc887/harness-run-erase30/state.json"
+        } >> "$GITHUB_ENV"
+
+    - name: Fetch pinned MinIO and mc (sha256-verified)
+      run: bash scripts/at-rest-harness/harness.sh bins
+
+    - name: Start native PostgreSQL and MinIO (at-rest harness)
+      run: bash scripts/at-rest-harness/harness.sh up
+
+    - name: Create the data and ledger buckets
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         export MC_CONFIG_DIR="$TC887_RUN_DIR/mc"
+         export MC_HOST_erase30="http://$TC887_S3_ACCESS_KEY_ID:$TC887_S3_SECRET_ACCESS_KEY@${TC887_S3_ENDPOINT#http://}"
+         "$TC887_BIN_DIR/mc" --quiet mb "erase30/$ERASE30_DATA_BUCKET"
+         "$TC887_BIN_DIR/mc" --quiet mb --with-lock "erase30/$ERASE30_LEDGER_BUCKET"
+         "$TC887_BIN_DIR/mc" --quiet retention set --default compliance 1d \
+           "erase30/$ERASE30_LEDGER_BUCKET")
+
+    - name: Space purge tests (against the harness PostgreSQL and MinIO)
+      timeout-minutes: 30
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         export TINYCLOUD_TEST_POSTGRES_URL="$TC887_PG_URL"
+         export TC735_TEST_MINIO_ENDPOINT="$TC887_S3_ENDPOINT"
+         export TC735_TEST_MINIO_BUCKET="$ERASE30_DATA_BUCKET"
+         export TC735_TEST_MINIO_LEDGER_BUCKET="$ERASE30_LEDGER_BUCKET"
+         export AWS_ACCESS_KEY_ID="$TC887_S3_ACCESS_KEY_ID"
+         export AWS_SECRET_ACCESS_KEY="$TC887_S3_SECRET_ACCESS_KEY"
+         export AWS_REGION="$TC887_S3_REGION" AWS_DEFAULT_REGION="$TC887_S3_REGION"
+         export AWS_EC2_METADATA_DISABLED=true
+         # The MinIO tests skip without these; here they must run.
+         for var in TINYCLOUD_TEST_POSTGRES_URL TC735_TEST_MINIO_ENDPOINT AWS_ACCESS_KEY_ID; do
+           [ -n "${!var}" ] || { echo "$var is empty" >&2; exit 1; }
+         done
+         cargo test --locked -p tinycloud-node --lib space_purge
+         cargo test --locked -p tinycloud-node --test space_purge_restore_prefix \
+           --test space_purge_sql_prefixes --test space_purge_end_to_end
+         cargo test --locked -p tinycloud-core --test space_purge_database \
+           --test space_purge_table_inventory --test space_purge_ledger
+         cargo test --locked -p tinycloud-core --lib -- chunks space_purge)
+
+    - name: Harness logs
+      if: failure()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh logs "$TC887_STATE"
+        fi
+
+    - name: Stop the harness
+      if: always()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh down --purge "$TC887_STATE"
+        fi
+
   # TC-887: test/w5-policy-runtime-node-e2e depends on the private
   # TinyCloudLabs/policy-engine repository by git, so the workflow token cannot
   # resolve it. With a read-only deploy key for that one repository in the
