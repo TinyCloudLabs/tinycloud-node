@@ -42,6 +42,11 @@ cors = true
     # ddl_requires_schema = "enforce"
     # [global.storage.duckdb]
     # path = "./data/duckdb"
+    ## DuckDB disk bounds (TC-2917). Unset, both default on only with chunked
+    ## artifact storage: 2 GiB kept free (provisional) and 1 GiB of spill per
+    ## connection; otherwise off. 0 turns either off.
+    # min_free_bytes = "2 GiB"           # short of it: 507 duckdb_disk_headroom
+    # max_temp_directory_size = "1 GiB"  # spill past it: 507 duckdb_disk_headroom
 
     [global.storage.blocks]
     type = "Local"

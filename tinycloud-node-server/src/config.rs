@@ -1779,6 +1779,64 @@ pub struct DuckDbStorageConfig {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_duckdb_max_memory")]
     pub max_memory_per_connection: String,
+    /// Free disk the node keeps behind the DuckDB cache (TC-2917); a write
+    /// or import short of it answers `507 duckdb_disk_headroom`. Unset: 2 GiB
+    /// when chunked artifact storage is enabled, otherwise 0 (off). The
+    /// 2 GiB default is provisional until the `storage_headroom` event shows
+    /// real headroom on production nodes.
+    #[serde(default)]
+    pub min_free_bytes: Option<ByteUnit>,
+    /// The most one DuckDB connection may spill to its temporary directory.
+    /// Unset: 1 GiB when chunked artifact storage is enabled, otherwise
+    /// DuckDB's own default. 0 keeps DuckDB's default.
+    #[serde(default)]
+    pub max_temp_directory_size: Option<ByteUnit>,
+}
+
+/// Flag-on default of `storage.duckdb.min_free_bytes` (TC-2917, provisional).
+#[cfg(feature = "duckdb")]
+const CHUNKED_DUCKDB_MIN_FREE_BYTES: u64 = 2 << 30;
+/// Flag-on default of `storage.duckdb.max_temp_directory_size` (TC-2917).
+#[cfg(feature = "duckdb")]
+const CHUNKED_DUCKDB_MAX_TEMP_DIRECTORY_BYTES: u64 = 1 << 30;
+
+#[cfg(feature = "duckdb")]
+impl DuckDbStorageConfig {
+    /// The DuckDB free-space floor in effect: the configured value, else the
+    /// flag-on default when chunked artifact storage is enabled, else 0 (off).
+    pub fn effective_min_free_bytes(&self, chunked: bool) -> u64 {
+        self.min_free_bytes.map_or(
+            if chunked {
+                CHUNKED_DUCKDB_MIN_FREE_BYTES
+            } else {
+                0
+            },
+            |value| value.as_u64(),
+        )
+    }
+
+    /// The DuckDB disk policy. `chunked` is whether chunked artifact storage
+    /// is enabled, which sets the defaults; `budget` is the node-wide disk
+    /// budget shared with SQL.
+    pub fn disk_policy(
+        &self,
+        chunked: bool,
+        budget: std::sync::Arc<tinycloud_core::sql::durability::DiskBudget>,
+    ) -> tinycloud_core::duckdb::disk::DuckDbDiskPolicy {
+        tinycloud_core::duckdb::disk::DuckDbDiskPolicy {
+            min_free_bytes: self.effective_min_free_bytes(chunked),
+            max_temp_directory_bytes: self.max_temp_directory_size.map_or(
+                if chunked {
+                    CHUNKED_DUCKDB_MAX_TEMP_DIRECTORY_BYTES
+                } else {
+                    0
+                },
+                |value| value.as_u64(),
+            ),
+            budget,
+            ..Default::default()
+        }
+    }
 }
 
 fn default_duckdb_memory_threshold() -> ByteUnit {
@@ -1800,6 +1858,8 @@ impl Default for DuckDbStorageConfig {
             memory_threshold: default_duckdb_memory_threshold(),
             idle_timeout_secs: default_duckdb_idle_timeout(),
             max_memory_per_connection: default_duckdb_max_memory(),
+            min_free_bytes: None,
+            max_temp_directory_size: None,
         }
     }
 }
@@ -2250,6 +2310,81 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn duckdb_disk_bounds_default_on_only_with_chunked_storage() {
+        let budget = std::sync::Arc::new(tinycloud_core::sql::durability::DiskBudget::default());
+        let unset = DuckDbStorageConfig::default();
+        let on = unset.disk_policy(true, budget.clone());
+        assert_eq!(
+            (on.min_free_bytes, on.max_temp_directory_bytes),
+            (2 << 30, 1 << 30)
+        );
+        let off = unset.disk_policy(false, budget.clone());
+        assert_eq!((off.min_free_bytes, off.max_temp_directory_bytes), (0, 0));
+        let set = DuckDbStorageConfig {
+            min_free_bytes: Some(ByteUnit::Byte(0)),
+            max_temp_directory_size: Some(ByteUnit::Mebibyte(256)),
+            ..Default::default()
+        };
+        let explicit = set.disk_policy(true, budget.clone());
+        assert_eq!(
+            (explicit.min_free_bytes, explicit.max_temp_directory_bytes),
+            (0, 256 << 20)
+        );
+        assert!(std::sync::Arc::ptr_eq(&explicit.budget, &budget));
+    }
+
+    /// With chunked artifacts on, the DuckDB floor must hold one artifact
+    /// ceiling; 0 (off) is refused too. With chunked artifacts off nothing is
+    /// required.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn chunked_artifacts_require_a_duckdb_floor_of_one_artifact_ceiling() {
+        const GIB: u64 = 1 << 30;
+        let chunked = |ceiling: u64, floor: Option<u64>| {
+            let mut config = Config::default();
+            config.storage.database = Some("postgres://test@localhost/test".into());
+            config.storage.sql.chunked_artifacts = true;
+            config.storage.sql.chunked_artifact_max_bytes = ceiling;
+            config.storage.sql.chunked_account_max_bytes = ceiling * 4;
+            config.storage.duckdb.min_free_bytes = floor.map(ByteUnit::Byte);
+            config
+        };
+        let mut flag_off = Config::default();
+        flag_off.storage.duckdb.min_free_bytes = Some(ByteUnit::Byte(1));
+        for (label, config, accepted) in [
+            (
+                "default floor (2 GiB), ceiling 2 GiB",
+                chunked(2 * GIB, None),
+                true,
+            ),
+            (
+                "default floor (2 GiB), ceiling 2 GiB + 1",
+                chunked(2 * GIB + 1, None),
+                false,
+            ),
+            (
+                "floor 4 GiB, ceiling 3 GiB",
+                chunked(3 * GIB, Some(4 * GIB)),
+                true,
+            ),
+            (
+                "floor 1 GiB, ceiling 3 GiB",
+                chunked(3 * GIB, Some(GIB)),
+                false,
+            ),
+            ("floor 0 (off), ceiling 1 GiB", chunked(GIB, Some(0)), false),
+            ("flag off, floor 1 byte", flag_off, true),
+        ] {
+            assert_eq!(
+                crate::resolve_runtime_config(&config).is_ok(),
+                accepted,
+                "{label}"
+            );
+        }
+    }
 
     #[test]
     fn column_encryption_strict_defaults_off_and_accepts_opt_in() {

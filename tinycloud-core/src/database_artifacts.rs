@@ -109,6 +109,8 @@ pub enum DatabaseArtifactError {
     Db(DbErr),
     #[error("artifact storage limit reached")]
     StorageLimit,
+    #[error("database artifact replacement is in progress")]
+    ReplacementBusy,
     #[error("database artifact payload too large: {0} bytes")]
     PayloadTooLarge(u64),
     /// A payload larger than the repository's single-statement write limit
@@ -145,7 +147,18 @@ pub enum DatabaseArtifactError {
 
 impl From<DbErr> for DatabaseArtifactError {
     fn from(error: DbErr) -> Self {
-        if error.to_string().contains("TC2917_QUOTA") {
+        use sea_orm::error::{RuntimeErr, SqlxError};
+        let replacement_busy = match &error {
+            DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(error)))
+            | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(error)))
+            | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(error))) => {
+                error.code().as_deref() == Some("TC001") && error.message() == "TC2917_BUSY"
+            }
+            _ => false,
+        };
+        if replacement_busy {
+            Self::ReplacementBusy
+        } else if error.to_string().contains("TC2917_QUOTA") {
             Self::StorageLimit
         } else if error.to_string().contains("TC2917_LAYOUT") {
             Self::StaleLineage
@@ -221,10 +234,9 @@ pub trait ArtifactSink: Send {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError>;
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError>;
     /// Whether the sink holds the whole artifact in memory. Such a read of a
-    /// large artifact waits for a large-transfer slot in either layout.
-    fn buffers_in_memory(&self) -> bool {
-        false
-    }
+    /// large artifact waits for a large-transfer slot in either layout. There
+    /// is no default: a sink that wraps another forwards the inner answer.
+    fn buffers_in_memory(&self) -> bool;
 }
 
 /// The most [`MemorySink`] allocates ahead of the bytes it is given.
@@ -459,8 +471,10 @@ impl Drop for StagingRelease {
 
 /// Remove the `<final>.tmp.<pid>.<n>` files a crashed hydration left beside
 /// each of `finals`: exactly this sink's temp-name pattern, and never a file
-/// this process still has in flight. Run before a hydration begins, under the
-/// database's hydration exclusion.
+/// this process still has in flight. A directory with that name is a DuckDB
+/// spill directory an evicted actor moved aside, and is removed with its
+/// contents. Run before a hydration begins, under the database's hydration
+/// exclusion.
 pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
     for path in finals {
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -492,8 +506,17 @@ pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&temp);
-            if is_staging && !live && tokio::fs::remove_file(&temp).await.is_ok() {
-                tracing::info!("Removed a staging file left by an interrupted hydration");
+            if !is_staging || live {
+                continue;
+            }
+            let removed = match entry.file_type().await {
+                Ok(kind) if kind.is_dir() => tokio::fs::remove_dir_all(&temp).await,
+                _ => tokio::fs::remove_file(&temp).await,
+            };
+            if removed.is_ok() {
+                tracing::info!(
+                    "Removed a staging file left by an interrupted hydration or cleanup"
+                );
             }
         }
     }
@@ -501,6 +524,10 @@ pub(crate) async fn sweep_stale_staging(finals: &[&std::path::Path]) {
 
 #[async_trait]
 impl ArtifactSink for CacheFileSink {
+    fn buffers_in_memory(&self) -> bool {
+        false
+    }
+
     async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
         self.discard();
         Ok(())
@@ -676,6 +703,18 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
     }
 
+    /// Persist an owned cumulative WAL against the caller's exact checkpoint.
+    async fn save_wal_snapshot(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _snapshot: tempfile::NamedTempFile,
+        _expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -771,7 +810,7 @@ pub struct SeaOrmDatabaseArtifactRepository {
     #[cfg(test)]
     race_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
-    chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    pub(crate) chunk_publish_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     chunk_reclaim_paused: bool,
 }
@@ -1123,6 +1162,18 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         expected: ArtifactExpectation,
     ) -> Result<ArtifactMeta, DatabaseArtifactError> {
         self.write_chunk_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
+    async fn save_wal_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.write_chunk_file(service, space, name, snapshot, expected, ArtifactPart::Wal)
             .await
     }
 
@@ -1832,6 +1883,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for GatedSink {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             Ok(())
         }
@@ -2602,6 +2656,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for RaceSink<'_> {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             self.attempts += 1;
             self.disturbed_this_attempt = false;
@@ -2702,6 +2759,9 @@ mod tests {
         struct DeltaRace<'a>(RaceSink<'a>, bool);
         #[async_trait]
         impl ArtifactSink for DeltaRace<'_> {
+            fn buffers_in_memory(&self) -> bool {
+                false
+            }
             async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
                 self.0.reset().await
             }
@@ -2805,6 +2865,9 @@ mod tests {
         );
         #[async_trait]
         impl ArtifactSink for Overtaken<'_> {
+            fn buffers_in_memory(&self) -> bool {
+                false
+            }
             async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
                 self.0.reset().await
             }

@@ -141,6 +141,24 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         Ok(saved)
     }
 
+    async fn save_wal_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        let saved = self
+            .inner
+            .save_wal_snapshot(service, space, name, snapshot, expected)
+            .await?;
+        self.sizes
+            .update(service, space, name, saved.size_bytes.max(0) as u64)
+            .await;
+        Ok(saved)
+    }
+
     async fn save(
         &self,
         service: &str,

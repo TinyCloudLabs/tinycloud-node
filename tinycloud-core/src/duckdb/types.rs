@@ -462,13 +462,21 @@ pub enum DuckDbError {
     #[error("Operation would increase database storage")]
     StorageWouldGrow,
     /// The database's whole checkpoint exceeds the artifact write limit
-    /// (TC-2961); it was not saved.
+    /// (TC-2961) or the artifact or account capacity (TC-2917); it was not
+    /// saved.
     #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
     DatabaseSizeLimit,
     /// The stored database exceeds the artifact read limit (TC-2961); it was
     /// not loaded.
     #[error("sql_database_size_limit: the database is larger than this node loads; no change was applied")]
     DatabaseTooLargeToLoad,
+    #[error("duckdb_disk_headroom: The node is short of disk space for this write")]
+    DiskHeadroom,
+    /// Another checkpoint replacement of this database is in flight (TC-2917).
+    /// Nothing was applied; the `unavailable_retryable` token gives the node's
+    /// `503` a `Retry-After` and makes SDK clients retry it, as for SQL.
+    #[error("unavailable_retryable: Database artifact replacement is temporarily unavailable")]
+    Unavailable,
     #[error("Invalid statement: {0}")]
     InvalidStatement(String),
     #[error("Schema error: {0}")]
