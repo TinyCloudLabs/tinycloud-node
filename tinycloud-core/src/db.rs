@@ -1,7 +1,7 @@
-mod space_purge;
 #[cfg(test)]
 #[path = "db/signature_before_locks_tests.rs"]
 mod signature_before_locks_tests;
+mod space_purge;
 #[cfg(test)]
 #[path = "db/status_snapshot_tests.rs"]
 mod status_snapshot_tests;

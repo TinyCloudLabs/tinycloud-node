@@ -976,7 +976,10 @@ impl sea_orm::ConnectionTrait for FencedWrite {
         }
     }
 
-    async fn query_all(&self, stmt: sea_orm::Statement) -> Result<Vec<sea_orm::QueryResult>, DbErr> {
+    async fn query_all(
+        &self,
+        stmt: sea_orm::Statement,
+    ) -> Result<Vec<sea_orm::QueryResult>, DbErr> {
         match self {
             Self::Pool(conn) => conn.query_all(stmt).await,
             Self::Transaction(transaction) => transaction.query_all(stmt).await,
