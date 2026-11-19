@@ -297,11 +297,18 @@ fn ledger_keys_env_takes_the_json_form_only() {
         ("TINYCLOUD_KEYS__TYPE", "static"),
         ("TINYCLOUD_KEYS__SECRET", node_secret.as_str()),
         ("TINYCLOUD_HOST_ID", "node-test-1"),
-        ("TINYCLOUD_STORAGE__DATABASE", "postgres://127.0.0.1:1/unused"),
+        (
+            "TINYCLOUD_STORAGE__DATABASE",
+            "postgres://127.0.0.1:1/unused",
+        ),
     ];
     let bare = run_tinycloud(
         &["--validate-config"],
-        &[&base[..], &[("TINYCLOUD_PURGE_LEDGER_KEYS", secret.as_str())]].concat(),
+        &[
+            &base[..],
+            &[("TINYCLOUD_PURGE_LEDGER_KEYS", secret.as_str())],
+        ]
+        .concat(),
     );
     let stderr = String::from_utf8_lossy(&bare.stderr);
     assert_eq!(bare.status.code(), Some(1), "stderr: {stderr}");
@@ -378,7 +385,10 @@ async fn lifecycle_on_accepts_a_purge_that_the_spawned_worker_completes() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(kv_is_empty(&kv), "the purge must remove the space's KV bytes");
+    assert!(
+        kv_is_empty(&kv),
+        "the purge must remove the space's KV bytes"
+    );
     assert_eq!(count(&db, "SELECT count(*) FROM space").await, 0);
     assert_eq!(
         count(&db, "SELECT count(*) FROM space_purge_tombstone").await,
@@ -552,7 +562,10 @@ async fn cli_reconcile_is_idempotent_and_reports_counts_only() {
     assert_eq!(first["purges_resumed"], 1);
     assert_eq!(first["purges_in_progress"], 0);
     assert_eq!(first["prefixes_purged"], 1);
-    assert!(kv_is_empty(&kv), "the live space's signed KV prefix is purged");
+    assert!(
+        kv_is_empty(&kv),
+        "the live space's signed KV prefix is purged"
+    );
     let after_first = state().await;
     assert_eq!(&after_first[..3], &[1, 1, 1]);
 

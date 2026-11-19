@@ -593,8 +593,12 @@ fn node_artifact_repository(tinycloud: &TinyCloud) -> SeaOrmDatabaseArtifactRepo
 pub(crate) async fn space_lifecycle_runtime(
     config: &Config,
     conn: &RecoveringConnection,
-) -> Result<Option<(space_lifecycle::LifecycleRuntime, Arc<storage::purge_ledger::PurgeLedger>)>>
-{
+) -> Result<
+    Option<(
+        space_lifecycle::LifecycleRuntime,
+        Arc<storage::purge_ledger::PurgeLedger>,
+    )>,
+> {
     use storage::purge_ledger::{PurgeLedgerConfig, PurgeLedgerStore};
     let (Some(host_id), Some(keys)) = (&config.host_id, &config.purge_ledger_keys) else {
         let ledger = match &config.storage.purge_ledger {
@@ -642,9 +646,9 @@ pub async fn reconcile_purge_ledger(
 ) -> Result<space_lifecycle::reconcile::ReconcileReport> {
     let conn = connect_database(config).await?;
     tinycloud_core::db::migrate(&conn).await?;
-    let (runtime, ledger) = space_lifecycle_runtime(config, &conn).await?.context(
-        "space lifecycle is off: set TINYCLOUD_HOST_ID and TINYCLOUD_PURGE_LEDGER_KEYS",
-    )?;
+    let (runtime, ledger) = space_lifecycle_runtime(config, &conn)
+        .await?
+        .context("space lifecycle is off: set TINYCLOUD_HOST_ID and TINYCLOUD_PURGE_LEDGER_KEYS")?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&conn).await?;
     let blocks: BlockStores = match &config.storage.blocks {
         Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
@@ -659,7 +663,9 @@ pub async fn reconcile_purge_ledger(
         blocks,
         ledger,
         sql: SqlService::new(
-            sql.path.clone().context("storage.sql.path is not resolved")?,
+            sql.path
+                .clone()
+                .context("storage.sql.path is not resolved")?,
             sql.memory_threshold.as_u64(),
             repository.clone(),
         ),
@@ -1246,9 +1252,7 @@ pub async fn app_with_control(
                     .await?,
                 encryption: Some(column_encryption),
             });
-            let runtime = runtime.with_storage_layout(
-                stores.layout().map_err(anyhow::Error::msg)?,
-            );
+            let runtime = runtime.with_storage_layout(stores.layout().map_err(anyhow::Error::msg)?);
             let report = runtime
                 .reconcile(&stores)
                 .await
@@ -1509,7 +1513,10 @@ pub async fn app_with_control(
                 .map(tracing::instrument_route)
                 .collect::<Vec<_>>(),
             )
-            .register("/space", rocket::catchers![space_lifecycle::lifecycle_error])
+            .register(
+                "/space",
+                rocket::catchers![space_lifecycle::lifecycle_error],
+            )
             .attach(AdHoc::on_liftoff("space-purge-worker", {
                 let runtime = runtime.clone();
                 let stores = stores.clone();

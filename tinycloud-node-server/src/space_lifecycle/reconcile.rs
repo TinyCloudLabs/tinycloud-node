@@ -158,12 +158,17 @@ impl LifecycleRuntime {
                 "resource" => {
                     let digest = hex::decode(&record.target_hmac)
                         .map_err(fail("invalid purge ledger record"))?;
-                    let tx = db.begin().await.map_err(fail("purge fence import failed"))?;
+                    let tx = db
+                        .begin()
+                        .await
+                        .map_err(fail("purge fence import failed"))?;
                     self.fence
                         .fence_hmac(&tx, "resource", &record.key_id, &digest)
                         .await
                         .map_err(fail("purge fence import failed"))?;
-                    tx.commit().await.map_err(fail("purge fence import failed"))?;
+                    tx.commit()
+                        .await
+                        .map_err(fail("purge fence import failed"))?;
                     report.resource_fences += 1;
                 }
                 _ => {
