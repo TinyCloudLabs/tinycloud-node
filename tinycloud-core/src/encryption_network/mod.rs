@@ -19,6 +19,8 @@ pub mod service;
 pub mod types;
 
 #[cfg(test)]
+mod create_network_tests;
+#[cfg(test)]
 mod delete_auth_tests;
 #[cfg(test)]
 mod deletion_ledger_tests;
