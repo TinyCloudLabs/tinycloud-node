@@ -1039,7 +1039,7 @@ impl SqlService {
                     return Err(SqlError::StorageWouldGrow);
                 }
             }
-            let saved = match self
+            let outcome = self
                 .bounded(
                     (space, db_name),
                     || SqlBusyStage::ArtifactTransfer,
@@ -1047,20 +1047,50 @@ impl SqlService {
                     async {
                         if is_wal {
                             self.artifact_repository
-                                .save_wal_snapshot("sql", &key.0, db_name, snapshot, expected)
+                                .save_wal_snapshot(
+                                    "sql",
+                                    &key.0,
+                                    db_name,
+                                    snapshot,
+                                    expected.clone(),
+                                )
                                 .await
                         } else {
                             self.artifact_repository
-                                .save_snapshot("sql", &key.0, db_name, snapshot, expected)
+                                .save_snapshot("sql", &key.0, db_name, snapshot, expected.clone())
                                 .await
                         }
                     },
                 )
+                .await;
+            let outcome = if is_wal
+                && matches!(
+                    &outcome,
+                    Ok(Err(DatabaseArtifactError::MissingCheckpoint
+                        | DatabaseArtifactError::IncrementalPersistenceUnsupported))
+                ) {
+                // Copying the WAL did not checkpoint the actor. An old-format
+                // base needs one complete snapshot before WAL parts can attach.
+                let snapshot = handle.snapshot().await?;
+                self.bounded(
+                    (space, db_name),
+                    || SqlBusyStage::ArtifactTransfer,
+                    self.bounds.artifact_transfer,
+                    self.artifact_repository
+                        .save_snapshot("sql", &key.0, db_name, snapshot, expected),
+                )
                 .await
-            {
+            } else {
+                outcome
+            };
+            let saved = match outcome {
                 Ok(Ok(saved)) => saved,
                 Ok(Err(error)) => {
-                    let lineage_conflict = matches!(error, DatabaseArtifactError::StaleLineage);
+                    let lineage_conflict = matches!(
+                        error,
+                        DatabaseArtifactError::StaleLineage
+                            | DatabaseArtifactError::ReplacementBusy
+                    );
                     let error = request_artifact_error(space, db_name)(error);
                     if !lineage_conflict {
                         self.back_off_checkpoint(&key, &error);
@@ -1284,7 +1314,8 @@ fn request_artifact_error<'a>(
 
 fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
     match err {
-        DatabaseArtifactError::StorageLimit => SqlError::StorageWouldGrow,
+        DatabaseArtifactError::StorageLimit => SqlError::DatabaseSizeLimit,
+        DatabaseArtifactError::ReplacementBusy => SqlError::ReplacementBusy,
         DatabaseArtifactError::Db(ref error) if is_transient_error(error) => {
             tracing::warn!(
                 service = "sql",
@@ -6294,5 +6325,484 @@ mod tests {
                 vec![vec![SqlValue::Integer(0)], vec![SqlValue::Integer(2)]]
             );
         }
+    }
+    #[tokio::test]
+    async fn postgres_chunked_legacy_wal_falls_back_to_complete_snapshot() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_legacy_wal_falls_back_to_complete_snapshot",
+        )
+        .await
+        else {
+            return;
+        };
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let third = TempDir::new().unwrap();
+        let space = test_space_id("legacy-wal-parts");
+        let legacy = Arc::new(SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()));
+        let source = SqlService::new(first.path().to_string_lossy().into_owned(), 0, legacy);
+        source
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        source
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                },
+            )),
+        );
+        let service = SqlService::new(
+            second.path().to_string_lossy().into_owned(),
+            0,
+            repo.clone(),
+        );
+        for id in [2, 3] {
+            service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: format!("INSERT INTO items VALUES ({id})"),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let meta = repo
+                .load_meta("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.storage_mode, "checkpoint-parts-v1");
+            assert_eq!(meta.revision, id);
+            assert_eq!(
+                meta.has_delta(),
+                id == 3,
+                "first old-format write must checkpoint before attaching WAL"
+            );
+            assert!(!service
+                .checkpoint_backoff
+                .contains_key(&(space.to_string(), "main".into())));
+        }
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+        let reopened = SqlService::new(third.path().to_string_lossy().into_owned(), 0, repo);
+        let result = reopened
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT id FROM items ORDER BY id".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(query) = result.response else {
+            panic!("query required");
+        };
+        assert_eq!(
+            query.rows,
+            vec![
+                vec![SqlValue::Integer(1)],
+                vec![SqlValue::Integer(2)],
+                vec![SqlValue::Integer(3)]
+            ]
+        );
+        reopened
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_replacement_contention_is_unavailable_without_backoff() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_replacement_contention_is_unavailable_without_backoff",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1024 * 1024,
+                    account_bytes: 4 * 1024 * 1024,
+                },
+            )),
+        );
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("parts-busy");
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let base = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut racing = (*repo).clone();
+        racing.chunk_publish_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+        let target = space.to_string();
+        let upload = tokio::spawn(async move {
+            let mut snapshot = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut snapshot, &[9; 1024]).unwrap();
+            racing
+                .save_snapshot(
+                    "sql",
+                    &target,
+                    "main",
+                    snapshot,
+                    ArtifactExpectation::Derived {
+                        revision: base.revision,
+                        checkpoint_content_hash: base.checkpoint_content_hash,
+                    },
+                )
+                .await
+        });
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if fixture
+                .conn
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT 1 FROM artifact_part WHERE state='sealed'".to_string(),
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let write = || SqlRequest::Execute {
+            schema: None,
+            sql: "INSERT INTO items VALUES (2)".into(),
+            params: vec![],
+        };
+        let refused = service
+            .execute(&space, "main", write(), None, "tinycloud.sql/write".into())
+            .await;
+        assert!(
+            matches!(refused, Err(SqlError::ReplacementBusy)),
+            "{refused:?}"
+        );
+        assert!(!service
+            .checkpoint_backoff
+            .contains_key(&(space.to_string(), "main".into())));
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let n: i64 = fixture
+                .conn
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM artifact_part WHERE state<>'published'"
+                        .to_string(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let locked = fixture.conn.begin().await.unwrap();
+        locked
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT owner FROM artifact_account WHERE owner=artifact_owner($1) FOR UPDATE",
+                [space.to_string().into()],
+            ))
+            .await
+            .unwrap();
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.execute(&space, "main", write(), None, "tinycloud.sql/write".into()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(busy, Err(SqlError::ReplacementBusy)), "{busy:?}");
+        assert!(!service
+            .checkpoint_backoff
+            .contains_key(&(space.to_string(), "main".into())));
+        locked.rollback().await.unwrap();
+        service
+            .execute(&space, "main", write(), None, "tinycloud.sql/write".into())
+            .await
+            .unwrap();
+        let result = service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT count(*) FROM items".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(query) = result.response else {
+            panic!("query required");
+        };
+        assert_eq!(query.rows, vec![vec![SqlValue::Integer(2)]]);
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_artifact_and_account_refusals_are_size_limits() {
+        for (artifact_bytes, account_bytes) in [(1, 4 * 1024 * 1024), (4 * 1024 * 1024, 1)] {
+            let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+                "postgres_chunked_artifact_and_account_refusals_are_size_limits",
+            )
+            .await
+            else {
+                return;
+            };
+            let repo = Arc::new(
+                SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+                    Some(crate::database_artifacts::chunks::ChunkLimits {
+                        artifact_bytes,
+                        account_bytes,
+                    }),
+                ),
+            );
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("parts-quota-refusal");
+            let service =
+                SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+            for _ in 0..2 {
+                let result = service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Execute {
+                            schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                            sql: "INSERT INTO items VALUES (1)".into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.sql/admin".into(),
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(SqlError::DatabaseSizeLimit)),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    service
+                        .checkpoint_backoff
+                        .get(&(space.to_string(), "main".into()))
+                        .unwrap()
+                        .failures,
+                    1
+                );
+            }
+            assert!(repo
+                .load_meta("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+    struct LostPartsReplyRepository(LostReplyArtifactRepository);
+
+    #[async_trait]
+    impl DatabaseArtifactRepository for LostPartsReplyRepository {
+        async fn load_meta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+            self.0.inner.load_meta(service, space, name).await
+        }
+        async fn read_chunks(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            meta: &ArtifactMeta,
+            sink: &mut dyn ArtifactSink,
+        ) -> Result<(), DatabaseArtifactError> {
+            self.0
+                .inner
+                .read_chunks(service, space, name, meta, sink)
+                .await
+        }
+        fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+            self.0.inner.chunked_checkpoints(service, space, name)
+        }
+        async fn save_snapshot(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            snapshot: tempfile::NamedTempFile,
+            expected: ArtifactExpectation,
+        ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+            let saved = self
+                .0
+                .inner
+                .save_snapshot(service, space, name, snapshot, expected)
+                .await?;
+            self.0.lose_reply()?;
+            Ok(saved)
+        }
+        async fn save_wal_snapshot(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            snapshot: tempfile::NamedTempFile,
+            expected: ArtifactExpectation,
+        ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+            let saved = self
+                .0
+                .inner
+                .save_wal_snapshot(service, space, name, snapshot, expected)
+                .await?;
+            self.0.lose_reply()?;
+            Ok(saved)
+        }
+        async fn save(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+            self.0.save(service, space, name, payload, expected).await
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_lost_publish_reply_remains_outcome_unknown() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_lost_publish_reply_remains_outcome_unknown",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(LostPartsReplyRepository(LostReplyArtifactRepository {
+            inner: Arc::new(
+                SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+                    Some(crate::database_artifacts::chunks::ChunkLimits {
+                        artifact_bytes: 1024 * 1024,
+                        account_bytes: 4 * 1024 * 1024,
+                    }),
+                ),
+            ),
+            lost_replies: AtomicU64::new(0),
+        }));
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("parts-lost-publish");
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_checkpoint_backoff(Duration::ZERO, Duration::ZERO);
+        for id in [1, 2] {
+            repo.0.lost_replies.store(1, Ordering::SeqCst);
+            let result = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE IF NOT EXISTS items(id INTEGER)".into()]),
+                        sql: format!("INSERT INTO items VALUES ({id})"),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(SqlError::OutcomeUnknown)),
+                "{result:?}"
+            );
+            // The publish committed. The response must never advertise a safe
+            // retry, and a fresh cache must recover the acknowledged state.
+            let result = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "SELECT count(*) FROM items".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .unwrap();
+            let SqlResponse::Query(query) = result.response else {
+                panic!("query required");
+            };
+            assert_eq!(query.rows, vec![vec![SqlValue::Integer(id)]]);
+            let meta = repo
+                .load_meta("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(meta.has_delta(), id == 2);
+        }
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
     }
 }

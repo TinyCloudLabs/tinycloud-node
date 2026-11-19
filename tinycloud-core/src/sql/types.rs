@@ -332,6 +332,12 @@ pub enum SqlError {
     /// A failure after the write was sent is [`SqlError::OutcomeUnknown`].
     #[error("unavailable_retryable: database storage temporarily unavailable; retry the request")]
     Unavailable,
+    /// A part reservation was positively refused before publication. Staged
+    /// bookkeeping can have committed, but the request cannot be durable.
+    #[error(
+        "unavailable_retryable: database artifact replacement is in progress; retry the request"
+    )]
+    ReplacementBusy,
     /// The connection was lost after the request's write was sent: it may
     /// or may not have been applied. The client must read the database back
     /// before deciding to retry (TC-1054).

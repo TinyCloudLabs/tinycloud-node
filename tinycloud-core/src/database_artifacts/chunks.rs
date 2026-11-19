@@ -17,8 +17,16 @@ fn statement(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-const REAP_CANDIDATE: &str = "SELECT service,space,name,part_id FROM artifact_part p WHERE state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
-const OWNER_REAP_CANDIDATE: &str = "SELECT service,space,name,part_id FROM artifact_part p WHERE owner=$1 AND state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
+const REAP_CANDIDATE: &str = "SELECT owner,service,space,name,part_id FROM artifact_part p WHERE state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
+const OWNER_REAP_CANDIDATE: &str = "SELECT owner,service,space,name,part_id FROM artifact_part p WHERE owner=$1 AND state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
+
+const DATABASE_REAP_CANDIDATE: &str = "SELECT owner,service,space,name,part_id FROM artifact_part p WHERE service=$1 AND space=$2 AND name=$3 AND state<>'published' AND lease_until<=statement_timestamp() AND NOT EXISTS(SELECT 1 FROM database_artifact d WHERE d.service=p.service AND d.space=p.space AND d.name=p.name AND (d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)) ORDER BY lease_until LIMIT 1";
+
+enum ReapScope<'a> {
+    All,
+    Owner(&'a str),
+    Database(&'a str, &'a str, &'a str),
+}
 
 impl SeaOrmDatabaseArtifactRepository {
     pub(super) async fn ensure_legacy_write(
@@ -68,7 +76,7 @@ impl SeaOrmDatabaseArtifactRepository {
     /// Each call frees at most one payload chunk per statement. Selection is
     /// advisory; the database rechecks pointers and takes the owner/part locks.
     pub async fn reap_unused_parts(&self, max_steps: usize) -> Result<(), DatabaseArtifactError> {
-        self.reap_parts(None, max_steps).await
+        self.reap_parts(ReapScope::All, max_steps).await
     }
 
     async fn reap_owner_best_effort(&self, owner: &str) {
@@ -76,41 +84,72 @@ impl SeaOrmDatabaseArtifactRepository {
         // collector completes larger passes independently of request success.
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            self.reap_parts(Some(owner), 16),
+            self.reap_parts(ReapScope::Owner(owner), 16),
         )
         .await;
     }
 
     async fn reap_parts(
         &self,
-        owner: Option<&str>,
+        scope: ReapScope<'_>,
         max_steps: usize,
     ) -> Result<(), DatabaseArtifactError> {
+        let mut excluded_owners: Vec<String> = Vec::new();
+        let mut last_error = None;
         for _ in 0..max_steps {
-            let candidate = match owner {
-                Some(owner) => statement(OWNER_REAP_CANDIDATE, vec![owner.into()]),
-                None => statement(REAP_CANDIDATE, vec![]),
+            let (sql, mut values): (&str, Vec<Value>) = match scope {
+                ReapScope::Owner(owner) => (OWNER_REAP_CANDIDATE, vec![owner.into()]),
+                ReapScope::All => (REAP_CANDIDATE, vec![]),
+                ReapScope::Database(service, space, name) => (
+                    DATABASE_REAP_CANDIDATE,
+                    vec![service.into(), space.into(), name.into()],
+                ),
             };
-            let Some(row) = self.conn.query_one(candidate).await? else {
+            let mut sql = sql.to_string();
+            if !excluded_owners.is_empty() {
+                let parameters = (values.len() + 1..=values.len() + excluded_owners.len())
+                    .map(|n| format!("${n}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql = sql.replace(" ORDER BY lease_until LIMIT 1",
+                    &format!(" AND NOT (p.owner=ANY(ARRAY[{parameters}]::text[])) ORDER BY lease_until LIMIT 1"));
+                values.extend(excluded_owners.iter().cloned().map(Into::into));
+            }
+            let Some(row) = self.conn.query_one(statement(&sql, values)).await? else {
                 break;
             };
+            let owner: String = row.try_get("", "owner")?;
             let values = vec![
                 row.try_get::<String>("", "service")?.into(),
                 row.try_get::<String>("", "space")?.into(),
                 row.try_get::<String>("", "name")?.into(),
                 row.try_get::<String>("", "part_id")?.into(),
             ];
-            let row = self
+            match self
                 .conn
                 .query_one(statement(
                     "SELECT artifact_reap_one($1,$2,$3,$4) AS progress",
                     values,
                 ))
-                .await?
-                .ok_or(DatabaseArtifactError::ArtifactChanged)?;
-            // Another collector can finish the selected part first. A fresh
-            // candidate query must still reach the rest of this bounded pass.
-            let _progress = row.try_get::<bool>("", "progress")?;
+                .await
+            {
+                Ok(Some(row)) => {
+                    let _progress = row.try_get::<bool>("", "progress")?;
+                }
+                Ok(None) => {
+                    excluded_owners.push(owner);
+                    last_error = Some(DatabaseArtifactError::ArtifactChanged);
+                }
+                Err(error) => {
+                    // A locked or broken owner cannot end another owner's
+                    // collection pass. Report one error after making progress.
+                    excluded_owners.push(owner);
+                    last_error = Some(error.into());
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -174,6 +213,13 @@ impl SeaOrmDatabaseArtifactRepository {
             .map_err(|_| DatabaseArtifactError::Backend("invalid artifact space".into()))?;
         let owner = space_id.did().to_string();
         self.configure_chunked_storage().await?;
+        // Prioritize this database's retired predecessor over the shared
+        // collector. Active uploads retain their lease and are never stolen.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.reap_parts(ReapScope::Database(service, space, name), 4096),
+        )
+        .await;
         self.reap_owner_best_effort(&owner).await;
         let current = self.load_meta(service, space, name).await?;
         expected.check(
@@ -760,7 +806,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(second, Err(DatabaseArtifactError::StorageLimit)),
+            matches!(second, Err(DatabaseArtifactError::ReplacementBusy)),
             "second replacement must refuse: {second:?}"
         );
         // Administrative failure injection changes the base after reservation,
@@ -802,6 +848,7 @@ mod tests {
             .await
             .unwrap();
         }
+        repo.reap_unused_parts(256).await.unwrap();
         let reserved = fixture
             .conn
             .query_one(statement(
@@ -1092,7 +1139,10 @@ mod tests {
                 ArtifactExpectation::Any,
             )
             .await;
-        assert!(matches!(second, Err(DatabaseArtifactError::StorageLimit)));
+        assert!(matches!(
+            second,
+            Err(DatabaseArtifactError::ReplacementBusy)
+        ));
         // Pending shrinkage cannot fund another database, then be aborted.
         let other = repo
             .save_snapshot(
@@ -2043,6 +2093,33 @@ mod tests {
                 smaller.len() as i64
             )
         );
+        let previous_wal: String = fixture
+            .conn
+            .query_one(statement(
+                "SELECT part_id FROM artifact_part WHERE content_hash=$1",
+                vec![second.delta_content_hash.clone().unwrap().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "part_id")
+            .unwrap();
+        fixture
+            .conn
+            .execute(statement(
+                "SELECT artifact_reap_one('sql',$1,'main',$2)",
+                vec![space.into(), previous_wal.into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger(&fixture).await,
+            (
+                (checkpoint.len() + wal.len() + smaller.len()) as i64,
+                smaller.len() as i64
+            ),
+            "a deleted prefix does not release the old WAL's charge or credit"
+        );
         repo.reap_unused_parts(64).await.unwrap();
         assert_eq!(
             ledger(&fixture).await,
@@ -2147,7 +2224,7 @@ mod tests {
         let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
             Some(ChunkLimits {
                 artifact_bytes: 1024,
-                account_bytes: 1024,
+                account_bytes: 4096,
             }),
         );
         let expectation = |meta: &ArtifactMeta| ArtifactExpectation::Derived {
@@ -2225,5 +2302,253 @@ mod tests {
         let durable = repo.load_meta("sql", space, "main").await.unwrap().unwrap();
         assert_eq!(durable.delta_content_hash, third.delta_content_hash);
         assert_eq!(durable.revision, third.revision + 1);
+    }
+    #[tokio::test]
+    async fn postgres_chunked_abort_after_committed_publish_keeps_all_chunks() {
+        use crate::database_artifacts::test_support::ReadAll;
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_abort_after_committed_publish_keeps_all_chunks",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:committed";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(
+            Some(ChunkLimits {
+                artifact_bytes: 4 * CHUNK_BYTES as u64,
+                account_bytes: 8 * CHUNK_BYTES as u64,
+            }),
+        );
+        let bytes = vec![7; 2 * CHUNK_BYTES + 17];
+        let saved = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&bytes),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let part: String = fixture
+            .conn
+            .query_one(statement(
+                "SELECT checkpoint_part_id FROM database_artifact",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "checkpoint_part_id")
+            .unwrap();
+        // Observe that the real Drop abort worker ran before checking durability.
+        // Three chunks ensure a part FK cannot mask deletion of a prefix.
+        fixture
+            .conn
+            .execute_unprepared(
+                r#"
+CREATE TABLE cleanup_attempt(id integer);
+ALTER FUNCTION artifact_reap_one(text,text,text,text,boolean) RENAME TO artifact_reap_checked;
+CREATE FUNCTION artifact_reap_one(a text,b text,c text,d text,abort_upload boolean DEFAULT false)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+ INSERT INTO cleanup_attempt VALUES(1);
+ RETURN artifact_reap_checked(a,b,c,d,abort_upload);
+END $$;
+"#,
+            )
+            .await
+            .unwrap();
+        // Models cancellation after commit but before its response disarmed the
+        // upload guard. Use the production Drop path, not a separate collector.
+        drop(UploadCleanup {
+            repo: repo.clone(),
+            service: "sql".into(),
+            space: space.into(),
+            name: "main".into(),
+            part_id: part,
+            armed: true,
+        });
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let n: i64 = fixture
+                .conn
+                .query_one(statement(
+                    "SELECT count(*)::bigint AS n FROM cleanup_attempt",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            if n > 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "abort worker must run");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let durable = repo.read_all("sql", space, "main").await.unwrap().unwrap();
+        assert_eq!(durable.revision, saved.revision);
+        assert_eq!(durable.payload, bytes);
+        assert_eq!(ledger(&fixture).await, (saved.size_bytes, 0));
+        let n: i64 = fixture
+            .conn
+            .query_one(statement(
+                "SELECT count(*)::bigint AS n FROM artifact_chunk",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_predecessor_progress_ignores_locked_owner() {
+        use sea_orm::TransactionTrait;
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_predecessor_progress_ignores_locked_owner",
+        )
+        .await
+        else {
+            return;
+        };
+        let a = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:flood";
+        let b = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000002:live";
+        let mut repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_chunk_limits(Some(ChunkLimits {
+                artifact_bytes: 64 * CHUNK_BYTES as u64,
+                account_bytes: 256 * CHUNK_BYTES as u64,
+            }));
+        repo.chunk_reclaim_paused = true;
+        repo.save_snapshot(
+            "sql",
+            a,
+            "main",
+            snapshot(&[1]),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        fixture.conn.execute(statement("INSERT INTO artifact_part(service,space,name,part_id,owner,size_bytes,chunk_count,state,lease_until) SELECT 'sql',$1,'garbage',md5(g::text),artifact_owner($1),1,1,'uploading','2000-01-01'::timestamptz FROM generate_series(1,1000)g",vec![a.into()])).await.unwrap();
+        fixture.conn.execute(statement("INSERT INTO artifact_chunk(service,space,name,part_id,ordinal,payload) SELECT service,space,name,part_id,0,decode('01','hex') FROM artifact_part WHERE space=$1 AND name='garbage'",vec![a.into()])).await.unwrap();
+        fixture
+            .conn
+            .execute(statement(
+                "UPDATE artifact_part SET state='deleting' WHERE space=$1 AND name='garbage'",
+                vec![a.into()],
+            ))
+            .await
+            .unwrap();
+        fixture.conn.execute(statement("UPDATE artifact_account SET reserved_bytes=reserved_bytes+1000 WHERE owner=artifact_owner($1)",vec![a.into()])).await.unwrap();
+        let first = repo
+            .save_snapshot(
+                "sql",
+                b,
+                "main",
+                snapshot(&vec![2; 40 * CHUNK_BYTES + 17]),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let second = repo
+            .save_snapshot(
+                "sql",
+                b,
+                "main",
+                snapshot(&[3; 1024]),
+                ArtifactExpectation::Derived {
+                    revision: first.revision,
+                    checkpoint_content_hash: first.checkpoint_content_hash,
+                },
+            )
+            .await
+            .unwrap();
+        let locked = fixture.conn.begin().await.unwrap();
+        locked
+            .query_one(statement(
+                "SELECT owner FROM artifact_account WHERE owner=artifact_owner($1) FOR UPDATE",
+                vec![a.into()],
+            ))
+            .await
+            .unwrap();
+        // More than an inline pass remains, but this writer must not wait on
+        // another owner's locked/flooded collector queue.
+        let third = repo
+            .save_snapshot(
+                "sql",
+                b,
+                "main",
+                snapshot(&[4; 4096]),
+                ArtifactExpectation::Derived {
+                    revision: second.revision,
+                    checkpoint_content_hash: second.checkpoint_content_hash,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.revision, 3);
+        // A global pass reports the locked owner after continuing other work.
+        assert!(repo.reap_unused_parts(128).await.is_err());
+        let state=fixture.conn.query_one(statement("SELECT (SELECT count(*) FROM artifact_part WHERE space=$1 AND state='deleting')::bigint AS garbage,(SELECT reserved_bytes-credit_bytes FROM artifact_account WHERE owner=artifact_owner($1))::bigint AS charged",vec![b.into()])).await.unwrap().unwrap();
+        assert_eq!(state.try_get::<i64>("", "garbage").unwrap(), 0);
+        assert_eq!(state.try_get::<i64>("", "charged").unwrap(), 4096);
+        let untouched:i64=fixture.conn.query_one(statement("SELECT count(*)::bigint AS n FROM artifact_chunk WHERE space=$1 AND name='garbage'",vec![a.into()])).await.unwrap().unwrap().try_get("","n").unwrap();
+        assert_eq!(untouched, 1000);
+        locked.rollback().await.unwrap();
+    }
+    #[tokio::test]
+    async fn postgres_chunked_flag_off_legacy_writes_do_not_update_parts() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_flag_off_legacy_writes_do_not_update_parts",
+        )
+        .await
+        else {
+            return;
+        };
+        let space =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:legacy-no-parts";
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        // Statement triggers run even for zero-row UPDATEs. Foreign-key
+        // relation locks are inherited from the original schema and are not
+        // evidence that the publication function issued a payload-table query.
+        fixture
+            .conn
+            .execute_unprepared(
+                r#"
+CREATE FUNCTION reject_legacy_part_update() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'unexpected parts UPDATE on legacy write'; END $$;
+CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
+ FOR EACH STATEMENT EXECUTE FUNCTION reject_legacy_part_update();
+"#,
+            )
+            .await
+            .unwrap();
+        let first = repo
+            .save(
+                "sql",
+                space,
+                "main",
+                vec![1; 128],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        repo.save_delta(
+            "sql",
+            space,
+            "main",
+            vec![2; 128],
+            ArtifactExpectation::Derived {
+                revision: first.revision,
+                checkpoint_content_hash: first.checkpoint_content_hash,
+            },
+        )
+        .await
+        .unwrap();
     }
 }

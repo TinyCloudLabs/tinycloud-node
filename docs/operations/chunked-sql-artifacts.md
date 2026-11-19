@@ -102,7 +102,10 @@ the same database's credit for a second simultaneous replacement.
 Published parts have a distinct state and infinite lease, and are excluded from
 both global and owner-local reclamation indexes. Inline cleanup is best effort,
 scoped to the uploading owner, at most 16 steps and 100 ms per pass; its errors
-do not fail the save. Background passes are limited to 128 steps and one second
+do not fail the save. A writer first prioritizes its own database's eligible
+predecessors for at most two seconds; active upload leases are never stolen.
+Failed owners are excluded for the remainder of a collection pass so other
+owners can continue. Owner-lock waits at reservation are bounded at 50 ms. Background passes are limited to 128 steps and one second
 per 10-second tick. GC lock acquisition waits at most 50 ms per statement.
 An owner already above its quota can replace a database with an equal or
 smaller image; that exception admits no growth and does not free pending shrink
@@ -135,3 +138,21 @@ shrink. Size refusal occurs after native execution;
 the separate snapshot/headroom acceptance must cover transient oversized
 writes and temporary copies before enabling. Operators check CVM disk headroom
 against the number and ceilings of open databases, plus that transient cost.
+
+Artifact, account and single-statement capacity refusals return 507. Existing
+per-space growth refusals retain 402. A concurrent replacement or contended
+reservation returns a retryable 503 without checkpoint back-off; staged
+bookkeeping does not turn this positive pre-publication refusal into an
+unknown write outcome. A genuinely lost publish reply retains its existing
+unknown-outcome behavior. Expired uploads remain counted until collection.
+
+An old-format checkpoint can be replaced by a full owned snapshot before WAL
+parts attach. For DuckDB, both legacy and owned-WAL persistence first compare
+the local main file's length and CID with the stored checkpoint under the
+actor fence. A mismatch requires a complete checkpoint, including blocks
+written directly to the main file by a large insert.
+
+The feature remains off. Additional file-removal lock duration, spill-directory
+cleanup, import failure cleanup and disk/spill admission conditions still need
+their separate acceptance before activation, alongside conversion and the
+ceiling-load benchmark.

@@ -3698,7 +3698,7 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
             tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
             Status::InternalServerError
         }
-        SqlError::Unavailable => Status::ServiceUnavailable,
+        SqlError::Unavailable | SqlError::ReplacementBusy => Status::ServiceUnavailable,
         SqlError::OutcomeUnknown => Status::InternalServerError,
         SqlError::Busy(_) | SqlError::RequestTimeout => Status::ServiceUnavailable,
     }
@@ -4164,6 +4164,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
         DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => Status::new(507),
+        DuckDbError::Unavailable => Status::ServiceUnavailable,
         DuckDbError::IngestError(_) => Status::InternalServerError,
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
@@ -8420,6 +8421,39 @@ mod tests {
             assert_eq!(duckdb_error_to_status(&error), Status::new(507));
             assert!(error.to_string().starts_with("sql_database_size_limit:"));
         }
+    }
+
+    #[test]
+    fn chunked_sql_refusals_keep_capacity_growth_and_contention_distinct() {
+        assert_eq!(
+            sql_error_to_status(&SqlError::DatabaseSizeLimit),
+            Status::new(507)
+        );
+        assert_eq!(
+            sql_error_to_status(&SqlError::StorageWouldGrow),
+            Status::new(402)
+        );
+        assert_eq!(
+            sql_error_to_status(&SqlError::ReplacementBusy),
+            Status::ServiceUnavailable
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn chunked_duckdb_refusals_keep_capacity_growth_and_contention_distinct() {
+        assert_eq!(
+            duckdb_error_to_status(&DuckDbError::DatabaseSizeLimit),
+            Status::new(507)
+        );
+        assert_eq!(
+            duckdb_error_to_status(&DuckDbError::StorageWouldGrow),
+            Status::new(402)
+        );
+        assert_eq!(
+            duckdb_error_to_status(&DuckDbError::Unavailable),
+            Status::ServiceUnavailable
+        );
     }
 
     #[tokio::test]
