@@ -149,7 +149,8 @@ pub const SQL_BUSY_RETRY_AFTER_SECS: u32 = 5;
 /// write began (TC-1274).
 pub const REQUEST_TIMEOUT: &str = "request_timeout";
 /// The whole body of a [`REQUEST_TIMEOUT`] response.
-pub const REQUEST_TIMEOUT_BODY: &str = "request_timeout: no change was applied; retry the request";
+pub const REQUEST_TIMEOUT_BODY: &str =
+    "request_timeout: no change was applied; retry the request with a new signature";
 /// Body prefix of a `503` whose read's audit record was not committed within
 /// the read-audit wait bound (TC-1317); `Retry-After` is
 /// [`SQL_BUSY_RETRY_AFTER_SECS`], since the audit queue is backlogged.
@@ -1276,6 +1277,33 @@ fn kv_list_target(capabilities: &[Capability]) -> Option<(SpaceId, Path)> {
     })
 }
 
+/// Whether the capabilities are a batch KV read (TC-1274, TC-3217): every one
+/// a `kv/get` of a key, or every one a `kv/metadata` of a key, at least two
+/// and at most [`MAX_KV_BATCH_READ_ITEMS`].
+fn is_kv_batch_read(capabilities: &[Capability]) -> bool {
+    if !(2..=MAX_KV_BATCH_READ_ITEMS).contains(&capabilities.len()) {
+        return false;
+    }
+    fn batch_ability(capability: &Capability) -> Option<&str> {
+        match &capability.resource {
+            Resource::TinyCloud(resource)
+                if resource.service().as_str() == "kv" && resource.path().is_some() =>
+            {
+                match capability.ability.as_ref().as_ref() {
+                    ability @ ("tinycloud.kv/get" | "tinycloud.kv/metadata") => Some(ability),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    let first = batch_ability(&capabilities[0]);
+    first.is_some()
+        && capabilities
+            .iter()
+            .all(|capability| batch_ability(capability) == first)
+}
+
 fn kv_invoke_options(
     invocation: &InvocationInfo,
     headers: &mut ObjectHeaders,
@@ -1472,9 +1500,16 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         })
         .count();
 
+    // TC-3217: a batch read always answers its state as an ETag; a tag list
+    // naming that state answers 304. `*` keeps its create meaning below.
+    let batch_read = is_kv_batch_read(capabilities);
+    let kv_batch_if_none_match =
+        batch_read.then(|| crate::auth_guards::kv_batch_states(if_none_match.as_deref()));
     let mut preconditions = HashMap::new();
     if let Some(value) = if_none_match {
-        if mutation_targets.is_empty() && kv_get_targets == 1 {
+        if batch_read && value.trim() != "*" {
+            // Taken above as `kv_batch_if_none_match`.
+        } else if mutation_targets.is_empty() && kv_get_targets == 1 {
             headers.0 .0.insert("If-None-Match".to_string(), value);
         } else {
             if value.trim() != "*" {
@@ -1566,6 +1601,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_cursor,
         kv_sync: None,
         replay: None,
+        kv_batch_if_none_match,
     })
 }
 
@@ -2561,6 +2597,15 @@ async fn invoke_impl(
                         } else { None };
                     }
                 }
+                // TC-3217: a batch read's state follows its answers.
+                let batch_state = match outcomes.last() {
+                    Some(InvocationOutcome::KvBatchState(state)) => {
+                        let state = *state;
+                        outcomes.pop();
+                        Some(state)
+                    }
+                    _ => None,
+                };
                 if let Some(written_paths) = batch_written_paths {
                     if outcomes.len() != written_paths.len()
                         || !outcomes.iter().all(|outcome| {
@@ -2650,6 +2695,7 @@ async fn invoke_impl(
                         }
                         Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchRead(
                             results,
+                            batch_state,
                         ))))
                     }
                 } else {
