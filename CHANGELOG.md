@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- SQL databases over the checkpoint save size limit remain readable and reject mutations before execution. Details: TC-1491.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
 - The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.

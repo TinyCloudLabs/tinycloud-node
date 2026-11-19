@@ -97,6 +97,10 @@ impl SizeTrackingArtifactRepository {
 
 #[async_trait]
 impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
+    fn max_write_bytes(&self) -> u64 {
+        self.inner.max_write_bytes()
+    }
+
     async fn load_meta(
         &self,
         service: &str,
