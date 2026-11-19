@@ -74,6 +74,8 @@ use tinycloud_core::{
 pub mod admin;
 pub mod admin_stats;
 pub mod attestation;
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_replacement_busy_tests;
 pub mod encryption;
 pub mod hooks;
 pub(crate) mod kv_sync;

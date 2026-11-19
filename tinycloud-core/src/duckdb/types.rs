@@ -472,7 +472,10 @@ pub enum DuckDbError {
     DatabaseTooLargeToLoad,
     #[error("duckdb_disk_headroom: The node is short of disk space for this write")]
     DiskHeadroom,
-    #[error("Database artifact replacement is temporarily unavailable")]
+    /// Another checkpoint replacement of this database is in flight (TC-2917).
+    /// Nothing was applied; the `unavailable_retryable` token gives the node's
+    /// `503` a `Retry-After` and makes SDK clients retry it, as for SQL.
+    #[error("unavailable_retryable: Database artifact replacement is temporarily unavailable")]
     Unavailable,
     #[error("Invalid statement: {0}")]
     InvalidStatement(String),
