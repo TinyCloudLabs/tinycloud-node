@@ -28,3 +28,41 @@ If versioning is ever turned on, a lifecycle rule must be added in the same chan
 ## 3. Never Object Lock on the data bucket
 
 The block / SQL object bucket must never have Object Lock, nor a default retention or legal hold. A locked version cannot be deleted before its retention ends. Purge would then report success while the bytes stayed. Object Lock belongs only on the ledger bucket.
+
+## 4. Turning space lifecycle on
+
+Space lifecycle (the `/space/list`, `/space/retire-owner`, `/space/purge` and `/space/purge/status` routes and the purge worker) is on only when both of these are set:
+
+- `TINYCLOUD_HOST_ID`: the stable, non-secret host name owners sign into lifecycle requests, `[a-z0-9-]{1,63}`, e.g. `node-prod-1`.
+- `TINYCLOUD_PURGE_LEDGER_KEYS`: a secret. It takes only the JSON form `{"active_key_id":"plk-YYYYMMDD","keys":{"plk-YYYYMMDD":"<base64url, at least 32 bytes>"}}`. Startup and `--validate-config` refuse a bare key and never print the value. Keep every retired key ID in `keys` for as long as its records can be in the ledger.
+
+Setting only one of them is a configuration error. On also needs PostgreSQL and a `[storage.purge_ledger]` (section 1).
+
+With both unset, the node starts as before and the lifecycle routes answer 404. If the database or the configured ledger already holds lifecycle state (records, fences, retirements or purge jobs), startup refuses: removing the settings cannot bypass the ledger. With lifecycle off and an S3 ledger configured, startup lists the ledger bucket, so the IAM grant in section 1 must be in place first.
+
+When on, the node does this before it serves anything:
+
+1. Verify every ledger record's HMAC, in the ledger store and in the database copy. One bad or conflicting record stops the start.
+2. Reconcile the database to the ledger: re-create owner fences and retirements, space fences and completion tombstones, and re-create the job of an accepted purge whose job is missing. The ledger wins; nothing is un-fenced.
+3. Match each signed storage prefix against the stores: purge a prefix that is still present, record one that is absent.
+
+Any failure stops the start. Once the node is up, if a lifecycle request cannot confirm its ledger write, the node refuses all space traffic (503) and reconciles again until it succeeds. The startup log line `purge ledger reconciled` carries counts only.
+
+## 5. Reconcile after a restore (restore runbook step 7)
+
+With the node stopped and the database restored, run:
+
+```sh
+tinycloud node purge-ledger reconcile --config <config>
+```
+
+It reads the database, the stores and the ledger from the config, and `TINYCLOUD_HOST_ID` and `TINYCLOUD_PURGE_LEDGER_KEYS` from the environment. It applies pending database migrations, as node start does, then runs the reconciliation the node runs at startup, once. It prints a JSON report with counts only, never a space, owner or purge ID. It is idempotent: a second run re-creates nothing, and its `purges_in_progress` counts the purges the first run resumed. `--json` prints the report on one line.
+
+Read the report:
+
+- `purges_resumed` and `purges_in_progress`: the worker finishes these once the node starts.
+- `purges_unresumable`: completed purges whose space is back but whose acceptance record has aged out of the ledger. The space stays fenced; escalate.
+- `prefixes_unavailable`: signed prefixes in a store this node does not run. They were not checked; escalate.
+- `prefixes_deferred`: prefixes still inside the upload grace. Run the command again after the grace, or let the node finish them.
+
+A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. There is no node lock: never run it while the node is serving.

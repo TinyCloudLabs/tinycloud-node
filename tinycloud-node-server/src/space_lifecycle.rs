@@ -176,31 +176,7 @@ impl LifecycleRuntime {
         let invalid = || std::io::Error::other("space lifecycle configuration unavailable");
         match (host_id, tombstone_key) {
             (None, None) => {
-                if !ledger.list_purge_records().await?.is_empty()
-                    || tinycloud_core::models::space_purge_fence::Entity::find()
-                        .filter(tinycloud_core::models::space_purge_fence::Column::Fenced.eq(true))
-                        .one(&conn)
-                        .await
-                        .map_err(|_| invalid())?
-                        .is_some()
-                    || space_retirement::Entity::find()
-                        .one(&conn)
-                        .await
-                        .map_err(|_| invalid())?
-                        .is_some()
-                    || space_purge_job::Entity::find()
-                        .one(&conn)
-                        .await
-                        .map_err(|_| invalid())?
-                        .is_some()
-                    || tinycloud_core::models::resource_purge_job::Entity::find()
-                        .one(&conn)
-                        .await
-                        .map_err(|_| invalid())?
-                        .is_some()
-                {
-                    return Err(invalid());
-                }
+                Self::refuse_unconfigured(&conn, Some(&*ledger)).await?;
                 Ok(None)
             }
             (host, Some(raw)) => {
@@ -212,6 +188,59 @@ impl LifecycleRuntime {
             }
             (Some(_), None) => Err(invalid()),
         }
+    }
+
+    /// With lifecycle off, refuse to start over lifecycle state: ledger
+    /// records (when a ledger is configured), fences, retirements or jobs.
+    pub async fn refuse_unconfigured(
+        conn: &RecoveringConnection,
+        ledger: Option<&dyn PurgeLedgerStore>,
+    ) -> Result<(), std::io::Error> {
+        let invalid = || std::io::Error::other("space lifecycle configuration unavailable");
+        if let Some(ledger) = ledger {
+            if !ledger.list_purge_records().await?.is_empty() {
+                return Err(invalid());
+            }
+        }
+        if tinycloud_core::models::space_purge_fence::Entity::find()
+            .filter(tinycloud_core::models::space_purge_fence::Column::Fenced.eq(true))
+            .one(conn)
+            .await
+            .map_err(|_| invalid())?
+            .is_some()
+            || space_retirement::Entity::find()
+                .one(conn)
+                .await
+                .map_err(|_| invalid())?
+                .is_some()
+            || space_purge_job::Entity::find()
+                .one(conn)
+                .await
+                .map_err(|_| invalid())?
+                .is_some()
+            || tinycloud_core::models::resource_purge_job::Entity::find()
+                .one(conn)
+                .await
+                .map_err(|_| invalid())?
+                .is_some()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connection(&self) -> &RecoveringConnection {
+        &self.conn
+    }
+    pub(crate) fn keys(&self) -> &LedgerKeys {
+        &self.keys
+    }
+    /// True once the ledger verified and no failed reconciliation followed.
+    pub(crate) fn ledger_verified(&self) -> bool {
+        self.ledger_verified.load(Ordering::Acquire)
+    }
+    pub fn host_id(&self) -> &str {
+        &self.host_id
     }
 
     pub fn new(
