@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.10](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.10) - 2026-11-19
+
+### Fixed
+
+- *(revocation)* delegator's exact-CID revoke grant to its own delegatee (TC-3150) ([#642](https://github.com/TinyCloudLabs/tinycloud-node/pull/642))
+
+### Other
+
+- prune six duplicate tests ([#651](https://github.com/TinyCloudLabs/tinycloud-node/pull/651))
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
