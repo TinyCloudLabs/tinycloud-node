@@ -41,6 +41,7 @@ pub mod m20261113_000000_database_artifact_external;
 
 pub mod m20261113_010000_artifact_chunks;
 pub mod m20261113_020000_artifact_chunk_wal;
+pub mod m20261113_030000_artifact_part_lifecycle;
 
 pub mod m20261117_000000_hook_subscription_headers;
 
@@ -94,6 +95,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261117_000000_hook_subscription_headers::Migration),
             Box::new(m20261117_000000_renewal_switch::Migration),
             Box::new(m20261113_020000_artifact_chunk_wal::Migration),
+            Box::new(m20261113_030000_artifact_part_lifecycle::Migration),
         ]
     }
 }
