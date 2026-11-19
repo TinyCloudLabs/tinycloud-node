@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Ops: added a reversible local-config HTTP ingress switch and operator runbook for a separately verified independent Cloudflare origin. Dry-run is the default; production routing and policy execution remain separate. Details: TC-1387.
 - Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
