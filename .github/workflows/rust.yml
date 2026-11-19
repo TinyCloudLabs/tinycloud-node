@@ -26,6 +26,11 @@ env:
 # `cargo test` step was therefore always true. The intent — build the wasm
 # crates for wasm32-unknown-unknown — is now a real, unconditional step in the
 # `build` job.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   threshold:
     name: threshold (crate, policy, primitive checker)
