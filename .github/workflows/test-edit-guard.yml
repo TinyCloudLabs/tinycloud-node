@@ -1,0 +1,44 @@
+# Fails a PR that removes or changes lines in existing test files unless the PR
+# body has a `test-ruling: TC-<N>` line (TC-1933). Rules and test-file patterns:
+# .github/scripts/test-edit-guard.mjs. Re-runs when the PR body is edited.
+name: Test edit guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-edit-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  self-test:
+    name: Test edit guard self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Self-test the guard
+        run: timeout 120 node .github/scripts/test-edit-guard.mjs --self-test
+
+  guard:
+    name: No unruled edits to existing tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Fail on unruled edits to existing tests
+        run: timeout 180 node .github/scripts/test-edit-guard.mjs
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}

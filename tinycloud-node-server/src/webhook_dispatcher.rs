@@ -8,13 +8,35 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tinycloud_core::{encryption::RowBinding, registry_admission::RegistryError, ColumnEncryption};
+use tinycloud_core::{
+    db_retry::{retry_owner, Replay},
+    encryption::RowBinding,
+    registry_admission::RegistryError,
+    sea_orm::DbErr,
+    ColumnEncryption,
+};
 
 type WebhookMac = Hmac<Sha256>;
 
 const PRIMARY_SECRET_KEY_ID: &str = "primary";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DISPATCH_BATCH_SIZE: u64 = 32;
+/// Added to the callback timeout to size a delivery lease.
+const LEASE_MARGIN: Duration = Duration::from_secs(60);
+
+/// A claimed delivery: its id and the lease token every mark must carry.
+struct Claim {
+    id: String,
+    token: String,
+}
+
+/// A mark that finds its lease gone (expired and re-claimed, or already
+/// settled) is refused by the database; nothing about the request is logged.
+fn log_if_stale(applied: bool) {
+    if !applied {
+        tracing::warn!("webhook delivery mark refused: lease no longer held");
+    }
+}
 
 #[derive(Clone)]
 pub struct WebhookDispatcher {
@@ -43,40 +65,91 @@ impl WebhookDispatcher {
     }
 
     pub async fn dispatch_due_once(&self) -> Result<()> {
-        let deliveries = self
-            .tinycloud
-            .list_due_webhook_deliveries(DISPATCH_BATCH_SIZE)
-            .await
-            .context("loading due webhook deliveries")?;
-
         // TC-991: re-derived once per subscription per pass and never carried across passes,
         // so a revocation or expiry applies by the next pass. TC-2481: so is the space's
         // registry admission, so a delisting stops its deliveries by the next pass.
         let mut authority = HashMap::<String, bool>::new();
         let mut hosting = HashMap::<String, Result<(), RegistryError>>::new();
-        for delivery in deliveries {
+        // Claim one delivery at a time so each lease starts when its send
+        // starts and only has to cover that one send.
+        let lease = self.timeout + LEASE_MARGIN;
+        let mut unsent = Vec::<Claim>::new();
+        let mut claim_error = None;
+        for _ in 0..DISPATCH_BATCH_SIZE {
+            // The claim is a SELECT, a conditional UPDATE and a read-back. A
+            // second run takes a fresh token and only happens when the tracker
+            // shows the UPDATE cannot have committed (TC-2610).
+            let (claimed, _) = retry_owner(
+                "webhook_claim_delivery",
+                self.tinycloud.connection().retry_policy(),
+                Replay::Never,
+                || self.tinycloud.claim_due_webhook_deliveries(1, lease),
+                |error: &DbErr| Some(error),
+            )
+            .await;
+            let delivery = match claimed.context("claiming due webhook deliveries") {
+                Ok(claimed) => match claimed.into_iter().next() {
+                    Some(delivery) => delivery,
+                    None => break,
+                },
+                Err(error) => {
+                    claim_error = Some(error);
+                    break;
+                }
+            };
+            let claim = Claim {
+                id: delivery.id.clone(),
+                token: delivery.lease_token.clone(),
+            };
+            let mut sent = false;
             if self
-                .dispatch_delivery(delivery, &mut authority, &mut hosting)
+                .dispatch_delivery(delivery, &mut authority, &mut hosting, &mut sent)
                 .await
                 .is_err()
             {
                 tracing::warn!("webhook delivery attempt failed");
+                if !sent {
+                    unsent.push(claim);
+                }
             }
         }
 
-        Ok(())
+        // An attempt that failed before any send did not deliver: give its
+        // delivery back so the next pass retries it without waiting for the
+        // lease to expire. Held until here so this pass does not reclaim it.
+        for claim in unsent {
+            if self
+                .tinycloud
+                .release_webhook_delivery_lease(&claim.id, &claim.token)
+                .await
+                .is_err()
+            {
+                tracing::warn!("webhook delivery lease release failed");
+            }
+        }
+
+        match claim_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
+    /// `sent` is set once the callback request is about to go out.
     async fn dispatch_delivery(
         &self,
         delivery: tinycloud_core::db::PendingWebhookDelivery,
         authority: &mut HashMap<String, bool>,
         hosting: &mut HashMap<String, Result<(), RegistryError>>,
+        sent: &mut bool,
     ) -> Result<()> {
         let current_attempt = delivery.attempts + 1;
+        let claim = Claim {
+            id: delivery.id.clone(),
+            token: delivery.lease_token.clone(),
+        };
 
         if !delivery.subscription_active {
-            self.record_terminal_failure(delivery.id, current_attempt, "subscription inactive")
+            self.record_terminal_failure(&claim, current_attempt, "subscription inactive")
                 .await?;
             return Ok(());
         }
@@ -84,19 +157,26 @@ impl WebhookDispatcher {
         let authorized = match authority.get(&delivery.subscription_id) {
             Some(authorized) => *authorized,
             None => {
-                let authorized = self
-                    .tinycloud
-                    .hook_register_authority_holds(
-                        &delivery.subscriber_did,
-                        &delivery.space_id,
-                        &crate::hooks::hook_scope_path(
-                            &delivery.target_service,
-                            delivery.path_prefix.as_deref(),
-                        ),
-                        OffsetDateTime::now_utc(),
-                    )
-                    .await
-                    .context("checking webhook subscription authority")?;
+                let scope_path = crate::hooks::hook_scope_path(
+                    &delivery.target_service,
+                    delivery.path_prefix.as_deref(),
+                );
+                let (authorized, _) = retry_owner(
+                    "webhook_authority",
+                    self.tinycloud.connection().retry_policy(),
+                    Replay::Never,
+                    || {
+                        self.tinycloud.hook_register_authority_holds(
+                            &delivery.subscriber_did,
+                            &delivery.space_id,
+                            &scope_path,
+                            OffsetDateTime::now_utc(),
+                        )
+                    },
+                    |error: &DbErr| Some(error),
+                )
+                .await;
+                let authorized = authorized.context("checking webhook subscription authority")?;
                 if !authorized {
                     self.tinycloud
                         .deactivate_hook_subscription(&delivery.subscription_id)
@@ -108,12 +188,8 @@ impl WebhookDispatcher {
             }
         };
         if !authorized {
-            self.record_terminal_failure(
-                delivery.id,
-                current_attempt,
-                "subscription authority lapsed",
-            )
-            .await?;
+            self.record_terminal_failure(&claim, current_attempt, "subscription authority lapsed")
+                .await?;
             return Ok(());
         }
 
@@ -136,13 +212,13 @@ impl WebhookDispatcher {
             // Delisted: this delivery ends, but the subscription stays, as it
             // does for every other refused delivery, until its authority lapses.
             Err(RegistryError::Denied) => {
-                self.record_terminal_failure(delivery.id, current_attempt, "space not hosted here")
+                self.record_terminal_failure(&claim, current_attempt, "space not hosted here")
                     .await?;
                 return Ok(());
             }
             Err(RegistryError::Unavailable) => {
                 self.record_retryable_failure(
-                    delivery.id,
+                    &claim,
                     current_attempt,
                     RegistryError::Unavailable.to_string(),
                 )
@@ -153,7 +229,7 @@ impl WebhookDispatcher {
 
         if delivery.secret_key_id != PRIMARY_SECRET_KEY_ID {
             self.record_terminal_failure(
-                delivery.id,
+                &claim,
                 current_attempt,
                 &format!(
                     "unsupported webhook secret key id {}",
@@ -176,7 +252,7 @@ impl WebhookDispatcher {
             Ok(secret) => secret,
             Err(error) => {
                 self.record_terminal_failure(
-                    delivery.id,
+                    &claim,
                     current_attempt,
                     &format!("secret decryption failed: {error}"),
                 )
@@ -200,7 +276,7 @@ impl WebhookDispatcher {
                     .and_then(Result::ok);
                 let Some(opened) = opened else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         "custom header decryption failed",
                     )
@@ -210,7 +286,7 @@ impl WebhookDispatcher {
                 match crate::webhook_headers::delivery_header_map(&opened) {
                     Ok(headers) => headers,
                     Err(reason) => {
-                        self.record_terminal_failure(delivery.id, current_attempt, reason)
+                        self.record_terminal_failure(&claim, current_attempt, reason)
                             .await?;
                         return Ok(());
                     }
@@ -227,11 +303,11 @@ impl WebhookDispatcher {
             Ok((_, destination)) => destination,
             Err(error) => {
                 if error.is_retryable() {
-                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                    self.record_retryable_failure(&claim, current_attempt, error.to_string())
                         .await?;
                 } else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         &format!("callback URL rejected: {error}"),
                     )
@@ -241,6 +317,22 @@ impl WebhookDispatcher {
             }
         };
 
+        // Send boundary: confirm this worker still holds a live lease and
+        // restart it for the send. Fails closed: a lease that expired (and
+        // possibly went to another dispatcher) during the preparation above
+        // means no send and no mark; the row is left to whoever holds it.
+        let renewed = self
+            .tinycloud
+            .renew_webhook_delivery_lease(&claim.id, &claim.token, self.timeout + LEASE_MARGIN)
+            .await
+            .context("renewing webhook delivery lease")?;
+        if !renewed {
+            tracing::warn!("webhook delivery send skipped: lease no longer held");
+            return Ok(());
+        }
+        // Past this point the callback may have been sent, so the lease stays
+        // held until a mark or its expiry.
+        *sent = true;
         match egress::post(self.egress.clone(), destination, self.timeout)
             .headers(custom_headers)
             .header("Content-Type", "application/json")
@@ -253,14 +345,16 @@ impl WebhookDispatcher {
             .await
         {
             Ok(response) if response.status().is_success() => {
-                self.tinycloud
-                    .mark_webhook_delivery_delivered(&delivery.id, current_attempt)
+                let applied = self
+                    .tinycloud
+                    .mark_webhook_delivery_delivered(&claim.id, &claim.token, current_attempt)
                     .await
                     .context("marking webhook delivery delivered")?;
+                log_if_stale(applied);
             }
             Ok(response) => {
                 self.record_retryable_failure(
-                    delivery.id,
+                    &claim,
                     current_attempt,
                     format!("callback returned {}", response.status()),
                 )
@@ -268,11 +362,11 @@ impl WebhookDispatcher {
             }
             Err(error) => {
                 if error.is_retryable() {
-                    self.record_retryable_failure(delivery.id, current_attempt, error.to_string())
+                    self.record_retryable_failure(&claim, current_attempt, error.to_string())
                         .await?;
                 } else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         &format!("callback URL rejected: {error}"),
                     )
@@ -286,37 +380,50 @@ impl WebhookDispatcher {
 
     async fn record_terminal_failure(
         &self,
-        delivery_id: String,
+        claim: &Claim,
         attempts: i64,
         error: &str,
     ) -> Result<()> {
-        self.tinycloud
-            .mark_webhook_delivery_failed(&delivery_id, attempts, None, error.to_string(), true)
+        let applied = self
+            .tinycloud
+            .mark_webhook_delivery_failed(
+                &claim.id,
+                &claim.token,
+                attempts,
+                None,
+                error.to_string(),
+                true,
+            )
             .await
             .context("marking webhook delivery dead-letter")?;
+        log_if_stale(applied);
         Ok(())
     }
 
     async fn record_retryable_failure(
         &self,
-        delivery_id: String,
+        claim: &Claim,
         attempts: i64,
         error: String,
     ) -> Result<()> {
         let next_attempt_number = attempts + 1;
         if next_attempt_number > self.max_attempts {
-            self.tinycloud
-                .mark_webhook_delivery_failed(&delivery_id, attempts, None, error, true)
+            let applied = self
+                .tinycloud
+                .mark_webhook_delivery_failed(&claim.id, &claim.token, attempts, None, error, true)
                 .await
                 .context("marking exhausted webhook delivery dead-letter")?;
+            log_if_stale(applied);
             return Ok(());
         }
 
         let next_attempt_at =
             OffsetDateTime::now_utc() + retry_delay_for_attempt(next_attempt_number);
-        self.tinycloud
+        let applied = self
+            .tinycloud
             .mark_webhook_delivery_failed(
-                &delivery_id,
+                &claim.id,
+                &claim.token,
                 attempts,
                 Some(next_attempt_at),
                 error,
@@ -324,6 +431,7 @@ impl WebhookDispatcher {
             )
             .await
             .context("marking webhook delivery for retry")?;
+        log_if_stale(applied);
         Ok(())
     }
 }
@@ -943,6 +1051,7 @@ mod tests {
         };
         use tinycloud_core::{
             db_pool::PoolRecoveryStats,
+            db_retry::isolate_overload,
             hash::hash,
             models::{abilities, actor, delegation},
             sea_orm::{ConnectionTrait, DbBackend, Statement},
@@ -1305,8 +1414,6 @@ mod tests {
         fn delta(before: PoolRecoveryStats, after: PoolRecoveryStats) -> PoolRecoveryStats {
             PoolRecoveryStats {
                 losses: after.losses - before.losses,
-                retries: after.retries - before.retries,
-                idempotent_retries: after.idempotent_retries - before.idempotent_retries,
                 revalidations: after.revalidations - before.revalidations,
                 revalidation_failures: after.revalidation_failures - before.revalidation_failures,
             }
@@ -1379,11 +1486,13 @@ mod tests {
             let idle = fixture.fill_pool().await;
             let before = fixture.stats();
             fixture.terminate(&idle).await;
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             let mass = delta(before, fixture.stats());
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
-            assert_eq!((mass.losses, mass.retries), (1, 1), "{mass:?}");
+            assert_eq!(mass.losses, 1, "{mass:?}");
             assert!(mass.revalidation_failures >= 1, "{mass:?}");
 
             // (a') the authority check's statement is reset once.
@@ -1391,12 +1500,14 @@ mod tests {
             fixture.fill_pool().await;
             let before = fixture.stats();
             fixture.proxy.cuts.store(1, Ordering::SeqCst);
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             let reauth = delta(before, fixture.stats());
             assert_eq!(fixture.proxy.reset.load(Ordering::SeqCst), 1);
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
-            assert_eq!((reauth.losses, reauth.retries), (1, 1), "{reauth:?}");
+            assert_eq!(reauth.losses, 1, "{reauth:?}");
             eprintln!("dispatch after mass termination {mass:?}; after one reset authority check {reauth:?}");
             fixture.drop_schema().await;
         }
@@ -1420,7 +1531,9 @@ mod tests {
 
             let before = fixture.stats();
             fixture.proxy.cuts.store(-1, Ordering::SeqCst);
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             fixture.proxy.cuts.store(0, Ordering::SeqCst);
             let failed = delta(before, fixture.stats());
             assert_eq!(
@@ -1428,7 +1541,7 @@ mod tests {
                 2,
                 "the authority check ran, and was retried once"
             );
-            assert_eq!((failed.losses, failed.retries), (2, 1), "{failed:?}");
+            assert_eq!(failed.losses, 2, "{failed:?}");
             assert!(
                 fixture.subscription_active(&subscription).await,
                 "a connection error must not deactivate the subscription"
@@ -1445,7 +1558,9 @@ mod tests {
                 "no callback was sent"
             );
 
-            dispatcher.dispatch_due_once().await.expect("the pass runs");
+            isolate_overload(dispatcher.dispatch_due_once())
+                .await
+                .expect("the pass runs");
             fixture.assert_delivered(&delivery).await;
             assert!(fixture.subscription_active(&subscription).await);
             eprintln!("authority check unreachable for one pass: {failed:?}");
@@ -1453,3 +1568,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lease_tests;
