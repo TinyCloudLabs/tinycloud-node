@@ -13,8 +13,8 @@ Purge acceptance and completion records go to `[storage.purge_ledger]`. They nev
 The ledger bucket:
 
 - Create it with Object Lock enabled and a default COMPLIANCE retention. Retention must cover the restore window plus the backup retention: a restore can bring back data that only the ledger proves was purged.
-- Grant the node `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`. Reconciliation and restore read and list the ledger.
-- Deny `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutBucketObjectLockConfiguration`, `s3:BypassGovernanceRetention` and lifecycle changes to every node credential. In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the deny does.
+- Grant the node only `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`. Reconciliation and restore read and list the ledger.
+- Deny every other action on both ledger ARNs (bucket and `/*`) to every node credential, with one `NotAction` deny. This covers `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutBucketObjectLockConfiguration`, lifecycle and bucket-policy changes. The node's key is shared with the data bucket, so a broad allow elsewhere must not reach the ledger. In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the deny does. `s3:BypassGovernanceRetention` stays denied in the bucket policy.
 - Ledger PUTs carry a SHA-256 checksum, as Object Lock buckets require.
 
 ## 2. Old versions in the data bucket
