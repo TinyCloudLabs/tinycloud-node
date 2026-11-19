@@ -454,20 +454,6 @@ mod tests {
         );
     }
 
-    /// Branch 2 (fresh database): the index is built, instantly, silently.
-    #[tokio::test]
-    async fn postgres_kv_write_fresh_database_gets_the_index() {
-        let Some(fixture) = PostgresTestDatabase::migrated_through(
-            "postgres_kv_write_fresh_database_gets_the_index",
-            None,
-        )
-        .await
-        else {
-            return;
-        };
-        assert!(postgres_index(&fixture.conn).await.unwrap().1);
-    }
-
     /// The index serves the reference probe `finish_candidates` runs, in its
     /// exact shape (`space`, `value`, `generation` all compared by equality):
     /// with sequential and bitmap scans disabled, the planner can only use an

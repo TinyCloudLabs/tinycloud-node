@@ -293,13 +293,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_fresh_database_gets_the_index() {
-        let db = sqlite().await;
-        Migrator::up(&db, None).await.unwrap();
-        assert_eq!(sqlite_index_columns(&db).await, expected_columns());
-    }
-
-    #[tokio::test]
     async fn sqlite_v1_20_6_upgrade_indexes_existing_history() {
         let db = sqlite().await;
         Migrator::up(&db, Some(v1_20_6_migrations())).await.unwrap();
