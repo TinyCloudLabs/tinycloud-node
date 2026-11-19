@@ -78,7 +78,7 @@ Once a retired owner has no live space and every purge of the owner is complete,
 
 A crash between steps leaves the record in place; the worker's next pass and this command finish steps 2 and 3. After a restore, this command (step 7) deletes the rows again for every `erased` record.
 
-**No rollback below this release.** An earlier release refuses an `erased` record when it verifies the ledger, so it does not start. Once any node has written one (check for objects under `_purge-ledger/owners-erased/`), fix forward only. The record is locked; it cannot be removed to allow a rollback.
+**No rollback past this release; recovery = fix forward.** This applies from the first deploy of the release, whether or not any `erased` record exists yet. An earlier release refuses an `erased` record when it verifies the ledger, so it does not start, and this release's `m20261112_*` purge migrations refuse `down`. Records under `_purge-ledger/owners-erased/` are locked and cannot be removed to allow a rollback. The release ships on its own (no other features in it), so a fix forward touches only this change.
 
 A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. Only `deletions.jsonl` is locked (the command waits up to 60 seconds for it, then fails); nothing else stops it running beside a serving node, so never run it while the node is serving.
 
