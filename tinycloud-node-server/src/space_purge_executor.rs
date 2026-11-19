@@ -1,14 +1,18 @@
-//! Dormant phase executor. Bootstrap must prove complete fence/entry-point
-//! coverage and authenticate accepted storage prefixes before scheduling it.
+//! Phase executor and the process's purge worker loop. The node schedules the
+//! worker only after startup has verified and reconciled the independent
+//! ledger (TC-2871).
 use crate::{
+    space_lifecycle::{LifecycleRuntime, PurgeStorageLayout},
     storage::{
         purge_completion::{complete_purge_with_encryption, verified_acceptance},
         purge_ledger::PurgeLedger,
         purge_reconcile::{PrefixStoreKind, VerifiedPurgePrefix},
-        sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore, S3SqlObjectStore},
+        purge_restore::RestorePurgeStore,
+        sql_object::{purge::SqlPhysicalPrefix, FsSqlObjectStore, S3SqlObjectStore, WriteMode},
     },
     BlockStores,
 };
+use std::{sync::Arc, time::Duration};
 use tinycloud_core::{
     encryption::ColumnEncryption,
     sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait},
@@ -47,6 +51,235 @@ pub enum PurgeExecutionError {
     PrefixInventory,
     #[error("purge SQL storage unavailable")]
     SqlStorageUnavailable,
+}
+impl PurgeExecutionError {
+    /// The fixed code a failed attempt records on its job; never an identity.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Database(_) => "database",
+            Self::Storage => "storage",
+            Self::Cache => "cache",
+            Self::Binding => "binding",
+            Self::LeaseLost => "lease_lost",
+            Self::PrefixInventory => "prefix_inventory",
+            Self::SqlStorageUnavailable => "sql_storage_unavailable",
+        }
+    }
+}
+
+/// The SQL object transport the purge lists and deletes through.
+pub enum PurgeSqlObjects {
+    S3(S3SqlObjectStore),
+    FileSystem(FsSqlObjectStore),
+}
+impl PurgeSqlObjects {
+    /// The SQL object store of the configured block backend: the block bucket
+    /// on S3, `{datadir}/sql-store` on local storage. No write probe runs;
+    /// the purge only lists and deletes.
+    pub async fn open(storage: &crate::config::Storage) -> anyhow::Result<Self> {
+        Ok(match &storage.blocks {
+            Either::A(s3) => {
+                Self::S3(S3SqlObjectStore::open_with_mode(s3, WriteMode::Conditional).await)
+            }
+            Either::B(fs) => Self::FileSystem(
+                FsSqlObjectStore::open(storage.datadir.join("sql-store"), fs.path())
+                    .map_err(|error| anyhow::anyhow!("purge SQL object store: {error}"))?,
+            ),
+        })
+    }
+    fn store(&self) -> SqlPurgeStore<'_> {
+        match self {
+            Self::S3(store) => SqlPurgeStore::S3(store),
+            Self::FileSystem(store) => SqlPurgeStore::FileSystem(store),
+        }
+    }
+}
+
+/// Every store a space purge touches, shared by the worker and by
+/// reconciliation. The caches are clones of the services the routes use, so
+/// their evictions reach the live actors.
+pub struct PurgeStores {
+    pub blocks: BlockStores,
+    pub ledger: Arc<PurgeLedger>,
+    pub sql: SqlService,
+    #[cfg(feature = "duckdb")]
+    pub duckdb: Option<tinycloud_core::duckdb::DuckDbService>,
+    pub sql_objects: PurgeSqlObjects,
+    pub encryption: Option<ColumnEncryption>,
+}
+impl PurgeStores {
+    /// The physical stores acceptance records sign, in executor order.
+    pub fn store_kinds(&self) -> Vec<PrefixStoreKind> {
+        #[cfg(feature = "duckdb")]
+        let duckdb = self.duckdb.is_some();
+        #[cfg(not(feature = "duckdb"))]
+        let duckdb = false;
+        let mut kinds = vec![
+            match self.blocks {
+                Either::A(_) => PrefixStoreKind::KvS3,
+                Either::B(_) => PrefixStoreKind::KvFileSystem,
+            },
+            match self.sql_objects {
+                PurgeSqlObjects::S3(_) => PrefixStoreKind::SqlS3,
+                PurgeSqlObjects::FileSystem(_) => PrefixStoreKind::SqlFileSystem,
+            },
+            PrefixStoreKind::SqliteCache,
+        ];
+        kinds.extend(duckdb.then_some(PrefixStoreKind::DuckDbCache));
+        kinds
+    }
+    pub fn layout(&self) -> Result<PurgeStorageLayout, &'static str> {
+        let kinds = self.store_kinds();
+        PurgeStorageLayout::new(
+            kinds[0],
+            kinds[1],
+            kinds.contains(&PrefixStoreKind::DuckDbCache),
+        )
+    }
+    pub fn restore_store(&self, kind: PrefixStoreKind) -> Option<RestorePurgeStore<'_>> {
+        match (kind, &self.blocks, &self.sql_objects) {
+            (PrefixStoreKind::KvFileSystem, Either::B(store), _) => {
+                Some(RestorePurgeStore::KvFileSystem(store))
+            }
+            (PrefixStoreKind::KvS3, Either::A(store), _) => Some(RestorePurgeStore::KvS3(store)),
+            (PrefixStoreKind::SqlFileSystem, _, PurgeSqlObjects::FileSystem(store)) => {
+                Some(RestorePurgeStore::SqlFileSystem(store))
+            }
+            (PrefixStoreKind::SqlS3, _, PurgeSqlObjects::S3(store)) => {
+                Some(RestorePurgeStore::SqlS3(store))
+            }
+            (PrefixStoreKind::SqliteCache, _, _) => Some(RestorePurgeStore::SqliteCache(&self.sql)),
+            #[cfg(feature = "duckdb")]
+            (PrefixStoreKind::DuckDbCache, _, _) => {
+                self.duckdb.as_ref().map(RestorePurgeStore::DuckDbCache)
+            }
+            _ => None,
+        }
+    }
+    pub fn executor<'a>(
+        &'a self,
+        db: &'a DatabaseConnection,
+        keys: &'a LedgerKeys,
+    ) -> SpacePurgeExecutor<'a> {
+        SpacePurgeExecutor {
+            db,
+            blocks: &self.blocks,
+            ledger: &self.ledger,
+            sql: &self.sql,
+            #[cfg(feature = "duckdb")]
+            duckdb: self.duckdb.as_ref(),
+            sql_objects: Some(self.sql_objects.store()),
+            keys,
+            encryption: self.encryption.as_ref(),
+        }
+    }
+}
+
+/// How long an idle worker waits before polling again when no request wakes it.
+const WORKER_IDLE: Duration = Duration::from_secs(10);
+
+/// The process's purge worker: sweep one completed purge's residue, claim one
+/// due phase or batch, execute it, release it on failure, and back off when
+/// idle. One loop per process; claims are leased in PostgreSQL. It does no
+/// work while the ledger is unverified or a reconciliation failed.
+pub async fn run_purge_worker(
+    runtime: LifecycleRuntime,
+    stores: Arc<PurgeStores>,
+    shutdown: rocket::Shutdown,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        let worked = tokio::select! {
+            worked = purge_step(&runtime, &stores) => worked,
+            _ = &mut shutdown => break,
+        };
+        if worked {
+            continue;
+        }
+        tokio::select! {
+            _ = runtime.work_requested.notified() => {}
+            _ = tokio::time::sleep(WORKER_IDLE) => {}
+            _ = &mut shutdown => break,
+        }
+    }
+}
+
+/// One bounded pass. True when it did work and another pass should follow.
+async fn purge_step(runtime: &LifecycleRuntime, stores: &PurgeStores) -> bool {
+    if !runtime.ledger_verified() {
+        return false;
+    }
+    let db = runtime.connection().sea_orm_connection();
+    let keys = runtime.keys();
+    let swept =
+        match tinycloud_core::space_purge_records::sweep_next(db, keys, stores.encryption.as_ref())
+            .await
+        {
+            Ok(swept) => swept,
+            Err(_) => {
+                ::tracing::warn!(
+                    event = "space_purge_sweep_failed",
+                    "space purge residue sweep failed"
+                );
+                false
+            }
+        };
+    let job = match space_purge_worker::claim(db, &uuid::Uuid::new_v4().to_string()).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return swept,
+        Err(_) => {
+            ::tracing::warn!(
+                event = "space_purge_claim_failed",
+                "space purge claim failed"
+            );
+            return false;
+        }
+    };
+    match execute_job(runtime, stores, db, keys, &job).await {
+        Ok(outcome) => ::tracing::info!(
+            event = "space_purge_phase",
+            phase = %job.phase,
+            outcome = ?outcome,
+            "space purge phase ran"
+        ),
+        Err(code) => {
+            // The purge ID and the fixed code only: never error text.
+            ::tracing::warn!(
+                event = "space_purge_phase_failed",
+                purge_id = %job.purge_id,
+                code,
+                "space purge phase failed; retrying later"
+            );
+            if code != "lease_lost" && space_purge_worker::retry(db, &job, code).await.is_err() {
+                ::tracing::warn!(
+                    event = "space_purge_release_failed",
+                    "space purge attempt release failed"
+                );
+            }
+        }
+    }
+    true
+}
+
+async fn execute_job(
+    runtime: &LifecycleRuntime,
+    stores: &PurgeStores,
+    db: &DatabaseConnection,
+    keys: &LedgerKeys,
+    job: &ClaimedPurge,
+) -> Result<PhaseOutcome, &'static str> {
+    let space: tinycloud_auth::resource::SpaceId =
+        job.space.parse().map_err(|_| "invalid_space")?;
+    let drain = runtime
+        .fence
+        .drain(db, &space)
+        .await
+        .map_err(|_| "fence_unavailable")?;
+    stores
+        .executor(db, keys)
+        .execute_claimed(job, &drain)
+        .await
+        .map_err(|error| error.code())
 }
 
 pub struct SpacePurgeExecutor<'a> {

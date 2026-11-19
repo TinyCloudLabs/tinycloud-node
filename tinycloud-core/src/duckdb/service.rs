@@ -31,6 +31,10 @@ const DUCKDB_MAGIC_OFFSET: usize = 8;
 type DatabaseLock = tokio::sync::Mutex<()>;
 type DatabaseLockRegistry = Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<DatabaseLock>>>>;
 
+/// Clones share all state: every mutable field is behind an `Arc` and the rest
+/// is immutable configuration. The space-purge worker uses a clone of the
+/// instance Rocket manages, so its evictions reach the live actors.
+#[derive(Clone)]
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     hydration_locks: DatabaseLockRegistry,
