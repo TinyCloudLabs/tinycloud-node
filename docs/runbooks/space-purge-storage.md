@@ -12,9 +12,12 @@ Purge acceptance and completion records go to `[storage.purge_ledger]`. They nev
 
 The ledger bucket:
 
-- Create it with Object Lock enabled and a default COMPLIANCE retention. Retention must cover the restore window plus the backup retention: a restore can bring back data that only the ledger proves was purged.
-- Grant the node only `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`. Reconciliation and restore read and list the ledger.
-- Deny every other action on both ledger ARNs (bucket and `/*`) to every node credential, with one `NotAction` deny. This covers `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutBucketObjectLockConfiguration`, lifecycle and bucket-policy changes. The node's key is shared with the data bucket, so a broad allow elsewhere must not reach the ledger. In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the deny does. `s3:BypassGovernanceRetention` stays denied in the bucket policy.
+- Production: `tinycloud-node-purge-ledger` (us-west-1). It has versioning on, Object Lock with a COMPLIANCE default retention of 365 days, all public access blocked, and SSE-S3. The node sets `TINYCLOUD_STORAGE__PURGE_LEDGER__TYPE=S3`, `TINYCLOUD_STORAGE__PURGE_LEDGER__BUCKET=tinycloud-node-purge-ledger` and `TINYCLOUD_STORAGE__PURGE_LEDGER__REGION=us-west-1`.
+- Retention must cover the restore window plus the backup retention, because a restore can bring back data that only the ledger proves was purged. 365 days covers the 14-day backup cap. A record older than 365 days may legally be gone, so reconciliation must never read a missing record as "never purged".
+- The node authenticates with a static IAM user key (`AWS_KEY` / `AWS_SECRET`), not a role, and the data bucket uses the same key. Grant the node only `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`. Reconciliation and restore read and list the ledger.
+- Deny every other action on both ledger ARNs (bucket and `/*`) to every node credential, with one `NotAction` deny. This covers `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:PutBucketObjectLockConfiguration`, lifecycle and bucket-policy changes. Because the key is shared, a broad allow elsewhere must not reach the ledger. That grant is a Sam step and is not applied yet.
+- The bucket policy denies `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` and any request without TLS.
+- In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the IAM deny does.
 - Ledger PUTs carry a SHA-256 checksum, as Object Lock buckets require.
 
 ## 2. Old versions in the data bucket
