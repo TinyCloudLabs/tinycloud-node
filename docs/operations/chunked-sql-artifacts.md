@@ -1,6 +1,6 @@
-# Opt-in SQL checkpoint parts
+# Opt-in database artifact parts
 
-Opt-in SQL persistence stores checkpoints and cumulative WAL as immutable PostgreSQL parts.
+Opt-in SQL and DuckDB persistence stores checkpoints and cumulative WAL as immutable PostgreSQL parts.
 Each payload statement carries at most 1 MiB. A metadata-only compare-and-swap
 publishes a sealed part; successful writes retain the existing durability and
 lineage semantics. Hydration verifies the part CID before publishing its cache.
@@ -38,13 +38,15 @@ bytes are gone. A periodic collector recovers uploads whose 120-second lease
 expired. Lease expiry determines eligibility; part identity and state fence
 uploads against concurrent reclamation. Active sealed uploads retain their lease
 until publication. Deleted artifacts are reclaimed by the same mechanism.
-It does not enable chunked DuckDB writes. Legacy data remains readable. Drain
+DuckDB uses owned checkpoint and WAL files under the same capacities. Its
+imports stream the already-buffered public request into bounded artifact
+statements. Legacy data remains readable. Drain
 older writers before enabling this format; turning the switch off does not
 convert published parts back to legacy blobs. Current readers understand both
 layouts; legacy persistence refuses a database already using parts.
 
 Do not enable for prolonged operation until the approved ceiling load acceptance and
-remaining conversion and DuckDB slices are complete. On each test release, report
+remaining conversion slice is complete. On each test release, report
 reserved, staged and retained bytes from the following metadata-only inventory:
 
 ```sql
@@ -118,3 +120,18 @@ Roll out WAL-capable readers to every instance before enabling the switch.
 Checkpoint-only part readers fail closed on WAL layouts. Schema changes are
 forward-only; switching the feature off keeps existing layouts readable and
 writable by the current binary, and does not downgrade their format.
+
+New DuckDB databases with parts enabled start file-backed under the existing
+node data directory, regardless of the in-memory threshold. Their actor fence
+protects checkpoint/WAL copies. Closing or idle-evicting an actor removes its
+cache files after the native connection is closed; the next access rehydrates
+from durable parts. Legacy actors retain their existing storage behavior.
+
+For disk headroom, each successfully persisted open database retains at most
+the configured artifact ceiling in checkpoint plus cumulative WAL. A full
+checkpoint also needs an owned temporary copy while streaming, and old/new
+versions overlap in PostgreSQL until their deletions commit. PostgreSQL can reuse deleted storage after vacuum; relation files need not
+shrink. Size refusal occurs after native execution;
+the separate snapshot/headroom acceptance must cover transient oversized
+writes and temporary copies before enabling. Operators check CVM disk headroom
+against the number and ceilings of open databases, plus that transient cost.

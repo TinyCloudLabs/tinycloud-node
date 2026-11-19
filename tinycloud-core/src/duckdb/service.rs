@@ -16,7 +16,7 @@ use crate::request_telemetry::{self, QueryTimer};
 
 use super::{
     caveats::DuckDbCaveats,
-    database::{spawn_actor, DatabaseHandle},
+    database::{spawn_actor_with_parts, DatabaseHandle},
     storage,
     types::*,
 };
@@ -318,32 +318,50 @@ impl DuckDbService {
             return Err(e);
         }
 
-        // Rename temp to final
+        // Close the previous actor before replacing its files: connection
+        // shutdown may checkpoint its old WAL into that path.
+        let key = (space.to_string(), db_name.to_string());
+        if let Some((_, handle)) = self.databases.remove(&key) {
+            handle.shutdown().await?;
+        }
+        self.lineage.remove(&key);
         tokio::fs::rename(&temp_path, &final_path)
             .await
             .map_err(|e| DuckDbError::ImportError(format!("Failed to finalize import: {}", e)))?;
-
-        // Remove the existing handle so the next access reopens the database from the new file
-        let key = (space.to_string(), db_name.to_string());
-        self.databases.remove(&key);
-        // An import deliberately replaces content it never read, so it carries
-        // no lineage. Drop the evicted actor's record with it: the next access
-        // rehydrates and records what the import committed.
-        self.lineage.remove(&key);
-
-        if let Err(e) = self
+        let persisted = if self
             .artifact_repository
-            .save(
-                "duckdb",
-                &space.to_string(),
-                db_name,
-                data.to_vec(),
-                ArtifactExpectation::Any,
-            )
-            .await
+            .chunked_checkpoints("duckdb", &key.0, db_name)
         {
+            let snapshot =
+                tempfile::NamedTempFile::new().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            tokio::fs::write(snapshot.path(), data)
+                .await
+                .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+            self.artifact_repository
+                .save_snapshot(
+                    "duckdb",
+                    &key.0,
+                    db_name,
+                    snapshot,
+                    ArtifactExpectation::Any,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            self.artifact_repository
+                .save(
+                    "duckdb",
+                    &key.0,
+                    db_name,
+                    data.to_vec(),
+                    ArtifactExpectation::Any,
+                )
+                .await
+                .map(|_| ())
+        };
+        if let Err(error) = persisted {
             self.discard_local_state(&key).await?;
-            return Err(artifact_error_to_duckdb(e));
+            return Err(artifact_error_to_duckdb(error));
         }
 
         Ok(())
@@ -389,11 +407,16 @@ impl DuckDbService {
             .databases
             .entry(key)
             .or_insert_with(|| {
-                spawn_actor(
+                spawn_actor_with_parts(
                     space.to_string(),
                     db_name.to_string(),
                     self.base_path.clone(),
                     self.memory_threshold,
+                    self.artifact_repository.chunked_checkpoints(
+                        "duckdb",
+                        &space.to_string(),
+                        db_name,
+                    ),
                     self.idle_timeout_secs,
                     self.max_memory_per_connection.clone(),
                     self.databases.clone(),
@@ -522,6 +545,30 @@ impl DuckDbService {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
 
+        if self
+            .artifact_repository
+            .chunked_checkpoints("duckdb", &key.0, db_name)
+        {
+            if expected != ArtifactExpectation::Absent {
+                if let Some(wal) = handle.wal_snapshot(MAX_WAL_DELTA_BYTES as u64).await? {
+                    let saved = self
+                        .artifact_repository
+                        .save_wal_snapshot("duckdb", &key.0, db_name, wal, expected)
+                        .await
+                        .map_err(artifact_error_to_duckdb)?;
+                    self.lineage.insert(
+                        key,
+                        ArtifactExpectation::Derived {
+                            revision: saved.revision,
+                            checkpoint_content_hash: saved.checkpoint_content_hash,
+                        },
+                    );
+                    return Ok(());
+                }
+            }
+            return self.checkpoint(space, db_name, handle, false).await;
+        }
+
         if let Some(wal) = handle
             .wal()
             .await?
@@ -567,6 +614,41 @@ impl DuckDbService {
     ) -> Result<(), DuckDbError> {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
+        if self
+            .artifact_repository
+            .chunked_checkpoints("duckdb", &key.0, db_name)
+        {
+            let snapshot = handle.snapshot().await?;
+            if without_growth {
+                let size = snapshot
+                    .as_file()
+                    .metadata()
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?
+                    .len();
+                let durable = self
+                    .artifact_repository
+                    .load_meta("duckdb", &key.0, db_name)
+                    .await
+                    .map_err(artifact_error_to_duckdb)?
+                    .map_or(0, |m| m.size_bytes.max(0) as u64);
+                if size > durable {
+                    return Err(DuckDbError::StorageWouldGrow);
+                }
+            }
+            let saved = self
+                .artifact_repository
+                .save_snapshot("duckdb", &key.0, db_name, snapshot, expected)
+                .await
+                .map_err(artifact_error_to_duckdb)?;
+            self.lineage.insert(
+                key,
+                ArtifactExpectation::Derived {
+                    revision: saved.revision,
+                    checkpoint_content_hash: saved.checkpoint_content_hash,
+                },
+            );
+            return Ok(());
+        }
         let payload = handle.export().await?;
         let bytes = payload.len();
         if without_growth {
@@ -1407,6 +1489,339 @@ mod tests {
                 assert_eq!(tables, vec!["events"]);
             }
             other => panic!("expected schema response, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_save_wal_restart_and_import() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        for memory_threshold in [0, u64::MAX] {
+            let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+                "postgres_chunked_duckdb_save_wal_restart_and_import",
+            )
+            .await
+            else {
+                return;
+            };
+            let repo = Arc::new(
+                SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+                    .with_chunk_limits(Some(crate::database_artifacts::chunks::ChunkLimits {
+                        artifact_bytes: 64 * 1024 * 1024,
+                        account_bytes: 128 * 1024 * 1024,
+                    }))
+                    .with_max_write_bytes(1024 * 1024),
+            );
+            let first = TempDir::new().unwrap();
+            let second = TempDir::new().unwrap();
+            let space = test_space_id("chunked-duckdb");
+            let service = DuckDbService::new(
+                first.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo.clone(),
+            );
+            service
+                .execute(
+                    &space,
+                    "analytics",
+                    DuckDbRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE events(id BIGINT, body VARCHAR)".into()]),
+                        sql: "INSERT INTO events SELECT i, md5(i::VARCHAR) FROM range(100000) t(i)"
+                            .into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/admin".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let initial = repo
+                .load_meta("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                initial.checkpoint_size_bytes > 1024 * 1024,
+                "test must cross a chunk boundary"
+            );
+            let checkpoint: String = fixture
+                .conn
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT checkpoint_part_id FROM database_artifact".to_string(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "checkpoint_part_id")
+                .unwrap();
+            assert!(
+                service.cache_path(&space, "analytics").exists(),
+                "chunked actors start file-backed"
+            );
+            service
+                .execute(
+                    &space,
+                    "analytics",
+                    DuckDbRequest::Execute {
+                        schema: None,
+                        sql: "INSERT INTO events VALUES (100000, 'last')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let saved = repo
+                .load_meta("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.revision, 2);
+            assert!(saved.delta_size_bytes > 0);
+            assert_eq!(
+                saved.checkpoint_content_hash,
+                initial.checkpoint_content_hash
+            );
+            service
+                .discard_local_state(&(space.to_string(), "analytics".into()))
+                .await
+                .unwrap();
+            drop(service);
+            // A new repository with the flag off still opens published parts.
+            let off = Arc::new(
+                SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+                    .with_max_write_bytes(1024 * 1024),
+            );
+            let reopened = DuckDbService::new(
+                second.path().to_string_lossy().into_owned(),
+                0,
+                300,
+                "128MB".into(),
+                off,
+            );
+            let result = reopened
+                .execute(
+                    &space,
+                    "analytics",
+                    DuckDbRequest::Query {
+                        sql: "SELECT count(*),max(CASE WHEN id=100000 THEN body END) FROM events"
+                            .into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(query) = result.response else {
+                panic!("query required");
+            };
+            assert_eq!(
+                query.rows,
+                vec![vec![
+                    DuckDbValue::Integer(100001),
+                    DuckDbValue::Text("last".into())
+                ]]
+            );
+            let handle = reopened
+                .databases
+                .get(&(space.to_string(), "analytics".into()))
+                .unwrap()
+                .clone();
+            reopened
+                .checkpoint(&space, "analytics", &handle, false)
+                .await
+                .unwrap();
+            repo.reap_unused_parts(128).await.unwrap();
+            let n: i64 = fixture
+                .conn
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM artifact_chunk WHERE part_id=$1",
+                    [checkpoint.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            assert_eq!(n, 0, "superseded checkpoint chunks must be gone");
+            let exported = reopened.export(&space, "analytics").await.unwrap();
+            assert!(exported.len() > 1024 * 1024);
+            // Import replaces a live actor and uses bounded payload statements.
+            reopened
+                .import_db(&space, "analytics", &exported)
+                .await
+                .unwrap();
+            let imported = repo
+                .load_meta("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!imported.has_delta());
+            let result = reopened
+                .execute(
+                    &space,
+                    "analytics",
+                    DuckDbRequest::Query {
+                        sql: "SELECT count(*) FROM events".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(query) = result.response else {
+                panic!("query required");
+            };
+            assert_eq!(query.rows, vec![vec![DuckDbValue::Integer(100001)]]);
+            reopened
+                .discard_local_state(&(space.to_string(), "analytics".into()))
+                .await
+                .unwrap();
+            repo.reap_unused_parts(128).await.unwrap();
+            let state=fixture.conn.query_one(Statement::from_string(DbBackend::Postgres,
+                "SELECT max(octet_length(payload))::bigint AS max_bytes,count(*) FILTER(WHERE pg_column_compression(payload) IS NOT NULL)::bigint AS compressed FROM artifact_chunk".to_string())).await.unwrap().unwrap();
+            assert!(state.try_get::<i64>("", "max_bytes").unwrap() <= 1024 * 1024);
+            assert_eq!(state.try_get::<i64>("", "compressed").unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_capacity_refusal_discards_local_write() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_capacity_refusal_discards_local_write",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 1,
+                    account_bytes: 1,
+                },
+            )),
+        );
+        let cache = TempDir::new().unwrap();
+        let service = file_service(&cache, repo.clone());
+        let space = test_space_id("chunked-duckdb-cap");
+        let outcome = service
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(DuckDbError::StorageWouldGrow)),
+            "{outcome:?}"
+        );
+        assert!(repo
+            .load_meta("duckdb", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!service
+            .databases
+            .contains_key(&(space.to_string(), "main".into())));
+        assert!(!service.cache_path(&space, "main").exists());
+    }
+    #[tokio::test]
+    async fn postgres_chunked_duckdb_actor_close_and_idle_evict_remove_files() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_duckdb_actor_close_and_idle_evict_remove_files",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                crate::database_artifacts::chunks::ChunkLimits {
+                    artifact_bytes: 4 * 1024 * 1024,
+                    account_bytes: 16 * 1024 * 1024,
+                },
+            )),
+        );
+        let cache = TempDir::new().unwrap();
+        let service = DuckDbService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            1,
+            "128MB".into(),
+            repo,
+        );
+        let space = test_space_id("chunked-duckdb-eviction");
+        let key = (space.to_string(), "main".to_string());
+        service
+            .execute(
+                &space,
+                "main",
+                DuckDbRequest::Execute {
+                    schema: Some(vec!["CREATE TABLE items(id INTEGER)".into()]),
+                    sql: "INSERT INTO items VALUES (1)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let path = service.cache_path(&space, "main");
+        assert!(path.exists());
+        let handle = service.databases.get(&key).unwrap().clone();
+        handle.shutdown().await.unwrap();
+        assert!(!path.exists(), "actor shutdown itself removes the cache");
+        assert!(!duckdb_wal_path(&path).exists());
+        let query = || DuckDbRequest::Query {
+            sql: "SELECT id FROM items".into(),
+            params: vec![],
+        };
+        for _ in 0..2 {
+            let result = service
+                .execute(
+                    &space,
+                    "main",
+                    query(),
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(query) = result.response else {
+                panic!("query required");
+            };
+            assert_eq!(query.rows, vec![vec![DuckDbValue::Integer(1)]]);
+            assert!(path.exists());
+            let until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while service.databases.contains_key(&key) {
+                assert!(tokio::time::Instant::now() < until, "actor must idle-evict");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                !path.exists(),
+                "idle eviction removes the closed actor's file"
+            );
+            assert!(!duckdb_wal_path(&path).exists());
+            assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         }
     }
 }
