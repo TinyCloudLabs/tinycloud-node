@@ -48,6 +48,7 @@ type OperationLockRegistry =
 /// How a hydration ended, as every caller that joined it sees it.
 #[derive(Clone, Debug)]
 enum HydrationOutcome {
+    SpaceDeleted,
     Ready,
     Unavailable(&'static str),
     Failed(String),
@@ -845,6 +846,7 @@ impl SqlService {
             }
             match self.join_hydration(flight, space, db_name).await? {
                 HydrationOutcome::Ready => continue,
+                HydrationOutcome::SpaceDeleted => return Err(SqlError::SpaceDeleted),
                 HydrationOutcome::Unavailable(kind) => {
                     note_unavailable(kind, space, db_name);
                     return Err(SqlError::Unavailable);
@@ -1393,6 +1395,8 @@ fn request_artifact_error<'a>(
 fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
     match err {
         DatabaseArtifactError::StorageLimit => SqlError::StorageWouldGrow,
+        DatabaseArtifactError::SpaceDeleted => SqlError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => SqlError::Unavailable,
         DatabaseArtifactError::Db(ref error) if is_transient_error(error) => {
             tracing::warn!(
                 service = "sql",
@@ -1457,6 +1461,7 @@ fn begin_write() -> Result<(), SqlError> {
 fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
         SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
+        SqlError::SpaceDeleted => HydrationOutcome::SpaceDeleted,
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
         SqlError::DatabaseTooLargeToLoad => HydrationOutcome::TooLarge,
         error => HydrationOutcome::Failed(error.to_string()),
@@ -6553,3 +6558,5 @@ mod tests {
         }
     }
 }
+
+mod space_purge;

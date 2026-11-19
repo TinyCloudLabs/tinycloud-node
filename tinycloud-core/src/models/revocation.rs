@@ -829,6 +829,9 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     if !signature_verified {
         check_signature(&r.revocation).await?;
     }
+    // TC-2871: the shared purge lock comes before the standing reads, so GC
+    // cannot retire the target between the check and the insert.
+    crate::space_purge_records::operation(db).await?;
     let delegation = check_standing(db, &r).await?;
     let hash: Hash = hash(&serialization);
 
@@ -860,6 +863,7 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
         .await?;
     }
 
+    crate::space_purge_records::request_for_records(db, &[delegation.id]).await?;
     Ok(hash)
 }
 
