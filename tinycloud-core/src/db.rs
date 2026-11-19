@@ -2616,7 +2616,42 @@ where
         result
     }
 
+    /// A delegation already stored answers as registered only while every
+    /// space it names is live: in a space being purged or deleted it gets the
+    /// purge refusal its first registration would get (TC-2871).
+    async fn answer_stored_delegation(&self, delegation: &Delegation) -> Result<(), TxError<B, K>> {
+        if self.space_purge_fence.is_some() {
+            let tx = self.begin_graph_transaction().await?;
+            space_purge::lock_delegation::<B, K>(
+                &tx,
+                self.space_purge_fence.as_deref(),
+                delegation,
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        // The content-addressed row authenticates these exact signed bytes.
+        for space in delegation.0.spaces() {
+            crate::request_telemetry::observe_space(space);
+        }
+        Ok(())
+    }
+
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
+        self.delegate_verified(delegation, &PreVerified::default())
+            .await
+    }
+
+    /// As [`Self::delegate`], with the signature `verified` holds, from
+    /// [`Self::preverify_delegation`] on these exact bytes, so a caller can
+    /// check it before its own reads (TC-3000). When `verified` does not
+    /// cover these bytes, their signature is checked here, still before any
+    /// read or lock.
+    pub async fn delegate_verified(
+        &self,
+        delegation: Delegation,
+        verified: &PreVerified,
+    ) -> Result<TransactResult, TxError<B, K>> {
         if self.secrets.renewal_seed().is_some_and(|seed| {
             crate::renewal::renewal_identity_from_seed(seed).0 == delegation.0.delegator
         }) {
@@ -2627,8 +2662,13 @@ where
         let renewal_lease = crate::renewal::lease_original_from_signed(&delegation)?.is_some();
         // TC-2986: the signature is checked before any lock, so a forged or
         // slow one never holds the guards or the spaces' write order.
-        let verified =
-            PreVerified::delegation(&self.conn, &delegation, self.encryption.as_ref()).await?;
+        let checked;
+        let verified = if verified.contains(&delegation.content_hash()) {
+            verified
+        } else {
+            checked = self.preverify_delegation(&delegation).await?;
+            &checked
+        };
         let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
@@ -2637,6 +2677,39 @@ where
             .map(Hash::from)
             .collect();
         let retained_hash = delegation.content_hash();
+        // TC-3000: its time window and its issuer's standing are checked on
+        // the pool too, so a stranger's or an expired delegation never queues
+        // behind the guards and write order of the chain and spaces it names.
+        let precheck = if renewal_lease {
+            delegation::check_owner_renewal_lease(&delegation).map_err(TxError::from)
+        } else {
+            delegation::precheck(
+                &self.conn,
+                &delegation,
+                self.delegated_sql_caveats,
+                self.named_keys,
+                self.renewal_identity
+                    .as_ref()
+                    .map(|identity| identity.renewer_did.as_str()),
+            )
+            .await
+            .map_err(TxError::from)
+        };
+        if let Err(refused) = precheck {
+            // A delegation already stored answers as before, even once it
+            // has expired: these exact signed bytes are already registered.
+            if !renewal_lease
+                && delegation::Entity::find_by_id(retained_hash)
+                    .one(&self.conn)
+                    .await
+                    .map_err(TxError::Db)?
+                    .is_some()
+            {
+                self.answer_stored_delegation(&delegation).await?;
+                return Ok(already_registered_result(retained_hash));
+            }
+            return Err(refused);
+        }
         // Capture expected row counts before consuming the delegation.
         let expected_ability_count = delegation.0.capabilities.len() as u64;
         let expected_parent_count = parent_hashes.len() as u64;
@@ -2661,27 +2734,14 @@ where
             Ok(None)
         } {
             Ok(Some(_)) if !renewal_lease => {
-                if self.space_purge_fence.is_some() {
-                    let tx = self.begin_graph_transaction().await?;
-                    space_purge::lock_delegation::<B, K>(
-                        &tx,
-                        self.space_purge_fence.as_deref(),
-                        &delegation,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                }
-                // The content-addressed row authenticates these exact signed bytes.
-                for space in delegation.0.spaces() {
-                    crate::request_telemetry::observe_space(space);
-                }
+                self.answer_stored_delegation(&delegation).await?;
                 return Ok(already_registered_result(retained_hash));
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
         match self
-            .transact_verified(vec![Event::Delegation(Box::new(delegation))], &verified)
+            .transact_verified(vec![Event::Delegation(Box::new(delegation))], verified)
             .await
         {
             Err(TxError::EpochInsert(epoch_err)) => {
@@ -2800,6 +2860,9 @@ where
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         // TC-2986: the signature is checked before any lock.
         let verified = PreVerified::revocation(&revocation).await?;
+        // TC-3000: and its time window, target and revoker, on the pool, so a
+        // stranger's or an expired revocation takes no lock.
+        revocation::precheck(&self.conn, &revocation).await?;
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
         let revocation_start = Instant::now();

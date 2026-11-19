@@ -822,8 +822,6 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
 ) -> Result<Hash, Error> {
     let (r, serialization) = (revocation.0, revocation.1);
 
-    let t = OffsetDateTime::now_utc();
-
     // W1 (audit P0 finding 5): verify both CACAO and did:key/UCAN format
     // revocations. The route accepts either suite so the Policy Engine
     // active_cutoff loop can rely on a single endpoint regardless of
@@ -831,33 +829,11 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     if !signature_verified {
         check_signature(&r.revocation).await?;
     }
-    let in_window = match &r.revocation {
-        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
-        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
-    };
-    if !in_window {
-        return Err(RevocationError::InvalidTime.into());
-    }
-
+    // TC-2871: the shared purge lock comes before the standing reads, so GC
+    // cannot retire the target between the check and the insert.
     crate::space_purge_records::operation(db).await?;
+    let delegation = check_standing(db, &r).await?;
     let hash: Hash = hash(&serialization);
-    let requested = Hash::from(r.revoked);
-    let delegation = target_for_cid(db, requested)
-        .await?
-        .ok_or(RevocationError::MissingParents)?;
-
-    // W1 (audit P0 finding 5) and TC-1436: authorized revokers are
-    //   1. the delegator that issued this delegation (an intermediate
-    //      delegator revokes the descendants it issued), or
-    //   2. the owner of a space the delegation's persisted abilities
-    //      target (owner-authorized active_cutoff), or
-    //   3. the holder of a current revoke control grant issued by one of
-    //      the above.
-    // The delegatee alone is never authorized: it may hold a key that
-    // others share, and revoking would cut them off as well.
-    if !revoker_is_authorized(db, &delegation, &requested, &r.revoker, &r.parents).await? {
-        return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
-    };
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
@@ -889,6 +865,54 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
 
     crate::space_purge_records::request_for_records(db, &[delegation.id]).await?;
     Ok(hash)
+}
+
+/// The checks of [`process_with`] after the signature: the revocation's time
+/// window now, its target is stored, and the revoker may revoke it. Returns
+/// the stored target.
+async fn check_standing<C: ConnectionTrait>(
+    db: &C,
+    r: &crate::util::RevocationInfo,
+) -> Result<delegation::Model, Error> {
+    let t = OffsetDateTime::now_utc();
+    let in_window = match &r.revocation {
+        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
+        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
+    };
+    if !in_window {
+        return Err(RevocationError::InvalidTime.into());
+    }
+
+    let requested = Hash::from(r.revoked);
+    let delegation = target_for_cid(db, requested)
+        .await?
+        .ok_or(RevocationError::MissingParents)?;
+
+    // W1 (audit P0 finding 5) and TC-1436: authorized revokers are
+    //   1. the delegator that issued this delegation (an intermediate
+    //      delegator revokes the descendants it issued), or
+    //   2. the owner of a space the delegation's persisted abilities
+    //      target (owner-authorized active_cutoff), or
+    //   3. the holder of a current revoke control grant issued by one of
+    //      the above.
+    // The delegatee alone is never authorized: it may hold a key that
+    // others share, and revoking would cut them off as well.
+    if !revoker_is_authorized(db, &delegation, &requested, &r.revoker, &r.parents).await? {
+        return Err(RevocationError::UnauthorizedRevoker(r.revoker.clone()).into());
+    }
+    Ok(delegation)
+}
+
+/// The checks of [`process_with`] after the signature, run on the pool
+/// before a revocation takes any chain guard, space write order or
+/// transaction (TC-3000): a stranger or an expired revocation is refused here
+/// instead of queueing behind the target's locks. They run again inside the
+/// transaction, which stays the authority.
+pub(crate) async fn precheck<C: ConnectionTrait>(
+    db: &C,
+    revocation: &Revocation,
+) -> Result<(), Error> {
+    check_standing(db, &revocation.0).await.map(|_| ())
 }
 
 /// Check a revocation's signature: CPU, or a DID resolution when network

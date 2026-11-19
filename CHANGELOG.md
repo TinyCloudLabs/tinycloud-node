@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 ### Changes
+- `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
+  - a delegation whose issuer has no applicable authority for its requested capabilities;
+  - a revocation by someone who may not revoke its target, or of a target that is not stored;
+  - a renewal lease not issued by the delegator of the original it renews;
+  - an expired or not-yet-valid delegation or revocation.
+  The checks run again inside the transaction, which decides. A delegation already stored still answers as registered when posted again, even after it has expired. **Clients that post a child without waiting for its parent's response must retry:** a child whose parent is not yet stored is now refused at once with 401 `Cannot find parent delegation`. Before, it could sometimes wait for the parent's write and be admitted. Refusal messages are unchanged, except that a stranger's renewal lease is now refused as unauthorized even where its window or shape was also wrong. `/delegate` also checks the request's signature before the Policy/v3 admission reads the graph, so a badly signed delegation citing a policy root answers 401 `Failed to verify signature` instead of 403. Details: TC-3000.
 - SQL databases over the checkpoint save size limit remain readable and reject mutations before execution. Details: TC-1491.
 - Ops: added a reversible local-config HTTP ingress switch and operator runbook for a separately verified independent Cloudflare origin. Dry-run is the default; production routing and policy execution remain separate. Details: TC-1387.
 - Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.

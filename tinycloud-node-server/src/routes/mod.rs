@@ -279,6 +279,32 @@ where
     }
 }
 
+/// The answer to a refused `/delegate`: a revocation refusal carries its
+/// code (TC-2381); anything else is [`delegation_failure`].
+fn delegate_refusal<S: StorageSetup, K: Secrets>(
+    error: &TxError<S, K>,
+    write_may_have_applied: bool,
+) -> InvokeError
+where
+    S::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    if matches!(error, TxError::SpaceDeleted) {
+        return InvokeError::Deleted("space_deleted");
+    }
+    if matches!(error, TxError::LifecycleUnavailable) {
+        return (
+            Status::ServiceUnavailable,
+            "Space lifecycle unavailable".into(),
+        )
+            .into();
+    }
+    match error.revocation_code() {
+        Some(code) => InvokeError::Revoked(code, error.to_string()),
+        None => delegation_failure(error, write_may_have_applied).into(),
+    }
+}
+
 /// `/invoke` and `/delegate` failure: plain text for everything except
 /// storage rejections, which carry the structured TC-619 JSON body, and
 /// revocation refusals, which carry a stable `code` (TC-2381).
@@ -864,8 +890,15 @@ pub async fn delegate(
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
+        let delegation = d.0;
+        // TC-3000: the request's own signature is checked first, so the
+        // policy admission's reads never run for a forged one.
+        let verified = tinycloud
+            .preverify_delegation(&delegation)
+            .await
+            .map_err(|e| delegate_refusal(&e, false))?;
         policy_v3
-            .ordinary_admission_allowed(tinycloud, &d.0)
+            .ordinary_admission_allowed(tinycloud, &delegation)
             .await
             .map_err(crate::policy_v3::authorization_failure)?;
         let timer = crate::prometheus::enabled().then(|| {
@@ -875,32 +908,16 @@ pub async fn delegate(
         });
         // One retry of the whole database operation after a connection
         // lost before any write (TC-2610); see `retry_owner`.
-        let delegation = d.0;
         let (res, write_may_have_applied) = retry_owner(
             "delegate",
             tinycloud.connection().retry_policy(),
             Replay::Never,
-            || tinycloud.delegate(delegation.clone()),
+            || tinycloud.delegate_verified(delegation.clone(), &verified),
             tx_database_error,
         )
         .await;
         let res = res
-            .map_err(|e| {
-                if matches!(e, TxError::SpaceDeleted) {
-                    return InvokeError::Deleted("space_deleted");
-                }
-                if matches!(e, TxError::LifecycleUnavailable) {
-                    return (
-                        Status::ServiceUnavailable,
-                        "Space lifecycle unavailable".into(),
-                    )
-                        .into();
-                }
-                match e.revocation_code() {
-                    Some(code) => InvokeError::Revoked(code, e.to_string()),
-                    None => delegation_failure(&e, write_may_have_applied).into(),
-                }
-            })
+            .map_err(|e| delegate_refusal(&e, write_may_have_applied))
             .and_then(|result: TransactResult| {
                 let TransactResult {
                     commits,
