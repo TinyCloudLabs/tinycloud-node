@@ -37,6 +37,21 @@ const reject = (name, input, insertAt = 'logship_gate') => ({ name, inputs: [{ i
 // `free_bytes`; any deviation drops it.
 export const storageHeadroom = (fields = {}, extra = {}) => ({ timestamp, level: 'INFO', target: 'tinycloud::disk_headroom', ...extra, fields: { message: 'storage headroom', store: 'sql', free_bytes: 7516192768, ...fields } });
 const headroomShipped = ['event', 'free_bytes', 'level', 'store', 'svc', 'ts'];
+// TC-3216: the node's three fair-share report lines, with the target, message and fields `fair_share.rs` `report()`
+// emits. The node writes an absent top account or rank as an empty pseudonym with zero counts.
+const fairTarget = 'tinycloud::fair_share';
+const fairHashes = ['b', 'c', 'd', 'e'].map(digit => digit.repeat(64));
+export const invokeRateLimited = (fields = {}, extra = {}) => ({ timestamp, level: 'WARN', target: fairTarget, ...extra, fields: { message: 'invocations over the per-invoker rate limit', event: 'invoke_rate_limited', mode: 'shadow', count: 12, accounts: 2, top_account_hash: fairHashes[0], top_account_count: 9, window_s: 60, ...fields } });
+export const accountLimited = (fields = {}, extra = {}) => ({ timestamp, level: 'WARN', target: fairTarget, ...extra, fields: { message: 'invocations over a per-account limit', event: 'account_limited', limit: 'db_time', mode: 'shadow', count: 7, accounts: 1, top_account_hash: fairHashes[0], top_account_count: 7, window_s: 60, ...fields } });
+const rankFields = (rank, hash, db_ms, requests, share) => ({ [`top${rank}_account_hash`]: hash, [`top${rank}_db_ms`]: db_ms, [`top${rank}_requests`]: requests, [`top${rank}_share`]: share });
+const emptyRank = rank => rankFields(rank, '', 0, 0, 0);
+export const topTalkers = (fields = {}, extra = {}) => ({ timestamp, level: 'WARN', target: fairTarget, ...extra, fields: { message: 'accounts with the most database time', event: 'node_top_talkers', window_s: 60, db_ms: 5000, requests: 40, unattributed_db_ms: 100, accounts: 4, ...rankFields(1, fairHashes[1], 3000, 20, 0.6), ...rankFields(2, fairHashes[2], 1500, 15, 0.3), ...rankFields(3, fairHashes[3], 400, 5, 0.08), ...fields } });
+const rateShipped = ['accounts', 'count', 'event', 'event_code', 'level', 'mode', 'svc', 'top_account_count', 'top_account_hash', 'ts', 'window_s'];
+const limitShipped = [...rateShipped, 'limit'].sort();
+const withoutTop = keys => keys.filter(key => !key.startsWith('top_account_'));
+const talkersBase = ['accounts', 'db_ms', 'event', 'event_code', 'level', 'requests', 'svc', 'ts', 'unattributed_db_ms', 'window_s'];
+const talkersShipped = ranks => [...talkersBase, ...ranks.flatMap(rank => ['account_hash', 'db_ms', 'requests', 'share'].map(name => `top${rank}_${name}`))].sort();
+const fairFallback = (name, input) => check(name, envelope(input), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`);
 // Like reject(), and the drop is counted under exactly `reason`.
 const rejectFor = (name, input, reason) => ({ name, inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(input) }], no_outputs_from: ['allowlist'], outputs: [{ extract_from: 'gate_counts', conditions: [{ type: 'vrl', source: `assert!(.count == 1 && .reason == "${reason}")\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC"))` }] }] });
 // TC-1843: per-window caps. Each capped class has its own route and `lua` cap transform. Events are injected at
@@ -130,6 +145,25 @@ export const vectorTests = [
   // TC-2346: the node's operation-retry warnings (target tinycloud_core::db_pool). Like every classified diagnostic they ship the code and the count only; operation, error_class and the timings stay in the node's own log.
   ...[['retrying operation after a lost database connection', 'db_operation_retried'], ['not retrying operation: its first run took longer than the retry window to fail', 'db_operation_retry_skipped_slow']].map(([message, code]) => check(`operation retry warning maps to ${code} with only the fixed diagnostic keys`, envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::db_pool', fields: { message, operation: 'delegate', error_class: 'io', elapsed_ms: 10001, retry_window_ms: 10000, sql: canary } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1 && .level == "warn" && keys(.) == ["event", "event_code", "event_count", "level", "svc", "ts"]`)),
   ...['retrying operation after a lost database connection: x', 'Retrying operation after a lost database connection', 'not retrying operation'].map(message => check(`operation retry warning near-miss "${message}" stays unclassified`, envelope({ timestamp, level: 'WARN', target: 'tinycloud_core::db_pool', fields: { message, operation: 'delegate', error_class: 'io' } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1')),
+  // TC-2954, TC-2961, TC-3027, TC-3006: the pooled-connection backstop (vendored sqlx-core, target tinycloud_core::db_pool),
+  // the SQL artifact read limit and checkpoint back-off (tinycloud_core::sql::service), the KV head size probe, the
+  // chain-guard slow wait (tinycloud::chain_guard) and the every-5xx line (tinycloud::request). Code and count only:
+  // sizes, delays, kinds, routes, statuses, errors and identifiers stay in the node's own log.
+  ...[
+    ['closing a pooled connection released inside a transaction', 'db_pool_closed_in_transaction', 'tinycloud_core::db_pool', {}],
+    ['Database exceeds the artifact read limit; not loaded', 'sql_database_too_large_to_load', 'tinycloud_core::sql::service', { service: 'sql', error_class: 'artifact_read_limit', bytes: 300666880, limit_bytes: 67108864 }],
+    ['Database checkpoint save failed; refusing its writes until the back-off ends', 'sql_checkpoint_save_backoff', 'tinycloud_core::sql::service', { service: 'sql', retry_after_ms: 30000 }],
+    ['kv head size probe failed; size omitted', 'kv_head_size_probe_failed', 'tinycloud::routes', { error: canary }],
+    ['chain guard wait exceeded the slow-wait threshold', 'chain_guard_slow_wait', 'tinycloud::chain_guard', { event: 'chain_guard_slow_wait', kind: 'exclusive', elapsed_ms: 612, guards: 3, suppressed: 0 }],
+    ['request answered with a 5xx', 'http_5xx', 'tinycloud::request', { error_class: 'http_5xx', status: 503, route: '/invoke', classified: true }],
+  ].map(([message, code, target, fields]) => check(`${code} warning maps to its code with only the fixed diagnostic keys`, envelope({ timestamp, level: 'WARN', target, fields: { message, ...fields, space: canary, db_name: canary } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1 && .level == "warn" && keys(.) == ["event", "event_code", "event_count", "level", "svc", "ts"]`)),
+  ...[
+    ['closing a pooled connection released inside a transaction', 'sqlx_core::pool::connection'],
+    ['closing a pooled connection released inside a transaction: x', 'tinycloud_core::db_pool'],
+    ['Database exceeds the artifact read limit', 'tinycloud_core::sql::service'],
+    ['database checkpoint save failed; refusing its writes until the back-off ends', 'tinycloud_core::sql::service'],
+    ['kv head size probe failed', 'tinycloud::routes'],
+  ].map(([message, target]) => check(`near-miss "${message}" on ${target} stays unclassified`, envelope({ timestamp, level: 'WARN', target, fields: { message } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1')),
   check('node 5xx diagnostic ships exactly its eight fields as an individual event', envelope(dbFailure()), `.event == "node_warning" && .svc == "api" && .level == "warn" && .event_code == "db_failure_5xx" && .status == 503 && .code == "sql_busy" && .service == "sql" && .route == "/invoke" && .elapsed_ms == 30001 && .failure_kind == "lock_wait" && .write_may_have_applied == false && .db_hash == "${goodHash}" && !exists(.event_count) && ${keysAre(dbShipped)}`),
   check('node 5xx diagnostic without a database ships without db_hash', envelope(dbFailure({ db_hash: undefined, status: 500, code: 'internal', service: 'other', failure_kind: 'other' })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "internal" && .service == "other" && .failure_kind == "other" && ${keysAre(dbShipped.filter(key => key !== 'db_hash'))}`),
   check('node 5xx diagnostic with an unknown outcome ships the write flag', envelope(dbFailure({ status: 500, code: 'outcome_unknown', write_may_have_applied: true })), `.event_code == "db_failure_5xx" && .status == 500 && .code == "outcome_unknown" && .write_may_have_applied == true && ${keysAre(dbShipped)}`),
@@ -170,6 +204,43 @@ export const vectorTests = [
   ...['tinycloud::request', 'tinycloud::storage', 'tinycloud::disk_headroom_x', 'tinycloud::disk_headroom::sub', 'tinycloud::disk'].map(target => rejectFor(`disk headroom on target ${target} is dropped at the gate`, envelope(storageHeadroom({}, { target })), target === 'tinycloud::request' ? 'invalid_fields' : 'filtered_level')),
   rejectFor('an unrelated info line on the headroom target is dropped', envelope(storageHeadroom({ message: canary, store: undefined, free_bytes: undefined })), 'invalid_fields'),
   check('disk headroom at warn level is a plain unclassified warning', envelope(storageHeadroom({}, { level: 'WARN' })), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
+  check('fair share: invoker rate line ships exactly its fields as an individual event', envelope(invokeRateLimited()), `.event == "node_warning" && .svc == "api" && .level == "warn" && .event_code == "invoke_rate_limited" && .mode == "shadow" && .count == 12 && .accounts == 2 && .top_account_hash == "${fairHashes[0]}" && .top_account_count == 9 && .window_s == 60 && !exists(.event_count) && ${keysAre(rateShipped)}`),
+  ...['db_time', 'in_flight'].map(limit => check(`fair share: account limit line ships limit ${limit}`, envelope(accountLimited({ limit, mode: 'enforce' })), `.event_code == "account_limited" && .limit == "${limit}" && .mode == "enforce" && .count == 7 && .accounts == 1 && .top_account_hash == "${fairHashes[0]}" && .top_account_count == 7 && ${keysAre(limitShipped)}`)),
+  check('fair share: an invoker line without a top account omits both top-account fields', envelope(invokeRateLimited({ top_account_hash: '', top_account_count: 0, accounts: 0 })), `.event_code == "invoke_rate_limited" && .accounts == 0 && ${keysAre(withoutTop(rateShipped))}`),
+  check('fair share: an account line without a top account omits both top-account fields', envelope(accountLimited({ top_account_hash: '', top_account_count: 0 })), `.event_code == "account_limited" && .limit == "db_time" && ${keysAre(withoutTop(limitShipped))}`),
+  ...[[1, 0, 1], [9007199254740991, 9007199254740991, 9007199254740991]].map(([count, accounts, top_account_count]) => check(`fair share: invoker line ships count ${count}, accounts ${accounts} and top_account_count ${top_account_count}`, envelope(invokeRateLimited({ count, accounts, top_account_count })), `.count == ${count} && .accounts == ${accounts} && .top_account_count == ${top_account_count} && ${keysAre(rateShipped)}`)),
+  check('fair share: top-talker line ships all three ranks', envelope(topTalkers()), `.event == "node_warning" && .event_code == "node_top_talkers" && .window_s == 60 && .db_ms == 5000 && .requests == 40 && .unattributed_db_ms == 100 && .accounts == 4 && .top1_account_hash == "${fairHashes[1]}" && .top1_db_ms == 3000 && .top1_requests == 20 && .top1_share == 0.6 && .top2_account_hash == "${fairHashes[2]}" && .top2_db_ms == 1500 && .top2_requests == 15 && .top2_share == 0.3 && .top3_account_hash == "${fairHashes[3]}" && .top3_db_ms == 400 && .top3_requests == 5 && .top3_share == 0.08 && !exists(.event_count) && ${keysAre(talkersShipped([1, 2, 3]))}`),
+  check('fair share: top-talker line with one account omits the empty ranks', envelope(topTalkers({ accounts: 1, ...rankFields(1, fairHashes[1], 4900, 40, 1), ...emptyRank(2), ...emptyRank(3) })), `.event_code == "node_top_talkers" && .accounts == 1 && .top1_share == 1.0 && ${keysAre(talkersShipped([1]))}`),
+  check('fair share: top-talker line with only unattributed time ships no rank', envelope(topTalkers({ db_ms: 100, requests: 0, accounts: 0, ...emptyRank(1), ...emptyRank(2), ...emptyRank(3) })), `.event_code == "node_top_talkers" && .unattributed_db_ms == 100 && .accounts == 0 && ${keysAre(talkersShipped([]))}`),
+  check('fair share: top-talker shares at the bounds ship as numbers', envelope(topTalkers({ ...rankFields(1, fairHashes[1], 3000, 20, 1), ...rankFields(2, fairHashes[2], 0, 15, 0) })), `.top1_share == 1.0 && .top2_share == 0.0 && ${keysAre(talkersShipped([1, 2, 3]))}`),
+  ...[['invoker', invokeRateLimited(), 'invoke_rate_limited'], ['account', accountLimited(), 'account_limited'], ['top-talker', topTalkers(), 'node_top_talkers']].map(([label, line, code]) => check(`fair share: ${label} line discards span, spans and envelope extras`, envelope({ ...line, span: { account: canary }, spans: [{ request_id: canary }], filename: canary, thread_id: canary }), `.event_code == "${code}" && !contains(encode_json(.), "TC959_SYNTHETIC")`)),
+  ...[
+    ['an extra field', { error: canary }], ['an extra limit field', { limit: 'db_time' }], ['a missing mode', { mode: undefined }], ['a missing top_account_hash', { top_account_hash: undefined }],
+    ['an unknown mode', { mode: 'observe' }], ['a free-text mode', { mode: canary }], ['count 0', { count: 0 }], ['a string count', { count: '12' }], ['a float count', { count: 1.5 }],
+    ['negative accounts', { accounts: -1 }], ['accounts above the safe integer range', { accounts: 9007199254740992 }], ['window_s 120', { window_s: 120 }], ['a string window_s', { window_s: '60' }],
+    ['an uppercase pseudonym', { top_account_hash: 'B'.repeat(64) }], ['a short pseudonym', { top_account_hash: 'b'.repeat(63) }], ['a raw identifier as pseudonym', { top_account_hash: canary }], ['a numeric pseudonym', { top_account_hash: 7 }],
+    ['a pseudonym with top_account_count 0', { top_account_count: 0 }], ['an empty pseudonym with a top_account_count', { top_account_hash: '' }], ['a string top_account_count', { top_account_count: '9' }],
+    ['the account-limit event name', { event: 'account_limited' }], ['a message with a suffix', { message: `invocations over the per-invoker rate limit: ${canary}` }],
+    // A key renamed with the key count unchanged: only the per-key checks can reject it.
+    ['top_account_count renamed', { top_account_count: undefined, top_account_total: 9 }], ['mode renamed', { mode: undefined, enforce: 'shadow' }],
+  ].map(([what, fields]) => fairFallback(`fair share: invoker line with ${what} falls back to unclassified`, invokeRateLimited(fields))),
+  ...[
+    ['limit invoker', { limit: 'invoker' }], ['a free-text limit', { limit: canary }], ['a missing limit', { limit: undefined }], ['an extra field', { space: canary }],
+    ['the invoker event name', { event: 'invoke_rate_limited' }], ['an unknown mode', { mode: 'Shadow' }], ['a long pseudonym', { top_account_hash: 'b'.repeat(65) }],
+    ['limit renamed', { limit: undefined, kind: 'db_time' }],
+  ].map(([what, fields]) => fairFallback(`fair share: account line with ${what} falls back to unclassified`, accountLimited(fields))),
+  ...[
+    ['an extra field', { error: canary }], ['a missing rank field', { top3_share: undefined }], ['a fourth rank', rankFields(4, fairHashes[0], 1, 1, 0.01)], ['negative db_ms', { db_ms: -1 }],
+    ['a float requests', { requests: 1.5 }], ['a string unattributed_db_ms', { unattributed_db_ms: '100' }], ['window_s 30', { window_s: 30 }], ['a share above 1', { top1_share: 1.5 }],
+    ['a negative share', { top2_share: -0.1 }], ['a string share', { top1_share: '0.6' }], ['a rank db_ms above the safe integer range', { top1_db_ms: 9007199254740992 }],
+    ['a raw identifier as a rank pseudonym', { top2_account_hash: canary }], ['an uppercase rank pseudonym', { top1_account_hash: 'C'.repeat(64) }],
+    ['an empty rank with database time', rankFields(3, '', 5, 0, 0)], ['an empty rank with requests', rankFields(3, '', 0, 1, 0)], ['an empty rank with a share', rankFields(3, '', 0, 0, 0.1)],
+    ['the invoker event name', { event: 'invoke_rate_limited' }], ['a different message', { message: 'accounts with the most database time ' }],
+    ['a rank share renamed', { top3_share: undefined, top3_ratio: 0.08 }], ['db_ms renamed', { db_ms: undefined, cpu_ms: 5000 }],
+  ].map(([what, fields]) => fairFallback(`fair share: top-talker line with ${what} falls back to unclassified`, topTalkers(fields))),
+  ...[['an invoker', invokeRateLimited()], ['a top-talker', topTalkers()]].map(([what, line]) => fairFallback(`fair share: ${what} line on another target is unclassified`, { ...line, target: 'tinycloud::request' })),
+  ...[['an invoker', invokeRateLimited()], ['a top-talker', topTalkers()]].map(([what, line]) => rejectFor(`fair share: ${what} line at info level is dropped at the gate`, envelope({ ...line, level: 'INFO' }), 'filtered_level')),
+  check('fair share: a line at error level is a plain unclassified error', envelope(invokeRateLimited({}, { level: 'ERROR' })), `.event == "node_error" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
   check('dependency warning is a fixed unclassified diagnostic', envelope({ timestamp, level: 'WARN', target: 'hyper::proto', fields: { message: canary, error: canary } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
   check('dependency error without a message still counts', envelope({ timestamp, level: 'ERROR', target: 'sqlx::pool', fields: { error: canary } }), '.event == "node_error" && .event_code == "unclassified" && .event_count == 1'),
   check('warning without a target or fields still counts', envelope({ timestamp, level: 'WARN' }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
@@ -267,6 +338,18 @@ export function requestProfileTests(profile) {
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(storageHeadroom({ store: 'duckdb' }))) }],
       no_outputs_from: ['event_route.diagnostic', 'event_route.request', ...capNames.map(name => `event_route.${name}`)],
       outputs: [{ extract_from: 'event_route.storage_headroom', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "node_storage_headroom" && .store == "duckdb" && .free_bytes == 7516192768)\nassert!(${keysAre(headroomShipped)})\nassert!(${safe})` }] }],
+    },
+    ...[['invoker', invokeRateLimited(), 'invoke_rate_limited', rateShipped], ['account', accountLimited({ limit: 'in_flight' }), 'account_limited', limitShipped], ['top-talker', topTalkers(), 'node_top_talkers', talkersShipped([1, 2, 3])]].map(([label, line, code, shipped]) => ({
+      name: `${profile}: fair-share ${label} line routes as an individual event, never into the count reducer or a cap`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(line)) }],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request', 'event_route.storage_headroom', ...capNames.map(name => `event_route.${name}`)],
+      outputs: [{ extract_from: 'event_route.fair_share', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "node_warning" && .event_code == "${code}")\nassert!(${keysAre(shipped)})\nassert!(!contains(encode_json(.), "TC959_SYNTHETIC") && !exists(.message) && !exists(.target) && !exists(.host))` }] }],
+    })),
+    {
+      name: `${profile}: invalid fair-share line is counted as unclassified, never an individual event`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(topTalkers({ top1_account_hash: canary }))) }],
+      no_outputs_from: ['event_route.fair_share', 'event_route.request'],
+      outputs: [{ extract_from: 'event_route.diagnostic', conditions: [{ type: 'vrl', source: `assert!(.event_count == 1 && .event_code == "unclassified")\nassert!(${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])})\nassert!(${safe})` }] }],
     },
     // TC-1843: the capped classes reach their cap transform from the raw envelope, with the same fields.
     ...[

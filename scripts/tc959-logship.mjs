@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { vectorTests, requestProfileTests } from '../log-shipper/cases.mjs';
-import { CAPPED_CLASSES, CAP_WINDOW_SECONDS } from '../log-shipper/budget.mjs';
+import { CAPPED_CLASSES, CAP_WINDOW_SECONDS, FAIR_SHARE_EVENT_CODES, INDIVIDUAL_EVENT_CODES } from '../log-shipper/budget.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const load = name => JSON.parse(readFileSync(resolve(root, 'log-shipper', name), 'utf8'));
@@ -71,6 +71,8 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
     .replaceAll('__DB_FAILURE_SERVICES__', JSON.stringify(schema.fields.service.values))
     .replaceAll('__DB_FAILURE_KINDS__', JSON.stringify(schema.fields.failure_kind.values))
     .replaceAll('__STORAGE_STORES__', JSON.stringify(schema.fields.store.values))
+    .replaceAll('__FAIR_SHARE_MODES__', JSON.stringify(schema.fields.mode.values))
+    .replaceAll('__FAIR_SHARE_LIMITS__', JSON.stringify(schema.fields.limit.values))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
@@ -144,14 +146,17 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
         db_failure_5xx: '.event == "node_warning" && .event_code == "db_failure_5xx"',
         // TC-2917: the disk headroom event ships as is: two per 5 minutes, no cap or reducer.
         storage_headroom: '.event == "node_storage_headroom"',
-        diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"',
+        // TC-3216: the fair-share report lines ship as is, outside the count reducer: the node emits each line at most
+        // once a minute (FAIR_SHARE_EVENTS_PER_MINUTE in all), so there is no cap.
+        fair_share: `.event == "node_warning" && includes(${JSON.stringify(FAIR_SHARE_EVENT_CODES)}, .event_code)`,
+        diagnostic: `(.event == "node_warning" && !includes(${JSON.stringify(INDIVIDUAL_EVENT_CODES)}, .event_code)) || .event == "node_error"`,
       } },
       ...Object.fromEntries(Object.entries(CAPPED_CLASSES).map(([name, { capPerMinute }]) => [capName(name), capTransform(name, capPerMinute)])),
       diagnostic_reduce: { type: 'reduce', inputs: ['event_route.diagnostic'], group_by: ['event', 'event_code', 'level', 'svc'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { event_count: 'sum', ts: 'discard' } },
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
     },
     sinks: { betterstack: {
-      type: 'http', inputs: ['event_route.request', 'event_route.storage_headroom', ...Object.keys(CAPPED_CLASSES).map(capName), 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
+      type: 'http', inputs: ['event_route.request', 'event_route.storage_headroom', 'event_route.fair_share', ...Object.keys(CAPPED_CLASSES).map(capName), 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
       encoding: { codec: 'json' }, framing: { method: 'newline_delimited' }, compression: 'gzip',
       auth: { strategy: 'bearer', token: token ?? 'SECRET[bs.bs_token]' },
       batch: { max_bytes: 262144, timeout_secs: 1 },
