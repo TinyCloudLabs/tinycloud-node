@@ -17,7 +17,7 @@ The database is the only store that goes back in time. Every step below re-appli
 
 ## Before restore
 
-1. Fence the node: no ingress, no route served, no worker running. Reads, writes, `space/create`, `space/host` and sync all stay off until step 9.
+1. Fence the node: no ingress, no route served, no worker running. Reads, writes, `space/create`, `space/host` and sync all stay off until step 9. Once the operator purge path (S12) exists: its window is off (`[lifecycle.operator_purge] enabled_until` absent) and `TINYCLOUD_PURGE_OPERATOR_SECRET` is unset.
 2. Check the purge ledger bucket `tinycloud-node-purge-ledger`:
    - Object Lock is on, with a COMPLIANCE default retention of 365 days; versioning is on; public access is blocked.
    - The bucket policy denies `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` and any request without TLS.
