@@ -1005,7 +1005,13 @@ Commands:
   because the service parses submitted CSRs with `node-forge`, which only
   understands RSA `SubjectPublicKeyInfo`s). Sends the CSR via
   `POST /v1/certs/:name`. Stores the private key and returned cert chain
-  under `dataPath/link/tls/{key,cert}.pem` with mode `0600`.
+  into a generation directory `dataPath/link/tls/gen-*/{key,cert}.pem`
+  (files `0600`, directory `0700`, each written atomically via a temp file,
+  fsync and rename) and publishes the pair by atomically swapping the
+  `dataPath/link/tls/current` symlink to that directory, so readers see the
+  previous pair or the new pair, never a mix. Superseded generations are
+  removed after the swap. A node whose data predates this layout still reads
+  `dataPath/link/tls/{key,cert}.pem` until the next issuance replaces them.
 - Writes `dataPath/link/state.json` (mode `0600`) with `{name, serviceUrl,
   sequence, lastLanIps, certNotAfter, bind}`. The LAN listener activates on
   next `serve` (re)start if it isn't already running; if it is running (an

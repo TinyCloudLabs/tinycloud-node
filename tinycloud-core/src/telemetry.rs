@@ -165,8 +165,6 @@ pub fn observe_stage(stage: InvocationStage, outcome: StageOutcome, duration: Du
 pub enum DbConnectionEvent {
     /// A statement or `BEGIN` failed with a connection-class error.
     Lost,
-    /// The failed statement or `BEGIN` was run once more.
-    Retried,
     /// The acquire hook pinged an idle connection released before a loss.
     Revalidated,
     /// That ping failed and the connection was closed.
@@ -177,20 +175,32 @@ pub enum DbConnectionEvent {
     /// That retried operation succeeded.
     OperationRetrySucceeded,
     /// An operation that qualified for its retry was not retried because
-    /// its first run took longer than the retry window to fail (TC-2346).
+    /// its first run left less than the minimum of the operation budget
+    /// (TC-2346).
     OperationRetrySkippedSlow,
+    /// An operation that qualified for its retry was not retried because
+    /// a database overload signal is active (TC-2610).
+    OperationRetrySkippedOverload,
+    /// An operation that qualified for its retry was not retried because
+    /// its request deadline left no room (TC-2610).
+    OperationRetrySkippedDeadline,
+    /// The retry attempt ran past the operation budget and was stopped
+    /// (TC-2610).
+    OperationRetryBudgetExpired,
 }
 
 impl DbConnectionEvent {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lost => "lost",
-            Self::Retried => "retried",
             Self::Revalidated => "revalidated",
             Self::RevalidationFailed => "revalidation_failed",
             Self::OperationRetried => "operation_retried",
             Self::OperationRetrySucceeded => "operation_retry_succeeded",
             Self::OperationRetrySkippedSlow => "operation_retry_skipped_slow",
+            Self::OperationRetrySkippedOverload => "operation_retry_skipped_overload",
+            Self::OperationRetrySkippedDeadline => "operation_retry_skipped_deadline",
+            Self::OperationRetryBudgetExpired => "operation_retry_budget_expired",
         }
     }
 }
