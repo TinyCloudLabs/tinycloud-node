@@ -206,9 +206,10 @@ lazy_static! {
         &["store"]
     )
     .unwrap();
-    /// Requests answered `507 sql_disk_headroom` (any SQL request whose error
-    /// maps to it: writes, and exports or queries that hit a full disk). The
-    /// label is the engine (`sql`).
+    /// Requests answered `507 sql_disk_headroom` or `507 duckdb_disk_headroom`
+    /// (any request whose error maps to it: writes, and exports or queries
+    /// that hit a full disk or a spill limit). The label is the engine (`sql`,
+    /// `duckdb`).
     pub static ref DISK_HEADROOM_REFUSALS: IntCounterVec = register_int_counter_vec!(
         "tinycloud_disk_headroom_refusals_total",
         "Requests refused for disk headroom, by engine.",
