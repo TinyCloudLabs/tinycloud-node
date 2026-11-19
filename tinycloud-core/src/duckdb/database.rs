@@ -188,18 +188,25 @@ impl DatabaseHandle {
     }
 
     /// Stop the actor and close its database before the cache is discarded.
+    ///
+    /// An actor that has already exited (idle eviction, at the same moment as
+    /// this call) is done too: it drops its receiver only after closing its
+    /// database and running its cleanup.
     pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send((
                 request_telemetry::current(),
                 DbMessage::Shutdown { response_tx },
             ))
             .await
-            .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
-        response_rx.await.map_err(|_| {
-            DuckDbError::Internal("Database actor dropped shutdown response".to_string())
-        })
+            .is_ok()
+        {
+            // A dropped sender means the actor exited with this message queued.
+            let _ = response_rx.await;
+        }
+        Ok(())
     }
 }
 
@@ -431,9 +438,18 @@ pub(crate) fn spawn_actor_with_parts(
     DatabaseHandle { id, tx }
 }
 
-/// Keep registration until cleanup is complete. A replacement actor's cache
-/// must never be removed by its predecessor. Explicit shutdown already holds
-/// the service's per-database operation fence, even if it removed the entry.
+type ActorEntry<'a> = dashmap::mapref::entry::Entry<'a, (String, String), DatabaseHandle>;
+
+/// Keep registration until the cache paths are free. A replacement actor's
+/// cache must never be removed by its predecessor. Explicit shutdown already
+/// holds the service's per-database operation fence, even if it removed the
+/// entry.
+///
+/// The files are only renamed aside while the map entry is held, so a lookup
+/// of any other database in the same map shard never waits on file deletion.
+/// The order is carried by the types in [`cleanup`]: renaming aside needs the
+/// held entry, releasing consumes it, and only the released form can be
+/// deleted.
 fn deregister_actor(
     databases: &DashMap<(String, String), DatabaseHandle>,
     key: (String, String),
@@ -441,37 +457,106 @@ fn deregister_actor(
     path: &Path,
     remove_files: bool,
 ) {
-    use dashmap::mapref::entry::Entry;
     let entry = databases.entry(key);
-    if matches!(&entry, Entry::Occupied(entry) if entry.get().id != id) {
+    if matches!(&entry, ActorEntry::Occupied(entry) if entry.get().id != id) {
         return;
     }
-    if remove_files {
-        let mut failed = false;
-        for candidate in [
-            path.to_path_buf(),
-            PathBuf::from(format!("{}.wal", path.display())),
-            PathBuf::from(format!("{}.tmp", path.display())),
-        ] {
-            let result = if candidate.is_dir() {
-                std::fs::remove_dir_all(&candidate)
-            } else {
-                std::fs::remove_file(&candidate)
-            };
-            if let Err(error) = result {
-                failed |= error.kind() != std::io::ErrorKind::NotFound;
+    let moved = if remove_files {
+        cleanup::move_aside(&entry, path)
+    } else {
+        cleanup::MovedAside::default()
+    };
+    if cleanup::delete_aside(cleanup::release(entry, moved)) {
+        // Operators use this value-free event when checking cache-disk headroom.
+        tracing::warn!(
+            event = "duckdb_cache_cleanup_failed",
+            "Database cache cleanup failed"
+        );
+    }
+}
+
+/// The cleanup steps, in a module of their own so that a [`cleanup::Released`]
+/// can only come from [`cleanup::release`].
+mod cleanup {
+    use std::path::{Path, PathBuf};
+
+    use super::{cache_file_paths, remove_cache_entry, ActorEntry};
+
+    /// Cache files renamed to staging names, not yet deleted.
+    #[derive(Default)]
+    pub(super) struct MovedAside {
+        temps: Vec<PathBuf>,
+        failed: bool,
+    }
+
+    /// [`MovedAside`] once the registration is gone: the only form that can
+    /// be deleted.
+    pub(super) struct Released(MovedAside);
+
+    /// Rename the cache files at `path` aside while `_held` keeps the
+    /// registration, so the paths are free before it can disappear. The
+    /// sweep before each hydration removes the names if the process stops
+    /// before [`delete_aside`].
+    pub(super) fn move_aside(_held: &ActorEntry<'_>, path: &Path) -> MovedAside {
+        let mut moved = MovedAside::default();
+        for candidate in cache_file_paths(path) {
+            let temp = crate::database_artifacts::staging_path(path);
+            match std::fs::rename(&candidate, &temp) {
+                Ok(()) => moved.temps.push(temp),
+                Err(error) => {
+                    moved.failed |= error.kind() != std::io::ErrorKind::NotFound;
+                    crate::database_artifacts::release_staging(&temp);
+                }
             }
         }
-        if failed {
-            // Operators use this value-free event when checking cache-disk headroom.
-            tracing::warn!(
-                event = "duckdb_cache_cleanup_failed",
-                "Database cache cleanup failed"
-            );
-        }
+        moved
     }
-    if let Entry::Occupied(entry) = entry {
-        entry.remove();
+
+    /// Drop the registration (or the vacant entry's lock), releasing the
+    /// shard.
+    pub(super) fn release(entry: ActorEntry<'_>, moved: MovedAside) -> Released {
+        match entry {
+            ActorEntry::Occupied(entry) => {
+                entry.remove();
+            }
+            ActorEntry::Vacant(entry) => drop(entry),
+        }
+        Released(moved)
+    }
+
+    /// Delete what was moved aside, outside the map lock. True if anything
+    /// failed, including the renames.
+    pub(super) fn delete_aside(Released(moved): Released) -> bool {
+        let mut failed = moved.failed;
+        for temp in moved.temps {
+            failed |= remove_cache_entry(&temp).is_err();
+            crate::database_artifacts::release_staging(&temp);
+        }
+        failed
+    }
+}
+
+/// The paths DuckDB keeps for the database at `path`: the main file, its WAL
+/// and its spill directory.
+pub(crate) fn cache_file_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}.wal", path.display())),
+        PathBuf::from(format!("{}.tmp", path.display())),
+    ]
+}
+
+/// Remove one cache file, or DuckDB's spill directory with its contents. A
+/// path that is already gone counts as removed.
+pub(crate) fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) => Err(error),
+    };
+    match removed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -1345,5 +1430,140 @@ mod tests {
             DuckDbResponse::Execute(ExecuteResponse { changes: 1 })
         ));
         assert_eq!(row_count(&conn, "events"), 1);
+    }
+
+    fn schema_write(sql: &str, schema: &str) -> DuckDbRequest {
+        DuckDbRequest::Execute {
+            sql: sql.to_string(),
+            params: Vec::new(),
+            schema: Some(vec![schema.to_string()]),
+        }
+    }
+
+    fn placeholder_handle(id: u64) -> DatabaseHandle {
+        let (tx, _rx) = mpsc::channel(1);
+        DatabaseHandle { id, tx }
+    }
+
+    fn file_actor(
+        base: &Path,
+        key: &(String, String),
+        idle_timeout_secs: u64,
+        databases: &Arc<DashMap<(String, String), DatabaseHandle>>,
+    ) -> DatabaseHandle {
+        spawn_actor_with_parts(
+            key.0.clone(),
+            key.1.clone(),
+            base.to_string_lossy().into_owned(),
+            u64::MAX,
+            true,
+            idle_timeout_secs,
+            "128MB".into(),
+            databases.clone(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_actor_close_spares_a_replacement_and_its_files() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-a".to_string(), "main".to_string());
+        let actor = file_actor(base.path(), &key, 300, &databases);
+        databases.insert(key.clone(), actor.clone());
+        actor
+            .execute(
+                schema_write("INSERT INTO t VALUES (1)", "CREATE TABLE t(i INTEGER)"),
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let path = base.path().join(&key.0).join("main.duckdb");
+        assert!(path.exists());
+
+        // A replacement registered under the key; its files are at the same path.
+        databases.insert(key.clone(), placeholder_handle(u64::MAX));
+        actor.shutdown().await.unwrap();
+        assert!(
+            path.exists(),
+            "the predecessor removed the replacement's cache"
+        );
+        assert_eq!(databases.get(&key).map(|handle| handle.id), Some(u64::MAX));
+
+        // With the entry vacant (explicit shutdown under the operation fence)
+        // every cache path goes, the spill directory included.
+        databases.remove(&key);
+        let [main, wal, spill] = cache_file_paths(&path);
+        std::fs::create_dir_all(&spill).unwrap();
+        std::fs::write(spill.join("spill"), b"x").unwrap();
+        std::fs::write(&wal, b"w").unwrap();
+        deregister_actor(&databases, key.clone(), 7, &path, true);
+        assert!(!main.exists() && !wal.exists() && !spill.exists());
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
+
+        // Actors that do not own their files never delete them.
+        std::fs::write(&path, b"keep").unwrap();
+        deregister_actor(&databases, key, 7, &path, false);
+        assert!(path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_idle_eviction_frees_cache_paths_before_deregistering() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-evict".to_string(), "main".to_string());
+        let path = base.path().join(&key.0).join("main.duckdb");
+        let [main, wal, spill] = cache_file_paths(&path);
+        // A spill directory a crashed query left behind.
+        std::fs::create_dir_all(&spill).unwrap();
+        for i in 0..2_000 {
+            std::fs::write(spill.join(format!("s{i}")), b"x").unwrap();
+        }
+        let actor = file_actor(base.path(), &key, 1, &databases);
+        databases.insert(key.clone(), actor.clone());
+        actor
+            .execute(
+                schema_write("INSERT INTO t VALUES (1)", "CREATE TABLE t(i INTEGER)"),
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while databases.contains_key(&key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actor must idle-evict"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !main.exists() && !wal.exists() && !spill.exists(),
+            "the registration vanished while cache paths remained"
+        );
+        // The renamed-aside files are deleted after the entry is released.
+        let dir = path.parent().unwrap();
+        while std::fs::read_dir(dir).unwrap().next().is_some() {
+            assert!(std::time::Instant::now() < deadline, "cleanup must finish");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_of_an_exited_actor_succeeds() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-exit".to_string(), "main".to_string());
+        let actor = file_actor(base.path(), &key, 300, &databases);
+        actor.shutdown().await.unwrap();
+        actor.shutdown().await.unwrap();
     }
 }
