@@ -256,6 +256,12 @@ struct CheckpointBackoff {
     refused: bool,
 }
 
+/// Hydration metadata kept for exactly as long as its actor's lineage.
+struct LoadedLineage {
+    expectation: ArtifactExpectation,
+    checkpoint_size_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
@@ -269,7 +275,7 @@ pub struct SqlService {
     /// durable save so a stale actor is rejected instead of clobbering. Written
     /// on hydration (the only path that creates an actor) and after each
     /// successful save, cleared alongside the actor by `discard_local_state`.
-    lineage: Arc<DashMap<(String, String), ArtifactExpectation>>,
+    lineage: Arc<DashMap<(String, String), LoadedLineage>>,
     base_path: String,
     memory_threshold: u64,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
@@ -521,7 +527,12 @@ impl SqlService {
         begin_write()?;
 
         let result = match handle
-            .execute_authorized(request.clone(), caveats.clone(), authority.clone(), growth)
+            .execute_authorized(
+                request.clone(),
+                caveats.clone(),
+                authority.clone(),
+                self.admitted_growth(&key, growth),
+            )
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -530,7 +541,12 @@ impl SqlService {
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
                 handle
-                    .execute_authorized(request, caveats, authority, growth)
+                    .execute_authorized(
+                        request,
+                        caveats,
+                        authority,
+                        self.admitted_growth(&key, growth),
+                    )
                     .await
             }
             other => other,
@@ -727,6 +743,9 @@ impl SqlService {
         let db_name = super::publication::DATABASE;
         let key = (space.to_string(), db_name.to_string());
         let handle = self.handle(space, db_name).await?;
+        if command["operation"] != "capabilities" && self.checkpoint_over_save_limit(&key) {
+            return Err(SqlError::DatabaseReadOnlySizeLimit);
+        }
         begin_write()?;
         let result = handle.publication(command).await?;
         if !result.write_targets.is_empty() {
@@ -1022,9 +1041,12 @@ impl SqlService {
                     .map_err(|e| SqlError::Internal(e.to_string()))?;
                 self.lineage.insert(
                     key,
-                    ArtifactExpectation::Derived {
-                        revision: meta.revision,
-                        checkpoint_content_hash: meta.checkpoint_content_hash,
+                    LoadedLineage {
+                        checkpoint_size_bytes: meta.checkpoint_size_bytes.max(0) as u64,
+                        expectation: ArtifactExpectation::Derived {
+                            revision: meta.revision,
+                            checkpoint_content_hash: meta.checkpoint_content_hash,
+                        },
                     },
                 );
                 Ok(())
@@ -1035,7 +1057,13 @@ impl SqlService {
                     "No durable database artifact; starting from an empty database"
                 );
                 remove_sql_cache_files(&cache_path).await?;
-                self.lineage.insert(key, ArtifactExpectation::Absent);
+                self.lineage.insert(
+                    key,
+                    LoadedLineage {
+                        expectation: ArtifactExpectation::Absent,
+                        checkpoint_size_bytes: 0,
+                    },
+                );
                 Ok(())
             }
         }
@@ -1071,7 +1099,7 @@ impl SqlService {
     /// outlived its record: its state cannot be asserted against the durable
     /// artifact, so it is discarded and the request fails.
     async fn expectation(&self, key: &(String, String)) -> Result<ArtifactExpectation, SqlError> {
-        if let Some(expectation) = self.lineage.get(key).map(|entry| entry.clone()) {
+        if let Some(expectation) = self.lineage.get(key).map(|entry| entry.expectation.clone()) {
             return Ok(expectation);
         }
         tracing::error!(
@@ -1082,6 +1110,23 @@ impl SqlService {
         Err(SqlError::Internal(
             "Database lineage missing for live actor".into(),
         ))
+    }
+
+    fn checkpoint_over_save_limit(&self, key: &(String, String)) -> bool {
+        let limit = self.artifact_repository.max_write_bytes();
+        limit != 0
+            && self
+                .lineage
+                .get(key)
+                .is_some_and(|entry| entry.checkpoint_size_bytes > limit)
+    }
+
+    fn admitted_growth(&self, key: &(String, String), growth: GrowthPolicy) -> GrowthPolicy {
+        if self.checkpoint_over_save_limit(key) {
+            GrowthPolicy::ReadOnlySaveLimit
+        } else {
+            growth
+        }
     }
 
     /// The error a write to `key` gets while its checkpoint back-off lasts
@@ -1185,9 +1230,12 @@ impl SqlService {
             self.checkpoint_backoff.remove(&key);
             self.lineage.insert(
                 key,
-                ArtifactExpectation::Derived {
-                    revision: saved.revision,
-                    checkpoint_content_hash: saved.checkpoint_content_hash,
+                LoadedLineage {
+                    checkpoint_size_bytes: saved.checkpoint_size_bytes.max(0) as u64,
+                    expectation: ArtifactExpectation::Derived {
+                        revision: saved.revision,
+                        checkpoint_content_hash: saved.checkpoint_content_hash,
+                    },
                 },
             );
             return Ok(());
@@ -1221,8 +1269,9 @@ impl SqlService {
                 Ok(saved) => {
                     // The delta rides on the same checkpoint, so only the
                     // revision this actor is caught up to moves.
-                    self.lineage
-                        .insert(key, expected.advanced_to(saved.revision));
+                    if let Some(mut lineage) = self.lineage.get_mut(&key) {
+                        lineage.expectation = expected.advanced_to(saved.revision);
+                    }
                     tracing::info!(
                         service = "sql",
                         mode = "wal",
@@ -1296,9 +1345,12 @@ impl SqlService {
         self.checkpoint_backoff.remove(&key);
         self.lineage.insert(
             key,
-            ArtifactExpectation::Derived {
-                revision: saved.revision,
-                checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+            LoadedLineage {
+                checkpoint_size_bytes: bytes as u64,
+                expectation: ArtifactExpectation::Derived {
+                    revision: saved.revision,
+                    checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+                },
             },
         );
         tracing::info!(
@@ -1546,6 +1598,287 @@ mod tests {
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         Arc::new(SeaOrmDatabaseArtifactRepository::new(db))
+    }
+
+    #[tokio::test]
+    async fn tc1491_oversized_checkpoint_is_read_only_across_reload() {
+        use super::super::caveats::PreparedStatement;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let writer = SeaOrmDatabaseArtifactRepository::new(db.clone());
+        let space = test_space_id("oversized-read-only");
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(fixture.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(v TEXT); INSERT INTO items VALUES ('original');
+             CREATE TABLE padding(v BLOB); INSERT INTO padding VALUES (zeroblob(262144));",
+        )
+        .unwrap();
+        drop(conn);
+        let payload = std::fs::read(fixture.path()).unwrap();
+        // An UPDATE's WAL fits this ceiling, but the stored checkpoint does not.
+        let limit = 64 * 1024;
+        assert!(payload.len() > limit);
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                "main",
+                payload.clone(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                super::super::publication::DATABASE,
+                payload.clone(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(db)
+                .with_max_write_bytes(limit as u64)
+                .with_max_read_bytes(payload.len() as u64),
+        );
+        let repo = Arc::new(SizeTrackingArtifactRepository::new(repo, SqlSizes::new()));
+        let before = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let caveats = Some(SqlCaveats {
+            statements: Some(vec![PreparedStatement {
+                name: "update".into(),
+                sql: "UPDATE items SET v = 'changed'".into(),
+            }]),
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            let cache = TempDir::new().unwrap();
+            let service =
+                SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+            for reload in 0..2 {
+                let read = service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "SELECT v FROM items".into(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/read".into(),
+                    )
+                    .await
+                    .unwrap();
+                let SqlResponse::Query(read) = read.response else {
+                    panic!("expected rows")
+                };
+                assert_eq!(read.rows, vec![vec![SqlValue::Text("original".into())]]);
+                let path = service.cache_path(&space, "main");
+                let local_before = std::fs::read(&path).unwrap();
+                for request in [
+                    SqlRequest::Execute {
+                        sql: "UPDATE items SET v = 'changed'".into(),
+                        params: vec![],
+                        schema: None,
+                    },
+                    SqlRequest::Query {
+                        sql: "WITH c AS (SELECT 1) UPDATE items SET v = 'changed' RETURNING v"
+                            .into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    SqlRequest::Batch {
+                        statements: vec![SqlStatement {
+                            sql: "DELETE FROM items".into(),
+                            params: vec![],
+                        }],
+                    },
+                    SqlRequest::ExecuteStatement {
+                        name: "update".into(),
+                        params: vec![],
+                    },
+                    SqlRequest::Execute {
+                        sql: "SELECT 1".into(),
+                        params: vec![],
+                        schema: Some(vec!["CREATE TABLE forbidden(v)".into()]),
+                    },
+                    SqlRequest::Execute {
+                        sql: "DROP TABLE items".into(),
+                        params: vec![],
+                        schema: None,
+                    },
+                    SqlRequest::Query {
+                        sql: "PRAGMA user_version = 7".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                ] {
+                    let error = service
+                        .execute(
+                            &space,
+                            "main",
+                            request,
+                            caveats.clone(),
+                            "tinycloud.sql/admin".into(),
+                        )
+                        .await
+                        .expect_err("oversized checkpoint admitted a mutation");
+                    assert!(
+                        error.to_string().contains("sql_database_size_limit"),
+                        "{error}"
+                    );
+                    assert!(error.to_string().contains("read-only"), "{error}");
+                    assert_eq!(std::fs::read(&path).unwrap(), local_before);
+                    assert_eq!(std::fs::metadata(sql_wal_path(&path)).unwrap().len(), 0);
+                }
+                let version = service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "PRAGMA user_version".into(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/admin".into(),
+                    )
+                    .await
+                    .unwrap();
+                let SqlResponse::Query(version) = version.response else {
+                    panic!("expected version")
+                };
+                assert_eq!(version.rows, vec![vec![SqlValue::Integer(0)]]);
+                // Export remains available and contains the unchanged rows.
+                let exported = service.export(&space, "main").await.unwrap();
+                let exported_file = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(exported_file.path(), exported).unwrap();
+                let conn = rusqlite::Connection::open(exported_file.path()).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT v FROM items", [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    "original"
+                );
+                drop(conn);
+                service
+                    .discard_local_state(&(space.to_string(), "main".into()))
+                    .await
+                    .unwrap();
+                assert!(
+                    !service
+                        .lineage
+                        .contains_key(&(space.to_string(), "main".into())),
+                    "reload {reload}"
+                );
+            }
+            let caps = service
+                .meeting_publication(
+                    &space,
+                    serde_json::json!({"contractVersion":3,"operation":"capabilities"}),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(caps.response, SqlResponse::Query(_)));
+            for operation in ["activate", "reserve", "stage", "publish", "delete", "purge"] {
+                let error = service
+                    .meeting_publication(
+                        &space,
+                        serde_json::json!({"contractVersion":3,"operation":operation}),
+                    )
+                    .await
+                    .expect_err("oversized publication mutation admitted");
+                assert!(
+                    error.to_string().contains("sql_database_size_limit"),
+                    "{error}"
+                );
+            }
+            service
+                .discard_local_state(&(
+                    space.to_string(),
+                    super::super::publication::DATABASE.into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let after = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(after.delta_payload, before.delta_payload);
+        assert_eq!(after.content_hash, before.content_hash);
+    }
+
+    #[tokio::test]
+    async fn tc1491_checkpoint_at_write_limit_still_accepts_wal_writes() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let writer = SeaOrmDatabaseArtifactRepository::new(db.clone());
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(fixture.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(v); INSERT INTO items VALUES (1);
+            CREATE TABLE padding(v); INSERT INTO padding VALUES (zeroblob(65536));",
+        )
+        .unwrap();
+        drop(conn);
+        let payload = std::fs::read(fixture.path()).unwrap();
+        let limit = payload.len() as u64;
+        let space = test_space_id("within-save-limit");
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                "main",
+                payload,
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_write_bytes(limit));
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    sql: "UPDATE items SET v = 2".into(),
+                    params: vec![],
+                    schema: None,
+                },
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        let stored = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.delta_payload.is_some(),
+            "small write should use WAL persistence"
+        );
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -352,6 +352,9 @@ pub enum SqlError {
     /// (TC-2961).
     #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
     DatabaseSizeLimit,
+    /// The hydrated checkpoint cannot be saved within the artifact write cap.
+    #[error("sql_database_size_limit: the database is read-only because its stored checkpoint exceeds the save size limit; no change was applied")]
+    DatabaseReadOnlySizeLimit,
     /// The database is larger than the node loads (TC-2961): its stored
     /// checkpoint or WAL delta exceeds the artifact read limit, so it was
     /// not loaded and nothing ran.
