@@ -2,8 +2,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::*;
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Token, TokenWithLocation, Tokenizer, Whitespace};
 
 use super::caveats::DuckDbCaveats;
 use super::types::DuckDbError;
@@ -397,8 +397,14 @@ pub fn validate_sql(
     let has_write = is_admin || ability_matches(ability, "tinycloud.duckdb/write");
 
     let dialect = GenericDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| DuckDbError::ParseError(e.to_string()))?;
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| DuckDbError::ParseError(ParserError::from(e).to_string()))?;
+    check_line_comment_ends(&tokens)?;
+    let statements = Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|e| DuckDbError::ParseError(e.to_string()))?;
 
     if statements.is_empty() {
         return Err(DuckDbError::ParseError("Empty SQL statement".to_string()));
@@ -407,6 +413,7 @@ pub fn validate_sql(
     // every nested statement/function follows the same diagnostic boundary.
     check_diagnostic_statements(&statements)?;
     check_restricted_sql(&statements, caveats)?;
+    check_transaction_control(&statements)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -429,6 +436,9 @@ pub fn validate_sql(
         if let Some(targets) = extract_write_targets_from_statement(stmt) {
             write_targets.push(targets);
         }
+    }
+    if is_read_only && statements.iter().any(advances_sequence) {
+        is_read_only = false;
     }
 
     // Function blocklist (defense in depth)
@@ -464,6 +474,65 @@ pub fn validate_sql(
         is_read_only,
         is_ddl,
     })
+}
+
+/// One DuckDB connection serves every principal of a database, so a client
+/// transaction left open would take in other callers' writes, and its
+/// `ROLLBACK` would undo them. The node opens and ends every transaction
+/// itself (`transactional` batches); clients never do, at any tier.
+fn check_transaction_control(statements: &[Statement]) -> Result<(), DuckDbError> {
+    fn controls_transaction(statement: &Statement) -> bool {
+        match statement {
+            Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::Savepoint { .. }
+            | Statement::ReleaseSavepoint { .. } => true,
+            Statement::Explain { statement, .. } => controls_transaction(statement),
+            _ => false,
+        }
+    }
+    if statements.iter().any(controls_transaction) {
+        return Err(DuckDbError::PermissionDenied(
+            "Transaction control is not allowed; send a transactional batch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// DuckDB ends a `--` comment at `\r` as well as `\n`; sqlparser 0.44 ends it
+/// only at `\n`. Refuse text after a `\r` in a line comment, so both see the
+/// same statements; a CRLF line end stays allowed.
+fn check_line_comment_ends(tokens: &[TokenWithLocation]) -> Result<(), DuckDbError> {
+    let mismatched = tokens.iter().any(|token| match &token.token {
+        Token::Whitespace(Whitespace::SingleLineComment { comment, .. }) => comment
+            .split_once('\r')
+            .is_some_and(|(_, rest)| !rest.chars().all(|c| c.is_ascii_whitespace())),
+        _ => false,
+    });
+    if mismatched {
+        return Err(DuckDbError::ParseError(
+            "Text after a carriage return in a line comment is not allowed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `nextval` and `setval` change a sequence, so a query calling them writes.
+fn advances_sequence(statement: &Statement) -> bool {
+    visit_expressions(statement, |expression| match expression {
+        Expr::Function(function)
+            if function.name.0.last().is_some_and(|ident| {
+                ["nextval", "setval"]
+                    .iter()
+                    .any(|name| ident.value.eq_ignore_ascii_case(name))
+            }) =>
+        {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// Collect mutation targets, returning `Unsupported` for unclassifiable SQL.
@@ -761,11 +830,6 @@ fn check_statement_allowed(stmt: &Statement, has_write: bool) -> Result<(), Duck
                 ))
             }
         }
-
-        // Transactions
-        Statement::StartTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. } => Ok(()),
 
         // Everything else is blocked
         other => Err(DuckDbError::PermissionDenied(format!(
@@ -1164,17 +1228,102 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // test-ruling: TC-3035 transaction control now counts as a write, so the
-    // read tier (and any `read_only` request) can no longer open or end a
-    // transaction on the shared connection.
+    // test-ruling: TC-3430 refuses client transaction control for every tier:
+    // one connection serves every principal of a database, so an open
+    // transaction would let one caller roll back another's write.
     #[test]
-    fn test_transaction_statements() {
-        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+    fn transaction_control_is_refused_for_every_tier() {
+        let read_only = Some(DuckDbCaveats {
+            tables: None,
+            columns: None,
+            statements: None,
+            read_only: Some(true),
+        });
+        for sql in [
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "START TRANSACTION",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "ROLLBACK TO SAVEPOINT s",
+            "SELECT 1; BEGIN",
+            "EXPLAIN ANALYZE COMMIT",
+        ] {
+            for (caveats, ability) in [
+                (&None, "tinycloud.duckdb/read"),
+                (&None, "tinycloud.duckdb/write"),
+                (&None, "tinycloud.duckdb/admin"),
+                (&None, "tinycloud.duckdb/*"),
+                (&read_only, "tinycloud.duckdb/admin"),
+            ] {
+                assert!(
+                    matches!(
+                        validate_sql(sql, caveats, ability),
+                        Err(DuckDbError::PermissionDenied(message)) if message.contains("Transaction control")
+                    ),
+                    "{sql} as {ability}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_after_a_carriage_return_in_a_line_comment_is_refused() {
+        for sql in [
+            "SELECT 1 --\r; DELETE FROM users",
+            "SELECT 1 -- a\rDELETE FROM users\n",
+            "SELECT 1 --\r\r;",
+        ] {
+            assert!(
+                matches!(
+                    validate_sql(sql, &None, "tinycloud.duckdb/admin"),
+                    Err(DuckDbError::ParseError(_))
+                ),
+                "{sql:?}"
+            );
+        }
+        for sql in [
+            "SELECT 1 -- note\nFROM users",
+            "SELECT 1 -- note\r\nFROM users",
+            "SELECT 1 -- note\r",
+            "SELECT 'a\rb' FROM users",
+            "SELECT 1\r\nFROM users",
+            "SELECT 1 /* a\rb */ FROM users",
+        ] {
+            assert!(
+                validate_sql(sql, &None, "tinycloud.duckdb/read").is_ok(),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_advance_is_a_write() {
+        let read_only = Some(DuckDbCaveats {
+            tables: None,
+            columns: None,
+            statements: None,
+            read_only: Some(true),
+        });
+        for sql in [
+            "SELECT nextval('s')",
+            "SELECT main.NEXTVAL('s') FROM users",
+            "SELECT setval('s', 10)",
+        ] {
             assert!(matches!(
                 validate_sql(sql, &None, "tinycloud.duckdb/read"),
                 Err(DuckDbError::ReadOnlyViolation)
             ));
+            assert!(matches!(
+                validate_sql(sql, &read_only, "tinycloud.duckdb/write"),
+                Err(DuckDbError::ReadOnlyViolation)
+            ));
+            assert!(validate_sql(sql, &None, "tinycloud.duckdb/write").is_ok());
         }
+        assert!(validate_sql("SELECT currval('s')", &None, "tinycloud.duckdb/read").is_ok());
     }
 
     #[test]
@@ -1389,8 +1538,6 @@ mod tests {
             ("WITH c AS (SELECT 1) SELECT * FROM c", true),
             ("EXPLAIN SELECT * FROM t", true),
             ("EXPLAIN ANALYZE SELECT * FROM t", false),
-            ("BEGIN", false),
-            ("COMMIT", false),
             ("INSERT INTO t VALUES (1)", false),
             ("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c", false),
             ("PREPARE p AS INSERT INTO t VALUES (1)", false),

@@ -69,13 +69,9 @@ const REFUSED: &[&str] = &[
     "SELECT 1; COPY t TO 'out.csv'",
     "SELECT 1; ATTACH 'other.duckdb' AS other",
     "SELECT 1; PRAGMA threads = 1",
-    "BEGIN; INSERT INTO t VALUES (1); COMMIT",
     "EXPLAIN SELECT 1; PREPARE p AS DELETE FROM t",
-    // Transaction control changes the shared connection's state.
-    "BEGIN",
-    "COMMIT",
-    "ROLLBACK",
-    "BEGIN; SELECT 1; COMMIT",
+    // Transaction control is refused for every tier before `read_only` is
+    // checked (TC-3430), so it is covered by that check's own tests.
 ];
 
 /// Plain reads stay allowed under `read_only`.
