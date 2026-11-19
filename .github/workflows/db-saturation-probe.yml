@@ -31,7 +31,8 @@ run-name: >-
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # GitHub's scheduler drops/delays runs at :00 (worst ~00:00 UTC, 30+ min nightly); offset 2 min. Doesn't fix the nightly gap (heartbeat grace + scheduler move ticket).
+    - cron: "2-59/5 * * * *"
   workflow_dispatch:
     inputs:
       threshold_pct:
