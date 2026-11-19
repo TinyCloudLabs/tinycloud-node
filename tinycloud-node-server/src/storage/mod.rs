@@ -58,5 +58,3 @@ pub mod purge_inventory;
 pub mod purge_reconcile;
 
 pub mod purge_restore;
-
-pub mod resource_review;

@@ -4,9 +4,7 @@ use rocket::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tinycloud::{
-    space_lifecycle::{
-        lifecycle_error, list_my_spaces, resources::list_my_resources, LifecycleRuntime,
-    },
+    space_lifecycle::{lifecycle_error, list_my_spaces, LifecycleRuntime},
     storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
@@ -42,9 +40,8 @@ async fn lifecycle_guard_and_json_refusals_use_the_configured_host_envelope_with
     let client = Client::tracked(
         rocket::build()
             .manage(runtime)
-            .mount("/", rocket::routes![list_my_spaces, list_my_resources])
-            .register("/space", rocket::catchers![lifecycle_error])
-            .register("/resource", rocket::catchers![lifecycle_error]),
+            .mount("/", rocket::routes![list_my_spaces])
+            .register("/space", rocket::catchers![lifecycle_error]),
     )
     .await
     .unwrap();
@@ -83,7 +80,6 @@ async fn lifecycle_guard_and_json_refusals_use_the_configured_host_envelope_with
     let valid_body = serde_json::json!({"version":1,"ownerDid":owner,"cursor":null}).to_string();
     for (path, authorization, header, body, expected_status) in [
         ("/space/list", None, None, "{}", Status::Unauthorized),
-        ("/resource/list", None, None, "{}", Status::Unauthorized),
         (
             "/space/list",
             Some(jwt.as_str()),

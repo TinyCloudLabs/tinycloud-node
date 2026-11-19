@@ -348,7 +348,7 @@ impl LifecycleRuntime {
         .map_err(unavailable)?;
         // Listings retain only nonce replay state; their cursor and request
         // key never create a durable pagination/idempotency record.
-        if matches!(kind, "list" | "resource-list") {
+        if kind == "list" {
             self.listing_slot(&proof.owner_did)?;
             return Ok(tx);
         }
@@ -1087,4 +1087,3 @@ pub async fn purge_status(
 
 pub mod leases;
 pub mod reconcile;
-pub mod resources;

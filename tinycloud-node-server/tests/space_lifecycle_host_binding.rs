@@ -6,10 +6,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tinycloud::{
-    space_lifecycle::{
-        list_my_spaces, purge_space, purge_status, resources::list_my_resources, retire_owner,
-        LifecycleRuntime,
-    },
+    space_lifecycle::{list_my_spaces, purge_space, purge_status, retire_owner, LifecycleRuntime},
     storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
@@ -55,13 +52,7 @@ async fn host(id: &str, byte: u8) -> (Client, tempfile::TempDir, DatabaseConnect
     runtime.verify_ledger().await.unwrap();
     let client = Client::tracked(rocket::build().manage(runtime).mount(
         "/",
-        rocket::routes![
-            list_my_spaces,
-            list_my_resources,
-            retire_owner,
-            purge_space,
-            purge_status
-        ],
+        rocket::routes![list_my_spaces, retire_owner, purge_space, purge_status],
     ))
     .await
     .unwrap();
@@ -143,13 +134,6 @@ async fn every_implemented_lifecycle_route_refuses_cross_host_replay_before_data
         (
             "/space/list",
             "tinycloud.space/list",
-            owner.clone(),
-            json!({"version":1,"ownerDid":owner,"cursor":null}),
-            Status::Ok,
-        ),
-        (
-            "/resource/list",
-            "tinycloud.resource/list",
             owner.clone(),
             json!({"version":1,"ownerDid":owner,"cursor":null}),
             Status::Ok,

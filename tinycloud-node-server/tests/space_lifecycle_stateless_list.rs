@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 use time::OffsetDateTime;
 use tinycloud::{
-    space_lifecycle::{list_my_spaces, resources::list_my_resources, LifecycleRuntime},
+    space_lifecycle::{list_my_spaces, LifecycleRuntime},
     storage::purge_ledger::FsPurgeLedger,
 };
 use tinycloud_auth::{
@@ -76,14 +76,12 @@ async fn list_key_reuse_with_fresh_nonce_is_read_only_and_creates_no_request_rec
     let client = Client::tracked(
         rocket::build()
             .manage(runtime)
-            .mount("/", rocket::routes![list_my_spaces, list_my_resources]),
+            .mount("/", rocket::routes![list_my_spaces]),
     )
     .await
     .unwrap();
-    for (path, action) in [
-        ("/space/list", "tinycloud.space/list"),
-        ("/resource/list", "tinycloud.resource/list"),
-    ] {
+    {
+        let (path, action) = ("/space/list", "tinycloud.space/list");
         let id = uuid::Uuid::new_v4().to_string();
         let mut first = None;
         let mut token = None;
@@ -127,6 +125,6 @@ async fn list_key_reuse_with_fresh_nonce_is_read_only_and_creates_no_request_rec
             .await
             .unwrap()
             .len(),
-        4
+        2
     );
 }

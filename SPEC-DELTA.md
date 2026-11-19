@@ -18,6 +18,7 @@ Verified frozen amendments: v1.5 contract `8b9bfdab43b78f11edcf5c76efbb71c4d2db1
 
 - Verified wire appendix: `tc-2871-space-delete-wire-appendix-v1.1.md`, SHA-256 `7c97793d01fe4cab76f165ffb342c5efd0818ca02facda0f7a73bdd52cd7c4a1`. This interface note is distinct from the superseded historical v1.1 contract.
 - Separate resource wire scope: owner-direct `POST /resource/list`, `/resource/dependencies`, `/resource/purge`, and `/resource/purge/status`, with exact `tinycloud.resource/list`, `tinycloud.resource/dependencies`, and `tinycloud.resource/delete` actions. Every lifecycle response binds `hostId`; resource lists use the same max-500 keyset pages and terminal-page semantics as space lists. The separately frozen resource wire below governs these routes.
+- Erase-30 (Naomi 11-19): the resource handlers are off the erase-30 path. `/resource/list` and the `storage::resource_review` adapter are removed, along with their resource-only tests. The resource wire freeze stays as a frozen contract with no implementation on this branch. Migrations, models, ledger `resource` kind/`retirement_snapshots`, the collector and fence helpers stay compiled because the space path shares or tolerates them.
 
 
 ## Frozen v1.7 / v1.7.1 and resource wire review
