@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
 - The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
@@ -57,6 +58,22 @@
 
   The sidecar ships a line only with exactly these keys, declared types, enum values and bounds; account fields only as 64-hex pseudonyms. A top account or rank the node reports as absent (empty pseudonym, zero counts) is omitted. Any other line on the fair-share target falls back to an `unclassified` count with no fields.
   - **N0 compose.** The embedded Vector configuration is regenerated for the TC-3006 codes and these events, so the reviewed N0 compose template changes from `90841a34…` to `15448ac0…` (raw `5419a6fb…` to `99c68db3…`; `docs/releasing.md`, `.github/workflows/docker.yml`). The release notes must say the compose hash changes.
+
+## [1.26.12] - 2026-11-19
+
+Ships the changes merged since 1.26.11 (#654, #659, #660), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **No database migration.** The migration sources are byte-identical to 1.26.11, so the deploy workflow's audited rollback can return to 1.26.11.
+- DuckDB clients that send their own `BEGIN`, `COMMIT` or `ROLLBACK` now get 403. The SDK's `transactional` batches are unchanged.
+
+### Changes
+
+- DuckDB: client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused with 403 at every tier; the node opens and ends every transaction itself (TC-3430, #660).
+- DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. `nextval` and `setval` count as writes. Line comments are parsed more strictly (TC-3035, TC-3430, #660).
+- The 503 body of a request that reached its deadline before its write began now asks for a new signature: "request_timeout: no change was applied; retry the request with a new signature" (TC-1997, #654).
+- Operations: a manual `Renewals switch` workflow reads, pauses or resumes scheduled renewals on the production nodes without an operator handling the admin secret. Runbook: `docs/runbooks/renewal-leases.md` (TC-3275, #659).
 
 ## [1.26.11] - 2026-11-19
 
