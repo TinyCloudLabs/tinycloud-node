@@ -1048,6 +1048,9 @@ fn unique_names(names: Vec<String>) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod read_only_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::caveats::DuckDbCaveats;
     use super::*;
