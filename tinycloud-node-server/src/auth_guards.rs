@@ -149,6 +149,33 @@ fn kv_etag(hash: Hash) -> String {
     format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
 }
 
+/// The ETag of a batch KV read's state (TC-3217). Its own prefix keeps it
+/// from ever equalling a single value's `blake3-` tag.
+fn kv_batch_etag(state: Hash) -> String {
+    format!("\"kv-batch-{}\"", hex::encode(state.as_ref()))
+}
+
+/// The batch states an `If-None-Match` names (TC-3217): every
+/// [`kv_batch_etag`] in its list, weak or strong. Any other tag names none.
+pub(crate) fn kv_batch_states(if_none_match: Option<&str>) -> Vec<[u8; 32]> {
+    if_none_match
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|tag| {
+            let hex = weak_entity_tag(tag.trim())
+                .strip_prefix("\"kv-batch-")?
+                .strip_suffix('"')?;
+            <[u8; 32]>::try_from(hex::decode(hex).ok()?).ok()
+        })
+        .collect()
+}
+
+/// A batch KV read's `ETag` and `Cache-Control` on `response` (TC-3217).
+fn set_kv_batch_validators(response: &mut Response<'_>, state: Hash) {
+    response.set_header(Header::new("ETag", kv_batch_etag(state)));
+    response.set_header(Header::new("Cache-Control", "private, no-cache"));
+}
+
 fn weak_entity_tag(value: &str) -> &str {
     value.strip_prefix("W/").unwrap_or(value)
 }
@@ -278,9 +305,20 @@ where
                 })
                 .respond_to(request)
             }
-            InvocationOutcome::KvBatchRead(items) => {
-                Json(kv_batch_read_response(items)).respond_to(request)
+            InvocationOutcome::KvBatchRead(items, state) => {
+                let mut response = Json(kv_batch_read_response(items)).respond_to(request)?;
+                if let Some(state) = state {
+                    set_kv_batch_validators(&mut response, state);
+                }
+                Ok(response)
             }
+            InvocationOutcome::KvBatchUnchanged(state) => {
+                let mut response = Response::build().status(Status::NotModified).finalize();
+                set_kv_batch_validators(&mut response, state);
+                Ok(response)
+            }
+            // `invoke_impl` takes a batch read's state into its response.
+            InvocationOutcome::KvBatchState(_) => Err(Status::InternalServerError),
             InvocationOutcome::KvRead(data) => data
                 .map(|(md, hash, c)| KVResponse(c, md, hash))
                 .respond_to(request),

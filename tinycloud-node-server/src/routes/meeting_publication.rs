@@ -118,6 +118,7 @@ fn receipt(value: serde_json::Value) -> SqlExecutionResult {
             row_count: 1,
         }),
         write_targets: vec![],
+        write_row_ids: vec![],
     }
 }
 /// Only status and generation-checked release remain from publication v3.

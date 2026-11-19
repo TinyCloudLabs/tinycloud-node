@@ -2,8 +2,8 @@ use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
 use prometheus::{
     register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, Encoder, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    TextEncoder,
+    register_int_gauge, register_int_gauge_vec, Encoder, Histogram, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 
 pub use tinycloud_core::telemetry::{
@@ -119,6 +119,28 @@ lazy_static! {
         "Current number of idle connections in the database pool."
     )
     .unwrap();
+    /// The PostgreSQL `idle_in_transaction_session_timeout` the node's pool
+    /// sets on each connection, in milliseconds; 0 when it sets none (TC-3178).
+    pub static ref DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: IntGauge = register_int_gauge!(
+        "tinycloud_db_idle_in_transaction_timeout_ms",
+        "Idle-in-transaction timeout the node's PostgreSQL pool sets, in milliseconds (0: none)."
+    )
+    .unwrap();
+    /// The PostgreSQL `statement_timeout` of the node's pool, in
+    /// milliseconds; 0 when off (TC-3178).
+    pub static ref DB_STATEMENT_TIMEOUT_MS: IntGauge = register_int_gauge!(
+        "tinycloud_db_statement_timeout_ms",
+        "Statement timeout of the node's PostgreSQL pool, in milliseconds (0: off)."
+    )
+    .unwrap();
+    /// How the node's pool applies its statement timeout: 1 on the mode in
+    /// effect (`session`, `local` or `off`), 0 on the others (TC-3178).
+    pub static ref DB_STATEMENT_TIMEOUT_MODE: IntGaugeVec = register_int_gauge_vec!(
+        "tinycloud_db_statement_timeout_mode",
+        "Statement timeout mode of the node's PostgreSQL pool: 1 on the mode in effect.",
+        &["mode"]
+    )
+    .unwrap();
     /// Cumulative durable read-audit records committed.
     pub static ref READ_AUDIT_RECORDS: IntCounter = register_int_counter!(
         "tinycloud_read_audit_records_total",
@@ -198,6 +220,23 @@ lazy_static! {
         "SQL and DuckDB invocations refused because they cited more than one SQL or DuckDB proof."
     )
     .unwrap();
+    /// Free bytes an unprivileged process can still allocate on the filesystem
+    /// behind each local store. The label is the store (`sql`, `duckdb`).
+    pub static ref STORAGE_FREE_BYTES: IntGaugeVec = register_int_gauge_vec!(
+        "tinycloud_storage_free_bytes",
+        "Free bytes on the filesystem behind each local store, by store.",
+        &["store"]
+    )
+    .unwrap();
+    /// Requests answered `507 sql_disk_headroom` (any SQL request whose error
+    /// maps to it: writes, and exports or queries that hit a full disk). The
+    /// label is the engine (`sql`).
+    pub static ref DISK_HEADROOM_REFUSALS: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_disk_headroom_refusals_total",
+        "Requests refused for disk headroom, by engine.",
+        &["engine"]
+    )
+    .unwrap();
 }
 
 pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
@@ -265,6 +304,50 @@ pub fn set_db_pool_gauges(size: i64, idle: i64) {
     if enabled() {
         DB_POOL_SIZE.set(size);
         DB_POOL_IDLE.set(idle);
+    }
+}
+
+/// Record the timeouts the PostgreSQL pool was built with, so an operator can
+/// read back what is in effect without the startup log (TC-3178).
+/// `idle_in_transaction_timeout_ms` is the value actually set: 0 when off or
+/// in `local` mode. Configuration facts set once at startup, so not gated on
+/// [`enabled`]: they are only served where the metrics endpoint is.
+pub fn set_db_pool_timeouts(
+    statement: tinycloud_core::db_pool::StatementTimeouts,
+    idle_in_transaction_timeout_ms: u64,
+) {
+    use tinycloud_core::db_pool::StatementTimeoutMode;
+    let statement_timeout_ms = match statement.mode {
+        StatementTimeoutMode::Off => 0,
+        StatementTimeoutMode::Session | StatementTimeoutMode::Local => statement.base.as_millis(),
+    };
+    DB_STATEMENT_TIMEOUT_MS.set(i64::try_from(statement_timeout_ms).unwrap_or(i64::MAX));
+    DB_IDLE_IN_TRANSACTION_TIMEOUT_MS
+        .set(i64::try_from(idle_in_transaction_timeout_ms).unwrap_or(i64::MAX));
+    for (mode, label) in [
+        (StatementTimeoutMode::Session, "session"),
+        (StatementTimeoutMode::Local, "local"),
+        (StatementTimeoutMode::Off, "off"),
+    ] {
+        DB_STATEMENT_TIMEOUT_MODE
+            .with_label_values(&[label])
+            .set(i64::from(statement.mode == mode));
+    }
+}
+
+/// Record the free bytes behind a local store from a sampler tick.
+pub fn set_storage_free_bytes(store: &str, free_bytes: u64) {
+    if enabled() {
+        STORAGE_FREE_BYTES
+            .with_label_values(&[store])
+            .set(i64::try_from(free_bytes).unwrap_or(i64::MAX));
+    }
+}
+
+/// Count one write refused for disk headroom.
+pub fn observe_disk_headroom_refusal(engine: &str) {
+    if enabled() {
+        DISK_HEADROOM_REFUSALS.with_label_values(&[engine]).inc();
     }
 }
 
@@ -470,5 +553,45 @@ mod tests {
         // The label set is fixed and bounded.
         assert_eq!(TimeRejection::Expired.as_str(), "expired");
         assert_eq!(TimeRejection::NotYetValid.as_str(), "not_yet_valid");
+    }
+
+    #[test]
+    fn pool_timeout_gauges_report_the_settings_in_effect() {
+        use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
+        let mode = |label: &str| DB_STATEMENT_TIMEOUT_MODE.with_label_values(&[label]).get();
+
+        set_db_pool_timeouts(
+            StatementTimeouts {
+                mode: StatementTimeoutMode::Session,
+                base: Duration::from_secs(30),
+            },
+            300_000,
+        );
+        assert_eq!(DB_STATEMENT_TIMEOUT_MS.get(), 30_000);
+        assert_eq!(DB_IDLE_IN_TRANSACTION_TIMEOUT_MS.get(), 300_000);
+        assert_eq!((mode("session"), mode("local"), mode("off")), (1, 0, 0));
+
+        // A later pool replaces every value; exactly one mode stays set.
+        set_db_pool_timeouts(
+            StatementTimeouts {
+                mode: StatementTimeoutMode::Local,
+                base: Duration::from_millis(300),
+            },
+            0,
+        );
+        assert_eq!(DB_STATEMENT_TIMEOUT_MS.get(), 300);
+        assert_eq!(DB_IDLE_IN_TRANSACTION_TIMEOUT_MS.get(), 0);
+        assert_eq!((mode("session"), mode("local"), mode("off")), (0, 1, 0));
+
+        // `off` reports no statement timeout whatever base remains configured.
+        set_db_pool_timeouts(
+            StatementTimeouts {
+                mode: StatementTimeoutMode::Off,
+                base: Duration::from_secs(30),
+            },
+            0,
+        );
+        assert_eq!(DB_STATEMENT_TIMEOUT_MS.get(), 0);
+        assert_eq!((mode("session"), mode("local"), mode("off")), (0, 0, 1));
     }
 }

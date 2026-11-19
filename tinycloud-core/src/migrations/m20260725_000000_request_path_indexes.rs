@@ -43,8 +43,8 @@ impl MigrationTrait for Migration {
 
         // 2. parent_delegation(child) -- highest priority. `child` is the
         //    trailing PK column of (parent, child). Both arms of the
-        //    recursive ancestor-closure CTE filter on it, and it now also
-        //    grows with read volume via TC-273's read audit.
+        //    recursive ancestor-closure CTE filter on it. TC-273's read audit
+        //    grew it with read volume until TC-3259 stopped reads writing it.
         manager
             .create_index(
                 Index::create()
@@ -570,6 +570,9 @@ mod tests {
                 callback_url: Set(format!("https://example.test/{i}")),
                 encrypted_secret: Set(vec![0u8; 8]),
                 encrypted_secret_format: Default::default(),
+                header_names_json: Default::default(),
+                encrypted_headers: Default::default(),
+                encrypted_headers_format: Default::default(),
                 secret_key_id: Set("key-1".to_string()),
                 active: Set(i % 5 != 0),
                 created_at: Set(OffsetDateTime::now_utc().to_string()),

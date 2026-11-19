@@ -604,6 +604,15 @@ impl EgressRequest {
         self
     }
 
+    /// Add caller-validated headers (TC-3123 custom webhook headers). Headers
+    /// set later with [`Self::header`] replace any of the same name.
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        if self.error.is_none() {
+            self.headers.extend(headers);
+        }
+        self
+    }
+
     /// Move the original body bytes into the request.
     pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
         if self.error.is_none() {
