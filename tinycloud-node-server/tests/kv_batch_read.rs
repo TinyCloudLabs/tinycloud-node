@@ -365,3 +365,240 @@ async fn batch_reads_answer_as_a_lookup_per_key_would() -> Result<()> {
     );
     Ok(())
 }
+
+/// A batch of `ability` over `keys`, conditional on `if_none_match`: its
+/// status, `ETag` and body.
+async fn conditional_batch(
+    client: &Client,
+    session: &Session,
+    ability: &str,
+    keys: &[&str],
+    if_none_match: Option<&str>,
+) -> Result<(Status, Option<String>, String)> {
+    let ability: Ability = ability.parse()?;
+    let capabilities = keys
+        .iter()
+        .map(|key| {
+            Ok((
+                session.space_id.clone().to_resource(
+                    "kv".parse::<Service>()?,
+                    Some(key.parse::<Path>()?),
+                    None,
+                    None,
+                ),
+                [ability.clone()],
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let invocation = session.invoke_any(capabilities, None)?;
+    let mut request = client
+        .post("/invoke")
+        .header(Header::new("Authorization", invocation.encode()?));
+    if let Some(tag) = if_none_match {
+        request = request.header(Header::new("If-None-Match", tag.to_owned()));
+    }
+    let response = request.dispatch().await;
+    let status = response.status();
+    let etag = response.headers().get_one("ETag").map(str::to_owned);
+    Ok((
+        status,
+        etag,
+        response.into_string().await.unwrap_or_default(),
+    ))
+}
+
+async fn put(client: &Client, session: &Session, key: &str, value: &[u8]) -> Result<()> {
+    let (status, body) = invoke(
+        client,
+        session,
+        "tinycloud.kv/put",
+        &[key.to_owned()],
+        value,
+        None,
+    )
+    .await?;
+    ensure!(status == Status::Ok, "put {key}: {status} {body}");
+    Ok(())
+}
+
+/// The value a batch response gives for `key`, `None` when not found.
+fn found(body: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    let result = results(body)?
+        .into_iter()
+        .find(|result| result["key"] == key)
+        .with_context(|| format!("{key} answered"))?;
+    match result["dataBase64"].as_str() {
+        Some(data) => Ok(Some(base64::decode(data)?)),
+        None => Ok(None),
+    }
+}
+
+/// TC-3217: a batch read carries the state it was read from as its `ETag`.
+/// Sent back in `If-None-Match` while nothing in the space has changed, it
+/// answers 304 with no body; any write or delete in the space, another key
+/// set, or `kv/metadata` instead of `kv/get` answers 200 with fresh values.
+#[tokio::test]
+async fn conditional_batch_reads_answer_304_only_while_unchanged() -> Result<()> {
+    let (client, _dir) = node().await?;
+    let session = sign_in(&client).await?;
+    put(&client, &session, "board/a", b"a1").await?;
+    put(&client, &session, "board/b", b"b1").await?;
+    let get = "tinycloud.kv/get";
+    let board = ["board/a", "board/b"];
+
+    let (status, first, body) = conditional_batch(&client, &session, get, &board, None).await?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    let first = first.context("a batch read has an ETag")?;
+    ensure!(first.starts_with("\"kv-batch-"), "{first}");
+    ensure!(found(&body, "board/a")? == Some(b"a1".to_vec()));
+
+    // Unchanged: 304, the same tag, no body.
+    let (status, tag, body) =
+        conditional_batch(&client, &session, get, &board, Some(&first)).await?;
+    ensure!(status == Status::NotModified, "{status} {body}");
+    ensure!(tag.as_deref() == Some(first.as_str()), "{tag:?}");
+    ensure!(body.is_empty(), "{body}");
+
+    // The same state does not answer another key set or ability.
+    let (status, _, body) = conditional_batch(
+        &client,
+        &session,
+        get,
+        &["board/a", "board/c"],
+        Some(&first),
+    )
+    .await?;
+    ensure!(status == Status::Ok, "other keys: {status} {body}");
+    let (status, _, body) = conditional_batch(
+        &client,
+        &session,
+        "tinycloud.kv/metadata",
+        &board,
+        Some(&first),
+    )
+    .await?;
+    ensure!(status == Status::Ok, "metadata: {status} {body}");
+
+    // A write to a key outside the batch leaves its answer, and its state,
+    // unchanged.
+    put(&client, &session, "elsewhere", b"x").await?;
+    let (status, tag, body) =
+        conditional_batch(&client, &session, get, &board, Some(&first)).await?;
+    ensure!(
+        status == Status::NotModified,
+        "after an unrelated write: {status} {body}"
+    );
+    ensure!(tag.as_deref() == Some(first.as_str()), "{tag:?}");
+
+    // A changed value answers the new value.
+    put(&client, &session, "board/a", b"a2").await?;
+    let (status, third, body) =
+        conditional_batch(&client, &session, get, &board, Some(&first)).await?;
+    ensure!(status == Status::Ok, "after a write: {status} {body}");
+    ensure!(found(&body, "board/a")? == Some(b"a2".to_vec()));
+    let third = third.context("ETag")?;
+
+    // A delete answers the key as not found.
+    let (status, body) = invoke(
+        &client,
+        &session,
+        "tinycloud.kv/del",
+        &["board/b".to_owned()],
+        b"",
+        None,
+    )
+    .await?;
+    ensure!(status.class().is_success(), "del: {status} {body}");
+    let (status, fourth, body) =
+        conditional_batch(&client, &session, get, &board, Some(&third)).await?;
+    ensure!(status == Status::Ok, "after a delete: {status} {body}");
+    ensure!(found(&body, "board/b")?.is_none());
+    let fourth = fourth.context("ETag")?;
+
+    let (status, _, body) =
+        conditional_batch(&client, &session, get, &board, Some(&fourth)).await?;
+    ensure!(status == Status::NotModified, "settled: {status} {body}");
+    Ok(())
+}
+
+/// TC-3217: `If-None-Match: *` on a batch read is not a state, so it never
+/// answers 304; and two key sets that differ only in keys never written have
+/// different states.
+#[tokio::test]
+async fn conditional_batch_reads_never_match_a_wildcard_or_another_absent_key() -> Result<()> {
+    let (client, _dir) = node().await?;
+    let session = sign_in(&client).await?;
+    put(&client, &session, "board/a", b"a1").await?;
+    put(&client, &session, "board/b", b"b1").await?;
+    let get = "tinycloud.kv/get";
+
+    for wildcard in ["*", " * "] {
+        let (status, _, body) = conditional_batch(
+            &client,
+            &session,
+            get,
+            &["board/a", "board/b"],
+            Some(wildcard),
+        )
+        .await?;
+        ensure!(
+            status == Status::BadRequest,
+            "{wildcard:?}: {status} {body}"
+        );
+    }
+
+    let (status, tag, body) =
+        conditional_batch(&client, &session, get, &["board/a", "board/x"], None).await?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    let tag = tag.context("ETag")?;
+    let (status, other, body) =
+        conditional_batch(&client, &session, get, &["board/a", "board/y"], Some(&tag)).await?;
+    ensure!(status == Status::Ok, "other absent key: {status} {body}");
+    ensure!(other.as_deref() != Some(tag.as_str()), "{other:?}");
+    Ok(())
+}
+
+/// TC-3217: a live key whose stored value can't be read is answered as not
+/// found with no `ETag`, so a client never caches that answer under the state
+/// of a key that is present.
+#[tokio::test]
+async fn a_batch_read_with_an_unreadable_value_has_no_etag() -> Result<()> {
+    let (client, dir) = node().await?;
+    let session = sign_in(&client).await?;
+    put(&client, &session, "board/a", b"a1").await?;
+    put(&client, &session, "board/b", b"b1").await?;
+    let get = "tinycloud.kv/get";
+    let board = ["board/a", "board/b"];
+
+    let block = files(dir.path())
+        .into_iter()
+        .find(|file| std::fs::read(file).is_ok_and(|bytes| bytes == b"a1"))
+        .context("the block of board/a")?;
+    let aside = block.with_extension("aside");
+    std::fs::rename(&block, &aside)?;
+    let (status, etag, body) = conditional_batch(&client, &session, get, &board, None).await?;
+    std::fs::rename(&aside, &block)?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    ensure!(found(&body, "board/a")?.is_none(), "{body}");
+    ensure!(etag.is_none(), "{etag:?}");
+
+    let (status, etag, body) = conditional_batch(&client, &session, get, &board, None).await?;
+    ensure!(status == Status::Ok, "{status} {body}");
+    ensure!(found(&body, "board/a")? == Some(b"a1".to_vec()), "{body}");
+    ensure!(etag.is_some(), "a readable batch has an ETag");
+    Ok(())
+}
+
+/// Every file under `dir`.
+fn files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

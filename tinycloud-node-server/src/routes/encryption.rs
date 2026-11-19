@@ -69,6 +69,7 @@ pub async fn create_network(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<DescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -76,6 +77,7 @@ pub async fn create_network(
         "server.encryption.create.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -272,6 +274,7 @@ pub async fn revoke_network(
     authorization: AuthHeaderGetter<InvocationInfo>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Status, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -279,6 +282,7 @@ pub async fn revoke_network(
         "server.encryption.revoke.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -450,6 +454,7 @@ pub async fn create_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -457,6 +462,7 @@ pub async fn create_encryption_key(
         "server.encryption.key_create.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -497,6 +503,7 @@ pub async fn describe_encryption_key(
     authorization: AuthHeaderGetter<InvocationInfo>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -504,6 +511,7 @@ pub async fn describe_encryption_key(
         "server.encryption.key_describe.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -559,6 +567,7 @@ pub async fn block_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -566,6 +575,7 @@ pub async fn block_encryption_key(
         "server.encryption.key_block.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -606,6 +616,7 @@ pub async fn unblock_encryption_key(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<KeyDescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -613,6 +624,7 @@ pub async fn unblock_encryption_key(
         "server.encryption.key_unblock.auth",
         invocation,
         tinycloud,
+        policy_v3,
         service.node_did(),
     )
     .await?;
@@ -722,6 +734,7 @@ async fn verify_auth(
     span: &'static str,
     invocation: Invocation,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
     node_did: &str,
 ) -> Result<(), InvokeError> {
     if invocation.0.invocation.payload().audience != node_did {
@@ -731,6 +744,12 @@ async fn verify_auth(
         )
             .into());
     }
+    // Before the invocation is recorded: a registered policy root never
+    // authorizes these routes, cited alone or beside other proofs.
+    policy_v3
+        .refuse_policy_root_proofs(&invocation.0.parents)
+        .await
+        .map_err(crate::policy_v3::authorization_failure)?;
     let start = Instant::now();
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())

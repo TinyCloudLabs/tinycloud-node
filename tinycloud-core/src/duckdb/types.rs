@@ -461,6 +461,14 @@ pub enum DuckDbError {
     QuotaExceeded,
     #[error("Operation would increase database storage")]
     StorageWouldGrow,
+    /// The database's whole checkpoint exceeds the artifact write limit
+    /// (TC-2961); it was not saved.
+    #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
+    DatabaseSizeLimit,
+    /// The stored database exceeds the artifact read limit (TC-2961); it was
+    /// not loaded.
+    #[error("sql_database_size_limit: the database is larger than this node loads; no change was applied")]
+    DatabaseTooLargeToLoad,
     #[error("Invalid statement: {0}")]
     InvalidStatement(String),
     #[error("Schema error: {0}")]

@@ -68,6 +68,10 @@ pub struct WriteEvent {
     pub database_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
+    /// TC-3123: SQLite rowid of the one row this statement inserted into
+    /// `table_name`, when provable. An id only; never row content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_id: Option<i64>,
     pub actor: String,
     pub epoch: String,
     pub event_index: u32,
@@ -307,6 +311,7 @@ mod tests {
             path: Some("documents/123".to_string()),
             database_path: None,
             table_name: None,
+            row_id: None,
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,
@@ -355,6 +360,7 @@ mod tests {
             )),
             database_path: Some("main.db".to_string()),
             table_name: Some("users".to_string()),
+            row_id: None,
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,
@@ -405,6 +411,7 @@ mod tests {
             path: Some("documents/123".to_string()),
             database_path: None,
             table_name: None,
+            row_id: None,
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,

@@ -504,14 +504,37 @@ impl ScopedControl {
         // Its issuer must still have direct authority over an exact-CID target.
         if self.has_cid_scope()
             && (self.directly_authorizes_cid(target, delegation)
-                || target_abilities.iter().any(|ability| {
-                    ability.resource.space().is_some_and(|space| {
-                        did_principal_matches(space.did().as_str(), &self.grantor)
-                    })
-                }))
+                || self.grantor_owns_a_target_space(target_abilities))
         {
             return true;
         }
+        self.scopes_cover_every_row(target_abilities)
+    }
+
+    /// Whether the control authorizes `target` only because its grantor is
+    /// the target's delegator: the grantor owns no space of the target and
+    /// the typed scopes do not cover every target row.
+    pub(crate) fn rests_only_on_party_authority(
+        &self,
+        target: &Hash,
+        delegation: &delegation::Model,
+        target_abilities: &[abilities::Model],
+    ) -> bool {
+        self.directly_authorizes_cid(target, delegation)
+            && !self.grantor_owns_a_target_space(target_abilities)
+            && !self.scopes_cover_every_row(target_abilities)
+    }
+
+    fn grantor_owns_a_target_space(&self, target_abilities: &[abilities::Model]) -> bool {
+        target_abilities.iter().any(|ability| {
+            ability
+                .resource
+                .space()
+                .is_some_and(|space| did_principal_matches(space.did().as_str(), &self.grantor))
+        })
+    }
+
+    fn scopes_cover_every_row(&self, target_abilities: &[abilities::Model]) -> bool {
         !target_abilities.is_empty()
             && target_abilities.iter().all(|target_ability| {
                 self.scopes
@@ -665,29 +688,34 @@ pub(crate) async fn target_for_cid<C: ConnectionTrait>(
     delegation::Entity::find_by_id(alias.id).one(db).await
 }
 
+/// The target of a capability that is exactly `tinycloud.delegation/revoke`
+/// on exactly `urn:cid:<target>`.
+fn exact_cid_revoke_target(cap: &crate::util::Capability) -> Option<Hash> {
+    if cap.ability.as_ref().as_ref() != ControlAction::Revoke.ability() {
+        return None;
+    }
+    let Resource::Other(resource) = &cap.resource else {
+        return None;
+    };
+    resource
+        .as_str()
+        .strip_prefix("urn:cid:")
+        .and_then(|cid| cid.parse::<Cid>().ok())
+        .map(Hash::from)
+}
+
 /// Whether `owner` may issue a parentless `tinycloud.delegation/revoke` grant
 /// on exactly `urn:cid:<target>`: the target is stored and one of its
-/// persisted abilities names a space `owner` owns. Being the target's
-/// delegator or delegatee is not enough.
+/// persisted abilities names a space `owner` owns.
 pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
     db: &C,
     owner: &str,
     cap: &crate::util::Capability,
 ) -> Result<bool, DbErr> {
-    if cap.ability.as_ref().as_ref() != ControlAction::Revoke.ability() {
-        return Ok(false);
-    }
-    let Resource::Other(resource) = &cap.resource else {
+    let Some(target) = exact_cid_revoke_target(cap) else {
         return Ok(false);
     };
-    let Some(target) = resource
-        .as_str()
-        .strip_prefix("urn:cid:")
-        .and_then(|cid| cid.parse::<Cid>().ok())
-    else {
-        return Ok(false);
-    };
-    let Some(target) = target_for_cid(db, Hash::from(target)).await? else {
+    let Some(target) = target_for_cid(db, target).await? else {
         return Ok(false);
     };
     Ok(abilities::Entity::find()
@@ -700,6 +728,56 @@ pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
                 .space()
                 .is_some_and(|space| did_principal_matches(space.did().as_str(), owner))
         }))
+}
+
+/// TC-3150: whether parentless `grant` is a delegator handing its own
+/// delegatee revocation of exactly what it delegated. It must carry exactly
+/// one capability, `tinycloud.delegation/revoke` on exactly `urn:cid:<D>`,
+/// with D already stored (so no grant can be issued ahead of D). Its issuer
+/// must be D's delegator and its audience D's delegatee, compared as
+/// principal DIDs. It must expire no later than D. Any other audience is
+/// refused, so a delegator can't hand revocation of its grants to a third
+/// party.
+pub(crate) async fn delegator_hands_back_revoke<C: ConnectionTrait>(
+    db: &C,
+    grant: &crate::util::DelegationInfo,
+) -> Result<bool, DbErr> {
+    let [cap] = grant.capabilities.as_slice() else {
+        return Ok(false);
+    };
+    let Some(target) = exact_cid_revoke_target(cap) else {
+        return Ok(false);
+    };
+    let Some(target) = target_for_cid(db, target).await? else {
+        return Ok(false);
+    };
+    let within_target_expiry = match target.expiry {
+        Some(target_expiry) => grant.expiry.is_some_and(|expiry| expiry <= target_expiry),
+        None => true,
+    };
+    Ok(within_target_expiry
+        && did_principal_matches(&target.delegator, &grant.delegator)
+        && did_principal_matches(&target.delegatee, &grant.delegate))
+}
+
+/// Whether a delegation in the chain `delegation` was issued under (its
+/// ancestors, not `delegation` itself) is revoked. A chain too long to walk
+/// counts as revoked.
+async fn issuing_chain_revoked<C: ConnectionTrait>(
+    db: &C,
+    delegation: &delegation::Model,
+) -> Result<bool, DbErr> {
+    let chain = match ancestor_chain_ids(db, &delegation.id).await {
+        Ok(chain) => chain,
+        Err(ChainTraversalError::Db(error)) => return Err(error),
+        Err(ChainTraversalError::LimitExceeded) => return Ok(true),
+    };
+    for node in chain {
+        if node != delegation.id && is_revoked(db, &node).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -726,9 +804,21 @@ pub enum RevocationError {
     MissingParents,
 }
 
+#[cfg(test)]
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     revocation: Revocation,
+) -> Result<Hash, Error> {
+    process_with(db, revocation, false).await
+}
+
+/// As [`process`]. With `signature_verified` the caller checked these exact
+/// signed bytes with [`check_signature`] before its transaction (TC-2986);
+/// only the time window is checked here.
+pub(crate) async fn process_with<C: ConnectionTrait>(
+    db: &C,
+    revocation: Revocation,
+    signature_verified: bool,
 ) -> Result<Hash, Error> {
     let (r, serialization) = (revocation.0, revocation.1);
 
@@ -738,32 +828,16 @@ pub(crate) async fn process<C: ConnectionTrait>(
     // revocations. The route accepts either suite so the Policy Engine
     // active_cutoff loop can rely on a single endpoint regardless of
     // whether the Grant Issuer signs with SIWE or did:key.
-    match &r.revocation {
-        TinyCloudRevocation::Cacao(c) => {
-            c.verify()
-                .await
-                .map_err(|_| RevocationError::InvalidSignature)?;
-            if !c.payload().valid_at(&t) {
-                return Err(RevocationError::InvalidTime.into());
-            };
-        }
-        TinyCloudRevocation::Ucan(u) => {
-            verify_ucan_signature(u)
-                .await
-                .map_err(|error| match error {
-                    UcanVerifyError::MethodDisabled { method } => {
-                        RevocationError::UnsupportedDidMethod(method)
-                    }
-                    UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
-                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
-                        RevocationError::InvalidSignature
-                    }
-                })?;
-            u.payload()
-                .validate_time(None)
-                .map_err(|_| RevocationError::InvalidTime)?;
-        }
+    if !signature_verified {
+        check_signature(&r.revocation).await?;
+    }
+    let in_window = match &r.revocation {
+        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
+        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
     };
+    if !in_window {
+        return Err(RevocationError::InvalidTime.into());
+    }
 
     let hash: Hash = hash(&serialization);
     let requested = Hash::from(r.revoked);
@@ -815,6 +889,32 @@ pub(crate) async fn process<C: ConnectionTrait>(
     Ok(hash)
 }
 
+/// Check a revocation's signature: CPU, or a DID resolution when network
+/// methods are on. Runs before any lock (TC-2986).
+pub(crate) async fn check_signature(revocation: &TinyCloudRevocation) -> Result<(), Error> {
+    match revocation {
+        TinyCloudRevocation::Cacao(c) => {
+            c.verify()
+                .await
+                .map_err(|_| RevocationError::InvalidSignature)?;
+        }
+        TinyCloudRevocation::Ucan(u) => {
+            verify_ucan_signature(u)
+                .await
+                .map_err(|error| match error {
+                    UcanVerifyError::MethodDisabled { method } => {
+                        RevocationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
+                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
+                        RevocationError::InvalidSignature
+                    }
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// W1 (audit P0 finding 5): authorize the revoker.
 ///
 /// Accepted paths:
@@ -844,14 +944,20 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     {
         ControlProofDecision::DirectSigner(principal) => principal,
         ControlProofDecision::Scoped(control) => {
-            if control.directly_authorizes_cid(requested, delegation) {
-                return Ok(true);
-            }
             let target_abilities = abilities::Entity::find()
                 .filter(abilities::Column::Delegation.eq(delegation.id))
                 .all(db)
                 .await?;
-            if control.authorizes_target(requested, delegation, &target_abilities) {
+            // TC-3150: a control that rests only on its grantor being the
+            // target's delegator carries that delegator's authority, which
+            // ends when the chain the target was issued under is revoked.
+            if control.authorizes_target(requested, delegation, &target_abilities)
+                && !(control.rests_only_on_party_authority(
+                    requested,
+                    delegation,
+                    &target_abilities,
+                ) && issuing_chain_revoked(db, delegation).await?)
+            {
                 return Ok(true);
             }
             // A proof that does not grant revoke leaves the signer's own

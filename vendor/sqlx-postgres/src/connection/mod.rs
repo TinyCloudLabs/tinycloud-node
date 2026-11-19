@@ -244,6 +244,11 @@ impl Connection for PgConnection {
     fn should_flush(&self) -> bool {
         !self.inner.stream.write_buffer().is_empty()
     }
+
+    #[doc(hidden)]
+    fn in_server_transaction_block(&self) -> bool {
+        !matches!(self.inner.transaction_status, TransactionStatus::Idle)
+    }
 }
 
 // Implement `AsMut<Self>` so that `PgConnection` can be wrapped in
