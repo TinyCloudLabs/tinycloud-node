@@ -4,6 +4,9 @@ use crate::{hash::Hash, resource_purge_fence::ResourceTarget};
 use std::collections::BTreeSet;
 use tinycloud_auth::ipld_core::cid::Cid;
 
+pub(crate) mod collector;
+pub use collector::collect_target_dependencies;
+
 pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const MAX_SNAPSHOT_IDENTITIES: usize = 4096;
 pub const MAX_SNAPSHOT_STRING_BYTES: usize = 4096;

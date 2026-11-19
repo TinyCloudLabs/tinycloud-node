@@ -64,9 +64,7 @@ mod space_purge_cache;
 pub mod space_purge_database;
 pub mod space_purge_fence;
 pub mod space_purge_ledger;
+pub mod space_purge_ledger_copy;
+pub mod space_purge_prefix_repair;
 pub mod space_purge_records;
 pub mod space_purge_worker;
-
-pub mod space_purge_ledger_copy;
-
-pub mod space_purge_prefix_repair;
