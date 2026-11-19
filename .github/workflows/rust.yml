@@ -26,6 +26,11 @@ env:
 # `cargo test` step was therefore always true. The intent — build the wasm
 # crates for wasm32-unknown-unknown — is now a real, unconditional step in the
 # `build` job.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   threshold:
     name: threshold (crate, policy, primitive checker)
@@ -98,7 +103,7 @@ jobs:
   test:
     name: test (workspace, PostgreSQL-backed, ${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -217,18 +222,22 @@ jobs:
     # checked in CI as well as through the excluded W5 wire-test crate.
     # A cold bundled DuckDB build took 11m52s before tests began in PR #473;
     # the prior 15m cap stopped it after 1,082 passing core tests, during integration tests.
+    # On 2026-11-19 (#650, runs 44524715442 and 44529183150) the cache missed: rust-cache
+    # falls back only within one environment hash, and main's DuckDB cache was saved on a
+    # runner image with a different one. The compile then took 15m09s-15m20s and the 20m cap
+    # stopped the tests after about 5m.
     - name: Run DuckDB-enabled core tests
       if: matrix.group == 'duckdb'
-      timeout-minutes: 20
+      timeout-minutes: 30
       run: cargo test -p tinycloud-core --features duckdb
 
     # The node feature graph rebuilds bundled DuckDB from cold: in PR #582 that
     # compile took about 14.5m, and the 15m cap stopped the step while its tests ran.
-    # The job's 60m cap covers this step after the 20m core step and setup.
+    # The job's 75m cap covers this step after the 30m core step and setup.
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 25
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test duckdb_read_only_admin
 
     # A hung PostgreSQL test holds row locks until its step is killed by the
     # timeout above. This dumps the sessions and what blocks them, so the
