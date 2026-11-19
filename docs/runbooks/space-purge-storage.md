@@ -81,3 +81,27 @@ A crash between steps leaves the record in place; the worker's next pass and thi
 **No rollback below this release.** An earlier release refuses an `erased` record when it verifies the ledger, so it does not start. Once any node has written one (check for objects under `_purge-ledger/owners-erased/`), fix forward only. The record is locked; it cannot be removed to allow a rollback.
 
 A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. Only `deletions.jsonl` is locked (the command waits up to 60 seconds for it, then fails); nothing else stops it running beside a serving node, so never run it while the node is serving.
+
+## 6. Ledger HMAC key: custody, rotation and loss
+
+**Production values (Amos, 11-19):**
+- `TINYCLOUD_PURGE_LEDGER_KEYS` comes from the production secret `PROD_TINYCLOUD_NODE_PURGE_LEDGER_KEYS`, sealed into the node's environment like the other `PROD_TINYCLOUD_NODE_*` secrets. JSON form only (section 4); key IDs are `plk-YYYYMMDD`.
+- `TINYCLOUD_HOST_ID=node-prod-1` is a plain, non-secret variable.
+- Amos generates the key, holds it, and sets the secret from a file. Agents never see it, and tests use fixture keys.
+- **Escrow:** a second copy goes in Sam's TinyCloud Secrets. It is set on Sam's card when S5 ships, before lifecycle is turned on.
+
+**Rotation:**
+1. Add the new key ID to `keys` and make it `active_key_id`.
+2. Keep every earlier ID in `keys` for as long as a record signed with it can still be in the ledger or the database copy: at least 365 days after the last record it signed.
+3. Update the escrow copy in the same change.
+
+**What a lost key means.** Every record is verified against the key its `key_id` names, and an ID missing from `keys` fails verification like a forged record. With lifecycle on, both node startup and `tinycloud node purge-ledger reconcile` stop at the first record that fails. So without the key, **the node does not start at all**: on any restart, not only after a restore.
+
+Neither of these gets around it:
+- **Turning lifecycle off:** startup refuses whenever the database or the ledger already holds lifecycle state.
+- **Removing the records:** they are under Object Lock COMPLIANCE for 365 days, so nobody can delete them, including the account root. After that they leave only if a lifecycle rule or an operator removes them, and the database copies stay until someone deletes them.
+
+**Recovery:**
+1. Restore the lost key from Sam's escrow into `PROD_TINYCLOUD_NODE_PURGE_LEDGER_KEYS` under its **original key ID**, alongside the current active key. Redeploy.
+2. Confirm that startup logs `purge ledger reconciled`. After a restore, run section 5 first.
+3. If the escrow copy is also gone, there is no supported path: the node stays down. Escalate to Sam. Any way forward, such as an operator-acknowledged retirement of that key ID, needs a design and a code change, and Sam decides it, because it means trusting records that can no longer be verified.
