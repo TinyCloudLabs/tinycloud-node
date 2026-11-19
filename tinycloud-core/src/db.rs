@@ -2065,14 +2065,16 @@ where
     ///
     /// An invocation only *reads* chain state: it evaluates the delegation
     /// chain and the revocation set to make an authorization decision. The
-    /// rows it writes (its own invocation record and the `parent_delegations`
-    /// edges pointing at the delegations it cited) are leaves hanging off the
-    /// graph — they never alter any delegation's ancestor closure, and nothing
-    /// traverses the graph downward from parent to child. So two invocations
-    /// on the same chain never had to exclude one another; only a writer of
-    /// chain state does. That mutual exclusion between invocations was the
-    /// dominant source of `chain_guard_wait` in production, because a single
-    /// busy account funnels all of its traffic through one root delegation.
+    /// rows it writes (its own invocation record, its invoked abilities and,
+    /// for a KV write, the `parent_delegations` edges pointing at the
+    /// delegations it cited; a read writes no edges since TC-3259) are leaves
+    /// hanging off the graph — they never alter any delegation's ancestor
+    /// closure, and nothing traverses the graph downward from parent to child.
+    /// So two invocations on the same chain never had to exclude one another;
+    /// only a writer of chain state does. That mutual exclusion between
+    /// invocations was the dominant source of `chain_guard_wait` in
+    /// production, because a single busy account funnels all of its traffic
+    /// through one root delegation.
     ///
     /// The security invariant is unchanged: a revocation takes these same
     /// guards EXCLUSIVE and holds them through commit, so it cannot commit
