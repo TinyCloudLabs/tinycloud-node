@@ -506,7 +506,7 @@ pub async fn list_my_spaces(
             let space: SpaceId = raw
                 .parse()
                 .map_err(|_| error(Status::BadRequest, "invalid_cursor"))?;
-            if space.did().as_str() != owner || space.to_string() != raw {
+            if space_owner(&space)? != owner || space.to_string() != raw {
                 return Err(error(Status::BadRequest, "invalid_cursor"));
             }
             Ok(raw)
@@ -871,6 +871,13 @@ fn request_space(raw: &str) -> Result<SpaceId, ApiError> {
     raw.parse()
         .map_err(|_| error(Status::BadRequest, "invalid_request"))
 }
+/// The canonical owner DID of a space. A space ID keeps whatever address
+/// casing its creator used; owner HMACs (purge jobs, retirements, management
+/// requests) are always taken over this form so they agree with
+/// `retire_owner`, which canonicalizes the proof's owner.
+fn space_owner(space: &SpaceId) -> Result<String, ApiError> {
+    canonicalize_did(space.did().as_str()).map_err(|_| error(Status::BadRequest, "invalid_request"))
+}
 impl LifecycleRuntime {
     fn space_hmacs(&self, space: &SpaceId) -> Result<Vec<Vec<u8>>, ApiError> {
         self.keys
@@ -889,7 +896,7 @@ impl LifecycleRuntime {
             .map_err(unavailable)?;
         let owner_hash = self
             .keys
-            .target_hmac(&job.hmac_key_id, "owner", space.did().as_str())
+            .target_hmac(&job.hmac_key_id, "owner", &space_owner(space)?)
             .map_err(unavailable)?;
         Ok(job.tombstone_hmac == space_hash
             && job.owner_hmac == owner_hash
@@ -945,7 +952,7 @@ pub async fn purge_space(
     }
     let recent = space_purge_job::Entity::find()
         .filter(
-            space_purge_job::Column::OwnerHmac.is_in(runtime.owner_hmacs(space.did().as_str())?),
+            space_purge_job::Column::OwnerHmac.is_in(runtime.owner_hmacs(&space_owner(&space)?)?),
         )
         .filter(space_purge_job::Column::AcceptedAt.gt(runtime.now() - time::Duration::minutes(1)))
         .count(&tx)
@@ -1012,7 +1019,7 @@ pub async fn purge_space(
         hmac_key_id: Set(record.key_id.clone()),
         owner_hmac: Set(runtime
             .keys
-            .target_hmac(&record.key_id, "owner", space.did().as_str())
+            .target_hmac(&record.key_id, "owner", &space_owner(&space)?)
             .map_err(unavailable)?),
         accepted_at: Set(
             OffsetDateTime::from_unix_timestamp(record.timestamp).map_err(unavailable)?
