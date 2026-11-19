@@ -500,32 +500,11 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 fn write_private_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let rendered = json::to_vec_pretty(value)?;
-    fs::write(path, rendered).with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_permissions(path)?;
-    Ok(())
+    crate::private_file::write_private_file_atomic(path, &rendered)
 }
 
 fn write_private_bytes_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_permissions(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to chmod {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::private_file::write_private_file_atomic(path, bytes)
 }
 
 fn derive_scrypt_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
