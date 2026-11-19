@@ -38,6 +38,7 @@ const REFUSED: &[&str] = &[
     "CREATE VIEW v AS SELECT * FROM t",
     "CREATE SCHEMA s",
     "CREATE SEQUENCE q",
+    "CREATE MACRO m(a) AS a + 1",
     "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
     // Stored bodies.
     "PREPARE p AS INSERT INTO t VALUES (1)",
@@ -70,9 +71,14 @@ const REFUSED: &[&str] = &[
     "SELECT 1; PRAGMA threads = 1",
     "BEGIN; INSERT INTO t VALUES (1); COMMIT",
     "EXPLAIN SELECT 1; PREPARE p AS DELETE FROM t",
+    // Transaction control changes the shared connection's state.
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "BEGIN; SELECT 1; COMMIT",
 ];
 
-/// Plain reads and transaction control stay allowed under `read_only`.
+/// Plain reads stay allowed under `read_only`.
 const ALLOWED: &[&str] = &[
     "SELECT 1",
     "SELECT * FROM t",
@@ -80,9 +86,6 @@ const ALLOWED: &[&str] = &[
     "SELECT 1; SELECT 2",
     "EXPLAIN SELECT * FROM t",
     "EXPLAIN ANALYZE SELECT * FROM t",
-    "BEGIN",
-    "COMMIT",
-    "ROLLBACK",
 ];
 
 #[test]

@@ -28,10 +28,8 @@ pub struct ParsedQuery {
 impl ParsedQuery {
     /// Whether the statements are plain reads: queries, `EXPLAIN TABLE`, and
     /// `EXPLAIN` without `ANALYZE`, none of which writes. Anything else,
-    /// including statements that run a stored body or change settings, is
-    /// not. Transactions are not either: `is_read_only` lets a read tier
-    /// open one, but a caller deciding whether a request can write should
-    /// treat it like any non-read statement.
+    /// including transaction control and statements that run a stored body
+    /// or change settings, is not.
     pub fn is_plain_read(&self) -> bool {
         self.is_read_only
             && self.statements.iter().all(|statement| {
@@ -665,12 +663,10 @@ fn classify_statement(
             *is_ddl = true;
             extract_tables_from_statement(stmt, tables);
         }
-        // Plans and transactions don't write, and a read tier may use them.
-        Statement::ExplainTable { .. }
-        | Statement::StartTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. } => {}
-        // Everything else is not known to be a read: `SET`, and the admin
+        // A plan of a table doesn't write.
+        Statement::ExplainTable { .. } => {}
+        // Everything else is not known to be a read: `SET`, transaction
+        // control (it changes the shared connection's state), and the admin
         // tier's statements that run a stored body, change data or settings,
         // or touch files (`PREPARE`, `EXECUTE`, `CALL`, `COPY`, `ATTACH`,
         // `CREATE SCHEMA`, ...). A statement the parser learns later is
@@ -1168,11 +1164,18 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // test-ruling: TC-3035 transaction control now counts as a write, so the
+    // read tier (and any `read_only` request) can no longer open or end a
+    // transaction on the shared connection; the write tier keeps it.
     #[test]
     fn test_transaction_statements() {
-        assert!(validate_sql("BEGIN", &None, "tinycloud.duckdb/read").is_ok());
-        assert!(validate_sql("COMMIT", &None, "tinycloud.duckdb/read").is_ok());
-        assert!(validate_sql("ROLLBACK", &None, "tinycloud.duckdb/read").is_ok());
+        for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
+            assert!(matches!(
+                validate_sql(sql, &None, "tinycloud.duckdb/read"),
+                Err(DuckDbError::ReadOnlyViolation)
+            ));
+            assert!(validate_sql(sql, &None, "tinycloud.duckdb/write").is_ok());
+        }
     }
 
     #[test]
@@ -1371,8 +1374,6 @@ mod tests {
             "WITH c AS (SELECT 1) SELECT * FROM c",
             "EXPLAIN SELECT * FROM t",
             "EXPLAIN ANALYZE SELECT * FROM t",
-            "BEGIN",
-            "COMMIT",
         ] {
             let parsed = validate_sql(sql, &read_only_caveat(), ADMIN)
                 .unwrap_or_else(|error| panic!("{sql}: {error}"));
