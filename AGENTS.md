@@ -1,0 +1,335 @@
+# TinyCloud Protocol Development Guidelines
+
+## Project Overview
+
+TinyCloud is a decentralized, user-controlled cloud framework enabling data sovereignty and privacy-preserving storage. Users retain full control over their data with fine-grained access permissions through capability-based security.
+
+**Core Concepts:**
+- **Orbits**: User-owned data storage spaces that can be self-hosted or managed
+- **Capabilities**: UCAN/CACAO-based tokens defining who can access data and how
+- **DIDs**: Decentralized Identifiers for authentication without centralized authority
+
+## Build Commands
+
+```bash
+# Build
+cargo build                              # Debug build
+cargo build --release                    # Production build
+
+# Run
+cargo run                                # Run locally (default port 8000)
+
+# Test
+cargo test                               # Run all tests
+cargo test module_name                   # Test specific module
+cargo test test_name -- --nocapture      # Single test with output
+
+# Load Testing
+k6 run --vus 10 --duration 30s test/load/k6/json_put.js
+```
+
+## Linting & Formatting
+
+```bash
+cargo clippy -- -D warnings              # Lint with warnings as errors
+cargo fmt                                # Format code
+cargo fmt -- --check                     # Check formatting without modifying
+```
+
+**Always run before committing:**
+```bash
+cargo fmt && cargo clippy -- -D warnings && cargo test
+```
+
+## Project Structure
+
+```
+tinycloud-node/
+├── tinycloud-node-server/        # Main HTTP server binary (Rocket-based)
+│   └── src/
+│       ├── main.rs               # Server bootstrap, Prometheus metrics
+│       ├── lib.rs                # Application setup, route mounting
+│       ├── routes/               # API endpoint handlers
+│       │   └── mod.rs            # /invoke, /delegate, /peer/generate, /healthz
+│       ├── auth_guards.rs        # Request guards for authorization headers
+│       ├── authorization.rs      # Auth header parsing and verification
+│       ├── config.rs             # Configuration structures
+│       ├── prometheus.rs         # Metrics exposition
+│       ├── tracing.rs            # Distributed tracing setup
+│       └── storage/              # Storage backend implementations
+│
+├── tinycloud-core/               # Core database layer (OrbitDatabase)
+│   └── src/
+│       ├── db.rs                 # Main database abstraction
+│       ├── events/               # Event types (Delegation, Invocation, Revocation)
+│       ├── models/               # Database entity definitions
+│       ├── storage/              # Storage trait definitions and implementations
+│       ├── types/                # Ability, Resource, Caveats, Metadata
+│       ├── migrations/           # Database schema migrations
+│       ├── hash.rs               # Content hashing (Blake2b, Blake3)
+│       ├── keys.rs               # Cryptographic key management
+│       └── manifest.rs           # Orbit manifest handling
+│
+├── tinycloud-auth/               # Shared authorization library
+│   └── src/
+│       ├── authorization.rs      # TinyCloudDelegation, Invocation, Revocation
+│       ├── resource.rs           # TinyCloud resource URIs and paths
+│       └── resolver.rs           # DID resolution
+│
+├── tinycloud-sdk-rs/             # Rust SDK for client applications
+├── tinycloud-sdk-wasm/           # WebAssembly SDK bindings for browsers
+│
+├── dependencies/
+│   ├── siwe/                     # EIP-4361 Sign-In with Ethereum
+│   ├── siwe-recap/               # EIP-5573 SIWE ReCap capability delegation
+│   └── cacao/                    # CAIP-74 Chain-Agnostic Object Capability
+│
+├── test/load/                    # Load testing infrastructure
+│   ├── k6/                       # k6 test scripts
+│   └── signer/                   # Signing utility for test capabilities
+│
+└── .github/workflows/            # CI/CD pipelines
+```
+
+## API Endpoints
+
+| Method | Endpoint | Description | Auth Required |
+|--------|----------|-------------|---------------|
+| `POST` | `/invoke` | Execute KV operations (list, get, put, delete, metadata) | Yes |
+| `POST` | `/delegate` | Create capability delegations | Yes |
+| `GET` | `/peer/generate/<orbit>` | Generate orbit host key pair | No |
+| `GET` | `/healthz` | Health check | No |
+| `OPTIONS` | `/*` | CORS preflight | No |
+
+**Authorization Header Format:**
+```
+Authorization: <base64url-encoded-UCAN-or-CACAO>
+```
+
+**KV Capabilities:**
+- `kv/list` - List keys in an orbit
+- `kv/get` - Read a value
+- `kv/put` - Write a value
+- `kv/delete` - Remove a value
+- `kv/metadata` - Get value metadata
+- `kv/sync` - Ordered change feed (key, ETag, deleted, metadata) under a prefix; must be the invocation's only capability and is never implied by `*` or defaults (see `docs/kv-sync.md`)
+- `kv/retain` - Never invoked; a grant carrying it, named in `x-tinycloud-retention-grant` on a `kv/sync` request, makes the node attest `authority.retainUntil`
+
+## Authentication Architecture
+
+TinyCloud uses a three-layer capability-based authentication:
+
+1. **UCAN (User-Controlled Authorization Network)**: JWT-like tokens encoding capabilities with delegation chains
+2. **CACAO (Chain-Agnostic Capability Object)**: IPLD-encoded capabilities with SIWE signatures
+3. **SIWE (Sign-In with Ethereum)**: EIP-4361 signature verification for Ethereum wallets
+
+**Request Flow:**
+```
+Request → Authorization Header → Parse (UCAN/CACAO) → Verify Signature →
+Validate Capability → Check Resource Permission → Execute Operation
+```
+
+## Configuration
+
+### Configuration File (`tinycloud.toml`)
+
+```toml
+[global]
+log_level = "normal"              # Default log verbosity: off, critical, normal, debug (NOT trace/info/warn/error)
+port = 8000                       # HTTP server port
+cors = true                       # Enable CORS headers
+
+[global.storage]
+datadir = "./data"                # Root for all local data paths
+staging = "FileSystem"            # Staging mode: Memory or FileSystem
+limit = "10 MiB"                  # Optional storage quota per space
+# database = "sqlite:./data/caps.db"  # Override: defaults to {datadir}/caps.db
+
+[global.storage.blocks]
+type = "Local"                    # Block storage: Local or S3
+# path = "./data/blocks"          # Override: defaults to {datadir}/blocks
+
+[global.keys]
+type = "Static"                   # Key derivation type
+secret = "<base64url-32+bytes>"   # Secret for key derivation
+
+[global.spaces]
+# allowlist = "http://localhost:10000"  # Optional space allowlist service
+```
+
+### Environment Variables
+
+All use the `TINYCLOUD_` prefix:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `TINYCLOUD_LOG_LEVEL` | Default log verbosity: `off`, `critical` (warnings and errors), `normal` (info) or `debug`. Used when `RUST_LOG` is unset. | `normal` |
+| `RUST_LOG` | Overrides the verbosity with a `tracing` `EnvFilter`. | `debug`, `tinycloud=debug` |
+| `TINYCLOUD_PORT` | Server port | `8000` |
+| `TINYCLOUD_STORAGE_DATADIR` | Root data directory | `./data` |
+| `TINYCLOUD_STORAGE_DATABASE` | Database URL (override) | `sqlite:./data/caps.db` |
+| `TINYCLOUD_STORAGE_BLOCKS_TYPE` | Block storage backend | `Local`, `S3` |
+| `TINYCLOUD_STORAGE_BLOCKS_PATH` | Local block path (override) | `./data/blocks` |
+| `TINYCLOUD_STORAGE_BLOCKS_BUCKET` | S3 bucket name | `my-bucket` |
+| `TINYCLOUD_STORAGE_BLOCKS_ENDPOINT` | S3 endpoint | `https://s3.amazonaws.com` |
+| `TINYCLOUD_STORAGE_LIMIT` | Storage quota | `10 MiB` |
+| `TINYCLOUD_KEYS_SECRET` | Key derivation secret | Base64URL string |
+| `TINYCLOUD_SPACES_ALLOWLIST` | Allowlist endpoint | `http://localhost:10000` |
+| `TINYCLOUD_STORAGE__SQL__SYNCHRONOUS` | SQL `PRAGMA synchronous` for file-backed databases: `full` (default) or `normal` (rollback flag) | `full` |
+| `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` | Per-database SQL size cap; `0` (default) = off. Sam's decision (card `sql-storage-report-read`) | `1 GiB` |
+| `TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES` | Disk kept free after in-flight SQL writes; `0` (default) = check off. Sam's decision (card `sql-storage-report-read`) | `512 MiB` |
+| `ROCKET_MAX_BLOCKING` | Rocket's blocking-thread-pool cap (default 512). `ROCKET_`-prefixed, not `TINYCLOUD_`, because Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded — `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting. | `1024` |
+
+### Database Support
+
+- **SQLite**: `sqlite:./path/to/db.db?mode=rwc`
+- **PostgreSQL**: `postgres://user:pass@host:port/dbname`
+- **MySQL**: `mysql://user:pass@host:port/dbname`
+
+## Code Style Guidelines
+
+### Naming Conventions
+- `snake_case` for functions, variables, and module names
+- `CamelCase` for types, traits, and enums
+- `SCREAMING_SNAKE_CASE` for constants
+
+### Error Handling
+- Prefer `Result<T, E>` and `Option<T>` over `unwrap()`/`expect()` in production code
+- Use `?` operator for error propagation
+- Define domain-specific error types with `thiserror`
+
+### Import Organization
+```rust
+// 1. Standard library
+use std::collections::HashMap;
+
+// 2. External crates
+use rocket::serde::json::Json;
+use serde::{Deserialize, Serialize};
+
+// 3. Local modules
+use crate::config::Config;
+use crate::storage::Storage;
+```
+
+### Documentation
+- Document all public interfaces with rustdoc comments (`///`)
+- Include examples in doc comments for complex functions
+- Use `#[doc(hidden)]` for internal APIs that shouldn't be in docs
+
+### Security
+- Validate inputs at API boundaries
+- Never log sensitive data (keys, tokens, credentials)
+- Use constant-time comparison for cryptographic values
+
+## Key Dependencies
+
+| Category | Crate | Purpose |
+|----------|-------|---------|
+| Web Framework | `rocket` | HTTP server, JSON handling |
+| Database | `sea-orm` | Async ORM with migrations |
+| Crypto | `k256` | ECDSA secp256k1 (Ethereum) |
+| Serialization | `serde`, `serde_json` | Data serialization |
+| IPLD | `serde_ipld_dagcbor`, `ipld-core` | Content-addressed data |
+| Async | `tokio` | Async runtime |
+| Cloud | `aws-sdk-s3` | S3 storage backend |
+| P2P | `libp2p` | Peer-to-peer networking |
+| Observability | `tracing`, `prometheus` | Logging and metrics |
+
+## Testing
+
+### Test Structure
+- **Unit tests**: Inline in source files (`#[cfg(test)]` modules)
+- **Integration tests**: `test/` directory
+- **Load tests**: `test/load/k6/` with k6 scripts
+
+### Load Testing
+
+```bash
+# Start the signer service (generates test capabilities)
+cd test/load/signer && cargo run
+
+# Run k6 tests
+k6 run --vus 10 --duration 30s test/load/k6/json_put.js
+k6 run --vus 10 --duration 30s test/load/k6/json_get.js
+k6 run --vus 5 --duration 60s test/load/k6/many_orbits.js
+```
+
+### CI/CD Workflows
+
+1. **rust.yml**: Runs on push/PR to main
+   - Builds all workspace crates
+   - Runs tests (excludes WASM)
+   - Runs clippy and fmt checks
+
+2. **docker.yml**: Docker image builds
+   - Builds on all branches
+   - Publishes to `ghcr.io` on main/tags
+
+## Local Development Setup
+
+```bash
+# 1. Initialize data directory (or let the init script do it)
+./scripts/init-tinycloud-data.sh
+
+# 2. Build and run (tinycloud.toml has sensible defaults)
+cargo build
+cargo run
+```
+
+## Docker Deployment
+
+```bash
+# Build image
+docker build -t tinycloud:latest .
+
+# Run container
+docker run -d \
+  -p 8000:8000 \
+  -p 8001:8001 \
+  -v $(pwd)/tinycloud:/app/tinycloud \
+  -e TINYCLOUD_STORAGE_DATABASE="sqlite:./data/caps.db" \
+  tinycloud:latest
+```
+
+**Exposed Ports:**
+- `8000`: HTTP API
+- `8001`: Prometheus metrics
+- `8081`: Relay (P2P)
+
+## Troubleshooting
+
+### Common Issues
+
+**Database connection errors:**
+- Ensure the SQLite file exists: `touch data/caps.db`
+- Check database URL format includes `?mode=rwc` for SQLite
+
+**Block storage errors:**
+- Ensure blocks directory exists: `mkdir -p data/blocks`
+- Check file permissions
+
+**Authorization failures:**
+- Verify UCAN/CACAO token format
+- Check token expiration timestamps
+- Ensure DID in capability matches request issuer
+
+### Debug Logging
+
+Log verbosity comes from `TINYCLOUD_LOG_LEVEL` (`normal` = info), or from
+`RUST_LOG` (a `tracing` `EnvFilter`) when that is set. Production logs are
+public: never log request URIs, credentials, space IDs, DIDs or keys
+(TC-961). One exception: the node's own DID is public (it is served
+unauthenticated at `/.well-known/tinycloud/node-keys`), and the node logs it
+once, with the identity's storage location, when it first creates a new
+identity (`created a new node identity at <location> (did:key:z6Mk…)`). No
+other DID, and never any key material, may be logged. Rocket's own
+per-request logging is filtered out at every level, and `tinycloud::request`
+logs each request by route template.
+Set it for verbose output:
+```bash
+RUST_LOG=debug cargo run
+```
+## Agent clients
+
+No Claude bias in what we build: products must not assume one AI vendor. The CLI, skills, guides and SDKs work the same in every agent client (Claude Code, Codex, Gemini CLI, Cursor and others). Install skills, configs and instructions where each client expects them, following its conventions, never only under Claude paths such as `~/.claude`. Test with more than one client.
