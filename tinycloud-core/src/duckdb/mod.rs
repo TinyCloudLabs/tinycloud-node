@@ -1,6 +1,7 @@
 pub mod caveats;
 pub mod database;
 pub mod describe;
+pub mod disk;
 pub mod parser;
 pub mod service;
 pub mod storage;

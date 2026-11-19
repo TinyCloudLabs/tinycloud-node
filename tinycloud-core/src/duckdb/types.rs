@@ -470,6 +470,8 @@ pub enum DuckDbError {
     /// not loaded.
     #[error("sql_database_size_limit: the database is larger than this node loads; no change was applied")]
     DatabaseTooLargeToLoad,
+    #[error("duckdb_disk_headroom: The node is short of disk space for this write")]
+    DiskHeadroom,
     #[error("Database artifact replacement is temporarily unavailable")]
     Unavailable,
     #[error("Invalid statement: {0}")]
