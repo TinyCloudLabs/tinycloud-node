@@ -49,6 +49,7 @@ pub mod m20261113_000000_database_artifact_external;
 pub mod m20261113_010000_artifact_chunks;
 pub mod m20261117_000000_hook_subscription_headers;
 
+pub mod m20261109_000000_hook_delivery_lease;
 pub mod m20261117_000000_renewal_switch;
 
 pub struct Migrator;
@@ -105,6 +106,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261113_000000_purge_ledger_repair::Migration),
             Box::new(m20261113_010000_resource_review_consumption::Migration),
             Box::new(m20261113_020000_resource_retirement_snapshot::Migration),
+            Box::new(m20261109_000000_hook_delivery_lease::Migration),
         ]
     }
 }
