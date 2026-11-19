@@ -667,6 +667,8 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
         DatabaseArtifactError::WriteLimitExceeded { .. } => DuckDbError::DatabaseSizeLimit,
         DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
         DatabaseArtifactError::StorageLimit => DuckDbError::StorageWouldGrow,
+        DatabaseArtifactError::SpaceDeleted => DuckDbError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => DuckDbError::LifecycleUnavailable,
         err => DuckDbError::Internal(err.to_string()),
     }
 }
@@ -1410,3 +1412,5 @@ mod tests {
         }
     }
 }
+
+mod space_purge;

@@ -284,6 +284,8 @@ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='uploading'
         }
         // One metadata-only statement is the acknowledgement boundary. Parts
         // are already durable and sealed; no transaction spans the transfer.
+        // With a purge fence, only this statement and the fence's live lock
+        // share a transaction (TC-2871).
         let sql = if let Some(previous) = current {
             values.extend([
                 previous.revision.into(),
@@ -311,15 +313,11 @@ INSERT INTO database_artifact(service,space,name,checkpoint_part_id,revision,con
 SELECT $1,$2,$3,$4,$5,$6,$6,$7,$7,''::bytea,'storage.database','checkpoint-parts-v1',$8,$8,0,1
 FROM ready ON CONFLICT DO NOTHING"#
         };
-        if self
-            .conn
-            .execute(statement(sql, values))
-            .await?
-            .rows_affected()
-            != 1
-        {
+        let scope = self.write_scope(space).await?;
+        if scope.execute(statement(sql, values)).await?.rows_affected() != 1 {
             return Err(DatabaseArtifactError::StaleLineage);
         }
+        scope.commit().await?;
         cleanup.armed = false;
         // Reclamation is outside the publish statement. If this pass cannot
         // finish, the periodic collector keeps the bytes charged until freed.

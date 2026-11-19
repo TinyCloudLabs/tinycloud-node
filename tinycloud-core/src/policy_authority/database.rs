@@ -43,11 +43,22 @@ impl DatabaseAuthorityStore {
         artifact: VerifiedDelegation,
         status: AuthorityStatus,
     ) -> Result<(), AuthorityError> {
-        policy_delegation::Entity::insert(artifact_model(&artifact, &status)?)
-            .exec(&self.db)
+        let transaction = self
+            .db
+            .begin()
             .await
             .map_err(|_| AuthorityError::TransactionFailed)?;
-        Ok(())
+        crate::space_purge_records::operation(&transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        policy_delegation::Entity::insert(artifact_model(&artifact, &status)?)
+            .exec(&transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)
     }
 
     /// Admit one cryptographically verified parent on the caller's
@@ -60,6 +71,9 @@ impl DatabaseAuthorityStore {
         observation: &AuthorityStatusObservation,
         now: OffsetDateTime,
     ) -> Result<(), AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         let cid = artifact.0.delegation_cid.clone();
         if let Some(row) = policy_delegation::Entity::find_by_id(cid.clone())
             .one(transaction)
@@ -116,6 +130,9 @@ impl DatabaseAuthorityStore {
         transaction: &DatabaseTransaction,
         challenge: ChallengeState,
     ) -> Result<(), AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         validate_challenge_lifetime(&challenge)?;
         let stored = StoredChallenge::try_from(&challenge)?;
         policy_challenge::ActiveModel {
@@ -194,6 +211,9 @@ impl DatabaseAuthorityStore {
         status: &AuthorityStatus,
         #[cfg_attr(not(test), allow(unused_variables))] attempt: usize,
     ) -> Result<Result<u64, sea_orm::DbErr>, AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         let row = delegation_row(transaction, cid, true).await?;
         let previous = status_from_model(&row)?;
         validate_status_transition(&previous, status)?;
@@ -233,6 +253,11 @@ impl DatabaseAuthorityStore {
             Some(revoked_at) => update.filter(policy_delegation::Column::RevokedAt.eq(revoked_at)),
             None => update.filter(policy_delegation::Column::RevokedAt.is_null()),
         };
+        if status.revoked_at.is_some() {
+            crate::space_purge_records::request_all(transaction)
+                .await
+                .map_err(|_| AuthorityError::TransactionFailed)?;
+        }
         Ok(update
             .exec(transaction)
             .await
@@ -249,6 +274,9 @@ impl DatabaseAuthorityStore {
         observation: &AuthorityStatusObservation,
         now: OffsetDateTime,
     ) -> Result<(), AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         if observation.checked_at > now
             || observation.fresh_until <= now
             || now - observation.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
@@ -297,6 +325,11 @@ impl DatabaseAuthorityStore {
             .map_err(|_| AuthorityError::TransactionFailed)?;
         if updated.rows_affected != 1 {
             return Err(AuthorityError::AuthorityStateUnavailable);
+        }
+        if next.revoked_at.is_some() {
+            crate::space_purge_records::request_all(transaction)
+                .await
+                .map_err(|_| AuthorityError::TransactionFailed)?;
         }
         Ok(())
     }
@@ -521,6 +554,9 @@ impl DatabaseAuthorityStore {
         challenge_id: String,
         consumed_at: OffsetDateTime,
     ) -> Result<(), AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         let mut authority_cids = artifact.0.proof_cids.clone();
         authority_cids.sort();
         authority_cids.dedup();
@@ -602,6 +638,9 @@ impl DatabaseAuthorityStore {
         let transaction = self
             .db
             .begin_with_config(policy_isolation_level(&self.db), None)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        crate::space_purge_records::operation(&transaction)
             .await
             .map_err(|_| AuthorityError::TransactionFailed)?;
         let operation = async {
@@ -687,6 +726,9 @@ impl DatabaseAuthorityKernel {
         decision: &TrustedPolicyDecision,
         bindings: &IssuanceBindings,
     ) -> Result<(), AuthorityError> {
+        crate::space_purge_records::operation(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
         validate_authority_pair(
             &policy_authority.0,
             &policy_enforcement.0,

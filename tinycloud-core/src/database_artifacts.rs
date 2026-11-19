@@ -105,6 +105,10 @@ pub struct DeltaSave {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseArtifactError {
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("database artifact storage error: {0}")]
     Db(DbErr),
     #[error("artifact storage limit reached")]
@@ -754,6 +758,7 @@ struct CurrentArtifact {
 
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
+    purge_fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
     conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// The largest payload a save sends; 0 = no limit (local tests only).
@@ -779,6 +784,7 @@ pub struct SeaOrmDatabaseArtifactRepository {
 impl SeaOrmDatabaseArtifactRepository {
     pub fn new(conn: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
         Self {
+            purge_fence: None,
             conn: conn.into(),
             sqlite_writer_lock: None,
             max_write_bytes: DEFAULT_MAX_ARTIFACT_WRITE_BYTES,
@@ -800,6 +806,46 @@ impl SeaOrmDatabaseArtifactRepository {
     pub fn with_chunk_limits(mut self, limits: Option<chunks::ChunkLimits>) -> Self {
         self.chunk_limits = limits;
         self
+    }
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
+    ) -> Self {
+        self.purge_fence = fence;
+        self
+    }
+    async fn check_space_read(&self, space: &str) -> Result<(), DatabaseArtifactError> {
+        if let Some(fence) = &self.purge_fence {
+            let space = space
+                .parse()
+                .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+            fence
+                .check(&self.conn, &space)
+                .await
+                .map_err(artifact_fence_error)?;
+        }
+        Ok(())
+    }
+    /// Where a metadata write runs. With a purge fence, the write and the
+    /// fence's live lock share one transaction, so a purge cannot fence and
+    /// delete the space between them (TC-2871). Open it immediately before
+    /// the write statement and commit right after: no read and no chunk
+    /// upload runs inside it (TC-2961). Without a fence the write stays one
+    /// autocommit statement on the pool.
+    async fn write_scope(&self, space: &str) -> Result<FencedWrite, DatabaseArtifactError> {
+        use sea_orm::TransactionTrait;
+        let Some(fence) = &self.purge_fence else {
+            return Ok(FencedWrite::Pool(self.conn.clone()));
+        };
+        let space = space
+            .parse()
+            .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+        let tx = self.conn.begin().await?;
+        fence
+            .lock_live(&tx, &space)
+            .await
+            .map_err(artifact_fence_error)?;
+        Ok(FencedWrite::Transaction(tx))
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -867,6 +913,87 @@ impl SeaOrmDatabaseArtifactRepository {
             if let Some(barrier) = &self.race_barrier {
                 barrier.wait().await;
             }
+        }
+    }
+}
+
+fn artifact_fence_error(error: crate::space_purge_fence::FenceError) -> DatabaseArtifactError {
+    match error {
+        crate::space_purge_fence::FenceError::Deleted => DatabaseArtifactError::SpaceDeleted,
+        crate::space_purge_fence::FenceError::Unavailable => {
+            DatabaseArtifactError::LifecycleUnavailable
+        }
+        crate::space_purge_fence::FenceError::Database(error) => DatabaseArtifactError::Db(error),
+    }
+}
+
+/// A [`SeaOrmDatabaseArtifactRepository::write_scope`]: the pool, or the
+/// short transaction that holds the purge fence's live lock.
+enum FencedWrite {
+    Pool(crate::db_pool::RecoveringConnection),
+    Transaction(sea_orm::DatabaseTransaction),
+}
+
+impl FencedWrite {
+    async fn commit(self) -> Result<(), DbErr> {
+        match self {
+            Self::Pool(_) => Ok(()),
+            Self::Transaction(transaction) => transaction.commit().await,
+        }
+    }
+}
+
+#[async_trait]
+impl sea_orm::ConnectionTrait for FencedWrite {
+    fn get_database_backend(&self) -> sea_orm::DatabaseBackend {
+        match self {
+            Self::Pool(conn) => conn.get_database_backend(),
+            Self::Transaction(transaction) => transaction.get_database_backend(),
+        }
+    }
+
+    async fn execute(&self, stmt: sea_orm::Statement) -> Result<sea_orm::ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute(stmt).await,
+            Self::Transaction(transaction) => transaction.execute(stmt).await,
+        }
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<sea_orm::ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute_unprepared(sql).await,
+            Self::Transaction(transaction) => transaction.execute_unprepared(sql).await,
+        }
+    }
+
+    async fn query_one(
+        &self,
+        stmt: sea_orm::Statement,
+    ) -> Result<Option<sea_orm::QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_one(stmt).await,
+            Self::Transaction(transaction) => transaction.query_one(stmt).await,
+        }
+    }
+
+    async fn query_all(&self, stmt: sea_orm::Statement) -> Result<Vec<sea_orm::QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_all(stmt).await,
+            Self::Transaction(transaction) => transaction.query_all(stmt).await,
+        }
+    }
+
+    fn support_returning(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.support_returning(),
+            Self::Transaction(transaction) => transaction.support_returning(),
+        }
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.is_mock_connection(),
+            Self::Transaction(transaction) => transaction.is_mock_connection(),
         }
     }
 }
@@ -967,6 +1094,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         name: &str,
     ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
         use database_artifact::Column;
+        self.check_space_read(space).await?;
         let row = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
@@ -1042,6 +1170,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
+        self.check_space_read(space).await?;
         // Parts stream in bounded statements: the whole-artifact read cap and
         // the large-transfer permit below are for the single-row layout.
         if self
@@ -1216,6 +1345,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // revision before either commits, exercising the CAS conflict path.
         #[cfg(test)]
         self.wait_at_race_barrier().await;
+        let scope = self.write_scope(space).await?;
 
         match existing.as_ref() {
             Some(existing) => {
@@ -1282,7 +1412,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::CheckpointContentHash
                             .eq(existing.checkpoint_content_hash.clone()),
                     )
-                    .exec(&self.conn)
+                    .exec(&scope)
                     .await?;
                 if update.rows_affected != 1 {
                     return Err(DatabaseArtifactError::Backend(
@@ -1309,7 +1439,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
                 }
-                .insert(&self.conn)
+                .insert(&scope)
                 .await
                 .map_err(|error| {
                     // For this table the composite primary key is the only unique
@@ -1325,6 +1455,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 })?;
             }
         }
+        scope.commit().await?;
 
         Ok(DatabaseArtifact {
             payload,
@@ -1390,6 +1521,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
+        let scope = self.write_scope(space).await?;
 
         let update = database_artifact::Entity::update_many()
             .col_expr(database_artifact::Column::Revision, Expr::value(revision))
@@ -1423,7 +1555,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .filter(database_artifact::Column::Name.eq(name))
             .filter(database_artifact::Column::Revision.eq(existing.0))
             .filter(database_artifact::Column::CheckpointContentHash.eq(existing.2.clone()))
-            .exec(&self.conn)
+            .exec(&scope)
             .await?;
         if update.rows_affected != 1 {
             return Err(DatabaseArtifactError::Backend(
@@ -1431,6 +1563,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             ));
         }
 
+        scope.commit().await?;
         Ok(DeltaSave {
             revision,
             size_bytes,

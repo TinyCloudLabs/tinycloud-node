@@ -147,8 +147,14 @@ mod tests {
     async fn applies_on_fresh_sqlite_is_idempotent_and_reapplies_after_down() {
         let db = fresh_db().await;
         Migrator::up(&db, None).await.expect("second up is a no-op");
-        Migrator::down(&db, Some(1)).await.expect("down");
-        Migrator::up(&db, None).await.expect("up after down");
+        Migration
+            .down(&SchemaManager::new(&db))
+            .await
+            .expect("down");
+        Migration
+            .up(&SchemaManager::new(&db))
+            .await
+            .expect("up after down");
         key_row("net", "docs/app-one/key")
             .insert(&db)
             .await

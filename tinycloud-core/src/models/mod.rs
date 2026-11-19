@@ -45,5 +45,23 @@ pub mod share_policy_presentation_jti;
 pub mod share_session_handle;
 pub mod signed_kv_ticket;
 pub mod space;
+pub mod space_purge_fence;
+pub mod space_purge_job;
+pub mod space_purge_nonce;
+pub mod space_purge_request;
+pub mod space_purge_tombstone;
+pub mod space_retirement;
 pub mod sql_store_manifest;
 pub mod sql_store_object;
+
+pub mod space_purge_shared_residue;
+
+pub mod resource_purge_job;
+pub mod resource_purge_tombstone;
+
+pub mod space_purge_ledger_copy;
+pub mod space_purge_prefix_repair;
+
+pub mod resource_review_consumption;
+
+pub mod resource_retirement_snapshot;
