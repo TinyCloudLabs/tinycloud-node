@@ -56,6 +56,98 @@ enum HydrationOutcome {
     TooLarge,
 }
 
+use crate::database_artifacts::{ArtifactSink, DatabaseArtifact, DeltaSave};
+use crate::db_retry::{retry_owner, Replay, RetryPolicy};
+use async_trait::async_trait;
+
+/// The artifact repository with its metadata read run by the retry owner
+/// ([`retry_owner`]): one cancel-safe database read that writes nothing and
+/// spawns nothing. The payload reads and the saves are not retried here: a
+/// payload read streams into the staging sink and a save writes.
+struct MetaRetry<'a> {
+    inner: &'a dyn DatabaseArtifactRepository,
+    policy: Option<RetryPolicy>,
+}
+
+#[async_trait]
+impl DatabaseArtifactRepository for MetaRetry<'_> {
+    async fn load_meta(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+    ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+        retry_owner(
+            "sql_hydration_meta",
+            self.policy.clone(),
+            Replay::Never,
+            || self.inner.load_meta(service, space, name),
+            |error: &DatabaseArtifactError| match error {
+                DatabaseArtifactError::Db(error) => Some(error),
+                _ => None,
+            },
+        )
+        .await
+        .0
+    }
+
+    async fn read_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        self.inner
+            .read_chunks(service, space, name, meta, sink)
+            .await
+    }
+
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.inner.chunked_checkpoints(service, space, name)
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.inner
+            .save_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
+    async fn save(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        payload: Vec<u8>,
+        expected: ArtifactExpectation,
+    ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+        self.inner
+            .save(service, space, name, payload, expected)
+            .await
+    }
+
+    async fn save_delta(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        payload: Vec<u8>,
+        expected: ArtifactExpectation,
+    ) -> Result<DeltaSave, DatabaseArtifactError> {
+        self.inner
+            .save_delta(service, space, name, payload, expected)
+            .await
+    }
+}
+
 const PHASE_LOADING: u8 = 0;
 const PHASE_WRITING: u8 = 1;
 
@@ -189,6 +281,7 @@ pub struct SqlService {
     bounds: SqlWaitBounds,
     durability: DurabilityPolicy,
     ddl_policy: DdlPolicy,
+    retry_policy: Option<RetryPolicy>,
     /// See [`CheckpointBackoff`]; kept across `discard_local_state`.
     checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
     /// The first back-off and its cap.
@@ -212,6 +305,7 @@ impl SqlService {
             bounds: SqlWaitBounds::default(),
             durability: DurabilityPolicy::default(),
             ddl_policy: DdlPolicy::default(),
+            retry_policy: None,
             checkpoint_backoff: Arc::new(DashMap::new()),
             checkpoint_backoff_bounds: (CHECKPOINT_BACKOFF, CHECKPOINT_BACKOFF_MAX),
         }
@@ -221,6 +315,14 @@ impl SqlService {
     /// per-database size cap and the disk headroom.
     pub fn with_durability(mut self, durability: DurabilityPolicy) -> Self {
         self.durability = durability;
+        self
+    }
+
+    /// The budget for retrying a hydration's artifact read after a lost
+    /// connection ([`crate::db_retry::retry_owner`]). Without it a hydration
+    /// is not retried.
+    pub fn with_retry_policy(mut self, policy: Option<RetryPolicy>) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -452,7 +554,7 @@ impl SqlService {
             Ok(result) => result,
             Err(error) => {
                 if (growth == GrowthPolicy::Forbid
-                    && self.expectation(&key) == ArtifactExpectation::Absent)
+                    && self.expectation(&key).await? == ArtifactExpectation::Absent)
                     // The disk failed the commit: its WAL is not to be trusted
                     // (Postgres never saw the write), so start over from it.
                     || matches!(error, SqlError::CommitFailed)
@@ -465,7 +567,7 @@ impl SqlService {
 
         if !result.write_targets.is_empty() {
             if growth == GrowthPolicy::Forbid
-                && self.expectation(&key) == ArtifactExpectation::Absent
+                && self.expectation(&key).await? == ArtifactExpectation::Absent
             {
                 // The actor's guard admitted no new pages. Serializing this
                 // empty database would nevertheless create a charged header.
@@ -543,11 +645,21 @@ impl SqlService {
         F: FnOnce(SqlService) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, SqlError>> + Send + 'static,
     {
+        // The operation task outlives this future if it is dropped, so it
+        // never runs inside a retry attempt (TC-2610).
+        crate::db_retry::refuse_in_retry_attempt("sql_operation_task")
+            .map_err(|error| SqlError::Internal(error.to_string()))?;
         let service = self.clone();
-        let task = request_cancel::within(request_cancel::current(), async move {
-            let _guard = guard;
-            operation(service).await
-        })
+        // The operation task does not inherit task-locals: carry the
+        // overload signal across the spawn.
+        let overload = crate::db_retry::overload();
+        let task = crate::db_retry::within_overload(
+            overload,
+            request_cancel::within(request_cancel::current(), async move {
+                let _guard = guard;
+                operation(service).await
+            }),
+        )
         .instrument(tracing::Span::current());
         let joined = match request_telemetry::current() {
             Some(context) => tokio::spawn(request_telemetry::scope(context, task)).await,
@@ -721,6 +833,10 @@ impl SqlService {
             if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
                 return Ok(handle);
             }
+            // A cold hydration runs on its own task, which a retry owner's
+            // budget could not stop (TC-2610).
+            crate::db_retry::refuse_in_retry_attempt("sql_hydration_task")
+                .map_err(|error| SqlError::Internal(error.to_string()))?;
             let (flight, start) = {
                 let mut flights = self
                     .hydrations
@@ -815,10 +931,13 @@ impl SqlService {
         };
         let service = self.clone();
         let (space, db_name) = (space.clone(), db_name.to_string());
-        let task = async move {
+        // The flight task does not inherit the caller's task-locals: carry
+        // the overload signal across the spawn.
+        let overload = crate::db_retry::overload();
+        let task = crate::db_retry::within_overload(overload, async move {
             let ended = service.hydrate(&space, &db_name, &retire.phase).await;
             retire.finish(ended);
-        }
+        })
         .instrument(tracing::Span::current());
         let telemetry = request_telemetry::current();
         let start = move || match telemetry {
@@ -843,15 +962,16 @@ impl SqlService {
             is_sqlite_database,
             is_sqlite_wal,
         );
+        // The metadata read, the first statement of a cold hydration, is
+        // retried once by the owner when its pooled connection was lost; the
+        // payload reads that follow are not.
+        let repository = MetaRetry {
+            inner: self.artifact_repository.as_ref(),
+            policy: self.retry_policy.clone(),
+        };
         let loaded = tokio::time::timeout(
             self.bounds.hydration_max,
-            read_artifact(
-                self.artifact_repository.as_ref(),
-                "sql",
-                &space.to_string(),
-                db_name,
-                &mut sink,
-            ),
+            read_artifact(&repository, "sql", &space.to_string(), db_name, &mut sink),
         )
         .await;
         let meta = match loaded {
@@ -954,12 +1074,16 @@ impl SqlService {
     }
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), SqlError> {
-        if let Some((_, handle)) = self.databases.remove(key) {
+        // The actor and its lineage leave together: both entries are dropped
+        // before shutdown is awaited, so a failing shutdown cannot leave a
+        // lineage without an actor (or an actor without a lineage).
+        let handle = self.databases.remove(key).map(|(_, handle)| handle);
+        self.lineage.remove(key);
+        if let Some(handle) = handle {
             // Wait for the connection to close before unlinking its cache:
             // an exit-time flush must not race the next durable hydration.
             handle.shutdown().await?;
         }
-        self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
             .join(format!("{}.db", key.1));
@@ -970,18 +1094,20 @@ impl SqlService {
     ///
     /// Every actor is created by `handle`, which records this during hydration,
     /// so a live actor always has an entry. A missing one means the actor
-    /// outlived its record and there is nothing to assert against.
-    fn expectation(&self, key: &(String, String)) -> ArtifactExpectation {
-        match self.lineage.get(key).map(|entry| entry.expectation.clone()) {
-            Some(expectation) => expectation,
-            None => {
-                tracing::warn!(
-                    service = "sql",
-                    "No recorded artifact lineage for a live database; saving without a lineage assertion"
-                );
-                ArtifactExpectation::Any
-            }
+    /// outlived its record: its state cannot be asserted against the durable
+    /// artifact, so it is discarded and the request fails.
+    async fn expectation(&self, key: &(String, String)) -> Result<ArtifactExpectation, SqlError> {
+        if let Some(expectation) = self.lineage.get(key).map(|entry| entry.expectation.clone()) {
+            return Ok(expectation);
         }
+        tracing::error!(
+            service = "sql",
+            "No recorded artifact lineage for a live database; discarding the actor"
+        );
+        self.discard_local_state(key).await?;
+        Err(SqlError::Internal(
+            "Database lineage missing for live actor".into(),
+        ))
     }
 
     fn checkpoint_over_save_limit(&self, key: &(String, String)) -> bool {
@@ -1052,7 +1178,7 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
-        let expected = self.expectation(&key);
+        let expected = self.expectation(&key).await?;
 
         if self
             .artifact_repository
@@ -1748,6 +1874,59 @@ mod tests {
             .discard_local_state(&(space.to_string(), "main".into()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tc2612_failed_shutdown_still_removes_actor_and_lineage() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-shutdown-failure");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        let handle = service.handle(&space, "a").await.unwrap();
+        assert!(service.lineage.contains_key(&key));
+        // Kill the actor, then re-register its dead handle so shutdown fails.
+        handle.shutdown().await.unwrap();
+        service.databases.insert(key.clone(), handle);
+
+        let result = service.discard_local_state(&key).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn tc2612_missing_lineage_is_an_error_and_discards_the_actor() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-missing-lineage");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        service.handle(&space, "a").await.unwrap();
+        service.lineage.remove(&key);
+
+        let result = service
+            .execute_without_growth(
+                &space,
+                "a",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE t (id INTEGER)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await;
+        assert!(matches!(result, Err(SqlError::Internal(_))), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
     }
 
     #[tokio::test]
@@ -4317,6 +4496,176 @@ mod tests {
                 other => panic!("expected a query response, got {other:?}"),
             }
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct ManualClock(Arc<AtomicU64>);
+
+    impl crate::db_retry::Clock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn lost_connection() -> DbErr {
+        DbErr::Exec(sea_orm::RuntimeErr::SqlxError(
+            sea_orm::error::SqlxError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ))
+    }
+
+    /// A seeded database `a`, and a cold service over it (an empty cache)
+    /// with the operation budget, whose artifact reads fail while
+    /// `repo.failures` is above zero.
+    async fn cold_service_over_a_seeded_database() -> (
+        SqlService,
+        Arc<FlakyArtifactRepository>,
+        SpaceId,
+        Vec<TempDir>,
+    ) {
+        let repo = Arc::new(FlakyArtifactRepository {
+            inner: artifact_repository().await,
+            failures: AtomicU64::new(0),
+            error: lost_connection,
+        });
+        let space = test_space_id("sql-hydration-retry");
+        let seed_cache = TempDir::new().unwrap();
+        let seeder = SqlService::new(
+            seed_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+        seeder
+            .execute(
+                &space,
+                "a",
+                insert("seed"),
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let cold_cache = TempDir::new().unwrap();
+        let cold = SqlService::new(
+            cold_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_retry_policy(Some(crate::db_retry::RetryPolicy::new(
+            std::time::Duration::from_secs(10),
+        )));
+        (cold, repo, space, vec![seed_cache, cold_cache])
+    }
+
+    /// TC-2610: a cold read whose hydration meets a lost connection restarts
+    /// its artifact read once, inside the request, and is served.
+    #[tokio::test]
+    async fn a_hydration_read_recovers_in_request_after_a_lost_connection() {
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+
+        let served = crate::db_retry::isolate_overload(cold.execute(
+            &space,
+            "a",
+            count(),
+            None,
+            "tinycloud.sql/read".into(),
+        ))
+        .await
+        .expect("the hydration was retried and served");
+
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0, "the loss was met");
+        match served.response {
+            SqlResponse::Query(query) => assert_eq!(query.rows, vec![vec![SqlValue::Integer(1)]]),
+            other => panic!("expected a query response, got {other:?}"),
+        }
+    }
+
+    /// TC-2610: inside the overload window the hydration read is not
+    /// retried; the same loss after the window is.
+    #[tokio::test]
+    async fn the_overload_signal_suppresses_the_hydration_retry_until_its_window_ends() {
+        use crate::db_retry::{with_overload_signal, OverloadSignal, OVERLOAD_SUPPRESS};
+        let clock = ManualClock::default();
+        let signal = OverloadSignal::new(clock.clone(), OVERLOAD_SUPPRESS);
+        clock.0.store(1_000, Ordering::SeqCst);
+        signal.stamp("request_timeout");
+
+        clock.0.store(1_000 + 29_999, Ordering::SeqCst);
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+        let inside = with_overload_signal(
+            signal.clone(),
+            cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
+        )
+        .await;
+        assert!(
+            matches!(inside, Err(SqlError::Unavailable)),
+            "inside the window: not retried, {inside:?}"
+        );
+        assert_eq!(
+            repo.failures.load(Ordering::SeqCst),
+            0,
+            "one loss, one read"
+        );
+
+        clock.0.store(1_000 + 30_000, Ordering::SeqCst);
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+        let after = with_overload_signal(
+            signal,
+            cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
+        )
+        .await
+        .expect("after the window the hydration is retried and served");
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0);
+        assert!(matches!(after.response, SqlResponse::Query(_)));
+    }
+
+    /// TC-2610: work that runs on a spawned task is refused inside a retry
+    /// attempt, since the owner's budget could not stop it: the operation
+    /// task of a request and a cold hydration each spawn nothing and are not
+    /// retried.
+    #[tokio::test]
+    async fn an_attempt_wrapped_around_a_spawn_path_is_refused() {
+        use crate::db_retry::{retry_owner, Replay, RetryPolicy};
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        let policy = Some(RetryPolicy::new(std::time::Duration::from_secs(10)));
+        let attempts = AtomicU64::new(0);
+
+        let (request, _) = retry_owner(
+            "test_request",
+            policy.clone(),
+            Replay::Never,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into())
+            },
+            |_: &SqlError| None,
+        )
+        .await;
+        assert!(matches!(request, Err(SqlError::Internal(_))), "{request:?}");
+
+        let (hydration, _) = retry_owner(
+            "test_hydration",
+            policy,
+            Replay::Never,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                cold.handle(&space, "a")
+            },
+            |_: &SqlError| None,
+        )
+        .await;
+        assert!(matches!(hydration, Err(SqlError::Internal(_))));
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "each ran once");
+        assert!(
+            cold.databases
+                .get(&(space.to_string(), "a".to_string()))
+                .is_none(),
+            "no hydration was started"
+        );
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0, "no read was made");
     }
 
     struct FailingArtifactRepository;

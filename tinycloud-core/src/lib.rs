@@ -7,6 +7,7 @@ pub mod database_identity;
 pub mod database_migration;
 pub mod db;
 pub mod db_pool;
+pub mod db_retry;
 pub mod did_resolution;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
