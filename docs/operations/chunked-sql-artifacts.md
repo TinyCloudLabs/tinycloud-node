@@ -7,10 +7,13 @@ lineage semantics. Hydration verifies the part CID before publishing its cache.
 
 A database stored in parts is not held to the single-row read limit
 (`storage.sql.max_artifact_read_bytes`, TC-2961): each statement reads at most
-1 MiB, hydration stages the parts in files beside the cache, and the artifact
-and account capacities bound its size. A read that keeps the whole database in
-memory (a DuckDB export) still waits for one of the node's large-transfer slots
-when it exceeds 8 MiB.
+1 MiB, and hydration stages the parts in files beside the cache. Its size is
+bounded by the artifact and account capacities when it is written; a read does
+not re-check them, so a database written under a larger capacity still loads
+whole after the capacity is lowered. A read into a sink that keeps the whole
+artifact in memory waits for one of the node's large-transfer slots when it
+exceeds 8 MiB. A SQL export of a database in parts is held to neither the read
+limit nor a slot yet; that is required before the switch is enabled.
 
 The switch is off by default. Set explicit capacities before enabling:
 

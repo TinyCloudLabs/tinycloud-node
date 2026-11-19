@@ -3555,6 +3555,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for StalledSink {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             Ok(())
         }
@@ -5110,6 +5113,9 @@ mod tests {
 
     #[async_trait]
     impl ArtifactSink for CountingSink<'_> {
+        fn buffers_in_memory(&self) -> bool {
+            false
+        }
         async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
             self.0.reset().await
         }
