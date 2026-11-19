@@ -45,7 +45,7 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Expr, Order, Query, SelectStatement},
+    sea_query::{Asterisk, Expr, Order, Query, SelectStatement, UnionType},
     AccessMode, Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect,
     Statement, TransactionTrait,
 };
@@ -691,12 +691,49 @@ pub(crate) fn kv_sync_statement(
     pos: Option<&KvSyncAnchor>,
     floor: Option<&KvSyncAnchor>,
 ) -> Statement {
-    let mut query = feed_select(backend, space, prefix, floor);
+    let first_page_floor = floor.filter(|_| backend == DbBackend::Postgres && pos.is_none());
+    let mut query = feed_select(
+        backend,
+        space,
+        prefix,
+        if first_page_floor.is_some() {
+            None
+        } else {
+            floor
+        },
+    );
     if let Some(pos) = pos {
         query
             .and_where(col(current_kv::Column::Seq).gte(pos.seq))
             .and_where(position_columns().gt(position_value(pos)));
     }
+    query = order_feed_select(query, limit);
+    if let Some(floor) = first_page_floor {
+        // Constrain the middle `deleted` column of the prefix index in each
+        // branch. Before PostgreSQL 18, a custom plan still scans the whole
+        // space's index when that column is unconstrained by the floor's OR.
+        // The branches are disjoint; each needs at most the final page's
+        // limit + 1 rows before their position-ordered merge.
+        let mut tombstones = query.clone();
+        query.and_where(col(current_kv::Column::Deleted).eq(false));
+        tombstones
+            .and_where(col(current_kv::Column::Deleted).eq(true))
+            .and_where(col(current_kv::Column::Seq).gt(floor.seq));
+        let mut union = Query::select();
+        union
+            .column(Asterisk)
+            .from_subquery(query, current_kv::Entity)
+            .union(UnionType::All, tombstones);
+        query = Query::select()
+            .column(Asterisk)
+            .from_subquery(union, current_kv::Entity)
+            .to_owned();
+        query = order_feed_select(query, limit);
+    }
+    backend.build(&query)
+}
+
+fn order_feed_select(mut query: SelectStatement, limit: usize) -> SelectStatement {
     query
         .order_by((current_kv::Entity, current_kv::Column::Seq), Order::Asc)
         .order_by((current_kv::Entity, current_kv::Column::Epoch), Order::Asc)
@@ -705,7 +742,7 @@ pub(crate) fn kv_sync_statement(
             Order::Asc,
         )
         .limit(limit.saturating_add(1) as u64);
-    backend.build(&query)
+    query
 }
 
 /// Every row of one event (`group`) inside `prefix`.
@@ -765,7 +802,10 @@ async fn feed_rows<C: ConnectionTrait>(
 /// prefix covers. A prefix holding most of the space should read
 /// `idx_current_kv_space_order` in order and stop at the page limit (9 pages
 /// of 10,000 rows locally). A narrow prefix should read its keys on
-/// `idx_current_kv_space_deleted_key_c` and sort the few it finds (13 pages).
+/// `idx_current_kv_space_deleted_key_c` and sort the few it finds. The first
+/// page merges live rows with post-floor tombstones in separate bounded
+/// branches, so both can seek through the prefix index's `deleted` column
+/// without requiring PostgreSQL 18's index skip scans.
 /// A pooled connection's prepared statement switches to one generic plan
 /// after five executions. For this statement that plan is the key index plus
 /// a sort of the whole prefix (935 pages for the broad prefix), and no one
@@ -3522,5 +3562,60 @@ pub(crate) mod tests {
             generic_pages >= 100,
             "the generic plan reads the broad prefix whole: {generic_pages} pages"
         );
+
+        // Retain old-tombstone exclusion and new-tombstone delivery when
+        // merging the two first-page branches, including an event split
+        // across live and deleted rows at the page boundary.
+        for (index, seq, deleted) in [
+            (40, 39, true),
+            (41, 4001, true),
+            (42, 4000, false),
+            (43, 4000, true),
+        ] {
+            current_kv::Entity::update_many()
+                .col_expr(current_kv::Column::Seq, Expr::value(seq))
+                .col_expr(current_kv::Column::EpochSeq, Expr::value(seq))
+                .col_expr(current_kv::Column::Deleted, Expr::value(deleted))
+                .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .filter(current_kv::Column::Key.eq(key(index)))
+                .exec(&conn)
+                .await
+                .unwrap();
+        }
+        for seq in [4000, 4001] {
+            event_order::ActiveModel {
+                seq: Set(seq),
+                epoch: Set(epoch),
+                epoch_seq: Set(seq),
+                event: Set(crate::hash::hash(format!("tc3256-new-{seq}").as_bytes())),
+                space: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&conn)
+            .await
+            .unwrap();
+        }
+        let state = KvSyncState {
+            pos: None,
+            floor: Some(floor),
+        };
+        let (changes, more, next) = kv_sync_page(&node_conn, &space, &narrow, 7, Some(&state))
+            .await
+            .unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.key.to_string())
+                .collect::<Vec<_>>(),
+            [44, 45, 46, 47, 48, 49, 42, 43].map(key)
+        );
+        assert!(!changes[6].deleted());
+        assert!(changes[7].deleted());
+        assert!(more);
+        let (changes, more, _) = kv_sync_page(&node_conn, &space, &narrow, 1, Some(&next))
+            .await
+            .unwrap();
+        assert_eq!(changes[0].key.to_string(), key(41));
+        assert!(changes[0].deleted());
+        assert!(!more);
     }
 }
