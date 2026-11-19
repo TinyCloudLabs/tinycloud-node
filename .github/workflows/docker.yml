@@ -765,10 +765,11 @@ jobs:
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
           # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes and the TC-2917
-          # storage-headroom event in the Vector config
-          # (raw 5419a6fb…; d703d69b… before TC-2917, 298ea356… before TC-2346, 192dfb7e… before TC-1777),
-          # its single node digest normalized to 64 zeros.
-          n0_template_hash = '90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51'
+          # storage-headroom event in the Vector config, and the TC-887 at-rest env lines, without the
+          # TC-2520 ssh-gateway service
+          # (raw bf3f1c1a…; 1a6566c7… before TC-2520, 5419a6fb… before TC-887, d703d69b… before TC-2917,
+          # 298ea356… before TC-2346, 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
+          n0_template_hash = '521dff54d891c943715370d09405f249b5786dc5ad7a1b57e0d632ef097b1751'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -951,6 +952,11 @@ jobs:
             -e TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1 \
             ${ledger_args[@]+"${ledger_args[@]}"} \
             "${IMAGE}" --validate-config
+          # TC-887: the at-rest root is not passed here. With a dstack TEE
+          # indicated (TINYCLOUD_KEYS__TYPE above) and no guest agent in this
+          # container, --validate-config refuses at-rest: its TEE checks run
+          # only at boot inside the CVM. The key's format is checked in the
+          # deploy step before the sealed file is written.
 
       # TC-959: only env_keys/encrypted_env may change here. Never copy the
       # precedent's raw-response logs or its unguarded compose_hash retry.
@@ -1087,6 +1093,7 @@ jobs:
           PHALA_ENV_BETTERSTACK_SOURCE_TOKEN: ${{ secrets.PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN }}
           PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
           PHALA_ENV_NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+          PHALA_ENV_AT_REST_ROOT_KEY: ${{ secrets.PROD_TINYCLOUD_AT_REST_ROOT_KEY }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -1113,6 +1120,7 @@ jobs:
             PHALA_ENV_BETTERSTACK_SOURCE_TOKEN
             PHALA_ENV_SQL_IDENTITY_FENCE
             PHALA_ENV_NAMED_KEYS_V1
+            PHALA_ENV_AT_REST_ROOT_KEY
           )
 
           for var in "${required_vars[@]}"; do
@@ -1130,6 +1138,24 @@ jobs:
           # so anything but a literal true/false is refused before it is written.
           if [ "${PHALA_ENV_NAMED_KEYS_V1}" != "true" ] && [ "${PHALA_ENV_NAMED_KEYS_V1}" != "false" ]; then
             echo "::error::named_keys_v1 must be exactly true or false"
+            exit 1
+          fi
+
+          # TC-887: the at-rest root key is the canonical standard base64 of
+          # 32 bytes (44 characters) that are not all one byte, exactly as the
+          # node requires. Refuse anything else before it is written; the
+          # messages never contain the value.
+          if ! [[ "${PHALA_ENV_AT_REST_ROOT_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            echo "::error::AT_REST_ROOT_KEY must be the standard base64 of 32 bytes"
+            exit 1
+          fi
+          if ! printf '%s' "$PHALA_ENV_AT_REST_ROOT_KEY" | python3 -c '
+          import base64, sys
+          text = sys.stdin.read()
+          key = base64.b64decode(text, validate=True)
+          sys.exit(0 if len(key) == 32 and base64.b64encode(key).decode() == text and len(set(key)) > 1 else 1)
+          ' >/dev/null 2>&1; then
+            echo "::error::AT_REST_ROOT_KEY must be canonical base64 of 32 bytes that are not all the same"
             exit 1
           fi
 
@@ -1178,16 +1204,19 @@ jobs:
             printf 'BETTERSTACK_SOURCE_TOKEN=%s\n' "$PHALA_ENV_BETTERSTACK_SOURCE_TOKEN"
             printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             printf 'NAMED_KEYS_V1=%s\n' "$PHALA_ENV_NAMED_KEYS_V1"
+            printf 'AT_REST_ROOT_KEY=%s\n' "$PHALA_ENV_AT_REST_ROOT_KEY"
             # TC-1482: optional. Unset keeps the node starting with
             # GET /admin/stats disabled (404); never written empty.
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
               printf 'NODE_STATS_READ_TOKEN=%s\n' "$PHALA_ENV_NODE_STATS_READ_TOKEN"
             fi
-            # SSH public keys authorized on the CVM (checked into the repo,
-            # see dstack-authorized-keys). The Phala Cloud pre-launch script
-            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
-            # at boot, enabling `phala ssh tinycloud-node`.
-            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
+            # TC-887: no DSTACK_AUTHORIZED_KEYS. A node with an at-rest root
+            # from the environment refuses to boot when the measured
+            # app-compose allows SSH keys, so this deploy seals none. A CVM
+            # whose allowed_envs still lists DSTACK_AUTHORIZED_KEYS fails the
+            # allowed_envs check below until that name is removed at the CVM
+            # level first (docs/releasing.md, "At-rest root from the
+            # environment: manual gate").
           } > .phala-prod.env
 
           # Validate complete env names/whitelist before any CVM mutation.
