@@ -8007,6 +8007,7 @@ dependencies = [
  "sha3",
  "sqlparser",
  "sqlx-core",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "time",
