@@ -921,7 +921,6 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
 }
 
 #[cfg(test)]
-#[path = "replacement_busy_tests.rs"]
 mod replacement_busy_tests;
 
 #[cfg(test)]
