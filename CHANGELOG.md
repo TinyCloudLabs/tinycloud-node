@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### Changes
-- Production compose: stored SQL databases load again up to 320 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Since 1.26.6 a database whose stored checkpoint or WAL delta was over 64 MiB answered `507 sql_database_size_limit` to every request. Loads stream in 4 MiB slices to the local cache file. The 64 MiB save limit is unchanged, so a write that needs a whole checkpoint over 64 MiB still answers 507 and applies nothing. Config only, no code change and no migration. The reviewed N0 compose template changes to `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da` (raw `d6af7a70…`). Details: TC-1491.
+- Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
 - The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
