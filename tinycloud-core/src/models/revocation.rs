@@ -1533,5 +1533,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "invocation_terminal_tests.rs"]
+#[path = "revocation/invocation_terminal_tests.rs"]
 mod invocation_terminal_tests;
