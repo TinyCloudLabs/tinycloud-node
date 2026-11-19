@@ -238,7 +238,7 @@ impl WebhookDispatcher {
                     .and_then(Result::ok);
                 let Some(opened) = opened else {
                     self.record_terminal_failure(
-                        delivery.id,
+                        &claim,
                         current_attempt,
                         "custom header decryption failed",
                     )
@@ -248,7 +248,7 @@ impl WebhookDispatcher {
                 match crate::webhook_headers::delivery_header_map(&opened) {
                     Ok(headers) => headers,
                     Err(reason) => {
-                        self.record_terminal_failure(delivery.id, current_attempt, reason)
+                        self.record_terminal_failure(&claim, current_attempt, reason)
                             .await?;
                         return Ok(());
                     }
