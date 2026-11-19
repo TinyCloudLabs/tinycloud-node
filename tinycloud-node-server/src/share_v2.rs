@@ -975,6 +975,9 @@ pub async fn register_policy(
         .begin()
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    tinycloud_core::space_purge_records::operation(&transaction)
+        .await
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
     model
         .insert(&transaction)
         .await
@@ -2839,6 +2842,9 @@ pub async fn policy_session_v2(
     let transaction = runtime
         .conn
         .begin()
+        .await
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    tinycloud_core::space_purge_records::operation(&transaction)
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
     let consumed = share_anonymous_challenge::Entity::update_many()

@@ -70,6 +70,30 @@ struct ReplayArgs {
     json: JsonArgs,
 }
 
+#[derive(Debug, Args)]
+struct PurgeLedgerArgs {
+    #[command(subcommand)]
+    command: PurgeLedgerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PurgeLedgerCommand {
+    /// Verify every purge-ledger record and re-apply it to the database and
+    /// stores (restore runbook step 7). Prints counts only. Idempotent.
+    Reconcile(PurgeReconcileArgs),
+}
+
+#[derive(Debug, Args)]
+struct PurgeReconcileArgs {
+    /// Base config file to load (database, stores and ledger come from it;
+    /// TINYCLOUD_HOST_ID and TINYCLOUD_PURGE_LEDGER_KEYS from the environment).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    #[command(flatten)]
+    json: JsonArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
     Service(ServiceArgs),
@@ -85,6 +109,8 @@ enum NodeCommand {
     Tunnel(TunnelArgs),
     /// The append-only ledger of deleted encryption keys.
     DeletionLedger(DeletionLedgerArgs),
+    /// The space purge ledger (TC-2871).
+    PurgeLedger(PurgeLedgerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +277,7 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Link(args) => run_link(args.command),
         NodeCommand::Tunnel(args) => run_tunnel(args.command),
         NodeCommand::DeletionLedger(args) => run_deletion_ledger(args.command),
+        NodeCommand::PurgeLedger(args) => run_purge_ledger(args.command),
     }
 }
 
@@ -371,6 +398,25 @@ async fn replay_deletion_ledger(args: ReplayArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Re-apply the space purge ledger to the restored database and stores. Run
+/// it with the node stopped, after the database restore; the node runs the
+/// same pass at every start before it serves.
+fn run_purge_ledger(command: PurgeLedgerCommand) -> Result<()> {
+    match command {
+        PurgeLedgerCommand::Reconcile(args) => block_on(reconcile_purge_ledger(args)),
+    }
+}
+
+async fn reconcile_purge_ledger(args: PurgeReconcileArgs) -> Result<()> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| runtime::serve_profile_config_path(Profile::default_for_host()));
+    let figment = runtime::serve_config_figment(&config_path)?;
+    let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
+    let report = crate::reconcile_purge_ledger(&config).await?;
+    emit_json(&report, args.json.json)
 }
 
 fn emit_json<T: serde::Serialize>(value: &T, json: bool) -> Result<()> {
