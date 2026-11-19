@@ -33,3 +33,21 @@ While paused:
 
 A failed scheduler pass logs `internal renewal scheduler pass failed` with a fixed `code`, never the raw error: `renewal_switch_unavailable` (the switch could not be read, so the pass issued nothing), `renewal_db_unavailable` (another database error) or `renewal_tick_failed` (anything else). The pass retries on the next tick.
 
+### Renewals switch workflow (production)
+
+Step 1 of the renewals emergency-off is pausing the production nodes with the `Renewals switch` GitHub Actions workflow (`.github/workflows/renewals-switch.yml`). It makes the calls above with `PROD_TINYCLOUD_ADMIN_SECRET` from the `production` environment, so nobody reads or handles the secret. Run it only on Naomi's or Holden's GO.
+
+```sh
+# Read the switch on both nodes (host defaults to both).
+gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node -f action=status
+# Pause: confirm must repeat the action. Each host gets a PUT, then a GET that must agree.
+gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node -f action=pause -f confirm=pause
+# Resume, here on one node only.
+gh workflow run renewals-switch.yml --repo TinyCloudLabs/tinycloud-node \
+  -f action=resume -f confirm=resume -f host=tee.node.tinycloud.xyz
+gh run watch --repo TinyCloudLabs/tinycloud-node "$(gh run list --repo TinyCloudLabs/tinycloud-node \
+  --workflow renewals-switch.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+`host` is `both` (default), `node.tinycloud.xyz` or `tee.node.tinycloud.xyz`. Run from `main` (the default); the `production` environment admits only `main` and `v*` tags. The log prints one line per call, such as `node.tinycloud.xyz GET: HTTP 200, paused=true`, and nothing else from the response. The run fails, after trying every selected host, if any call fails or a node's final state differs from the requested one; the error line names those hosts. A pause or resume without the matching `confirm` fails before any call.
+
