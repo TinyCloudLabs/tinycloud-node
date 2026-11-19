@@ -74,7 +74,7 @@ If any check in steps 2-4 fails, stop. Keep the node fenced and alert with count
    tinycloud node purge-ledger reconcile --config <config>
    ```
 
-   It reads `TINYCLOUD_HOST_ID` and `TINYCLOUD_PURGE_LEDGER_KEYS` from the environment, applies pending migrations, runs the node's startup reconciliation once, and prints counts only. Run it again until a run re-creates nothing; how to read the report is in `space-purge-storage.md` section 5. It does the following:
+   It reads `TINYCLOUD_HOST_ID` and `TINYCLOUD_PURGE_LEDGER_KEYS` from the environment, applies pending migrations, runs the node's startup reconciliation once, and prints counts only. Run it again until a run reports 0 for `repaired_copies`, `tombstones_created`, `purges_resumed`, `prefixes_purged`, `owners_erased_redeleted` and `owners_pruned`. `owner_retirements` and `space_fences` count every record on every run and never reach 0. How to read the report is in `space-purge-storage.md` section 5. It does the following:
    - Verify every record's HMAC before using it. An invalid record is an alert; do not skip it and do not serve.
    - Re-apply every owner retirement to the registry and to each configured TinyCloud-operated host. Every host must import the retirement before `space/create` or `space/host` is allowed.
    - Re-create the fence of every accepted purge and resume it. A purge is never un-fenced. A record authenticates each prefix it purges by an HMAC tied to a store kind. The worker lists candidate prefixes in each store and acts only on a candidate whose HMAC is in the record (`VerifiedPurgePrefix::verify_candidate` in `tinycloud-node-server/src/storage/purge_reconcile.rs`; `purge_restore_prefix_batch` in `purge_restore.rs`). The prefixes, by store:
@@ -97,7 +97,7 @@ If any check in steps 2-4 fails, stop. Keep the node fenced and alert with count
    - every accepted purge is complete;
    - every configured host has imported every retirement;
    - step 6 reported no refused entries;
-   - step 7's last run re-created nothing and reported `blocked_rows_present` 0.
+   - step 7's last run reported 0 for those six counts and `blocked_rows_present` 0.
 9. Only then remove the fence. If any evidence is missing or inconsistent, keep the node fenced and escalate. Never bypass reconciliation.
 
 ## Invariants for later work
