@@ -619,6 +619,11 @@ pub async fn read_artifact<R: DatabaseArtifactRepository + ?Sized>(
 
 #[async_trait]
 pub trait DatabaseArtifactRepository: Send + Sync {
+    /// Largest single-statement save payload; zero disables the limit.
+    fn max_write_bytes(&self) -> u64 {
+        DEFAULT_MAX_ARTIFACT_WRITE_BYTES
+    }
+
     /// The artifact's stored metadata, with no payload bytes read.
     ///
     /// One cheap statement whatever the artifact's size: use it for existence
@@ -1244,6 +1249,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             || self
                 .observed_chunked
                 .contains(&(service.into(), space.into(), name.into()))
+    }
+
+    fn max_write_bytes(&self) -> u64 {
+        self.max_write_bytes
     }
 
     async fn save_snapshot(

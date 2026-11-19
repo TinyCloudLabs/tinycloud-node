@@ -69,6 +69,16 @@ A kill -9 test cannot inject "after COMMIT, before its fsync completed"; `before
 
 **The artifact read limit is on by default (TC-2961).** A database whose stored checkpoint or WAL delta exceeds 64 MiB is not loaded: every request to it is answered `507 sql_database_size_limit` until artifacts are stored in bounded parts (TC-2917). A database already stored over the limit becomes unreadable, not only unwritable; count such rows before deploying the limit or lowering it.
 
+**Loaded SQL databases over the save limit are read-only (TC-1491).** Hydration
+retains the stored checkpoint size alongside the actor's lineage. If it exceeds
+`max_artifact_write_bytes` (and that limit is nonzero), every SQL mutation is
+refused before execution with `507 sql_database_size_limit`, including small
+writes that would fit in a WAL delta, DDL, schema initialization and writable
+PRAGMAs. No snapshot or checkpoint is read for the refusal. Reads and exports
+continue to work within the read limit. Reloading recomputes admission from
+durable metadata; discarding the database clears it with lineage. This is always
+on, uses the existing save limit, and adds no configuration switch.
+
 **At most two artifact transfers over 8 MiB run at once per node (TC-2961)**, shared by every tenant and by SQL and DuckDB, first come first served, with no per-tenant share. Further ones wait holding no database connection. How long one can wait and run depends on its path:
 - a SQL checkpoint save: wait and upload together within `artifact_transfer_timeout_ms` (45 s); a save cut while still waiting answers `503` and starts no back-off;
 - a SQL load: wait and download together within `hydration_max_ms` (600 s), in a task that outlives its callers, who answer `503` after `hydration_wait_timeout_ms` (30 s);
@@ -98,4 +108,7 @@ A write that fails because the disk is full is answered as `sql_disk_headroom` (
 
 **Retire order.** When that reset fails, the actor is retired (deregistered before the error reply, TC-1594 tracks closing the connection first). The pre-commit gate and the reservation release are on the same path as before: the reservation is released by a drop guard in `SqlService::execute_locked` when the request returns, whatever the actor did, so the retire order does not change it. A request that triggers the reset held a `PRAGMA`; its transaction and its reservation have ended before the reset runs. The actor also retires when a connection is still inside a transaction after a request.
 
-`Publication` commands are not gated either. DuckDB is untouched.
+The withdrawn `Publication` entry point keeps its capabilities read available;
+other commands also receive the oversized-checkpoint refusal when applicable.
+DuckDB is unchanged: it has the analogous small-WAL/full-checkpoint issue and is
+not enabled in production.
