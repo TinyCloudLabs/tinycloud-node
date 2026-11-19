@@ -1347,8 +1347,8 @@ mod tests {
         }
     }
 
-    /// `EXPLAIN ANALYZE` runs what it wraps, so wrapping `EXECUTE` is the
-    /// same bypass shape as `EXECUTE` itself. It is a read-only violation if
+    /// `EXPLAIN ANALYZE` runs what it wraps, so wrapping `EXECUTE` is treated
+    /// like `EXECUTE` itself. It is a read-only violation if
     /// the parser accepts it, and a parse refusal otherwise; never allowed.
     #[test]
     fn read_only_caveat_refuses_explain_analyze_of_execute() {
