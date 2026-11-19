@@ -1033,6 +1033,63 @@ mod binding {
         );
     }
 
+    /// TC-2871: in a space being purged, a stored delegation posted again
+    /// after it expired gets the purge refusal, not "already registered".
+    #[tokio::test]
+    async fn a_stored_delegation_posted_again_after_it_expired_into_a_purged_space_is_refused() {
+        use sea_orm::TransactionTrait;
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 30,
+            now() + 2,
+        );
+        f.db.delegate(deleg(&token))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let keys = Arc::new(
+            crate::space_purge_ledger::LedgerKeys::new(
+                "test".into(),
+                std::collections::BTreeMap::from([("test".into(), vec![7; 32])]),
+            )
+            .unwrap(),
+        );
+        let fence = Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
+        fence.set_serving_ready(true);
+        let tx = f.db.conn.begin().await.unwrap();
+        fence
+            .fence_hmac(
+                &tx,
+                "space",
+                "test",
+                &keys
+                    .target_hmac("test", "space", &f.space.to_string())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let db = f.db.clone().with_space_purge_fence(fence);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = db.delegate(deleg(&token)).await;
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::ParentRevoked(_)
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
+
     /// TC-3000 on PostgreSQL: a stranger's delegation does not open a
     /// transaction to wait for the database-side space lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

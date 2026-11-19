@@ -2516,6 +2516,27 @@ where
         result
     }
 
+    /// A delegation already stored answers as registered only while every
+    /// space it names is live: in a space being purged or deleted it gets the
+    /// purge refusal its first registration would get (TC-2871).
+    async fn answer_stored_delegation(&self, delegation: &Delegation) -> Result<(), TxError<B, K>> {
+        if self.space_purge_fence.is_some() {
+            let tx = self.begin_graph_transaction().await?;
+            space_purge::lock_delegation::<B, K>(
+                &tx,
+                self.space_purge_fence.as_deref(),
+                delegation,
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        // The content-addressed row authenticates these exact signed bytes.
+        for space in delegation.0.spaces() {
+            crate::request_telemetry::observe_space(space);
+        }
+        Ok(())
+    }
+
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
         self.delegate_verified(delegation, &PreVerified::default())
             .await
@@ -2584,9 +2605,7 @@ where
                     .map_err(TxError::Db)?
                     .is_some()
             {
-                for space in delegation.0.spaces() {
-                    crate::request_telemetry::observe_space(space);
-                }
+                self.answer_stored_delegation(&delegation).await?;
                 return Ok(already_registered_result(retained_hash));
             }
             return Err(refused);
@@ -2612,20 +2631,7 @@ where
             .await
         {
             Ok(Some(_)) if !renewal_lease => {
-                if self.space_purge_fence.is_some() {
-                    let tx = self.begin_graph_transaction().await?;
-                    space_purge::lock_delegation::<B, K>(
-                        &tx,
-                        self.space_purge_fence.as_deref(),
-                        &delegation,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                }
-                // The content-addressed row authenticates these exact signed bytes.
-                for space in delegation.0.spaces() {
-                    crate::request_telemetry::observe_space(space);
-                }
+                self.answer_stored_delegation(&delegation).await?;
                 return Ok(already_registered_result(retained_hash));
             }
             Ok(Some(_)) | Ok(None) => {}
