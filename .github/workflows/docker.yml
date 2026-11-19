@@ -536,8 +536,8 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
-    # TC-971: production-environment policy admits main and v* tags. Most deploy
-    # secrets live there; PROD_TINYCLOUD_ADMIN_SECRET is repository-scoped.
+    # TC-971: production-environment policy admits main and v* tags. Deploy
+    # secrets, including PROD_TINYCLOUD_ADMIN_SECRET, live there only.
     # Digest promotion additionally requires main, not a release tag.
     environment: production
     if: >-
@@ -1292,7 +1292,7 @@ jobs:
         timeout-minutes: 5
         if: ${{ success() && inputs.authorize_quota_values }}
         env:
-          # Repository-scoped; never read by an agent or passed in argv.
+          # Production environment secret; never read by an agent or passed in argv.
           QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}

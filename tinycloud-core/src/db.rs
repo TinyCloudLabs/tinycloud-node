@@ -198,6 +198,8 @@ pub struct PendingWebhookDelivery {
     pub callback_url: String,
     pub encrypted_secret: Vec<u8>,
     pub encrypted_secret_format: i16,
+    pub encrypted_headers: Option<Vec<u8>>,
+    pub encrypted_headers_format: i16,
     pub secret_key_id: String,
     pub subscription_active: bool,
     pub subscriber_did: String,
@@ -324,6 +326,14 @@ pub struct KvInvokeOptions {
     /// no KV mutation (see [`kv_mutation_keys`]), which has no such
     /// transaction.
     pub replay: Option<invocation_replay::Model>,
+    /// TC-3217: `Some` for a batch read (every capability a `kv/get`, or
+    /// every one a `kv/metadata`), holding the batch states the client
+    /// already has (from `If-None-Match`; often none). The invocation answers
+    /// its batch state (see [`kv_batch_state`]) after its outcomes as
+    /// [`InvocationOutcome::KvBatchState`]; if that state is one of these,
+    /// it reads no value and answers [`InvocationOutcome::KvBatchUnchanged`]
+    /// alone. Either way it is authorized and its read audited as usual.
+    pub kv_batch_if_none_match: Option<Vec<[u8; 32]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -920,6 +930,26 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
         .await
     }
 
+    /// Pause or resume all scheduled renewals on this node's database.
+    pub async fn set_renewals_paused(
+        &self,
+        paused: bool,
+    ) -> Result<crate::renewal::RenewalSwitch, crate::renewal::RenewalStoreError>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        crate::renewal::set_renewals_paused(
+            &self.conn,
+            paused,
+            crate::renewal::verifier_now().unix_timestamp(),
+        )
+        .await
+    }
+
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()
@@ -1392,6 +1422,8 @@ where
                             callback_url: subscription.callback_url,
                             encrypted_secret: subscription.encrypted_secret,
                             encrypted_secret_format: subscription.encrypted_secret_format,
+                            encrypted_headers: subscription.encrypted_headers,
+                            encrypted_headers_format: subscription.encrypted_headers_format,
                             secret_key_id: subscription.secret_key_id,
                             subscription_active: subscription.active,
                             subscriber_did: subscription.subscriber_did,
@@ -2033,14 +2065,16 @@ where
     ///
     /// An invocation only *reads* chain state: it evaluates the delegation
     /// chain and the revocation set to make an authorization decision. The
-    /// rows it writes (its own invocation record and the `parent_delegations`
-    /// edges pointing at the delegations it cited) are leaves hanging off the
-    /// graph — they never alter any delegation's ancestor closure, and nothing
-    /// traverses the graph downward from parent to child. So two invocations
-    /// on the same chain never had to exclude one another; only a writer of
-    /// chain state does. That mutual exclusion between invocations was the
-    /// dominant source of `chain_guard_wait` in production, because a single
-    /// busy account funnels all of its traffic through one root delegation.
+    /// rows it writes (its own invocation record, its invoked abilities and,
+    /// for a KV write, the `parent_delegations` edges pointing at the
+    /// delegations it cited; a read writes no edges since TC-3259) are leaves
+    /// hanging off the graph — they never alter any delegation's ancestor
+    /// closure, and nothing traverses the graph downward from parent to child.
+    /// So two invocations on the same chain never had to exclude one another;
+    /// only a writer of chain state does. That mutual exclusion between
+    /// invocations was the dominant source of `chain_guard_wait` in
+    /// production, because a single busy account funnels all of its traffic
+    /// through one root delegation.
     ///
     /// The security invariant is unchanged: a revocation takes these same
     /// guards EXCLUSIVE and holds them through commit, so it cannot commit
@@ -3752,17 +3786,55 @@ where
             })
             .collect::<Vec<_>>();
         let mut kv_lookup = KvReadLookup::fetch(&self.conn, &caps).await;
-        for cap in caps {
-            match cap {
-                (space, "kv", "tinycloud.kv/get", path) => {
-                    let data = match kv_lookup
+        // TC-3217: a batch read looks every row up before reading any value,
+        // so its state names exactly the rows it answers from.
+        let mut batch_rows = None;
+        if let Some(known) = options.kv_batch_if_none_match.as_ref() {
+            let mut rows = Vec::with_capacity(caps.len());
+            for &(space, service, ability, path) in &caps {
+                if service != "kv" {
+                    continue;
+                }
+                let row = match ability {
+                    "tinycloud.kv/get" => kv_lookup
                         .entity(&self.conn, space, path)
                         .await
-                        .map_err(|error| TxStoreError::Tx(error.into()))?
-                    {
-                        Some(entry) => read_kv_entity(&self.storage, space, entry)
+                        .map_err(|error| TxStoreError::Tx(error.into()))?,
+                    "tinycloud.kv/metadata" => kv_lookup.entity(&self.conn, space, path).await?,
+                    _ => continue,
+                };
+                rows.push((space, ability, path, row));
+            }
+            let state = kv_batch_state(&rows);
+            if known.iter().any(|known| known.as_slice() == state.as_ref()) {
+                results.push(InvocationOutcome::KvBatchUnchanged(state));
+            } else {
+                batch_rows = Some((rows.into_iter().map(|(.., row)| row), state));
+            }
+        }
+        let unchanged = matches!(results.last(), Some(InvocationOutcome::KvBatchUnchanged(_)));
+        // A live row whose content can't be read is answered as not found,
+        // which its state does not describe: that answer carries no state.
+        let mut unreadable = false;
+        for cap in caps {
+            match cap {
+                (_, "kv", "tinycloud.kv/get" | "tinycloud.kv/metadata", _) if unchanged => {}
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let row = match batch_rows.as_mut() {
+                        Some((rows, _)) => rows.next().flatten(),
+                        None => kv_lookup
+                            .entity(&self.conn, space, path)
                             .await
-                            .map_err(TxStoreError::StoreRead)?,
+                            .map_err(|error| TxStoreError::Tx(error.into()))?,
+                    };
+                    let data = match row {
+                        Some(entry) => {
+                            let data = read_kv_entity(&self.storage, space, entry)
+                                .await
+                                .map_err(TxStoreError::StoreRead)?;
+                            unreadable |= data.is_none();
+                            data
+                        }
                         None => None,
                     };
                     if let Some((size, limit)) = oversized_kv_response(&options, data.as_ref()) {
@@ -3782,11 +3854,12 @@ where
                     results.push(InvocationOutcome::KvList(list, truncated, None));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
+                    let row = match batch_rows.as_mut() {
+                        Some((rows, _)) => rows.next().flatten(),
+                        None => kv_lookup.entity(&self.conn, space, path).await?,
+                    };
                     results.push(InvocationOutcome::KvMetadata(
-                        kv_lookup
-                            .entity(&self.conn, space, path)
-                            .await?
-                            .map(|entry| (entry.metadata, entry.value)),
+                        row.map(|entry| (entry.metadata, entry.value)),
                     ));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
@@ -3803,6 +3876,9 @@ where
                 }
                 _ => {}
             }
+        }
+        if let Some((_, state)) = batch_rows.filter(|_| !unreadable) {
+            results.push(InvocationOutcome::KvBatchState(state));
         }
 
         let read_audit_start = Instant::now();
@@ -4235,7 +4311,15 @@ pub enum InvocationOutcome<R> {
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
-    KvBatchRead(Vec<KvBatchReadItem>),
+    /// A batch of `kv/get` or `kv/metadata` answers, in request order, with
+    /// the batch state they were read from (TC-3217).
+    KvBatchRead(Vec<KvBatchReadItem>, Option<Hash>),
+    /// The state a batch read answered from (see [`kv_batch_state`]),
+    /// following its outcomes (TC-3217).
+    KvBatchState(Hash),
+    /// A conditional batch read whose state the client already has: no
+    /// value was read (TC-3217).
+    KvBatchUnchanged(Hash),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, Delegation>),
     /// Ordered delegation chain from leaf to root, retaining exact signed bytes.
@@ -5349,6 +5433,39 @@ async fn get_kv_entity<C: ConnectionTrait>(
     Ok(result)
 }
 
+/// Domain separator of [`kv_batch_state`] (TC-3217).
+const KV_BATCH_STATE_DOMAIN: &[u8] = b"tinycloud/kv-batch-state/v2\0";
+
+/// TC-3217: one value naming everything a batch KV read answers: each target
+/// in request order (ability, space and key) and the live row it found, by
+/// its write position (`seq`, `epoch`, `epoch_seq`) and value digest, or its
+/// absence. A write, a delete or a re-creation of any of those keys changes
+/// the row, so an equal value means an equal answer. Computed from the rows
+/// the batch already looked up: it costs no statement.
+fn kv_batch_state(rows: &[(&SpaceId, &str, &Path, Option<current_kv::Model>)]) -> Hash {
+    let mut preimage = KV_BATCH_STATE_DOMAIN.to_vec();
+    let field = |preimage: &mut Vec<u8>, bytes: &[u8]| {
+        preimage.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(bytes);
+    };
+    for (space, ability, path, row) in rows {
+        field(&mut preimage, ability.as_bytes());
+        field(&mut preimage, space.to_string().as_bytes());
+        field(&mut preimage, path.as_str().as_bytes());
+        match row {
+            Some(row) => {
+                preimage.push(1);
+                preimage.extend_from_slice(&row.seq.to_be_bytes());
+                field(&mut preimage, row.epoch.as_ref());
+                preimage.extend_from_slice(&row.epoch_seq.to_be_bytes());
+                field(&mut preimage, row.value.as_ref());
+            }
+            None => preimage.push(0),
+        }
+    }
+    crate::hash::hash(&preimage)
+}
+
 /// Most keys one `IN (...)` statement carries where there is no array
 /// parameter (SQLite), well under its 32766-variable limit.
 const KV_LOOKUP_CHUNK: usize = 500;
@@ -5441,29 +5558,43 @@ impl KvReadLookup {
     }
 }
 
-/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL
-/// `key = ANY($2)`) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN` lists).
-/// A key with no live row is absent from the map.
+/// The PostgreSQL batch lookup: one index seek per key, whatever the plan.
+///
+/// TC-3211: `space = $1 AND deleted = $2 AND key = ANY($3)` is a prepared
+/// statement, and after five executions PostgreSQL may switch to its generic
+/// plan. With the space and the array length unknown, that plan walked the
+/// whole space on `idx_current_kv_space_order` (`key` is its fifth column) and
+/// checked every key against the array. In production this was about 740
+/// buffer pages to return 44 rows. Joining each key from `unnest($3)` to a
+/// `LIMIT 1` lateral lookup makes every plan, generic or custom, a seek on
+/// `(space, deleted, key)` or the primary key. `LIMIT 1` changes no answer,
+/// since `(space, key)` is the primary key, and it keeps the subquery from
+/// being flattened back into a join the planner could reorder.
+const KV_LOOKUP_POSTGRES: &str = r#"SELECT "c".* FROM unnest($3::text[]) AS "k"("key") CROSS JOIN LATERAL (SELECT * FROM "current_kv" WHERE "current_kv"."space" = $1 AND "current_kv"."deleted" = $2 AND "current_kv"."key" = "k"."key" LIMIT 1) AS "c""#;
+
+/// The live rows of `keys` in `space`, by key, in one statement (PostgreSQL,
+/// [`KV_LOOKUP_POSTGRES`]) or one per `KV_LOOKUP_CHUNK` keys (SQLite `IN`
+/// lists). A key with no live row is absent from the map.
 async fn get_kv_entities<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     keys: &[&Path],
 ) -> Result<HashMap<String, current_kv::Model>, DbErr> {
-    let live = || {
-        current_kv::Entity::find()
-            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
-            .filter(current_kv::Column::Deleted.eq(false))
-    };
     let rows = match db.get_database_backend() {
         DbBackend::Postgres => {
             let keys = keys
                 .iter()
                 .map(|key| key.as_str().to_owned())
                 .collect::<Vec<_>>();
-            live()
-                .filter(Expr::cust_with_values(
-                    r#""current_kv"."key" = ANY($1)"#,
-                    [keys],
+            current_kv::Entity::find()
+                .from_raw_sql(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    KV_LOOKUP_POSTGRES,
+                    [
+                        SpaceIdWrap(space_id.clone()).into(),
+                        false.into(),
+                        keys.into(),
+                    ],
                 ))
                 .all(db)
                 .await?
@@ -5472,7 +5603,9 @@ async fn get_kv_entities<C: ConnectionTrait>(
             let mut rows = Vec::new();
             for chunk in keys.chunks(KV_LOOKUP_CHUNK) {
                 rows.extend(
-                    live()
+                    current_kv::Entity::find()
+                        .filter(current_kv::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                        .filter(current_kv::Column::Deleted.eq(false))
                         .filter(
                             current_kv::Column::Key
                                 .is_in(chunk.iter().map(|key| crate::types::Path((*key).clone()))),
@@ -6408,6 +6541,73 @@ mod test {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         SpaceId::new(did, name.parse().unwrap()).unwrap()
+    }
+
+    /// TC-3217: a batch state names each target's row by every field of its
+    /// write position and its value digest, and an absent target by its key,
+    /// so two batches that differ in any one of them never share a state.
+    #[test]
+    fn kv_batch_state_tells_apart_rows_that_differ_in_one_field() {
+        let space = test_space_id("default");
+        let (a, x, y): (Path, Path, Path) = (
+            "board/a".parse().unwrap(),
+            "board/x".parse().unwrap(),
+            "board/y".parse().unwrap(),
+        );
+        let row = current_kv::Model {
+            space: SpaceIdWrap(space.clone()),
+            key: crate::types::Path(a.clone()),
+            invocation: crate::hash::hash(b"invocation"),
+            seq: 7,
+            epoch: crate::hash::hash(b"epoch"),
+            epoch_seq: 3,
+            value: crate::hash::hash(b"a1"),
+            generation: 0,
+            metadata: Metadata(Default::default()),
+            deleted: false,
+        };
+        let get = "tinycloud.kv/get";
+        let state = |rows: &[(&Path, Option<current_kv::Model>)]| {
+            kv_batch_state(
+                &rows
+                    .iter()
+                    .map(|(path, row)| (&space, get, *path, row.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let base = state(&[(&a, Some(row.clone())), (&x, None)]);
+        let variants = [
+            current_kv::Model {
+                seq: 8,
+                ..row.clone()
+            },
+            current_kv::Model {
+                epoch: crate::hash::hash(b"other epoch"),
+                ..row.clone()
+            },
+            current_kv::Model {
+                epoch_seq: 4,
+                ..row.clone()
+            },
+            current_kv::Model {
+                value: crate::hash::hash(b"a2"),
+                ..row.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                state(&[(&a, Some(variant.clone())), (&x, None)]),
+                base,
+                "{variant:?}"
+            );
+        }
+        assert_ne!(state(&[(&a, None), (&x, None)]), base, "present vs absent");
+        assert_ne!(
+            state(&[(&a, Some(row.clone())), (&y, None)]),
+            base,
+            "key sets that differ only in an absent key"
+        );
+        assert_eq!(state(&[(&a, Some(row)), (&x, None)]), base);
     }
 
     #[tokio::test]
@@ -9163,7 +9363,7 @@ mod test {
         else {
             return;
         };
-        // `key = ANY($2)` takes any number of keys in one statement.
+        // `unnest($3)` takes any number of keys in one statement.
         assert_kv_lookup_statement_counts(&mut fixture.conn.clone(), 1).await;
     }
 
@@ -12264,6 +12464,9 @@ mod test {
                 callback_url: "https://example.com/hook".to_string(),
                 encrypted_secret: vec![0u8; 4],
                 encrypted_secret_format: 0,
+                header_names_json: None,
+                encrypted_headers: None,
+                encrypted_headers_format: 0,
                 secret_key_id: "kid".to_string(),
                 active: true,
                 created_at: rfc3339(OffsetDateTime::now_utc()),
@@ -13652,6 +13855,85 @@ mod test {
         assert_eq!(listed, vec![wanted]);
     }
 
+    /// TC-3211: the batch lookup seeks each key even in PostgreSQL's generic
+    /// plan, the one a prepared statement switches to after five executions.
+    /// The old `key = ANY($3)` filter's generic plan walked the whole space on
+    /// `idx_current_kv_space_order` and filtered every row against the array.
+    #[tokio::test]
+    async fn postgres_kv_batch_lookup_generic_plan_seeks_each_key() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_batch_lookup_generic_plan_seeks_each_key",
+        )
+        .await
+        else {
+            return;
+        };
+        let conn = &fixture.conn;
+        let keys: Vec<String> = (0..300).map(|i| format!("items/{i:03}")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let space = seed_kv_keys(conn, "pg-batch-lookup-plan", &refs).await;
+        conn.execute_unprepared("ANALYZE current_kv").await.unwrap();
+
+        let tx = conn.begin().await.unwrap();
+        tx.execute_unprepared("SET LOCAL plan_cache_mode = force_generic_plan")
+            .await
+            .unwrap();
+        tx.execute_unprepared(&format!(
+            "PREPARE tc3211_lookup(text, boolean, text[]) AS {KV_LOOKUP_POSTGRES}"
+        ))
+        .await
+        .unwrap();
+        let plan = tx
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) EXECUTE \
+                     tc3211_lookup('{space}', false, ARRAY['items/007', 'items/250', 'absent'])"
+                ),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get_by_index::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        tx.execute_unprepared("DEALLOCATE tc3211_lookup")
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        println!("TC-3211 generic plan:\n{plan}");
+
+        assert!(
+            plan.contains("Function Scan on unnest"),
+            "one probe per key: {plan}"
+        );
+        assert!(
+            plan.lines()
+                .any(|line| line.contains("Index Cond") && line.contains("= k.key")),
+            "each key is an index condition: {plan}"
+        );
+        assert!(!plan.contains("ANY"), "no array filter: {plan}");
+        assert!(
+            !plan.contains("idx_current_kv_space_order"),
+            "the space is not walked: {plan}"
+        );
+
+        let found = get_kv_entities(
+            conn,
+            &space,
+            &[
+                &"items/007".parse().unwrap(),
+                &"items/250".parse().unwrap(),
+                &"absent".parse().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        let mut found: Vec<&str> = found.keys().map(String::as_str).collect();
+        found.sort_unstable();
+        assert_eq!(found, ["items/007", "items/250"]);
+    }
+
     /// TC-1274: SQLite needs no `COLLATE` index. Its `BINARY` bounds already
     /// seek on `idx_current_kv_space_deleted_key` for a prefix ending in `/`,
     /// so the migration is a no-op there. (A bare prefix is an `OR` with the
@@ -13699,6 +13981,9 @@ mod test {
                 callback_url: format!("https://example.com/{id}"),
                 encrypted_secret: Vec::new(),
                 encrypted_secret_format: 0,
+                header_names_json: None,
+                encrypted_headers: None,
+                encrypted_headers_format: 0,
                 secret_key_id: "primary".to_string(),
                 active: true,
                 created_at: id.to_string(),

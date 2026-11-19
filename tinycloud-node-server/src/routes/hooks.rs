@@ -229,7 +229,9 @@ async fn mint_hook_ticket(
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation)?;
-    let parent_exp = find_parent_expiry(invocation, tinycloud)
+    // The current effective end of the cited delegations (renewal stamps
+    // included), never a projected one: see `find_parent_expiry`.
+    let parent_exp = find_parent_expiry(&invocation.parents, tinycloud, now.unix_timestamp())
         .await?
         .unwrap_or(invocation_exp);
     let requested_ttl = request
@@ -339,25 +341,40 @@ pub async fn hook_events<'r>(
             tinycloud_core::request_telemetry::observe_space(&space);
         }
     }
+    // Each open (and reopen) re-checks the ticket's authority: the whole
+    // delegation chain for revocation (the cited delegations and every
+    // ancestor), and the chain's current effective end, recomputed now. The
+    // stream ends at the earliest of the ticket's `exp`, its `parent_exp`,
+    // that current end and `max_ticket_ttl_seconds` from now. A stream open
+    // when a delegation in the chain is revoked, or when stamping stops, is
+    // not re-checked: it ends at its deadline, at most
+    // `hooks.max_ticket_ttl_seconds` (300 s by default) later, and the reopen
+    // is refused. Hooks only signal; content is read through KV, which checks
+    // revocation and the effective end per request.
     let revoked = std::sync::Mutex::new(None);
+    let current_end = std::sync::Mutex::new(None);
     let stream_deadline = hook_stream_deadline(
         &claims,
         hooks.config().max_ticket_ttl_seconds,
         || async {
-            match tinycloud
+            if let Some(code) = tinycloud
                 .delegation_chains_revocation(&claims.authorizing_delegations)
                 .await
                 .map_err(|error| (Status::InternalServerError, error.to_string()))?
             {
-                None => Ok(()),
-                Some(code) => {
-                    *revoked.lock().unwrap() = Some(code);
-                    Err((
-                        Status::Unauthorized,
-                        "hook ticket authority revoked".to_string(),
-                    ))
-                }
+                *revoked.lock().unwrap() = Some(code);
+                return Err((
+                    Status::Unauthorized,
+                    "hook ticket authority revoked".to_string(),
+                ));
             }
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let end = find_parent_expiry(&claims.authorizing_delegations, tinycloud, now).await?;
+            if end.is_some_and(|end| end <= now) {
+                return Err((Status::Unauthorized, "hook ticket expired".to_string()));
+            }
+            *current_end.lock().unwrap() = end;
+            Ok(())
         },
         OffsetDateTime::now_utc,
     )
@@ -366,6 +383,17 @@ pub async fn hook_events<'r>(
         Some(code) => InvokeError::Revoked(code, message),
         None => InvokeError::Text(status, message),
     })?;
+    let stream_deadline = match current_end
+        .lock()
+        .unwrap()
+        .and_then(|end| OffsetDateTime::from_unix_timestamp(end).ok())
+    {
+        Some(end) => stream_deadline.min(
+            rocket::tokio::time::Instant::now()
+                + Duration::try_from(end - OffsetDateTime::now_utc()).unwrap_or_default(),
+        ),
+        None => stream_deadline,
+    };
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
@@ -424,6 +452,9 @@ pub struct HookWebhookRequest {
     pub abilities: Vec<String>,
     pub callback_url: String,
     pub secret: String,
+    /// TC-3123: write-only custom delivery headers. `null`/absent/`{}` = none.
+    #[serde(default)]
+    pub headers: Option<crate::webhook_headers::WebhookHeaders>,
 }
 
 #[derive(Debug, Clone, FromForm)]
@@ -444,6 +475,8 @@ pub struct HookWebhookResponse {
     pub abilities: Vec<String>,
     pub callback_url: String,
     pub secret_key_id: String,
+    /// TC-3123: registered custom header names; values are never returned.
+    pub header_names: Vec<String>,
     pub active: bool,
     pub created_at: String,
 }
@@ -510,8 +543,29 @@ pub async fn create_webhook(
         request.secret.as_bytes(),
         RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
     );
+    let (header_names_json, encrypted_headers, encrypted_headers_format) = match request
+        .headers
+        .as_ref()
+        .filter(|headers| !headers.is_empty())
+    {
+        None => (None, None, 0),
+        Some(headers) => (
+            Some(
+                serde_json::to_string(&headers.names())
+                    .expect("serializing header names cannot fail"),
+            ),
+            Some(webhook_encryption.encrypt(
+                &headers.sealed_plaintext(),
+                crate::webhook_headers::binding(&[id.as_bytes()]),
+            )),
+            2,
+        ),
+    };
     let model = hook_subscription::Model {
         encrypted_secret_format: 2,
+        header_names_json,
+        encrypted_headers,
+        encrypted_headers_format,
         id,
         subscriber_did: invocation.info().invoker.clone(),
         space_id: normalized.space.clone(),
@@ -769,6 +823,11 @@ pub fn normalize_webhook_request(
     if request.secret.len() > 256 {
         return Err((Status::BadRequest, "secret exceeds 256 bytes".to_string()));
     }
+    if let Some(headers) = &request.headers {
+        headers
+            .validate()
+            .map_err(|message| (Status::BadRequest, message))?;
+    }
     validate_callback_length(&request.callback_url)?;
 
     let url = reqwest::Url::parse(&request.callback_url)
@@ -900,6 +959,9 @@ pub fn webhook_response_from_model(
     let abilities = model
         .abilities()
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let header_names = model
+        .header_names()
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     Ok(HookWebhookResponse {
         id: model.id.clone(),
@@ -910,6 +972,7 @@ pub fn webhook_response_from_model(
         abilities,
         callback_url: model.callback_url.clone(),
         secret_key_id: model.secret_key_id.clone(),
+        header_names,
         active: model.active,
         created_at: model.created_at.clone(),
     })
@@ -942,11 +1005,22 @@ fn hook_subscription_id(
     hasher.finalize().to_cid(0x55).to_string()
 }
 
+/// The current effective end of the delegations that authorize a hook ticket:
+/// the earliest, over the cited delegations, of the end `/invoke` reads use.
+/// That is the authorization graph's effective end
+/// (`SpaceDatabase::delegation_effective_expiry`): the latest admitted
+/// renewal stamp of this node's current renewer epoch (stamps of older epochs
+/// or that fail verification are ignored), capped by every ancestor's
+/// effective end. Without one, as for `/invoke`, the signed expiry applies. It
+/// is never a projected end: a stamp counts only once it is stored, so when
+/// stamping stops the end stays at the last stamp's end. `None` when nothing
+/// in the chain expires.
 async fn find_parent_expiry(
-    invocation: &InvocationInfo,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
     tinycloud: &TinyCloud,
+    now: i64,
 ) -> Result<Option<i64>, (Status, String)> {
-    if invocation.parents.is_empty() {
+    if parents.is_empty() {
         return Ok(None);
     }
 
@@ -955,22 +1029,31 @@ async fn find_parent_expiry(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    let parent_ids: Vec<Hash> = invocation
-        .parents
-        .iter()
-        .map(|cid| Hash::from(*cid))
-        .collect();
+    let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
 
-    let expiries = delegation::Entity::find()
+    let signed = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
         .all(&tx)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    drop(tx);
 
-    Ok(expiries
-        .into_iter()
-        .filter_map(|delegation| delegation.expiry.map(|expiry| expiry.unix_timestamp()))
-        .min())
+    let mut end = None;
+    for parent in signed {
+        let effective = tinycloud
+            .delegation_effective_expiry(parent.id, now)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        // A chain with no expiry anywhere resolves to `i64::MAX`.
+        let parent_end = effective
+            .or(parent.expiry.map(|expiry| expiry.unix_timestamp()))
+            .filter(|parent_end| *parent_end != i64::MAX);
+        end = match (end, parent_end) {
+            (Some(end), Some(parent_end)) => Some(std::cmp::min(end, parent_end)),
+            (end, parent_end) => end.or(parent_end),
+        };
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
@@ -1090,6 +1173,7 @@ mod tests {
             path: Some("documents/1".to_string()),
             database_path: None,
             table_name: None,
+            row_id: None,
             actor: "did:key:actor".to_string(),
             epoch: "epoch".to_string(),
             event_index: 1,
@@ -1150,6 +1234,7 @@ mod tests {
             path: Some("documents/1".to_string()),
             database_path: None,
             table_name: None,
+            row_id: None,
             actor: "did:key:actor".to_string(),
             epoch: "epoch".to_string(),
             event_index: 1,
@@ -1232,6 +1317,7 @@ mod tests {
                 path: Some(format!("documents/{index}")),
                 database_path: None,
                 table_name: None,
+                row_id: None,
                 actor: "did:key:actor".to_string(),
                 epoch: "epoch".to_string(),
                 event_index: index,
@@ -1351,6 +1437,7 @@ mod tests {
             abilities: vec!["tinycloud.kv/put".to_string()],
             callback_url: "https://example.com/hooks".to_string(),
             secret: "dev-secret".to_string(),
+            headers: None,
         };
 
         let policy = EgressPolicy::from_config(&Config::default(), None).unwrap();
@@ -1376,6 +1463,7 @@ mod tests {
                 abilities: vec!["tinycloud.kv/put".to_string()],
                 callback_url: callback_url.to_string(),
                 secret: "dev-secret".to_string(),
+                headers: None,
             };
             assert!(
                 normalize_webhook_request(
@@ -1549,6 +1637,9 @@ mod tests {
                 .tinycloud
                 .create_hook_subscription(hook_subscription::Model {
                     encrypted_secret_format: 2,
+                    header_names_json: None,
+                    encrypted_headers: None,
+                    encrypted_headers_format: 0,
                     id: id.clone(),
                     subscriber_did: did_of(&fixture.session.1).into(),
                     space_id: fixture.space.to_string(),
@@ -1771,6 +1862,221 @@ mod tests {
         Ok(())
     }
 
+    const TC3123_AUTH: &str = "Bearer tc3123-value-marker";
+    const TC3123_KEY: &str = "tc3123-key-marker";
+
+    async fn tc3123_register(
+        fixture: &HookRouteFixture,
+        callback: &str,
+        headers: serde_json::Value,
+    ) -> Result<(Status, String)> {
+        let header = fixture.session_header(&[(
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"],
+        )])?;
+        let response = fixture
+            .client
+            .post("/hooks/webhooks")
+            .header(rocket::http::Header::new("Authorization", header))
+            .header(rocket::http::ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "space": fixture.space.to_string(), "service": "kv", "pathPrefix": "documents",
+                    "callbackUrl": callback, "secret": "secret", "headers": headers,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        Ok((
+            response.status(),
+            response.into_string().await.unwrap_or_default(),
+        ))
+    }
+
+    /// TC-3123: registered headers are write-only (names on create and list),
+    /// sealed and row-bound at rest, and sent byte-exact with the HMAC intact.
+    #[tokio::test]
+    async fn tc3123_custom_headers_round_trip_names_only_and_sealed() -> Result<()> {
+        use crate::egress::test_support::{callback_server, TestLookup};
+        use tinycloud_core::models::hook_delivery;
+        let mut callback = callback_server(200, None).await?;
+        let lookup = std::sync::Arc::new(TestLookup::default());
+        lookup.set("callback.test", &["127.0.0.1"]).await;
+        let policy = std::sync::Arc::new(
+            EgressPolicy::for_test(vec![], lookup.clone(), true)
+                .with_test_root(callback.certificate.clone()),
+        );
+        let fixture = hook_route_fixture_with_policy(
+            &[
+                ("hooks", "kv/documents", "tinycloud.hooks/register"),
+                ("hooks", "kv/documents", "tinycloud.hooks/list"),
+            ],
+            policy.clone(),
+        )
+        .await?;
+        let (status, body) = tc3123_register(
+            &fixture,
+            &callback.url,
+            serde_json::json!({"X-Api-Key": TC3123_KEY, "Authorization": TC3123_AUTH}),
+        )
+        .await?;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(!body.contains("marker"), "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            created["headerNames"],
+            serde_json::json!(["Authorization", "X-Api-Key"])
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let (status, body) =
+            fixture
+                .list(fixture.session_header(&[(
+                    fixture.hooks("kv/documents")?,
+                    &["tinycloud.hooks/list"],
+                )])?)
+                .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(!body.contains("marker"), "{body}");
+        let listed: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            listed[0]["headerNames"],
+            serde_json::json!(["Authorization", "X-Api-Key"])
+        );
+
+        // At rest: no column holds a value; the sealed bytes open only under
+        // this row's binding.
+        let stored = fixture
+            .tinycloud
+            .find_hook_subscription(&id)
+            .await?
+            .unwrap();
+        let sealed = stored.encrypted_headers.clone().unwrap();
+        assert_eq!(stored.encrypted_headers_format, 2);
+        for marker in [TC3123_AUTH, TC3123_KEY, "marker"] {
+            let marker = marker.as_bytes();
+            for bytes in [&sealed, &stored.encrypted_secret] {
+                assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+            }
+        }
+        // Every column is a Model field: bytes above, text columns via Debug.
+        assert!(!format!("{stored:?}").contains("marker"));
+        let encryption = ColumnEncryption::new([3; 32]);
+        assert!(encryption
+            .decrypt_recorded(
+                &sealed,
+                crate::webhook_headers::binding(&[b"sub_other".as_slice()]),
+                2,
+            )
+            .is_err());
+        assert!(encryption
+            .decrypt_recorded(
+                &sealed,
+                RowBinding::new("hook_subscription", "encrypted_secret", &[id.as_bytes()]),
+                2
+            )
+            .is_err());
+
+        tc1132_queue(&fixture, &id, "delivery_tc3123").await?;
+        crate::webhook_dispatcher::WebhookDispatcher::new(
+            fixture.tinycloud.clone(),
+            crate::config::HooksConfig::default(),
+            encryption,
+            policy,
+        )?
+        .dispatch_due_once()
+        .await?;
+        let (body, headers) =
+            tokio::time::timeout(Duration::from_secs(2), callback.requests.recv())
+                .await?
+                .unwrap();
+        assert_eq!(headers["Authorization"], TC3123_AUTH);
+        assert_eq!(headers["X-Api-Key"], TC3123_KEY);
+        assert_eq!(headers.get_all("Authorization").iter().count(), 1);
+        let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(b"secret")?;
+        hmac::Mac::update(&mut mac, &body);
+        let signature = format!(
+            "sha256={}",
+            hex::encode(hmac::Mac::finalize(mac).into_bytes())
+        );
+        assert_eq!(headers["X-TinyCloud-Signature"], signature);
+        assert_eq!(headers["X-TinyCloud-Subscription-Id"], id);
+        assert_eq!(headers["Content-Type"], "application/json");
+        let delivery = hook_delivery::Entity::find_by_id("delivery_tc3123")
+            .one(&fixture.db)
+            .await?
+            .unwrap();
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DELIVERED
+        );
+        Ok(())
+    }
+
+    /// TC-3123: injection and reserved names are refused before anything is
+    /// stored, and no refusal echoes a value.
+    #[tokio::test]
+    async fn tc3123_header_refusals_store_nothing_and_never_echo_values() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/register")]).await?;
+        let long = "v".repeat(1025);
+        for (headers, expected) in [
+            (
+                serde_json::json!({"Authorization": "Bearer marker\r\nX-Evil: 1"}),
+                "headers: invalid value for header \"Authorization\"",
+            ),
+            (
+                serde_json::json!({"Authorization": "marker\u{0}"}),
+                "headers: invalid value for header \"Authorization\"",
+            ),
+            (
+                serde_json::json!({"X-TinyCloud-Signature": "sha256=marker"}),
+                "headers: header \"X-TinyCloud-Signature\" is reserved",
+            ),
+            (
+                serde_json::json!({"hOsT": "marker.example"}),
+                "headers: header \"hOsT\" is reserved",
+            ),
+            (
+                serde_json::json!({"Bad Name": "marker"}),
+                "headers: invalid header name",
+            ),
+            (
+                serde_json::json!({"X-Key": "marker", "x-KEY": "marker"}),
+                "headers: duplicate header \"x-KEY\"",
+            ),
+            (
+                serde_json::json!({"X-Long": format!("marker{long}")}),
+                "headers: value for header \"X-Long\" exceeds 1024 bytes",
+            ),
+        ] {
+            let (status, body) =
+                tc3123_register(&fixture, "https://1.1.1.1/hooks", headers).await?;
+            assert_eq!(status, Status::BadRequest, "{body}");
+            assert_eq!(body, expected);
+        }
+        assert_eq!(fixture.persisted_rows().await?[4], 0);
+
+        // Absent, null and empty headers register with no names and no sealed column.
+        for headers in [serde_json::Value::Null, serde_json::json!({})] {
+            let (status, body) =
+                tc3123_register(&fixture, "https://1.1.1.1/hooks", headers).await?;
+            assert_eq!(status, Status::Ok, "{body}");
+            let created: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(created["headerNames"], serde_json::json!([]));
+            let stored = fixture
+                .tinycloud
+                .find_hook_subscription(created["id"].as_str().unwrap())
+                .await?
+                .unwrap();
+            assert_eq!(stored.header_names_json, None);
+            assert_eq!(stored.encrypted_headers, None);
+            assert_eq!(stored.encrypted_headers_format, 0);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn tc1132_healthy_refresh_preserves_authorized_delivery() -> Result<()> {
         use crate::egress::test_support::{callback_server, GatedLookup};
@@ -1922,6 +2228,9 @@ mod tests {
     async fn converts_subscription_model_without_secret() {
         let model = hook_subscription::Model {
             encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: "sub_01".to_string(),
             subscriber_did: "did:key:test".to_string(),
             space_id: "tinycloud:space".to_string(),
@@ -2861,6 +3170,9 @@ mod tests {
             .tinycloud
             .create_hook_subscription(hook_subscription::Model {
                 encrypted_secret_format: 0,
+                header_names_json: None,
+                encrypted_headers: None,
+                encrypted_headers_format: 0,
                 id: "sub_existing".to_string(),
                 subscriber_did: "did:key:someone-else".to_string(),
                 space_id: fixture.space.to_string(),
@@ -3382,6 +3694,9 @@ mod tests {
         let space = fixture.space.to_string();
         let row = |id: &str, path_prefix: &str| hook_subscription::Model {
             encrypted_secret_format: 0,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: id.to_string(),
             subscriber_did: "did:key:other-subscriber".to_string(),
             space_id: space.clone(),

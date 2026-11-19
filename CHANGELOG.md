@@ -3,13 +3,89 @@
 ## [Unreleased]
 ### Changes
 - DuckDB: a delegation with the `read_only` caveat allows only queries, `EXPLAIN` and transaction statements, whatever its ability tier. Any other statement (for example `PREPARE`, `EXECUTE`, `CALL`, `COPY`) is refused with a read-only violation. Details: TC-3035.
+- Revocation: the delegator of a delegation D can now give D's own delegatee the right to revoke exactly D. The delegator issues a parentless delegation, to D's delegatee only, carrying exactly one capability: `tinycloud.delegation/revoke` on exactly `urn:cid:<D>`. D must already be on the node, and the grant must expire no later than D. Any other audience, extra capability, wildcard, or `<space>/delegation` scope is still refused, as before. The delegatee then revokes D through the existing `/revoke`, presenting that grant as its one proof. The grant stops working when it is itself revoked, and when the chain D was issued under is revoked. It reaches no other delegation: not D's parent, not a sibling. Owner-issued grants are unchanged. No route, migration or config change. Details: TC-3150.
+- Read audits no longer write `parent_delegations` rows: about 370 bytes less per read for each delegation it cites (table plus indexes, PostgreSQL 18). A read citing one delegation with one capability goes from about 2,174 to about 1,800 bytes, about 17% less. Reads also stop growing `parent_delegations`, the table the permission check searches. A read's audit record (every `/invoke` that changes no KV data: KV get, list, metadata and sync, capabilities read, and SQL/DuckDB authorization) keeps its `actor`, `invocation` and `invoked_abilities` rows: the space purge (TC-2871) finds a space's reads through `invoked_abilities`, and the database migration inventory attributes SQL databases through them. The cited parents stay inside the signed `serialization`. KV writes still store all four. Existing rows are kept; no migration. On PostgreSQL a read-audit batch is still one statement, and one with more than 65,535 parameters still falls back to one transaction. Rollback: v1.26.9 and v1.26.10 read these records as they are, since the permission check walks parent edges upward from a delegation, never from a read. After a rollback the older node writes the parent rows again; mixed history is harmless. Details: TC-3259.
+- PostgreSQL: a batch KV read seeks each key, also after the database starts reusing a generic plan. The batch lookup of live `current_kv` rows used `key = ANY($3)`. After five runs of the prepared statement, PostgreSQL's generic plan walked the whole space on `idx_current_kv_space_order` and checked each row against the array. In production that read about 740 buffer pages for 44 rows, and it was 58% of query CPU. The lookup is now one `LIMIT 1` lateral probe per key over `unnest($3)`, and every plan seeks on `(space, deleted, key)` or the primary key. Same rows, same single statement; no migration and no database setting. Details: TC-3211.
+- A batch KV read (two or more `kv/get`, or two or more `kv/metadata`, in one `/invoke`) answers with an `ETag` (`"kv-batch-…"`) and `Cache-Control: private, no-cache`. The tag names the keys, the ability, and the write position and value digest of each key's live row (or its absence), taken from the rows the batch already looks up, so it costs no extra statement. Sent back in `If-None-Match`, it answers `304` with no body while none of those keys has been written or deleted. The invocation is still authorized and its read still audited, but no value is read. Writes to keys outside the batch leave the tag unchanged. A batch that answers a live key as not found because its stored value can't be read carries no `ETag`, so a client never caches that answer under the state of a present key. Previously a non-`*` `If-None-Match` on a batch read answered 400. Details: TC-3217.
+- Renewals: an operator can pause and resume all scheduled renewal stamps on a node with `PUT /admin/renewals` `{"paused":true|false}` (admin Bearer secret; `GET` reads the state). The switch is persisted in the node database (one migration, `m20261117_000000_renewal_switch`, seeded as running, so nothing changes on deploy) and is re-checked inside the stamp transaction. Lease registration and already-issued stamps are unchanged while paused; a grant that ends while paused is not revived on resume. Runbook: `docs/runbooks/renewal-leases.md`. Details: TC-3163.
+- Hooks honour renewal stamps. A hook ticket's `parent_exp` is now the cited delegations' current effective end, the one `/invoke` reads use: the latest admitted stamp of the node's current renewer epoch, capped by every ancestor, else the signed expiry. It is recomputed at every `/hooks/events` open and reopen, so a renewed grant (including an owner-lease-renewed one) keeps its subscription past its signed expiry, and a stream ends at the earliest of its ticket's `exp`, that current end and `hooks.max_ticket_ttl_seconds` (300 s by default) after it opened. Each open still checks the whole chain for revocation; a stream already open when a delegation in its chain is revoked, or when stamping stops, ends at that deadline and its reopen is refused. Unrenewed grants are unchanged. `/info` reports `hooks-effective-end-v1`. Details: TC-3174.
+- Signed KV URLs honour renewal stamps. `POST /signed/kv` caps a URL at the cited delegations' current effective end, the one `/invoke` reads use (the latest admitted stamp of the node's current renewer epoch, capped by every ancestor, else the cited delegation's signed expiry), instead of the signed expiry, so a renewed grant can mint one past its signed expiry. Every `GET /signed/kv/<id>` recomputes that end and answers 401 `signed URL expired` once it has passed, even before the URL's stored `expiresAt`, for example when the grant's lease is revoked. Unrenewed grants are unchanged. Details: TC-3176.
+- Signed KV URLs re-check revocation at every use. `GET /signed/kv/<id>` checks the whole delegation chain the URL was minted under (the cited delegations and every ancestor) and answers 401 `signed URL authority revoked` once any is revoked. Before, revocation was checked only at mint, so an already-minted URL kept serving content until its `expiresAt` (up to 300 s). Details: TC-3177.
 - SQLite stamp replay deadlines now use the same timestamp encoding as cleanup (TC-2920).
+- Metrics: the PostgreSQL pool's timeouts in effect are exported, so an operator can read them back without the startup log: `tinycloud_db_idle_in_transaction_timeout_ms` (0 when none is set, including `local` statement-timeout mode), `tinycloud_db_statement_timeout_ms` (0 when off) and `tinycloud_db_statement_timeout_mode{mode="session"|"local"|"off"}` (1 on the mode in effect). Values only; no connection details (TC-3178).
 - PostgreSQL database artifacts use uncompressed external storage for new writes to avoid repeated decompression during chunked reads (TC-2917). Existing large artifacts require an operator re-toast; verify both storage settings after rollout and follow `scripts/tc2917-README.md` if lock contention deferred the migration.
 - Encryption: v2 column format with key ids, per-purpose keys and recorded format metadata. Optional strict reads are off by default. Details: TC-2516, TC-2517.
 - Encryption network key-wrap v1 uses the explicit legacy column codec after the TC-2516 integration; wire bytes and default-off v2 writer flags are unchanged. Details: TC-2518.
 - Deploys: the workflow supports an explicit, reason-recorded rollback to an earlier released dstack image on the unchanged N0 compose. It checks image labels, release tag, ancestry, and identical migration sources while preserving the normal forward-release guard.
 - A new Policy/v3 registration records the share key its content source names (`share/<shareId>` on the owner's `default` network) in the registration's transaction, so publishing a share needs no `tinycloud.encryption/key.create` grant: the publisher encrypts to the key's public key and registers. A missing key is created at `keyVersion` 1 and counts toward the network's key limit; at the limit the registration answers 403 `key_limit_exceeded` and stores nothing. An existing key keeps its state. The registration now also requires the source's network to exist and be active. Docs: `docs/encryption-named-keys.md`. Details: TC-2525
 - Share-email issuer trust bundles can pin one next key for the same issuer DID during an explicit UTC overlap window. The legacy key stops at `issuerNotAfter`; malformed, duplicate, unbounded or expired overlaps fail startup and `--validate-config`. Existing single-key bundles remain unchanged. This is node-side trust support only: the OpenCredentials witness and js-sdk policy contract must also support key rotation before activation. Older node images reject overlap fields; restore the previous single-key bundle before rollback. See `deploy/share-email/production-trust-bundle-contract.md`.
+- Webhook registration (`POST /hooks/webhooks`) accepts optional write-only `headers` (`{name: value}`). They are sent on every delivery alongside the unchanged `X-TinyCloud-*` headers and HMAC signature, so a callback that requires its own credential (`Authorization: Bearer …`) can be woken. Validation:
+  - At most 8 headers, 4096 bytes in total.
+  - Names are RFC 7230 tokens of up to 64 bytes.
+  - Values are 1–1024 bytes of printable ASCII (0x20–0x7E), so no tab, CR, LF or NUL, and no leading or trailing space.
+  - Case-insensitive duplicates are refused.
+  - Reserved names are refused: `Host`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Content-MD5`, `Content-Range`, `Transfer-Encoding`, `Accept-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie`, `Cookie2`, `Set-Cookie`, `Forwarded`, `Via`, `X-Real-IP`, and anything starting `Proxy-`, `Sec-`, `X-Forwarded-` or `X-TinyCloud-`.
+  - A refusal returns 400 and stores nothing.
+  - A body that fails to parse (for example `headers` sent as a string) answers 422, and no part of it reaches a log line at any log level.
+
+  Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
+- SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
+
+## [1.26.10] - 2026-11-18
+
+Ships the changes merged since 1.26.9 (#611, #615, #622, #626, #627), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **Two database migrations, fix-forward only** (both run at boot and are additive):
+  - `m20261117_000000_hook_subscription_headers` adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged.
+  - `m20261117_000000_renewal_switch` adds the node-wide renewal switch, seeded as running, so nothing changes on deploy.
+
+  The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.10 is fixed forward, not rolled back to 1.26.9. Two older migration files change only inside their `#[cfg(test)]` modules (`m20260725_000000_request_path_indexes`, `m20261005_000000_deactivate_hook_subscriptions`: test fixtures gain the new `hook_subscription` columns); their migration code is unchanged.
+
+### Changes
+
+- PostgreSQL: a batch KV read seeks each key under a generic plan too (TC-3211, #627).
+- A batch KV read answers with an `ETag`, and `If-None-Match` answers `304` while none of its keys changed (TC-3217, #626).
+- Renewals: an operator can pause and resume all scheduled renewal stamps with `PUT /admin/renewals` (TC-3163, #622).
+- Hook tickets and signed KV URLs honour renewal stamps (the cited delegations' current effective end), and signed KV URLs re-check whole-chain revocation at every use (TC-3174, TC-3176, TC-3177, #622).
+- Metrics: the PostgreSQL pool's timeouts in effect are exported (TC-3178, #622).
+- Webhooks accept optional write-only custom `headers`, and SQL write events carry `rowId` for a single-row insert (TC-3123, #611).
+- Docs: `docs/releasing.md` and comments in `.github/workflows/docker.yml` say `PROD_TINYCLOUD_ADMIN_SECRET` is a production-environment secret (#615; comments only, no workflow change).
+
+## [1.26.9] - 2026-11-17
+
+Ships the 1.26.6 changes below, which were built but never deployed, on top of 1.26.8 (1.26.5 plus the TC-3076 fix and a rotated admin secret).
+
+### Upgrade notes
+
+- **One database migration, fix-forward only:** `m20261113_010000_artifact_chunks` (PostgreSQL, runs at boot, waits at most 500 ms for each table lock; details under 1.26.6). The deploy workflow's audited rollback only returns to a release with identical migrations, so a bad 1.26.9 is fixed forward, not rolled back to 1.26.8.
+- **Read limit:** a SQL or DuckDB database whose stored checkpoint or WAL delta is over 64 MiB is no longer loaded and answers `507 sql_database_size_limit` until it is converted to checkpoint parts. Nothing is deleted. Details: TC-2961.
+- Checkpoint saves, idle transactions and the N0 compose template change as in the 1.26.6 upgrade notes.
+
+### Changes
+
+- The 16 Nov incident fixes, detailed under 1.26.6:
+  - whole-checkpoint saves over 8 MiB run without a transaction, and at most two large artifact transfers run at once per node (TC-2961);
+  - PostgreSQL ends transactions left idle for 5 minutes, and a protected legacy meeting write waits for its space's write order before opening its transaction (TC-2954);
+  - `/invoke` refuses a KV write mixed with a read before any work, `POST /delegate` and `POST /revoke` check signatures before any lock, and Policy/v3 mint and registration no longer re-verify under their locks (TC-2986);
+  - opt-in PostgreSQL checkpoint parts (off by default), and disk headroom as a shipped log event and metrics (TC-2917).
+- Unchanged from 1.26.8: the TC-3076 child-expiry fix and the rotated admin secret.
+- Docs: README and `TinyCloud.md` copy aligned with the documented trust model.
+
+## [1.26.8] - 2026-11-17
+
+### Changes
+
+- No code changes: rebuild to carry a rotated admin secret.
+
+## [1.26.7] - 2026-11-16
+
+Hotfix built from 1.26.5: it does not contain the 1.26.6 changes below.
+
+### Changes
+
+- `POST /delegate` accepts a child delegation that expires at its parent's exact expiry, milliseconds included, again. Since 1.26.0 the parent's end was read in whole seconds, so a child expiring in the parent's last partial second was refused with 401 "Child delegation expiry exceeds parent expiry". A child expiring even 1 ms after its parent is still refused, and a renewed parent's end is unchanged. Details: TC-3076.
 
 ## [1.26.6] - 2026-11-13
 
