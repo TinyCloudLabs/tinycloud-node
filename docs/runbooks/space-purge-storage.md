@@ -12,14 +12,18 @@ Purge acceptance and completion records go to `[storage.purge_ledger]`. They nev
 
 The ledger bucket:
 
-- Create it with Object Lock enabled and a default COMPLIANCE retention. Retention must cover the restore window plus the backup retention: a restore can bring back data that only the ledger proves was purged.
-- Grant the node `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`. Reconciliation and restore read and list the ledger.
-- Deny `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutBucketObjectLockConfiguration`, `s3:BypassGovernanceRetention` and lifecycle changes to every node credential. In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the deny does.
+- Production: `tinycloud-node-purge-ledger` (us-west-1). It has versioning on, Object Lock with a COMPLIANCE default retention of 365 days, all public access blocked, and SSE-S3. The node sets `TINYCLOUD_STORAGE__PURGE_LEDGER__TYPE=S3`, `TINYCLOUD_STORAGE__PURGE_LEDGER__BUCKET=tinycloud-node-purge-ledger` and `TINYCLOUD_STORAGE__PURGE_LEDGER__REGION=us-west-1`.
+- Retention must cover the restore window plus the backup retention, because a restore can bring back data that only the ledger proves was purged. 365 days covers the 14-day backup cap. A record older than 365 days may legally be gone, so reconciliation must never read a missing record as "never purged".
+- The node authenticates with a static IAM user key (`AWS_KEY` / `AWS_SECRET`), not a role. The node IAM user's policy allows `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on the ledger bucket; reconciliation and restore read and list the ledger. The same policy denies `s3:DeleteObject`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:PutBucketObjectLockConfiguration` and `s3:PutLifecycleConfiguration`. That grant is a Sam step and is not applied yet.
+- The bucket policy denies `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` and any request without TLS.
+- In a versioned bucket, a plain `DeleteObject` adds a delete marker that hides a locked record from reads. Object Lock does not stop that; only the IAM deny does.
 - Ledger PUTs carry a SHA-256 checksum, as Object Lock buckets require.
 
 ## 2. Old versions in the data bucket
 
-The data bucket is versioned. A purge deletes current objects, and S3 keeps each deleted object as a noncurrent version. The node does not delete versions and needs no `s3:DeleteObjectVersion` permission. A lifecycle rule on the data bucket expires noncurrent versions 7 days after they become noncurrent, and removes expired delete markers. Purged bytes are therefore gone from the bucket at most 7 days after the purge (plus the provider's lifecycle lag).
+The production data bucket is `tinycloud-production-blocks` (us-west-1). Versioning has never been enabled on it, and it has no lifecycle rules, so a purge's delete is final: no old version remains. The node never deletes versions and needs no `s3:DeleteObjectVersion` permission.
+
+If versioning is ever turned on, a lifecycle rule must be added in the same change. It must expire noncurrent versions 7 days after they become noncurrent and remove expired delete markers. With that rule, purged bytes leave the bucket at most 7 days after the purge, plus the provider's lifecycle lag. Without it, a purge leaves every old version behind.
 
 ## 3. Never Object Lock on the data bucket
 
