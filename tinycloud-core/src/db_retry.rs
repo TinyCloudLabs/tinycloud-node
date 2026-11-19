@@ -372,8 +372,12 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    // Each attempt future lives on the heap: kept inline, a request's whole
+    // operation future is copied into this one several times, which overflows
+    // the 2 MiB test-thread stack in debug builds. Costs one allocation per
+    // attempt.
     if OWNER.try_with(|_| ()).is_ok() {
-        let result = attempt().await;
+        let result = Box::pin(attempt()).await;
         let applied = WRITE_MAY_HAVE_APPLIED
             .try_with(|state| state.applied())
             .unwrap_or(false);
@@ -384,7 +388,7 @@ where
             let started = Instant::now();
             let first_state = Arc::new(WriteState::default());
             let result = WRITE_MAY_HAVE_APPLIED
-                .scope(Arc::clone(&first_state), attempt())
+                .scope(Arc::clone(&first_state), Box::pin(attempt()))
                 .await;
             let first_applied = first_state.applied();
 
@@ -470,7 +474,7 @@ where
             let second_state = Arc::new(WriteState::default());
             let second = tokio::time::timeout(
                 remaining,
-                WRITE_MAY_HAVE_APPLIED.scope(Arc::clone(&second_state), attempt()),
+                WRITE_MAY_HAVE_APPLIED.scope(Arc::clone(&second_state), Box::pin(attempt())),
             )
             .await;
             match second {
