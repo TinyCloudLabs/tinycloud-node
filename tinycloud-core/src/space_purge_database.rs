@@ -52,16 +52,15 @@ pub const PURGED_BY_SPACE: &[(&str, PurgePhase)] = &[
     ("space", PurgePhase::Completion),
 ];
 
-/// Rows keyed by the owner, deleted only when the purge leaves that owner with
-/// no live space on this node: `artifact_account` in
-/// [`delete_verified_empty_inventory`], the encryption-network rows in
-/// [`delete_owner_encryption_networks`].
-pub const PURGED_BY_OWNER: &[&str] = &[
-    "artifact_account",
-    "encryption_network",
-    "encryption_network_key",
-    "encryption_network_member",
-    "encryption_ceremony",
+/// Rows keyed by the owner, and the condition under which a space purge
+/// deletes them: `artifact_account` in [`delete_verified_empty_inventory`],
+/// the encryption-network rows in [`delete_owner_encryption_networks`].
+pub const PURGED_BY_OWNER: &[(&str, &str)] = &[
+    ("artifact_account", "quota counters only, all zero once no artifact row remains and re-created on demand: when the owner has no other live space"),
+    ("encryption_network", "by owner, only after owner retirement, when the owner has no other live space"),
+    ("encryption_network_key", "by owner, only after owner retirement, when the owner has no other live space"),
+    ("encryption_network_member", "by owner, only after owner retirement, when the owner has no other live space"),
+    ("encryption_ceremony", "by owner, only after owner retirement, when the owner has no other live space"),
 ];
 
 /// Tables a space purge does not delete by key, and why.
@@ -74,7 +73,7 @@ pub const RETAINED: &[(&str, &str)] = &[
     ("policy_v3_registration", "signed policy projection: removed with its proof closure by records GC, else shared residue"),
     ("policy_v3_session", "signed policy projection: removed with its proof closure by records GC, else shared residue"),
     ("policy_v3_challenge", "policy challenge: removed with its registration by records GC; expires_at-bounded"),
-    ("encryption_audit", "key-operation audit trail: key.delete keeps it as evidence; owner erase pending the deletion-ledger ruling"),
+    ("encryption_audit", "key-operation audit trail: key.delete keeps it as evidence; erase even after owner retirement awaits the deletion-ledger ruling"),
     ("encryption_nonce", "owner-delete replay nonce: expires_at-bounded, names no space"),
     ("renewal_identity", "this node's own renewer identity, not user data"),
     ("renewal_lease", "renewal state of a signed delegation, keyed by delegation CID, not by space"),
@@ -129,9 +128,17 @@ pub async fn delete_sql_and_hook_rows(
 }
 
 /// Database phase: delete the owner's encryption networks with their keys,
-/// members and ceremonies when this purge leaves the owner with no live space
-/// on this node. Kept separate so it can be gated on its deletion-ledger
-/// evidence. No foreign key references these rows.
+/// members and ceremonies, only when the owner is retired and this purge
+/// leaves them with no live space on this node. Purging an owner's last space
+/// is not account erasure: the owner keeps their DID, and their named keys may
+/// protect data elsewhere. Kept separate so it can be gated on its
+/// deletion-ledger evidence. No foreign key references these rows.
+///
+/// Retired means a `space_retirement` row whose `(owner_hmac, hmac_key_id)`
+/// equals this job's. Known limitations, both failing safe by keeping the
+/// networks: a key rotation that gave the retirement a different key id than
+/// the job; and a job whose owner digest covers the space's DID as written
+/// while retirement covers the canonical DID (EIP-55 case differences).
 ///
 /// Live means a `space` row with no accepted, uncompleted purge: the target
 /// keeps its row until completion, and two concurrently purged last spaces
@@ -147,6 +154,18 @@ pub async fn delete_owner_encryption_networks(
         identity::{canonicalize_principal, did_principal_matches},
         resource::SpaceId,
     };
+    let retired = tx
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT 1 FROM space_purge_job j JOIN space_retirement r
+               ON r.owner_hmac=j.owner_hmac AND r.hmac_key_id=j.hmac_key_id
+             WHERE j.purge_id=$1 AND j.space=$2",
+            [job.purge_id.clone().into(), job.space.clone().into()],
+        ))
+        .await?;
+    if retired.is_none() {
+        return Ok(0);
+    }
     let space: SpaceId = job
         .space
         .parse()
