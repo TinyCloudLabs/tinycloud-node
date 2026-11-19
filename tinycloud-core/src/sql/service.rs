@@ -1013,7 +1013,16 @@ impl SqlService {
             .artifact_repository
             .chunked_checkpoints("sql", &key.0, db_name)
         {
-            let snapshot = handle.snapshot().await?;
+            let wal = if growth != GrowthPolicy::Forbid && expected != ArtifactExpectation::Absent {
+                handle.wal_snapshot(MAX_WAL_DELTA_BYTES as u64).await?
+            } else {
+                None
+            };
+            let is_wal = wal.is_some();
+            let snapshot = match wal {
+                Some(wal) => wal,
+                None => handle.snapshot().await?,
+            };
             let bytes = snapshot
                 .as_file()
                 .metadata()
@@ -1035,8 +1044,17 @@ impl SqlService {
                     (space, db_name),
                     || SqlBusyStage::ArtifactTransfer,
                     self.bounds.artifact_transfer,
-                    self.artifact_repository
-                        .save_snapshot("sql", &key.0, db_name, snapshot, expected),
+                    async {
+                        if is_wal {
+                            self.artifact_repository
+                                .save_wal_snapshot("sql", &key.0, db_name, snapshot, expected)
+                                .await
+                        } else {
+                            self.artifact_repository
+                                .save_snapshot("sql", &key.0, db_name, snapshot, expected)
+                                .await
+                        }
+                    },
                 )
                 .await
             {
@@ -2740,6 +2758,17 @@ mod tests {
             .unwrap()
             .try_get::<String>("", "checkpoint_part_id")
             .unwrap();
+        let checkpoint_bytes: Vec<Vec<u8>> = fixture
+            .conn
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT payload FROM artifact_chunk ORDER BY ordinal".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get("", "payload").unwrap())
+            .collect();
         service
             .execute(
                 &space,
@@ -2810,21 +2839,39 @@ mod tests {
         )).await.unwrap().unwrap();
         assert_eq!(
             state.try_get::<i64>("", "chunks").unwrap(),
-            (current_meta.checkpoint_size_bytes as u64).div_ceil(1024 * 1024) as i64
+            ((current_meta.checkpoint_size_bytes as u64).div_ceil(1024 * 1024)
+                + (current_meta.delta_size_bytes as u64).div_ceil(1024 * 1024)) as i64
         );
         let old_chunks = fixture
             .conn
             .query_one(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
                 "SELECT count(*)::bigint AS chunks FROM artifact_chunk WHERE part_id=$1",
-                [superseded_part.into()],
+                [superseded_part.clone().into()],
             ))
             .await
             .unwrap()
             .unwrap()
             .try_get::<i64>("", "chunks")
             .unwrap();
-        assert_eq!(old_chunks, 0, "superseded checkpoint must be reclaimed");
+        assert_eq!(
+            old_chunks,
+            (current_meta.checkpoint_size_bytes as u64).div_ceil(1024 * 1024) as i64,
+            "WAL publication must retain the base checkpoint"
+        );
+        let unchanged_bytes: Vec<Vec<u8>> = fixture
+            .conn
+            .query_all(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT payload FROM artifact_chunk WHERE part_id=$1 ORDER BY ordinal",
+                [superseded_part.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get("", "payload").unwrap())
+            .collect();
+        assert_eq!(unchanged_bytes, checkpoint_bytes);
         assert!(state.try_get::<i64>("", "max_bytes").unwrap() <= 1024 * 1024);
         assert_eq!(state.try_get::<i64>("", "compressed").unwrap(), 0);
         let meta = repo
@@ -2833,7 +2880,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(meta.revision, 2);
-        assert_eq!(meta.delta_size_bytes, 0);
+        assert!(meta.delta_size_bytes > 0);
+        let old_wal: String = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT delta_part_id FROM database_artifact".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "delta_part_id")
+            .unwrap();
+        let handle = reopened
+            .databases
+            .get(&(space.to_string(), "main".into()))
+            .unwrap()
+            .clone();
+        reopened
+            .persist_write(&space, "main", &handle, GrowthPolicy::Forbid)
+            .await
+            .unwrap();
+        repo.reap_unused_parts(64).await.unwrap();
+        let old_count: i64 = fixture
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT count(*)::bigint AS n FROM artifact_chunk WHERE part_id IN ($1,$2)",
+                [superseded_part.into(), old_wal.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(
+            old_count, 0,
+            "forced checkpoint must reclaim both old parts"
+        );
+        let fresh = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fresh.has_delta());
+        assert_eq!(fresh.revision, 3);
+        assert_eq!(before, reopened.export(&space, "main").await.unwrap());
         reopened
             .discard_local_state(&(space.to_string(), "main".into()))
             .await
