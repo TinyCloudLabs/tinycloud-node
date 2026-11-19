@@ -851,6 +851,39 @@ mod tests {
     }
 
     #[test]
+    fn read_ability_cannot_hide_a_write_after_a_carriage_return_in_a_comment() {
+        let smuggled = "SELECT 1 --\r; DELETE FROM events";
+        let conn = storage::open_connection(None, "128MB").unwrap();
+        conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
+            .unwrap();
+        // DuckDB itself ends the comment at `\r` and runs the DELETE.
+        conn.execute_batch("BEGIN").unwrap();
+        conn.execute_batch(smuggled).unwrap();
+        assert_eq!(row_count(&conn, "events"), 0);
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(row_count(&conn, "events"), 1);
+
+        let request = DuckDbRequest::Query {
+            sql: smuggled.to_string(),
+            params: Vec::new(),
+        };
+        for arrow_format in [false, true] {
+            assert!(matches!(
+                handle_message(
+                    &conn,
+                    &request,
+                    &None,
+                    "tinycloud.duckdb/read",
+                    arrow_format,
+                    None
+                ),
+                Err(DuckDbError::ParseError(_))
+            ));
+        }
+        assert_eq!(row_count(&conn, "events"), 1);
+    }
+
+    #[test]
     fn full_database_allows_existing_schema_delete_and_drop() {
         let conn = storage::open_connection(None, "128MB").unwrap();
         conn.execute_batch(
@@ -981,11 +1014,43 @@ mod tests {
             sql: "COMMIT".to_string(),
             params: Vec::new(),
         };
+        // test-ruling: TC-3430 refuses client transaction control before the
+        // storage guard, so the escape now fails as PermissionDenied; the
+        // contract (no escape, row kept) is unchanged.
         assert!(matches!(
             without_growth(&conn, &escape),
-            Err(DuckDbError::StorageWouldGrow)
+            Err(DuckDbError::PermissionDenied(_))
         ));
         assert_eq!(row_count(&conn, "events"), 1);
+    }
+
+    #[test]
+    fn one_caller_cannot_roll_back_another_callers_write() {
+        let conn = storage::open_connection(None, "128MB").unwrap();
+        conn.execute_batch("CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (1)")
+            .unwrap();
+        let as_writer = |sql: &str| {
+            handle_message(
+                &conn,
+                &execute_request(sql),
+                &None,
+                "tinycloud.duckdb/write",
+                false,
+                None,
+            )
+        };
+        // Caller A opens a transaction; caller B writes on the same connection;
+        // A rolls back. Before TC-3430 B's acknowledged row was lost.
+        assert!(matches!(
+            as_writer("BEGIN"),
+            Err(DuckDbError::PermissionDenied(_))
+        ));
+        assert!(as_writer("INSERT INTO events VALUES (2)").is_ok());
+        assert!(matches!(
+            as_writer("ROLLBACK"),
+            Err(DuckDbError::PermissionDenied(_))
+        ));
+        assert_eq!(row_count(&conn, "events"), 2);
     }
 
     #[test]
