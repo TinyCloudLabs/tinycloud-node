@@ -232,6 +232,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_upgrade_from_the_previous_release_line() {
+        let conn = sqlite().await;
+        let before = through() - 1;
+        Migrator::up(&conn, Some(before)).await.unwrap();
+        assert!(!table_exists(&conn, DbBackend::Sqlite, "sql_store_manifest").await);
+        up_through(&conn).await;
+        assert!(table_exists(&conn, DbBackend::Sqlite, "sql_store_manifest").await);
+        assert!(Migrator::migrations().iter().any(|m| m.name() == VERSION));
+    }
+
+    #[tokio::test]
     async fn postgres_fresh_rerun_and_down() {
         let Some(fixture) = PostgresTestSchema::migrated_through(
             "postgres_sql_store_migration",

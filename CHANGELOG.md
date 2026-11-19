@@ -3,6 +3,9 @@
 ## [Unreleased]
 ### Changes
 - Ops: added a reversible local-config HTTP ingress switch and operator runbook for a separately verified independent Cloudflare origin. Dry-run is the default; production routing and policy execution remain separate. Details: TC-1387.
+- DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
+- DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
+- The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
 - Revocation: the delegator of a delegation D can now give D's own delegatee the right to revoke exactly D. The delegator issues a parentless delegation, to D's delegatee only, carrying exactly one capability: `tinycloud.delegation/revoke` on exactly `urn:cid:<D>`. D must already be on the node, and the grant must expire no later than D. Any other audience, extra capability, wildcard, or `<space>/delegation` scope is still refused, as before. The delegatee then revokes D through the existing `/revoke`, presenting that grant as its one proof. The grant stops working when it is itself revoked, and when the chain D was issued under is revoked. It reaches no other delegation: not D's parent, not a sibling. Owner-issued grants are unchanged. No route, migration or config change. Details: TC-3150.
 - Read audits no longer write `parent_delegations` rows: about 370 bytes less per read for each delegation it cites (table plus indexes, PostgreSQL 18). A read citing one delegation with one capability goes from about 2,174 to about 1,800 bytes, about 17% less. Reads also stop growing `parent_delegations`, the table the permission check searches. A read's audit record (every `/invoke` that changes no KV data: KV get, list, metadata and sync, capabilities read, and SQL/DuckDB authorization) keeps its `actor`, `invocation` and `invoked_abilities` rows: the space purge (TC-2871) finds a space's reads through `invoked_abilities`, and the database migration inventory attributes SQL databases through them. The cited parents stay inside the signed `serialization`. KV writes still store all four. Existing rows are kept; no migration. On PostgreSQL a read-audit batch is still one statement, and one with more than 65,535 parameters still falls back to one transaction. Rollback: v1.26.9 and v1.26.10 read these records as they are, since the permission check walks parent edges upward from a delegation, never from a read. After a rollback the older node writes the parent rows again; mixed history is harmless. Details: TC-3259.
 - PostgreSQL: a batch KV read seeks each key, also after the database starts reusing a generic plan. The batch lookup of live `current_kv` rows used `key = ANY($3)`. After five runs of the prepared statement, PostgreSQL's generic plan walked the whole space on `idx_current_kv_space_order` and checked each row against the array. In production that read about 740 buffer pages for 44 rows, and it was 58% of query CPU. The lookup is now one `LIMIT 1` lateral probe per key over `unnest($3)`, and every plan seeks on `(space, deleted, key)` or the primary key. Same rows, same single statement; no migration and no database setting. Details: TC-3211.
@@ -30,6 +33,19 @@
 
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
+
+## [1.26.11] - 2026-11-19
+
+Ships the changes merged since 1.26.10 (#631, #642), detailed under [Unreleased] above.
+
+### Upgrade notes
+
+- **No database migration.** The migration sources are byte-identical to 1.26.10 (a comment edit from #631 in `m20260725_000000_request_path_indexes` is restored to its 1.26.10 text), so the deploy workflow's audited rollback can return to 1.26.10.
+
+### Changes
+
+- Revocation: a delegator can give its own delegatee an exact-CID grant to revoke exactly that delegation through `/revoke` (TC-3150, #642).
+- Read audits no longer write `parent_delegations` rows; they keep `actor`, `invocation` and `invoked_abilities` (TC-3259, #631).
 
 ## [1.26.10] - 2026-11-18
 
