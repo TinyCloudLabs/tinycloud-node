@@ -148,6 +148,38 @@ impl WebhookDispatcher {
             }
         };
         let signature = sign_payload(&secret, delivery.payload_json.as_bytes())?;
+        let custom_headers = match &delivery.encrypted_headers {
+            None => reqwest::header::HeaderMap::new(),
+            Some(sealed) => {
+                // Never record the opened bytes or the decryption detail.
+                let opened = (delivery.encrypted_headers_format == 2)
+                    .then(|| {
+                        self.encryption.decrypt_recorded(
+                            sealed,
+                            crate::webhook_headers::binding(&[delivery.subscription_id.as_bytes()]),
+                            2,
+                        )
+                    })
+                    .and_then(Result::ok);
+                let Some(opened) = opened else {
+                    self.record_terminal_failure(
+                        delivery.id,
+                        current_attempt,
+                        "custom header decryption failed",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                match crate::webhook_headers::delivery_header_map(&opened) {
+                    Ok(headers) => headers,
+                    Err(reason) => {
+                        self.record_terminal_failure(delivery.id, current_attempt, reason)
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+        };
 
         let destination = match crate::routes::hooks::validate_webhook_callback_url(
             &delivery.callback_url,
@@ -173,6 +205,7 @@ impl WebhookDispatcher {
         };
 
         match egress::post(self.egress.clone(), destination, self.timeout)
+            .headers(custom_headers)
             .header("Content-Type", "application/json")
             .header("X-TinyCloud-Delivery-Id", &delivery.id)
             .header("X-TinyCloud-Event-Id", &delivery.event_id)
@@ -408,6 +441,9 @@ mod tests {
         hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
             hook_subscription::Model {
                 encrypted_secret_format: 2,
+                header_names_json: None,
+                encrypted_headers: None,
+                encrypted_headers_format: 0,
                 id: subscription_id.to_string(),
                 subscriber_did: subscriber_did.to_string(),
                 space_id: SPACE_ID.to_string(),
@@ -555,6 +591,60 @@ mod tests {
         );
         assert_eq!(delivery.attempts, 1);
         assert!(delivery.delivered_at.is_some());
+        Ok(())
+    }
+
+    /// TC-3123: sealed headers moved from another row (or recorded with any
+    /// format but 2) never reach the callback, and `last_error` stays fixed.
+    #[tokio::test]
+    async fn tc3123_foreign_or_unsealed_headers_dead_letter_without_sending() -> Result<()> {
+        let plaintext = serde_json::to_vec(&[("Authorization", "Bearer tc3123-marker")])?;
+        for (bound_to, format) in [("sub_other", 2), ("sub_01", 0)] {
+            let (_tempdir, tinycloud, db, encryption) = test_tinycloud().await?;
+            let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
+            let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+            let mut subscription = hook_subscription::Entity::find_by_id("sub_01")
+                .one(&db)
+                .await?
+                .unwrap()
+                .into_active_model();
+            subscription.header_names_json =
+                ActiveValue::Set(Some(r#"["Authorization"]"#.to_string()));
+            subscription.encrypted_headers = ActiveValue::Set(Some(encryption.encrypt(
+                &plaintext,
+                crate::webhook_headers::binding(&[bound_to.as_bytes()]),
+            )));
+            subscription.encrypted_headers_format = ActiveValue::Set(format);
+            subscription.update(&db).await?;
+
+            WebhookDispatcher::new(
+                tinycloud,
+                HooksConfig::default(),
+                encryption,
+                EgressPolicy::test_loopback(),
+            )?
+            .dispatch_due_once()
+            .await?;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+                    .await
+                    .is_err(),
+                "{bound_to}/{format}"
+            );
+            let delivery = hook_delivery::Entity::find_by_id(delivery_id)
+                .one(&db)
+                .await?
+                .unwrap();
+            assert_eq!(
+                delivery.status,
+                tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+            );
+            assert_eq!(
+                delivery.last_error.as_deref(),
+                Some("custom header decryption failed")
+            );
+        }
         Ok(())
     }
 

@@ -350,9 +350,9 @@ The ref check above runs inside the workflow file of the dispatched ref, so it
 only protects refs whose `docker.yml` already has it. `workflow_dispatch` runs
 the workflow file at the selected ref, and repository or organization secrets
 are readable by every ref. To close that, every job that reads production
-secrets runs in GitHub's `production` environment. Most deploy secrets
-exist only there; `PROD_TINYCLOUD_ADMIN_SECRET` is the approved repository-
-scoped exception and is consumed only inside the deploy job.
+secrets runs in GitHub's `production` environment. All deploy secrets,
+including `PROD_TINYCLOUD_ADMIN_SECRET`, exist only there and are consumed
+only inside the deploy job.
 
 | Workflow | Job | Production secrets |
 | --- | --- | --- |
@@ -373,8 +373,8 @@ Environment settings (Settings → Environments → `production`):
   `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
   `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN`,
   `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`,
-  `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
-- Except for the explicit node admin exception, none may also exist as a repository secret; this repository
+  `PROD_TINYCLOUD_ADMIN_SECRET`, `PROD_TINYCLOUD_BETTERSTACK_SOURCE_TOKEN`.
+- None of these may also exist as a repository secret; this repository
   must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
   same-named repository or organization secret is still readable by a job
   without `environment: production`.
@@ -415,9 +415,10 @@ The quota steps send `PROD_TINYCLOUD_ADMIN_SECRET` to billing's
 Billing's storage-comp guard checks the Worker secret
 `TINYCLOUD_ADMIN_SECRET`, which is the node/billing shared admin value:
 billing uses it for its own calls to the node's `/admin/*` routes, and a
-rotation sets the GitHub secret and the `tinycloud-billing` Worker secret
-to one new value. No separate billing runner secret exists; rotating the
-shared value must update both holders together, or the quota steps fail
+rotation updates three holders together: the `production` environment secret,
+the `tinycloud-billing` Worker secret and the internal Pages project secret.
+Then redeploy the node. No separate billing runner secret exists; rotating the
+shared value must update all holders together, or the quota steps fail
 closed with `quota API rejected the request`. The value is never passed in
 argv/logs and never added to the CVM env or `allowed_envs` under a billing
 name. A missing credential or an incompatible billing URL fails before
@@ -588,6 +589,10 @@ its branch policy before any workflow that names it runs.
      `kv-sync-v1`, `kv-sync-root`, `tee`).
      A release that includes TC-2132 also reports `delegation-issued-query-v1`;
      without it `POST /delegation/query` answers `direction: "issued"` with 400.
+     A release that includes TC-3174 also reports `hooks-effective-end-v1`:
+     hook tickets and stream opens use the current effective end (renewal
+     stamps included); without it a renewed grant's hooks stop at its signed
+     expiry.
    - Every PostgreSQL connection got its TCP keepalive options (TC-1054,
      1.20.5 on). The production logs are private, so this is read from
      `/info`, which carries two counts (no hosts or errors):

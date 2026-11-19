@@ -1,3 +1,5 @@
+> Note (November 2026): this is a February 2025 vision memo. It describes plans, not shipped behavior. For what the node does today, see the [README](README.md) and [Security and trust](https://docs.tinycloud.xyz/concepts/security-and-trust).
+
 MEMO: TinyCloud – Building Interoperable, Sovereign Apps and Data
 
 1. Overview and Motivation

@@ -31,6 +31,7 @@ jobs:
       - env:
           TINYCLOUD_HISTORY_SDK_FIXTURE_DIR: ${{ runner.temp }}/scheduler-holder-history
         run: cargo test --locked -p tinycloud-node --features renewal-test-clock --test renewal_scheduler_e2e -- --nocapture
+      - run: cargo test --locked -p tinycloud-node --features renewal-test-clock --test renewal_stop_all_e2e -- --nocapture
       - uses: actions/upload-artifact@v4
         if: always()
         with:
