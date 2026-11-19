@@ -25,7 +25,7 @@ use super::{
     key_id::KeyKind,
     keys::{find_key_row, lock_network_row, KeyState},
     network_id::NetworkId,
-    service::{now_rfc3339, EncryptionService, EncryptionServiceError},
+    service::{is_half_created, now_rfc3339, EncryptionService, EncryptionServiceError},
 };
 
 /// Audit outcome of a deleted key.
@@ -139,11 +139,11 @@ impl EncryptionService {
         // The guarded updates (the key version must still match) keep each
         // row's write correct without it; the lock is defense in depth.
         lock_network_row(tx, network).await?;
-        if encryption_network::Entity::find_by_id(network.to_string())
+        let row = encryption_network::Entity::find_by_id(network.to_string())
             .one(tx)
             .await?
-            .is_none()
-        {
+            .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        if is_half_created(tx, &row).await? {
             return Err(EncryptionServiceError::NetworkNotFound);
         }
 

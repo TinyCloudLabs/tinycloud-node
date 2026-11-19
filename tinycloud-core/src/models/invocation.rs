@@ -376,8 +376,9 @@ pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
     .await
 }
 
-/// `authorize_holder`'s checks against a caller-loaded snapshot: the per-key
-/// read check for KV value details (TC-2492), and a test oracle.
+/// `authorize_holder`'s checks against a caller-loaded snapshot from the
+/// caller's same transaction: the per-key read check for KV value details
+/// (TC-2492), and a test oracle.
 pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     db: &C,
     holder: &str,
@@ -778,22 +779,7 @@ async fn save<C: ConnectionTrait>(
     );
 
     // Ensure the invoker actor exists before inserting the invocation
-    match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
-        id: invocation.invoker.clone(),
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
+    crate::space_purge_records::operation_actors(db, &[&invocation.invoker]).await?;
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,

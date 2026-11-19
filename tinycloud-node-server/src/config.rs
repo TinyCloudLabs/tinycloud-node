@@ -1,6 +1,10 @@
 use crate::{
     allow_list::SpaceAllowListService,
-    storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
+    storage::{
+        file_system::FileSystemConfig,
+        purge_ledger::{DataStoreLocation, PurgeLedgerConfig},
+        s3::S3BlockConfig,
+    },
     BlockConfig, BlockStage,
 };
 use base64::{decode_config, URL_SAFE_NO_PAD};
@@ -62,6 +66,80 @@ pub struct Config {
     pub column_encryption: ColumnEncryptionConfig,
     #[serde(default)]
     pub sql: SqlConfig,
+    /// `TINYCLOUD_HOST_ID` (e.g. `node-prod-1`): the stable, non-secret host
+    /// identifier signed into space lifecycle requests, `[a-z0-9-]{1,63}`.
+    /// Set together with `purge_ledger_keys`; both absent keeps space
+    /// lifecycle off (TC-2871).
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// `TINYCLOUD_PURGE_LEDGER_KEYS`: the purge ledger's HMAC keys. Secret;
+    /// never serialized or printed.
+    #[serde(default, skip_serializing)]
+    pub purge_ledger_keys: Option<PurgeLedgerKeys>,
+}
+
+/// The purge ledger's HMAC keys, accepted only in the JSON form
+/// `{"active_key_id":"plk-YYYYMMDD","keys":{"<id>":"<base64url, at least 32 bytes>"}}`.
+/// The bare single-key form is refused. Debug output is redacted.
+#[derive(Deserialize, Clone, Hash, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct PurgeLedgerKeys(String);
+
+impl PurgeLedgerKeys {
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+    /// The raw secret, for `LedgerKeys::from_config` only.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PurgeLedgerKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PurgeLedgerKeys(<redacted>)")
+    }
+}
+
+impl Config {
+    /// Space lifecycle is on when `host_id` and `purge_ledger_keys` are both
+    /// set, and off when both are absent. Call after `storage.resolve()`.
+    /// Messages never carry the key value.
+    pub fn validate_space_lifecycle(&self) -> Result<(), String> {
+        let (host, keys) = match (&self.host_id, &self.purge_ledger_keys) {
+            (None, None) => return Ok(()),
+            (Some(host), Some(keys)) => (host, keys),
+            _ => {
+                return Err(
+                    "space lifecycle: set host_id (TINYCLOUD_HOST_ID) and purge_ledger_keys (TINYCLOUD_PURGE_LEDGER_KEYS) together, or neither"
+                        .into(),
+                )
+            }
+        };
+        if host.is_empty()
+            || host.len() > 63
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err("host_id must match [a-z0-9-]{1,63}".into());
+        }
+        if !keys.expose().trim_start().starts_with('{') {
+            return Err(
+                "purge_ledger_keys must be the JSON form {\"active_key_id\":…,\"keys\":{…}}; the bare-key form is refused"
+                    .into(),
+            );
+        }
+        tinycloud_core::space_purge_ledger::LedgerKeys::from_config(keys.expose().to_owned())
+            .map_err(|_| "purge_ledger_keys is not a valid key set".to_owned())?;
+        if self.storage.purge_ledger.is_none() {
+            return Err("space lifecycle needs [storage.purge_ledger]".into());
+        }
+        if !self.storage.database().starts_with("postgres") {
+            return Err("space lifecycle requires PostgreSQL".into());
+        }
+        Ok(())
+    }
 }
 
 /// Recorded column reads may require encrypted storage when explicitly enabled.
@@ -1824,6 +1902,12 @@ pub struct Storage {
     pub sql: SqlStorageConfig,
     #[serde(default)]
     pub duckdb: DuckDbStorageConfig,
+    /// `[storage.purge_ledger]`: the space-purge ledger's own store (TC-2871),
+    /// never the block store. Local block storage defaults it to
+    /// `<datadir>/purge-ledger`; S3 block storage has no default, and the
+    /// purge stays unavailable until a ledger bucket is configured.
+    #[serde(default)]
+    pub purge_ledger: Option<PurgeLedgerConfig>,
 }
 
 fn default_datadir() -> PathBuf {
@@ -1856,6 +1940,12 @@ impl Storage {
             }
         }
 
+        if self.purge_ledger.is_none() && matches!(self.blocks, BlockConfig::B(_)) {
+            self.purge_ledger = Some(PurgeLedgerConfig::Local {
+                path: dir.join("purge-ledger"),
+            });
+        }
+
         if self.limit.map(|limit| limit.as_u64()) == Some(0) {
             self.limit = None;
         }
@@ -1866,6 +1956,21 @@ impl Storage {
         self.database
             .as_deref()
             .expect("Storage::resolve() must be called before accessing database")
+    }
+
+    /// Refuse a purge ledger that shares the block store. Call after resolve().
+    pub fn validate_purge_ledger(&self) -> Result<(), String> {
+        let Some(ledger) = &self.purge_ledger else {
+            return Ok(());
+        };
+        let data = match &self.blocks {
+            BlockConfig::A(s3) => DataStoreLocation::S3 {
+                bucket: &s3.bucket,
+                endpoint: s3.endpoint.as_ref(),
+            },
+            BlockConfig::B(fs) => DataStoreLocation::Local(fs.path()),
+        };
+        ledger.validate_separate_from(&data)
     }
 }
 
@@ -1879,6 +1984,7 @@ impl Default for Storage {
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
+            purge_ledger: None,
         }
     }
 }
@@ -1989,16 +2095,17 @@ pub struct DatabaseConfig {
     /// kernel default.
     #[serde(default = "default_database_tcp_user_timeout_ms")]
     pub tcp_user_timeout_ms: u64,
-    /// A read (or `BEGIN`) whose connection is lost is retried once only if
-    /// that attempt failed within this many milliseconds (TC-1054). A
-    /// connection found dead at once is retried; one whose loss took a
-    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not. This
-    /// bounds the retry, so one read waits for one detection plus at most
-    /// this window (~40 s) of connection-loss detection rather than two
-    /// detections (~60 s). It is not a request or per-db lock deadline:
-    /// acquisition waits, legitimate transfers and queueing behind the lock
-    /// add to it (those are bounded by `invocation.deadline_ms` and the
-    /// `storage.sql` wait bounds, TC-1274).
+    /// The time budget of one database operation's single retry, in
+    /// milliseconds (TC-2610). An operation (`/delegate`, the `/invoke`
+    /// authorization step, a KV read, a read-audit batch, the metadata read
+    /// that starts a SQL hydration) whose connection is lost is run once more
+    /// only when nothing can have committed, and only if the first run leaves
+    /// room in this budget for a short backoff and a second run; the second
+    /// run is stopped when the budget ends. Statements, `BEGIN` and `COMMIT`
+    /// are not retried on their own. It is not a request or per-db lock
+    /// deadline: acquisition waits, legitimate transfers and queueing behind
+    /// the lock add to it (those are bounded by `invocation.deadline_ms` and
+    /// the `storage.sql` wait bounds, TC-1274).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
     /// How long an authorized read waits for its audit record to commit

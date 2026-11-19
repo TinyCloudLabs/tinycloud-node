@@ -1,13 +1,21 @@
-//! TC-2346: `/delegate` and the `/invoke` authorization step run their whole
-//! operation once more after a connection lost before any write, and never
-//! otherwise.
+//! TC-2346, TC-2610: `/delegate` and the `/invoke` authorization step run
+//! their whole database operation once more after a connection lost before
+//! any write, and never otherwise.
 //!
 //! The route tests go through the Rocket client. SQLite has no connection to
-//! lose, so a `fault::Plan` fails the pool wrapper's next two retryable
-//! statements of the operation (the statement and its own retry), which is
-//! what a burst does; the loss then travels through the real wrapper, write
-//! tracker, route and error mapping. The operation tests call
-//! `track_writes_retrying` with the real operation and an injected failure.
+//! lose, so a `fault::Plan` fails the pool wrapper's next read or `BEGIN` of
+//! the operation once per planned failure; the loss then travels through
+//! the real wrapper, write tracker, route and error mapping. The operation
+//! tests call `retry_owner` with the real operation and an injected failure.
+
+use std::future::Future;
+use tinycloud_core::db_retry::{isolate_overload, retry_owner, Replay, RetryPolicy};
+
+/// Run `future` under `plan` with an overload signal of its own, so a
+/// request timeout in another test never suppresses this test's retry.
+async fn retried<F: Future>(plan: &Plan, future: F) -> F::Output {
+    isolate_overload(plan.scope(future)).await
+}
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,22 +110,22 @@ async fn delegate_route_retries_a_connection_lost_before_any_write_and_stores_on
     use rocket::http::Header;
     let fixture = fixture().await?;
     let header = owner_delegation_header(&fixture, "tc2346-route-delegate")?;
-    let plan = Plan::new(2, lost);
+    let plan = Plan::new(1, lost);
 
-    let response = plan
-        .scope(
-            fixture
-                .client
-                .post("/delegate")
-                .header(Header::new("Authorization", header))
-                .dispatch(),
-        )
-        .await;
+    let response = retried(
+        &plan,
+        fixture
+            .client
+            .post("/delegate")
+            .header(Header::new("Authorization", header))
+            .dispatch(),
+    )
+    .await;
 
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
     assert_eq!(status, Status::Ok, "{body}");
-    assert_eq!(plan.injected(), 2, "the loss reached the operation");
+    assert_eq!(plan.injected(), 1, "the loss reached the operation");
     assert_eq!(stored_delegations(&fixture).await, 1);
     Ok(())
 }
@@ -127,22 +135,22 @@ async fn delegate_route_retries_a_reset_socket_before_any_write() -> Result<()> 
     use rocket::http::Header;
     let fixture = fixture().await?;
     let header = owner_delegation_header(&fixture, "tc2346-route-delegate-io")?;
-    let plan = Plan::new(2, reset);
+    let plan = Plan::new(1, reset);
 
-    let response = plan
-        .scope(
-            fixture
-                .client
-                .post("/delegate")
-                .header(Header::new("Authorization", header))
-                .dispatch(),
-        )
-        .await;
+    let response = retried(
+        &plan,
+        fixture
+            .client
+            .post("/delegate")
+            .header(Header::new("Authorization", header))
+            .dispatch(),
+    )
+    .await;
 
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
     assert_eq!(status, Status::Ok, "{body}");
-    assert_eq!(plan.injected(), 2);
+    assert_eq!(plan.injected(), 1);
     assert_eq!(stored_delegations(&fixture).await, 1);
     Ok(())
 }
@@ -152,24 +160,24 @@ async fn delegate_route_answers_the_safe_503_when_the_retry_is_lost_too() -> Res
     use rocket::http::Header;
     let fixture = fixture().await?;
     let header = owner_delegation_header(&fixture, "tc2346-route-delegate-twice")?;
-    // The first run's statement and its retry, then the second run's too.
-    let plan = Plan::new(4, lost);
+    // The first run's failure, then the second run's.
+    let plan = Plan::new(2, lost);
 
-    let response = plan
-        .scope(
-            fixture
-                .client
-                .post("/delegate")
-                .header(Header::new("Authorization", header))
-                .dispatch(),
-        )
-        .await;
+    let response = retried(
+        &plan,
+        fixture
+            .client
+            .post("/delegate")
+            .header(Header::new("Authorization", header))
+            .dispatch(),
+    )
+    .await;
 
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
     assert_eq!(status, Status::ServiceUnavailable, "{body}");
     assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
-    assert_eq!(plan.injected(), 4, "two runs, no third");
+    assert_eq!(plan.injected(), 2, "two runs, no third");
     assert_eq!(stored_delegations(&fixture).await, 0);
     Ok(())
 }
@@ -177,25 +185,21 @@ async fn delegate_route_answers_the_safe_503_when_the_retry_is_lost_too() -> Res
 #[tokio::test]
 async fn sql_invoke_route_retries_the_authorization_after_a_lost_connection() -> Result<()> {
     let fixture = fixture().await?;
-    let plan = Plan::new(2, lost);
+    let plan = Plan::new(1, lost);
 
-    let reply = plan
-        .scope(fixture.owner_sql("db", tc1791_query("SELECT 1")))
-        .await?;
+    let reply = retried(&plan, fixture.owner_sql("db", tc1791_query("SELECT 1"))).await?;
 
     assert_eq!(reply.status, Status::Ok, "{}", reply.body);
-    assert_eq!(plan.injected(), 2, "the loss reached the authorization");
+    assert_eq!(plan.injected(), 1, "the loss reached the authorization");
     Ok(())
 }
 
 #[tokio::test]
 async fn sql_invoke_route_answers_the_safe_503_when_the_retry_is_lost_too() -> Result<()> {
     let fixture = fixture().await?;
-    let plan = Plan::new(4, lost);
+    let plan = Plan::new(2, lost);
 
-    let reply = plan
-        .scope(fixture.owner_sql("db", tc1791_query("SELECT 1")))
-        .await?;
+    let reply = retried(&plan, fixture.owner_sql("db", tc1791_query("SELECT 1"))).await?;
 
     assert_eq!(reply.status, Status::ServiceUnavailable, "{}", reply.body);
     assert!(
@@ -203,7 +207,7 @@ async fn sql_invoke_route_answers_the_safe_503_when_the_retry_is_lost_too() -> R
         "{}",
         reply.body
     );
-    assert_eq!(plan.injected(), 4);
+    assert_eq!(plan.injected(), 2);
     Ok(())
 }
 
@@ -248,7 +252,7 @@ async fn tc2514_delegation_lookup_failure_is_retryable() -> Result<()> {
             "{action}: {}",
             reply.body
         );
-        assert_eq!(plan.injected(), 2, "{action}: stop at the failed lookup");
+        assert_eq!(plan.injected(), 1, "{action}: stop at the failed lookup");
         assert!(!applied, "{action}: preflight must not write");
     }
 
@@ -356,22 +360,24 @@ async fn a_parent_revoked_during_the_retry_wait_refuses_the_retried_invocation()
         .await?;
     assert_eq!(control.status, Status::Ok, "{}", control.body);
 
-    let plan = Plan::new(2, lost);
+    let plan = Plan::new(1, lost);
     let query = tc1791_query("SELECT 1");
     let revoker = async {
-        // Revoke as soon as the first failure is in: the two failures and the
-        // delay before the retry (at least 100 ms) all still lie ahead.
+        // Revoke as soon as the first failure is in: the delay before the
+        // retry (at least 100 ms) still lies ahead.
         while plan.injected() < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         fixture.revoke("tc2346-revoke-parent", parent).await
     };
-    let (reply, revoked) =
-        tokio::join!(plan.scope(fixture.invoke_json(invoke()?, &query)), revoker);
+    let (reply, revoked) = tokio::join!(
+        retried(&plan, fixture.invoke_json(invoke()?, &query)),
+        revoker
+    );
     revoked?;
     let reply = reply?;
 
-    assert_eq!(plan.injected(), 2);
+    assert_eq!(plan.injected(), 1);
     assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
     Ok(())
 }
@@ -386,9 +392,10 @@ async fn a_loss_after_the_delegation_transaction_began_is_not_retried_and_stays_
     let delegation = owner_delegation(&fixture, "tc2346-b")?;
     let attempts = AtomicUsize::new(0);
 
-    let (result, applied) = track_writes_retrying(
+    let (result, applied) = retry_owner(
         "delegate",
-        None,
+        Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
+        Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             let delegation = delegation.clone();
@@ -422,9 +429,10 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
     ];
     for failure in failures {
         let attempts = AtomicUsize::new(0);
-        let (result, applied) = track_writes_retrying(
+        let (result, applied) = retry_owner(
             "delegate",
-            None,
+            Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
+            Replay::Never,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async move { Err::<TransactResult, Failure>(TxError::Db(failure())) }
@@ -438,9 +446,10 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
     }
     // A refusal that is not a database error is never retried either.
     let attempts = AtomicUsize::new(0);
-    let (result, _) = track_writes_retrying(
+    let (result, _) = retry_owner(
         "delegate",
-        None,
+        Some(RetryPolicy::new(std::time::Duration::from_secs(10))),
+        Replay::Never,
         || {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err::<TransactResult, Failure>(TxError::SpaceNotFound) }
@@ -472,8 +481,7 @@ async fn an_authorization_failure_reports_the_trackers_verdict() {
 /// A mutating invocation (a `kv/del` beside the SQL read) reaches the same
 /// authorization step. Its read-write transaction began and the connection
 /// was then lost, so the delete may have applied: `outcome_unknown`, not a
-/// retry and not a safe `503`. The mutating path retries a lost `BEGIN`
-/// itself once, so the loss is injected twice.
+/// retry and not a safe `503`.
 #[tokio::test]
 async fn a_mutating_invocation_that_lost_its_connection_after_begin_is_outcome_unknown(
 ) -> Result<()> {
@@ -487,14 +495,153 @@ async fn a_mutating_invocation_that_lost_its_connection_after_begin_is_outcome_u
     let kv = fixture.kv_resource("notes/x")?.to_string();
     let header =
         fixture.owner_invocation(&[(sql, "tinycloud.sql/read"), (kv, "tinycloud.kv/del")])?;
-    let plan = Plan::new(0, lost).after_begin(2);
+    let plan = Plan::new(0, lost).after_begin(1);
 
-    let reply = plan
-        .scope(fixture.invoke_json(header, &tc1791_query("SELECT 1")))
-        .await?;
+    let reply = retried(
+        &plan,
+        fixture.invoke_json(header, &tc1791_query("SELECT 1")),
+    )
+    .await?;
 
-    assert_eq!(plan.injected(), 2, "the loss reached the transaction");
+    assert_eq!(plan.injected(), 1, "the loss reached the transaction");
     assert_eq!(reply.status, Status::InternalServerError, "{}", reply.body);
     assert!(reply.body.starts_with(OUTCOME_UNKNOWN), "{}", reply.body);
+    Ok(())
+}
+
+// ---- KV reads and writes ----------------------------------------------
+
+async fn kv_get_header(fixture: &KvSyncFixture, key: &str) -> Result<String> {
+    let kv = fixture.kv_resource(key)?.to_string();
+    fixture.owner_invocation(&[(kv, "tinycloud.kv/get")])
+}
+
+/// A KV read that meets a dead pooled connection before its audit step is
+/// run once more inside the request and answers the value.
+#[tokio::test]
+async fn a_kv_read_recovers_in_request_from_a_dead_pooled_connection() -> Result<()> {
+    let fixture = fixture().await?;
+    fixture.owner_write("notes/x", Some(b"value")).await?;
+    let header = kv_get_header(&fixture, "notes/x").await?;
+    let plan = Plan::new(1, lost);
+
+    let reply = retried(&plan, fixture.dispatch(header, &[])).await;
+
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(reply.body, "value");
+    assert_eq!(plan.injected(), 1, "the loss reached the read");
+    Ok(())
+}
+
+/// The retried read writes its audit record once: the failed run stopped
+/// before the audit step, so only the successful run recorded.
+#[tokio::test]
+async fn a_kv_read_that_recovers_on_its_second_attempt_writes_one_audit_record() -> Result<()> {
+    use tinycloud_core::models::invocation;
+    let fixture = fixture().await?;
+    fixture.owner_write("notes/x", Some(b"value")).await?;
+    let header = kv_get_header(&fixture, "notes/x").await?;
+    let audited = || async {
+        (
+            tinycloud(&fixture).read_audit_health().records,
+            invocation::Entity::find()
+                .count(&fixture.conn)
+                .await
+                .unwrap(),
+        )
+    };
+    let (records_before, rows_before) = audited().await;
+    let plan = Plan::new(1, lost);
+
+    let reply = retried(&plan, fixture.dispatch(header, &[])).await;
+
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    assert_eq!(plan.injected(), 1);
+    let (records_after, rows_after) = audited().await;
+    assert_eq!(records_after - records_before, 1, "one audit record");
+    assert_eq!(rows_after - rows_before, 1, "one audit row");
+    Ok(())
+}
+
+/// A KV put is never replayed: it fails once with the safe `503`, nothing is
+/// applied, and the same put sent again commits once.
+#[tokio::test]
+async fn a_kv_put_fails_once_safely_with_nothing_applied() -> Result<()> {
+    use rocket::http::{ContentType, Header};
+    use tinycloud_core::models::kv_write;
+    let fixture = fixture().await?;
+    let put = |nonce: String| {
+        let (header, _) = tc409_root_invocation(
+            &fixture.owner,
+            &fixture.owner_vm,
+            "kv",
+            "tinycloud.kv/put",
+            Some("notes/p"),
+            &nonce,
+        )
+        .expect("put invocation");
+        fixture
+            .client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::Plain)
+            .body("v")
+            .dispatch()
+    };
+    let writes = || async { kv_write::Entity::find().count(&fixture.conn).await.unwrap() };
+    let before = writes().await;
+    let plan = Plan::new(1, lost);
+
+    let response = retried(&plan, put(fixture.next_nonce())).await;
+
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::ServiceUnavailable, "{body}");
+    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
+    assert_eq!(plan.injected(), 1, "failed once, no replay");
+    assert_eq!(writes().await, before, "nothing was applied");
+
+    let again = put(fixture.next_nonce()).await;
+    assert!(again.status().class().is_success(), "{}", again.status());
+    assert_eq!(writes().await, before + 1, "the re-sent put committed once");
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl tinycloud_core::db_retry::Clock for ManualClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A read inside the overload window is not retried; the same loss after the
+/// window is.
+#[tokio::test]
+async fn the_overload_signal_suppresses_the_kv_read_retry_until_its_window_ends() -> Result<()> {
+    use tinycloud_core::db_retry::{with_overload_signal, OverloadSignal, OVERLOAD_SUPPRESS};
+    let fixture = fixture().await?;
+    fixture.owner_write("notes/x", Some(b"value")).await?;
+    let clock = ManualClock::default();
+    let signal = OverloadSignal::new(clock.clone(), OVERLOAD_SUPPRESS);
+    clock.0.store(1_000, Ordering::SeqCst);
+    signal.stamp("request_timeout");
+
+    clock.0.store(1_000 + 29_999, Ordering::SeqCst);
+    let plan = Plan::new(1, lost);
+    let header = kv_get_header(&fixture, "notes/x").await?;
+    let inside =
+        with_overload_signal(signal.clone(), plan.scope(fixture.dispatch(header, &[]))).await;
+    assert_eq!(inside.status, Status::ServiceUnavailable, "{}", inside.body);
+    assert_eq!(plan.injected(), 1, "inside the window: not retried");
+
+    clock.0.store(1_000 + 30_000, Ordering::SeqCst);
+    let plan = Plan::new(1, lost);
+    let header = kv_get_header(&fixture, "notes/x").await?;
+    let after = with_overload_signal(signal, plan.scope(fixture.dispatch(header, &[]))).await;
+    assert_eq!(after.status, Status::Ok, "{}", after.body);
+    assert_eq!(after.body, "value");
+    assert_eq!(plan.injected(), 1, "after the window: retried and served");
     Ok(())
 }

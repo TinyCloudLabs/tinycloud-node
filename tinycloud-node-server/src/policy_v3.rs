@@ -2303,6 +2303,9 @@ pub async fn register_policy(
     let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
         .await
         .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let roots = [
         (
             policy_root_cid.clone(),
@@ -2924,6 +2927,9 @@ pub async fn mint(
         None => None,
     };
     let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
         .await
         .map_err(db_error)?;
     tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
@@ -3711,6 +3717,12 @@ async fn ingest_status_checkpoint_unmounted(
         }
         None
     };
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::PreviousCheckpointDigestHex,
@@ -3743,12 +3755,18 @@ async fn ingest_status_checkpoint_unmounted(
         )
         .filter(policy_v3_root::Column::RootCid.eq(request.root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "status-concurrent-update".into()));
     }
+    if state == "revoked" {
+        tinycloud_core::space_purge_records::request_all(&txn)
+            .await
+            .map_err(db_error)?;
+    }
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(StatusResponse {
         root_cid: request.root_cid,
         sequence,
@@ -3826,6 +3844,12 @@ pub async fn status(
         None,
         None,
     )?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::StatusCheckpointBytes,
@@ -3850,12 +3874,13 @@ pub async fn status(
         .filter(policy_v3_root::Column::RootCid.eq(request.root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
         .filter(policy_v3_root::Column::RevokedAt.is_null())
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "status-concurrent-update".into()));
     }
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(StatusResponse {
         root_cid: request.root_cid,
         sequence,
@@ -3994,6 +4019,12 @@ pub async fn revoke_root(
         Some(format_time(revoked_at)),
         Some(revocation_digest),
     )?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::StatusCheckpointBytes,
@@ -4026,12 +4057,16 @@ pub async fn revoke_root(
         .filter(policy_v3_root::Column::RootCid.eq(root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
         .filter(policy_v3_root::Column::RevokedAt.is_null())
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "root-revocation-concurrent".into()));
     }
+    tinycloud_core::space_purge_records::request_all(&txn)
+        .await
+        .map_err(db_error)?;
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(crate::routes::RevokeResponse {
         revoked: true,
         cid: root_cid,

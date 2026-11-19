@@ -1,6 +1,7 @@
 #[cfg(test)]
 #[path = "db/signature_before_locks_tests.rs"]
 mod signature_before_locks_tests;
+mod space_purge;
 #[cfg(test)]
 #[path = "db/status_snapshot_tests.rs"]
 mod status_snapshot_tests;
@@ -206,6 +207,58 @@ pub struct PendingWebhookDelivery {
     pub space_id: String,
     pub target_service: String,
     pub path_prefix: Option<String>,
+    /// Token of the lease this claim holds; every mark must present it.
+    pub lease_token: String,
+}
+
+// The lease columns are deliberately not on the `hook_delivery` entity: older
+// migrations and rows are written through that entity on schemas that predate
+// the lease columns. They are addressed by name here only.
+fn webhook_lease_token_column() -> sea_orm::sea_query::Alias {
+    sea_orm::sea_query::Alias::new("lease_token")
+}
+
+fn webhook_lease_expires_column() -> sea_orm::sea_query::Alias {
+    sea_orm::sea_query::Alias::new("lease_expires_at")
+}
+
+/// Whole-second RFC 3339 so lease timestamps compare correctly as text.
+fn webhook_lease_timestamp(value: OffsetDateTime) -> String {
+    value
+        .replace_nanosecond(0)
+        .expect("zero is a valid nanosecond")
+        .format(&Rfc3339)
+        .expect("current timestamps should format as RFC3339")
+}
+
+/// Due for delivery and not held under an unexpired lease.
+fn webhook_claimable(now: &str, lease_now: &str) -> Condition {
+    Condition::all()
+        .add(
+            hook_delivery::Column::Status
+                .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
+        )
+        .add(
+            Condition::any()
+                .add(hook_delivery::Column::NextAttemptAt.is_null())
+                .add(hook_delivery::Column::NextAttemptAt.lte(now)),
+        )
+        .add(
+            Condition::any()
+                .add(Expr::col(webhook_lease_expires_column()).is_null())
+                .add(Expr::col(webhook_lease_expires_column()).lte(lease_now)),
+        )
+}
+
+/// The row is still open and `token` is its current lease.
+fn webhook_lease_held(delivery_id: &str, token: &str) -> Condition {
+    Condition::all()
+        .add(hook_delivery::Column::Id.eq(delivery_id))
+        .add(Expr::col(webhook_lease_token_column()).eq(token))
+        .add(
+            hook_delivery::Column::Status
+                .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
+        )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -291,6 +344,7 @@ pub struct SpaceDatabase<C, B, S> {
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
     database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
+    space_purge_fence: Option<Arc<crate::space_purge_fence::SpacePurgeFence>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +453,10 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Secrets(K::Error),
     #[error("Space not found")]
     SpaceNotFound,
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("epoch insert failed: {0}")]
     EpochInsert(DbErr),
     #[error("Invalid delegation CID: {0}")]
@@ -574,7 +632,9 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     delegated_sql_caveats: bool,
     renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     check_hosted: bool,
+    fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
 ) -> Result<(), TxError<B, K>> {
+    let (mode, lifecycle) = space_purge::probe::<B, K, _>(conn, fence, &invocation.0, mode).await?;
     match mode {
         InvokeMode::Admitted => {
             let roots = invocation
@@ -608,7 +668,8 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
         .map_err(TxError::<B, K>::from)?,
         InvokeMode::Internal | InvokeMode::MeetingPublication => {}
     }
-    if check_hosted {
+    space_purge::refuse_absent::<B, K>(&lifecycle)?;
+    if check_hosted && lifecycle.is_none() {
         let hosted = space::Entity::find()
             .filter(space::Column::Id.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
             .count(conn)
@@ -744,6 +805,7 @@ where
             encryption,
             sql_sizes: SqlSizes::default(),
             delegated_sql_caveats: false,
+            space_purge_fence: None,
             named_keys: false,
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -956,6 +1018,18 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// Persisted renewal identity captured during database startup.
     pub fn renewal_identity(&self) -> Option<&crate::renewal::RenewalNodeIdentity> {
         self.renewal_identity.as_ref()
+    }
+
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Arc<crate::space_purge_fence::SpacePurgeFence>,
+    ) -> Self {
+        self.space_purge_fence = Some(fence);
+        self
+    }
+
+    pub fn space_purge_fence(&self) -> Option<&Arc<crate::space_purge_fence::SpacePurgeFence>> {
+        self.space_purge_fence.as_ref()
     }
 
     /// Exposes the node's capability database for projections that are
@@ -1386,30 +1460,56 @@ where
         })
     }
 
-    pub async fn list_due_webhook_deliveries(
+    /// Claims up to `limit` due deliveries for `lease`. One conditional UPDATE
+    /// sets a fresh lease token and expiry on each row that is still due and
+    /// unleased (or whose lease has expired), so two dispatchers never hold
+    /// the same delivery inside one lease.
+    pub async fn claim_due_webhook_deliveries(
         &self,
         limit: u64,
+        lease: std::time::Duration,
     ) -> Result<Vec<PendingWebhookDelivery>, DbErr> {
-        let now = OffsetDateTime::now_utc()
+        let now = OffsetDateTime::now_utc();
+        let now_text = now
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
+        let lease_now = webhook_lease_timestamp(now);
+        let lease_expires_at = webhook_lease_timestamp(now + lease);
+        let token = uuid::Uuid::new_v4().to_string();
 
-        hook_delivery::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(
-                        hook_delivery::Column::Status
-                            .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
-                    )
-                    .add(
-                        Condition::any()
-                            .add(hook_delivery::Column::NextAttemptAt.is_null())
-                            .add(hook_delivery::Column::NextAttemptAt.lte(now)),
-                    ),
-            )
+        // The `A_id` alias keeps this poll's SQL prefix, which the PostgreSQL
+        // round-trip budget test classifies as background dispatcher traffic.
+        let candidates: Vec<String> = hook_delivery::Entity::find()
+            .select_only()
+            .column_as(hook_delivery::Column::Id, "A_id")
+            .filter(webhook_claimable(&now_text, &lease_now))
             .order_by_asc(hook_delivery::Column::CreatedAt)
             .order_by_asc(hook_delivery::Column::Attempts)
             .limit(limit)
+            .into_tuple()
+            .all(&self.conn)
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The due/unleased predicate is re-evaluated by the UPDATE itself, so a
+        // row another dispatcher claimed after the SELECT is not taken.
+        hook_delivery::Entity::update_many()
+            .col_expr(webhook_lease_token_column(), Expr::value(token.clone()))
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(lease_expires_at),
+            )
+            .filter(hook_delivery::Column::Id.is_in(candidates))
+            .filter(webhook_claimable(&now_text, &lease_now))
+            .exec(&self.conn)
+            .await?;
+
+        hook_delivery::Entity::find()
+            .filter(Expr::col(webhook_lease_token_column()).eq(token.clone()))
+            .order_by_asc(hook_delivery::Column::CreatedAt)
+            .order_by_asc(hook_delivery::Column::Attempts)
             .find_also_related(hook_subscription::Entity)
             .all(&self.conn)
             .await
@@ -1433,68 +1533,151 @@ where
                             space_id: subscription.space_id,
                             target_service: subscription.target_service,
                             path_prefix: subscription.path_prefix,
+                            lease_token: token.clone(),
                         })
                     })
                     .collect()
             })
     }
 
+    /// Gives a claimed delivery back without changing its state, so it is
+    /// claimable again at once. Returns `false`, changing nothing, when
+    /// `lease_token` is no longer the row's current lease.
+    pub async fn release_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, DbErr> {
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Extends a claimed delivery's lease to `extend` from now. Succeeds only
+    /// while `lease_token` is still the row's current lease, the lease has not
+    /// expired and the delivery is open; returns `false`, changing nothing,
+    /// otherwise.
+    pub async fn renew_webhook_delivery_lease(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        extend: std::time::Duration,
+    ) -> Result<bool, DbErr> {
+        let now = OffsetDateTime::now_utc();
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(webhook_lease_timestamp(now + extend)),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .filter(Expr::col(webhook_lease_expires_column()).gt(webhook_lease_timestamp(now)))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Marks a claimed delivery delivered. Returns `false`, changing nothing,
+    /// when `lease_token` is no longer the row's current lease.
     pub async fn mark_webhook_delivery_delivered(
         &self,
         delivery_id: &str,
+        lease_token: &str,
         attempts: i64,
-    ) -> Result<(), DbErr> {
-        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(());
-        };
-
+    ) -> Result<bool, DbErr> {
         let delivered_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
-        let mut active = delivery.into_active_model();
-        active.status = Set(HOOK_DELIVERY_STATUS_DELIVERED.to_string());
-        active.attempts = Set(attempts);
-        active.next_attempt_at = Set(None);
-        active.last_error = Set(None);
-        active.delivered_at = Set(Some(delivered_at));
-        active.update(&self.conn).await?;
-        Ok(())
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(
+                hook_delivery::Column::Status,
+                Expr::value(HOOK_DELIVERY_STATUS_DELIVERED),
+            )
+            .col_expr(hook_delivery::Column::Attempts, Expr::value(attempts))
+            .col_expr(
+                hook_delivery::Column::NextAttemptAt,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                hook_delivery::Column::LastError,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                hook_delivery::Column::DeliveredAt,
+                Expr::value(Some(delivered_at)),
+            )
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
+    /// Records a failed attempt on a claimed delivery. Returns `false`,
+    /// changing nothing, when `lease_token` is no longer the row's current
+    /// lease.
     pub async fn mark_webhook_delivery_failed(
         &self,
         delivery_id: &str,
+        lease_token: &str,
         attempts: i64,
         next_attempt_at: Option<OffsetDateTime>,
         last_error: String,
         dead_letter: bool,
-    ) -> Result<(), DbErr> {
-        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
-            .one(&self.conn)
-            .await?
-        else {
-            return Ok(());
-        };
-
-        let mut active = delivery.into_active_model();
-        active.status = Set(if dead_letter {
-            HOOK_DELIVERY_STATUS_DEAD_LETTER.to_string()
+    ) -> Result<bool, DbErr> {
+        let status = if dead_letter {
+            HOOK_DELIVERY_STATUS_DEAD_LETTER
         } else {
-            HOOK_DELIVERY_STATUS_RETRYING.to_string()
-        });
-        active.attempts = Set(attempts);
-        active.next_attempt_at = Set(next_attempt_at.map(|value| {
+            HOOK_DELIVERY_STATUS_RETRYING
+        };
+        let next_attempt_at = next_attempt_at.map(|value| {
             value
                 .format(&Rfc3339)
                 .expect("current timestamps should format as RFC3339")
-        }));
-        active.last_error = Set(Some(last_error));
-        active.delivered_at = Set(None);
-        active.update(&self.conn).await?;
-        Ok(())
+        });
+        let result = hook_delivery::Entity::update_many()
+            .col_expr(hook_delivery::Column::Status, Expr::value(status))
+            .col_expr(hook_delivery::Column::Attempts, Expr::value(attempts))
+            .col_expr(
+                hook_delivery::Column::NextAttemptAt,
+                Expr::value(next_attempt_at),
+            )
+            .col_expr(
+                hook_delivery::Column::LastError,
+                Expr::value(Some(last_error)),
+            )
+            .col_expr(
+                hook_delivery::Column::DeliveredAt,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_token_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                webhook_lease_expires_column(),
+                Expr::value(Option::<String>::None),
+            )
+            .filter(webhook_lease_held(delivery_id, lease_token))
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
     pub async fn count_active_hook_subscriptions(&self, space_id: &str) -> Result<u64, DbErr> {
@@ -2176,6 +2359,7 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            self.space_purge_fence.as_deref(),
             verified,
         )
         .await?;
@@ -2377,6 +2561,16 @@ where
             .await
         {
             Ok(Some(_)) if !renewal_lease => {
+                if self.space_purge_fence.is_some() {
+                    let tx = self.begin_graph_transaction().await?;
+                    space_purge::lock_delegation::<B, K>(
+                        &tx,
+                        self.space_purge_fence.as_deref(),
+                        &delegation,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                }
                 // The content-addressed row authenticates these exact signed bytes.
                 for space in delegation.0.spaces() {
                     crate::request_telemetry::observe_space(space);
@@ -2485,6 +2679,7 @@ where
             &[],
             self.delegated_sql_caveats,
             self.named_keys,
+            self.space_purge_fence.as_deref(),
             verified,
         )
         .await
@@ -2782,6 +2977,34 @@ where
         .await
     }
 
+    /// [`Self::invoke_with_options_admitted`] for an invocation with no KV
+    /// mutation (`kv/get`, `kv/list`, `kv/metadata`, `kv/sync`), which lends
+    /// the admitted value so the caller's retry owner
+    /// ([`crate::db_retry::retry_owner`]) can run it again after a lost
+    /// connection. The read audit is the last step: a run that fails before
+    /// it has recorded nothing, and a run whose audit step fails is not a
+    /// database error, so it is never retried. A mutating invocation must use
+    /// [`Self::invoke_with_options_admitted`], which consumes the value.
+    pub async fn invoke_read_admitted<S>(
+        &self,
+        invocation: impl AdmittedInput,
+        inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let invocation = sealed::Sealed::into_invocation(invocation);
+        debug_assert!(
+            kv_mutation_keys(&invocation).is_empty(),
+            "invoke_read_admitted is for invocations with no KV mutation"
+        );
+        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Admitted)
+            .await
+    }
+
     pub async fn invoke_with_options<S>(
         &self,
         invocation: Invocation,
@@ -3008,13 +3231,12 @@ where
         OsRng.fill_bytes(&mut attempt_bytes);
         let attempt_id = hex::encode(attempt_bytes);
         // Registration and authorization commit before any blob can be
-        // persisted. Retrying an uncertain preparatory COMMIT uses exactly the
-        // same attempt ID, so the claim is recorded once and no other
-        // writer's claim is affected.
+        // persisted. A failure of the preparatory transaction is returned
+        // as it is: its commit may have been applied, so it is never
+        // replayed here (TC-2610).
         // SQLite's preparatory write follows sequence→writer→BEGIN and
         // releases every guard before an ordinary upload.
-        let mut retried = false;
-        let blobs = loop {
+        let blobs = {
             let _sequence = if self.writer_lock.is_some() {
                 self.acquire_space_sequence_guards(&sequence_spaces).await
             } else {
@@ -3041,12 +3263,7 @@ where
             ))
             .await;
             match prepared {
-                Ok(generations) => break generations,
-                Err(TxError::Db(error))
-                    if !retried && crate::db_pool::is_connection_error(&error) =>
-                {
-                    retried = true;
-                }
+                Ok(generations) => generations,
                 Err(TxError::Db(error)) if crate::kv_orphans::is_candidate_unavailable(&error) => {
                     return Err(TxStoreError::KvCandidateUnavailable);
                 }
@@ -3094,49 +3311,32 @@ where
             let begin_mutation = || {
                 let legacy_spaces = &legacy_spaces;
                 async move {
-                    // Retrying a lost BEGIN or freeze lock is safe before
-                    // any KV transaction body or COMMIT has run.
-                    let mut retried = false;
-                    loop {
-                        let begin_start = Instant::now();
-                        let tx_result = self.begin_graph_transaction().await;
-                        crate::telemetry::observe_stage(
-                            crate::telemetry::InvocationStage::DbTxBegin,
-                            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
-                            begin_start.elapsed(),
-                        );
-                        let tx = match tx_result {
-                            Ok(tx) => tx,
-                            Err(error)
-                                if !retried && crate::db_pool::is_connection_error(&error) =>
-                            {
-                                retried = true;
-                                continue;
+                    let begin_start = Instant::now();
+                    let tx_result = self.begin_graph_transaction().await;
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::DbTxBegin,
+                        crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+                        begin_start.elapsed(),
+                    );
+                    let tx = match tx_result {
+                        Ok(tx) => tx,
+                        Err(error) => return Err(TxStoreError::Tx(TxError::Db(error))),
+                    };
+                    let locked: Result<bool, DbErr> = async {
+                        // Protected legacy writes take the durable freeze
+                        // row before uploading and hold it through commit.
+                        for space in legacy_spaces {
+                            if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                                return Ok(true);
                             }
-                            Err(error) => return Err(TxStoreError::Tx(TxError::Db(error))),
-                        };
-                        let locked: Result<bool, DbErr> = async {
-                            // Protected legacy writes take the durable freeze
-                            // row before uploading and hold it through commit.
-                            for space in legacy_spaces {
-                                if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
-                                    return Ok(true);
-                                }
-                            }
-                            Ok(false)
                         }
-                        .await;
-                        match locked {
-                            Ok(false) => break Ok(tx),
-                            Ok(true) => break Err(TxStoreError::LegacyMeetingFrozen),
-                            Err(error)
-                                if !retried && crate::db_pool::is_connection_error(&error) =>
-                            {
-                                retried = true;
-                                drop(tx);
-                            }
-                            Err(error) => break Err(error.into()),
-                        }
+                        Ok(false)
+                    }
+                    .await;
+                    match locked {
+                        Ok(false) => Ok(tx),
+                        Ok(true) => Err(TxStoreError::LegacyMeetingFrozen),
+                        Err(error) => Err(error.into()),
                     }
                 }
             };
@@ -3322,6 +3522,7 @@ where
                 &sequence_spaces,
                 self.delegated_sql_caveats,
                 self.named_keys,
+                self.space_purge_fence.as_deref(),
             )
             .await?;
 
@@ -3404,8 +3605,18 @@ where
             self.delegated_sql_caveats,
             self.renewal_identity.as_ref(),
             !claim_checks_hosting,
+            self.space_purge_fence.as_deref(),
         )
         .await?;
+        for space in spaces {
+            space_purge::lock_live::<B, K>(
+                &tx,
+                self.space_purge_fence.as_deref(),
+                space,
+                &invocation.0.invoker,
+            )
+            .await?;
+        }
         let generations = if blobs.is_empty() {
             Vec::new()
         } else {
@@ -3657,6 +3868,13 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        let (mode, lifecycle) = space_purge::probe::<B, K, _>(
+            &self.conn,
+            self.space_purge_fence.as_deref(),
+            &invocation.0,
+            mode,
+        )
+        .await?;
         let now = OffsetDateTime::now_utc();
         if mode != InvokeMode::Admitted {
             invocation::verify_invocation(&invocation.0.invocation)
@@ -3697,8 +3915,9 @@ where
         .await
         .map_err(TxError::<B, K>::from)?;
 
+        space_purge::refuse_absent::<B, K>(&lifecycle)?;
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
-        if !requested_spaces.is_empty() {
+        if lifecycle.is_none() && !requested_spaces.is_empty() {
             let hosted = space::Entity::find()
                 .filter(space::Column::Id.is_in(requested_spaces.iter().cloned().map(SpaceIdWrap)))
                 .count(&self.conn)
@@ -4625,8 +4844,8 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 /// already taken on `db` (this same transaction) with
 /// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
-    db: &C,
+pub(crate) async fn transact<S: StorageSetup, K: Secrets>(
+    db: &DatabaseTransaction,
     store_setup: &S,
     secrets: &K,
     node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
@@ -4636,6 +4855,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     sequence_locks_held: &[SpaceId],
     delegated_sql_caveats: bool,
     named_keys: bool,
+    fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
 ) -> Result<TransactResult, TxError<S, K>> {
     transact_verified(
         db,
@@ -4648,6 +4868,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         sequence_locks_held,
         delegated_sql_caveats,
         named_keys,
+        fence,
         &PreVerified::default(),
     )
     .await
@@ -4657,8 +4878,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 /// transaction (TC-2986); inside it, those events have only their time
 /// window checked.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
-    db: &C,
+pub(crate) async fn transact_verified<S: StorageSetup, K: Secrets>(
+    db: &DatabaseTransaction,
     store_setup: &S,
     secrets: &K,
     node_identity: Option<&crate::renewal::RenewalNodeIdentity>,
@@ -4668,6 +4889,7 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
     sequence_locks_held: &[SpaceId],
     delegated_sql_caveats: bool,
     named_keys: bool,
+    fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
     verified: &PreVerified,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
@@ -4734,6 +4956,7 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
                 )
                 .await?
             };
+            space_purge::lock_delegation::<S, K>(db, fence, d).await?;
             registered.insert(*hash, reg);
         }
     }
@@ -5054,6 +5277,23 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
 
         let mut delegation_cids = Vec::new();
         for (hash, event) in event_hashes {
+            let fence_targets = match &event {
+                Event::Invocation(i, _)
+                | Event::InternalInvocation(i, _)
+                | Event::AdmittedInvocation(i, _) => Some((
+                    i.0.spaces().cloned().collect::<Vec<_>>(),
+                    i.0.invoker.clone(),
+                )),
+                Event::Revocation(r) => Some((
+                    space_order
+                        .iter()
+                        .filter(|(_, (_, _, _, hashes))| hashes.contains_key(&hash))
+                        .map(|(space, _)| space.clone())
+                        .collect(),
+                    r.0.revoker.clone(),
+                )),
+                Event::Delegation(_) => None,
+            };
             match event {
                 Event::Delegation(_) => {
                     // Already registered atomically before epoch construction.
@@ -5126,6 +5366,11 @@ pub(crate) async fn transact_verified<C: ConnectionTrait, S: StorageSetup, K: Se
                     }
                 }
             };
+            if let Some((spaces, actor)) = fence_targets {
+                for space in &spaces {
+                    space_purge::lock_live::<S, K>(db, fence, space, &actor).await?;
+                }
+            }
         }
 
         for space in new_spaces {
