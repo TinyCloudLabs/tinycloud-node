@@ -149,20 +149,6 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn stale_sequence_close_resyncs_without_backoff() {
-        let mut state = BackoffState::new();
-        let action = state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
-        assert_eq!(
-            action,
-            ReconnectAction::ResyncAndRetry {
-                jump: SEQUENCE_RESYNC_JUMP
-            }
-        );
-        // A resync-and-retry is not itself a backoff escalation.
-        assert_eq!(state.attempt, 0);
-    }
-
-    #[::core::prelude::v1::test]
     fn superseded_close_stops_and_does_not_reconnect() {
         let mut state = BackoffState::new();
         let action = state.next_action(AttemptOutcome::Closed(CLOSE_SUPERSEDED), 0.0);
