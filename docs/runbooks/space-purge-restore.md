@@ -21,7 +21,7 @@ The database is the only store that goes back in time. Every step below re-appli
 ## Before restore
 
 1. Fence the node: no ingress, no route served, no worker running. Reads, writes, `space/create`, `space/host` and sync all stay off until step 9. Once the operator purge path (S12) exists: its window is off (`[lifecycle.operator_purge] enabled_until` absent) and `TINYCLOUD_PURGE_OPERATOR_SECRET` is unset.
-2. Check both buckets, read-only. Keep each command's output with the restore record.
+2. Check both buckets, read-only, with operator credentials, not the node key (the node key is denied these read-backs on the ledger). Keep each command's output with the restore record.
 
    Ledger bucket `tinycloud-node-purge-ledger`:
    - Object Lock is on, with a COMPLIANCE default retention of 365 days; versioning is on; public access is blocked.
@@ -29,9 +29,18 @@ The database is the only store that goes back in time. Every step below re-appli
    - The node authenticates with a static IAM user key (`AWS_KEY` / `AWS_SECRET`), not a role, and the data bucket uses the same key. A broad allow on that user (`s3:*` or `Resource: *`) would therefore also reach the ledger bucket, so the policy denies everything on the ledger except the node's three calls. That user's policy:
      - allows **only** `s3:PutObject` and `s3:GetObject` on the ledger objects (`arn:aws:s3:::tinycloud-node-purge-ledger/_purge-ledger/*`, plus `_operator-audit/*` once S12 exists), and `s3:ListBucket` on `arn:aws:s3:::tinycloud-node-purge-ledger`;
      - has one `Deny` with `NotAction: [s3:PutObject, s3:GetObject, s3:ListBucket]` on both ledger ARNs, `arn:aws:s3:::tinycloud-node-purge-ledger` and `arn:aws:s3:::tinycloud-node-purge-ledger/*`. This covers `DeleteObject`, `DeleteObjectVersion`, `PutObjectRetention`, `PutObjectLegalHold`, `PutBucketObjectLockConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy` / `DeleteBucketPolicy`, `PutBucketPublicAccessBlock` and ACL changes, whatever else the user is allowed;
-     - names neither the data bucket nor a wildcard resource in any of these statements.
+     - names neither the data bucket nor `Resource: "*"` in any of these statements.
 
-     Read-only check, with output kept: `aws iam simulate-principal-policy --policy-source-arn <node user ARN>` against the ledger ARNs. Expected:
+     Read-only check, with output kept. Each result must match exactly; `implicitDeny` on a deny row means the `NotAction` deny is missing.
+     ```
+     U=<node user ARN>; L=arn:aws:s3:::tinycloud-node-purge-ledger
+     Q='EvaluationResults[].[EvalActionName,EvalResourceName,EvalDecision]'
+     aws iam simulate-principal-policy --policy-source-arn "$U" --action-names s3:DeleteObject s3:DeleteObjectVersion s3:PutObjectRetention s3:PutObjectLegalHold --resource-arns "$L/_purge-ledger/x" --query "$Q" --output text
+     aws iam simulate-principal-policy --policy-source-arn "$U" --action-names s3:PutBucketObjectLockConfiguration s3:PutLifecycleConfiguration s3:PutBucketPolicy s3:DeleteBucketPolicy --resource-arns "$L" --query "$Q" --output text
+     aws iam simulate-principal-policy --policy-source-arn "$U" --action-names s3:PutObject s3:GetObject --resource-arns "$L/_purge-ledger/x" --query "$Q" --output text
+     aws iam simulate-principal-policy --policy-source-arn "$U" --action-names s3:ListBucket --resource-arns "$L" --query "$Q" --output text
+     ```
+     Expected: the first two commands return `explicitDeny` on every row, and the last two return `allowed`:
      - `explicitDeny` for `s3:DeleteObject`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:DeleteObjectVersion`, `s3:PutBucketObjectLockConfiguration`, `s3:PutLifecycleConfiguration`, `s3:PutBucketPolicy` and `s3:DeleteBucketPolicy`;
      - `allowed` for `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::tinycloud-node-purge-ledger/_purge-ledger/x`, and for `s3:ListBucket` on the bucket ARN.
 
