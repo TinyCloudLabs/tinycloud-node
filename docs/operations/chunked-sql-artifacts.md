@@ -34,7 +34,11 @@ smaller than 8 MiB without rewriting the checkpoint. Larger WALs and writes
 forbidden from growing use a fresh checkpoint. In-memory databases use
 checkpoints. Both kinds of part use the same 1 MiB statement limit, and the
 artifact ceiling covers checkpoint plus WAL together. Conversion of existing
-artifacts follows separately.
+artifacts follows separately. Enabling parts does not convert legacy rows or
+bypass their single-row read limit: an existing legacy checkpoint or WAL over
+64 MiB still answers `507 sql_database_size_limit` with the default limits.
+The train includes no converter for those rows. Already-published parts load
+without that single-row limit, including with the switch off.
 Aborted and superseded parts enter a fenced deleting state; reclamation deletes
 at most one payload chunk per statement and releases its charge only after all
 bytes are gone. A periodic collector recovers uploads whose 120-second lease

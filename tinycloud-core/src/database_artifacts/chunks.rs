@@ -700,11 +700,30 @@ mod tests {
             ),
         );
         assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
-        let (space, meta) = match (a, b) {
-            (Ok(meta), Err(DatabaseArtifactError::StorageLimit)) => (first, meta),
-            (Err(DatabaseArtifactError::StorageLimit), Ok(meta)) => (second, meta),
+        let (space, refused_space, meta) = match (a, b) {
+            (
+                Ok(meta),
+                Err(DatabaseArtifactError::StorageLimit | DatabaseArtifactError::ReplacementBusy),
+            ) => (first, second, meta),
+            (
+                Err(DatabaseArtifactError::StorageLimit | DatabaseArtifactError::ReplacementBusy),
+                Ok(meta),
+            ) => (second, first, meta),
             other => panic!("unexpected {other:?}"),
         };
+        // Contention can refuse the racing reservation before it checks quota.
+        // Once the winner has published, capacity must refuse the other space.
+        assert!(matches!(
+            repo.save_snapshot(
+                "sql",
+                refused_space,
+                "main",
+                snapshot(&payload),
+                ArtifactExpectation::Absent,
+            )
+            .await,
+            Err(DatabaseArtifactError::StorageLimit)
+        ));
         let reserved = fixture
             .conn
             .query_one(statement(
@@ -1366,7 +1385,16 @@ mod tests {
             upload.await.unwrap(),
             Err(DatabaseArtifactError::StaleLineage)
         ));
-        repo.reap_unused_parts(64).await.unwrap();
+        // Drop cleanup and the collector may contend on the owner's row.
+        // A bounded collection pass is best effort; require eventual reclamation.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ledger(&fixture).await != (0, 0) {
+                let _ = repo.reap_unused_parts(64).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deleted and aborted parts must release all quota");
         assert_eq!(ledger(&fixture).await, (0, 0));
         assert!(repo
             .load_meta("sql", space, "main")
@@ -2581,19 +2609,33 @@ END $$;
             .unwrap();
         // More than an inline pass remains, but this writer must not wait on
         // another owner's locked/flooded collector queue.
-        let third = repo
-            .save_snapshot(
-                "sql",
-                b,
-                "main",
-                snapshot(&[4; 4096]),
-                ArtifactExpectation::Derived {
-                    revision: second.revision,
-                    checkpoint_content_hash: second.checkpoint_content_hash,
-                },
-            )
-            .await
-            .unwrap();
+        let third = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                match repo
+                    .save_snapshot(
+                        "sql",
+                        b,
+                        "main",
+                        snapshot(&[4; 4096]),
+                        ArtifactExpectation::Derived {
+                            revision: second.revision,
+                            checkpoint_content_hash: second.checkpoint_content_hash.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(meta) => break meta,
+                    // A bounded pass can leave this database's own predecessor
+                    // pending. Retry it without collecting the locked owner.
+                    Err(DatabaseArtifactError::ReplacementBusy) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("unexpected {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("this database's predecessor must make progress");
         assert_eq!(third.revision, 3);
         // A global pass reports the locked owner after continuing other work.
         assert!(repo.reap_unused_parts(128).await.is_err());
