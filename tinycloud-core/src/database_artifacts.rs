@@ -2204,9 +2204,12 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::ReadAll;
     use super::*;
-    use crate::migrations::Migrator;
-    use sea_orm::{ConnectOptions, Database};
-    use sea_orm_migration::MigratorTrait;
+    use crate::migrations::{
+        m20261118_010000_artifact_payload_encoding::Migration as ArtifactEncodingMigration,
+        Migrator,
+    };
+    use sea_orm::{ConnectOptions, Database, Statement};
+    use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 
     #[tokio::test]
     async fn delta_save_replaces_wal_and_checkpoint_clears_it() {
@@ -4002,6 +4005,107 @@ mod tests {
         let source = TestAtRestSource::new(mode, mode != AtRestMode::Off, Some(keys()));
         let repo = SeaOrmDatabaseArtifactRepository::new(conn.clone()).with_at_rest(source.clone());
         (repo, source)
+    }
+
+    #[tokio::test]
+    async fn artifact_encoding_rollback_refuses_sealed_rows() {
+        let conn = sqlite_conn().await;
+        let (repo, _source) = at_rest_repo(&conn, AtRestMode::Encrypt);
+        let checkpoint = database_bytes(SQLITE_HEADER, 4096, 3);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        let before = stored_row(&conn, "space", "main").await.unwrap();
+        assert_eq!(before.payload_encoding, Some(1));
+
+        let manager = SchemaManager::new(&conn);
+        assert!(matches!(
+            ArtifactEncodingMigration.down(&manager).await,
+            Err(DbErr::Migration(_))
+        ));
+        assert_eq!(stored_row(&conn, "space", "main").await.unwrap(), before);
+        assert_eq!(hydrate(&repo, "space", "main").await, (checkpoint, None));
+    }
+
+    #[tokio::test]
+    async fn artifact_encoding_rollback_refuses_each_nonnull_metadata_field() {
+        use database_artifact::Column;
+
+        for column in [
+            Column::PayloadEncoding,
+            Column::DeltaEncoding,
+            Column::Manifest,
+        ] {
+            let conn = sqlite_conn().await;
+            let repo = SeaOrmDatabaseArtifactRepository::new(conn.clone());
+            repo.save(
+                "sql",
+                "space",
+                "main",
+                vec![1, 2, 3],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+            let value = match column {
+                Column::Manifest => Expr::value(Vec::<u8>::new()),
+                _ => Expr::value(99_i16),
+            };
+            database_artifact::Entity::update_many()
+                .col_expr(column, value)
+                .exec(&conn)
+                .await
+                .unwrap();
+            let before = stored_row(&conn, "space", "main").await.unwrap();
+
+            assert!(matches!(
+                ArtifactEncodingMigration
+                    .down(&SchemaManager::new(&conn))
+                    .await,
+                Err(DbErr::Migration(_))
+            ));
+            assert_eq!(stored_row(&conn, "space", "main").await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_encoding_rollback_preserves_plaintext_rows() {
+        let conn = sqlite_conn().await;
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn.clone());
+        let checkpoint = database_bytes(SQLITE_HEADER, 4096, 3);
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            checkpoint.clone(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+        let manager = SchemaManager::new(&conn);
+        ArtifactEncodingMigration.down(&manager).await.unwrap();
+        for column in ["payload_encoding", "delta_encoding", "manifest"] {
+            assert!(!manager
+                .has_column("database_artifact", column)
+                .await
+                .unwrap());
+        }
+        let row = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT payload FROM database_artifact".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<Vec<u8>>("", "payload").unwrap(), checkpoint);
     }
 
     /// The stored row, payload bytes included.

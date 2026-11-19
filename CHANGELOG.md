@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Encryption at rest: rolling back the SQL artifact encoding migration now refuses while at-rest keys or artifact encoding/manifest metadata remain. Plaintext rows with no key material can still roll back without changing their payloads. Details: TC-887.
 - Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
