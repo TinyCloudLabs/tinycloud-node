@@ -17,11 +17,17 @@
 //!
 //! [`replay`] re-applies a ledger to a database (seed NULL, state `deleted`)
 //! and is the first step of a restore. It applies committed and still-open
-//! intents and skips aborted ones. The file is only ever appended to, never
-//! rotated.
+//! intents and skips aborted ones.
+//!
+//! Lines are only ever appended, with one exception:
+//! [`DeletionLedger::prune_owners`] removes the settled operations of given
+//! owners by writing the remaining lines to `<ledger path>.prune.tmp` and
+//! renaming that over the ledger, so the ledger path always names a whole
+//! file. [`DeletionLedger::open`] removes a temporary file an interrupted
+//! prune left behind.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -178,6 +184,71 @@ fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The file [`DeletionLedger::prune_owners`] writes before renaming it over
+/// the ledger: the ledger path with `.prune.tmp` appended.
+fn prune_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".prune.tmp");
+    PathBuf::from(name)
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Fsyncs the directory holding `path`, so a created, renamed or removed
+/// entry in it is durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+/// Opens the ledger file for reading and appending and forces its mode to
+/// 0600. With `create` false a missing file is an error.
+fn open_ledger_file(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Writes `bytes` to a new file at `temp` with mode 0600 and fsyncs it. A
+/// file already there is a leftover of an earlier failed prune and is
+/// replaced; `create_new` never follows a link planted at the name.
+fn write_prune_temp(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    remove_if_present(temp)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Takes a non-blocking exclusive `flock`. `Ok(false)` means another open
 /// file description holds it.
 #[cfg(unix)]
@@ -283,24 +354,13 @@ impl DeletionLedger {
     ) -> Result<Self, DeletionLedgerError> {
         validate_path(path).map_err(DeletionLedgerError::Path)?;
         let lock = acquire_lock(path, lock_interval, lock_limit)?;
-        let mut options = OpenOptions::new();
-        options.read(true).append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        // Left by a prune that stopped before its rename took effect: the
+        // ledger path names a whole file either way.
+        remove_if_present(&prune_temp_path(path))?;
+        let mut file = open_ledger_file(path, true)?;
         let dropped_tail_bytes = repair_tail(&mut file)?;
         file.sync_all()?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
+        sync_parent(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
@@ -354,12 +414,7 @@ impl DeletionLedger {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         self.check_not_moved(&file)?;
-        if self.unrepaired.load(Ordering::SeqCst) {
-            return Err(std::io::Error::other(
-                "an earlier failed append left bytes in the ledger that could not be removed",
-            )
-            .into());
-        }
+        self.refuse_if_unrepaired()?;
         let length_before = file.metadata()?.len();
         if let Err(error) = write(&mut file, line).and_then(|()| file.sync_all()) {
             let unchanged = file
@@ -378,6 +433,16 @@ impl DeletionLedger {
                 );
             }
             return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn refuse_if_unrepaired(&self) -> Result<(), DeletionLedgerError> {
+        if self.unrepaired.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other(
+                "an earlier failed append left bytes in the ledger that could not be removed",
+            )
+            .into());
         }
         Ok(())
     }
@@ -404,6 +469,67 @@ impl DeletionLedger {
     #[cfg(not(unix))]
     fn check_not_moved(&self, _file: &File) -> Result<(), DeletionLedgerError> {
         Ok(())
+    }
+
+    /// Removes every SETTLED operation (an intent that a `committed` or
+    /// `aborted` line names) whose network belongs to one of `owners`,
+    /// together with the lines that settle it. `owners` are canonical DIDs, as
+    /// [`NetworkId::owner_did`] gives them. An open operation is kept and
+    /// counted as `skipped_open`. Every other line is kept byte for byte and
+    /// in order. Which owners may be pruned is the caller's decision.
+    ///
+    /// It holds the append mutex throughout (the ledger lock is held while
+    /// the ledger is open), writes the kept lines to `<ledger path>.prune.tmp`
+    /// with mode 0600 and fsyncs it, renames it over the ledger, fsyncs the
+    /// directory and reopens the append handle on the new file. A crash at
+    /// any point leaves the ledger path naming the old file or the new one,
+    /// each whole, and the next [`DeletionLedger::open`] removes a leftover
+    /// temporary file. When nothing is removed the file is not rewritten. If
+    /// the directory fsync or the reopen fails, the handle still names the
+    /// replaced file, so later appends fail as [`DeletionLedgerError::Moved`]
+    /// until the ledger is opened again. Blocking.
+    pub fn prune_owners(
+        &self,
+        owners: &BTreeSet<String>,
+    ) -> Result<PruneReport, DeletionLedgerError> {
+        self.prune_owners_at(owners, |_| Ok(()))
+    }
+
+    /// [`DeletionLedger::prune_owners`], calling `at` at each [`PrunePoint`].
+    /// An error from `at` stops the prune there as a crash would: nothing is
+    /// cleaned up and the handle is not reopened.
+    pub(super) fn prune_owners_at(
+        &self,
+        owners: &BTreeSet<String>,
+        mut at: impl FnMut(PrunePoint) -> std::io::Result<()>,
+    ) -> Result<PruneReport, DeletionLedgerError> {
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.check_not_moved(&file)?;
+        self.refuse_if_unrepaired()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let (kept, report) = prune_lines(&bytes, owners)?;
+        if report.pruned_lines == 0 {
+            return Ok(report);
+        }
+        let temp = prune_temp_path(&self.path);
+        if let Err(error) = write_prune_temp(&temp, &kept) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        at(PrunePoint::TempWritten)?;
+        if let Err(error) = std::fs::rename(&temp, &self.path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        at(PrunePoint::Renamed)?;
+        sync_parent(&self.path)?;
+        *file = open_ledger_file(&self.path, false)?;
+        Ok(report)
     }
 
     /// The start-time replay. Applies the ledger to the database exactly as a
@@ -475,6 +601,101 @@ fn repair_tail(file: &mut File) -> Result<usize, DeletionLedgerError> {
     }
     file.set_len(start as u64)?;
     Ok(bytes.len() - start)
+}
+
+/// Steps of [`DeletionLedger::prune_owners`] at which a test can stop it as a
+/// crash would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrunePoint {
+    /// The temporary file is written and fsynced; the ledger is untouched.
+    TempWritten,
+    /// The temporary file has been renamed over the ledger.
+    Renamed,
+}
+
+/// Result of [`DeletionLedger::prune_owners`]: counts only, never a DID or an
+/// operation.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneReport {
+    /// Settled operations of the given owners that were removed.
+    pub pruned_operations: usize,
+    /// Lines removed: those operations and the lines that settled them.
+    pub pruned_lines: usize,
+    /// Operations of the given owners that are still open: kept.
+    pub skipped_open: usize,
+    /// Lines left in the file.
+    pub kept_lines: usize,
+}
+
+/// The bytes [`DeletionLedger::prune_owners`] keeps, and its counts. A file
+/// that does not end in a newline or holds a line that is not a record is
+/// refused: `open` and failed appends never leave either.
+fn prune_lines(
+    bytes: &[u8],
+    owners: &BTreeSet<String>,
+) -> Result<(Vec<u8>, PruneReport), DeletionLedgerError> {
+    let lines: Vec<&[u8]> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
+    if bytes.last().is_some_and(|last| *last != b'\n') {
+        return Err(DeletionLedgerError::Malformed(lines.len()));
+    }
+    let records = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                return Ok(None);
+            }
+            serde_json::from_slice::<Record>(line)
+                .map(Some)
+                .map_err(|_| DeletionLedgerError::Malformed(index + 1))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fn settling_op(record: &Option<Record>) -> Option<&str> {
+        match record {
+            Some(Record::Committed(Committed { committed })) => Some(committed.as_str()),
+            Some(Record::Aborted(Aborted { aborted })) => Some(aborted.as_str()),
+            _ => None,
+        }
+    }
+    let settled: HashSet<&str> = records.iter().filter_map(settling_op).collect();
+    let mut report = PruneReport::default();
+    let mut dropped = vec![false; lines.len()];
+    let mut dropped_ops = HashSet::new();
+    let mut kept_ops = HashSet::new();
+    for (index, record) in records.iter().enumerate() {
+        let Some(Record::Intent(intent)) = record else {
+            continue;
+        };
+        let listed = intent
+            .network_id
+            .parse::<NetworkId>()
+            .is_ok_and(|network| owners.contains(network.owner_did()));
+        if listed && settled.contains(intent.op.as_str()) {
+            dropped[index] = true;
+            dropped_ops.insert(intent.op.as_str());
+            report.pruned_operations += 1;
+        } else {
+            report.skipped_open += usize::from(listed);
+            kept_ops.insert(intent.op.as_str());
+        }
+    }
+    for (index, record) in records.iter().enumerate() {
+        // A settling line stays while any intent it names stays.
+        if let Some(op) = settling_op(record) {
+            dropped[index] = dropped_ops.contains(op) && !kept_ops.contains(op);
+        }
+    }
+    let mut kept = Vec::with_capacity(bytes.len());
+    for (line, drop_line) in lines.iter().zip(dropped) {
+        if drop_line {
+            report.pruned_lines += 1;
+        } else {
+            kept.extend_from_slice(line);
+            report.kept_lines += 1;
+        }
+    }
+    Ok((kept, report))
 }
 
 /// What a ledger file holds.

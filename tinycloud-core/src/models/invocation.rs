@@ -376,8 +376,7 @@ pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
     .await
 }
 
-/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
-#[cfg(test)]
+/// `authorize_holder` checks against the caller's same transaction snapshot.
 pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     db: &C,
     holder: &str,
@@ -778,22 +777,7 @@ async fn save<C: ConnectionTrait>(
     );
 
     // Ensure the invoker actor exists before inserting the invocation
-    match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
-        id: invocation.invoker.clone(),
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
+    crate::space_purge_records::operation_actors(db, &[&invocation.invoker]).await?;
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,

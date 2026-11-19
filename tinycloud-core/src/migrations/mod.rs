@@ -1,3 +1,10 @@
+mod m20261112_000000_space_purge;
+mod m20261112_010000_space_purge_fences;
+mod m20261112_020000_space_purge_shared_residue;
+mod m20261112_030000_resource_purge;
+mod m20261113_000000_purge_ledger_repair;
+mod m20261113_010000_resource_review_consumption;
+mod m20261113_020000_resource_retirement_snapshot;
 use sea_orm_migration::prelude::*;
 pub mod m20230510_101010_init_tables;
 pub mod m20260218_sql_database;
@@ -92,6 +99,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261113_010000_artifact_chunks::Migration),
             Box::new(m20261117_000000_hook_subscription_headers::Migration),
             Box::new(m20261117_000000_renewal_switch::Migration),
+            Box::new(m20261112_000000_space_purge::Migration),
+            Box::new(m20261112_010000_space_purge_fences::Migration),
+            Box::new(m20261112_020000_space_purge_shared_residue::Migration),
+            Box::new(m20261112_030000_resource_purge::Migration),
+            Box::new(m20261113_000000_purge_ledger_repair::Migration),
+            Box::new(m20261113_010000_resource_review_consumption::Migration),
+            Box::new(m20261113_020000_resource_retirement_snapshot::Migration),
             Box::new(m20261109_000000_hook_delivery_lease::Migration),
         ]
     }

@@ -72,14 +72,14 @@ mod tests {
     #[tokio::test]
     async fn existing_subscriptions_gain_empty_headers_and_down_drops_columns() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        // This migration's position, not the list's end: later migrations
-        // follow it, and `down` must roll back through it.
+        // Up to just before this migration, then this one alone: the
+        // erase-30 purge migrations that follow it are irreversible by
+        // design, so `down` can only ever roll back this single step.
         let migrations = Migrator::migrations();
         let before = migrations
             .iter()
             .position(|migration| migration.name() == super::Migration.name())
             .unwrap();
-        let after = migrations.len() - before;
         Migrator::up(&db, Some(before as u32)).await.unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
@@ -92,7 +92,7 @@ mod tests {
         .await
         .unwrap();
 
-        Migrator::up(&db, None).await.unwrap();
+        Migrator::up(&db, Some(1)).await.unwrap();
         let row = crate::models::hook_subscription::Entity::find_by_id("sub")
             .one(&db)
             .await
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(row.encrypted_headers_format, 0);
         assert_eq!(row.encrypted_secret, [1, 2]);
 
-        Migrator::down(&db, Some(after as u32)).await.unwrap();
+        Migrator::down(&db, Some(1)).await.unwrap();
         let row = db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,

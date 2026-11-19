@@ -31,6 +31,10 @@ const DUCKDB_MAGIC_OFFSET: usize = 8;
 type DatabaseLock = tokio::sync::Mutex<()>;
 type DatabaseLockRegistry = Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<DatabaseLock>>>>;
 
+/// Clones share all state: every mutable field is behind an `Arc` and the rest
+/// is immutable configuration. The space-purge worker uses a clone of the
+/// instance Rocket manages, so its evictions reach the live actors.
+#[derive(Clone)]
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     hydration_locks: DatabaseLockRegistry,
@@ -667,6 +671,8 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
         DatabaseArtifactError::WriteLimitExceeded { .. } => DuckDbError::DatabaseSizeLimit,
         DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
         DatabaseArtifactError::StorageLimit => DuckDbError::StorageWouldGrow,
+        DatabaseArtifactError::SpaceDeleted => DuckDbError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => DuckDbError::LifecycleUnavailable,
         err => DuckDbError::Internal(err.to_string()),
     }
 }
@@ -1410,3 +1416,5 @@ mod tests {
         }
     }
 }
+
+mod space_purge;

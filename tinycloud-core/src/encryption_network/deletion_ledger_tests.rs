@@ -1,6 +1,6 @@
 //! Deletion ledger: durable append, tail repair, settling and replay.
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait,
@@ -8,8 +8,8 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 
 use super::deletion_ledger::{
-    read, replay, validate_path, DeletionLedger, DeletionLedgerError, Intent, LedgerKey, Record,
-    ReplayReport,
+    read, replay, validate_path, DeletionLedger, DeletionLedgerError, Intent, LedgerKey,
+    PrunePoint, PruneReport, Record, ReplayReport,
 };
 use crate::{migrations::Migrator, models::encryption_network_key};
 
@@ -668,4 +668,367 @@ async fn an_operation_committed_means_every_key_is_deleted_at_its_version_or_lat
     assert!(!committed(&[("apps/a/missing", 1)]).await);
     // A key that is only deleted at an older version than the operation's.
     assert!(!committed(&[("apps/a/deleted", 2)]).await);
+}
+
+// ------------------------------------------------------------------- prune
+
+const OTHER_OWNER: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+
+fn owners(list: &[&str]) -> BTreeSet<String> {
+    list.iter().map(|owner| owner.to_string()).collect()
+}
+
+/// An intent on the `default` network of `owner`.
+fn intent_of(owner: &str, op: &str, keys: &[(&str, i64)]) -> Intent {
+    Intent {
+        network_id: super::NetworkId::new(owner.to_string(), "default".to_string())
+            .unwrap()
+            .to_string(),
+        ..intent(op, keys)
+    }
+}
+
+/// The ledger's lines, each with its newline.
+fn lines_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .split_inclusive('\n')
+        .map(str::to_string)
+        .collect()
+}
+
+fn prune_temp_of(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.prune.tmp", path.display()))
+}
+
+/// OWNER: a committed and an aborted operation. OTHER_OWNER: a committed one
+/// and an open one. The two owners' lines interleave.
+fn two_owner_ledger(ledger: &DeletionLedger) {
+    for record in [
+        Record::Intent(intent_of(OWNER, "a1", &[("apps/a/x", 1)])),
+        Record::Intent(intent_of(
+            OTHER_OWNER,
+            "b1",
+            &[("apps/b/x", 1), ("apps/b/y", 2)],
+        )),
+        Record::committed("a1"),
+        Record::Intent(intent_of(OWNER, "a2", &[("apps/a/y", 1)])),
+        Record::committed("b1"),
+        Record::aborted("a2"),
+        Record::Intent(intent_of(OTHER_OWNER, "b2", &[("apps/b/z", 1)])),
+    ] {
+        ledger.append(&record).unwrap();
+    }
+}
+
+#[test]
+fn prune_removes_the_settled_operations_of_the_given_owners_and_keeps_every_other_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    two_owner_ledger(&ledger);
+    let before = lines_of(&path);
+
+    let report = ledger.prune_owners(&owners(&[OWNER])).unwrap();
+    assert_eq!(
+        report,
+        PruneReport {
+            pruned_operations: 2,
+            pruned_lines: 4,
+            skipped_open: 0,
+            kept_lines: 3,
+        }
+    );
+    // The other owner's lines, byte for byte and in their order.
+    assert_eq!(
+        lines_of(&path),
+        vec![before[1].clone(), before[4].clone(), before[6].clone()]
+    );
+    assert!(!prune_temp_of(&path).exists());
+    // The report holds counts only.
+    assert_eq!(
+        serde_json::to_value(&report).unwrap(),
+        serde_json::json!({
+            "prunedOperations": 2,
+            "prunedLines": 4,
+            "skippedOpen": 0,
+            "keptLines": 3,
+        })
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[test]
+fn prune_keeps_an_open_operation_until_it_is_settled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent_of(
+            OWNER,
+            "done",
+            &[("apps/a/x", 1)],
+        )))
+        .unwrap();
+    ledger.append(&Record::committed("done")).unwrap();
+    ledger
+        .append(&Record::Intent(intent_of(
+            OWNER,
+            "open",
+            &[("apps/a/y", 1)],
+        )))
+        .unwrap();
+    let open_line = lines_of(&path)[2].clone();
+
+    let report = ledger.prune_owners(&owners(&[OWNER])).unwrap();
+    assert_eq!(
+        report,
+        PruneReport {
+            pruned_operations: 1,
+            pruned_lines: 2,
+            skipped_open: 1,
+            kept_lines: 1,
+        }
+    );
+    assert_eq!(lines_of(&path), vec![open_line]);
+
+    // Once settled, it goes with its settling line.
+    ledger.append(&Record::committed("open")).unwrap();
+    let report = ledger.prune_owners(&owners(&[OWNER])).unwrap();
+    assert_eq!(
+        report,
+        PruneReport {
+            pruned_operations: 1,
+            pruned_lines: 2,
+            skipped_open: 0,
+            kept_lines: 0,
+        }
+    );
+    assert!(std::fs::read(&path).unwrap().is_empty());
+}
+
+#[test]
+fn prune_is_idempotent_and_rewrites_nothing_when_nothing_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    two_owner_ledger(&ledger);
+    assert_eq!(
+        ledger
+            .prune_owners(&owners(&[OWNER]))
+            .unwrap()
+            .pruned_operations,
+        2
+    );
+    let after = std::fs::read(&path).unwrap();
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        || std::fs::metadata(&path).unwrap().ino()
+    };
+    #[cfg(unix)]
+    let pruned_inode = inode();
+
+    let unchanged = PruneReport {
+        kept_lines: 3,
+        ..PruneReport::default()
+    };
+    let lists: [&[&str]; 3] = [&[OWNER], &[], &["did:key:z6MkNoLinesInThisLedger"]];
+    for list in lists {
+        assert_eq!(
+            ledger.prune_owners(&owners(list)).unwrap(),
+            unchanged,
+            "{list:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), after, "{list:?}");
+        #[cfg(unix)]
+        assert_eq!(inode(), pruned_inode, "not rewritten: {list:?}");
+    }
+    // The open operation of the other owner is reported, never removed.
+    assert_eq!(
+        ledger
+            .prune_owners(&owners(&[OTHER_OWNER]))
+            .unwrap()
+            .skipped_open,
+        1
+    );
+    assert_eq!(read(&path).unwrap().open_intents().len(), 1);
+}
+
+#[tokio::test]
+async fn an_append_after_a_prune_lands_in_the_new_file_and_the_ledger_replays() {
+    let db = fresh_db().await;
+    active_key(&db, "apps/a/x").await;
+    active_key(&db, "apps/a/y").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    ledger
+        .append(&Record::Intent(intent_of(
+            OTHER_OWNER,
+            "gone",
+            &[("apps/b/x", 1)],
+        )))
+        .unwrap();
+    ledger.append(&Record::committed("gone")).unwrap();
+    ledger
+        .append(&Record::Intent(intent("kept", &[("apps/a/x", 1)])))
+        .unwrap();
+    ledger.append(&Record::committed("kept")).unwrap();
+    assert_eq!(
+        ledger
+            .prune_owners(&owners(&[OTHER_OWNER]))
+            .unwrap()
+            .pruned_lines,
+        2
+    );
+
+    // The handle follows the new file.
+    ledger
+        .append(&Record::Intent(intent("later", &[("apps/a/y", 1)])))
+        .unwrap();
+    let contents = read(&path).unwrap();
+    assert!(!contents.torn_tail);
+    assert_eq!(contents.records.len(), 3);
+    let open: Vec<&str> = contents
+        .open_intents()
+        .into_iter()
+        .map(|intent| intent.op.as_str())
+        .collect();
+    assert_eq!(open, vec!["later"]);
+
+    let report = ledger.replay_at_start(&db).await.unwrap();
+    assert_eq!(report.operations, 2);
+    assert_eq!(report.applied, 2);
+    for key in ["apps/a/x", "apps/a/y"] {
+        let row = row(&db, key).await;
+        assert_eq!(row.state, "deleted", "{key}");
+        assert_eq!(row.sealed_seed, None, "{key}");
+    }
+    assert!(read(&path).unwrap().open_intents().is_empty());
+
+    // A reopen reads and appends to the same file.
+    drop(ledger);
+    let ledger = DeletionLedger::open(&path).unwrap();
+    ledger.append(&Record::committed("after-reopen")).unwrap();
+    assert_eq!(read(&path).unwrap().records.len(), 5);
+}
+
+fn crash_at(at: PrunePoint) -> impl FnMut(PrunePoint) -> std::io::Result<()> {
+    move |point| {
+        if point == at {
+            Err(std::io::Error::other("the process stops here"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn a_prune_stopped_before_its_rename_leaves_the_old_ledger_and_open_removes_the_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    two_owner_ledger(&ledger);
+    let before = std::fs::read(&path).unwrap();
+    let temp = prune_temp_of(&path);
+
+    let result = ledger.prune_owners_at(&owners(&[OWNER]), crash_at(PrunePoint::TempWritten));
+    assert!(
+        matches!(result, Err(DeletionLedgerError::Io(_))),
+        "{result:?}"
+    );
+    assert!(temp.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(ledger);
+
+    let ledger = DeletionLedger::open(&path).unwrap();
+    assert!(!temp.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(ledger);
+
+    // A temporary file cut off while it was written goes the same way.
+    std::fs::write(&temp, br#"{"op":"b1","netw"#).unwrap();
+    let ledger = DeletionLedger::open(&path).unwrap();
+    assert!(!temp.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        ledger
+            .prune_owners(&owners(&[OWNER]))
+            .unwrap()
+            .pruned_operations,
+        2
+    );
+}
+
+#[test]
+fn a_prune_stopped_after_its_rename_leaves_the_new_ledger_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, ledger) = ledger_in(&dir);
+    two_owner_ledger(&ledger);
+    let before = lines_of(&path);
+    let pruned = vec![before[1].clone(), before[4].clone(), before[6].clone()];
+
+    let result = ledger.prune_owners_at(&owners(&[OWNER]), crash_at(PrunePoint::Renamed));
+    assert!(
+        matches!(result, Err(DeletionLedgerError::Io(_))),
+        "{result:?}"
+    );
+    assert_eq!(lines_of(&path), pruned);
+    assert!(!prune_temp_of(&path).exists());
+    // The handle still names the replaced file: an append fails rather than
+    // land there.
+    assert!(matches!(
+        ledger.append(&Record::committed("late")),
+        Err(DeletionLedgerError::Moved)
+    ));
+    drop(ledger);
+
+    let ledger = DeletionLedger::open(&path).unwrap();
+    assert_eq!(lines_of(&path), pruned);
+    ledger.append(&Record::committed("late")).unwrap();
+    assert_eq!(read(&path).unwrap().records.len(), 4);
+}
+
+#[test]
+fn prune_refuses_a_file_it_cannot_read_whole_and_changes_nothing() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.jsonl");
+    let whole =
+        serde_json::to_string(&Record::Intent(intent_of(OWNER, "op", &[("apps/a/x", 1)]))).unwrap();
+    std::fs::write(
+        &path,
+        format!("{whole}\nnot json\n{}\n", r#"{"committed":"op"}"#),
+    )
+    .unwrap();
+    let ledger = DeletionLedger::open(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        ledger.prune_owners(&owners(&[OWNER])),
+        Err(DeletionLedgerError::Malformed(2))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!prune_temp_of(&path).exists());
+
+    // A final line without its newline, as only a failed append that could
+    // not be cut back leaves.
+    let path = dir.path().join("unterminated.jsonl");
+    let ledger = DeletionLedger::open(&path).unwrap();
+    ledger
+        .append(&Record::Intent(intent_of(OWNER, "op", &[("apps/a/x", 1)])))
+        .unwrap();
+    ledger.append(&Record::committed("op")).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(br#"{"committed":"o"#)
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        ledger.prune_owners(&owners(&[OWNER])),
+        Err(DeletionLedgerError::Malformed(3))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
