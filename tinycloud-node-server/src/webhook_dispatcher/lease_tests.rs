@@ -84,6 +84,10 @@ async fn insert_deliveries(
 ) -> Result<()> {
     hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
         hook_subscription::Model {
+            encrypted_secret_format: 2,
+            header_names_json: None,
+            encrypted_headers: None,
+            encrypted_headers_format: 0,
             id: "sub_01".to_string(),
             subscriber_did: OWNER_DID.to_string(),
             space_id: SPACE_ID.to_string(),
@@ -93,7 +97,10 @@ async fn insert_deliveries(
                 serde_json::to_string(&vec!["tinycloud.kv/put".to_string()]).unwrap(),
             ),
             callback_url: callback_url.to_string(),
-            encrypted_secret: encryption.encrypt(b"hook-secret"),
+            encrypted_secret: encryption.encrypt(
+                b"hook-secret",
+                RowBinding::new("hook_subscription", "encrypted_secret", &[b"sub_01"]),
+            ),
             secret_key_id: PRIMARY_SECRET_KEY_ID.to_string(),
             active: true,
             created_at: "2026-04-09T00:00:00Z".to_string(),
