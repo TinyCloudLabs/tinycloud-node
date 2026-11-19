@@ -190,39 +190,63 @@ pub async fn encryption_owners<C: ConnectionTrait>(conn: &C) -> Result<BTreeSet<
     Ok(owners)
 }
 
+/// `LIKE` patterns, over lowercased values, that every stored spelling of
+/// the canonical `owner` matches: (owner DID, network id). `NetworkId` and
+/// `canonicalize_principal` accept a `did:pkh:eip155` owner with any chain id
+/// `u64` parses (`1`, `01`, `+1`) and any address case, so for such an owner
+/// the patterns pin only the address; any other DID is kept verbatim. Both
+/// are supersets: callers keep a row only if it parses to `owner`.
+fn owner_patterns(owner: &str) -> (String, String) {
+    let escape = |value: &str| {
+        value
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    };
+    let did = match tinycloud_auth::identity::parse_pkh_did(owner) {
+        Ok(Some(pkh)) => format!("did:pkh:eip155:%:{}", escape(&pkh.address)),
+        _ => escape(owner),
+    };
+    let network = format!("{}{did}:%", escape(NETWORK_PREFIX));
+    (did, network)
+}
+
 /// The network ids, exactly as stored, of `owner`'s rows in any encryption
-/// table, including key rows whose network row is gone. The SQL prefilter is
-/// case-insensitive (a stored id may differ in EIP-55 case); the final match
-/// is on the parsed canonical owner, or the network row's `owner_did`.
+/// table, including key rows whose network row is gone. Every spelling the
+/// parsers accept counts (`owner_patterns`); the final match is on the
+/// parsed canonical owner of the network id, or of the network row's
+/// `owner_did`. Erasure and the prune gate share this one inventory.
 async fn owner_network_ids<C: ConnectionTrait>(
     conn: &C,
     owner: &str,
 ) -> Result<BTreeSet<String>, DbErr> {
-    let prefix = format!("{NETWORK_PREFIX}{owner}:").to_lowercase();
-    let length = i32::try_from(prefix.chars().count())
-        .map_err(|_| DbErr::Custom("owner DID too long".into()))?;
-    let owned = conn
+    let (did, network) = owner_patterns(owner);
+    let mut ids = BTreeSet::new();
+    for row in conn
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT network_id FROM encryption_network WHERE owner_did=$1",
-            [owner.into()],
+            "SELECT network_id, owner_did FROM encryption_network WHERE lower(owner_did) LIKE $1",
+            [did.into()],
         ))
         .await?
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "network_id"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
+    {
+        let owner_did: String = row.try_get("", "owner_did")?;
+        if canonical_owner(&owner_did).as_deref() == Some(owner) {
+            ids.insert(row.try_get("", "network_id")?);
+        }
+    }
     let rows = conn
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT network_id AS id FROM encryption_network WHERE left(lower(network_id),$2)=$1
-             UNION SELECT network_id FROM encryption_network_key WHERE left(lower(network_id),$2)=$1
-             UNION SELECT network_id FROM encryption_network_member WHERE left(lower(network_id),$2)=$1
-             UNION SELECT network_id FROM encryption_ceremony WHERE left(lower(network_id),$2)=$1
-             UNION SELECT network_id FROM encryption_audit WHERE left(lower(network_id),$2)=$1",
-            [prefix.into(), length.into()],
+            "SELECT network_id AS id FROM encryption_network WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM encryption_network_key WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM encryption_network_member WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM encryption_ceremony WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM encryption_audit WHERE lower(network_id) LIKE $1",
+            [network.into()],
         ))
         .await?;
-    let mut ids = owned;
     for row in rows {
         let id: String = row.try_get("", "id")?;
         if canonical_owner(&id).as_deref() == Some(owner) {

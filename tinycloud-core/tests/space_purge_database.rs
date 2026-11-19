@@ -698,3 +698,98 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
         .await
         .unwrap();
 }
+
+/// Every stored spelling of an owner is that owner (#650 review F1).
+/// `NetworkId` accepts a padded or signed chain id and any address case, and
+/// rows written before ids were canonicalized kept the raw spelling.
+/// Erasure must delete all of them, key rows whose network row is gone
+/// included, and the prune gate must count them until it has. An owner on
+/// another chain with the same address is a different owner.
+#[tokio::test]
+async fn postgres_owner_erasure_covers_every_stored_owner_spelling() {
+    let Ok(url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = Database::connect(&url).await.unwrap();
+    let schema = format!("purge_spellings_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(url);
+    options.set_schema_search_path(schema.clone());
+    let db = Database::connect(options).await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let keys = LedgerKeys::new(
+        "test".into(),
+        BTreeMap::from([("test".into(), vec![7; 32])]),
+    )
+    .unwrap();
+
+    let address = "0x52908400098527886e0f7030069857d2e4169ee7";
+    let owner =
+        tinycloud_auth::identity::canonicalize_did(&format!("did:pkh:eip155:1:{address}")).unwrap();
+    assert_ne!(owner, format!("did:pkh:eip155:1:{address}"), "EIP-55 case");
+    let padded = format!("did:pkh:eip155:01:{address}");
+    let other_chain = format!("did:pkh:eip155:10:{address}");
+    network(&db, &owner).await;
+    network(&db, &padded).await;
+    network(&db, &other_chain).await;
+    let orphan = format!(
+        "urn:tinycloud:encryption:did:pkh:eip155:+1:0x{}:orphan",
+        address[2..].to_uppercase()
+    );
+    exec(
+        &db,
+        "INSERT INTO encryption_network_key(network_id,key_path,kind,state,public_key,created_at,updated_at)
+         VALUES($1,'key','test','active','\\x01','now','now')",
+        vec![orphan.clone().into()],
+    )
+    .await;
+    let owners = encryption_owners(&db).await.unwrap();
+    assert!(owners.contains(&owner) && !owners.contains(&padded));
+    assert_eq!(owner_key_rows(&db, &owner).await.unwrap(), 3);
+
+    let digest = keys.target_hmac("test", "owner", &owner).unwrap();
+    let erased = keys
+        .sign(
+            "test",
+            "owner",
+            &digest,
+            &uuid::Uuid::new_v4().to_string(),
+            "erased",
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .unwrap();
+    let (path, body) = (erased.object_key().unwrap(), erased.to_bytes().unwrap());
+    let now = time::OffsetDateTime::now_utc();
+    assert_eq!(
+        erase_owner_encryption_rows(&db, &keys, &path, &body, &owner, now)
+            .await
+            .unwrap(),
+        11,
+        "five rows per spelled network plus the orphan key"
+    );
+    assert_eq!(owner_key_rows(&db, &owner).await.unwrap(), 0);
+    assert_eq!(networks(&db, &owner).await, [0; 5]);
+    assert_eq!(networks(&db, &padded).await, [0; 5]);
+    assert_eq!(
+        int(
+            &db,
+            "SELECT count(*) AS n FROM encryption_network_key WHERE network_id=$1",
+            vec![orphan.into()]
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        networks(&db, &other_chain).await,
+        [1; 5],
+        "chain 10 is another owner"
+    );
+    db.close().await.unwrap();
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
