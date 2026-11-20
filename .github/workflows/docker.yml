@@ -768,10 +768,11 @@ jobs:
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
           # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes, the TC-2917
           # storage-headroom event in the Vector config, the TC-1491 artifact read limit env line and the TC-3554
-          # key-recovery sidecar + DstackKmsEpoch epoch-0 pins (raw 8e602959…; 417719648a0c… / d6af7a70… before
-          # TC-3554, 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
+          # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar (raw 272f43b8…;
+          # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
+          # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = '70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f'
+          n0_template_hash = '6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
