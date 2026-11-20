@@ -677,6 +677,10 @@ Before any CVM mutation the workflow requires:
   profile stay byte-exact;
 - the deployed compose to differ from that template only by
   `deploy_image_digest`;
+- the exact spliced compose sent to Phala to pass `config -q` under the
+  guest's docker compose v2.26.0 (sha256-pinned release binary; placeholders
+  for required `${NAME:?}` inputs), after the image is pinned and before the
+  deploy step;
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
   that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
   An untagged, mislabelled, feature-variant or freshly built image is
