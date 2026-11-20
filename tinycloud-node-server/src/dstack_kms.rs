@@ -2,6 +2,10 @@
 //! inside the TEE, verify it fail-closed, and derive the node root the
 //! guest agent's v0 `GetKey` would have derived from it.
 //!
+//! Two transports, chosen by configuration, never one falling back to the
+//! other: Phala's dstack-key-recovery sidecar on a unix socket, or our own
+//! RA-TLS client straight to the KMS. Both feed the same verifier.
+//!
 //! The protocol, the checks and their test vectors are specified in
 //! `docs/tc-3554-kms-epoch-fetch.md`; OpenKey implements the same document.
 //! Every failure is fatal. Nothing here falls back to the current epoch or to
@@ -11,7 +15,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
-use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, SigningKey, VerifyingKey};
+use k256::ecdsa::{
+    signature::hazmat::PrehashVerifier, RecoveryId, Signature, SigningKey, VerifyingKey,
+};
 use rcgen::{
     CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
@@ -22,8 +28,8 @@ use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
 use tinycloud_core::keys::StaticSecret;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpStream, UnixStream},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -31,6 +37,8 @@ use crate::config::LegacyKmsEpoch;
 
 /// The guest agent path production's node root comes from.
 const NODE_KEY_PATH: &[u8] = b"tinycloud/keys/primary";
+/// `NODE_KEY_PATH`, percent-encoded for a query string.
+const NODE_KEY_QUERY: &str = "tinycloud%2Fkeys%2Fprimary";
 /// dstack RA-TLS extensions: the raw TDX quote, the event log, and the
 /// certificate's special usage.
 const OID_TDX_QUOTE: &[u64] = &[1, 3, 6, 1, 4, 1, 62397, 1, 1];
@@ -62,18 +70,28 @@ pub fn fetched_node_root() -> Option<StaticSecret> {
 
 /// The parsed, pinned configuration.
 struct Pins {
-    host: String,
-    port: u16,
+    transport: Transport,
     root_epoch: u32,
     kms_root: VerifyingKey,
-    kms_ca: CertificateDer<'static>,
     app_id: [u8; 20],
     expected_did: String,
 }
 
+enum Transport {
+    /// Phala's dstack-key-recovery sidecar, `serve --no-addr` on this socket.
+    KeyRecovery { socket: String },
+    /// Our RA-TLS client straight to the KMS.
+    Kms(KmsEndpoint),
+}
+
+struct KmsEndpoint {
+    host: String,
+    port: u16,
+    ca: CertificateDer<'static>,
+}
+
 impl Pins {
     fn parse(config: &LegacyKmsEpoch) -> Result<Self> {
-        let (host, port) = parse_origin(&config.kms_url)?;
         let kms_root = decode_hex("keys.legacy.kms_root_pubkey", &config.kms_root_pubkey)?;
         ensure!(
             kms_root.len() == 33,
@@ -82,8 +100,35 @@ impl Pins {
         );
         let kms_root = VerifyingKey::from_sec1_bytes(&kms_root)
             .map_err(|_| anyhow!("keys.legacy.kms_root_pubkey is not a secp256k1 point"))?;
-        let kms_ca = base64::decode(config.kms_ca_cert.trim())
-            .context("keys.legacy.kms_ca_cert must be standard base64 of the CA's DER")?;
+        let transport = match (
+            &config.key_recovery_socket,
+            &config.kms_url,
+            &config.kms_ca_cert,
+        ) {
+            (Some(socket), None, None) => {
+                ensure!(
+                    socket.starts_with('/'),
+                    "keys.legacy.key_recovery_socket must be an absolute path"
+                );
+                Transport::KeyRecovery {
+                    socket: socket.clone(),
+                }
+            }
+            (None, Some(url), Some(ca)) => {
+                let (host, port) = parse_origin(url)?;
+                let ca = base64::decode(ca.trim())
+                    .context("keys.legacy.kms_ca_cert must be standard base64 of the CA's DER")?;
+                Transport::Kms(KmsEndpoint {
+                    host,
+                    port,
+                    ca: CertificateDer::from(ca),
+                })
+            }
+            _ => bail!(
+                "keys.legacy needs exactly one transport: key_recovery_socket, or kms_url \
+                 with kms_ca_cert"
+            ),
+        };
         let app_id: [u8; 20] = decode_hex("keys.legacy.app_id", &config.app_id)?
             .try_into()
             .map_err(|id: Vec<u8>| {
@@ -94,11 +139,9 @@ impl Pins {
             "keys.legacy.expected_did must be a did:key"
         );
         Ok(Self {
-            host,
-            port,
+            transport,
             root_epoch: config.root_epoch,
             kms_root,
-            kms_ca: CertificateDer::from(kms_ca),
             app_id,
             expected_did: config.expected_did.clone(),
         })
@@ -128,7 +171,7 @@ fn decode_hex(name: &str, value: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("{name} is not hex"))
 }
 
-async fn fetch(config: &LegacyKmsEpoch, socket: &str) -> Result<StaticSecret> {
+async fn fetch(config: &LegacyKmsEpoch, agent_socket: &str) -> Result<StaticSecret> {
     let pins = Pins::parse(config)?;
 
     let info = crate::dstack::get_info()
@@ -141,21 +184,36 @@ async fn fetch(config: &LegacyKmsEpoch, socket: &str) -> Result<StaticSecret> {
         hex::encode(pins.app_id)
     );
 
+    let (secret, transport) = match &pins.transport {
+        Transport::KeyRecovery { socket } => {
+            let raw = key_recovery_get(socket, pins.root_epoch).await?;
+            let response: RecoveredKey = serde_json::from_slice(&raw)
+                .context("parsing the key-recovery /v0/key response")?;
+            drop(raw);
+            (verify_recovered_key(&response, &pins)?, "key-recovery")
+        }
+        Transport::Kms(kms) => (fetch_app_key(&pins, kms, agent_socket).await?, "kms"),
+    };
+    ::tracing::info!(
+        root_epoch = pins.root_epoch,
+        transport,
+        node_did = %pins.expected_did,
+        "fetched and verified the node root of a historical KMS root epoch"
+    );
+    Ok(secret)
+}
+
+/// The KMS transport: our RA-TLS client, `GetAppKey` for the pinned epoch.
+async fn fetch_app_key(pins: &Pins, kms: &KmsEndpoint, agent_socket: &str) -> Result<StaticSecret> {
     let temp_ca: TempCaResponse = serde_json::from_slice(
-        &prpc(
-            &pins,
-            tls_config(&pins.kms_ca, None)?,
-            "GetTempCaCert",
-            b"{}",
-        )
-        .await?,
+        &prpc(kms, tls_config(&kms.ca, None)?, "GetTempCaCert", b"{}").await?,
     )
     .context("parsing the KMS GetTempCaCert response")?;
 
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .context("generating the RA-TLS client key")?;
     let report_data = ra_tls_report_data(&key.public_key_der());
-    let quote = crate::dstack::get_quote(socket, &report_data)
+    let quote = crate::dstack::get_quote(agent_socket, &report_data)
         .await
         .context("quoting the RA-TLS client key")?;
     let quote_bytes =
@@ -174,11 +232,12 @@ async fn fetch(config: &LegacyKmsEpoch, socket: &str) -> Result<StaticSecret> {
         "api_version": 1,
         "vm_config": quote.vm_config,
         "root_epoch": pins.root_epoch,
+        "app_epoch": 0,
         "launch_ticket": "",
     }))?;
     let raw = prpc(
-        &pins,
-        tls_config(&pins.kms_ca, Some((chain, client_key)))?,
+        kms,
+        tls_config(&kms.ca, Some((chain, client_key)))?,
         "GetAppKey",
         &request,
     )
@@ -186,14 +245,7 @@ async fn fetch(config: &LegacyKmsEpoch, socket: &str) -> Result<StaticSecret> {
     let response: AppKeyResponse =
         serde_json::from_slice(&raw).context("parsing the KMS GetAppKey response")?;
     drop(raw);
-
-    let secret = verify_app_key(&response, &pins)?;
-    ::tracing::info!(
-        root_epoch = pins.root_epoch,
-        node_did = %pins.expected_did,
-        "fetched and verified the node root of a historical KMS root epoch"
-    );
-    Ok(secret)
+    verify_app_key(&response, pins)
 }
 
 #[derive(Deserialize)]
@@ -222,23 +274,33 @@ impl Drop for AppKeyResponse {
     }
 }
 
-/// Checks (a)–(c) of the spec; returns the node root.
+/// The dstack-key-recovery `/v0/key` answer (its `KeyResult::to_json`).
+/// Every field the checks use is required in substance; absent ones fail.
+#[derive(Deserialize)]
+struct RecoveredKey {
+    #[serde(default)]
+    api: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    public_key: String,
+    #[serde(default)]
+    signature_chain: Vec<String>,
+    root_epoch: Option<u32>,
+    app_epoch: Option<u32>,
+}
+
+impl Drop for RecoveredKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+/// Checks (a)–(c) of the spec on a KMS `GetAppKey` answer; returns the node
+/// root.
 fn verify_app_key(response: &AppKeyResponse, pins: &Pins) -> Result<StaticSecret> {
     // (a) The KMS says which root epoch issued the key.
-    match response.root_epoch {
-        Some(epoch) if epoch == pins.root_epoch => {}
-        Some(epoch) => bail!(
-            "the KMS answered root_epoch {epoch}, not keys.legacy.root_epoch {}; refusing the key",
-            pins.root_epoch
-        ),
-        None => bail!("the KMS response has no root_epoch; refusing the key"),
-    }
-    // App epochs above 0 use a different issuance message.
-    match response.app_epoch {
-        Some(0) => {}
-        Some(epoch) => bail!("the KMS answered app_epoch {epoch}; only app epoch 0 is supported"),
-        None => bail!("the KMS response has no app_epoch; refusing the key"),
-    }
+    check_epochs("the KMS", response.root_epoch, response.app_epoch, pins)?;
 
     // (b) That epoch's KMS root signed this app key for this app.
     let app_root = Zeroizing::new(decode_hex("k256_key", &response.k256_key)?);
@@ -251,7 +313,92 @@ fn verify_app_key(response: &AppKeyResponse, pins: &Pins) -> Result<StaticSecret
         .map_err(|_| anyhow!("k256_key is not a secp256k1 key"))?;
     let app_pub = app_key.verifying_key().to_encoded_point(true);
     drop(app_key);
-    let signature = decode_hex("k256_signature", &response.k256_signature)?;
+    verify_issuance(&response.k256_signature, app_pub.as_bytes(), pins)?;
+
+    // (c) The root derives the expected identity.
+    expected_identity(&legacy_get_key(&app_root, NODE_KEY_PATH), pins)
+}
+
+/// The spec's checks on a dstack-key-recovery answer, which carries the
+/// derived key and its signature chain instead of the app root; returns the
+/// node root.
+///
+/// `signature_chain[1]` is the KMS `k256_signature`, so (b) applies to the
+/// app key that `signature_chain[0]` recovers. The chain proves the epoch
+/// root issued that app key to this app and that the app key vouched for
+/// `public_key`; it does not prove the path or the derivation. Only (c), the
+/// DID, proves those.
+fn verify_recovered_key(response: &RecoveredKey, pins: &Pins) -> Result<StaticSecret> {
+    ensure!(
+        response.api == "v0",
+        "the key-recovery sidecar answered api {:?}, not v0; refusing the key",
+        response.api
+    );
+    // (a)
+    check_epochs(
+        "the key-recovery sidecar",
+        response.root_epoch,
+        response.app_epoch,
+        pins,
+    )?;
+
+    let key = Zeroizing::new(decode_hex("key-recovery key", &response.key)?);
+    let key: Zeroizing<[u8; 32]> = Zeroizing::new(
+        key.as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("the key-recovery key must be 32 bytes, got {}", key.len()))?,
+    );
+    let public_key = SigningKey::from_slice(key.as_ref())
+        .map_err(|_| anyhow!("the key-recovery key is not a secp256k1 key"))?
+        .verifying_key()
+        .to_encoded_point(true);
+    ensure!(
+        decode_hex("key-recovery public_key", &response.public_key)? == public_key.as_bytes(),
+        "the key-recovery public_key is not the public key of its key; refusing the key"
+    );
+
+    // (b) on the chain: the app key that signed `public_key` was issued to
+    // this app by the pinned epoch root.
+    let [link0, issued] = response.signature_chain.as_slice() else {
+        bail!(
+            "the key-recovery signature_chain must have 2 links, got {}",
+            response.signature_chain.len()
+        );
+    };
+    let app_pub = recover_app_pub(link0, public_key.as_bytes())?;
+    verify_issuance(issued, app_pub.as_bytes(), pins)?;
+
+    // (c)
+    expected_identity(&key, pins)
+}
+
+/// (a): both epochs present, the root epoch the pinned one, the app epoch 0
+/// (later app epochs use a different issuance message).
+fn check_epochs(
+    peer: &str,
+    root_epoch: Option<u32>,
+    app_epoch: Option<u32>,
+    pins: &Pins,
+) -> Result<()> {
+    match root_epoch {
+        Some(epoch) if epoch == pins.root_epoch => {}
+        Some(epoch) => bail!(
+            "{peer} answered root_epoch {epoch}, not keys.legacy.root_epoch {}; refusing the key",
+            pins.root_epoch
+        ),
+        None => bail!("{peer}'s response has no root_epoch; refusing the key"),
+    }
+    match app_epoch {
+        Some(0) => Ok(()),
+        Some(epoch) => bail!("{peer} answered app_epoch {epoch}; only app epoch 0 is supported"),
+        None => bail!("{peer}'s response has no app_epoch; refusing the key"),
+    }
+}
+
+/// (b): `k256_signature` (65 bytes, low-S) by the pinned epoch root over
+/// keccak256("dstack-kms-issued:" || app_id || app_pub).
+fn verify_issuance(k256_signature: &str, app_pub: &[u8], pins: &Pins) -> Result<()> {
+    let signature = decode_hex("k256_signature", k256_signature)?;
     ensure!(
         signature.len() == 65,
         "k256_signature must be 65 bytes (r || s || v), got {}",
@@ -264,16 +411,40 @@ fn verify_app_key(response: &AppKeyResponse, pins: &Pins) -> Result<StaticSecret
         "k256_signature is high-S; refusing it"
     );
     pins.kms_root
-        .verify_prehash(&issued_digest(&pins.app_id, app_pub.as_bytes()), &signature)
+        .verify_prehash(&issued_digest(&pins.app_id, app_pub), &signature)
         .map_err(|_| {
             anyhow!(
                 "k256_signature does not verify under keys.legacy.kms_root_pubkey for root epoch {}",
                 pins.root_epoch
             )
-        })?;
+        })
+}
 
-    // (c) The root derives the expected identity.
-    let root = legacy_get_key(&app_root, NODE_KEY_PATH);
+/// The app key behind `signature_chain[0]`: a recoverable signature (r || s
+/// || v) over keccak256(purpose || ":" || hex(public_key)), purpose empty.
+fn recover_app_pub(link0: &str, public_key: &[u8]) -> Result<k256::EncodedPoint> {
+    let link0 = decode_hex("signature_chain[0]", link0)?;
+    ensure!(
+        link0.len() == 65,
+        "signature_chain[0] must be 65 bytes (r || s || v), got {}",
+        link0.len()
+    );
+    let signature = Signature::from_slice(&link0[..64])
+        .map_err(|_| anyhow!("signature_chain[0]: r or s is out of range"))?;
+    let recovery_id = RecoveryId::from_byte(link0[64])
+        .ok_or_else(|| anyhow!("signature_chain[0] has recovery id {}", link0[64]))?;
+    let digest: [u8; 32] = Keccak256::new()
+        .chain_update(b":")
+        .chain_update(hex::encode(public_key))
+        .finalize()
+        .into();
+    let app_pub = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)
+        .map_err(|_| anyhow!("signature_chain[0] recovers no app key"))?;
+    Ok(app_pub.to_encoded_point(true))
+}
+
+/// (c): the node root derives `keys.legacy.expected_did`.
+fn expected_identity(root: &[u8; 32], pins: &Pins) -> Result<StaticSecret> {
     let secret = StaticSecret::new(root.to_vec()).map_err(|_| anyhow!("derived root is short"))?;
     let node_did = secret.node_did();
     ensure!(
@@ -422,26 +593,26 @@ fn ensure_kms_rpc_cert(der: &[u8], kms_ca: &[u8]) -> Result<()> {
 
 /// `POST /prpc/{method}?json` to the KMS; the 2xx response body.
 async fn prpc(
-    pins: &Pins,
+    kms: &KmsEndpoint,
     tls: Arc<rustls::ClientConfig>,
     method: &str,
     body: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
-    tokio::time::timeout(CALL_TIMEOUT, prpc_once(pins, tls, method, body))
+    tokio::time::timeout(CALL_TIMEOUT, prpc_once(kms, tls, method, body))
         .await
         .map_err(|_| anyhow!("KMS {method} timed out"))?
 }
 
 async fn prpc_once(
-    pins: &Pins,
+    kms: &KmsEndpoint,
     tls: Arc<rustls::ClientConfig>,
     method: &str,
     body: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let tcp = TcpStream::connect((pins.host.as_str(), pins.port))
+    let tcp = TcpStream::connect((kms.host.as_str(), kms.port))
         .await
         .with_context(|| format!("connecting to the KMS for {method}"))?;
-    let name = ServerName::try_from(pins.host.clone())
+    let name = ServerName::try_from(kms.host.clone())
         .map_err(|_| anyhow!("keys.legacy.kms_url host is not a valid TLS name"))?;
     let mut stream = tokio_rustls::TlsConnector::from(tls)
         .connect(name, tcp)
@@ -453,11 +624,11 @@ async fn prpc_once(
         .peer_certificates()
         .and_then(|chain| chain.first())
         .ok_or_else(|| anyhow!("the KMS presented no certificate"))?;
-    ensure_kms_rpc_cert(leaf, &pins.kms_ca)?;
+    ensure_kms_rpc_cert(leaf, &kms.ca)?;
 
-    let host = match pins.port {
-        443 => pins.host.clone(),
-        port => format!("{}:{port}", pins.host),
+    let host = match kms.port {
+        443 => kms.host.clone(),
+        port => format!("{}:{port}", kms.host),
     };
     let head = format!(
         "POST /prpc/{method}?json HTTP/1.1\r\n\
@@ -468,10 +639,45 @@ async fn prpc_once(
          \r\n",
         body.len()
     );
+    let call = format!("KMS {method}");
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
-    stream.flush().await?;
+    http_exchange(&call, stream).await
+}
 
+/// The key-recovery sidecar's `GET /v0/key` for the node key path, the
+/// pinned root epoch and app epoch 0; the 2xx response body.
+async fn key_recovery_get(socket: &str, root_epoch: u32) -> Result<Zeroizing<Vec<u8>>> {
+    let call = "key-recovery /v0/key";
+    tokio::time::timeout(CALL_TIMEOUT, async {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connecting to the key-recovery sidecar at {socket}"))?;
+        stream
+            .write_all(key_recovery_request(root_epoch).as_bytes())
+            .await?;
+        http_exchange(call, stream).await
+    })
+    .await
+    .map_err(|_| anyhow!("{call} timed out"))?
+}
+
+fn key_recovery_request(root_epoch: u32) -> String {
+    format!(
+        "GET /v0/key?path={NODE_KEY_QUERY}&root_epoch={root_epoch}&app_epoch=0 HTTP/1.1\r\n\
+         Host: key-recovery\r\n\
+         Connection: close\r\n\
+         \r\n"
+    )
+}
+
+/// Flushes the written request, reads the response to EOF and returns its
+/// 2xx body.
+async fn http_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    call: &str,
+    mut stream: S,
+) -> Result<Zeroizing<Vec<u8>>> {
+    stream.flush().await?;
     // Sized up front so the buffer holding key material never reallocates.
     let mut raw = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BYTES));
     let mut chunk = Zeroizing::new([0u8; 8192]);
@@ -481,38 +687,38 @@ async fn prpc_once(
             Ok(n) => {
                 ensure!(
                     raw.len() + n <= MAX_RESPONSE_BYTES,
-                    "KMS {method} response is too large"
+                    "{call} response is too large"
                 );
                 raw.extend_from_slice(&chunk[..n]);
             }
-            // A peer that closes without close_notify; the body length
+            // A TLS peer that closes without close_notify; the body length
             // check below still catches truncation.
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err).with_context(|| format!("reading KMS {method}")),
+            Err(err) => return Err(err).with_context(|| format!("reading {call}")),
         }
     }
-    http_body(method, &raw)
+    http_body(call, &raw)
 }
 
 /// The body of a raw HTTP/1.1 response, or an error naming the refusal.
-fn http_body(method: &str, raw: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn http_body(call: &str, raw: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("KMS {method}: malformed HTTP response"))?;
+        .ok_or_else(|| anyhow!("{call}: malformed HTTP response"))?;
     let head = std::str::from_utf8(&raw[..header_end])
-        .map_err(|_| anyhow!("KMS {method}: malformed HTTP response"))?;
+        .map_err(|_| anyhow!("{call}: malformed HTTP response"))?;
     let body = &raw[header_end + 4..];
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
         .and_then(|line| line.split(' ').nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("KMS {method}: malformed HTTP status"))?;
+        .ok_or_else(|| anyhow!("{call}: malformed HTTP status"))?;
     if !(200..300).contains(&status) {
-        // A refusal carries the KMS's reason and no key material.
+        // A refusal carries the peer's reason and no key material.
         bail!(
-            "the KMS refused {method}: HTTP {status}: {}",
+            "{call} refused: HTTP {status}: {}",
             String::from_utf8_lossy(&body[..body.len().min(512)])
         );
     }
@@ -527,26 +733,26 @@ fn http_body(method: &str, raw: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             content_length = Some(
                 value
                     .parse::<usize>()
-                    .map_err(|_| anyhow!("KMS {method}: bad Content-Length"))?,
+                    .map_err(|_| anyhow!("{call}: bad Content-Length"))?,
             );
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             chunked = value.eq_ignore_ascii_case("chunked");
         }
     }
     if chunked {
-        return dechunk(method, body);
+        return dechunk(call, body);
     }
     match content_length {
         Some(len) => {
-            ensure!(body.len() >= len, "KMS {method}: response is truncated");
+            ensure!(body.len() >= len, "{call}: response is truncated");
             Ok(Zeroizing::new(body[..len].to_vec()))
         }
         None => Ok(Zeroizing::new(body.to_vec())),
     }
 }
 
-fn dechunk(method: &str, mut body: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    let malformed = || anyhow!("KMS {method}: malformed chunked response");
+fn dechunk(call: &str, mut body: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let malformed = || anyhow!("{call}: malformed chunked response");
     let mut out = Zeroizing::new(Vec::with_capacity(body.len()));
     loop {
         let line_end = body
@@ -601,6 +807,23 @@ mod tests {
             hex::encode(root.as_ref()),
             "bbeb1e02123fe7cfab8471656ab89eff4d0b517fabdd457aa624942d1d5e0b02"
         );
+        // The key-recovery chain over that root: its public key and the
+        // digest `signature_chain[0]` signs.
+        let public_key = SigningKey::from_slice(root.as_ref())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true);
+        assert_eq!(
+            hex::encode(public_key.as_bytes()),
+            "0324658ea9452d044b7e5a70c79b352bb73968365b45bed193df98f6dde67a65e3"
+        );
+        assert_eq!(
+            hex::encode(Keccak256::digest(format!(
+                ":{}",
+                hex::encode(public_key.as_bytes())
+            ))),
+            "aafcab4c272e0db55aac89ee9d441edb18b2a0a3742794205dcd013d08d25c98"
+        );
         assert_eq!(
             StaticSecret::new(root.to_vec()).unwrap().node_did(),
             VECTOR_DID
@@ -613,11 +836,11 @@ mod tests {
 
     fn pins(root_epoch: u32, kms: &SigningKey) -> Pins {
         Pins {
-            host: "localhost".into(),
-            port: 443,
+            transport: Transport::KeyRecovery {
+                socket: "/run/key-recovery/kr.sock".into(),
+            },
             root_epoch,
             kms_root: *kms.verifying_key(),
-            kms_ca: CertificateDer::from(Vec::new()),
             app_id: APP_ID,
             expected_did: VECTOR_DID.into(),
         }
@@ -646,6 +869,49 @@ mod tests {
         format!(
             "{:#}",
             verify_app_key(response, pins).err().expect("refused")
+        )
+    }
+
+    /// What the key-recovery sidecar returns for the node path of
+    /// `APP_ROOT`, issued by `signer`.
+    fn recovered(signer: &SigningKey, root_epoch: Option<u32>) -> RecoveredKey {
+        let key = legacy_get_key(&APP_ROOT, NODE_KEY_PATH);
+        let public_key = SigningKey::from_slice(key.as_ref())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true);
+        RecoveredKey {
+            api: "v0".into(),
+            key: hex::encode(key.as_ref()),
+            public_key: hex::encode(public_key.as_bytes()),
+            signature_chain: vec![
+                chain_link(&APP_ROOT, public_key.as_bytes()),
+                response(signer, root_epoch).k256_signature.clone(),
+            ],
+            root_epoch,
+            app_epoch: Some(0),
+        }
+    }
+
+    /// `signature_chain[0]` as dstack's `sign_recoverable_keccak256` builds
+    /// it: the app key over keccak256(":" || hex(public_key)), r || s || v.
+    fn chain_link(app_root: &[u8; 32], public_key: &[u8]) -> String {
+        let digest = Keccak256::new()
+            .chain_update(format!(":{}", hex::encode(public_key)))
+            .finalize();
+        let (signature, recovery) = SigningKey::from_slice(app_root)
+            .unwrap()
+            .sign_prehash_recoverable(&digest)
+            .unwrap();
+        let mut link = signature.to_vec();
+        link.push(recovery.to_byte());
+        hex::encode(link)
+    }
+
+    fn recovered_refusal(response: &RecoveredKey, pins: &Pins) -> String {
+        format!(
+            "{:#}",
+            verify_recovered_key(response, pins).err().expect("refused")
         )
     }
 
@@ -696,6 +962,113 @@ mod tests {
         let mut pinned = pins(0, &kms);
         pinned.expected_did = "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi".into();
         assert!(refusal(&response(&kms, Some(0)), &pinned).contains("derives node DID"));
+    }
+
+    #[test]
+    fn a_recovered_key_with_a_valid_chain_derives_the_expected_did() {
+        let kms = kms_root(7);
+        let secret = verify_recovered_key(&recovered(&kms, Some(0)), &pins(0, &kms)).unwrap();
+        assert_eq!(secret.node_did(), VECTOR_DID);
+    }
+
+    #[test]
+    fn a_recovered_key_is_refused_unless_every_check_passes() {
+        let (kms, other) = (kms_root(7), kms_root(8));
+        let pinned = pins(0, &kms);
+        type Tamper = Box<dyn Fn(&mut RecoveredKey)>;
+        let cases: [(&str, Tamper); 9] = [
+            ("not v0", Box::new(|r| r.api = "v1".into())),
+            ("root_epoch 1", Box::new(|r| r.root_epoch = Some(1))),
+            ("no root_epoch", Box::new(|r| r.root_epoch = None)),
+            ("app_epoch 1", Box::new(|r| r.app_epoch = Some(1))),
+            ("no app_epoch", Box::new(|r| r.app_epoch = None)),
+            (
+                "not the public key of its key",
+                Box::new(|r| r.public_key = hex::encode(app_pub(&[0x02; 32]))),
+            ),
+            (
+                // The app key behind link 0 is not the one the root issued.
+                "does not verify",
+                Box::new(|r| {
+                    let public_key = hex::decode(&r.public_key).unwrap();
+                    r.signature_chain[0] = chain_link(&[0x02; 32], &public_key);
+                }),
+            ),
+            (
+                "2 links",
+                Box::new(|r| {
+                    r.signature_chain.pop();
+                }),
+            ),
+            ("32 bytes", Box::new(|r| r.key = hex::encode([0x01; 31]))),
+        ];
+        for (expected, tamper) in cases {
+            let mut response = recovered(&kms, Some(0));
+            tamper(&mut response);
+            let err = recovered_refusal(&response, &pinned);
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        assert!(recovered_refusal(&recovered(&other, Some(0)), &pinned).contains("does not verify"));
+        let mut other_did = pins(0, &kms);
+        other_did.expected_did = "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi".into();
+        assert!(
+            recovered_refusal(&recovered(&kms, Some(0)), &other_did).contains("derives node DID")
+        );
+    }
+
+    fn app_pub(app_root: &[u8; 32]) -> Vec<u8> {
+        SigningKey::from_slice(app_root)
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn the_key_recovery_request_names_the_node_path_and_both_epochs() {
+        assert_eq!(NODE_KEY_QUERY.replace("%2F", "/").as_bytes(), NODE_KEY_PATH);
+        assert_eq!(
+            key_recovery_request(0),
+            "GET /v0/key?path=tinycloud%2Fkeys%2Fprimary&root_epoch=0&app_epoch=0 HTTP/1.1\r\n\
+             Host: key-recovery\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn exactly_one_transport_must_be_configured() {
+        let kms = kms_root(7);
+        let config = |socket: Option<&str>, url: Option<&str>, ca: Option<&str>| LegacyKmsEpoch {
+            key_recovery_socket: socket.map(Into::into),
+            kms_url: url.map(Into::into),
+            kms_ca_cert: ca.map(Into::into),
+            root_epoch: 0,
+            kms_root_pubkey: hex::encode(kms.verifying_key().to_encoded_point(true).as_bytes()),
+            app_id: hex::encode(APP_ID),
+            expected_did: VECTOR_DID.into(),
+        };
+        let (socket, url, ca) = (
+            Some("/run/key-recovery/kr.sock"),
+            Some("https://kms.example"),
+            Some("AA=="),
+        );
+        assert!(matches!(
+            Pins::parse(&config(socket, None, None)).unwrap().transport,
+            Transport::KeyRecovery { .. }
+        ));
+        assert!(matches!(
+            Pins::parse(&config(None, url, ca)).unwrap().transport,
+            Transport::Kms(_)
+        ));
+        for (socket, url, ca) in [
+            (socket, url, ca),
+            (socket, url, None),
+            (None, None, None),
+            (None, url, None),
+            (Some("kr.sock"), None, None),
+        ] {
+            assert!(Pins::parse(&config(socket, url, ca)).is_err());
+        }
     }
 
     #[test]
@@ -781,9 +1154,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n1\r\n}\r\n0\r\n\r\n";
         assert_eq!(http_body("M", chunked).unwrap().as_slice(), b"{}");
         let refused = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\nnot authorized!";
-        let err = http_body("GetAppKey", refused).unwrap_err().to_string();
+        let err = http_body("KMS GetAppKey", refused).unwrap_err().to_string();
         assert!(
-            err.contains("refused GetAppKey: HTTP 400: not authorized"),
+            err.contains("KMS GetAppKey refused: HTTP 400: not authorized"),
             "{err}"
         );
     }

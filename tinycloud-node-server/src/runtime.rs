@@ -807,12 +807,11 @@ mod tests {
         let _env = [
             EnvGuard::set("TINYCLOUD_KEYS__TYPE", "DstackKmsEpoch"),
             EnvGuard::set(
-                "TINYCLOUD_KEYS__LEGACY__KMS_URL",
-                "https://kms.example:8000",
+                "TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET",
+                "/run/key-recovery/kr.sock",
             ),
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH", "0"),
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY", "02ab"),
-            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__KMS_CA_CERT", "MIIB+w=="),
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__APP_ID", "350d124c"),
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", did),
             EnvGuard::set("TINYCLOUD_KEYS__EXPECTED_NODE_DID", did),
@@ -823,10 +822,11 @@ mod tests {
             config::KeysConfig {
                 source: config::Keys::DstackKmsEpoch(config::DstackKmsEpoch {
                     legacy: config::LegacyKmsEpoch {
-                        kms_url: "https://kms.example:8000".into(),
+                        key_recovery_socket: Some("/run/key-recovery/kr.sock".into()),
+                        kms_url: None,
+                        kms_ca_cert: None,
                         root_epoch: 0,
                         kms_root_pubkey: "02ab".into(),
-                        kms_ca_cert: "MIIB+w==".into(),
                         app_id: "350d124c".into(),
                         expected_did: did.into(),
                     },
