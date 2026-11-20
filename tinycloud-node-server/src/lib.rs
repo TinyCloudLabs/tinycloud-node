@@ -32,6 +32,8 @@ pub mod config;
 pub mod delivery_limiter;
 pub mod delivery_link;
 pub mod dstack;
+#[cfg(feature = "dstack")]
+pub mod dstack_kms;
 pub mod egress;
 pub mod epoch_head_backfill;
 pub mod hooks;
@@ -923,7 +925,7 @@ pub async fn app_with_control(
     }
 
     let key_setup: StaticSecret =
-        match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
+        match resolve_keys(&tinycloud_config.keys.source, &tinycloud_config.tee).await? {
             Some(key_setup) => key_setup,
             None => {
                 // The node's stored identity, generated on its first start. The
@@ -944,6 +946,11 @@ pub async fn app_with_control(
                     .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
             }
         };
+    // TC-3554: a pinned node DID is checked before anything uses the key or
+    // the database is opened.
+    tinycloud_config
+        .keys
+        .check_node_did(&key_setup.node_did())?;
     let pseudonymizer =
         std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
     let tracing_fairing = tracing::TracingFairing::new(
@@ -2110,6 +2117,8 @@ pub(crate) async fn resolve_keys(
                 .map(Some)
                 .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
         }
+        #[cfg(feature = "dstack")]
+        Keys::DstackKmsEpoch(source) => dstack_kms::node_root(&source.legacy).await.map(Some),
         Keys::Auto => {
             // Check TINYCLOUD_TEE_MODE env var first
             match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {

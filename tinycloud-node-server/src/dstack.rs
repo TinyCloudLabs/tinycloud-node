@@ -32,6 +32,9 @@ pub struct GetQuoteResponse {
     pub quote: String,       // hex-encoded TDX quote
     pub event_log: String,   // JSON event log
     pub report_data: String, // hex-encoded 64-byte REPORTDATA the agent quoted
+    /// The VM hardware config the KMS needs alongside the quote (TC-3554).
+    #[serde(default)]
+    pub vm_config: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

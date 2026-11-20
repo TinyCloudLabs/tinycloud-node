@@ -56,7 +56,10 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "dstack")]
 use std::future::Future;
 
-use crate::{config::Keys, node_control::paths::KeyBackend};
+use crate::{
+    config::{Keys, KeysConfig},
+    node_control::paths::KeyBackend,
+};
 
 #[cfg(target_os = "macos")]
 use super::paths::SERVICE_LABEL;
@@ -216,7 +219,22 @@ pub fn default_backup_path(data_root: &Path) -> PathBuf {
         .join(format!("node-key-{stamp}.bundle"))
 }
 
+/// The node identity `keys` resolves to. With `keys.expected_node_did` set,
+/// any other DID is an error, so no caller (serve, the control plane, link,
+/// tunnel, backup) can use or report it.
 pub fn resolve_identity_state(
+    keys: Option<&KeysConfig>,
+    data_root: &Path,
+    purpose: IdentityPurpose,
+) -> Result<IdentityState> {
+    let state = resolve_identity_source(keys.map(|keys| &keys.source), data_root, purpose)?;
+    if let (Some(keys), Some(node_did)) = (keys, state.node_did.as_deref()) {
+        keys.check_node_did(node_did)?;
+    }
+    Ok(state)
+}
+
+fn resolve_identity_source(
     keys: Option<&Keys>,
     data_root: &Path,
     purpose: IdentityPurpose,
@@ -236,11 +254,38 @@ pub fn resolve_identity_state(
         Some(Keys::Provider) => resolve_provider_state(data_root, purpose),
         #[cfg(feature = "dstack")]
         Some(Keys::Dstack) => resolve_dstack_state(purpose),
+        #[cfg(feature = "dstack")]
+        Some(Keys::DstackKmsEpoch(source)) => resolve_kms_epoch_state(&source.legacy, purpose),
     }
 }
 
+/// A probe reports the root only once serve fetched it, so status calls
+/// never reach the KMS; serve and backup fetch it (once per process).
+#[cfg(feature = "dstack")]
+fn resolve_kms_epoch_state(
+    legacy: &crate::config::LegacyKmsEpoch,
+    purpose: IdentityPurpose,
+) -> Result<IdentityState> {
+    let secret = match purpose {
+        IdentityPurpose::Probe => crate::dstack_kms::fetched_node_root(),
+        IdentityPurpose::Serve | IdentityPurpose::Backup => Some(
+            block_on_async(crate::dstack_kms::node_root(legacy))
+                .context("failed to load the historical KMS epoch node identity")?,
+        ),
+    };
+    let node_did = secret.as_ref().map(StaticSecret::node_did);
+    let ready = secret.is_some();
+    Ok(identity_state(
+        IdentitySourceKind::Dstack,
+        secret,
+        node_did,
+        ready,
+        false,
+    ))
+}
+
 pub fn backup_identity(
-    keys: Option<&Keys>,
+    keys: Option<&KeysConfig>,
     data_root: &Path,
     passphrase: &[u8],
     output: Option<PathBuf>,
@@ -1149,9 +1194,12 @@ mod tests {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
         let _env = EnvGuard::set(STATIC_ENV_KEY, &encode_env_secret(&[1u8; 32]));
-        let state =
-            resolve_identity_state(Some(&Keys::Provider), temp.path(), IdentityPurpose::Probe)
-                .unwrap();
+        let state = resolve_identity_state(
+            Some(&Keys::Provider.into()),
+            temp.path(),
+            IdentityPurpose::Probe,
+        )
+        .unwrap();
         assert_eq!(state.source, IdentitySourceKind::StaticEnv);
         assert_eq!(state.backend, Some(KeyBackend::Static));
         assert!(state.identity_ready);
@@ -1168,7 +1216,7 @@ mod tests {
         }))
         .unwrap();
         let state = resolve_identity_state(
-            Some(&Keys::Static(static_cfg)),
+            Some(&Keys::Static(static_cfg).into()),
             temp.path(),
             IdentityPurpose::Probe,
         )
@@ -1177,6 +1225,37 @@ mod tests {
         assert_eq!(state.backend, Some(KeyBackend::Static));
         assert!(state.identity_ready);
         assert!(state.node_did.is_some());
+    }
+
+    /// TC-3554: with `keys.expected_node_did` set, no caller (the control
+    /// plane's probe included) gets an identity with another DID.
+    #[::core::prelude::v1::test]
+    fn a_pinned_node_did_refuses_any_other_identity() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _env = EnvGuard::unset(STATIC_ENV_KEY);
+        let secret = [3u8; 32];
+        let did = StaticSecret::new(secret.to_vec()).unwrap().node_did();
+        let keys = |pin: &str| -> crate::config::KeysConfig {
+            json::from_value(serde_json::json!({
+                "type": "static",
+                "secret": encode_env_secret(&secret),
+                "expected_node_did": pin,
+            }))
+            .unwrap()
+        };
+        let other = StaticSecret::new(vec![4u8; 32]).unwrap().node_did();
+        for purpose in [
+            IdentityPurpose::Probe,
+            IdentityPurpose::Serve,
+            IdentityPurpose::Backup,
+        ] {
+            let err = resolve_identity_state(Some(&keys(&other)), temp.path(), purpose)
+                .expect_err("a different DID is refused");
+            assert!(err.to_string().contains("expected_node_did"), "{err}");
+            let state = resolve_identity_state(Some(&keys(&did)), temp.path(), purpose).unwrap();
+            assert_eq!(state.node_did.as_deref(), Some(did.as_str()));
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -1232,7 +1311,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let _env = EnvGuard::unset(STATIC_ENV_KEY);
         let state = match resolve_identity_state(
-            Some(&Keys::Provider),
+            Some(&Keys::Provider.into()),
             temp.path(),
             IdentityPurpose::Serve,
         ) {
