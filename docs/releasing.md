@@ -663,9 +663,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`**
-  (raw `272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468` normalized). With the TC-3554 key-recovery sidecar (1.26.14), before the node opened its root from `root_wrap`, the template was `70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`
-  (raw `8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9` normalized); before the TC-3554 key-recovery sidecar and `DstackKmsEpoch` epoch-0 pins the template was `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da`
+  **`70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`**
+  (raw `8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9` normalized). Before the TC-3554 key-recovery sidecar and `DstackKmsEpoch` epoch-0 pins the template was `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da`
   (raw `d6af7a704ba532a2f9fce5166f4c7f05125e31f33e5cabf885b35efac61aa8b9` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES` env line the template was `90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51`
   (raw `5419a6fbb73efe8b4430e4ab76d5e2970b2c9204525854e23f59dbdc01f4e250` normalized; before the TC-2917 `node_storage_headroom` event (the node's disk headroom line shipped as an individual event) in the Vector config the template was `9d0cd8a2…`, raw `d703d69b…`; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
@@ -819,14 +818,12 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, and the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar), whatever digest
-main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
-on this compose, and only once the database holds the `root_wrap` blob:**
-1.26.14 needs the sidecar this compose lacks,
-and an older binary does not know `DstackKmsEpoch`; both refuse to start, so
-this command and any rollback below 1.26.15 fail closed rather
-than serve under the moved KMS root. It is not a rollback of a
+`8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, and the TC-3554 key-recovery sidecar with `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch`), whatever digest
+main's template currently pins. **Since TC-3554 only an image of 1.26.14 or
+later boots on this compose:** an older binary does not know
+`DstackKmsEpoch` and refuses to start, so this command and any rollback below
+1.26.14 fail closed rather than serve under the moved KMS root. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.
@@ -834,9 +831,10 @@ substitutions fail before mutation.
 From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
 `docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
 `root_wrap` row, so the restored node opens the same root without a fetch.
-A fresh or empty database has no row, and the node refuses to start on this
-sidecar-free compose until one boot on the sidecar compose (1.26.15's) has
-sealed it. That refusal is expected; it is not a fault in the restore.
+A fresh or empty database has no row: on this sidecar compose the first boot
+fetches epoch 0 and seals it again, and on a sidecar-free compose the node
+refuses to start until one boot on the sidecar compose has sealed it. That
+refusal is expected; it is not a fault in the restore.
 
 ### TC-1302 captured pre-N0 rollback
 
