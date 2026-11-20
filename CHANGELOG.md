@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- `keys.type = DstackKmsEpoch`: the node seals the fetched historical root in the database (`root_wrap`, one row; migration `m20261120_000000_root_wrap`) under AES-256-GCM with dstack `GetKey("tinycloud/keys/primary-wrap")` of the current root, bound to the pinned app id and DID. Later boots open it and need no transport (`keys.legacy.key_recovery_socket` / `kms_url` become optional) and never call the sidecar or KMS. Until the opened root's DID matches the pins, the node writes nothing but `root_wrap`. No blob and no transport, a tampered blob, or one that opens to another DID refuses startup. Details: TC-3554.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
