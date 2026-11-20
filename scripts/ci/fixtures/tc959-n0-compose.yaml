@@ -24,21 +24,22 @@ services:
         mode: non-blocking
         max-buffer-size: 4m
         cache-disabled: "true"
+    depends_on:
+      - key-recovery
     ports:
       - "8000:8000"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
+      - key-recovery:/run/key-recovery
     environment:
-      # TC-3554: the node keeps its pre-move root and identity (KMS root epoch
-      # 0, docs/tc-3554-kms-epoch-fetch.md). It opens that root from the
-      # database's root_wrap blob and checks it against these pins before any
-      # other database write. The blob is sealed under the current root by a
-      # boot of a root_wrap release on the sidecar compose (1.26.14's). This
-      # compose has no sidecar and no transport, so with no blob it refuses to
-      # start: DEPLOY ONLY AFTER A BLOB EXISTS IN PROD. Every pin is a literal
-      # so the compose hash attests it.
+      # TC-3554: the node keeps its pre-move root and identity. Phala's move to
+      # KMS prod2 left that root at root epoch 0, so the node fetches it through
+      # the key-recovery sidecar below and verifies it against these pins before
+      # the database connects (docs/tc-3554-kms-epoch-fetch.md). Every pin is a
+      # literal so the compose hash attests it.
       TINYCLOUD_KEYS__TYPE: DstackKmsEpoch
+      TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET: /run/key-recovery/kr.sock
       TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH: "0"
       TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY: 0334c76e0c3f52ec64cbf9bbf5c910c272330166fd656c0a86bb330963e46910e1
       TINYCLOUD_KEYS__LEGACY__APP_ID: 350d124c81d53a57e8899e9f85a904918e663b61
@@ -118,6 +119,39 @@ services:
       TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: /var/lib/tinycloud/ledger/deletions.jsonl
       ROCKET_ADDRESS: "0.0.0.0"
       ROCKET_MAX_BLOCKING: "1024"
+
+  # TC-3554: Phala's dstack-key-recovery (0.6.5, cosign-verified digest) fetches
+  # the epoch-0 key from the KMS and serves it on a unix socket. No ports and no
+  # TCP listener; the socket lives on a volume only this service and tinycloud
+  # mount. Runs as uid 0 (TDX device, host-shared files) with primary gid 1000,
+  # so its 0660 socket is group-owned by the node's tinycloud group. From
+  # host-shared it sees only .appkeys.json and .sys-config.json (launch ticket,
+  # vm_config), never the decrypted env. Its `key` answers are not logged
+  # anywhere (serve mode prints only the listen line; logging off). Removed once
+  # the node keeps its root sealed under the current root.
+  key-recovery:
+    image: ghcr.io/dstack-tee/dstack-key-recovery@sha256:26803eb7eb34f69f367d7ebc0b4abc31f35caad5e58213de77a91dddcd2d0b6b
+    restart: unless-stopped
+    user: "0:1000"
+    command: ["serve", "--no-addr", "--socket", "/run/key-recovery/kr.sock"]
+    # The quote goes through the host's vsock QGS; Docker's default seccomp
+    # profile blocks AF_VSOCK.
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      DSTACK_CCEL_FILE: /ccel.bin
+    volumes:
+      - key-recovery:/run/key-recovery
+      - /dstack/.host-shared/.appkeys.json:/dstack/.host-shared/.appkeys.json:ro
+      - /dstack/.host-shared/.sys-config.json:/dstack/.host-shared/.sys-config.json:ro
+      - /run/log/dstack:/run/log/dstack:ro
+      - /sys/firmware/acpi/tables/data/CCEL:/ccel.bin:ro
+      - /etc/tdx-attest.conf:/etc/tdx-attest.conf:ro
+    devices:
+      - /dev/tdx_guest:/dev/tdx_guest
+      - /dev/vsock:/dev/vsock
+    logging:
+      driver: none
 
   dstack-ingress:
     image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744
@@ -206,6 +240,7 @@ services:
 volumes:
   cert-data:
   deletion-ledger:
+  key-recovery:
 
 networks:
   logship:
