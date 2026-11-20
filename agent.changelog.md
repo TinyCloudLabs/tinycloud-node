@@ -8,6 +8,9 @@ Track changes to agent-facing development guidance for TinyCloud Node. Add a con
 - CI: Docker Container and Release cancel superseded PR runs. All PR workflows
   that also handle non-PR events now isolate those events by run ID, preserving
   pending as well as running main, tag, release and manual runs.
+- Cargo-dist leaves the customized Release workflow intact (`allow-dirty = ["ci"]`).
+  Dist upgrades now require a manual release.yml update; explicit CI regeneration
+  must reapply its PR-only concurrency block.
 
 ## 2026-10-17
 
