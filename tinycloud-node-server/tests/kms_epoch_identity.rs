@@ -1545,13 +1545,24 @@ fn no_blob_and_no_transport_refuses_startup() {
 /// The first boot seals epoch 0's root in `root_wrap` under the wrap key
 /// (`GetKey("tinycloud/keys/primary-wrap")`) and the pinned AAD. Later
 /// boots open it and serve the same DID without calling the sidecar,
-/// whether or not it is still configured.
+/// whether or not it is still configured. The seal and opened log lines are
+/// the deploy gate for the sidecar-free compose.
 #[test]
 fn a_sealed_root_boots_without_the_sidecar() {
     let tee = SidecarTee::start(SidecarScenario::Happy);
     let expected = epoch_did(0);
     let dir = shipped_layout();
-    assert_eq!(start_node(tee.node(dir.path()), dir.path()).did, expected);
+    let first = start_node(tee.node(dir.path()), dir.path());
+    assert_eq!(first.did, expected);
+    let log = first.log();
+    for line in [
+        "fetched and verified the node root",
+        "sealed the node root into root_wrap",
+        "opened the node root from root_wrap",
+    ] {
+        assert!(log.contains(line), "{log}");
+    }
+    drop(first);
     tee.assert_sidecar_requests(1);
     assert!(tables(dir.path()).contains(&"renewal_identity".to_owned()));
     let (wrapped, node_did, epoch) =
@@ -1568,10 +1579,20 @@ fn a_sealed_root_boots_without_the_sidecar() {
         legacy_get_key(&APP_KEYS[0], PRIMARY_KEY_PATH)
     );
 
+    // Restart still on the sidecar compose: opened, nothing fetched or
+    // sealed.
+    let restart = start_node(tee.node(dir.path()), dir.path());
+    assert_eq!(restart.did, expected);
+    let log = restart.log();
+    assert!(log.contains("opened the node root from root_wrap"), "{log}");
+    for line in ["fetched and verified", "sealed the node root"] {
+        assert!(!log.contains(line), "{log}");
+    }
+    drop(restart);
+
     let mut no_sidecar = tee.node(dir.path());
     no_sidecar.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
     assert_eq!(start_node(no_sidecar, dir.path()).did, expected);
-    assert_eq!(start_node(tee.node(dir.path()), dir.path()).did, expected);
     tee.assert_sidecar_requests(1);
     assert_eq!(stored_root(dir.path()).unwrap().0, wrapped);
     tee.agent.assert_never_asked_for_the_node_key();

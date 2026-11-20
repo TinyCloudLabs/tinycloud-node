@@ -144,6 +144,11 @@ where
         }
     };
     let secret = open_wrapped(&stored, &*wrap_key().await?, &aad, &pins)?;
+    ::tracing::info!(
+        event = "root_wrap_opened",
+        root_epoch = pins.root_epoch,
+        "opened the node root from root_wrap"
+    );
     // A probe or an in-process caller of `node_root` gets this root.
     let _ = NODE_ROOT.set(secret.clone());
     Ok((secret, db))
@@ -184,15 +189,17 @@ fn open_wrapped(
         stored.kms_root_epoch,
         pins.root_epoch
     );
-    let root = root_wrap::unseal(wrap_key, aad, &stored.wrapped).map_err(|_| {
+    let mut root = root_wrap::unseal(wrap_key, aad, &stored.wrapped).map_err(|_| {
         anyhow!(
             "the root_wrap blob does not open under this app's wrap key for keys.legacy.app_id \
              and expected_did (tampered, or sealed by another app or for another identity); \
              refusing it"
         )
     })?;
-    let secret =
-        StaticSecret::new(root.to_vec()).map_err(|_| anyhow!("the unsealed root is short"))?;
+    let secret = StaticSecret::new(std::mem::take(&mut *root)).map_err(|mut short| {
+        short.zeroize();
+        anyhow!("the unsealed root is short")
+    })?;
     ensure!(
         secret.node_did() == pins.expected_did,
         "the root unsealed from root_wrap does not derive keys.legacy.expected_did {}; refusing it",
