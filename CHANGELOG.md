@@ -50,6 +50,23 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.14] - 2026-11-20
+
+Restores the node after Phala moved its CVM to KMS `dstack-pha-prod2` (TC-3554). The node keeps its root and identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`); no data is re-encrypted.
+
+### Upgrade notes
+
+- **No database migration.**
+- **Before the first boot, with the node stopped,** `renewal_identity` must read `(did:key:z6MkgWpiYdQV8pAr3dtHLdQsoZR3wF5wsS7fpkzAuX6q1PZj, 1)`. The 04:42Z boot on the moved root bumped it; the reviewed, pinned reset puts it back. Without it the restored node bumps the epoch again and every existing renewal lease stops renewing.
+- The CVM runs `dstack-dev-0.5.15`; the deploy guard now allows it and the deploy no longer asks Phala for an OS image.
+- **No rollback below 1.26.14 on this compose.** An older binary does not know `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` and refuses to start; without the epoch-0 fetch it could only derive keys from the moved root, which is a different identity.
+
+### Changes
+
+- Keys: `DstackKmsEpoch` fetches a historical KMS root epoch inside the TEE, through Phala's `dstack-key-recovery` sidecar on a unix socket, and verifies it before the database connects: the KMS signature chain under a pinned root public key, the root and app epochs, and the expected node DID. Any mismatch stops the boot; there is no fallback to the current root. A `DstackKmsEpoch` identity refuses `backup`. Spec: `docs/tc-3554-kms-epoch-fetch.md`. Details: TC-3554.
+- Production compose: the `key-recovery` sidecar (digest-pinned, no ports, socket shared only with the node, logging off) and the epoch-0 pins as literals. Details: TC-3554.
+- Deploys: production OS pin `dstack-0.5.15`, `dstack-dev-0.5.15` on the dev allowlist, and the reviewed N0 compose hash updated for the new compose. Details: TC-3554.
+
 ## [1.26.13] - 2026-11-20
 
 Ships the changes merged since 1.26.12 (#653, #442, #557, #646, #655, #650, #652, #665, #664, #624, #610, #599 and the production compose change for SQL databases up to 320 MiB), detailed under [Unreleased] above.
