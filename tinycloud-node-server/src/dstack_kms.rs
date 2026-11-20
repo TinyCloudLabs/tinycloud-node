@@ -575,8 +575,10 @@ fn ensure_kms_rpc_cert(der: &[u8], kms_ca: &[u8]) -> Result<()> {
         .map_err(|_| anyhow!("the KMS TLS certificate does not parse"))?;
     let (_, ca) = x509_parser::parse_x509_certificate(kms_ca)
         .map_err(|_| anyhow!("keys.legacy.kms_ca_cert does not parse"))?;
+    let issued_by_pin =
+        cert.issuer() == ca.subject() && cert.verify_signature(Some(ca.public_key())).is_ok();
     ensure!(
-        cert.issuer() == ca.subject() && cert.verify_signature(Some(ca.public_key())).is_ok(),
+        issued_by_pin,
         "the KMS TLS certificate is not issued directly by keys.legacy.kms_ca_cert"
     );
     let usage = cert
