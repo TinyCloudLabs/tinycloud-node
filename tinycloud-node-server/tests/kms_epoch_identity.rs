@@ -142,6 +142,8 @@ fn spawn_logged(command: &mut Command, logs: &Path) -> (KillOnDrop, PathBuf) {
 struct Node {
     _server: KillOnDrop,
     did: String,
+    /// `/info` `identityRoot`: how this boot obtained the root.
+    identity_root: Option<String>,
     log: PathBuf,
 }
 
@@ -173,9 +175,16 @@ fn start_node(mut command: Command, logs: &Path) -> Node {
             if response.status().is_success() {
                 let body: Value = response.json().unwrap();
                 let did = body["nodeDid"].as_str().unwrap().to_owned();
+                let info: Value = client
+                    .get(format!("http://127.0.0.1:{port}/info"))
+                    .send()
+                    .unwrap()
+                    .json()
+                    .unwrap();
                 return Node {
                     _server: server,
                     did,
+                    identity_root: info["identityRoot"].as_str().map(str::to_owned),
                     log,
                 };
             }
@@ -1554,6 +1563,7 @@ fn a_sealed_root_boots_without_the_sidecar() {
     let dir = shipped_layout();
     let first = start_node(tee.node(dir.path()), dir.path());
     assert_eq!(first.did, expected);
+    assert_eq!(first.identity_root.as_deref(), Some("sealed-new"));
     let log = first.log();
     for line in [
         "fetched and verified the node root",
@@ -1583,6 +1593,7 @@ fn a_sealed_root_boots_without_the_sidecar() {
     // sealed.
     let restart = start_node(tee.node(dir.path()), dir.path());
     assert_eq!(restart.did, expected);
+    assert_eq!(restart.identity_root.as_deref(), Some("sealed"));
     let log = restart.log();
     assert!(log.contains("opened identity root from root_wrap"), "{log}");
     for line in ["fetched and verified", "sealed the node root"] {
@@ -1592,7 +1603,9 @@ fn a_sealed_root_boots_without_the_sidecar() {
 
     let mut no_sidecar = tee.node(dir.path());
     no_sidecar.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
-    assert_eq!(start_node(no_sidecar, dir.path()).did, expected);
+    let no_sidecar = start_node(no_sidecar, dir.path());
+    assert_eq!(no_sidecar.did, expected);
+    assert_eq!(no_sidecar.identity_root.as_deref(), Some("sealed"));
     tee.assert_sidecar_requests(1);
     assert_eq!(stored_root(dir.path()).unwrap().0, wrapped);
     tee.agent.assert_never_asked_for_the_node_key();

@@ -59,6 +59,33 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 static NODE_ROOT: tokio::sync::OnceCell<StaticSecret> = tokio::sync::OnceCell::const_new();
+static IDENTITY_ROOT: std::sync::OnceLock<IdentityRoot> = std::sync::OnceLock::new();
+
+/// How this process obtained its identity root from `root_wrap` (TC-3579).
+/// `/info` reports it as `identityRoot`, because the seal and open log lines
+/// are INFO and never shipped. It names the path only, never key material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityRoot {
+    /// Opened the `root_wrap` row an earlier boot stored.
+    Sealed,
+    /// Found no row, fetched the root through the transport and sealed it
+    /// this boot.
+    SealedNew,
+}
+
+impl IdentityRoot {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sealed => "sealed",
+            Self::SealedNew => "sealed-new",
+        }
+    }
+}
+
+/// How [`wrapped_node_root`] obtained this process's root, once it has.
+pub fn identity_root() -> Option<IdentityRoot> {
+    IDENTITY_ROOT.get().copied()
+}
 
 /// The verified node root for `config`, fetched from the KMS at most once
 /// per process, or the root [`wrapped_node_root`] opened. A process serves
@@ -110,8 +137,8 @@ where
         .await
         .context("creating the root_wrap table")?;
     let aad = root_wrap::aad(&pins.app_id, &pins.expected_did);
-    let stored = match root_wrap::read(&db).await.context("reading root_wrap")? {
-        Some(stored) => stored,
+    let (stored, origin) = match root_wrap::read(&db).await.context("reading root_wrap")? {
+        Some(stored) => (stored, IdentityRoot::Sealed),
         None => {
             let Some(transport) = &pins.transport else {
                 bail!(
@@ -137,10 +164,11 @@ where
                 root_epoch = pins.root_epoch,
                 "sealed the node root into root_wrap"
             );
-            root_wrap::read(&db)
+            let stored = root_wrap::read(&db)
                 .await
                 .context("reading root_wrap")?
-                .context("root_wrap is empty after the blob was stored")?
+                .context("root_wrap is empty after the blob was stored")?;
+            (stored, IdentityRoot::SealedNew)
         }
     };
     let secret = open_wrapped(&stored, &*wrap_key().await?, &aad, &pins)?;
@@ -151,6 +179,7 @@ where
     );
     // A probe or an in-process caller of `node_root` gets this root.
     let _ = NODE_ROOT.set(secret.clone());
+    let _ = IDENTITY_ROOT.set(origin);
     Ok((secret, db))
 }
 
