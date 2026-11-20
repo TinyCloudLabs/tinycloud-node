@@ -1396,6 +1396,10 @@ jobs:
           IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
         run: |
           set -euo pipefail
+          if ! git cat-file -e "${IMAGE_REVISION}^{commit}"; then
+            echo "::error::Image revision ${IMAGE_REVISION} is not in this checkout's history."
+            exit 1
+          fi
           if ! git grep -q identityRoot "${IMAGE_REVISION}" -- tinycloud-node-server/src/routes/mod.rs; then
             echo "Image revision ${IMAGE_REVISION} predates /info identityRoot; not checked."
             exit 0
