@@ -147,7 +147,7 @@ where
     ::tracing::info!(
         event = "root_wrap_opened",
         root_epoch = pins.root_epoch,
-        "opened the node root from root_wrap"
+        "opened identity root from root_wrap"
     );
     // A probe or an in-process caller of `node_root` gets this root.
     let _ = NODE_ROOT.set(secret.clone());

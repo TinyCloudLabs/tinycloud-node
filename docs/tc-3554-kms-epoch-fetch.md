@@ -73,34 +73,36 @@ Boot, before any migration, `renewal_identity` write or other database write:
 3. **Open.** The row's `node_did` must equal `EXPECTED_DID` and its `kms_root_epoch`
    `ROOT_EPOCH`. Unseal under `K_wrap` and the AAD, and check the root's node DID equals
    `EXPECTED_DID`. A row present never triggers a fetch, even with a transport
-   configured. Logs `opened the node root from root_wrap` (`event = "root_wrap_opened"`).
+   configured. Logs `opened identity root from root_wrap` (`event = "root_wrap_opened"`).
 4. `TINYCLOUD_KEYS__EXPECTED_NODE_DID`, then migrations and the rest of startup.
 
 Any failure refuses startup; the node never falls back to fetching again or to the
 current root.
 
-### Rollout gate
+### Release order
 
-Deploy the sidecar-free compose only after both of these, on the sidecar compose with a
-`root_wrap` release:
+With a `root_wrap` release, in this order:
 
-1. the first boot logs `sealed the node root into root_wrap`; and
-2. a second restart, still on the sidecar compose, logs `opened the node root from
-   root_wrap` and no `fetched and verified the node root …` (no key-recovery fetch).
+1. **Seal boot**, on the sidecar compose: logs `sealed the node root into root_wrap`.
+2. **Restart that opens from the blob**, still on the sidecar compose: logs
+   `opened identity root from root_wrap` and no `fetched and verified the node root …`
+   (no key-recovery fetch).
+3. **Then** the sidecar-free compose.
 
 ### Recovery: the blob no longer opens
 
 `K_wrap` comes from the current KMS root. If that root changes again, the blob stops
 opening and startup refuses. Recovery is an operator action, in this order:
 
-1. Copy the `root_wrap` row out of the database and keep it. It is ciphertext, so it is
-   safe to keep.
+1. Before **any** delete, copy the `root_wrap` row out of the database as a backup and
+   keep it. It is ciphertext, so it is safe to keep.
 2. Confirm that the sidecar (or the KMS) still returns root epoch 0 for this app.
 3. Only then delete the row, and boot once on the sidecar compose so it seals again.
 
-**If epoch 0 is no longer retrievable, deleting the row loses the node identity for
-good**: the row is the only remaining copy of the root, sealed under a key the node can
-no longer derive. Open question: how long Phala keeps root epoch 0 retrievable.
+**Never delete the row while epoch 0 cannot be fetched.** The row is then the only
+remaining copy of the root, sealed under a key the node can no longer derive; deleting it
+loses the node identity for good. Open question: how long Phala keeps root epoch 0
+retrievable.
 
 ## Protocol
 

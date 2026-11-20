@@ -1558,7 +1558,7 @@ fn a_sealed_root_boots_without_the_sidecar() {
     for line in [
         "fetched and verified the node root",
         "sealed the node root into root_wrap",
-        "opened the node root from root_wrap",
+        "opened identity root from root_wrap",
     ] {
         assert!(log.contains(line), "{log}");
     }
@@ -1584,7 +1584,7 @@ fn a_sealed_root_boots_without_the_sidecar() {
     let restart = start_node(tee.node(dir.path()), dir.path());
     assert_eq!(restart.did, expected);
     let log = restart.log();
-    assert!(log.contains("opened the node root from root_wrap"), "{log}");
+    assert!(log.contains("opened identity root from root_wrap"), "{log}");
     for line in ["fetched and verified", "sealed the node root"] {
         assert!(!log.contains(line), "{log}");
     }
