@@ -50,6 +50,20 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.17] - 2026-11-20
+
+Restores the key-recovery sidecar so a node whose root_wrap blob no longer opens can re-seal from epoch 0 (recovery runbook, `docs/tc-3554-kms-epoch-fetch.md`). No code change. Details: TC-3554.
+
+### Upgrade notes
+
+- **No database migration.**
+- The production compose, its tc959 fixture and mount check, and the reviewed N0 template (`70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`) are back to 1.26.15's. With a blob that opens, the node still opens it and never calls the sidecar.
+- **Recovery order:** copy the `root_wrap` row out as a backup, confirm the sidecar still fetches epoch 0, only then delete the row; the first 1.26.17 boot re-seals it. **Never delete the row while epoch 0 cannot be fetched.**
+
+### Changes
+
+- Production compose: the `key-recovery` sidecar service, its volume, `depends_on` and `TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET` are restored as in 1.26.15. Details: TC-3554.
+
 ## [1.26.16] - 2026-11-20
 
 Drops the `key-recovery` sidecar from the production compose (TC-3554). The node opens its epoch-0 root from the `root_wrap` blob that 1.26.15 sealed; it keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`). No code change from 1.26.15.
