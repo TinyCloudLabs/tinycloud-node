@@ -390,6 +390,11 @@ pub struct NodeInfo {
     /// when the node's database is not PostgreSQL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresInfo>,
+    /// How this boot obtained the identity root from `root_wrap` (TC-3579):
+    /// `sealed` (opened the stored row) or `sealed-new` (fetched the root and
+    /// sealed it this boot). Omitted for every other key source.
+    #[serde(rename = "identityRoot", skip_serializing_if = "Option::is_none")]
+    pub identity_root: Option<&'static str>,
 }
 
 /// Process-wide PostgreSQL connection counters in [`NodeInfo`].
@@ -452,7 +457,15 @@ fn build_info(
                 sockets_configured: sqlx_core::net::tcp_keepalive::sockets_configured(),
                 connections_opened: crate::postgres_connections_opened(),
             }),
+        identity_root: identity_root(),
     }
+}
+
+fn identity_root() -> Option<&'static str> {
+    #[cfg(feature = "dstack")]
+    return crate::dstack_kms::identity_root().map(crate::dstack_kms::IdentityRoot::as_str);
+    #[cfg(not(feature = "dstack"))]
+    None
 }
 
 /// The node's pool, if it manages one. Unlike a `State` guard it never

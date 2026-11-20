@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- `/info` and `/version` report `identityRoot` for a `keys.type = DstackKmsEpoch` node: `sealed` when this boot opened the stored `root_wrap` row, `sealed-new` when it fetched the root and sealed it. It names the path, never key material, and is omitted for every other key source. The production deploy fails unless a sidecar-free compose reports `sealed` (a compose with the key-recovery sidecar may also report `sealed-new`); images built before this field are not checked. Details: TC-3579.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;

@@ -93,9 +93,11 @@ With a `root_wrap` release, in this order:
 3. **Then** the sidecar-free compose. Serving the same DID on it proves the node opens
    from the blob with no transport.
 
-A separate restart on the sidecar compose is not needed, and on production it cannot be
-observed: the `seal` and `opened identity root from root_wrap` lines are INFO and are not
-shipped.
+A separate restart on the sidecar compose is not needed. The `seal` and `opened identity
+root from root_wrap` lines are INFO and are not shipped, so `/info` reports the path
+instead (TC-3579): `identityRoot` is `sealed-new` on the seal boot and `sealed` on every
+boot that opened a stored row. The production deploy requires `sealed` on the
+sidecar-free compose.
 
 ### Recovery: the blob no longer opens
 

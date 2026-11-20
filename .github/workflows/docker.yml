@@ -1385,6 +1385,41 @@ jobs:
             rm -f "${RESPONSE_FILE}"
           done
 
+      # TC-3579: the root_wrap seal/open log lines are INFO and never shipped,
+      # so /info names how this boot obtained the identity root. The
+      # sidecar-free compose can only open the stored row ("sealed"); one
+      # that runs the key-recovery sidecar may seal it this boot
+      # ("sealed-new"). An image built before the field (a rollback or an
+      # older promoted digest) is not checked.
+      - name: Verify the identity root opened from root_wrap
+        env:
+          IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${IMAGE_REVISION}^{commit}"; then
+            echo "::error::Image revision ${IMAGE_REVISION} is not in this checkout's history."
+            exit 1
+          fi
+          if ! git grep -q identityRoot "${IMAGE_REVISION}" -- tinycloud-node-server/src/routes/mod.rs; then
+            echo "Image revision ${IMAGE_REVISION} predates /info identityRoot; not checked."
+            exit 0
+          fi
+          ALLOWED="sealed"
+          if grep -q '^  key-recovery:$' docker-compose.dstack-postgres.yaml; then
+            ALLOWED="sealed sealed-new"
+          fi
+          ROOT="$(curl -fsS --max-time 15 https://tee.node.tinycloud.xyz/info | jq -r '.identityRoot // "absent"')"
+          case " ${ALLOWED} " in
+            *" ${ROOT} "*)
+              echo "identityRoot: ${ROOT}"
+              echo "Identity root: \`${ROOT}\`" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::/info identityRoot is '${ROOT}', expected one of: ${ALLOWED}."
+              exit 1
+              ;;
+          esac
+
       - name: Report unverified storage overrides
         if: >-
           ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' && steps.quotas.outcome != 'success' }}
