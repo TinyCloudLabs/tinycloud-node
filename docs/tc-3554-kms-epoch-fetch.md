@@ -79,19 +79,6 @@ current root. `K_wrap` comes from the current KMS root: if that root changes aga
 blob stops opening and startup refuses. Recovery is then an operator action: delete the
 row and boot once with a transport.
 
-## Renewer identity reset (fallback)
-
-Leases issued before the root moved name the epoch-0 renewer at renewer epoch 1. A node
-that ran meanwhile under another root moved `renewal_identity` to another renewer and
-epoch, and restarting on the epoch-0 root alone would move it to yet another epoch. The
-optional pins `TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__FROM_RENEWER_DID`, `…__FROM_EPOCH`
-and `…__TO_RENEWER_DID` repair this once. After the identity checks and migrations, and
-before the node initializes its renewer identity, one transaction sets the row to
-(`TO_RENEWER_DID`, 1) only if it holds exactly (`FROM_RENEWER_DID`, `FROM_EPOCH`).
-`TO_RENEWER_DID` must be the renewer of the root being served, or startup refuses. Any
-other stored state is left alone and startup handles it as before. The node logs only
-whether the reset applied.
-
 ## Protocol
 
 The guest agent is the dstack socket (`/var/run/dstack.sock`, v0 API). Bytes fields in

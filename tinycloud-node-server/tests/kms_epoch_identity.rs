@@ -300,41 +300,11 @@ fn legacy_get_key(app_key: &[u8], path: &str) -> [u8; 32] {
     okm
 }
 
-/// The node root served from the app key of root epoch `epoch`.
-fn epoch_root(epoch: usize) -> StaticSecret {
-    StaticSecret::new(legacy_get_key(&APP_KEYS[epoch], PRIMARY_KEY_PATH).to_vec()).unwrap()
-}
-
 /// The node DID served from the app key of root epoch `epoch`.
 fn epoch_did(epoch: usize) -> String {
-    epoch_root(epoch).node_did()
-}
-
-/// The renewer DID of the node root of root epoch `epoch`.
-fn epoch_renewer(epoch: usize) -> String {
-    tinycloud_core::renewal::renewal_identity(&epoch_root(epoch)).0
-}
-
-/// The stored `renewal_identity` row: (renewer_did, epoch).
-fn stored_renewer(cwd: &Path) -> (String, i64) {
-    rusqlite::Connection::open(database(cwd))
+    StaticSecret::new(legacy_get_key(&APP_KEYS[epoch], PRIMARY_KEY_PATH).to_vec())
         .unwrap()
-        .query_row(
-            "SELECT renewer_did, epoch FROM renewal_identity WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
-}
-
-fn store_renewer(cwd: &Path, renewer_did: &str, epoch: i64) {
-    rusqlite::Connection::open(database(cwd))
-        .unwrap()
-        .execute(
-            "UPDATE renewal_identity SET renewer_did = ?1, epoch = ?2 WHERE id = 1",
-            rusqlite::params![renewer_did, epoch],
-        )
-        .unwrap();
+        .node_did()
 }
 
 /// SEC1-compressed (33-byte) secp256k1 public key of `secret`.
@@ -1650,43 +1620,4 @@ fn an_unsealed_root_with_another_did_refuses_before_any_other_write() {
     assert!(assert_only_root_wrap(dir.path()));
     assert_eq!(tee.sidecar.requests(), Vec::<String>::new());
     tee.agent.assert_never_asked_for_the_node_key();
-}
-
-/// The pinned renewer identity reset (the fallback): applied once when the
-/// stored state is exactly the from-state, before startup initializes the
-/// renewer; any other state is handled as before; a to-DID that is not this
-/// node's renewer refuses startup.
-#[test]
-fn renewal_reset_moves_only_the_pinned_from_state() {
-    let tee = SidecarTee::start(SidecarScenario::Happy);
-    let (renewer, rotated) = (epoch_renewer(0), epoch_renewer(1));
-    let dir = shipped_layout();
-    start_node(tee.node(dir.path()), dir.path());
-    assert_eq!(stored_renewer(dir.path()), (renewer.clone(), 1));
-    store_renewer(dir.path(), &rotated, 2);
-    let reset = |to: &str| {
-        let mut node = tee.node(dir.path());
-        node.env(
-            "TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__FROM_RENEWER_DID",
-            &rotated,
-        )
-        .env("TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__FROM_EPOCH", "2")
-        .env("TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__TO_RENEWER_DID", to);
-        node
-    };
-
-    let (code, log) = run_to_exit(reset(&rotated), dir.path());
-    assert_refused(code, &log);
-    assert!(log.contains("renewal_reset.to_renewer_did"), "{log}");
-    assert_eq!(stored_renewer(dir.path()), (rotated.clone(), 2));
-
-    assert_eq!(start_node(reset(&renewer), dir.path()).did, epoch_did(0));
-    assert_eq!(stored_renewer(dir.path()), (renewer.clone(), 1));
-
-    // Not the pinned from-state: startup moves the renewer to a new epoch,
-    // as without the reset.
-    store_renewer(dir.path(), &rotated, 3);
-    start_node(reset(&renewer), dir.path());
-    assert_eq!(stored_renewer(dir.path()), (renewer, 4));
-    tee.assert_sidecar_requests(1);
 }
