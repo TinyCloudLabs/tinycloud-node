@@ -3,6 +3,12 @@
 Track changes to agent-facing development guidance for TinyCloud Node. Add a concise entry when
 `agent.dev.md` or related agent workflow expectations change.
 
+## 2026-11-20
+
+- CI: Docker Container and Release cancel superseded PR runs. Non-PR events
+  use unique concurrency groups, preserving every main, tag, release and manual
+  run, including pending runs.
+
 ## 2026-10-17
 
 - Added the TC-887 native at-rest harness (`scripts/at-rest-harness/`): a real node on native

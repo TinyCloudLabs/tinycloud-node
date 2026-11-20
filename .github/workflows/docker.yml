@@ -13,6 +13,11 @@ name: Docker Container
 # (RELEASE_PLZ_TOKEN) and a manual `git push --tags` also emits a normal `push`
 # event, so tag pushes reliably reach this workflow. `on: release` is kept for
 # backward compatibility should a PAT-published Release ever reappear.
+# Group only PR runs together; production and release runs must not supersede one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
