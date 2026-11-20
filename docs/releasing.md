@@ -817,11 +817,11 @@ The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73
 With the template lock on main this redeploys exactly main's raw compose
 `272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468`
 (the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, and the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar), whatever digest
-main's template currently pins. **Since TC-3554 only a release that opens its
-root from `root_wrap` (after 1.26.14) boots on this compose, and only once
-the database holds the blob:** 1.26.14 needs the sidecar this compose lacks,
+main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
+on this compose, and only once the database holds the `root_wrap` blob:**
+1.26.14 needs the sidecar this compose lacks,
 and an older binary does not know `DstackKmsEpoch`; both refuse to start, so
-this command and any rollback below the `root_wrap` release fail closed rather
+this command and any rollback below 1.26.15 fail closed rather
 than serve under the moved KMS root. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
@@ -830,10 +830,9 @@ substitutions fail before mutation.
 From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
 `docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
 `root_wrap` row, so the restored node opens the same root without a fetch.
-A fresh or empty database has no row: on this sidecar compose the first boot
-fetches epoch 0 and seals it again, and on a sidecar-free compose the node
-refuses to start until one boot on the sidecar compose has sealed it. That
-refusal is expected; it is not a fault in the restore.
+A fresh or empty database has no row, and the node refuses to start on this
+sidecar-free compose until one boot on the sidecar compose (1.26.15's) has
+sealed it. That refusal is expected; it is not a fault in the restore.
 
 ### TC-1302 captured pre-N0 rollback
 
