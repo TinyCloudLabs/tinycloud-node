@@ -1,13 +1,16 @@
 //! The `DstackKmsEpoch` key source (TC-3554), observed through the real
-//! `tinycloud` binary against a stand-in dstack guest agent and a stand-in
-//! dstack KMS. The protocol and every check are specified in
+//! `tinycloud` binary against a stand-in dstack guest agent and either of
+//! its two transports: a stand-in dstack KMS (RA-TLS `GetAppKey`) or a
+//! stand-in dstack-key-recovery sidecar (`GET /v0/key` on a Unix socket).
+//! The KMS protocol and every check are specified in
 //! `docs/tc-3554-kms-epoch-fetch.md`.
 //!
-//! - The node fetches the app key for root epoch 0 over RA-TLS and serves the
-//!   DID derived from it, never the current epoch's key from dstack `GetKey`.
-//! - A wrong epoch, a bad issuance signature, a KMS refusal or a DID
-//!   mismatch stops startup without falling back.
+//! - The node fetches the app key for root epoch 0 and serves the DID
+//!   derived from it, never the current epoch's key from dstack `GetKey`.
+//! - A wrong epoch, a bad issuance signature, a signature chain for another
+//!   key, a refusal or a DID mismatch stops startup without falling back.
 //! - A DID mismatch stops startup before the database is opened.
+//! - Configuring both transports, or neither, stops startup before any call.
 //!
 //! Every key below is a fixed fixture key; none of them is a real KMS, app or
 //! node key.
@@ -77,6 +80,10 @@ const REPORT_DATA_AT: usize = QUOTE_HEADER_LEN + 520;
 
 const GET_TEMP_CA_CERT: &str = "POST /prpc/GetTempCaCert?json";
 const GET_APP_KEY: &str = "POST /prpc/GetAppKey?json";
+
+/// The exact request the node sends the key-recovery sidecar for root
+/// epoch 0.
+const SIDECAR_REQUEST: &str = "GET /v0/key?path=tinycloud%2Fkeys%2Fprimary&root_epoch=0&app_epoch=0 HTTP/1.1\r\nHost: key-recovery\r\nConnection: close\r\n\r\n";
 
 // ---------------------------------------------------------------------------
 // The node process (patterns from tests/startup_identity.rs)
@@ -270,17 +277,28 @@ fn issuance_digest(app_id: &[u8], app_pub: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// The KMS's 65-byte `r || s || v` issuance signature of `app_key` by `root`.
-/// k256 signs low-S and adjusts the recovery id to match.
-fn issuance_signature(root: &[u8], app_key: &[u8]) -> Vec<u8> {
-    let digest = issuance_digest(&APP_ID, &compressed_pubkey(app_key));
-    let (signature, recovery) = SigningKey::from_slice(root)
+/// A 65-byte `r || s || v` recoverable signature of the prehashed `digest`
+/// by `key`. k256 signs low-S and adjusts the recovery id to match.
+fn recoverable_signature(key: &[u8], digest: &[u8]) -> Vec<u8> {
+    let (signature, recovery) = SigningKey::from_slice(key)
         .unwrap()
-        .sign_prehash_recoverable(&digest)
+        .sign_prehash_recoverable(digest)
         .unwrap();
     let mut out = signature.to_bytes().to_vec();
     out.push(recovery.to_byte());
     out
+}
+
+/// The KMS's issuance signature of `app_key` by `root`.
+fn issuance_signature(root: &[u8], app_key: &[u8]) -> Vec<u8> {
+    recoverable_signature(root, &issuance_digest(&APP_ID, &compressed_pubkey(app_key)))
+}
+
+/// dstack's v0 key signature: the app root's signature of
+/// keccak256(":" || lowercase hex of `public_key`) (purpose "").
+fn key_signature(app_key: &[u8], public_key: &[u8]) -> Vec<u8> {
+    let message = format!(":{}", hex::encode(public_key));
+    recoverable_signature(app_key, &Keccak256::digest(message.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +308,8 @@ fn issuance_signature(root: &[u8], app_key: &[u8]) -> Vec<u8> {
 struct Request {
     method: String,
     path: String,
+    /// The request line and headers, without the terminating blank line.
+    head: String,
     body: Vec<u8>,
 }
 
@@ -335,14 +355,27 @@ fn read_request(stream: &mut impl Read) -> io::Result<Option<Request>> {
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(length);
-    Ok(Some(Request { method, path, body }))
+    Ok(Some(Request {
+        method,
+        path,
+        head,
+        body,
+    }))
 }
 
 fn write_response(stream: &mut impl Write, status: &str, body: &Value) -> io::Result<()> {
-    let body = body.to_string();
+    write_text(stream, status, "application/json", &body.to_string())
+}
+
+fn write_text(
+    stream: &mut impl Write,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> io::Result<()> {
     stream.write_all(
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
@@ -848,6 +881,9 @@ impl KmsState {
                 body["root_epoch"]
             ));
         }
+        if body["app_epoch"].as_u64() != Some(0) {
+            return Err(format!("app_epoch must be 0, got {}", body["app_epoch"]));
+        }
         Ok(())
     }
 
@@ -877,6 +913,118 @@ fn extension<'a>(cert: &X509Certificate<'a>, oid: &str) -> Result<&'a [u8], Stri
         .find(|extension| extension.oid.to_id_string() == oid)
         .ok_or_else(|| format!("client certificate lacks extension {oid}"))?;
     octet_string_content(extension.value).map_err(|error| format!("extension {oid}: {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// Stand-in dstack-key-recovery sidecar
+// ---------------------------------------------------------------------------
+
+/// How the stand-in sidecar answers `GET /v0/key`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SidecarScenario {
+    /// The requested epoch's key with a valid signature chain.
+    Happy,
+    /// Always epoch 1's key and chain, with `root_epoch: 1`.
+    WrongEpoch,
+    /// Epoch 0's key and `root_epoch: 0`, issuance signed by epoch 1's root.
+    BadSignature,
+    /// Epoch 0's primary key (so the right DID), but the app root's
+    /// signature covers another derived key's public key.
+    ChainForAnotherKey,
+    /// HTTP 500: the sidecar could not get the epoch's keys.
+    Refused,
+}
+
+/// dstack-key-recovery on a Unix socket. It records every request head
+/// (with its terminating blank line) it receives.
+struct Sidecar {
+    socket: PathBuf,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl Sidecar {
+    fn start(socket: PathBuf, scenario: SidecarScenario) -> Self {
+        let listener = UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let recorded = Arc::clone(&recorded);
+                std::thread::spawn(move || serve_sidecar(stream, scenario, &recorded));
+            }
+        });
+        Self { socket, requests }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().clone()
+    }
+}
+
+fn serve_sidecar(mut stream: UnixStream, scenario: SidecarScenario, recorded: &Mutex<Vec<String>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let Ok(Some(request)) = read_request(&mut stream) else {
+        return;
+    };
+    recorded.lock().push(format!("{}\r\n\r\n", request.head));
+    let requested = request
+        .path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("root_epoch="))
+        .and_then(|epoch| epoch.parse::<usize>().ok());
+    let reply = match (request.method.as_str(), scenario, requested) {
+        ("GET", SidecarScenario::Happy, Some(epoch @ (0 | 1))) => {
+            Some(sidecar_reply(epoch, epoch, PRIMARY_KEY_PATH))
+        }
+        ("GET", SidecarScenario::WrongEpoch, Some(_)) => {
+            Some(sidecar_reply(1, 1, PRIMARY_KEY_PATH))
+        }
+        ("GET", SidecarScenario::BadSignature, Some(_)) => {
+            Some(sidecar_reply(0, 1, PRIMARY_KEY_PATH))
+        }
+        ("GET", SidecarScenario::ChainForAnotherKey, Some(_)) => {
+            Some(sidecar_reply(0, 0, "tinycloud/keys/another"))
+        }
+        _ => None,
+    };
+    let _ = match reply {
+        Some(reply) => write_response(&mut stream, "200 OK", &reply),
+        None => write_text(
+            &mut stream,
+            "500 Internal Server Error",
+            "text/plain",
+            &format!(
+                "failed to get the keys of root epoch {}: app is not authorized",
+                requested.map_or("?".to_owned(), |epoch| epoch.to_string())
+            ),
+        ),
+    };
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+/// A `GET /v0/key` reply (dstack-key-recovery 0.6.5) for the primary key of
+/// epoch `epoch`'s app key, claiming `root_epoch: epoch`. The chain is the
+/// app root's signature of the public key of the key derived at
+/// `signed_path`, then the issuance of that app key by epoch `signer`'s root.
+fn sidecar_reply(epoch: usize, signer: usize, signed_path: &str) -> Value {
+    let app_key = &APP_KEYS[epoch];
+    let key = legacy_get_key(app_key, PRIMARY_KEY_PATH);
+    let signed_public_key = compressed_pubkey(&legacy_get_key(app_key, signed_path));
+    json!({
+        "api": "v0",
+        "key": hex::encode(key),
+        "public_key": hex::encode(compressed_pubkey(&key)),
+        "signature_chain": [
+            hex::encode(key_signature(app_key, &signed_public_key)),
+            hex::encode(issuance_signature(&KMS_ROOT_KEYS[signer], app_key)),
+        ],
+        "root_epoch": epoch,
+        "app_epoch": 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1082,70 @@ impl Tee {
             assert_eq!(call.verdict, Ok(()), "{log:#?}");
             assert_eq!(call.body["root_epoch"], json!(0), "{log:#?}");
         }
+    }
+}
+
+/// The guest agent and the key-recovery sidecar; no KMS.
+struct SidecarTee {
+    _sockets: tempfile::TempDir,
+    agent: Agent,
+    sidecar: Sidecar,
+}
+
+impl SidecarTee {
+    fn start(scenario: SidecarScenario) -> Self {
+        let sockets = tempfile::tempdir().unwrap();
+        let agent = Agent::start(sockets.path().join("dstack.sock"));
+        let sidecar = Sidecar::start(sockets.path().join("key-recovery.sock"), scenario);
+        Self {
+            _sockets: sockets,
+            agent,
+            sidecar,
+        }
+    }
+
+    /// The container entrypoint in `cwd`, selecting `DstackKmsEpoch` through
+    /// the sidecar for root epoch 0 with every pin correct.
+    fn node(&self, cwd: &Path) -> Command {
+        let mut command = tinycloud(cwd);
+        command
+            .env("TINYCLOUD_KEYS__TYPE", "DstackKmsEpoch")
+            .env(
+                "TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET",
+                &self.sidecar.socket,
+            )
+            .env("TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH", "0")
+            .env(
+                "TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY",
+                hex::encode(compressed_pubkey(&KMS_ROOT_KEYS[0])),
+            )
+            .env("TINYCLOUD_KEYS__LEGACY__APP_ID", hex::encode(APP_ID))
+            .env("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", epoch_did(0))
+            .env("DSTACK_SIMULATOR_ENDPOINT", &self.agent.socket);
+        command
+    }
+
+    /// The sidecar got exactly `count` requests, each the exact epoch-0
+    /// request.
+    fn assert_sidecar_requests(&self, count: usize) {
+        let requests = self.sidecar.requests();
+        assert_eq!(requests.len(), count, "{requests:#?}");
+        for request in &requests {
+            assert_eq!(request, SIDECAR_REQUEST, "{requests:#?}");
+        }
+    }
+
+    /// A refused start, through the sidecar under `scenario`: one request,
+    /// no fallback, no database.
+    fn assert_refused_start(scenario: SidecarScenario) -> String {
+        let tee = Self::start(scenario);
+        let dir = shipped_layout();
+        let (code, log) = run_to_exit(tee.node(dir.path()), dir.path());
+        assert_refused(code, &log);
+        tee.assert_sidecar_requests(1);
+        tee.agent.assert_never_asked_for_a_key();
+        assert_database_never_opened(dir.path());
+        log
     }
 }
 
@@ -1013,7 +1225,7 @@ fn happy_path_serves_the_epoch0_did() {
     let call = &kms.app_key_calls[0];
     assert_eq!(call.body["api_version"], json!(1), "{kms:#?}");
     assert_eq!(call.body["vm_config"], json!(VM_CONFIG), "{kms:#?}");
-    assert!(call.body.get("app_epoch").is_none(), "{kms:#?}");
+    assert_eq!(call.body["app_epoch"], json!(0), "{kms:#?}");
     let agent = tee.agent.requests();
     assert!(agent.iter().any(|line| line == "GET /Info"), "{agent:?}");
     assert!(
@@ -1103,4 +1315,132 @@ fn did_mismatch_refuses_before_the_database_connects() {
     tee.assert_app_key_requests(2);
 
     tee.agent.assert_never_asked_for_a_key();
+}
+
+/// Through the sidecar, the node serves epoch 0's DID from exactly one
+/// `GET /v0/key`, never asks dstack for a key, and opens its database.
+#[test]
+fn sidecar_happy_path_serves_the_epoch0_did() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let expected = epoch_did(0);
+    let dir = shipped_layout();
+    let node = start_node(tee.node(dir.path()), dir.path());
+    assert_eq!(node.did, expected);
+    assert!(
+        database(dir.path()).exists(),
+        "a serving node did not create {}",
+        database(dir.path()).display()
+    );
+    let log = node.log();
+    for secret in [
+        hex::encode(APP_KEYS[0]),
+        hex::encode(legacy_get_key(&APP_KEYS[0], PRIMARY_KEY_PATH)),
+    ] {
+        assert!(
+            !log.contains(&secret),
+            "the node logged key material:\n{log}"
+        );
+    }
+    tee.assert_sidecar_requests(1);
+    let agent = tee.agent.requests();
+    assert!(agent.iter().any(|line| line == "GET /Info"), "{agent:?}");
+    tee.agent.assert_never_asked_for_a_key();
+}
+
+/// A sidecar that answers another root epoch than the one requested.
+#[test]
+fn sidecar_epoch_mismatch_refuses_startup() {
+    let log = SidecarTee::assert_refused_start(SidecarScenario::WrongEpoch);
+    assert!(log.contains("root_epoch"), "{log}");
+}
+
+/// A key whose issuance is not signed by the pinned epoch-0 root.
+#[test]
+fn sidecar_bad_issuance_signature_refuses_startup() {
+    let log = SidecarTee::assert_refused_start(SidecarScenario::BadSignature);
+    assert!(log.to_lowercase().contains("signature"), "{log}");
+}
+
+/// The right key (its DID matches the pin), but a chain that certifies
+/// another key: only the chain check can refuse it.
+#[test]
+fn sidecar_chain_for_another_key_refuses_startup() {
+    SidecarTee::assert_refused_start(SidecarScenario::ChainForAnotherKey);
+}
+
+/// A sidecar that cannot get the epoch's keys: no retry, no fallback to
+/// dstack GetKey (and no KMS is running to fall back to).
+#[test]
+fn sidecar_refusal_refuses_startup_without_fallback() {
+    SidecarTee::assert_refused_start(SidecarScenario::Refused);
+}
+
+/// Through the sidecar, a fetched root whose DID is not the pinned legacy
+/// DID, and a served DID that is not the any-source pin: both refuse before
+/// the database opens.
+#[test]
+fn sidecar_did_mismatch_refuses_before_the_database_connects() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let other = epoch_did(1);
+
+    let dir = shipped_layout();
+    let mut wrong_legacy_pin = tee.node(dir.path());
+    wrong_legacy_pin.env("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", &other);
+    let (code, log) = run_to_exit(wrong_legacy_pin, dir.path());
+    assert_refused(code, &log);
+    assert_database_never_opened(dir.path());
+    tee.assert_sidecar_requests(1);
+
+    let dir = shipped_layout();
+    let mut wrong_node_pin = tee.node(dir.path());
+    wrong_node_pin.env("TINYCLOUD_KEYS__EXPECTED_NODE_DID", &other);
+    let (code, log) = run_to_exit(wrong_node_pin, dir.path());
+    assert_refused(code, &log);
+    assert_database_never_opened(dir.path());
+    tee.assert_sidecar_requests(2);
+
+    tee.agent.assert_never_asked_for_a_key();
+}
+
+/// The sidecar socket and the KMS both configured: refused before the node
+/// calls the agent, the sidecar or the KMS.
+#[test]
+fn two_transports_configured_refuses_before_any_call() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let kms = Kms::start(Scenario::Happy);
+    let dir = shipped_layout();
+    let mut both = tee.node(dir.path());
+    both.env(
+        "TINYCLOUD_KEYS__LEGACY__KMS_URL",
+        format!("https://localhost:{}", kms.port),
+    )
+    .env(
+        "TINYCLOUD_KEYS__LEGACY__KMS_CA_CERT",
+        base64::encode(&kms.ca_der),
+    );
+    let (code, log) = run_to_exit(both, dir.path());
+    assert_refused(code, &log);
+    assert!(log.contains("key_recovery_socket"), "{log}");
+    assert_eq!(tee.agent.requests(), Vec::<String>::new());
+    assert_eq!(tee.sidecar.requests(), Vec::<String>::new());
+    let kms = kms.log();
+    assert!(kms.requests.is_empty(), "{kms:#?}");
+    assert!(kms.connection_errors.is_empty(), "{kms:#?}");
+    assert_database_never_opened(dir.path());
+}
+
+/// `DstackKmsEpoch` with neither the sidecar socket nor the KMS configured:
+/// refused before the node calls the agent.
+#[test]
+fn no_transport_configured_refuses_before_any_call() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let dir = shipped_layout();
+    let mut neither = tee.node(dir.path());
+    neither.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
+    let (code, log) = run_to_exit(neither, dir.path());
+    assert_refused(code, &log);
+    assert!(log.contains("key_recovery_socket"), "{log}");
+    assert_eq!(tee.agent.requests(), Vec::<String>::new());
+    assert_eq!(tee.sidecar.requests(), Vec::<String>::new());
+    assert_database_never_opened(dir.path());
 }

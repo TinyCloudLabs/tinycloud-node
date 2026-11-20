@@ -1654,15 +1654,22 @@ pub struct DstackKmsEpoch {
 #[cfg(feature = "dstack")]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LegacyKmsEpoch {
-    /// KMS origin, `https://host[:port]`.
-    pub kms_url: String,
+    /// Transport: the dstack-key-recovery sidecar's unix socket. Set this or
+    /// `kms_url` + `kms_ca_cert`, never both; there is no runtime fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_recovery_socket: Option<String>,
+    /// Transport: the KMS origin, `https://host[:port]`, fetched over our own
+    /// RA-TLS client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_url: Option<String>,
+    /// The KMS RPC CA certificate, standard base64 of its DER. The only TLS
+    /// trust anchor for `kms_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_ca_cert: Option<String>,
     /// The KMS root epoch to fetch; the response must carry exactly this.
     pub root_epoch: u32,
     /// That epoch's KMS root secp256k1 key, SEC1 compressed, hex.
     pub kms_root_pubkey: String,
-    /// The KMS RPC CA certificate, standard base64 of its DER. The only TLS
-    /// trust anchor for KMS connections.
-    pub kms_ca_cert: String,
     /// This app's 20-byte dstack app id, hex.
     pub app_id: String,
     /// The node DID the fetched root must derive.
