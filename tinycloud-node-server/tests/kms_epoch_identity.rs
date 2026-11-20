@@ -9,8 +9,13 @@
 //!   derived from it, never the current epoch's key from dstack `GetKey`.
 //! - A wrong epoch, a bad issuance signature, a signature chain for another
 //!   key, a refusal or a DID mismatch stops startup without falling back.
-//! - A DID mismatch stops startup before the database is opened.
-//! - Configuring both transports, or neither, stops startup before any call.
+//! - The first boot seals the fetched root in the database's `root_wrap`
+//!   under dstack `GetKey("tinycloud/keys/primary-wrap")`; later boots open
+//!   it with no transport. A tampered blob, a blob that opens to another
+//!   identity, or no blob and no transport stops startup.
+//! - A refused node writes nothing to its database but `root_wrap`: no
+//!   migration and no renewal identity before the identity checks pass.
+//! - Configuring both transports stops startup before any call.
 //!
 //! Every key below is a fixed fixture key; none of them is a real KMS, app or
 //! node key.
@@ -21,6 +26,7 @@ use parking_lot::Mutex;
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
+use rusqlite::OptionalExtension;
 use rustls::{
     client::danger::HandshakeSignatureValid,
     crypto::CryptoProvider,
@@ -42,7 +48,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tinycloud_core::keys::StaticSecret;
+use tinycloud_core::{keys::StaticSecret, root_wrap};
 use x509_parser::{certificate::X509Certificate, parse_x509_certificate};
 
 /// The repository's `tinycloud.toml`, which the Docker image copies next to
@@ -51,6 +57,9 @@ const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tinycloud.
 
 /// The legacy `GetKey` path the node's root comes from.
 const PRIMARY_KEY_PATH: &str = "tinycloud/keys/primary";
+/// How the stand-in agent records the node's one legitimate `GetKey`: the
+/// key that seals the root in `root_wrap`.
+const WRAP_KEY_REQUEST: &str = "POST /GetKey tinycloud/keys/primary-wrap";
 
 /// The app id the guest agent reports and the node pins.
 const APP_ID: [u8; 20] = *b"tc-3554 fixture app!";
@@ -227,6 +236,47 @@ fn assert_database_never_opened(cwd: &Path) {
             file.display()
         );
     }
+}
+
+/// The node's database tables, other than SQLite's own.
+fn tables(cwd: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(database(cwd)).unwrap();
+    let mut tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap();
+    let mut names = tables
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    names.sort();
+    names
+}
+
+/// The stored `root_wrap` row: (wrapped, node_did, kms_root_epoch).
+fn stored_root(cwd: &Path) -> Option<(Vec<u8>, String, i64)> {
+    rusqlite::Connection::open(database(cwd))
+        .unwrap()
+        .query_row(
+            "SELECT wrapped, node_did, kms_root_epoch FROM root_wrap WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
+/// The refused node wrote nothing to its database but `root_wrap`: no
+/// migration ran and no renewal identity was written. Returns whether it
+/// stored a root.
+fn assert_only_root_wrap(cwd: &Path) -> bool {
+    assert!(database(cwd).exists(), "the node never opened its database");
+    assert_eq!(
+        tables(cwd),
+        ["root_wrap"],
+        "the node wrote to its database before its identity checks passed"
+    );
+    stored_root(cwd).is_some()
 }
 
 fn assert_refused(code: Option<i32>, log: &str) {
@@ -484,10 +534,15 @@ impl Agent {
         self.requests.lock().clone()
     }
 
-    fn assert_never_asked_for_a_key(&self) {
+    /// The node never fell back to dstack `GetKey` for its identity: the
+    /// only key it asked for is the `root_wrap` key.
+    fn assert_never_asked_for_the_node_key(&self) {
         let requests = self.requests();
         assert!(
-            !requests.iter().any(|line| line.starts_with("POST /GetKey")),
+            requests
+                .iter()
+                .filter(|line| line.starts_with("POST /GetKey"))
+                .all(|line| line == WRAP_KEY_REQUEST),
             "the node fell back to dstack GetKey: {requests:?}"
         );
     }
@@ -498,7 +553,18 @@ fn serve_agent(mut stream: UnixStream, recorded: &Mutex<Vec<String>>) {
     let Ok(Some(request)) = read_request(&mut stream) else {
         return;
     };
-    recorded.lock().push(request.line());
+    // A `GetKey` is recorded with the key path it asks for.
+    let line = match serde_json::from_slice::<Value>(&request.body) {
+        Ok(body) if request.path == "/GetKey" => {
+            format!(
+                "{} {}",
+                request.line(),
+                body["path"].as_str().unwrap_or("?")
+            )
+        }
+        _ => request.line(),
+    };
+    recorded.lock().push(line);
     let (status, body) = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/Info") => (
             "200 OK",
@@ -1136,17 +1202,45 @@ impl SidecarTee {
     }
 
     /// A refused start, through the sidecar under `scenario`: one request,
-    /// no fallback, no database.
+    /// no fallback, and nothing written to the database.
     fn assert_refused_start(scenario: SidecarScenario) -> String {
         let tee = Self::start(scenario);
         let dir = shipped_layout();
         let (code, log) = run_to_exit(tee.node(dir.path()), dir.path());
         assert_refused(code, &log);
         tee.assert_sidecar_requests(1);
-        tee.agent.assert_never_asked_for_a_key();
-        assert_database_never_opened(dir.path());
+        tee.agent.assert_never_asked_for_the_node_key();
+        assert!(!assert_only_root_wrap(dir.path()));
         log
     }
+}
+
+/// Seed the shipped layout's database with the `root_wrap` row a previous
+/// boot would have stored, but sealing `root`: under the stand-in agent's
+/// `GetKey` answer, for the pinned app id and epoch 0's DID.
+fn seed_root_wrap(cwd: &Path, root: &[u8]) {
+    fs::create_dir_all(cwd.join("data")).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", database(cwd).display());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = tinycloud_core::sea_orm::Database::connect(url)
+            .await
+            .unwrap();
+        root_wrap::ensure_table(&db).await.unwrap();
+        root_wrap::insert_if_absent(
+            &db,
+            &root_wrap::WrappedRoot {
+                wrapped: root_wrap::seal(
+                    &CURRENT_GET_KEY,
+                    &root_wrap::aad(&APP_ID, &epoch_did(0)),
+                    root,
+                ),
+                node_did: epoch_did(0),
+                kms_root_epoch: 0,
+            },
+        )
+        .await
+        .unwrap();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,7 +1326,7 @@ fn happy_path_serves_the_epoch0_did() {
         agent.iter().any(|line| line == "POST /GetQuote"),
         "{agent:?}"
     );
-    tee.agent.assert_never_asked_for_a_key();
+    tee.agent.assert_never_asked_for_the_node_key();
     drop(node);
 
     let pinned_dir = shipped_layout();
@@ -1240,7 +1334,7 @@ fn happy_path_serves_the_epoch0_did() {
     pinned.env("TINYCLOUD_KEYS__EXPECTED_NODE_DID", &expected);
     assert_eq!(start_node(pinned, pinned_dir.path()).did, expected);
     tee.assert_app_key_requests(2);
-    tee.agent.assert_never_asked_for_a_key();
+    tee.agent.assert_never_asked_for_the_node_key();
 }
 
 /// A KMS that answers another root epoch than the one requested.
@@ -1252,8 +1346,8 @@ fn epoch_mismatch_refuses_startup() {
     assert_refused(code, &log);
     assert!(log.contains("root_epoch"), "{log}");
     tee.assert_app_key_requests(1);
-    tee.agent.assert_never_asked_for_a_key();
-    assert_database_never_opened(dir.path());
+    tee.agent.assert_never_asked_for_the_node_key();
+    assert!(!assert_only_root_wrap(dir.path()));
 }
 
 /// An app key whose issuance is not signed by the pinned epoch-0 root.
@@ -1265,8 +1359,8 @@ fn bad_issuance_signature_refuses_startup() {
     assert_refused(code, &log);
     assert!(log.to_lowercase().contains("signature"), "{log}");
     tee.assert_app_key_requests(1);
-    tee.agent.assert_never_asked_for_a_key();
-    assert_database_never_opened(dir.path());
+    tee.agent.assert_never_asked_for_the_node_key();
+    assert!(!assert_only_root_wrap(dir.path()));
 }
 
 /// A KMS that refuses the epoch: no retry, no fallback to dstack GetKey.
@@ -1286,14 +1380,16 @@ fn kms_refusal_refuses_startup_without_fallback() {
         1,
         "{kms:#?}"
     );
-    tee.agent.assert_never_asked_for_a_key();
-    assert_database_never_opened(dir.path());
+    tee.agent.assert_never_asked_for_the_node_key();
+    assert!(!assert_only_root_wrap(dir.path()));
 }
 
 /// A fetched root whose DID is not the pinned legacy DID, and a served DID
-/// that is not the any-source pin: both refuse before the database opens.
+/// that is not the any-source pin: both refuse before anything but
+/// `root_wrap` is written. The fetched root's own DID check refuses before
+/// it is sealed.
 #[test]
-fn did_mismatch_refuses_before_the_database_connects() {
+fn did_mismatch_refuses_before_any_other_database_write() {
     let tee = Tee::start(Scenario::Happy);
     let other = epoch_did(1);
 
@@ -1302,7 +1398,7 @@ fn did_mismatch_refuses_before_the_database_connects() {
     wrong_legacy_pin.env("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", &other);
     let (code, log) = run_to_exit(wrong_legacy_pin, dir.path());
     assert_refused(code, &log);
-    assert_database_never_opened(dir.path());
+    assert!(!assert_only_root_wrap(dir.path()));
     // The fetch itself succeeded; the DID check refused.
     tee.assert_app_key_requests(1);
 
@@ -1311,10 +1407,10 @@ fn did_mismatch_refuses_before_the_database_connects() {
     wrong_node_pin.env("TINYCLOUD_KEYS__EXPECTED_NODE_DID", &other);
     let (code, log) = run_to_exit(wrong_node_pin, dir.path());
     assert_refused(code, &log);
-    assert_database_never_opened(dir.path());
+    assert!(assert_only_root_wrap(dir.path()));
     tee.assert_app_key_requests(2);
 
-    tee.agent.assert_never_asked_for_a_key();
+    tee.agent.assert_never_asked_for_the_node_key();
 }
 
 /// Through the sidecar, the node serves epoch 0's DID from exactly one
@@ -1344,7 +1440,7 @@ fn sidecar_happy_path_serves_the_epoch0_did() {
     tee.assert_sidecar_requests(1);
     let agent = tee.agent.requests();
     assert!(agent.iter().any(|line| line == "GET /Info"), "{agent:?}");
-    tee.agent.assert_never_asked_for_a_key();
+    tee.agent.assert_never_asked_for_the_node_key();
 }
 
 /// A sidecar that answers another root epoch than the one requested.
@@ -1377,9 +1473,9 @@ fn sidecar_refusal_refuses_startup_without_fallback() {
 
 /// Through the sidecar, a fetched root whose DID is not the pinned legacy
 /// DID, and a served DID that is not the any-source pin: both refuse before
-/// the database opens.
+/// anything but `root_wrap` is written.
 #[test]
-fn sidecar_did_mismatch_refuses_before_the_database_connects() {
+fn sidecar_did_mismatch_refuses_before_any_other_database_write() {
     let tee = SidecarTee::start(SidecarScenario::Happy);
     let other = epoch_did(1);
 
@@ -1388,7 +1484,7 @@ fn sidecar_did_mismatch_refuses_before_the_database_connects() {
     wrong_legacy_pin.env("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", &other);
     let (code, log) = run_to_exit(wrong_legacy_pin, dir.path());
     assert_refused(code, &log);
-    assert_database_never_opened(dir.path());
+    assert!(!assert_only_root_wrap(dir.path()));
     tee.assert_sidecar_requests(1);
 
     let dir = shipped_layout();
@@ -1396,10 +1492,10 @@ fn sidecar_did_mismatch_refuses_before_the_database_connects() {
     wrong_node_pin.env("TINYCLOUD_KEYS__EXPECTED_NODE_DID", &other);
     let (code, log) = run_to_exit(wrong_node_pin, dir.path());
     assert_refused(code, &log);
-    assert_database_never_opened(dir.path());
+    assert!(assert_only_root_wrap(dir.path()));
     tee.assert_sidecar_requests(2);
 
-    tee.agent.assert_never_asked_for_a_key();
+    tee.agent.assert_never_asked_for_the_node_key();
 }
 
 /// The sidecar socket and the KMS both configured: refused before the node
@@ -1429,18 +1525,120 @@ fn two_transports_configured_refuses_before_any_call() {
     assert_database_never_opened(dir.path());
 }
 
-/// `DstackKmsEpoch` with neither the sidecar socket nor the KMS configured:
-/// refused before the node calls the agent.
+/// No `root_wrap` blob and no transport: refused before any call to the
+/// agent or the sidecar, with nothing written but the empty table.
 #[test]
-fn no_transport_configured_refuses_before_any_call() {
+fn no_blob_and_no_transport_refuses_startup() {
     let tee = SidecarTee::start(SidecarScenario::Happy);
     let dir = shipped_layout();
     let mut neither = tee.node(dir.path());
     neither.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
     let (code, log) = run_to_exit(neither, dir.path());
     assert_refused(code, &log);
+    assert!(log.contains("no root_wrap blob"), "{log}");
     assert!(log.contains("key_recovery_socket"), "{log}");
     assert_eq!(tee.agent.requests(), Vec::<String>::new());
     assert_eq!(tee.sidecar.requests(), Vec::<String>::new());
-    assert_database_never_opened(dir.path());
+    assert!(!assert_only_root_wrap(dir.path()));
+}
+
+/// The first boot seals epoch 0's root in `root_wrap` under the wrap key
+/// (`GetKey("tinycloud/keys/primary-wrap")`) and the pinned AAD. Later
+/// boots open it and serve the same DID without calling the sidecar,
+/// whether or not it is still configured. The seal and opened log lines are
+/// the deploy gate for the sidecar-free compose.
+#[test]
+fn a_sealed_root_boots_without_the_sidecar() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let expected = epoch_did(0);
+    let dir = shipped_layout();
+    let first = start_node(tee.node(dir.path()), dir.path());
+    assert_eq!(first.did, expected);
+    let log = first.log();
+    for line in [
+        "fetched and verified the node root",
+        "sealed the node root into root_wrap",
+        "opened identity root from root_wrap",
+    ] {
+        assert!(log.contains(line), "{log}");
+    }
+    drop(first);
+    tee.assert_sidecar_requests(1);
+    assert!(tables(dir.path()).contains(&"renewal_identity".to_owned()));
+    let (wrapped, node_did, epoch) =
+        stored_root(dir.path()).expect("the first boot stored no root_wrap blob");
+    assert_eq!((node_did.as_str(), epoch), (expected.as_str(), 0));
+    let unsealed = root_wrap::unseal(
+        &CURRENT_GET_KEY,
+        &root_wrap::aad(&APP_ID, &expected),
+        &wrapped,
+    )
+    .unwrap();
+    assert_eq!(
+        unsealed.as_slice(),
+        legacy_get_key(&APP_KEYS[0], PRIMARY_KEY_PATH)
+    );
+
+    // Restart still on the sidecar compose: opened, nothing fetched or
+    // sealed.
+    let restart = start_node(tee.node(dir.path()), dir.path());
+    assert_eq!(restart.did, expected);
+    let log = restart.log();
+    assert!(log.contains("opened identity root from root_wrap"), "{log}");
+    for line in ["fetched and verified", "sealed the node root"] {
+        assert!(!log.contains(line), "{log}");
+    }
+    drop(restart);
+
+    let mut no_sidecar = tee.node(dir.path());
+    no_sidecar.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
+    assert_eq!(start_node(no_sidecar, dir.path()).did, expected);
+    tee.assert_sidecar_requests(1);
+    assert_eq!(stored_root(dir.path()).unwrap().0, wrapped);
+    tee.agent.assert_never_asked_for_the_node_key();
+}
+
+/// A tampered blob refuses startup. The node neither fetches the root
+/// again nor falls back to the current root.
+#[test]
+fn a_tampered_blob_refuses_startup_without_fallback() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let dir = shipped_layout();
+    start_node(tee.node(dir.path()), dir.path());
+    let (mut wrapped, _, _) = stored_root(dir.path()).unwrap();
+    wrapped[20] ^= 1;
+    rusqlite::Connection::open(database(dir.path()))
+        .unwrap()
+        .execute(
+            "UPDATE root_wrap SET wrapped = ?1 WHERE id = 1",
+            rusqlite::params![wrapped],
+        )
+        .unwrap();
+
+    let (code, log) = run_to_exit(tee.node(dir.path()), dir.path());
+    assert_refused(code, &log);
+    assert!(log.contains("root_wrap blob does not open"), "{log}");
+    tee.assert_sidecar_requests(1);
+    tee.agent.assert_never_asked_for_the_node_key();
+}
+
+/// A blob that opens under the wrap key and the pinned AAD but holds a root
+/// with another DID refuses startup before any migration or renewal
+/// identity write.
+#[test]
+fn an_unsealed_root_with_another_did_refuses_before_any_other_write() {
+    let tee = SidecarTee::start(SidecarScenario::Happy);
+    let dir = shipped_layout();
+    seed_root_wrap(dir.path(), &legacy_get_key(&APP_KEYS[1], PRIMARY_KEY_PATH));
+    let mut no_sidecar = tee.node(dir.path());
+    no_sidecar.env_remove("TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET");
+    let (code, log) = run_to_exit(no_sidecar, dir.path());
+    assert_refused(code, &log);
+    assert!(
+        log.contains("does not derive keys.legacy.expected_did"),
+        "{log}"
+    );
+    assert!(assert_only_root_wrap(dir.path()));
+    assert_eq!(tee.sidecar.requests(), Vec::<String>::new());
+    tee.agent.assert_never_asked_for_the_node_key();
 }

@@ -915,6 +915,28 @@ jobs:
           printf 'Deployment image: `%s` — version `%s`, revision `%s`.\n' \
             "${RESOLVED_IMAGE}" "${VERSION}" "${REVISION}" >> "$GITHUB_STEP_SUMMARY"
 
+      # The guest runs docker compose v2.26.0 (dstack 0.5.15 base image; meta-virtualization
+      # docker-compose_git.bb PV). Its schema refuses e.g. long-form `devices`
+      # ("services.key-recovery.devices.0 must be a string"), which stopped the witness boot.
+      # Validate the exact spliced compose sent to Phala with that version, before any CVM change.
+      # `config -q` needs no Docker daemon. Required `${NAME:?}` inputs get placeholders here; the
+      # sealed values are checked by the existing validation in the deploy step.
+      - name: Validate the compose with the guest's docker compose version
+        env:
+          COMPOSE_VERSION: v2.26.0
+          COMPOSE_SHA256: 59c6b262bedc4a02f46c8400e830e660935684899c770c3f5e804a2b7079fc16
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/docker-compose-guest"
+          curl -fsSL -o "$bin" "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  ${bin}" | sha256sum -c -
+          chmod +x "$bin"
+          "$bin" version | grep -q "${COMPOSE_VERSION}"
+          mapfile -t required < <(grep -oE '\$\{[A-Z_0-9]+:\?' docker-compose.dstack-postgres.yaml | grep -oE '[A-Z_0-9]+' | sort -u)
+          placeholders=()
+          for name in "${required[@]}"; do placeholders+=("${name}=placeholder"); done
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" "${placeholders[@]}" "$bin" -f docker-compose.dstack-postgres.yaml config -q
+
       # TC-500: Phala considers a CVM ready before compose services have
       # started. Validate the production-sealed bundle using the exact image
       # selected above against the production database/TLS/key configuration,

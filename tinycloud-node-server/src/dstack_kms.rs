@@ -8,10 +8,11 @@
 //!
 //! The protocol, the checks and their test vectors are specified in
 //! `docs/tc-3554-kms-epoch-fetch.md`; OpenKey implements the same document.
-//! Every failure is fatal. Nothing here falls back to the current epoch or to
-//! the guest agent's `GetKey`.
+//! Every failure is fatal. Nothing here falls back to the current epoch: the
+//! guest agent's `GetKey` only derives the key that seals the fetched root in
+//! the database (`root_wrap`), never the identity.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
@@ -26,7 +27,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use serde::Deserialize;
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
-use tinycloud_core::keys::StaticSecret;
+use tinycloud_core::{
+    keys::StaticSecret,
+    root_wrap::{self, WrappedRoot},
+    sea_orm::ConnectionTrait,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UnixStream},
@@ -39,6 +44,9 @@ use crate::config::LegacyKmsEpoch;
 const NODE_KEY_PATH: &[u8] = b"tinycloud/keys/primary";
 /// `NODE_KEY_PATH`, percent-encoded for a query string.
 const NODE_KEY_QUERY: &str = "tinycloud%2Fkeys%2Fprimary";
+/// The guest agent path of the key that seals the node root in `root_wrap`,
+/// derived from the current KMS root.
+const WRAP_KEY_PATH: &str = "tinycloud/keys/primary-wrap";
 /// dstack RA-TLS extensions: the raw TDX quote, the event log, and the
 /// certificate's special usage.
 const OID_TDX_QUOTE: &[u64] = &[1, 3, 6, 1, 4, 1, 62397, 1, 1];
@@ -53,24 +61,157 @@ const MAX_RESPONSE_BYTES: usize = 1 << 20;
 static NODE_ROOT: tokio::sync::OnceCell<StaticSecret> = tokio::sync::OnceCell::const_new();
 
 /// The verified node root for `config`, fetched from the KMS at most once
-/// per process. A process serves one configuration.
+/// per process, or the root [`wrapped_node_root`] opened. A process serves
+/// one configuration.
 pub async fn node_root(config: &LegacyKmsEpoch) -> Result<StaticSecret> {
     let socket = crate::dstack::socket_path();
     NODE_ROOT
-        .get_or_try_init(|| fetch(config, &socket))
+        .get_or_try_init(|| async {
+            let pins = Pins::parse(config)?;
+            let transport = pins.transport.as_ref().context(
+                "keys.legacy configures no transport (key_recovery_socket, or kms_url with \
+                 kms_ca_cert) to fetch the node root from",
+            )?;
+            fetch(&pins, transport, &socket).await
+        })
         .await
         .cloned()
 }
 
-/// The node root if this process already fetched it. Status probes use this
-/// so they never call the KMS themselves.
+/// The node root if this process already fetched or unsealed it. Status
+/// probes use this so they never call the KMS themselves.
 pub fn fetched_node_root() -> Option<StaticSecret> {
     NODE_ROOT.get().cloned()
 }
 
+/// The node root from the database's `root_wrap` blob, opened with this
+/// app's wrap key (dstack `GetKey(WRAP_KEY_PATH)` on the current KMS root),
+/// so later boots need no historical epoch; and the database connection,
+/// which `connect` opens.
+///
+/// With no blob, the root is fetched once through the configured transport
+/// and fully verified, then sealed and stored (first writer wins); the
+/// stored blob is read back and opened as on every later boot. Until the
+/// identity check here passes, nothing touches the database but the
+/// `root_wrap` table. Every failure refuses startup, and nothing falls back
+/// to the current root as the identity.
+pub async fn wrapped_node_root<C, F, Fut>(
+    config: &LegacyKmsEpoch,
+    connect: F,
+) -> Result<(StaticSecret, C)>
+where
+    C: ConnectionTrait,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<C>>,
+{
+    let pins = Pins::parse(config)?;
+    let db = connect().await?;
+    root_wrap::ensure_table(&db)
+        .await
+        .context("creating the root_wrap table")?;
+    let aad = root_wrap::aad(&pins.app_id, &pins.expected_did);
+    let stored = match root_wrap::read(&db).await.context("reading root_wrap")? {
+        Some(stored) => stored,
+        None => {
+            let Some(transport) = &pins.transport else {
+                bail!(
+                    "the database has no root_wrap blob, and keys.legacy configures no transport \
+                     to fetch root epoch {} once and seal it: set key_recovery_socket (or kms_url \
+                     with kms_ca_cert) for that boot; refusing to start",
+                    pins.root_epoch
+                );
+            };
+            let root = fetch(&pins, transport, &crate::dstack::socket_path()).await?;
+            root_wrap::insert_if_absent(
+                &db,
+                &WrappedRoot {
+                    wrapped: root_wrap::seal(&*wrap_key().await?, &aad, root.as_bytes()),
+                    node_did: pins.expected_did.clone(),
+                    kms_root_epoch: i32::try_from(pins.root_epoch)
+                        .context("keys.legacy.root_epoch does not fit root_wrap")?,
+                },
+            )
+            .await
+            .context("storing the root_wrap blob")?;
+            ::tracing::info!(
+                root_epoch = pins.root_epoch,
+                "sealed the node root into root_wrap"
+            );
+            root_wrap::read(&db)
+                .await
+                .context("reading root_wrap")?
+                .context("root_wrap is empty after the blob was stored")?
+        }
+    };
+    let secret = open_wrapped(&stored, &*wrap_key().await?, &aad, &pins)?;
+    ::tracing::info!(
+        event = "root_wrap_opened",
+        root_epoch = pins.root_epoch,
+        "opened identity root from root_wrap"
+    );
+    // A probe or an in-process caller of `node_root` gets this root.
+    let _ = NODE_ROOT.set(secret.clone());
+    Ok((secret, db))
+}
+
+/// The root sealing key: dstack `GetKey(WRAP_KEY_PATH)`, 32 bytes.
+async fn wrap_key() -> Result<Zeroizing<[u8; 32]>> {
+    let key = Zeroizing::new(
+        crate::dstack::get_key(WRAP_KEY_PATH)
+            .await
+            .context("deriving the root_wrap key with dstack GetKey")?,
+    );
+    Ok(Zeroizing::new(key.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "dstack GetKey({WRAP_KEY_PATH}) returned {} bytes, not 32",
+            key.len()
+        )
+    })?))
+}
+
+/// The node root in a stored `root_wrap` row: the row names the pinned DID
+/// and root epoch, the blob opens under `wrap_key` and `aad`, and the opened
+/// root derives the pinned DID.
+fn open_wrapped(
+    stored: &WrappedRoot,
+    wrap_key: &[u8; 32],
+    aad: &[u8],
+    pins: &Pins,
+) -> Result<StaticSecret> {
+    ensure!(
+        stored.node_did == pins.expected_did,
+        "the root_wrap row is not for keys.legacy.expected_did {}; refusing it",
+        pins.expected_did
+    );
+    ensure!(
+        u32::try_from(stored.kms_root_epoch).ok() == Some(pins.root_epoch),
+        "the root_wrap row is for KMS root epoch {}, not keys.legacy.root_epoch {}; refusing it",
+        stored.kms_root_epoch,
+        pins.root_epoch
+    );
+    let mut root = root_wrap::unseal(wrap_key, aad, &stored.wrapped).map_err(|_| {
+        anyhow!(
+            "the root_wrap blob does not open under this app's wrap key for keys.legacy.app_id \
+             and expected_did (tampered, or sealed by another app or for another identity); \
+             refusing it"
+        )
+    })?;
+    let secret = StaticSecret::new(std::mem::take(&mut *root)).map_err(|mut short| {
+        short.zeroize();
+        anyhow!("the unsealed root is short")
+    })?;
+    ensure!(
+        secret.node_did() == pins.expected_did,
+        "the root unsealed from root_wrap does not derive keys.legacy.expected_did {}; refusing it",
+        pins.expected_did
+    );
+    Ok(secret)
+}
+
 /// The parsed, pinned configuration.
 struct Pins {
-    transport: Transport,
+    /// `None` once the root is sealed in `root_wrap`: nothing to fetch.
+    transport: Option<Transport>,
     root_epoch: u32,
     kms_root: VerifyingKey,
     app_id: [u8; 20],
@@ -110,22 +251,25 @@ impl Pins {
                     socket.starts_with('/'),
                     "keys.legacy.key_recovery_socket must be an absolute path"
                 );
-                Transport::KeyRecovery {
+                Some(Transport::KeyRecovery {
                     socket: socket.clone(),
-                }
+                })
             }
             (None, Some(url), Some(ca)) => {
                 let (host, port) = parse_origin(url)?;
                 let ca = base64::decode(ca.trim())
                     .context("keys.legacy.kms_ca_cert must be standard base64 of the CA's DER")?;
-                Transport::Kms(KmsEndpoint {
+                Some(Transport::Kms(KmsEndpoint {
                     host,
                     port,
                     ca: CertificateDer::from(ca),
-                })
+                }))
             }
+            // Only a boot that finds the root sealed in `root_wrap` can
+            // start without one.
+            (None, None, None) => None,
             _ => bail!(
-                "keys.legacy needs exactly one transport: key_recovery_socket, or kms_url \
+                "keys.legacy takes at most one transport: key_recovery_socket, or kms_url \
                  with kms_ca_cert"
             ),
         };
@@ -171,9 +315,7 @@ fn decode_hex(name: &str, value: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("{name} is not hex"))
 }
 
-async fn fetch(config: &LegacyKmsEpoch, agent_socket: &str) -> Result<StaticSecret> {
-    let pins = Pins::parse(config)?;
-
+async fn fetch(pins: &Pins, transport: &Transport, agent_socket: &str) -> Result<StaticSecret> {
     let info = crate::dstack::get_info()
         .await
         .context("reading the app id from the dstack guest agent")?;
@@ -184,15 +326,15 @@ async fn fetch(config: &LegacyKmsEpoch, agent_socket: &str) -> Result<StaticSecr
         hex::encode(pins.app_id)
     );
 
-    let (secret, transport) = match &pins.transport {
+    let (secret, transport) = match transport {
         Transport::KeyRecovery { socket } => {
             let raw = key_recovery_get(socket, pins.root_epoch).await?;
             let response: RecoveredKey = serde_json::from_slice(&raw)
                 .context("parsing the key-recovery /v0/key response")?;
             drop(raw);
-            (verify_recovered_key(&response, &pins)?, "key-recovery")
+            (verify_recovered_key(&response, pins)?, "key-recovery")
         }
-        Transport::Kms(kms) => (fetch_app_key(&pins, kms, agent_socket).await?, "kms"),
+        Transport::Kms(kms) => (fetch_app_key(pins, kms, agent_socket).await?, "kms"),
     };
     ::tracing::info!(
         root_epoch = pins.root_epoch,
@@ -838,9 +980,9 @@ mod tests {
 
     fn pins(root_epoch: u32, kms: &SigningKey) -> Pins {
         Pins {
-            transport: Transport::KeyRecovery {
+            transport: Some(Transport::KeyRecovery {
                 socket: "/run/key-recovery/kr.sock".into(),
-            },
+            }),
             root_epoch,
             kms_root: *kms.verifying_key(),
             app_id: APP_ID,
@@ -966,6 +1108,61 @@ mod tests {
         assert!(refusal(&response(&kms, Some(0)), &pinned).contains("derives node DID"));
     }
 
+    const WRAP_KEY: [u8; 32] = [0x42; 32];
+
+    /// A `root_wrap` row sealing `root` under `WRAP_KEY` for `app_id` and
+    /// the vector DID.
+    fn wrapped(root: &[u8], app_id: &[u8; 20]) -> WrappedRoot {
+        WrappedRoot {
+            wrapped: root_wrap::seal(&WRAP_KEY, &root_wrap::aad(app_id, VECTOR_DID), root),
+            node_did: VECTOR_DID.into(),
+            kms_root_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn a_wrapped_root_opens_to_the_pinned_identity() {
+        let pins = pins(0, &kms_root(7));
+        let root = legacy_get_key(&APP_ROOT, NODE_KEY_PATH);
+        let aad = root_wrap::aad(&APP_ID, VECTOR_DID);
+        let secret =
+            open_wrapped(&wrapped(root.as_ref(), &APP_ID), &WRAP_KEY, &aad, &pins).unwrap();
+        assert_eq!(secret.as_bytes(), &root[..]);
+        assert_eq!(secret.node_did(), VECTOR_DID);
+    }
+
+    #[test]
+    fn a_wrapped_root_is_refused_unless_every_check_passes() {
+        let pins = pins(0, &kms_root(7));
+        let root = legacy_get_key(&APP_ROOT, NODE_KEY_PATH);
+        let aad = root_wrap::aad(&APP_ID, VECTOR_DID);
+        let good = wrapped(root.as_ref(), &APP_ID);
+        let refusal = |row: &WrappedRoot, key: &[u8; 32]| {
+            let error = open_wrapped(row, key, &aad, &pins).err().expect("refused");
+            format!("{error:#}")
+        };
+
+        let mut tampered = good.clone();
+        tampered.wrapped[20] ^= 1;
+        assert!(refusal(&tampered, &WRAP_KEY).contains("does not open"));
+        assert!(refusal(&good, &[0x43; 32]).contains("does not open"));
+        // Sealed by another app (another AAD).
+        assert!(refusal(&wrapped(root.as_ref(), &[0x36; 20]), &WRAP_KEY).contains("does not open"));
+
+        let mut other_did = good.clone();
+        other_did.node_did = "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi".into();
+        assert!(refusal(&other_did, &WRAP_KEY).contains("not for keys.legacy.expected_did"));
+        let mut other_epoch = good.clone();
+        other_epoch.kms_root_epoch = 1;
+        assert!(refusal(&other_epoch, &WRAP_KEY).contains("root epoch 1"));
+
+        // Authentic for this app and DID, but the root inside derives
+        // another identity.
+        let other_root = legacy_get_key(&[0x02; 32], NODE_KEY_PATH);
+        assert!(refusal(&wrapped(other_root.as_ref(), &APP_ID), &WRAP_KEY)
+            .contains("does not derive keys.legacy.expected_did"));
+    }
+
     #[test]
     fn a_recovered_key_with_a_valid_chain_derives_the_expected_did() {
         let kms = kms_root(7);
@@ -1038,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_transport_must_be_configured() {
+    fn at_most_one_transport_may_be_configured() {
         let kms = kms_root(7);
         let config = |socket: Option<&str>, url: Option<&str>, ca: Option<&str>| LegacyKmsEpoch {
             key_recovery_socket: socket.map(Into::into),
@@ -1056,17 +1253,22 @@ mod tests {
         );
         assert!(matches!(
             Pins::parse(&config(socket, None, None)).unwrap().transport,
-            Transport::KeyRecovery { .. }
+            Some(Transport::KeyRecovery { .. })
         ));
         assert!(matches!(
             Pins::parse(&config(None, url, ca)).unwrap().transport,
-            Transport::Kms(_)
+            Some(Transport::Kms(_))
         ));
+        // Enough to open a sealed root; fetching refuses.
+        assert!(Pins::parse(&config(None, None, None))
+            .unwrap()
+            .transport
+            .is_none());
         for (socket, url, ca) in [
             (socket, url, ca),
             (socket, url, None),
-            (None, None, None),
             (None, url, None),
+            (None, None, ca),
             (Some("kr.sock"), None, None),
         ] {
             assert!(Pins::parse(&config(socket, url, ca)).is_err());

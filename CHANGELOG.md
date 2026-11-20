@@ -50,6 +50,23 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.15] - 2026-11-20
+
+Seals the node's epoch-0 root in its database so later boots stop depending on the KMS serving root epoch 0 or on the `key-recovery` sidecar (TC-3554). Ships on the 1.26.14 sidecar compose, unchanged; the node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
+
+### Upgrade notes
+
+- **One migration,** `m20261120_000000_root_wrap`: a one-row `root_wrap` table. The node also creates it before the identity check, before any other migration.
+- **Release order:** (1) the first 1.26.15 boot on the sidecar compose fetches epoch 0, verifies it and logs `sealed the node root into root_wrap`; (2) a restart, still on the sidecar compose, must log `opened identity root from root_wrap` and no fetch. Only then may the sidecar-free compose (1.26.16) deploy.
+- **Never delete the `root_wrap` row while epoch 0 cannot be fetched**; copy it out first. If the current KMS root changes, the blob stops opening and startup refuses; the runbook is in `docs/tc-3554-kms-epoch-fetch.md`.
+- **No rollback below 1.26.14 on this compose,** as before. Rolling back to 1.26.14 after 1.26.15 has run is a rollback across this migration and is not reviewed.
+
+### Changes
+
+- `keys.type = DstackKmsEpoch`: the node seals the fetched historical root in the database (`root_wrap`, one row; migration `m20261120_000000_root_wrap`) under AES-256-GCM with dstack `GetKey("tinycloud/keys/primary-wrap")` of the current root, bound to the pinned app id and DID. Later boots open it and need no transport (`keys.legacy.key_recovery_socket` / `kms_url` become optional) and never call the sidecar or KMS. Until the opened root's DID matches the pins, the node writes nothing but `root_wrap`. No blob and no transport, a tampered blob, or one that opens to another DID refuses startup. Startup logs `sealed the node root into root_wrap` on the sealing boot and `opened identity root from root_wrap` (`event = "root_wrap_opened"`) whenever it opens the blob. Details: TC-3554.
+- Deploys: before any CVM change, `deploy-phala` validates the exact spliced compose sent to Phala with the guest's docker compose v2.26.0 (sha256-pinned release binary, `config -q`), so a compose the guest's schema refuses (for example long-form `devices`) fails the workflow instead of the boot. The runner-compose check in the deploy step stays. Details: TC-3554.
+- Space purge: `root_wrap` is classified `RETAINED` (this node's own sealed identity root, not user data), so no space or owner purge ever deletes it. Details: TC-3554.
+
 ## [1.26.14] - 2026-11-20
 
 Restores the node after Phala moved its CVM to KMS `dstack-pha-prod2` (TC-3554). The node keeps its root and identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`); no data is re-encrypted.

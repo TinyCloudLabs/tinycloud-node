@@ -33,6 +33,7 @@ pub mod renewal;
 pub mod request_cancel;
 pub mod request_telemetry;
 pub mod resource_review;
+pub mod root_wrap;
 pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;

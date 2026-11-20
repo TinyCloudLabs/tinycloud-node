@@ -677,6 +677,10 @@ Before any CVM mutation the workflow requires:
   profile stay byte-exact;
 - the deployed compose to differ from that template only by
   `deploy_image_digest`;
+- the exact spliced compose sent to Phala to pass `config -q` under the
+  guest's docker compose v2.26.0 (sha256-pinned release binary; placeholders
+  for required `${NAME:?}` inputs), after the image is pinned and before the
+  deploy step;
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
   that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
   An untagged, mislabelled, feature-variant or freshly built image is
@@ -823,6 +827,14 @@ later boots on this compose:** an older binary does not know
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.
+
+From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
+`docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
+`root_wrap` row, so the restored node opens the same root without a fetch.
+A fresh or empty database has no row: on this sidecar compose the first boot
+fetches epoch 0 and seals it again, and on a sidecar-free compose the node
+refuses to start until one boot on the sidecar compose has sealed it. That
+refusal is expected; it is not a fault in the restore.
 
 ### TC-1302 captured pre-N0 rollback
 

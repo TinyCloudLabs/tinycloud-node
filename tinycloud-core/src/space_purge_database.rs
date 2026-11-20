@@ -87,6 +87,7 @@ pub const RETAINED: &[(&str, &str)] = &[
     ("policy_v3_challenge", "policy challenge: removed with its registration by records GC; expires_at-bounded"),
     ("encryption_nonce", "owner-delete replay nonce: expires_at-bounded, names no space"),
     ("renewal_identity", "this node's own renewer identity, not user data"),
+    ("root_wrap", "this node's own sealed identity root, not user data; never purged (TC-3554)"),
     ("renewal_lease", "renewal state of a signed delegation, keyed by delegation CID, not by space"),
     ("space_purge_job", "the purge's own durable progress row: raw space is nulled in the terminal transaction"),
     ("resource_purge_job", "owner resource lifecycle job: its raw target belongs to the resource purge, not a space"),

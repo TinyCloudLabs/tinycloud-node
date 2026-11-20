@@ -1631,8 +1631,9 @@ pub enum Keys {
     #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
     /// The app root of a historical dstack KMS root epoch, fetched from the
-    /// KMS inside the TEE and verified fail-closed (TC-3554,
-    /// docs/tc-3554-kms-epoch-fetch.md). A migration bridge only.
+    /// KMS inside the TEE and verified fail-closed once, then sealed in the
+    /// database's `root_wrap` under a key of the current root (TC-3554,
+    /// docs/tc-3554-kms-epoch-fetch.md).
     #[cfg(feature = "dstack")]
     #[serde(rename = "dstack_kms_epoch", alias = "DstackKmsEpoch")]
     DstackKmsEpoch(DstackKmsEpoch),
@@ -1656,6 +1657,8 @@ pub struct DstackKmsEpoch {
 pub struct LegacyKmsEpoch {
     /// Transport: the dstack-key-recovery sidecar's unix socket. Set this or
     /// `kms_url` + `kms_ca_cert`, never both; there is no runtime fallback.
+    /// Needed only while the database holds no `root_wrap` blob: the boot
+    /// that fetches the root seals it there, and later boots open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_recovery_socket: Option<String>,
     /// Transport: the KMS origin, `https://host[:port]`, fetched over our own

@@ -7,8 +7,9 @@ root used before Phala's 2026-11-20 KMS move), checks them, and derives the lega
 in TypeScript. Both sides follow this document; if the code and this document disagree,
 treat it as a bug.
 
-There are two transports, selected by configuration. Exactly one is configured; neither
-falls back to the other at runtime.
+There are two transports, selected by configuration. At most one is configured; neither
+falls back to the other at runtime. The node needs one only until the fetched root is
+sealed in its database (see [Sealed root](#sealed-root-root_wrap)).
 
 - **A, key-recovery sidecar (the deployed one).** Phala's `dstack-key-recovery` 0.6.5
   runs as a sidecar, talks to the KMS with its own attestation and the launch ticket,
@@ -38,13 +39,69 @@ compose hash attests them.
 | App id | `APP_ID` | hex, 20 bytes |
 | Expected legacy identity | `EXPECTED_DID` | the `did:key` derived from the fetched root (node only; OpenKey uses a canary unseal instead) |
 
-Set `KEY_RECOVERY_SOCKET`, or both `KMS_URL` and `KMS_CA_CERT`; any other combination
-refuses startup before any call.
+Set `KEY_RECOVERY_SOCKET`, or both `KMS_URL` and `KMS_CA_CERT`, or (node, once the root
+is sealed) neither; any other combination refuses startup before any call.
 
 The node selects this source with `TINYCLOUD_KEYS__TYPE=DstackKmsEpoch`. Independently
 of the key source, `TINYCLOUD_KEYS__EXPECTED_NODE_DID` pins the DID the node may serve
-and publish. A mismatch refuses startup before the database is opened, and the
-control plane refuses to report a different identity.
+and publish. A mismatch refuses startup before anything but `root_wrap` is written to
+the database, and the control plane refuses to report a different identity.
+
+## Sealed root (`root_wrap`)
+
+The node fetches the historical root once and keeps it sealed in its own database, so
+later boots depend neither on the transport nor on the KMS still serving that epoch.
+
+- **Table.** `root_wrap(id SMALLINT PRIMARY KEY CHECK (id = 1), wrapped BLOB/BYTEA NOT
+  NULL, node_did TEXT NOT NULL, kms_root_epoch INTEGER NOT NULL, created_at)`: at most one
+  row.
+- **Wrap key.** `K_wrap` = agent `GetKey("tinycloud/keys/primary-wrap")`, from the
+  current KMS root. It never becomes the identity.
+- **Seal.** AES-256-GCM, `wrapped = nonce(12, random) || ciphertext || tag(16)`,
+  `AAD = "tinycloud/root-wrap/v1" || APP_ID(20 raw bytes) || EXPECTED_DID(UTF-8)`.
+  Keys and plaintext are zeroized after use.
+
+Boot, before any migration, `renewal_identity` write or other database write:
+
+1. Parse the pins (no call). Connect the database, `CREATE TABLE IF NOT EXISTS
+   root_wrap`, read the row.
+2. **Row absent.** No transport configured: refuse. Otherwise fetch and verify the root
+   as below (every check, steps 1-10), seal it, `INSERT … ON CONFLICT DO NOTHING`, and
+   re-read the row, so that concurrent first boots agree on one blob. Logs
+   `sealed the node root into root_wrap`.
+3. **Open.** The row's `node_did` must equal `EXPECTED_DID` and its `kms_root_epoch`
+   `ROOT_EPOCH`. Unseal under `K_wrap` and the AAD, and check the root's node DID equals
+   `EXPECTED_DID`. A row present never triggers a fetch, even with a transport
+   configured. Logs `opened identity root from root_wrap` (`event = "root_wrap_opened"`).
+4. `TINYCLOUD_KEYS__EXPECTED_NODE_DID`, then migrations and the rest of startup.
+
+Any failure refuses startup; the node never falls back to fetching again or to the
+current root.
+
+### Release order
+
+With a `root_wrap` release, in this order:
+
+1. **Seal boot**, on the sidecar compose: logs `sealed the node root into root_wrap`.
+2. **Restart that opens from the blob**, still on the sidecar compose: logs
+   `opened identity root from root_wrap` and no `fetched and verified the node root …`
+   (no key-recovery fetch).
+3. **Then** the sidecar-free compose.
+
+### Recovery: the blob no longer opens
+
+`K_wrap` comes from the current KMS root. If that root changes again, the blob stops
+opening and startup refuses. Recovery is an operator action, in this order:
+
+1. Before **any** delete, copy the `root_wrap` row out of the database as a backup and
+   keep it. It is ciphertext, so it is safe to keep.
+2. Confirm that the sidecar (or the KMS) still returns root epoch 0 for this app.
+3. Only then delete the row, and boot once on the sidecar compose so it seals again.
+
+**Never delete the row while epoch 0 cannot be fetched.** The row is then the only
+remaining copy of the root, sealed under a key the node can no longer derive; deleting it
+loses the node identity for good. Open question: how long Phala keeps root epoch 0
+retrievable.
 
 ## Protocol
 
@@ -184,12 +241,15 @@ in `dstack_kms::tests`:
 | Condition | Result |
 |---|---|
 | Agent unreachable or app id mismatch | startup refused |
-| Zero or two transports configured | startup refused before any call |
+| Two transports configured, or a partial KMS transport | startup refused before any call |
+| No `root_wrap` row and no transport | startup refused, nothing written but the empty table |
+| `root_wrap` row for another DID or epoch, tampered, or sealed under another key or AAD | startup refused, no fetch, no fallback |
+| Unsealed root's DID ≠ `EXPECTED_DID` | startup refused before any other database write |
 | Sidecar unreachable or answers non-2xx | startup refused, no fallback |
 | Sidecar `api` ≠ `v0`, `public_key` ≠ pub(`key`), chain not 2 × 65 bytes | startup refused |
 | KMS TLS fails, server leaf not `kms:rpc` | startup refused |
 | KMS answers non-2xx (not authorized for the epoch, unknown app, bad attestation) | startup refused, no fallback |
 | `root_epoch` absent or different; `app_epoch` absent or ≠ 0 | startup refused |
 | Signature malformed, high-S, or not by `KMS_ROOT_PUBKEY` (transport A: for the app key link 0 recovers) | startup refused |
-| Derived DID ≠ `EXPECTED_DID` | startup refused |
-| Served DID ≠ `TINYCLOUD_KEYS__EXPECTED_NODE_DID` (any key source) | startup refused before the database connects |
+| Derived DID ≠ `EXPECTED_DID` | startup refused, nothing sealed |
+| Served DID ≠ `TINYCLOUD_KEYS__EXPECTED_NODE_DID` (any key source) | startup refused before any database write other than `root_wrap` |

@@ -924,30 +924,45 @@ pub async fn app_with_control(
         );
     }
 
-    let key_setup: StaticSecret =
-        match resolve_keys(&tinycloud_config.keys.source, &tinycloud_config.tee).await? {
-            Some(key_setup) => key_setup,
-            None => {
-                // The node's stored identity, generated on its first start. The
-                // control plane only probed it at spawn, so publish what serve
-                // resolved.
-                let identity = key_provider::resolve_identity_state(
-                    Some(&tinycloud_config.keys),
-                    &tinycloud_config.storage.datadir,
-                    IdentityPurpose::Serve,
-                )?;
-                if let Some(control) = control.as_ref() {
-                    control
-                        .set_identity_snapshot(key_provider::identity_snapshot(&identity))
-                        .await;
-                }
-                identity
-                    .secret
-                    .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
+    // TC-3554: a `DstackKmsEpoch` root opens from the database's `root_wrap`
+    // blob, so that source connects the database itself; nothing else
+    // touches it before the identity checks below pass.
+    let (key_setup, early_database): (StaticSecret, Option<RecoveringConnection>) =
+        match &tinycloud_config.keys.source {
+            #[cfg(feature = "dstack")]
+            Keys::DstackKmsEpoch(source) => {
+                let (root, database) = dstack_kms::wrapped_node_root(&source.legacy, || {
+                    connect_database(&tinycloud_config)
+                })
+                .await?;
+                (root, Some(database))
             }
+            keys => match resolve_keys(keys, &tinycloud_config.tee).await? {
+                Some(key_setup) => (key_setup, None),
+                None => {
+                    // The node's stored identity, generated on its first start. The
+                    // control plane only probed it at spawn, so publish what serve
+                    // resolved.
+                    let identity = key_provider::resolve_identity_state(
+                        Some(&tinycloud_config.keys),
+                        &tinycloud_config.storage.datadir,
+                        IdentityPurpose::Serve,
+                    )?;
+                    if let Some(control) = control.as_ref() {
+                        control
+                            .set_identity_snapshot(key_provider::identity_snapshot(&identity))
+                            .await;
+                    }
+                    let key_setup = identity
+                        .secret
+                        .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
+                    (key_setup, None)
+                }
+            },
         };
     // TC-3554: a pinned node DID is checked before anything uses the key or
-    // the database is opened.
+    // writes to the database (other than `root_wrap`), and for every other
+    // key source before the database is opened.
     tinycloud_config
         .keys
         .check_node_did(&key_setup.node_did())?;
@@ -1013,7 +1028,10 @@ pub async fn app_with_control(
         Some(TeeContext::derive_local(&key_setup))
     });
 
-    let database_connection = connect_database(&tinycloud_config).await?;
+    let database_connection = match early_database {
+        Some(database) => database,
+        None => connect_database(&tinycloud_config).await?,
+    };
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
     // wired into SpaceDatabase, then seeded
     // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
@@ -2118,7 +2136,10 @@ pub(crate) async fn resolve_keys(
                 .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
         }
         #[cfg(feature = "dstack")]
-        Keys::DstackKmsEpoch(source) => dstack_kms::node_root(&source.legacy).await.map(Some),
+        Keys::DstackKmsEpoch(_) => anyhow::bail!(
+            "keys.type = DstackKmsEpoch opens its root from the database (root_wrap) at serve; \
+             it has no database-free resolution"
+        ),
         Keys::Auto => {
             // Check TINYCLOUD_TEE_MODE env var first
             match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
