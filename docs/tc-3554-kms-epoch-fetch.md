@@ -83,26 +83,43 @@ current root.
 
 With a `root_wrap` release, in this order:
 
-1. **Seal boot**, on the sidecar compose: logs `sealed the node root into root_wrap`.
-2. **Restart that opens from the blob**, still on the sidecar compose: logs
-   `opened identity root from root_wrap` and no `fetched and verified the node root …`
-   (no key-recovery fetch).
-3. **Then** the sidecar-free compose.
+1. **Seal boot**, on the sidecar compose. The node fetches epoch 0, seals it into
+   `root_wrap`, then reads the row back and opens it in the same boot before it serves,
+   which is the path every later boot takes. A node that serves its expected DID after
+   this boot has sealed and opened the blob.
+2. **Check the row** on a database read: exactly one `root_wrap` row, `node_did` equal to
+   `EXPECTED_DID`, `kms_root_epoch` 0, `created_at` after the seal boot. Never select
+   `wrapped`. Keep an operator-only export of the row (see Recovery).
+3. **Then** the sidecar-free compose. Serving the same DID on it proves the node opens
+   from the blob with no transport.
+
+A separate restart on the sidecar compose is not needed, and on production it cannot be
+observed: the `seal` and `opened identity root from root_wrap` lines are INFO and are not
+shipped.
 
 ### Recovery: the blob no longer opens
 
 `K_wrap` comes from the current KMS root. If that root changes again, the blob stops
-opening and startup refuses. Recovery is an operator action, in this order:
+opening and startup refuses. A rollback to an older `root_wrap` release does not help:
+with a row present, every such release opens from the blob and refuses the same way.
+Recovery is an operator action, in this order:
 
-1. Before **any** delete, copy the `root_wrap` row out of the database as a backup and
-   keep it. It is ciphertext, so it is safe to keep.
-2. Confirm that the sidecar (or the KMS) still returns root epoch 0 for this app.
-3. Only then delete the row, and boot once on the sidecar compose so it seals again.
+1. **Export** the `root_wrap` row (all columns, `wrapped` as hex) to operator-only
+   storage and record its sha256, checked against a second read. It is ciphertext, so it
+   is safe to keep; never put it in an issue or a repository.
+2. **Delete** the row (one transaction, exactly `id = 1` and the exported hash).
+3. **Boot once on the sidecar compose.** Once the production compose is sidecar-free,
+   that takes a release that restores the sidecar compose and its reviewed N0 template.
+   The node fetches epoch 0 and seals a new row with the same DID.
+4. If that boot refuses because epoch 0 cannot be fetched, **re-insert the exported row
+   byte-exact**. The database is then as it was before step 2, but the node is still
+   down: the blob still does not open. Only the KMS serving root epoch 0 again, or an
+   owner-held escrow of the root, brings it back.
 
-**Never delete the row while epoch 0 cannot be fetched.** The row is then the only
-remaining copy of the root, sealed under a key the node can no longer derive; deleting it
-loses the node identity for good. Open question: how long Phala keeps root epoch 0
-retrievable.
+The delete is reversible only while the export exists: never delete without it. If the
+KMS no longer serves epoch 0, the exported row is the only remaining copy of the root,
+sealed under a key the node can no longer derive. Open question: how long Phala keeps
+root epoch 0 retrievable.
 
 ## Protocol
 
