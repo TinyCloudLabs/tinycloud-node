@@ -815,6 +815,12 @@ mod tests {
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__APP_ID", "350d124c"),
             EnvGuard::set("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", did),
             EnvGuard::set("TINYCLOUD_KEYS__EXPECTED_NODE_DID", did),
+            EnvGuard::set(
+                "TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__FROM_RENEWER_DID",
+                "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi",
+            ),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__FROM_EPOCH", "2"),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__TO_RENEWER_DID", did),
         ];
         let config = legacy_config_figment().extract::<config::Config>().unwrap();
         assert_eq!(
@@ -829,6 +835,12 @@ mod tests {
                         kms_root_pubkey: "02ab".into(),
                         app_id: "350d124c".into(),
                         expected_did: did.into(),
+                        renewal_reset: Some(config::RenewalReset {
+                            from_renewer_did:
+                                "did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi".into(),
+                            from_epoch: 2,
+                            to_renewer_did: did.into(),
+                        }),
                     },
                 }),
                 expected_node_did: Some(did.into()),

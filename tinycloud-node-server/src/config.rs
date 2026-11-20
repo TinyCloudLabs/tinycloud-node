@@ -1677,6 +1677,25 @@ pub struct LegacyKmsEpoch {
     pub app_id: String,
     /// The node DID the fetched root must derive.
     pub expected_did: String,
+    /// TC-3554 one-shot repair of the persisted renewer identity; see
+    /// [`RenewalReset`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_reset: Option<RenewalReset>,
+}
+
+/// After the identity checks and migrations, before the node initializes
+/// its renewer identity: if `renewal_identity` holds exactly
+/// `from_renewer_did` at `from_epoch`, it becomes `to_renewer_did` at epoch
+/// 1, in one transaction. `to_renewer_did` must be the renewer of the root
+/// being served. Any other stored state is left alone (and startup handles
+/// it as usual). Pinned in the attested compose
+/// (`TINYCLOUD_KEYS__LEGACY__RENEWAL_RESET__*`).
+#[cfg(feature = "dstack")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct RenewalReset {
+    pub from_renewer_did: String,
+    pub from_epoch: u64,
+    pub to_renewer_did: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]

@@ -30,7 +30,7 @@ use sha3::Keccak256;
 use tinycloud_core::{
     keys::StaticSecret,
     root_wrap::{self, WrappedRoot},
-    sea_orm::ConnectionTrait,
+    sea_orm::{ConnectionTrait, TransactionTrait},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -38,7 +38,7 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::LegacyKmsEpoch;
+use crate::config::{LegacyKmsEpoch, RenewalReset};
 
 /// The guest agent path production's node root comes from.
 const NODE_KEY_PATH: &[u8] = b"tinycloud/keys/primary";
@@ -199,6 +199,29 @@ fn open_wrapped(
         pins.expected_did
     );
     Ok(secret)
+}
+
+/// The pinned one-shot renewer identity reset (TC-3554, [`RenewalReset`]):
+/// after the identity checks and migrations, before the node initializes
+/// its renewer identity from `root`.
+pub async fn reset_renewal_identity<C: TransactionTrait + ConnectionTrait>(
+    db: &C,
+    root: &StaticSecret,
+    reset: &RenewalReset,
+) -> Result<()> {
+    ensure!(
+        reset.to_renewer_did == tinycloud_core::renewal::renewal_identity(root).0,
+        "keys.legacy.renewal_reset.to_renewer_did is not this node's renewer; refusing to start"
+    );
+    let applied = tinycloud_core::renewal::reset_renewal_identity(
+        db,
+        (&reset.from_renewer_did, reset.from_epoch),
+        (&reset.to_renewer_did, 1),
+    )
+    .await
+    .context("resetting renewal_identity")?;
+    ::tracing::info!(applied, "keys.legacy.renewal_reset checked");
+    Ok(())
 }
 
 /// The parsed, pinned configuration.
@@ -1236,6 +1259,7 @@ mod tests {
             kms_root_pubkey: hex::encode(kms.verifying_key().to_encoded_point(true).as_bytes()),
             app_id: hex::encode(APP_ID),
             expected_did: VECTOR_DID.into(),
+            renewal_reset: None,
         };
         let (socket, url, ca) = (
             Some("/run/key-recovery/kr.sock"),

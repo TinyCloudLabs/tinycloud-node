@@ -1062,6 +1062,14 @@ pub async fn app_with_control(
     // history current, then runs the CID-alias backfill with the column key
     // before any request is served.
     tinycloud_core::db::migrate(&database_connection).await?;
+    // TC-3554: before `new_with_encryption` initializes the renewer identity,
+    // which would move a mismatched one to a new epoch.
+    #[cfg(feature = "dstack")]
+    if let Keys::DstackKmsEpoch(source) = &tinycloud_config.keys.source {
+        if let Some(reset) = &source.legacy.renewal_reset {
+            dstack_kms::reset_renewal_identity(&database_connection, &key_setup, reset).await?;
+        }
+    }
     let lifecycle = space_lifecycle_runtime(&tinycloud_config, &seed_conn).await?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
     let block_store: BlockStores = match &tinycloud_config.storage.blocks {

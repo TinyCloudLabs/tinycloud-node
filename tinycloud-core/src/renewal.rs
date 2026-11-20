@@ -499,6 +499,42 @@ pub async fn initialize_renewal_identity<C: TransactionTrait + ConnectionTrait>(
     Ok((current_did, epoch, public_key))
 }
 
+/// TC-3554 one-shot repair: move the persisted renewer identity from exactly
+/// `from` (DID, epoch) to `to`, in one transaction. Any other stored state
+/// is left alone, so [`initialize_renewal_identity`] then treats it as
+/// usual. Returns whether the row changed.
+pub async fn reset_renewal_identity<C: TransactionTrait + ConnectionTrait>(
+    conn: &C,
+    from: (&str, u64),
+    to: (&str, u64),
+) -> Result<bool, RenewalStoreError> {
+    let epoch = |epoch: u64| {
+        i64::try_from(epoch)
+            .ok()
+            .filter(|epoch| *epoch > 0)
+            .ok_or(RenewalStoreError::InvalidInput)
+    };
+    let (from_epoch, to_epoch) = (epoch(from.1)?, epoch(to.1)?);
+    let tx = crate::db::begin_write_transaction(conn, None).await?;
+    let changed = tx
+        .execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            "UPDATE renewal_identity SET renewer_did = $1, epoch = $2 \
+             WHERE id = 1 AND renewer_did = $3 AND epoch = $4",
+            [
+                Value::String(Some(Box::new(to.0.to_owned()))),
+                Value::BigInt(Some(to_epoch)),
+                Value::String(Some(Box::new(from.0.to_owned()))),
+                Value::BigInt(Some(from_epoch)),
+            ],
+        ))
+        .await?
+        .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(changed)
+}
+
 pub async fn current_renewal_identity<C: ConnectionTrait>(
     db: &C,
     secret: &StaticSecret,
@@ -1811,6 +1847,71 @@ mod tests {
                 .1,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn renewer_identity_reset_moves_only_the_exact_from_state() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("CREATE TABLE epoch (seq BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE renewal_identity (id INTEGER PRIMARY KEY, renewer_did TEXT, epoch BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        let (restored_seed, rotated_seed) = ([1; 32], [2; 32]);
+        let restored = renewal_identity_from_seed(restored_seed).0;
+        initialize_renewal_identity(&db, restored_seed)
+            .await
+            .unwrap();
+        // The rotation bumped the epoch to 2 under another renewer.
+        let (rotated, rotated_epoch, _) = initialize_renewal_identity(&db, rotated_seed)
+            .await
+            .unwrap();
+        assert_eq!(rotated_epoch, 2);
+
+        // Any other from-state: untouched.
+        for from in [
+            (restored.as_str(), 2),
+            (rotated.as_str(), 1),
+            (rotated.as_str(), 3),
+        ] {
+            assert!(!reset_renewal_identity(&db, from, (&restored, 1))
+                .await
+                .unwrap());
+        }
+        assert!(matches!(
+            current_renewal_identity_from_seed(&db, restored_seed).await,
+            Err(RenewalStoreError::IdentityEpoch)
+        ));
+
+        assert!(reset_renewal_identity(&db, (&rotated, 2), (&restored, 1))
+            .await
+            .unwrap());
+        // One-shot: the from-state is gone.
+        assert!(!reset_renewal_identity(&db, (&rotated, 2), (&restored, 1))
+            .await
+            .unwrap());
+        assert_eq!(
+            current_renewal_identity_from_seed(&db, restored_seed)
+                .await
+                .unwrap()
+                .1,
+            1
+        );
+        // Startup then keeps epoch 1 for the restored renewer.
+        assert_eq!(
+            initialize_renewal_identity(&db, restored_seed)
+                .await
+                .unwrap()
+                .1,
+            1
+        );
+        assert!(matches!(
+            reset_renewal_identity(&db, (&rotated, 0), (&restored, 1)).await,
+            Err(RenewalStoreError::InvalidInput)
+        ));
     }
 
     #[test]
