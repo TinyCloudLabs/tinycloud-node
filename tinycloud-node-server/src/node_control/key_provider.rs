@@ -290,6 +290,17 @@ pub fn backup_identity(
     passphrase: &[u8],
     output: Option<PathBuf>,
 ) -> Result<BackupResult> {
+    #[cfg(feature = "dstack")]
+    if let Some(KeysConfig {
+        source: Keys::DstackKmsEpoch(_),
+        ..
+    }) = keys
+    {
+        bail!(
+            "refusing to back up a DstackKmsEpoch identity: it is a migration bridge on an \
+             exposed KMS root epoch; re-key the node instead of exporting it"
+        );
+    }
     let state = resolve_identity_state(keys, data_root, IdentityPurpose::Backup)?;
     let secret = state
         .secret
@@ -1256,6 +1267,40 @@ mod tests {
             let state = resolve_identity_state(Some(&keys(&did)), temp.path(), purpose).unwrap();
             assert_eq!(state.node_did.as_deref(), Some(did.as_str()));
         }
+    }
+
+    /// TC-3554: the epoch-0 bridge identity is never exported, and the refusal
+    /// comes before any KMS fetch.
+    #[cfg(feature = "dstack")]
+    #[::core::prelude::v1::test]
+    fn a_kms_epoch_identity_is_never_backed_up() {
+        let temp = tempdir().unwrap();
+        let keys: crate::config::KeysConfig = json::from_value(serde_json::json!({
+            "type": "dstack_kms_epoch",
+            "legacy": {
+                "kms_url": "https://127.0.0.1:1",
+                "root_epoch": 0,
+                "kms_root_pubkey": "unreachable",
+                "kms_ca_cert": "unreachable",
+                "app_id": "35".repeat(20),
+                "expected_did": "did:key:z6Mki14g4VZeY9fra5wUt8m5DmYkmAfWDtUKecu65Kd1uWU9",
+            },
+        }))
+        .unwrap();
+        let output = temp.path().join("backup.json");
+        let err = backup_identity(
+            Some(&keys),
+            temp.path(),
+            b"correct horse battery staple",
+            Some(output.clone()),
+        )
+        .expect_err("a DstackKmsEpoch identity is refused for backup");
+        assert!(
+            err.to_string()
+                .contains("refusing to back up a DstackKmsEpoch identity"),
+            "{err:#}"
+        );
+        assert!(!output.exists());
     }
 
     #[::core::prelude::v1::test]
