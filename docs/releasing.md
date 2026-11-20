@@ -824,12 +824,13 @@ later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.
 
-The node's root lives in the database (`root_wrap`, TC-3554,
+From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
 `docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
-`root_wrap` row, so the restored node opens the same root on this compose.
-A fresh or empty database has no row, and the node refuses to start on this
-compose until one boot on the sidecar compose seals it. That refusal is
-expected; it is not a fault in the restore.
+`root_wrap` row, so the restored node opens the same root without a fetch.
+A fresh or empty database has no row: on this sidecar compose the first boot
+fetches epoch 0 and seals it again, and on a sidecar-free compose the node
+refuses to start until one boot on the sidecar compose has sealed it. That
+refusal is expected; it is not a fault in the restore.
 
 ### TC-1302 captured pre-N0 rollback
 
