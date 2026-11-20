@@ -30,7 +30,20 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
     environment:
-      TINYCLOUD_KEYS_TYPE: Dstack
+      # TC-3554: the node identity is the KMS root epoch 0 app root, a
+      # migration bridge (docs/tc-3554-kms-epoch-fetch.md). It opens from the
+      # database's root_wrap blob; this compose has no sidecar and no
+      # transport, so it refuses to boot until a blob exists. DEPLOY ONLY
+      # AFTER A BLOB EXISTS IN PROD (sealed by a boot of the sidecar compose).
+      # Every pin is a literal so the compose hash attests it. The UNSET_
+      # value waits on Phala (P2: epoch-0 root key); it is not hex, so the
+      # node refuses to boot until the real value replaces it here.
+      TINYCLOUD_KEYS__TYPE: DstackKmsEpoch
+      TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH: "0"
+      TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY: UNSET_TC3554_P2_EPOCH0_KMS_ROOT_PUBKEY
+      TINYCLOUD_KEYS__LEGACY__APP_ID: 350d124c81d53a57e8899e9f85a904918e663b61
+      TINYCLOUD_KEYS__LEGACY__EXPECTED_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
+      TINYCLOUD_KEYS__EXPECTED_NODE_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
       TINYCLOUD_STORAGE_DATABASE: "${DATABASE_URL}"
       TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
       TINYCLOUD_STORAGE_BLOCKS_BUCKET: "${S3_BUCKET}"
