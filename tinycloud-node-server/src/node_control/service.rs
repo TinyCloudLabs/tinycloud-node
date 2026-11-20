@@ -198,7 +198,7 @@ fn identity_source_warnings(paths: &ProfilePaths, control_config: Option<&Value>
         None => {
             let file_static = effective_config(paths)
                 .ok()
-                .map(|config| matches!(config.keys, crate::config::Keys::Static(_)))
+                .map(|config| matches!(config.keys.source, crate::config::Keys::Static(_)))
                 .unwrap_or(false);
             let env_static = std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some();
             file_static || env_static
@@ -1770,7 +1770,7 @@ mod tests {
 
     fn create_provider_identity(paths: &ProfilePaths) -> bool {
         match key_provider::resolve_identity_state(
-            Some(&crate::config::Keys::Provider),
+            Some(&crate::config::Keys::Provider.into()),
             &paths.data_root,
             key_provider::IdentityPurpose::Serve,
         ) {
@@ -2338,7 +2338,7 @@ esac
             .unwrap()
             .extract::<crate::config::Config>()
             .unwrap();
-        assert_eq!(config.keys, crate::config::Keys::Provider);
+        assert_eq!(config.keys.source, crate::config::Keys::Provider);
     }
 
     #[::core::prelude::v1::test]
