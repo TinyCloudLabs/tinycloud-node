@@ -827,6 +827,13 @@ later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.
 
+The node's root lives in the database (`root_wrap`, TC-3554,
+`docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
+`root_wrap` row, so the restored node opens the same root on this compose.
+A fresh or empty database has no row, and the node refuses to start on this
+compose until one boot on the sidecar compose seals it. That refusal is
+expected; it is not a fault in the restore.
+
 ### TC-1302 captured pre-N0 rollback
 
 This is a compose rollback, not merely a node digest selection. The source
