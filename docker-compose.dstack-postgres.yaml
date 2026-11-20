@@ -30,7 +30,18 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
     environment:
-      TINYCLOUD_KEYS_TYPE: Dstack
+      # TC-3554 K1 — DO NOT MERGE. Boots on the pre-move KMS root epoch 0 as a
+      # migration bridge (docs/tc-3554-kms-epoch-fetch.md). The two `${…:?}`
+      # values wait on Phala (P2: epoch-0 root key, KMS RPC CA); replace them
+      # with literals before any deploy so the compose hash attests them.
+      TINYCLOUD_KEYS__TYPE: DstackKmsEpoch
+      TINYCLOUD_KEYS__LEGACY__KMS_URL: https://kms.dstack-pha-prod2.phala.network
+      TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH: "0"
+      TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY: "${LEGACY_KMS_ROOT_PUBKEY:?TC-3554 P2: epoch-0 KMS root k256 pubkey, literal}"
+      TINYCLOUD_KEYS__LEGACY__KMS_CA_CERT: "${LEGACY_KMS_CA_CERT:?TC-3554 P2: KMS RPC CA DER base64, literal}"
+      TINYCLOUD_KEYS__LEGACY__APP_ID: 350d124c81d53a57e8899e9f85a904918e663b61
+      TINYCLOUD_KEYS__LEGACY__EXPECTED_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
+      TINYCLOUD_KEYS__EXPECTED_NODE_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
       TINYCLOUD_STORAGE_DATABASE: "${DATABASE_URL}"
       TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
       TINYCLOUD_STORAGE_BLOCKS_BUCKET: "${S3_BUCKET}"
