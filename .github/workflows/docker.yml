@@ -109,8 +109,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: tinycloudlabs/tinycloud-node
   # Production dstack OS the tinycloud-node CVM must run (the Phala KMS only releases app keys to this image).
-  PHALA_OS_IMAGE: dstack-0.5.12
-  PHALA_OS_IMAGE_HASH: 8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
+  # TC-3554: Phala moved the CVM to dstack-0.5.15 with the KMS move; deploying 0.5.12 would be a downgrade.
+  # Hash from Phala /os-images (name dstack-0.5.15); re-read it before this merges.
+  PHALA_OS_IMAGE: dstack-0.5.15
+  PHALA_OS_IMAGE_HASH: 4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca
 
 jobs:
   rollback-audit:
@@ -595,7 +597,7 @@ jobs:
 
       # Fail closed before any production change unless the CVM runs the pinned production OS, or the one pinned dev OS
       # in scripts/ci/phala-dev-os-allowlist.txt after a fresh integrity check (scripts/ci/phala-os-guard.sh).
-      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`.
+      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15`.
       - name: Require a permitted OS image on the CVM
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}

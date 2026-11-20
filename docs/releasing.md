@@ -63,7 +63,7 @@ The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
 deploy, unless the `tinycloud-node` CVM reports one of:
 
 - the production image: `.os.is_dev == false` with the name and hash pinned in
-  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`); or
+  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.15`); or
 - a dev image whose `.os.os_image_hash` is listed in
   `scripts/ci/phala-dev-os-allowlist.txt` (today only `dstack-dev-0.5.12`), and
   that passes a fresh check in the same job: `download.dstack.org` serves
@@ -77,7 +77,7 @@ CI never changes the OS. If the check fails, set it by hand, then re-run:
 
 ```sh
 phala cvms get tinycloud-node --json | jq .os
-phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12
+phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15
 ```
 
 `phala deploy --image/--no-dev-os` is ignored for an existing CVM; the PATCH is
