@@ -50,6 +50,22 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
+## [1.26.16] - 2026-11-20
+
+Drops the `key-recovery` sidecar from the production compose (TC-3554). The node opens its epoch-0 root from the `root_wrap` blob that 1.26.15 sealed; it keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`). No code change from 1.26.15.
+
+### Upgrade notes
+
+- **Deploy only after both:** 1.26.15's first boot on the sidecar compose logged `sealed the node root into root_wrap`, and a restart, still on the sidecar compose, logged `opened identity root from root_wrap` and no fetch. With no blob this compose has no transport and the node refuses to start.
+- **No database migration.**
+- **No rollback below 1.26.15 on this compose:** 1.26.14 needs the sidecar and refuses to start. Rolling back to 1.26.15 is fine (same code). Going back to the sidecar compose is a compose rollback (1.26.15's N0 template `70c71aa0…`).
+- A fresh or empty database refuses to start on this compose until one boot on the sidecar compose seals it.
+
+### Changes
+
+- Production compose: the `key-recovery` service, its volume, `depends_on` and `TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET` are removed; the epoch-0 pins stay as literals. Details: TC-3554.
+- Deploys: the reviewed N0 compose template hash is `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7` (raw `272f43b8…`); the tc959 fixture and mount check follow. Details: TC-3554.
+
 ## [1.26.15] - 2026-11-20
 
 Seals the node's epoch-0 root in its database so later boots stop depending on the KMS serving root epoch 0 or on the `key-recovery` sidecar (TC-3554). Ships on the 1.26.14 sidecar compose, unchanged; the node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
