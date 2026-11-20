@@ -15,9 +15,17 @@ values and PASS/FAIL; the root secret is never written anywhere.
 base64 without padding (the TINYCLOUD_KEYS_SECRET form), for piping straight
 into the sealing step. Never redirect it to a file on a shared host.
 
+--from-app-root (TC-3554): instead of a bundle, read a dstack app root key
+(the KMS AppKeyResponse.k256_key, 64 hex chars) from stdin and derive the node
+root the way the guest agent's v0 GetKey does (dstack guest-api-v0.md:140-150):
+HKDF-SHA256(salt=b"RATLS", IKM=k256_key, info=b"tinycloud/keys/primary", L=32).
+The node uses those 32 bytes directly as its root (lib.rs Keys::Dstack).
+
 Usage:
   decode_bundle.py BUNDLE --passphrase-file F --node-keys URL_OR_FILE
   decode_bundle.py BUNDLE --passphrase-file F --emit-secret
+  decode_bundle.py --from-app-root --node-keys URL_OR_FILE   < app-root-hex
+  decode_bundle.py --from-app-root --emit-secret             < app-root-hex
 The passphrase file may be /dev/stdin. Needs: python3, cryptography, blake3.
 """
 import argparse
@@ -31,6 +39,8 @@ import urllib.request
 from blake3 import blake3
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 AAD = b"tinycloud-node/key-backup/v1"
@@ -108,6 +118,13 @@ def derived_public_identity(root: bytes) -> dict:
     }
 
 
+def root_from_app_root(app_root: bytes, path: bytes = b"tinycloud/keys/primary") -> bytes:
+    """dstack v0 GetKey: HKDF-SHA256(salt "RATLS", IKM app root k256 key, info path)."""
+    if len(app_root) != 32:
+        raise ValueError(f"app root key must be 32 bytes, got {len(app_root)}")
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"RATLS", info=path).derive(app_root)
+
+
 def load_node_keys(source: str) -> dict:
     if source.startswith("https://") or source.startswith("http://"):
         with urllib.request.urlopen(source, timeout=20) as resp:
@@ -118,22 +135,35 @@ def load_node_keys(source: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("bundle")
-    ap.add_argument("--passphrase-file", required=True)
+    ap.add_argument("bundle", nargs="?")
+    ap.add_argument("--passphrase-file")
+    ap.add_argument("--from-app-root", action="store_true",
+                    help="read a dstack app root key (64 hex) from stdin instead of a bundle")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--node-keys", help="URL or file of /.well-known/tinycloud/node-keys")
     mode.add_argument("--emit-secret", action="store_true")
     args = ap.parse_args()
 
-    with open(args.bundle) as f:
-        bundle = json.load(f)
-    with open(args.passphrase_file, "rb") as f:
-        passphrase = f.read().rstrip(b"\r\n")
-    if not passphrase:
-        sys.exit("passphrase is empty")
-    root = decrypt_bundle(bundle, passphrase)
-    print(f"bundle: backend {bundle['backend']} nodeDid {bundle['nodeDid']} root_len {len(root)}",
-          file=sys.stderr)
+    bundle = None
+    if args.from_app_root:
+        if args.bundle or args.passphrase_file:
+            ap.error("--from-app-root takes no bundle or passphrase file")
+        app_root = bytes.fromhex(sys.stdin.read().strip())
+        root = root_from_app_root(app_root)
+        del app_root
+        print(f"app root: root_len {len(root)}", file=sys.stderr)
+    else:
+        if not args.bundle or not args.passphrase_file:
+            ap.error("a bundle and --passphrase-file are required without --from-app-root")
+        with open(args.bundle) as f:
+            bundle = json.load(f)
+        with open(args.passphrase_file, "rb") as f:
+            passphrase = f.read().rstrip(b"\r\n")
+        if not passphrase:
+            sys.exit("passphrase is empty")
+        root = decrypt_bundle(bundle, passphrase)
+        print(f"bundle: backend {bundle['backend']} nodeDid {bundle['nodeDid']} root_len {len(root)}",
+              file=sys.stderr)
 
     if args.emit_secret:
         sys.stdout.write(b64u_encode(root))
@@ -141,12 +171,13 @@ def main() -> None:
 
     derived = derived_public_identity(root)
     expected = load_node_keys(args.node_keys)
-    ok = derived["nodeDid"] == bundle["nodeDid"]
+    ok = bundle is None or derived["nodeDid"] == bundle["nodeDid"]
     for field, value in derived.items():
         match = expected.get(field) == value
         ok = ok and match
         print(f"{field}: {'match' if match else 'MISMATCH'} {value}")
-    print("PASS: bundle restores the published node identity" if ok else "FAIL")
+    source = "app root" if bundle is None else "bundle"
+    print(f"PASS: {source} restores the published node identity" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
 
