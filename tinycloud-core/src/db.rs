@@ -370,6 +370,9 @@ pub struct KvInvokeOptions {
     pub max_response_bytes: Option<u64>,
     pub list_limit: Option<usize>,
     pub list_cursor: Option<Path>,
+    /// Whether a `kv/list` also returns each key's size and modified time
+    /// (`x-tinycloud-list-entries: true`, TC-2492).
+    pub list_entries: bool,
     /// Parameters of a `tinycloud.kv/sync` request (TC-732). `None` reads the
     /// first page at the default limit.
     pub kv_sync: Option<crate::kv_sync::KvSyncRequest>,
@@ -3333,6 +3336,7 @@ where
                         .ok_or(TxStoreError::MissingInput)?;
 
                     let value = stage.hash();
+                    let size = stage.written() as i64;
 
                     stages.insert((space.clone(), path.clone()), stage);
                     write_hashes.insert((space.clone(), path.clone()), value);
@@ -3343,6 +3347,7 @@ where
                         metadata,
                         value,
                         generation: 0,
+                        size,
                     });
                 }
                 // add delete for tx
@@ -3897,9 +3902,15 @@ where
                         .expect("staged KV writes have a content hash");
                     results.push(PendingOutcome::Done(InvocationOutcome::KvWrite(hash)));
                 }
-                (space, "kv", "tinycloud.kv/metadata", path) => results.push(PendingOutcome::Done(
-                    InvocationOutcome::KvMetadata(metadata_with_hash(tx, space, path).await?),
-                )),
+                // A write's invocation always has more than one capability, so
+                // a head here is part of a batch and gets no details (TC-2492).
+                (space, "kv", "tinycloud.kv/metadata", path) => {
+                    results.push(PendingOutcome::Done(InvocationOutcome::KvMetadata(
+                        metadata_with_hash(tx, space, path)
+                            .await?
+                            .map(|(metadata, hash)| (metadata, hash, KvValueDetails::default())),
+                    )))
+                }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
@@ -3954,7 +3965,12 @@ where
                         options.list_cursor.as_ref(),
                     )
                     .await?;
-                    InvocationOutcome::KvList(list, truncated, None)
+                    // A list in a write's invocation (which `/invoke` refuses)
+                    // reports no size or write time (TC-2492).
+                    let details = options
+                        .list_entries
+                        .then(|| vec![KvValueDetails::default(); list.len()]);
+                    InvocationOutcome::KvList(list, truncated, None, details)
                 }
                 PendingOutcome::CapabilitiesRead(space) => {
                     self.capabilities_outcome::<S>(&space, invoker, caps_read_params)
@@ -4178,6 +4194,9 @@ where
             })
             .collect::<Vec<_>>();
         let mut kv_lookup = KvReadLookup::fetch(&self.conn, &caps).await;
+        // A batch head has no per-key headers, so only a lone head pays for
+        // its value's details (TC-2492).
+        let lone_capability = caps.len() == 1;
         // TC-3217: a batch read looks every row up before reading any value,
         // so its state names exactly the rows it answers from.
         let mut batch_rows = None;
@@ -4243,16 +4262,60 @@ where
                         options.list_cursor.as_ref(),
                     )
                     .await?;
-                    results.push(InvocationOutcome::KvList(list, truncated, None));
+                    let details = if options.list_entries {
+                        let visible = kv_details_visible(
+                            &self.conn,
+                            &invocation.0,
+                            &auth_graph,
+                            now,
+                            space,
+                            &list,
+                        )
+                        .await?;
+                        let mut details = if visible.contains(&true) {
+                            kv_list_details(&self.conn, space, &list).await?
+                        } else {
+                            vec![KvValueDetails::default(); list.len()]
+                        };
+                        for (details, visible) in details.iter_mut().zip(visible) {
+                            if !visible {
+                                *details = KvValueDetails::default();
+                            }
+                        }
+                        Some(details)
+                    } else {
+                        None
+                    };
+                    results.push(InvocationOutcome::KvList(list, truncated, None, details));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     let row = match batch_rows.as_mut() {
                         Some((rows, _)) => rows.next().flatten(),
                         None => kv_lookup.entity(&self.conn, space, path).await?,
                     };
-                    results.push(InvocationOutcome::KvMetadata(
-                        row.map(|entry| (entry.metadata, entry.value)),
-                    ));
+                    let visible = match row {
+                        Some(_) if lone_capability => kv_details_visible(
+                            &self.conn,
+                            &invocation.0,
+                            &auth_graph,
+                            now,
+                            space,
+                            std::slice::from_ref(path),
+                        )
+                        .await?
+                        .contains(&true),
+                        _ => false,
+                    };
+                    let metadata = match row {
+                        Some(entry) if visible => Some(
+                            kv_metadata_details(&self.conn, &self.storage, space, entry).await?,
+                        ),
+                        Some(entry) => {
+                            Some((entry.metadata, entry.value, KvValueDetails::default()))
+                        }
+                        None => None,
+                    };
+                    results.push(InvocationOutcome::KvMetadata(metadata));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
@@ -4696,11 +4759,13 @@ enum PendingOutcome<R> {
 
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
-    KvList(Vec<Path>, bool, Option<String>),
+    /// A page of keys; with `x-tinycloud-list-entries`, also each key's
+    /// details, in the same order (TC-2492).
+    KvList(Vec<Path>, bool, Option<String>, Option<Vec<KvValueDetails>>),
     /// One page of the `tinycloud.kv/sync` change feed (TC-732).
     KvSync(Box<crate::kv_sync::KvSyncPage>),
     KvDelete(Option<Hash>),
-    KvMetadata(Option<(Metadata, Hash)>),
+    KvMetadata(Option<(Metadata, Hash, KvValueDetails)>),
     KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
     /// A batch of `kv/get` or `kv/metadata` answers, in request order, with
@@ -4739,6 +4804,17 @@ pub struct KvBatchReadValue {
     pub metadata: Metadata,
     pub hash: Hash,
     pub data: Option<Vec<u8>>,
+}
+
+/// What the node reports about a live KV value besides its metadata
+/// (TC-2492).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvValueDetails {
+    /// The stored value's size in bytes, when known.
+    pub size: Option<u64>,
+    /// When the current value was written: the issue time of the invocation
+    /// that wrote it, by the node's clock.
+    pub modified: Option<OffsetDateTime>,
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
@@ -5887,6 +5963,148 @@ async fn read_kv_entity<B: ImmutableReadStore>(
         None => return Ok(None),
     };
     Ok(Some((e.metadata, content_hash, c)))
+}
+
+/// A live row's metadata with the value's size and modified time (TC-2492).
+/// A row written before sizes were recorded reports the stored object's
+/// length only when the store can probe it without reading the object; a
+/// probe that fails leaves the size unknown rather than failing the head.
+async fn kv_metadata_details<C: ConnectionTrait, B: ImmutableReadStore>(
+    db: &C,
+    store: &B,
+    space_id: &SpaceId,
+    entry: current_kv::Model,
+) -> Result<(Metadata, Hash, KvValueDetails), DbErr> {
+    let size = match entry.size {
+        Some(size) => u64::try_from(size).ok(),
+        None => match store.size(space_id, &entry.value, entry.generation).await {
+            Ok(size) => size,
+            Err(error) => {
+                tracing::warn!(%error, "kv head size probe failed; size omitted");
+                None
+            }
+        },
+    };
+    let modified = invocation_issued_at(db, &[entry.invocation])
+        .await?
+        .remove(&entry.invocation);
+    Ok((
+        entry.metadata,
+        entry.value,
+        KvValueDetails { size, modified },
+    ))
+}
+
+/// The issue times of the invocations `ids`, by id; an id with no row is
+/// absent.
+async fn invocation_issued_at<C: ConnectionTrait>(
+    db: &C,
+    ids: &[Hash],
+) -> Result<HashMap<Hash, OffsetDateTime>, DbErr> {
+    let mut issued = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(KV_LOOKUP_CHUNK) {
+        let rows: Vec<(Hash, OffsetDateTime)> = invocation::Entity::find()
+            .select_only()
+            .column(invocation::Column::Id)
+            .column(invocation::Column::IssuedAt)
+            .filter(invocation::Column::Id.is_in(chunk.iter().copied()))
+            .into_tuple()
+            .all(db)
+            .await?;
+        issued.extend(rows);
+    }
+    Ok(issued)
+}
+
+/// Each listed key's size and modified time, in `paths` order (TC-2492). A
+/// row written before sizes were recorded has no size here, and a key whose
+/// row is gone by now has neither.
+async fn kv_list_details<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    paths: &[Path],
+) -> Result<Vec<KvValueDetails>, DbErr> {
+    let rows = if db.get_database_backend() == DbBackend::MySql {
+        // As in `KvReadLookup`: MySQL collations can't match rows back to
+        // keys by string, so look each key up on its own.
+        let mut rows = HashMap::with_capacity(paths.len());
+        for path in paths {
+            if let Some(row) = get_kv_entity(db, space_id, path).await? {
+                rows.insert(path.as_str().to_owned(), row);
+            }
+        }
+        rows
+    } else {
+        get_kv_entities(db, space_id, &paths.iter().collect::<Vec<_>>()).await?
+    };
+    let invocations = rows
+        .values()
+        .map(|row| row.invocation)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let issued = invocation_issued_at(db, &invocations).await?;
+    Ok(paths
+        .iter()
+        .map(|path| match rows.get(path.as_str()) {
+            Some(row) => KvValueDetails {
+                size: row.size.and_then(|size| u64::try_from(size).ok()),
+                modified: issued.get(&row.invocation).copied(),
+            },
+            None => KvValueDetails::default(),
+        })
+        .collect())
+}
+
+/// Whether the invoker may see each of `paths`' size and write time
+/// (TC-2492): only as the space's owner, or holding an unexpired, unrevoked
+/// `tinycloud.kv/get` that covers that key through the delegations the
+/// invocation cites. Checked per key against `graph`, the snapshot the
+/// invocation was authorized on, by the rules `/invoke` authorizes with: a
+/// `kv/list` or `kv/metadata` grant alone reveals neither.
+async fn kv_details_visible<C: ConnectionTrait>(
+    db: &C,
+    invocation: &crate::util::InvocationInfo,
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    now: OffsetDateTime,
+    space: &SpaceId,
+    paths: &[Path],
+) -> Result<Vec<bool>, DbErr> {
+    let ability: crate::types::Ability = "tinycloud.kv/get"
+        .to_string()
+        .try_into()
+        .expect("tinycloud.kv/get is a valid ability");
+    let service: tinycloud_auth::resource::Service = "kv".parse().expect("kv is a valid service");
+    let mut visible = Vec::with_capacity(paths.len());
+    for path in paths {
+        let capability = crate::util::Capability {
+            resource: Resource::TinyCloud(space.clone().to_resource(
+                service.clone(),
+                Some(path.clone()),
+                None,
+                None,
+            )),
+            ability: ability.clone(),
+            caveats: Default::default(),
+        };
+        visible.push(
+            match invocation::authorize_holder_with_graph(
+                db,
+                &invocation.invoker,
+                std::slice::from_ref(&capability),
+                &invocation.parents,
+                now,
+                graph,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(invocation::Error::Db(error)) => return Err(error),
+                Err(invocation::Error::InvalidInvocation(_)) => false,
+            },
+        );
+    }
+    Ok(visible)
 }
 
 async fn get_kv_entity<C: ConnectionTrait>(
@@ -7053,6 +7271,7 @@ mod test {
             value: crate::hash::hash(b"a1"),
             generation: 0,
             metadata: Metadata(Default::default()),
+            size: None,
             deleted: false,
         };
         let get = "tinycloud.kv/get";
@@ -7103,6 +7322,243 @@ mod test {
     async fn basic() {
         let _db = get_db().await.unwrap();
     }
+
+    /// TC-2492: a put records its value's size, and head and list report it
+    /// with the writing invocation's issue time. A row from before sizes were
+    /// recorded reports the stored length on head only through a cheap store
+    /// probe, and no size in a list.
+    async fn assert_kv_value_details(
+        db: &SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>,
+        name: &str,
+    ) {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let space = test_space_id(name);
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let path: Path = "docs/report.txt".parse().unwrap();
+        let value = b"twenty-one bytes long";
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(value).await.unwrap();
+        db.invoke_internal_kv_put::<MemoryStaging>(
+            space.clone(),
+            path.clone(),
+            Metadata(Default::default()),
+            stage,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+
+        let row = get_kv_entity(&db.conn, &space, &path)
+            .await
+            .unwrap()
+            .expect("the put is live");
+        assert_eq!(
+            row.size,
+            Some(value.len() as i64),
+            "the put records its size"
+        );
+        let issued_at = invocation::Entity::find_by_id(row.invocation)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("the writing invocation is stored")
+            .issued_at;
+        let recorded = KvValueDetails {
+            size: Some(value.len() as u64),
+            modified: Some(issued_at),
+        };
+        let missing: Path = "docs/missing.txt".parse().unwrap();
+
+        let (_, _, details) = kv_metadata_details(&db.conn, &db.storage, &space, row)
+            .await
+            .unwrap();
+        assert_eq!(details, recorded);
+        assert_eq!(
+            kv_list_details(&db.conn, &space, &[path.clone(), missing.clone()])
+                .await
+                .unwrap(),
+            vec![recorded.clone(), KvValueDetails::default()]
+        );
+
+        // A row written before sizes were recorded.
+        current_kv::Entity::update_many()
+            .col_expr(current_kv::Column::Size, Expr::value(Option::<i64>::None))
+            .filter(current_kv::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        let legacy = get_kv_entity(&db.conn, &space, &path)
+            .await
+            .unwrap()
+            .expect("the put is live");
+        assert_eq!(legacy.size, None);
+        let (_, _, details) = kv_metadata_details(&db.conn, &db.storage, &space, legacy.clone())
+            .await
+            .unwrap();
+        assert_eq!(details, recorded, "head probes the stored length");
+        let unknown_size = KvValueDetails {
+            size: None,
+            modified: Some(issued_at),
+        };
+        for probe_fails in [false, true] {
+            let store = UnreadableStore { probe_fails };
+            let (_, _, details) = kv_metadata_details(&db.conn, &store, &space, legacy.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                details, unknown_size,
+                "without a working cheap probe (failing: {probe_fails}), head reports no size \
+                 and reads nothing"
+            );
+        }
+        assert_eq!(
+            kv_list_details(&db.conn, &space, &[path, missing])
+                .await
+                .unwrap(),
+            vec![unknown_size, KvValueDetails::default()],
+            "list reports no size rather than probing each value"
+        );
+    }
+
+    /// A store whose object reads fail the test. Its size probe finds
+    /// nothing, or fails when `probe_fails`.
+    struct UnreadableStore {
+        probe_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ImmutableReadStore for UnreadableStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<bool, Self::Error> {
+            panic!("a head must not touch the stored object")
+        }
+        async fn read(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+            panic!("a head must not read the stored object")
+        }
+        async fn size(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+        ) -> Result<Option<u64>, Self::Error> {
+            if self.probe_fails {
+                Err(std::io::Error::other("probe refused"))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn read_range(
+            &self,
+            _space: &SpaceId,
+            _hash: &Hash,
+            _generation: i64,
+            _range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            panic!("a head must not read the stored object")
+        }
+    }
+
+    /// TC-2492: the recorded size is the count of stored bytes, whatever
+    /// length the writer declares, and a list's details come from the listed
+    /// space only.
+    #[tokio::test]
+    async fn kv_value_size_is_the_stored_byte_count_and_stays_in_its_space() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+
+        let db = get_db().await.unwrap();
+        let mine = test_space_id("size-mine");
+        let theirs = test_space_id("size-theirs");
+        for space in [&mine, &theirs] {
+            space::ActiveModel {
+                id: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        let path: Path = "docs/report.txt".parse().unwrap();
+        for (space, value, declared) in [
+            (&mine, &b"twenty-one bytes long"[..], "999"),
+            (&theirs, &b"x"[..], "1"),
+        ] {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(value).await.unwrap();
+            db.invoke_internal_kv_put::<MemoryStaging>(
+                space.clone(),
+                path.clone(),
+                Metadata(std::collections::BTreeMap::from([(
+                    "content-length".to_string(),
+                    declared.to_string(),
+                )])),
+                stage,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+        }
+        let row = get_kv_entity(&db.conn, &mine, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.size, Some(21), "size is the stored byte count");
+        for (space, size) in [(&mine, 21), (&theirs, 1)] {
+            let details = kv_list_details(&db.conn, space, std::slice::from_ref(&path))
+                .await
+                .unwrap();
+            assert_eq!(
+                details[0].size,
+                Some(size),
+                "details come from the listed space"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_kv_value_details_report_size_and_modified_time() {
+        let db = get_db().await.unwrap();
+        assert_kv_value_details(&db, "sqlite-kv-value-details").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kv_value_details_report_size_and_modified_time() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_value_details_report_size_and_modified_time",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = SpaceDatabase::new(
+            schema.conn.clone(),
+            MemoryStore::default(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_kv_value_details(&db, "pg-kv-value-details").await;
+    }
+
     #[tokio::test]
     async fn renewal_identity_is_rejected_by_generic_authorization() {
         let secret = StaticSecret::new([0u8; 32].to_vec()).unwrap();
@@ -8253,7 +8709,7 @@ mod test {
                     assert_eq!(body, b"seeded");
                     read = true;
                 }
-                InvocationOutcome::KvList(keys, false, _) => {
+                InvocationOutcome::KvList(keys, false, _, _) => {
                     let keys = keys.iter().map(Path::as_str).collect::<Vec<_>>();
                     assert!(keys.contains(&"docs/a"), "its own write: {keys:?}");
                     assert!(keys.contains(&"docs/b"), "{keys:?}");
@@ -9369,6 +9825,7 @@ mod test {
                 value: crate::hash::hash(b"shared-value"),
                 generation: 0,
                 metadata: Metadata(std::collections::BTreeMap::new()),
+                size: None,
             };
             kv_write::ActiveModel::from(write.clone())
                 .insert(conn)
@@ -9938,6 +10395,7 @@ mod test {
                 value: Set(crate::hash::hash(format!("value-{seq}").as_bytes())),
                 generation: Set(0),
                 metadata: Set(Metadata(std::collections::BTreeMap::new())),
+                size: Set(None),
             });
         }
         for chunk in writes.chunks(50) {

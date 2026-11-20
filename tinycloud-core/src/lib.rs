@@ -47,8 +47,8 @@ pub mod write_hooks;
 pub use admission::{AdmissionError, AdmittedInput, AdmittedInvocation};
 pub use db::{
     kv_mixes_writes_and_reads, kv_mutation_keys, Commit, DelegationStatus, InvocationOutcome,
-    KvBatchReadItem, KvBatchReadValue, KvInvokeOptions, KvPrecondition, SpaceDatabase,
-    TransactResult, TxError, TxStoreError,
+    KvBatchReadItem, KvBatchReadValue, KvInvokeOptions, KvPrecondition, KvValueDetails,
+    SpaceDatabase, TransactResult, TxError, TxStoreError,
 };
 pub use db_pool::RecoveringConnection;
 pub use encryption::{ColumnEncryption, RowBinding};

@@ -45,6 +45,7 @@ pub mod m20261111_000000_delegation_renewals;
 pub mod m20261112_000000_renewal_identity;
 
 pub mod m20261113_000000_database_artifact_external;
+pub mod m20261114_000000_kv_value_size;
 
 pub mod m20261113_010000_artifact_chunks;
 pub mod m20261117_000000_hook_subscription_headers;
@@ -97,6 +98,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261112_000000_renewal_identity::Migration),
             Box::new(m20261113_000000_database_artifact_external::Migration),
             Box::new(m20261113_010000_artifact_chunks::Migration),
+            Box::new(m20261114_000000_kv_value_size::Migration),
             Box::new(m20261117_000000_hook_subscription_headers::Migration),
             Box::new(m20261117_000000_renewal_switch::Migration),
             Box::new(m20261112_000000_space_purge::Migration),

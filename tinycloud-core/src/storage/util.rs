@@ -13,6 +13,7 @@ pub struct HashBuffer<B> {
     #[pin]
     buffer: B,
     hasher: Blake3Hasher,
+    written: u64,
 }
 
 impl<B> HashBuffer<B> {
@@ -25,6 +26,10 @@ impl<B> HashBuffer<B> {
     pub fn hash(&mut self) -> Hash {
         self.hasher.finalize()
     }
+    /// The number of bytes written through this buffer.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
 }
 
 impl<B> HashBuffer<B> {
@@ -32,6 +37,7 @@ impl<B> HashBuffer<B> {
         Self {
             buffer,
             hasher: Blake3Hasher::new(),
+            written: 0,
         }
     }
 }
@@ -49,6 +55,7 @@ where
         match p.buffer.poll_write(cx, buf) {
             Poll::Ready(Ok(written)) => {
                 p.hasher.update(&buf[..written]);
+                *p.written += written as u64;
                 Poll::Ready(Ok(written))
             }
             result => result,

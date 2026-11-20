@@ -729,6 +729,7 @@ async fn postgres_current_value_keeps_expired_invocation_proof_until_its_last_li
         epoch: Set(hash(b"epoch")),
         epoch_seq: Set(1),
         value: Set(hash(b"live bytes")),
+        size: Set(None),
         generation: Set(0),
         metadata: Set(tinycloud_core::types::Metadata(BTreeMap::new())),
         deleted: Set(false),
