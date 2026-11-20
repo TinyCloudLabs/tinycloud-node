@@ -26,21 +26,24 @@ services:
         cache-disabled: "true"
     ports:
       - "8000:8000"
+    depends_on:
+      - key-recovery
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
+      - key-recovery:/run/key-recovery
     environment:
       # TC-3554 K1 — DO NOT MERGE. Boots on the pre-move KMS root epoch 0 as a
-      # migration bridge (docs/tc-3554-kms-epoch-fetch.md). Every pin is a
-      # literal so the compose hash attests it. The two UNSET_ values wait on
-      # Phala (P2: epoch-0 root key, KMS RPC CA); they are neither hex nor
-      # base64, so the node refuses to boot (before any agent or KMS call)
-      # until the real values replace them here.
+      # migration bridge (docs/tc-3554-kms-epoch-fetch.md), fetched through
+      # the key-recovery sidecar below and verified by the node against these
+      # pins. Every pin is a literal so the compose hash attests it. The
+      # UNSET_ value waits on Phala (P2: epoch-0 root key); it is not hex, so
+      # the node refuses to boot (before any agent or sidecar call) until the
+      # real value replaces it here.
       TINYCLOUD_KEYS__TYPE: DstackKmsEpoch
-      TINYCLOUD_KEYS__LEGACY__KMS_URL: https://kms.dstack-pha-prod2.phala.network
+      TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET: /run/key-recovery/kr.sock
       TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH: "0"
       TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY: UNSET_TC3554_P2_EPOCH0_KMS_ROOT_PUBKEY
-      TINYCLOUD_KEYS__LEGACY__KMS_CA_CERT: UNSET_TC3554_P2_KMS_RPC_CA_DER_BASE64
       TINYCLOUD_KEYS__LEGACY__APP_ID: 350d124c81d53a57e8899e9f85a904918e663b61
       TINYCLOUD_KEYS__LEGACY__EXPECTED_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
       TINYCLOUD_KEYS__EXPECTED_NODE_DID: did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi
@@ -118,6 +121,39 @@ services:
       TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH: /var/lib/tinycloud/ledger/deletions.jsonl
       ROCKET_ADDRESS: "0.0.0.0"
       ROCKET_MAX_BLOCKING: "1024"
+
+  # TC-3554 — DO NOT MERGE; removed in the next compose. Phala's
+  # dstack-key-recovery (0.6.5, cosign-verified digest) fetches the epoch-0
+  # key from the KMS and serves it on a unix socket. No ports and no TCP
+  # listener; the socket lives on a volume only this service and tinycloud
+  # mount. Runs as uid 0 (TDX device, host-shared files) with primary gid
+  # 1000, so its 0660 socket is group-owned by the node's tinycloud group.
+  # From host-shared it sees only .appkeys.json and .sys-config.json (launch
+  # ticket, vm_config), never the decrypted env. Its `key` answers are not
+  # logged anywhere (serve mode prints only the listen line; logging off).
+  key-recovery:
+    image: ghcr.io/dstack-tee/dstack-key-recovery@sha256:26803eb7eb34f69f367d7ebc0b4abc31f35caad5e58213de77a91dddcd2d0b6b
+    restart: unless-stopped
+    user: "0:1000"
+    command: ["serve", "--no-addr", "--socket", "/run/key-recovery/kr.sock"]
+    # The quote goes through the host's vsock QGS; Docker's default seccomp
+    # profile blocks AF_VSOCK.
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      DSTACK_CCEL_FILE: /ccel.bin
+    volumes:
+      - key-recovery:/run/key-recovery
+      - /dstack/.host-shared/.appkeys.json:/dstack/.host-shared/.appkeys.json:ro
+      - /dstack/.host-shared/.sys-config.json:/dstack/.host-shared/.sys-config.json:ro
+      - /run/log/dstack:/run/log/dstack:ro
+      - /sys/firmware/acpi/tables/data/CCEL:/ccel.bin:ro
+      - /etc/tdx-attest.conf:/etc/tdx-attest.conf:ro
+    devices:
+      - /dev/tdx_guest:/dev/tdx_guest
+      - /dev/vsock:/dev/vsock
+    logging:
+      driver: none
 
   dstack-ingress:
     image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744
@@ -206,6 +242,7 @@ services:
 volumes:
   cert-data:
   deletion-ledger:
+  key-recovery:
 
 networks:
   logship:
