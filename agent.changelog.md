@@ -5,9 +5,9 @@ Track changes to agent-facing development guidance for TinyCloud Node. Add a con
 
 ## 2026-11-20
 
-- CI: Docker Container and Release cancel superseded PR runs. Non-PR events
-  use unique concurrency groups, preserving every main, tag, release and manual
-  run, including pending runs.
+- CI: Docker Container and Release cancel superseded PR runs. All PR workflows
+  that also handle non-PR events now isolate those events by run ID, preserving
+  pending as well as running main, tag, release and manual runs.
 
 ## 2026-10-17
 
