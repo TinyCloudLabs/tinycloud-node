@@ -11,7 +11,8 @@ There are two transports, selected by configuration. At most one is configured; 
 falls back to the other at runtime. The node needs one only until the fetched root is
 sealed in its database (see [Sealed root](#sealed-root-root_wrap)).
 
-- **A, key-recovery sidecar (the deployed one).** Phala's `dstack-key-recovery` 0.6.5
+- **A, key-recovery sidecar (1.26.14's compose; with `root_wrap`, only for the sealing
+  boot).** Phala's `dstack-key-recovery` 0.6.5
   runs as a sidecar, talks to the KMS with its own attestation and the launch ticket,
   and serves the derived key and its signature chain on a unix socket. The sidecar does
   not check the KMS root signature and pins no root, so every check below still runs in
