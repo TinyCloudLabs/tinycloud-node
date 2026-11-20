@@ -57,7 +57,7 @@ Restores the node after Phala moved its CVM to KMS `dstack-pha-prod2` (TC-3554).
 ### Upgrade notes
 
 - **No database migration.**
-- **Before the first boot, with the node stopped,** `renewal_identity` must read `(did:key:z6MkgWpiYdQV8pAr3dtHLdQsoZR3wF5wsS7fpkzAuX6q1PZj, 1)`. The 04:42Z boot on the moved root bumped it; the reviewed, pinned reset puts it back. Without it the restored node bumps the epoch again and every existing renewal lease stops renewing.
+- **Before the first boot, with the node stopped,** `renewal_identity` must read the original renewer `did:key:z6MkgWpiYdQV8pAr3dtHLdQsoZR3wF5wsS7fpkzAuX6q1PZj` at the epoch its live renewal leases carry. A boot on the moved root that reached startup would have replaced the DID and bumped the epoch, orphaning every existing lease; if one did, the reviewed, pinned reset puts the row back. (On 2026-11-20 the row still held the original DID, so the 04:42Z boots had not written it.)
 - The CVM runs `dstack-dev-0.5.15`; the deploy guard now allows it and the deploy no longer asks Phala for an OS image.
 - **No rollback below 1.26.14 on this compose.** An older binary does not know `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` and refuses to start; without the epoch-0 fetch it could only derive keys from the moved root, which is a different identity.
 
