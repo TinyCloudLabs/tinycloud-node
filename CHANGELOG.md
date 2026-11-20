@@ -58,7 +58,7 @@ Restores the key-recovery sidecar so a node whose root_wrap blob no longer opens
 
 - **No database migration.**
 - The production compose, its tc959 fixture and mount check, and the reviewed N0 template (`70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`) are back to 1.26.15's. With a blob that opens, the node still opens it and never calls the sidecar.
-- **Recovery order:** export and keep a copy of the root_wrap row; delete it; deploy 1.26.17 so the node re-seals from epoch 0; if epoch 0 is not fetchable, re-insert the exported row byte-exact (the delete is reversible).
+- **Recovery order:** export and keep a copy of the `root_wrap` row (its ciphertext; store it ops-only); delete the row; deploy 1.26.17 so the first boot fetches epoch 0 through the sidecar and re-seals; if that boot refuses because epoch 0 cannot be fetched, re-insert the exported row byte-exact. The delete is reversible; never delete without the export.
 
 ### Changes
 
