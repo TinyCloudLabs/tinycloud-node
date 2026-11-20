@@ -65,6 +65,7 @@ Seals the node's epoch-0 root in its database so later boots stop depending on t
 
 - `keys.type = DstackKmsEpoch`: the node seals the fetched historical root in the database (`root_wrap`, one row; migration `m20261120_000000_root_wrap`) under AES-256-GCM with dstack `GetKey("tinycloud/keys/primary-wrap")` of the current root, bound to the pinned app id and DID. Later boots open it and need no transport (`keys.legacy.key_recovery_socket` / `kms_url` become optional) and never call the sidecar or KMS. Until the opened root's DID matches the pins, the node writes nothing but `root_wrap`. No blob and no transport, a tampered blob, or one that opens to another DID refuses startup. Startup logs `sealed the node root into root_wrap` on the sealing boot and `opened identity root from root_wrap` (`event = "root_wrap_opened"`) whenever it opens the blob. Details: TC-3554.
 - Deploys: before any CVM change, `deploy-phala` validates the exact spliced compose sent to Phala with the guest's docker compose v2.26.0 (sha256-pinned release binary, `config -q`), so a compose the guest's schema refuses (for example long-form `devices`) fails the workflow instead of the boot. The runner-compose check in the deploy step stays. Details: TC-3554.
+- Space purge: `root_wrap` is classified `RETAINED` (this node's own sealed identity root, not user data), so no space or owner purge ever deletes it. Details: TC-3554.
 
 ## [1.26.14] - 2026-11-20
 
