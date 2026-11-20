@@ -6999,6 +6999,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser 0.16.0",
  "yasna",
 ]
 
@@ -9959,7 +9960,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.26.13"
+version = "1.26.14"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9979,6 +9980,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "hkdf",
  "hmac 0.12.1",
  "hyper 0.14.32",
  "if-addrs",
@@ -10041,6 +10043,7 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -11397,6 +11400,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry 0.7.1",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

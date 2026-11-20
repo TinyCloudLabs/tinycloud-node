@@ -76,7 +76,7 @@ pub enum LinkListenerState {
 
 pub fn enable(
     data_root: &Path,
-    keys: Option<&crate::config::Keys>,
+    keys: Option<&crate::config::KeysConfig>,
     args: EnableArgs,
 ) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
@@ -139,7 +139,10 @@ pub fn enable(
     build_status(&paths, &link_state, Some(&issuance))
 }
 
-pub fn disable(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
+pub fn disable(
+    data_root: &Path,
+    keys: Option<&crate::config::KeysConfig>,
+) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
     let _lock = StateLock::acquire(&paths)?;
     let Some(mut link_state) = state::read_state(&paths)? else {
@@ -217,7 +220,10 @@ pub fn status(data_root: &Path) -> Result<LinkStatusReport> {
     build_status(&paths, &link_state, None)
 }
 
-pub fn renew(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
+pub fn renew(
+    data_root: &Path,
+    keys: Option<&crate::config::KeysConfig>,
+) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
     let _lock = StateLock::acquire(&paths)?;
     let mut link_state = state::read_state(&paths)?

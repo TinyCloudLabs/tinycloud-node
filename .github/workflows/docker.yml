@@ -109,8 +109,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: tinycloudlabs/tinycloud-node
   # Production dstack OS the tinycloud-node CVM must run (the Phala KMS only releases app keys to this image).
-  PHALA_OS_IMAGE: dstack-0.5.12
-  PHALA_OS_IMAGE_HASH: 8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
+  # TC-3554: Phala's KMS move put its CVMs on dstack 0.5.15 (prod and dev classes); 0.5.12 would be a downgrade.
+  # Hash from Phala /os-images (name dstack-0.5.15). The node CVM itself runs dstack-dev-0.5.15 (allowlist).
+  PHALA_OS_IMAGE: dstack-0.5.15
+  PHALA_OS_IMAGE_HASH: 4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca
 
 jobs:
   rollback-audit:
@@ -595,7 +597,7 @@ jobs:
 
       # Fail closed before any production change unless the CVM runs the pinned production OS, or the one pinned dev OS
       # in scripts/ci/phala-dev-os-allowlist.txt after a fresh integrity check (scripts/ci/phala-os-guard.sh).
-      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`.
+      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15`.
       - name: Require a permitted OS image on the CVM
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
@@ -765,10 +767,11 @@ jobs:
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
           # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes, the TC-2917
-          # storage-headroom event in the Vector config and the TC-1491 artifact read limit env line
-          # (raw d6af7a70…; 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
+          # storage-headroom event in the Vector config, the TC-1491 artifact read limit env line and the TC-3554
+          # key-recovery sidecar + DstackKmsEpoch epoch-0 pins (raw 8e602959…; 417719648a0c… / d6af7a70… before
+          # TC-3554, 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = '417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da'
+          n0_template_hash = '70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -1205,8 +1208,10 @@ jobs:
           # The CLI/SDK can include request details in errors. Never forward
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
+          # No --image/--no-dev-os: the CVM keeps its OS class (TC-3554: it runs
+          # dstack-dev-0.5.15); the guards before and after check the OS.
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
-          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --no-dev-os --image "${PHALA_OS_IMAGE}" --wait >/dev/null 2>&1; then
+          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"
             exit 1
           fi

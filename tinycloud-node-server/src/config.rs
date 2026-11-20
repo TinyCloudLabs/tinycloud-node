@@ -47,7 +47,7 @@ pub struct Config {
     pub prometheus: Prometheus,
     pub cors: bool,
     #[serde(default)]
-    pub keys: Keys,
+    pub keys: KeysConfig,
     #[serde(default)]
     pub tee: TeeConfig,
     #[serde(default)]
@@ -1586,6 +1586,42 @@ impl SqlStoreConfig {
     }
 }
 
+/// `[keys]`: where the node identity comes from, plus an optional pin on the
+/// DID that identity must have.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct KeysConfig {
+    #[serde(flatten)]
+    pub source: Keys,
+    /// `keys.expected_node_did` (`TINYCLOUD_KEYS__EXPECTED_NODE_DID`): when
+    /// set, the node refuses to start, and the control plane refuses to
+    /// report an identity, unless the resolved node DID equals this value.
+    /// Applies to every key source (TC-3554).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_node_did: Option<String>,
+}
+
+impl From<Keys> for KeysConfig {
+    fn from(source: Keys) -> Self {
+        Self {
+            source,
+            expected_node_did: None,
+        }
+    }
+}
+
+impl KeysConfig {
+    /// Refuse a node DID other than the pinned one, if a pin is configured.
+    pub fn check_node_did(&self, node_did: &str) -> anyhow::Result<()> {
+        match &self.expected_node_did {
+            Some(expected) if expected != node_did => anyhow::bail!(
+                "node identity {node_did} is not the pinned keys.expected_node_did {expected}; \
+                 refusing to use it"
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
@@ -1594,11 +1630,50 @@ pub enum Keys {
     #[cfg(feature = "dstack")]
     #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
+    /// The app root of a historical dstack KMS root epoch, fetched from the
+    /// KMS inside the TEE and verified fail-closed (TC-3554,
+    /// docs/tc-3554-kms-epoch-fetch.md). A migration bridge only.
+    #[cfg(feature = "dstack")]
+    #[serde(rename = "dstack_kms_epoch", alias = "DstackKmsEpoch")]
+    DstackKmsEpoch(DstackKmsEpoch),
     #[default]
     #[serde(rename = "auto", alias = "Auto")]
     Auto,
     #[serde(rename = "provider", alias = "Provider")]
     Provider,
+}
+
+/// `keys.type = "DstackKmsEpoch"`; every value is public and pinned in the
+/// attested compose (`TINYCLOUD_KEYS__LEGACY__*`).
+#[cfg(feature = "dstack")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct DstackKmsEpoch {
+    pub legacy: LegacyKmsEpoch,
+}
+
+#[cfg(feature = "dstack")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct LegacyKmsEpoch {
+    /// Transport: the dstack-key-recovery sidecar's unix socket. Set this or
+    /// `kms_url` + `kms_ca_cert`, never both; there is no runtime fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_recovery_socket: Option<String>,
+    /// Transport: the KMS origin, `https://host[:port]`, fetched over our own
+    /// RA-TLS client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_url: Option<String>,
+    /// The KMS RPC CA certificate, standard base64 of its DER. The only TLS
+    /// trust anchor for `kms_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_ca_cert: Option<String>,
+    /// The KMS root epoch to fetch; the response must carry exactly this.
+    pub root_epoch: u32,
+    /// That epoch's KMS root secp256k1 key, SEC1 compressed, hex.
+    pub kms_root_pubkey: String,
+    /// This app's 20-byte dstack app id, hex.
+    pub app_id: String,
+    /// The node DID the fetched root must derive.
+    pub expected_did: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]

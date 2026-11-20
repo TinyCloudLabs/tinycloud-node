@@ -1,7 +1,7 @@
 [package]
 name = "tinycloud-node"
 build = "build.rs"
-version = "1.26.13"
+version = "1.26.14"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
@@ -72,6 +72,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# TC-3554 historical KMS epoch fetch (src/dstack_kms.rs), `dstack` builds only.
+hkdf = { version = "0.12", optional = true }
+k256 = { version = "0.13.4", features = ["ecdsa"], optional = true }
+sha3 = { version = "0.10", optional = true }
+x509-parser = { version = "0.16", features = ["verify"], optional = true }
+zeroize = { version = "1", optional = true }
 rsa = "0.9"
 if-addrs = "0.13"
 tracing = "0.1"
@@ -144,7 +150,9 @@ tinycloud-sdk-wasm = { path = "../tinycloud-sdk-wasm" }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 pem = "3"
-x509-parser = "0.16"
+# `verify`: the stand-in KMS in tests/kms_epoch_identity.rs checks that the
+# RA-TLS client certificate is signed by its temp CA (TC-3554).
+x509-parser = { version = "0.16", features = ["verify"] }
 
 [features]
 renewal-test-clock = ["tinycloud-core/renewal-test-clock"]
@@ -153,7 +161,14 @@ default = ["jemalloc"]
 # above). A no-op on targets where the dependency isn't in the graph (e.g.
 # macOS dev hosts, glibc Linux).
 jemalloc = ["dep:tikv-jemallocator"]
-dstack = []
+dstack = [
+    "dep:hkdf",
+    "dep:k256",
+    "dep:sha3",
+    "dep:x509-parser",
+    "dep:zeroize",
+    "rcgen/x509-parser",
+]
 duckdb = ["tinycloud-core/duckdb"]
 tc-bench-v1 = []
 # Enables only the hermetic mounted fixture's placeholder trust identities.
