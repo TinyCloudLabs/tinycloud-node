@@ -32,6 +32,7 @@ enum Command {
     /// Preview classification and collisions on a copied data directory.
     DryRun,
     /// Inspect schema and row counts from a local snapshot, including artifact bytes.
+    /// The tool holds no at-rest keys, so an artifact sealed at rest is refused.
     OfflineFingerprint {
         /// Explicitly attest that this database is a local snapshot or copy.
         #[arg(long)]
@@ -179,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
             migration::validate_inventory(&items)?;
         }
         Command::OfflineFingerprint { .. } => {
-            let items = migration::offline_inventory(&conn, &args.datadir).await?;
+            let items = migration::offline_inventory(&conn, &args.datadir, None).await?;
             println!("{}", serde_json::to_string_pretty(&items)?);
         }
         Command::Fence { state } => {

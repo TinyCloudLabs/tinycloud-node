@@ -376,3 +376,86 @@ impl<R: AsyncRead + Unpin> AsyncRead for DecryptReader<R> {
         r
     }
 }
+
+/// Push-style counterpart of [`DecryptReader`], for callers that receive the
+/// ciphertext in slices they do not choose (SQL artifacts arrive in
+/// `substr` slices). Holds at most one segment. Like the reader, it only
+/// hands out a segment after it authenticates, and fails for good on the
+/// first error.
+pub struct SegmentOpener {
+    cipher: SegmentCipher,
+    plaintext_len: u64,
+    next: u64,
+    segments: u64,
+    seg: Vec<u8>,
+    /// `seg` holds a segment already handed out; the next push starts anew.
+    emitted: bool,
+    failed: bool,
+}
+
+impl SegmentOpener {
+    /// The bytes pushed next start just after `header`.
+    pub fn new(
+        key: &DataKey,
+        id: &BlobIdentity<'_>,
+        header: &Header,
+    ) -> Result<Self, EnvelopeError> {
+        if header.dek_id() != key.id() {
+            return Err(EnvelopeError::KeyMismatch);
+        }
+        Ok(Self {
+            cipher: SegmentCipher::new(key, id, header),
+            plaintext_len: header.plaintext_len(),
+            next: 0,
+            segments: header.segment_count(),
+            seg: Vec::with_capacity(SEGMENT_LEN + TAG_LEN),
+            emitted: false,
+            failed: false,
+        })
+    }
+
+    /// Takes bytes from the front of `input` until a segment is complete and
+    /// returns its authenticated plaintext, or `None` once `input` is used up
+    /// with the segment still incomplete. Call again while it returns
+    /// `Some`. Bytes after the last segment are an integrity failure.
+    pub fn push(&mut self, input: &mut &[u8]) -> Result<Option<&[u8]>, EnvelopeError> {
+        if self.failed {
+            return Err(EnvelopeError::Integrity);
+        }
+        if self.emitted {
+            self.seg.clear();
+            self.emitted = false;
+        }
+        if self.next == self.segments {
+            if input.is_empty() {
+                return Ok(None);
+            }
+            self.failed = true;
+            return Err(EnvelopeError::Integrity);
+        }
+        let len = segment_plain_len(self.plaintext_len, self.next);
+        let take = (len + TAG_LEN - self.seg.len()).min(input.len());
+        self.seg.extend_from_slice(&input[..take]);
+        *input = &input[take..];
+        if self.seg.len() < len + TAG_LEN {
+            return Ok(None);
+        }
+        let (body, tag) = self.seg.split_at_mut(len);
+        if let Err(error) = self.cipher.open_segment(self.next, body, tag) {
+            self.failed = true;
+            return Err(error);
+        }
+        self.next += 1;
+        self.emitted = true;
+        Ok(Some(&self.seg[..len]))
+    }
+
+    /// `Ok` only once every segment has authenticated: a blob that stopped
+    /// early (truncated) is an integrity failure.
+    pub fn finish(&self) -> Result<(), EnvelopeError> {
+        if self.failed || self.next != self.segments {
+            return Err(EnvelopeError::Integrity);
+        }
+        Ok(())
+    }
+}
