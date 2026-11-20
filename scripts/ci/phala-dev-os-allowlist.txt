@@ -3,3 +3,5 @@
 # download.dstack.org on each deploy (see phala-os-guard.sh).
 # dstack-dev-0.5.12
 e866e987221db357129ebc3f066b6706ef955889ea95e5510acbdf3d3055186b
+# dstack-dev-0.5.15 (TC-3554: the node CVM runs it since Phala's KMS move)
+432b8a1e82ec8a90b3d30bb201e5d20a8bc5c05b69f1d8ba13687232dda5aebd
