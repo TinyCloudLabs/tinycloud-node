@@ -112,7 +112,9 @@ Recovery is an operator action, in this order:
    that takes a release that restores the sidecar compose and its reviewed N0 template.
    The node fetches epoch 0 and seals a new row with the same DID.
 4. If that boot refuses because epoch 0 cannot be fetched, **re-insert the exported row
-   byte-exact**. The database is then as it was before step 2.
+   byte-exact**. The database is then as it was before step 2, but the node is still
+   down: the blob still does not open. Only the KMS serving root epoch 0 again, or an
+   owner-held escrow of the root, brings it back.
 
 The delete is reversible only while the export exists: never delete without it. If the
 KMS no longer serves epoch 0, the exported row is the only remaining copy of the root,
