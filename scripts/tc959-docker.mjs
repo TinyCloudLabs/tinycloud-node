@@ -393,7 +393,8 @@ export async function main(args = process.argv.slice(2)) {
       assert.equal(service.ports[0].host_ip ?? '0.0.0.0', '0.0.0.0');
     }
     phase = 'compose_mounts';
-    assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger']]);
+    // TC-3554: the node also mounts the key-recovery sidecar's socket volume (the sidecar itself is not projected here).
+    assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger'], ['volume', 'key-recovery', '/run/key-recovery']]);
     assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
     phase = 'compose_networks';
     assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
