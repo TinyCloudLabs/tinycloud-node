@@ -21,11 +21,18 @@ root the way the guest agent's v0 GetKey does (dstack guest-api-v0.md:140-150):
 HKDF-SHA256(salt=b"RATLS", IKM=k256_key, info=b"tinycloud/keys/primary", L=32).
 The node uses those 32 bytes directly as its root (lib.rs Keys::Dstack).
 
+--from-app-root also REQUIRES the KMS issuance check: --app-id, --k256-signature
+(AppKeyResponse.k256_signature, r||s||v hex) and --kms-root-pubkey (the trusted
+KMS root secp256k1 key for that root epoch, SEC1 hex). The signature must verify
+over keccak256("dstack-kms-issued:" || app_id || sec1_compressed(app_root_pubkey))
+(dstack guest-api-v0.md:264-306; app epoch 0 format, app-key-epochs.md:158-160),
+high-S rejected. Without a passing check nothing is derived or emitted.
+
 Usage:
   decode_bundle.py BUNDLE --passphrase-file F --node-keys URL_OR_FILE
   decode_bundle.py BUNDLE --passphrase-file F --emit-secret
-  decode_bundle.py --from-app-root --node-keys URL_OR_FILE   < app-root-hex
-  decode_bundle.py --from-app-root --emit-secret             < app-root-hex
+  decode_bundle.py --from-app-root --app-id HEX --k256-signature HEX --kms-root-pubkey HEX \
+      (--node-keys URL_OR_FILE | --emit-secret)  < app-root-hex
 The passphrase file may be /dev/stdin. Needs: python3, cryptography, blake3.
 """
 import argparse
@@ -37,7 +44,10 @@ import sys
 import urllib.request
 
 from blake3 import blake3
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed, encode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -125,6 +135,70 @@ def root_from_app_root(app_root: bytes, path: bytes = b"tinycloud/keys/primary")
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"RATLS", info=path).derive(app_root)
 
 
+_KECCAK_RC = [
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+    0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008]
+_KECCAK_ROT = [[0, 36, 3, 41, 18], [1, 44, 10, 45, 2], [62, 6, 43, 15, 61],
+               [28, 55, 25, 21, 56], [27, 20, 39, 8, 14]]
+_M64 = (1 << 64) - 1
+
+
+def keccak256(data: bytes) -> bytes:
+    """Keccak-256 with the original 0x01 padding (Ethereum), not SHA3-256."""
+    def rol(v, n):
+        return ((v << n) | (v >> (64 - n))) & _M64 if n else v
+    rate = 136
+    buf = bytearray(data) + b"\x01" + b"\x00" * ((-len(data) - 1) % rate)
+    buf[-1] |= 0x80
+    a = [[0] * 5 for _ in range(5)]
+    for off in range(0, len(buf), rate):
+        for i in range(rate // 8):
+            a[i % 5][i // 5] ^= int.from_bytes(buf[off + 8 * i:off + 8 * i + 8], "little")
+        for rc in _KECCAK_RC:
+            c = [a[x][0] ^ a[x][1] ^ a[x][2] ^ a[x][3] ^ a[x][4] for x in range(5)]
+            d = [c[(x - 1) % 5] ^ rol(c[(x + 1) % 5], 1) for x in range(5)]
+            a = [[a[x][y] ^ d[x] for y in range(5)] for x in range(5)]
+            b = [[0] * 5 for _ in range(5)]
+            for x in range(5):
+                for y in range(5):
+                    b[y][(2 * x + 3 * y) % 5] = rol(a[x][y], _KECCAK_ROT[x][y])
+            a = [[b[x][y] ^ (~b[(x + 1) % 5][y] & b[(x + 2) % 5][y]) for y in range(5)]
+                 for x in range(5)]
+            a[0][0] ^= rc
+    return b"".join(a[i % 5][i // 5].to_bytes(8, "little") for i in range(4))
+
+
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def verify_kms_issuance(app_root: bytes, app_id: bytes, signature: bytes,
+                        kms_root_pubkey: bytes) -> bytes:
+    """Check the KMS root signed this app root key for app_id (app epoch 0 format).
+
+    Returns the SEC1-compressed app root public key; raises on any failure.
+    """
+    if len(app_id) != 20:
+        raise ValueError(f"app id must be 20 bytes, got {len(app_id)}")
+    if len(signature) != 65:
+        raise ValueError(f"k256_signature must be 65 bytes (r||s||v), got {len(signature)}")
+    app_pub = ec.derive_private_key(int.from_bytes(app_root, "big"), ec.SECP256K1()) \
+        .public_key().public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    r, s = int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:64], "big")
+    if not (0 < r < SECP256K1_N and 0 < s <= SECP256K1_N // 2):
+        raise ValueError("k256_signature: r/s out of range or high-S")
+    digest = keccak256(b"dstack-kms-issued:" + app_id + app_pub)
+    root = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), kms_root_pubkey)
+    try:
+        root.verify(encode_dss_signature(r, s), digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    except InvalidSignature:
+        raise ValueError("k256_signature does not verify under --kms-root-pubkey") from None
+    return app_pub
+
+
 def load_node_keys(source: str) -> dict:
     if source.startswith("https://") or source.startswith("http://"):
         with urllib.request.urlopen(source, timeout=20) as resp:
@@ -139,6 +213,10 @@ def main() -> None:
     ap.add_argument("--passphrase-file")
     ap.add_argument("--from-app-root", action="store_true",
                     help="read a dstack app root key (64 hex) from stdin instead of a bundle")
+    ap.add_argument("--app-id", help="--from-app-root: dstack app id, 20 bytes hex")
+    ap.add_argument("--k256-signature", help="--from-app-root: AppKeyResponse.k256_signature hex")
+    ap.add_argument("--kms-root-pubkey",
+                    help="--from-app-root: trusted KMS root secp256k1 pubkey (SEC1 hex)")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--node-keys", help="URL or file of /.well-known/tinycloud/node-keys")
     mode.add_argument("--emit-secret", action="store_true")
@@ -148,10 +226,20 @@ def main() -> None:
     if args.from_app_root:
         if args.bundle or args.passphrase_file:
             ap.error("--from-app-root takes no bundle or passphrase file")
+        if not (args.app_id and args.k256_signature and args.kms_root_pubkey):
+            ap.error("--from-app-root requires --app-id, --k256-signature and --kms-root-pubkey")
         app_root = bytes.fromhex(sys.stdin.read().strip())
+        try:
+            app_pub = verify_kms_issuance(
+                app_root, bytes.fromhex(args.app_id.removeprefix("0x")),
+                bytes.fromhex(args.k256_signature.removeprefix("0x")),
+                bytes.fromhex(args.kms_root_pubkey.removeprefix("0x")))
+        except ValueError as e:
+            sys.exit(f"FAIL: KMS issuance check: {e}")
         root = root_from_app_root(app_root)
         del app_root
-        print(f"app root: root_len {len(root)}", file=sys.stderr)
+        print(f"app root: KMS issuance check PASS, app_root_pubkey {app_pub.hex()} "
+              f"root_len {len(root)}", file=sys.stderr)
     else:
         if not args.bundle or not args.passphrase_file:
             ap.error("a bundle and --passphrase-file are required without --from-app-root")
