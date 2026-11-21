@@ -455,38 +455,49 @@ If the TinyCloud Protocol instance is not able to find or establish a connection
 
 TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the example DApps and tutorials for detailed information.
 
-### UCAN DID resolution (TC-1080)
+### UCAN DID verification (TC-1080, TC-1500)
 
-UCAN signature verification resolves only `did:key`, `did:pkh` and `did:jwk`
-by default. Other methods fail before resolution with `did_method_disabled:`.
-Issuer DID URLs carrying a query fail with `did_url_query_rejected:` under every
-setting. DID parsing and string comparisons, including share-email `did:web`
-identifiers, are unchanged. Existing route status codes and policy machine codes
-are preserved.
+The node verifies a UCAN signature only when it derives the signer's key
+offline. It accepts these DIDs, as issuers and as the holders of new grants:
 
-Keep `[global.did_resolution] network_methods = false` in `tinycloud.toml`
-or the canonical environment variable
-`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=false`. Network DID methods, including
-`did:web`, remain disabled under the current policy.
+- `did:key`: Ed25519, secp256k1 and P-256 (compressed) keys, base58btc. The
+  identifier must be exactly 48 (Ed25519) or 49 characters, checked before it
+  is decoded.
+- `did:jwk`: Ed25519 (OKP) and secp256k1 or P-256 (EC) public keys, in an
+  identifier of at most 256 characters, checked before it is decoded.
+- `did:pkh`: CAIP-10 accounts in the `eip155`, `solana` and `bip122`
+  (Bitcoin and Dogecoin mainnet) namespaces.
 
-**Full TC-1080 Part B hardening is REQUIRED before any future re-enable**,
-including setting the existing `network_methods` option to `true`. The
-unhardened SSI client is not an acceptable rollback path. Part B is not
-implemented here, and there is no Part B development bypass. The required
-node-side fetcher, destination enforcement, resource limits and local-listener
-acceptance checks are described in the
+Keys must be valid points on their curve, and an Ed25519 key (including a
+`solana` account) must not be of small order. A DID of another method fails before
+resolution with `did_method_disabled:`. A `did:key`, `did:jwk` or `did:pkh`
+naming another key type or namespace (P-384, `tezos`, the legacy `eth`/`sol`/
+`btc` forms) or a malformed identifier fails with `did_unverifiable:`. Issuer
+DID URLs carrying a query fail with `did_url_query_rejected:`.
+
+`POST /delegate` also refuses a new grant whose holder (`aud`) is not such a DID
+with `did_holder_unverifiable:`. A Policy/v3 delegate,
+`did:tinycloud:policy:<64 lowercase hex>`, is exempt: it holds a policy root and
+never signs. Grants already stored are unchanged. DID parsing and string
+comparisons, including share-email `did:web` identifiers, are unchanged.
+
+No setting enables network DID methods. `did_resolution.network_methods`
+(`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS`) was removed: a node that still
+sets it starts, warns that the setting is ignored, and refuses `did:web`.
+**Full TC-1080 Part B hardening is REQUIRED before any future enable.** The
+required node-side fetcher, destination enforcement, resource limits and
+local-listener acceptance checks are described in the
 [developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).
 
-The startup log records the effective policy. Refusals increment
-`tinycloud_did_resolution_refused_total{method,reason}` (even when latency
-telemetry is disabled), with reasons `method_disabled` and `query_rejected`.
-Unknown methods use the bounded label `unknown`. Warnings contain only the
-method, sanitized host and reason, with one warning per method/host per minute
-and at most ten per minute globally; the next warning reports suppressed counts.
+Refusals increment `tinycloud_did_resolution_refused_total{method,reason}`
+(even when latency telemetry is disabled), with reasons `method_disabled`,
+`unverifiable`, `holder_unverifiable` and `query_rejected`. Unknown methods use
+the bounded label `unknown`. Warnings contain only the method, sanitized host
+and reason, with one warning per method/host per minute and at most ten per
+minute globally; the next warning reports suppressed counts.
 
 Public `GET /info` also exposes only counts and booleans:
 `"did_resolution": { "network_methods": false, "refused_total": 0 }`.
-Both values use relaxed atomic reads; `refused_total` counts every refusal for
-this process lifetime and resets on restart. Post-deploy, check
-`GET /info` gives `did_resolution.network_methods == false`, and compare
-`refused_total` over time. No DIDs, hosts, URLs or per-method data are exposed.
+`network_methods` is always `false`. `refused_total` counts every refusal for
+this process lifetime and resets on restart. No DIDs, hosts, URLs or
+per-method data are exposed.

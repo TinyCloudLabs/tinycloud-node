@@ -145,6 +145,12 @@ pub enum DelegationError {
     InvalidSignature,
     #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
     UnsupportedDidMethod(String),
+    #[error("did_unverifiable: this `did:{0}` identifier is malformed or names a key type this node cannot verify")]
+    UnverifiableDid(String),
+    /// TC-1500: the grant's holder is neither a DID this node can verify
+    /// offline nor a Policy/v3 delegate.
+    #[error("did_holder_unverifiable: the delegate is not a DID this node can verify")]
+    UnverifiableHolder,
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     DidUrlQueryRejected,
     #[error("Unauthorized Delegator: {0}")]
@@ -248,14 +254,29 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(
+    if let Err(error) = validate_with(
         db,
         &delegation.0,
         delegated_sql_caveats,
         named_keys,
         renewal_identity,
     )
-    .await?;
+    .await
+    {
+        // TC-1500: a grant stored before the holder rule existed answers as
+        // already registered when resubmitted, as the single-delegation path
+        // does, so batch retries stay idempotent.
+        if matches!(
+            error,
+            Error::InvalidDelegation(DelegationError::UnverifiableHolder)
+        ) {
+            let hash = delegation.content_hash();
+            if Entity::find_by_id(hash).one(db).await?.is_some() {
+                return Ok(DelegationRegistration::Existing(hash));
+            }
+        }
+        return Err(error);
+    }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -273,11 +294,12 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
         check_signature(&delegation.0.delegation).await?;
     }
     check_owner_renewal_lease(delegation)?;
+    check_holder(&delegation.0)?;
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
-/// Check a delegation's signature: CPU, or a DID resolution when network
-/// methods are on. Runs before any lock (TC-2986).
+/// Check a delegation's signature: CPU only, no DID is fetched. Runs before
+/// any lock (TC-2986).
 pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ucan) => {
@@ -286,6 +308,9 @@ pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<
                 .map_err(|error| match error {
                     UcanVerifyError::MethodDisabled { method } => {
                         DelegationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::Unverifiable { method } => {
+                        DelegationError::UnverifiableDid(method)
                     }
                     UcanVerifyError::QueryRejected => DelegationError::DidUrlQueryRejected,
                     UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
@@ -301,6 +326,18 @@ pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<
         }
     };
     Ok(())
+}
+
+/// TC-1500: a new grant's holder (`aud`) must be a DID the node can verify
+/// offline, or a Policy/v3 delegate, so no grant is issued to a key that could
+/// never sign an invocation the node accepts. CPU only. Stored grants are not
+/// re-checked.
+fn check_holder(delegation: &util::DelegationInfo) -> Result<(), Error> {
+    if crate::did_resolution::check_holder(&delegation.delegate) {
+        Ok(())
+    } else {
+        Err(DelegationError::UnverifiableHolder.into())
+    }
 }
 
 /// Check that a delegation is within its signed time window now.
@@ -850,7 +887,8 @@ fn check_capability_rules(
     }) {
         return Err(DelegationError::KeyDeleteNotDelegable.into());
     }
-    Ok(())
+    // After the capability rules, so a refusal specific to the capabilities wins.
+    check_holder(delegation)
 }
 
 /// The capabilities the issuer does not hold as a root authority, which a
@@ -1491,6 +1529,113 @@ mod tests {
             matches!(result, Err(super::Error::InvalidDelegation(super::DelegationError::UnsupportedDidMethod(method))) if method == "web")
         );
         assert_no_connections(&[&listener]).await;
+    }
+
+    /// TC-1500: a new grant's holder must be a DID the node can verify offline, or a
+    /// Policy/v3 delegate. A malformed issuer keeps its issuer code.
+    #[tokio::test]
+    async fn new_grant_holder_must_be_verifiable() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::{
+            authorization::TinyCloudDelegation,
+            ipld_core::cid::multibase,
+            resolver::DID_METHODS,
+            ssi::jwk::{Algorithm, JWK},
+        };
+        let key = JWK::generate_ed25519().unwrap();
+        let issuer = DID_METHODS.generate(&key, "key").unwrap().to_string();
+        let event = |issuer: &str, holder: &str| {
+            let token = signed_ucan_to(issuer, holder, &key, Algorithm::EdDSA, true)
+                .encode()
+                .unwrap();
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap()
+        };
+        let z2d = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, [&[0xed][..], &[9; 32]].concat())
+        );
+        let p384 = format!(
+            "did:key:{}",
+            multibase::encode(
+                multibase::Base::Base58Btc,
+                [&[0x81, 0x24, 0x02][..], &[9; 48]].concat()
+            )
+        );
+        let accepted = [
+            HOLDER.to_owned(),
+            DID_METHODS
+                .generate(&JWK::generate_secp256k1(), "key")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_p256(), "key")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_p256(), "jwk")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_secp256k1(), "pkh:eip155:1")
+                .unwrap()
+                .to_string(),
+            format!("did:tinycloud:policy:{}", "ab".repeat(32)),
+        ];
+        for holder in &accepted {
+            assert!(
+                super::check_capability_rules(&event(&issuer, holder).0, false, true).is_ok(),
+                "{holder}"
+            );
+        }
+        for holder in [
+            z2d.as_str(),
+            p384.as_str(),
+            "did:web:example.com",
+            "did:pkh:tezos:NetXdQprcVkpaWU:tz1YwA1FwpgLtc1G8DKbbZ6e6PTb1dQMRn5x",
+            "did:tinycloud:policy:not-a-digest",
+        ] {
+            assert!(
+                matches!(
+                    super::check_capability_rules(&event(&issuer, holder).0, false, true),
+                    Err(super::Error::InvalidDelegation(
+                        super::DelegationError::UnverifiableHolder
+                    ))
+                ),
+                "{holder}"
+            );
+        }
+        // Through `process`, the path a transaction takes without preverification.
+        let result = super::process(&database().await, &event(&issuer, &z2d), None).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::InvalidDelegation(
+                    super::DelegationError::UnverifiableHolder
+                ))
+            ),
+            "{result:?}"
+        );
+        // A grant stored before the holder rule answers as already registered when it is
+        // resubmitted through a batch, as on the single-delegation path.
+        let db = database().await;
+        let token = signed_ucan_to(&issuer, &z2d, &key, Algorithm::EdDSA, false)
+            .encode()
+            .unwrap();
+        let stored =
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap();
+        super::save(&db, stored.0.clone(), stored.1.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::process(&db, &stored, None).await.unwrap(),
+            super::DelegationRegistration::Existing(stored.content_hash())
+        );
+        // A malformed issuer is refused as the issuer.
+        let result = super::check_signature(&event(&z2d, HOLDER).0.delegation).await;
+        assert!(
+            matches!(result, Err(super::Error::InvalidDelegation(super::DelegationError::UnverifiableDid(ref method))) if method == "key"),
+            "{result:?}"
+        );
     }
     use super::*;
     use crate::migrations::Migrator;
@@ -2817,7 +2962,7 @@ mod tests {
             domain: domain.parse().unwrap(),
             address: [1; 20],
             statement: None,
-            uri: "did:key:z6MkTestDelegatee".parse().unwrap(),
+            uri: crate::test_support::did_resolution::HOLDER.parse().unwrap(),
             version: Version::V1,
             chain_id: 1,
             nonce: "siwenonce".into(),

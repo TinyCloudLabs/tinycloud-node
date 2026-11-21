@@ -34,8 +34,6 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub invocation: InvocationConfig,
-    #[serde(default)]
-    pub did_resolution: DidResolutionConfig,
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -2294,16 +2292,6 @@ impl Default for DatabaseConfig {
             read_audit_wait_ms: default_database_read_audit_wait_ms(),
         }
     }
-}
-
-/// UCAN issuer resolution policy (TC-1080). Parsing and identity comparisons are unchanged.
-#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct DidResolutionConfig {
-    /// Allow methods beyond key, pkh and jwk. Default: false.
-    /// Canonical env: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true.
-    /// Requires a restart; issuer queries are always refused.
-    #[serde(default)]
-    pub network_methods: bool,
 }
 
 impl DatabaseConfig {
