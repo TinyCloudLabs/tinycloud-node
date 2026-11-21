@@ -254,14 +254,29 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(
+    if let Err(error) = validate_with(
         db,
         &delegation.0,
         delegated_sql_caveats,
         named_keys,
         renewal_identity,
     )
-    .await?;
+    .await
+    {
+        // TC-1500: a grant stored before the holder rule existed answers as
+        // already registered when resubmitted, as the single-delegation path
+        // does, so batch retries stay idempotent.
+        if matches!(
+            error,
+            Error::InvalidDelegation(DelegationError::UnverifiableHolder)
+        ) {
+            let hash = delegation.content_hash();
+            if Entity::find_by_id(hash).one(db).await?.is_some() {
+                return Ok(DelegationRegistration::Existing(hash));
+            }
+        }
+        return Err(error);
+    }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -1599,6 +1614,21 @@ mod tests {
                 ))
             ),
             "{result:?}"
+        );
+        // A grant stored before the holder rule answers as already registered when it is
+        // resubmitted through a batch, as on the single-delegation path.
+        let db = database().await;
+        let token = signed_ucan_to(&issuer, &z2d, &key, Algorithm::EdDSA, false)
+            .encode()
+            .unwrap();
+        let stored =
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap();
+        super::save(&db, stored.0.clone(), stored.1.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::process(&db, &stored, None).await.unwrap(),
+            super::DelegationRegistration::Existing(stored.content_hash())
         );
         // A malformed issuer is refused as the issuer.
         let result = super::check_signature(&event(&z2d, HOLDER).0.delegation).await;

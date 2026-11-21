@@ -106,7 +106,7 @@ fn did_key_verifiable(id: &str) -> bool {
         return false;
     };
     let supported = match bytes.as_slice() {
-        [0xed, 0x01, key @ ..] => key.len() == 32,
+        [0xed, 0x01, key @ ..] => ed25519_strong(key),
         [0xe7, 0x01, key @ ..] | [0x80, 0x24, key @ ..] => key.len() == 33,
         _ => false,
     };
@@ -134,7 +134,9 @@ fn did_jwk_verifiable(id: &str) -> bool {
         return false;
     };
     let supported = match &jwk.params {
-        Params::OKP(okp) => okp.curve == "Ed25519" && okp.private_key.is_none(),
+        Params::OKP(okp) => {
+            okp.curve == "Ed25519" && okp.private_key.is_none() && ed25519_strong(&okp.public_key.0)
+        }
         Params::EC(ec) => {
             matches!(ec.curve.as_deref(), Some("secp256k1" | "P-256"))
                 && ec.ecc_private_key.is_none()
@@ -183,21 +185,33 @@ fn did_pkh_verifiable(id: &str) -> bool {
                     .strip_prefix("0x")
                     .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
         }
-        "solana" => (32..=44).contains(&address.len()) && base58_decoded_len(address) == Some(32),
+        "solana" => {
+            (32..=44).contains(&address.len())
+                && base58_decode(address).is_some_and(|key| ed25519_strong(&key))
+        }
         "bip122" => {
             matches!(reference, BIP122_BITCOIN_MAINNET | BIP122_DOGECOIN_MAINNET)
                 && (25..=35).contains(&address.len())
-                && base58_decoded_len(address).is_some()
+                && base58_decode(address).is_some()
         }
         _ => false,
     }
 }
 
-fn base58_decoded_len(value: &str) -> Option<usize> {
+fn base58_decode(value: &str) -> Option<Vec<u8>> {
     tinycloud_auth::ipld_core::cid::multibase::Base::Base58Btc
         .decode(value)
         .ok()
-        .map(|bytes| bytes.len())
+}
+
+/// A 32-byte Ed25519 public key that decompresses and is not of small order. ssi verifies
+/// with dalek's non-strict `verify`, under which anyone can sign for a small-order key, so a
+/// grant to one would be a grant to everyone.
+fn ed25519_strong(key: &[u8]) -> bool {
+    <[u8; 32]>::try_from(key)
+        .ok()
+        .and_then(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok())
+        .is_some_and(|key| !key.is_weak())
 }
 
 /// Refuse a DID the node cannot verify offline, counting and logging the refusal.
@@ -578,6 +592,33 @@ mod tests {
             "1".repeat(MAX_DID_PKH_ID_LEN)
         );
         assert_eq!(verdict(&long), (Err(Unverifiable::Identifier), 0));
+    }
+
+    /// TC-1500 review N1: small-order Ed25519 keys (identity, order 2, order 4) are refused in
+    /// every form that names an Ed25519 key, because anyone can sign for them.
+    #[test]
+    fn refuses_small_order_ed25519_keys() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mut order_two = [0xff; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        for key in [identity, order_two, [0; 32]] {
+            let point = ed25519_dalek::VerifyingKey::from_bytes(&key).unwrap();
+            assert!(point.is_weak());
+            let x = URL_SAFE_NO_PAD.encode(key);
+            for did in [
+                did_key(&[&[0xed, 0x01][..], &key].concat()),
+                did_jwk(serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": x})),
+                format!(
+                    "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:{}",
+                    multibase::Base::Base58Btc.encode(key)
+                ),
+            ] {
+                assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 1), "{did}");
+                assert!(!check_holder(&did), "{did}");
+            }
+        }
     }
 
     #[test]

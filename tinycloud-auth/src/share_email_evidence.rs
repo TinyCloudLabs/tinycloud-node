@@ -576,7 +576,9 @@ thread_local! {
 }
 
 /// The 32-byte public key of an Ed25519 `did:key`: base58btc multibase over the `0xed 0x01`
-/// multicodec only. The length is checked before the base58 decode (TC-1500 M1).
+/// multicodec only. The length is checked before the base58 decode (TC-1500 M1). The key must
+/// decompress and must not be of small order: ssi verifies with dalek's non-strict `verify`,
+/// under which anyone can sign for a small-order key.
 pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
     if did.len() != ED25519_DID_KEY_LEN {
         return Err(EvidenceError::Invalid);
@@ -593,7 +595,10 @@ pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
     }
     let mut key = [0; 32];
     key.copy_from_slice(&bytes[2..]);
-    Ok(key)
+    match ed25519_dalek::VerifyingKey::from_bytes(&key) {
+        Ok(verifying) if !verifying.is_weak() => Ok(key),
+        _ => Err(EvidenceError::Invalid),
+    }
 }
 
 fn canonical_kid(did: &str) -> Result<String, EvidenceError> {
@@ -832,6 +837,31 @@ mod tests {
         assert_eq!(DID_KEY_DECODES.with(std::cell::Cell::get), before + 1);
         // The right length, but not the Ed25519 multicodec.
         assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(44))).is_err());
+    }
+
+    /// Small-order Ed25519 points (identity, order 2, order 4): anyone can sign for them.
+    fn small_order_keys() -> [[u8; 32]; 3] {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mut order_two = [0xff; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        [identity, order_two, [0; 32]]
+    }
+
+    #[test]
+    fn did_key_public_key_refuses_small_order_keys() {
+        for key in small_order_keys() {
+            let did = format!(
+                "did:key:{}",
+                crate::ipld_core::cid::multibase::encode(
+                    crate::ipld_core::cid::multibase::Base::Base58Btc,
+                    [&[0xed, 0x01][..], &key].concat()
+                )
+            );
+            assert_eq!(did.len(), ED25519_DID_KEY_LEN, "{did}");
+            assert!(did_key_public_key(&did).is_err(), "{did}");
+        }
     }
 
     #[test]

@@ -468,7 +468,8 @@ offline. It accepts these DIDs, as issuers and as the holders of new grants:
 - `did:pkh`: CAIP-10 accounts in the `eip155`, `solana` and `bip122`
   (Bitcoin and Dogecoin mainnet) namespaces.
 
-Keys must be valid points on their curve. A DID of another method fails before
+Keys must be valid points on their curve, and an Ed25519 key (including a
+`solana` account) must not be of small order. A DID of another method fails before
 resolution with `did_method_disabled:`. A `did:key`, `did:jwk` or `did:pkh`
 naming another key type or namespace (P-384, `tezos`, the legacy `eth`/`sol`/
 `btc` forms) or a malformed identifier fails with `did_unverifiable:`. Issuer
