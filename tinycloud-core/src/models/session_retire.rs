@@ -4,6 +4,7 @@
 //! was retired. While the row is live (`expires_at > now`) the key invokes
 //! nothing, and a delegation it issues is refused unless it was stored
 //! before the retire. Expired rows are ignored by every lookup and pruned.
+use super::{delegation, delegation_cid_alias};
 use crate::did_resolution::verify_ucan_signature;
 use crate::encryption_network::delete_auth::CLOCK_SKEW_SECS;
 use sea_orm::{
