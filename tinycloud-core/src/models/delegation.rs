@@ -386,7 +386,7 @@ fn check_holder(delegation: &util::DelegationInfo) -> Result<(), Error> {
 }
 
 /// Check that a delegation is within its signed time window now.
-fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+pub(crate) fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     let valid = match delegation {
         TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_ok(),
         TinyCloudDelegation::Cacao(cacao) => cacao.payload().valid_now(),
@@ -967,6 +967,26 @@ pub(crate) async fn precheck<C: ConnectionTrait>(
     renewer_did: Option<&str>,
 ) -> Result<(), Error> {
     verify_time(&delegation.0.delegation)?;
+    precheck_standing(
+        db,
+        delegation,
+        delegated_sql_caveats,
+        named_keys,
+        renewer_did,
+    )
+    .await
+}
+
+/// [`precheck`] without its time window: the issuer's standing and the
+/// capability rules. Only for TC-3443's sign-out, which covers a carried
+/// root that is not valid yet without storing it.
+pub(crate) async fn precheck_standing<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewer_did: Option<&str>,
+) -> Result<(), Error> {
     let delegation = &delegation.0;
     if renewer_did.is_some_and(|renewer_did| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());

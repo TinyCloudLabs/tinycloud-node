@@ -2893,10 +2893,22 @@ where
     /// refused, so one key cannot seed rows for another.
     ///
     /// The carried roots are stored inside the retire's own write
-    /// transaction, after the key's retire lock and before the retire reads
-    /// what the key holds, so the retire counts them. If any is refused, or
-    /// anything fails, nothing is written. A repeat call keeps the first
-    /// retire time.
+    /// transaction, before the retire reads what the key holds, so the
+    /// retire counts them. If any is refused, or anything fails, nothing is
+    /// written. A repeat call keeps the first retire time.
+    ///
+    /// A carried root that has expired is skipped (it can never be posted)
+    /// and its index reported. One not valid yet is not stored (`/delegate`
+    /// would refuse it too) but is covered: its signature and issuer's
+    /// standing are checked as for any other, and the retire lasts at least
+    /// until it expires, so posting it later finds the key retired.
+    ///
+    /// Locks are taken as `transact_verified` takes them: chain guards, the
+    /// in-process space sequence guards, the SQLite writer lock, then, inside
+    /// the transaction, the PostgreSQL space sequence locks, then the key's
+    /// retire lock, then (in `retire_in`) its originals' renewal locks.
+    /// `/delegate` takes a space's sequence lock before a delegatee's lock
+    /// too, so the two never wait on each other in a cycle.
     pub async fn retire_session(
         &self,
         did: &str,
@@ -2927,24 +2939,65 @@ where
         }
         // As `delegate_verified`, before any lock: the signature, then, for
         // one not already stored, its time window and issuer's standing.
+        let now = OffsetDateTime::now_utc();
+        let renewal_seed_did = self
+            .secrets
+            .renewal_seed()
+            .map(|seed| crate::renewal::renewal_identity_from_seed(seed).0);
         let mut verified = PreVerified::default();
         let mut to_store = Vec::new();
+        let mut pending_end = None;
+        let mut skipped = Vec::new();
         let mut seen = HashSet::new();
         for (index, delegation) in carried.into_iter().enumerate() {
             let hash = delegation.content_hash();
             if !seen.insert(hash) {
                 continue;
             }
+            if delegation.0.expiry.is_some_and(|expiry| expiry <= now) {
+                skipped.push(index);
+                continue;
+            }
+            let refused =
+                |error: TxError<B, K>| carried_refusal(format!("delegation {index}"), error);
             let checked = self
                 .preverify_delegation(&delegation)
                 .await
-                .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
+                .map_err(refused)?;
             verified = verified.union(checked);
             if delegation::Entity::find_by_id(hash)
                 .one(&self.conn)
                 .await?
                 .is_some()
             {
+                continue;
+            }
+            // As `delegate_batch_in_transaction_verified`.
+            if renewal_seed_did.as_ref() == Some(&delegation.0.delegator) {
+                return Err(refused(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(
+                        delegation.0.delegator.clone(),
+                    ),
+                )));
+            }
+            let renewer_did = self
+                .renewal_identity
+                .as_ref()
+                .map(|identity| identity.renewer_did.as_str());
+            if delegation::verify_time(&delegation.0.delegation).is_err() {
+                // Not valid yet: every check but the time window, then
+                // cover it without storing it.
+                delegation::precheck_standing(
+                    &self.conn,
+                    &delegation,
+                    self.delegated_sql_caveats,
+                    self.named_keys,
+                    renewer_did,
+                )
+                .await
+                .map_err(|error| refused(TxError::from(error)))?;
+                let end = session_retire::covering(delegation.0.expiry);
+                pending_end = pending_end.max(Some(end));
                 continue;
             }
             // TC-1500: `check_holder` runs in `delegation::precheck` (via
@@ -2955,14 +3008,10 @@ where
                 &delegation,
                 self.delegated_sql_caveats,
                 self.named_keys,
-                self.renewal_identity
-                    .as_ref()
-                    .map(|identity| identity.renewer_did.as_str()),
+                renewer_did,
             )
             .await
-            .map_err(|error| {
-                carried_refusal(format!("delegation {index}"), TxError::<B, K>::from(error))
-            })?;
+            .map_err(|error| refused(TxError::from(error)))?;
             to_store.push((index, delegation));
         }
         let mut roots = Vec::new();
@@ -2978,24 +3027,68 @@ where
         }
         roots.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
         roots.dedup();
+        let (indexes, events): (Vec<usize>, Vec<Event>) = to_store
+            .into_iter()
+            .map(|(index, delegation)| (index, Event::Delegation(Box::new(delegation))))
+            .unzip();
+        let registry_spaces =
+            self.registry_registration_spaces(&events)
+                .await
+                .map_err(|error| {
+                    carried_refusal("delegations".to_owned(), TxError::<B, K>::from(error))
+                })?;
+        let spaces = sequence_spaces(&self.conn, &events).await?;
         let _chain_guards = self
             .acquire_chain_guards(&roots)
             .await
             .map_err(|error| carried_refusal("delegations".to_owned(), error))?;
+        let _sequence_guards = self.acquire_space_sequence_guards(&spaces).await;
         let _writer = match &self.writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         let tx = self.begin_graph_transaction().await?;
+        // The space sequence locks `transact_verified` would take, first,
+        // then the key's own lock; the stores below take no lock again.
+        let events: Vec<(Hash, Event)> = events
+            .into_iter()
+            .map(|event| (event.hash(), event))
+            .collect();
+        let held: Vec<SpaceId> = event_spaces(&tx, &events)
+            .await?
+            .into_keys()
+            .filter(|space| {
+                registry_spaces
+                    .as_ref()
+                    .is_none_or(|served| served.contains(space))
+            })
+            .collect();
+        crate::kv_sync::lock_space_sequences_not_held(&tx, held.iter(), &[]).await?;
         session_retire::lock_did(&tx, did).await?;
-        for (index, delegation) in to_store {
-            self.delegate_batch_in_transaction_verified(&tx, vec![delegation], &verified)
-                .await
-                .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
+        for (index, (_, event)) in indexes.into_iter().zip(events) {
+            transact_verified(
+                &tx,
+                &self.storage,
+                &self.secrets,
+                self.renewal_identity.as_ref(),
+                vec![event],
+                self.encryption.as_ref(),
+                None,
+                &held,
+                self.delegated_sql_caveats,
+                self.named_keys,
+                self.space_purge_fence.as_deref(),
+                &verified,
+                registry_spaces.as_ref(),
+            )
+            .await
+            .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
         }
-        let outcome =
-            session_retire::retire_in(&tx, did, session_retire::stored_now(), ttl).await?;
+        let mut outcome =
+            session_retire::retire_in(&tx, did, session_retire::stored_now(), ttl, pending_end)
+                .await?;
         tx.commit().await?;
+        outcome.skipped = skipped;
         Ok(outcome)
     }
 

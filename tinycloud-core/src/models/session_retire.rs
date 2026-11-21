@@ -250,10 +250,13 @@ pub async fn raise_expiry<C: ConnectionTrait>(
 /// What a retire did: the key's retire time and, when a row records it, the
 /// row's expiry. `expires_at` is `None` when the key held no live grant
 /// here, so nothing was written and `retired_at` is just the request's time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `skipped` lists the carried delegations (by request index) left out
+/// because they had expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireOutcome {
     pub retired_at: OffsetDateTime,
     pub expires_at: Option<OffsetDateTime>,
+    pub skipped: Vec<usize>,
 }
 
 impl RetireOutcome {
@@ -288,7 +291,7 @@ pub async fn retire<C: ConnectionTrait + TransactionTrait>(
     ttl: Duration,
 ) -> Result<RetireOutcome, DbErr> {
     let tx = crate::db::begin_write_transaction(db, None).await?;
-    let outcome = retire_in(&tx, did, now, ttl).await?;
+    let outcome = retire_in(&tx, did, now, ttl, None).await?;
     tx.commit().await?;
     Ok(outcome)
 }
@@ -322,12 +325,16 @@ pub async fn lock_did<C: ConnectionTrait>(tx: &C, did: &str) -> Result<(), DbErr
     Ok(())
 }
 
-/// [`retire`] inside the caller's write transaction `tx`.
+/// [`retire`] inside the caller's write transaction `tx`. `pending_end` is
+/// the latest end of grants the key will hold that are not stored (TC-3443:
+/// carried roots not valid yet); it counts as a live grant and the row
+/// lasts until it.
 pub(crate) async fn retire_in<C: ConnectionTrait>(
     tx: &C,
     did: &str,
     now: OffsetDateTime,
     ttl: Duration,
+    pending_end: Option<OffsetDateTime>,
 ) -> Result<RetireOutcome, DbErr> {
     if tx.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
         // The key's own lock first: no delegation to it is stored from here
@@ -353,16 +360,16 @@ pub(crate) async fn retire_in<C: ConnectionTrait>(
                 .map(|row| RetireOutcome {
                     retired_at: row.retired_at,
                     expires_at: Some(row.expires_at),
+                    skipped: Vec::new(),
                 }),
         )
     };
-    let Some(end) = latest_authority_end(tx, did)
-        .await?
-        .filter(|end| *end > now)
-    else {
+    let stored_end = latest_authority_end(tx, did).await?;
+    let Some(end) = stored_end.max(pending_end).filter(|end| *end > now) else {
         return Ok(existing().await?.unwrap_or(RetireOutcome {
             retired_at: now,
             expires_at: None,
+            skipped: Vec::new(),
         }));
     };
     let expires_at = end.max(now.saturating_add(ttl));
@@ -556,6 +563,7 @@ mod tests {
         let nothing = RetireOutcome {
             retired_at: now,
             expires_at: None,
+            skipped: Vec::new(),
         };
         assert_eq!(retire(&db, stranger, now, ttl).await.unwrap(), nothing);
         let lapsed = "did:key:z6MkretireLapsed";

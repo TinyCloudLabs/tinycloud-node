@@ -76,6 +76,18 @@ impl Fx {
         proof: Vec<Cid>,
         expiry: i64,
     ) -> String {
+        self.delegation_window(issuer, audience, proof, now() - 60, expiry)
+    }
+
+    /// As [`Self::delegation`], valid from `not_before` until `expiry`.
+    fn delegation_window(
+        &self,
+        issuer: &JWK,
+        audience: &str,
+        proof: Vec<Cid>,
+        not_before: i64,
+        expiry: i64,
+    ) -> String {
         let mut caps = Capabilities::<serde_json::Value>::new();
         caps.with_action(
             self.kv().parse().unwrap(),
@@ -85,7 +97,7 @@ impl Fx {
         Payload::<serde_json::Value> {
             issuer: did_vm(issuer).1.parse().unwrap(),
             audience: audience.parse().unwrap(),
-            not_before: Some(NumericDate::try_from_seconds((now() - 60) as f64).unwrap()),
+            not_before: Some(NumericDate::try_from_seconds(not_before as f64).unwrap()),
             expiration: NumericDate::try_from_seconds(expiry as f64).unwrap(),
             nonce: Some(format!("tc3443-{}", rand::random::<u64>())),
             facts: None,
@@ -726,4 +738,90 @@ async fn postgres_refused_carried_delegation_writes_nothing() {
         return;
     };
     refused_carry_scenario(f).await;
+}
+
+/// TC-3443 L2: a carried root that has expired is skipped and reported; one
+/// not valid yet is checked, not stored, and covered.
+async fn carried_time_window_scenario(f: Fx) {
+    let session = f.session_did();
+    let day = 86_400;
+    let expired = f.delegation_window(&f.owner, &session, vec![], now() - 7200, now() - 3600);
+    let outcome = f.retire_carrying(&session, &[&expired]).await.unwrap();
+    assert_eq!(outcome.skipped, vec![0]);
+    assert!(!outcome.recorded(), "an expired root is no grant");
+    assert!(!f.stored(&expired).await);
+    assert!(f.retire_row(&session).await.is_none());
+
+    // Not valid yet, and signed by one who cannot root the space: refused.
+    let pending_expiry = f.created + 60 * day;
+    let forged = f.delegation_window(&f.holder, &session, vec![], now() + 3600, pending_expiry);
+    let error = f.retire_carrying(&session, &[&forged]).await.unwrap_err();
+    assert!(
+        error.starts_with("session_retire_invalid: delegation 0: "),
+        "{error}"
+    );
+    assert!(f.retire_row(&session).await.is_none());
+
+    let pending = f.delegation_window(&f.owner, &session, vec![], now() + 3600, pending_expiry);
+    let outcome = f
+        .retire_carrying(&session, &[&expired, &pending])
+        .await
+        .unwrap();
+    assert_eq!(outcome.skipped, vec![0]);
+    assert!(outcome.recorded(), "a root not valid yet is a grant");
+    assert!(
+        !f.stored(&pending).await,
+        "a root not valid yet is not stored"
+    );
+    let row = f.retire_row(&session).await.unwrap();
+    assert_eq!(Some(row.expires_at), outcome.expires_at);
+    assert!(row.expires_at >= OffsetDateTime::from_unix_timestamp(pending_expiry).unwrap());
+}
+
+#[tokio::test]
+async fn sqlite_carried_roots_outside_their_time_window() {
+    carried_time_window_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_carried_roots_outside_their_time_window() {
+    let Some(f) = pg_fx("postgres_carried_roots_outside_their_time_window").await else {
+        return;
+    };
+    carried_time_window_scenario(f).await;
+}
+
+/// TC-3443 L1: a retire carrying a root in the space and a `/delegate` of
+/// another root to the same key in that space both take the space's
+/// sequence lock before the key's lock, so they never deadlock.
+async fn carried_retire_racing_delegate_scenario(f: Fx) {
+    let session = f.session_did();
+    let day = 86_400;
+    for round in 0..4 {
+        let expiry = f.created + (30 + round) * day;
+        let carried = f.delegation_until(&f.owner, &session, vec![], expiry);
+        let posted = f.delegation_until(&f.owner, &session, vec![], expiry);
+        let carry = [carried.as_str()];
+        let (retired, stored) =
+            tokio::join!(f.retire_carrying(&session, &carry), f.delegate(&posted));
+        let outcome = retired.unwrap_or_else(|error| panic!("round {round}: {error}"));
+        stored.unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert!(outcome.recorded());
+        assert!(f.stored(&carried).await && f.stored(&posted).await);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_carried_retire_racing_a_delegate_in_its_space() {
+    carried_retire_racing_delegate_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_carried_retire_racing_a_delegate_in_its_space_does_not_deadlock() {
+    let Some(f) =
+        pg_fx("postgres_carried_retire_racing_a_delegate_in_its_space_does_not_deadlock").await
+    else {
+        return;
+    };
+    carried_retire_racing_delegate_scenario(f).await;
 }

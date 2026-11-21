@@ -144,23 +144,12 @@ async fn sign_in(client: &Client, post_root: bool) -> Result<Session> {
     .await;
     ensure!(status == Status::Ok, "host delegate: {status} {body}");
 
-    let jwk = JWK::generate_ed25519()?;
-    let prepared = prepare_session(serde_json::from_value(json!({
-        "abilities": {"kv": {"": ["tinycloud.kv/get"]}},
-        "address": format!("0x{}", encode_eip55(&address)),
-        "chainId": 1,
-        "domain": "localhost",
-        "issuedAt": (now - time::Duration::minutes(1)).format(rfc3339)?,
-        "expirationTime": (now + time::Duration::hours(1)).format(rfc3339)?,
-        "spaceId": space,
-        "jwk": jwk,
-        "nonce": "tc3443retire",
-    }))?)?;
-    let signature = sign(&key, &prepared.siwe)?;
-    let session = complete_session_setup(SignedSession {
-        session: prepared,
-        signature: Signature::from(signature),
-    })?;
+    let session = session_root(
+        &JWK::generate_ed25519()?,
+        &space,
+        now - time::Duration::minutes(1),
+        now + time::Duration::hours(1),
+    )?;
     if post_root {
         let (status, body) = post(
             client,
@@ -171,6 +160,36 @@ async fn sign_in(client: &Client, post_root: bool) -> Result<Session> {
         ensure!(status == Status::Ok, "session delegate: {status} {body}");
     }
     Ok(session)
+}
+
+/// A SIWE session root from the fixture's owner to `jwk` in `space`, valid
+/// from `issued` until `expires`.
+fn session_root(
+    jwk: &JWK,
+    space: &SpaceId,
+    issued: time::OffsetDateTime,
+    expires: time::OffsetDateTime,
+) -> Result<Session> {
+    let key = SigningKey::from_bytes(&[78; 32].into())?;
+    let public = key.verifying_key().to_encoded_point(false);
+    let address: [u8; 20] = Keccak256::digest(&public.as_bytes()[1..])[12..].try_into()?;
+    let rfc3339 = &time::format_description::well_known::Rfc3339;
+    let prepared = prepare_session(serde_json::from_value(json!({
+        "abilities": {"kv": {"": ["tinycloud.kv/get"]}},
+        "address": format!("0x{}", encode_eip55(&address)),
+        "chainId": 1,
+        "domain": "localhost",
+        "issuedAt": issued.format(rfc3339)?,
+        "expirationTime": expires.format(rfc3339)?,
+        "spaceId": space,
+        "jwk": jwk,
+        "nonce": "tc3443retire",
+    }))?)?;
+    let signature = sign(&key, &prepared.siwe)?;
+    Ok(complete_session_setup(SignedSession {
+        session: prepared,
+        signature: Signature::from(signature),
+    })?)
 }
 
 /// A `kv/get` delegation from `session` to a fresh key, and that key as a
@@ -375,15 +394,29 @@ async fn retire_carrying_the_session_root_covers_a_root_posted_later() -> Result
         );
     }
 
+    // An expired root to the key is skipped and reported; the live one is
+    // admitted and covered.
+    let expired = authorization(
+        &session_root(
+            &session.jwk,
+            &session.space_id,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+        )?
+        .delegation_header,
+    )?;
     let (status, body) = retire_with_body(
         &client,
         &session_retire_token(&session, |_| ()),
-        carrying(vec![root.clone()]),
+        carrying(vec![expired, root.clone()]),
     )
     .await;
     ensure!(status == Status::Ok, "carrying retire: {status} {body}");
     let carried: Value = serde_json::from_str(&body)?;
-    ensure!(carried["recorded"] == true, "{carried}");
+    ensure!(
+        carried["recorded"] == true && carried["skipped"] == json!([0]),
+        "{carried}"
+    );
     let expires_at = carried["expiresAt"].as_str().context("expiresAt")?;
     let rfc3339 = &time::format_description::well_known::Rfc3339;
     ensure!(
@@ -391,6 +424,7 @@ async fn retire_carrying_the_session_root_covers_a_root_posted_later() -> Result
             >= time::OffsetDateTime::now_utc() + time::Duration::days(29),
         "{carried}"
     );
+    ensure!(bare.get("skipped").is_none(), "{bare}");
 
     // The thief posts the root: already stored, and the key stays retired.
     let (status, body) = post(&client, "/delegate", &root).await;

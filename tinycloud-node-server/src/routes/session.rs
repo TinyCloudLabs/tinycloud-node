@@ -69,6 +69,9 @@ pub struct SessionRetired {
     recorded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
+    /// Indexes of carried delegations left out because they had expired.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<usize>,
 }
 
 /// The optional request body: root delegations to the session key, each
@@ -114,11 +117,15 @@ fn rfc3339(time: time::OffsetDateTime) -> Result<String, (Status, String)> {
 /// admits it, inside the retire, so the retire covers it and posting it
 /// later cannot bring the key back. Each must be to the retiring key; any
 /// refusal refuses the whole request and writes nothing. A root neither
-/// carried nor stored here is not covered.
+/// carried nor stored here is not covered. A carried root that has expired
+/// is skipped and its index listed in `skipped`; one not valid yet is not
+/// stored but its signature and issuer are checked and the retire lasts
+/// until it expires.
 ///
-/// 200 `{"did", "retiredAt", "recorded", "expiresAt"?}`: `recorded: false`
-/// when this node holds no live grant for the key and none was carried,
-/// so nothing was written; a repeat call answers the first retire time.
+/// 200 `{"did", "retiredAt", "recorded", "expiresAt"?, "skipped"?}`:
+/// `recorded: false` when this node holds no live grant for the key and
+/// none was carried, so nothing was written; a repeat call answers the
+/// first retire time.
 /// 401 `session_retire_invalid: <reason>`; 429 over the per-IP limit.
 #[post("/session/retire", data = "<body>")]
 pub async fn retire_session(
@@ -196,5 +203,6 @@ pub async fn retire_session(
         retired_at: rfc3339(outcome.retired_at)?,
         recorded: outcome.recorded(),
         expires_at: outcome.expires_at.map(rfc3339).transpose()?,
+        skipped: outcome.skipped,
     }))
 }

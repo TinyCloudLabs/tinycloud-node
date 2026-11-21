@@ -476,10 +476,14 @@ request is refused. Each is admitted as `POST /delegate` admits it, inside
 the retire, so the retire covers it and posting it later cannot bring the
 key back; one already stored is fine. If any is refused, the request answers
 `401 session_retire_invalid: delegation <i>: <reason>` and nothing is
-written.
+written. A carried root that has already expired is skipped (it can never be
+posted) and its index is listed in `"skipped"`. One not valid yet (its
+`nbf` is ahead) is not stored, but its signature and issuer are checked and
+the retire lasts at least until it expires.
 
 The node answers `200 {"did": "<did:key>", "retiredAt": "<RFC3339>",
-"recorded": true, "expiresAt": "<RFC3339>"}`; a repeat call answers the first
+"recorded": true, "expiresAt": "<RFC3339>", "skipped": [<i>, ...]}`
+(`skipped` only when an expired root was skipped); a repeat call answers the first
 `retiredAt`. `"recorded": false` (and no `expiresAt`) means this node holds no
 live grant for the key and none was carried, so nothing was written. A bad
 request answers `401 session_retire_invalid: <reason>`; too many requests from
