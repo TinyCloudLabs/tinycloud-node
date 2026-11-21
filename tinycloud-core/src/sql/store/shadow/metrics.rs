@@ -1,15 +1,16 @@
-//! TC-1491 shadow-uploader metric names and label values (contract §4, TC-961).
+//! Shadow-uploader metric names and label values. No space ID, DID,
+//! database ID, key, object key or payload byte ever appears here. TC-1491.
 //!
 //! The actual Prometheus registration lives in the node server's
-//! `prometheus.rs`-style module; this file holds only the names and the fixed
-//! label value sets. No space ID, DID, database ID, key, object key or payload
-//! byte ever appears here. The `log_label` helpers keep tracing calls honest.
+//! `prometheus.rs`-style module; this file holds only the names and the
+//! fixed label value sets. The `log_label` helpers keep tracing calls
+//! honest.
 //!
-//! The counters and gauges listed below are the ones the capture hook and the
-//! uploader emit; the full registration (bootstrap totals, cycle histograms,
-//! breaker gauge) rides with the uploader in later milestones. Names and label
-//! vocabularies are pinned here so the registration code cannot drift from the
-//! contract.
+//! The counters and gauges listed below are the ones the capture hook and
+//! the uploader emit; the full registration (bootstrap totals, cycle
+//! histograms, breaker gauge) rides with the uploader in later milestones.
+//! Names and label vocabularies are pinned here so the registration code
+//! cannot drift from what the contract documents.
 
 /// Counter: `sql_store_captures_total{kind,result}`.
 pub const CAPTURES_TOTAL: &str = "sql_store_captures_total";
@@ -24,11 +25,10 @@ pub const SHED_TOTAL: &str = "sql_store_shed_total";
 /// Counter: `sql_store_lineage_switch_regression_total`.
 ///
 /// Incremented when the planner emits `Action::Switch` with
-/// `capture.revision < frontier.last_seq`. Bobbie flagged (TC-1491 PR C
-/// amendment C4) that `manifest.rs`'s `LineageSwitch` branch has no
-/// `at_seq >= last_seq` filter today, so the planner is the one place that
-/// notices and counts the regression. Slice 3 fixes the manifest; the
-/// counter stays.
+/// `capture.revision < frontier.last_seq`. The manifest's `LineageSwitch`
+/// branch does not reject that regression itself, so the planner is the
+/// one place that notices and counts it. A later slice tightens the
+/// manifest; the counter stays.
 pub const LINEAGE_SWITCH_REGRESSION_TOTAL: &str = "sql_store_lineage_switch_regression_total";
 /// Counter: `sql_store_bootstrap_total{result}`.
 pub const BOOTSTRAP_TOTAL: &str = "sql_store_bootstrap_total";

@@ -1,9 +1,11 @@
-//! Per-DB upload state and the pure planner (TC-1491 1b design, §2).
+//! Per-DB upload state and the pure planner.
 //!
-//! `plan()` decides what the uploader should do with the newest capture, given
-//! the cached manifest frontier and the upload policy. It performs no I/O.
-//! The decision rules match 1b-design §2 and the contract 11.7 "revision
-//! regression" rule (cid first, then revision).
+//! `plan()` decides what the uploader should do with the newest capture,
+//! given the cached manifest frontier and the upload policy. It performs
+//! no I/O. The decision rules check the capture's cid against the frontier
+//! first, then the revision.
+//!
+//! TC-1491.
 
 use std::time::{Duration, Instant};
 
@@ -37,13 +39,13 @@ pub enum Action {
     },
     /// The captured cid matches no current lineage; the uploader must open a
     /// new lineage via a lineage switch. Counted via
-    /// `sql_store_lineage_switch_regression_total` when the revision regressed
-    /// below the manifest's `last_seq` (PR C amendment C4: the manifest's
-    /// LineageSwitch CAS currently lacks that filter; the planner is what
-    /// notices).
+    /// `sql_store_lineage_switch_regression_total` when the revision
+    /// regressed below the manifest's `last_seq`. The manifest's
+    /// `LineageSwitch` CAS does not reject that regression itself, so the
+    /// planner is what notices and counts it.
     Switch { revision: i64, cid: String },
     /// No capture in hand and no covered frontier: the DB needs to be
-    /// bootstrapped from P. The bootstrap path is implemented in PR D; the
+    /// bootstrapped from P. The bootstrap path lands in a later change; the
     /// planner only reports the shape.
     NeedsBootstrap,
 }
@@ -122,12 +124,13 @@ impl DbState {
 
 /// The pure decision function. No I/O, no clock reads beyond `now`.
 ///
-/// Rules (1b-design §2, contract 11.7):
+/// Rules:
 /// 1. `allowed = false` → `Idle`, the uploader drops any pending capture.
-/// 2. No capture and no frontier → `NeedsBootstrap` (deferred to PR D).
+/// 2. No capture and no frontier → `NeedsBootstrap` (bootstrap lands in
+///    a later change).
 /// 3. No capture, frontier present → `Idle`.
 /// 4. Frontier absent, capture present → `Snapshot` (first publish).
-/// 5. Capture `revision <= frontier.last_seq` **and** same `cid`: `Idle`.
+/// 5. Capture `revision <= frontier.last_seq` and same `cid`: `Idle`.
 /// 6. Capture `cid != frontier.base_checkpoint_cid`: `Snapshot` in a fresh
 ///    chain of the same lineage; if the capture also regressed below
 ///    `last_seq`, the planner emits `Switch` (defensive, contract 3.3).
@@ -156,11 +159,21 @@ pub fn plan(
     };
 
     let Some(front) = frontier else {
-        // No published frontier: first publish is always a snapshot.
-        return Action::Snapshot {
-            revision: capture.revision,
-            cid: capture.cid.clone(),
-            base_seq: capture.revision.max(0) as u64,
+        // No published frontier: a first snapshot is the only valid first
+        // publish because a segment needs a published base. A `Wal` capture
+        // without a matching frontier has no base to ride on, so the planner
+        // refuses to publish it as a snapshot (it is not a snapshot's bytes).
+        // The DB falls into `NeedsBootstrap`, which the follow-up uploader
+        // satisfies via the paced P-read; an older WAL capture is left in
+        // the slot and is replaced by a fresh checkpoint capture the next
+        // time one is emitted.
+        return match capture.kind {
+            CaptureKindTag::Checkpoint => Action::Snapshot {
+                revision: capture.revision,
+                cid: capture.cid.clone(),
+                base_seq: capture.revision.max(0) as u64,
+            },
+            CaptureKindTag::Wal => Action::NeedsBootstrap,
         };
     };
 
@@ -174,10 +187,17 @@ pub fn plan(
                 cid: capture.cid.clone(),
             };
         }
-        return Action::Snapshot {
-            revision: capture.revision,
-            cid: capture.cid.clone(),
-            base_seq: capture.revision.max(0) as u64,
+        // A WAL capture whose cid does not match the frontier cannot become
+        // a snapshot (its bytes are WAL frames, not a SQLite checkpoint); it
+        // must wait for the next checkpoint capture or be bootstrapped from
+        // P. Same reasoning as the frontier-absent WAL case above.
+        return match capture.kind {
+            CaptureKindTag::Checkpoint => Action::Snapshot {
+                revision: capture.revision,
+                cid: capture.cid.clone(),
+                base_seq: capture.revision.max(0) as u64,
+            },
+            CaptureKindTag::Wal => Action::NeedsBootstrap,
         };
     }
 
@@ -279,6 +299,39 @@ mod tests {
                 cid: "cid-a".into(),
                 base_seq: 7,
             }
+        );
+    }
+
+    #[test]
+    fn wal_capture_without_frontier_is_needs_bootstrap_not_snapshot() {
+        // A Wal capture is not a snapshot's bytes; it cannot become a first
+        // publish. The planner says `NeedsBootstrap` and the uploader must
+        // read P instead.
+        let mut st = DbState::default();
+        st.mark_capture(
+            capture(7, "cid-a", CaptureKindTag::Wal, 100),
+            Instant::now(),
+        );
+        assert_eq!(
+            plan(&st, None, &policy(), true, Instant::now()),
+            Action::NeedsBootstrap
+        );
+    }
+
+    #[test]
+    fn wal_capture_with_mismatched_cid_is_needs_bootstrap_not_snapshot() {
+        // After a cid change (P checkpointed) the only valid capture to
+        // publish is a Checkpoint. A Wal capture still in the slot must
+        // wait for the next checkpoint or bootstrap from P.
+        let mut st = DbState::default();
+        st.mark_capture(
+            capture(9, "cid-b", CaptureKindTag::Wal, 100),
+            Instant::now(),
+        );
+        let f = frontier(3, 5, "cid-a");
+        assert_eq!(
+            plan(&st, Some(&f), &policy(), true, Instant::now()),
+            Action::NeedsBootstrap
         );
     }
 

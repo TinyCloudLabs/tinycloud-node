@@ -1,20 +1,22 @@
-//! TC-1491 slice 1b: the shadow uploader's capture seam and spool types.
+//! The shadow uploader's capture seam and spool types.
 //!
 //! The capture hook (in `SqlService::persist_write`) hands the bytes it has
-//! already written to Postgres to a [`ShadowSink`]. In the funded phase this
-//! is the only moment those bytes exist outside Postgres, so capturing them
-//! here avoids a second read from P (see the TC-1491 contract, section 8, and
-//! the private 1b design note R7). The sink's `captured` is non-blocking: it
-//! does a bounded [`try_send`] onto the uploader's channel and sheds on full.
+//! already written to Postgres to a [`ShadowSink`]. In the shadow phase
+//! this is the only moment those bytes exist outside Postgres, so capturing
+//! them here avoids a second read from Postgres. The sink's `captured` is
+//! non-blocking: it does a bounded `try_send` onto the uploader's channel
+//! and sheds on full.
 //!
 //! The planner, spool and uploader live in sibling modules. Nothing in this
 //! module performs I/O on its own.
 //!
 //! `NoopSink` is the default; every `SqlService` holds one unless the node
-//! runtime builds a `ShadowHandle` and calls [`SqlService::with_shadow`]. When
-//! `[sql_store] enabled = false` the service never leaves `NoopSink`, no task
-//! is spawned, and `persist_write` loses nothing beyond the one `wants()` call
-//! that returns false before any byte is cloned.
+//! runtime builds a `ShadowHandle` and calls [`SqlService::with_shadow`].
+//! When `[sql_store] enabled = false` the service never leaves `NoopSink`,
+//! no task is spawned, and `persist_write` loses nothing beyond the one
+//! `wants()` call that returns false before any byte is cloned.
+//!
+//! TC-1491.
 
 use bytes::Bytes;
 

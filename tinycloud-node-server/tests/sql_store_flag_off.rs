@@ -1,20 +1,22 @@
-//! TC-1491 PR C flag-off / allowlist-empty guarantees (contract §5.3, F1/F2).
+//! Flag-off and allowlist-empty guarantees for the SQL-store shadow
+//! wiring. The uploader's integration gate has three fail-closed states,
+//! each tested here:
 //!
-//! The uploader's integration gate has three fail-closed states, each tested
-//! here:
-//!
-//! 1. `enabled = false` → `maybe_build` returns `None`; no `ShadowHandle`,
+//! 1. `enabled = false` → `maybe_build` returns `None`: no `ShadowHandle`,
 //!    no task, no spool dir, no owner-marker IO call. `SqlService.shadow`
 //!    stays `NoopSink` and SQL writes commit as they always have.
 //! 2. `enabled = true, spaces = []` → still `None`, still no IO call. This
-//!    is the user-facing live state once PR D lifts the m2 refusal; the
-//!    flag can be edited to `true` but the allowlist stays empty by
-//!    default, so an operator explicitly chooses which space uploads.
-//! 3. `enabled = true, spaces = ["<allowed>"]` → a handle IS built AND the
-//!    owner marker is written exactly once. The sink in PR C is still the
-//!    `NoopSink` (the uploader run loop lives in a later milestone), so
-//!    the capture hook still sees `wants() == false` for every space.
-//!    What this test proves is the *construction* gate.
+//!    is the user-facing live state once a later release lifts the
+//!    build-level refusal; the flag can be edited to `true` but the
+//!    allowlist stays empty by default, so an operator explicitly chooses
+//!    which space uploads.
+//! 3. `enabled = true, spaces = ["<allowed>"]` → a handle is built and the
+//!    owner marker is written exactly once. The sink is still `NoopSink`
+//!    in this change (the uploader run loop lives in a later milestone),
+//!    so the capture hook still sees `wants() == false` for every space.
+//!    What this test proves is the construction gate.
+//!
+//! TC-1491.
 //!
 //! The actual object-store backend is faked by the `FakeIo` used in the
 //! `sql_store` module tests; we re-exercise the same construction entry
@@ -69,6 +71,12 @@ impl OwnerMarkerIo for FakeIo {
         let puts = &self.puts;
         Box::pin(async move {
             let mut current = marker.lock().unwrap();
+            if let Some(existing) = current.as_ref() {
+                if existing == &body {
+                    return Ok(());
+                }
+                return Err(ShadowBuildError::OwnerMarkerMismatch);
+            }
             *current = Some(body);
             puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())

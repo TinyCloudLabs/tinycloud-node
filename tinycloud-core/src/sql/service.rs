@@ -287,7 +287,7 @@ pub struct SqlService {
     checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
     /// The first back-off and its cap.
     checkpoint_backoff_bounds: (Duration, Duration),
-    /// The shadow uploader's capture seam (TC-1491 PR C).
+    /// The shadow uploader's capture seam (TC-1491).
     ///
     /// Defaults to [`NoopSink`] on construction, so flag-off builds (the
     /// production default) pay a single branchless `wants()` returning false
@@ -347,7 +347,7 @@ impl SqlService {
         self.bounds = bounds;
         self
     }
-    /// Wire the shadow uploader's capture sink (TC-1491 PR C). The default
+    /// Wire the shadow uploader's capture sink (TC-1491). The default
     /// is [`NoopSink`]; the node runtime calls this after
     /// [`SqlService::new`] when `[sql_store]` is enabled with a non-empty
     /// allowlist.
@@ -1204,6 +1204,22 @@ impl SqlService {
             .chunked_checkpoints("sql", &key.0, db_name)
         {
             let snapshot = handle.snapshot().await?;
+            // Capture reads the snapshot file into memory only when
+            // `shadow.wants(space)` returns true. Zero-cost for the flag-off
+            // path (the default). TC-2917 chunked artifacts means a very
+            // large checkpoint is possible here; the capture payload is the
+            // same whole-file bytes the follow-up uploader would need, so
+            // memory doubling is a known cost for allowlisted chunked
+            // databases until the capture Bytes can be backed by a file
+            // handle.
+            let space_str_ck = space.to_string();
+            let capture_snapshot_bytes = if self.shadow.wants(&space_str_ck) {
+                Some(std::fs::read(snapshot.path()).map_err(|e| {
+                    SqlError::Internal(format!("read snapshot for shadow capture: {e}"))
+                })?)
+            } else {
+                None
+            };
             let bytes = snapshot
                 .as_file()
                 .metadata()
@@ -1251,10 +1267,24 @@ impl SqlService {
                     checkpoint_size_bytes: saved.checkpoint_size_bytes.max(0) as u64,
                     expectation: ArtifactExpectation::Derived {
                         revision: saved.revision,
-                        checkpoint_content_hash: saved.checkpoint_content_hash,
+                        checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
                     },
                 },
             );
+            // Capture hook runs on the Ok arm only. Err returns above never
+            // emit; a stale-lineage conflict does not reach here. The anchor
+            // is the fresh `saved.checkpoint_content_hash`.
+            if let Some(payload_vec) = capture_snapshot_bytes {
+                self.shadow.captured(crate::sql::store::Capture {
+                    space: space_str_ck,
+                    db_id: db_name.to_string(),
+                    revision: saved.revision,
+                    cid: saved.checkpoint_content_hash,
+                    kind: crate::sql::store::CaptureKind::Checkpoint(bytes::Bytes::from(
+                        payload_vec,
+                    )),
+                });
+            }
             return Ok(());
         }
 
@@ -1268,10 +1298,10 @@ impl SqlService {
             None
         };
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
-            // TC-1491 PR C (contract A2): consult the sink BEFORE cloning any
-            // byte. `wants` returns false under flag-off, empty allowlist,
-            // breaker-open or disallowed-space, so the hot path pays only a
-            // branchless virtual call.
+            // Consult the sink before cloning any bytes. `wants` returns
+            // false under flag-off, empty allowlist, breaker-open or
+            // disallowed-space, so the hot path pays only a branchless
+            // virtual call. (TC-1491.)
             let space_str = space.to_string();
             let capture_bytes = self.shadow.wants(&space_str).then(|| wal.clone());
             match self
@@ -1295,10 +1325,9 @@ impl SqlService {
                     if let Some(mut lineage) = self.lineage.get_mut(&key) {
                         lineage.expectation = expected.advanced_to(saved.revision);
                     }
-                    // TC-1491 PR C capture hook (delta branch, contract A1/A3).
-                    // Amendment C3: only reachable on this Ok arm; a Err return
-                    // below never emits a capture, and discard_local_state
-                    // (service.rs:582,756,1109) is not touched.
+                    // Capture hook, delta branch. Only reachable on the
+                    // success arm: an Err return above never emits, and
+                    // `discard_local_state` is not touched.
                     if let (
                         Some(wal_vec),
                         ArtifactExpectation::Derived {
@@ -1350,10 +1379,10 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        // TC-1491 PR C (contract A2 + A3): one `wants()` call BEFORE the
-        // single payload clone; the clone only happens when the sink will
-        // actually consume it. The anchor cid for a checkpoint capture is
-        // `saved.checkpoint_content_hash` (below), not the old `expected`.
+        // Consult the sink before cloning any bytes; the clone only
+        // happens when the sink will actually consume it. The anchor cid
+        // for a checkpoint capture is `saved.checkpoint_content_hash`
+        // (below), not the old `expected`.
         let space_str_ck = space.to_string();
         let capture_payload = self.shadow.wants(&space_str_ck).then(|| payload.clone());
         let (saved, transfer_started) =
@@ -1402,9 +1431,9 @@ impl SqlService {
                 },
             },
         );
-        // TC-1491 PR C capture hook (checkpoint branch, contract A1/A3).
-        // Amendment C3: only the Ok path reaches here; a `StaleLineage` or
-        // save error returns above and never emits. The anchor is the fresh
+        // Capture hook, non-chunked checkpoint branch. Only the success
+        // path reaches here: a `StaleLineage` or save error returns above
+        // and never emits. The anchor is the fresh
         // `saved.checkpoint_content_hash`: no extra PG read, no stale cid.
         if let Some(payload_vec) = capture_payload {
             self.shadow.captured(crate::sql::store::Capture {
@@ -1943,9 +1972,8 @@ mod tests {
             .unwrap();
     }
 
-    /// TC-1491 PR C: a counting `ShadowSink` for the capture-hook tests
-    /// below. Records every `wants` call and every captured payload (bytes
-    /// kept because `Capture` holds the newest cumulative WAL / checkpoint).
+    /// A counting `ShadowSink` for the capture-hook tests below. Records
+    /// every `wants` call and every captured payload. (TC-1491.)
     #[derive(Debug, Default)]
     struct ProbeSink {
         allow: Vec<String>,

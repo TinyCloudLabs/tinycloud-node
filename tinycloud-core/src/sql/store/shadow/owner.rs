@@ -1,31 +1,30 @@
-//! TC-1491 1b-design §9 (owner marker + addendum).
+//! Owner marker: one host per `sql/v1/` namespace. At first enable the
+//! uploader allocates a random 128-bit store ID, persists it in the control
+//! database's `sql_store_owner` table and writes the object
+//! `sql/v1/_owner/v1` with that ID as the body via `put_if_absent`. At
+//! every subsequent boot the pair is re-checked:
 //!
-//! One host per `sql/v1/` namespace. At first enable the uploader allocates a
-//! random 128-bit store ID, persists it in the control database's
-//! `sql_store_owner` table and writes the object `sql/v1/_owner/v1` with that
-//! ID as the body via `put_if_absent`. At every subsequent boot the pair is
-//! re-checked:
-//!
-//! - both present and equal: OK.
-//! - both present and **different**: refuse to start (the object was written
-//!   by another control database; another node holds this namespace).
+//! - both present and equal: ok.
+//! - both present and different: refuse to start (the object was written by
+//!   another control database; another node holds this namespace).
 //! - row absent, marker present (control DB wiped but bucket retained):
 //!   refuse to start.
 //! - row present, marker absent: a fresh bucket was given to an existing
 //!   control DB; re-write the marker to restore the pair.
 //! - both absent: first enable; write both.
 //!
-//! None of the error paths log the body: the store ID is treated as opaque.
-//! The marker is written **before** the uploader starts its first cycle
-//! (contract O4); callers sequence that.
+//! None of the error paths log the body: the store ID is treated as
+//! opaque. The marker is written before the uploader starts its first
+//! cycle; callers sequence that.
 //!
-//! Slice 4 orphan listing and any prefix delete MUST explicitly exclude
-//! `sql/v1/_probe/` and `sql/v1/_owner/` (addendum to §9).
+//! A later change that lists orphans or deletes by prefix must exclude
+//! `sql/v1/_probe/` and `sql/v1/_owner/`, so the marker is not counted as
+//! an unregistered orphan.
+//!
+//! TC-1491.
 
 use rand::RngCore;
-use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::models::sql_store_owner as owner;
@@ -95,17 +94,15 @@ pub async fn load_owner_row<C: ConnectionTrait>(
 }
 
 /// Insert the owner row if absent; return the (possibly newly stored) store
-/// ID. The invariant is **exactly one row** across the lifetime of the
+/// ID. The invariant is exactly one row across the lifetime of the
 /// control database: a load runs first and short-circuits when a row is
-/// present, so a fresh candidate is never inserted on a second boot.
-///
-/// On a concurrent first-enable race, two workers can both see "absent" and
-/// both try to insert a row with their own `store_id` (the primary key).
-/// Different IDs leave two rows, which `load_owner_row` then rejects as
-/// malformed. The caller therefore holds a boot-time lock around this call,
-/// or accepts that only one node may initialise one `sql/v1/` namespace at
-/// a time (contract §9: one host per namespace, which the owner marker
-/// itself enforces at the bucket level).
+/// present, so a fresh candidate is never inserted on a second boot. On a
+/// concurrent first-enable race, the second writer's INSERT is guarded by a
+/// `WHERE NOT EXISTS (SELECT 1 FROM sql_store_owner)` clause that is
+/// evaluated by the engine at insert time; the second row is never written
+/// because the clause is false by then. One of the two store IDs wins; the
+/// other is lost (that candidate was never visible outside this function).
+/// Portable across SQLite, PostgreSQL and MySQL.
 pub async fn insert_or_load_owner_row(
     conn: &DatabaseConnection,
     desired: &StoreId,
@@ -116,18 +113,19 @@ pub async fn insert_or_load_owner_row(
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|e| OwnerMarkerError::System(e.to_string()))?;
-    let model = owner::ActiveModel {
-        store_id: Set(desired.as_str().to_owned()),
-        created_at: Set(now),
-    };
-    owner::Entity::insert(model)
-        .on_conflict(
-            OnConflict::columns([owner::Column::StoreId])
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(conn)
-        .await?;
+    // Singleton guard: INSERT ... SELECT ... WHERE NOT EXISTS (...) is
+    // evaluated by the engine at insert time, so a concurrent writer that
+    // races past the `load_owner_row` short-circuit above will see the
+    // guard as false and write zero rows (sea-orm's exec_without_returning
+    // does not care). Portable across SQLite, PostgreSQL and MySQL.
+    let backend = conn.get_database_backend();
+    let stmt = sea_orm::Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO sql_store_owner (store_id, created_at) \
+         SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM sql_store_owner)",
+        [desired.as_str().into(), now.into()],
+    );
+    conn.execute(stmt).await?;
     load_owner_row(conn)
         .await?
         .ok_or_else(|| OwnerMarkerError::System("owner row inserted but not readable".into()))

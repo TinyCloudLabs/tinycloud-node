@@ -1,12 +1,11 @@
-//! TC-1491 1b-design §9: the node-identity fence for the `sql/v1/` namespace.
+//! The node-identity fence for the `sql/v1/` namespace.
 //!
-//! One row (asserted at insert time) holds the node's 128-bit store ID in hex
-//! and its creation time. The boot check pairs this with the object
-//! `sql/v1/_owner/v1` so a bucket that was once owned by a different control
-//! database refuses to start.
+//! One row (asserted at insert time) holds the node's 128-bit store ID in
+//! hex and its creation time. The boot check pairs this with the object
+//! `sql/v1/_owner/v1` so a bucket that was once owned by a different
+//! control database refuses to start.
 //!
-//! **[shadow only]** The down migration drops the table; in store-master the
-//! row is part of the identity fence and down must refuse.
+//! TC-1491.
 
 use sea_orm::entity::prelude::*;
 

@@ -1,19 +1,23 @@
-//! TC-1491 1b-design §9 (owner marker): the `sql_store_owner` row that pairs
-//! with the `sql/v1/_owner/v1` object at boot.
+//! Owner marker: the `sql_store_owner` row that pairs with the
+//! `sql/v1/_owner/v1` object at boot.
 //!
 //! One empty table, no foreign keys, no index on any existing table, no
-//! backfill. **MySQL-safe**: `varchar(32)` primary key (128-bit hex) plus a
-//! bounded `varchar(40)` timestamp, both well under the 3,072-byte InnoDB key
-//! cap. Re-run is a no-op (IF NOT EXISTS).
+//! backfill. MySQL-safe: `varchar(32)` primary key (128-bit hex) plus a
+//! bounded `varchar(40)` timestamp, both well under the 3,072-byte InnoDB
+//! key cap. Re-run is a no-op (IF NOT EXISTS).
 //!
-//! Interaction with TC-3443 (`m20261121_000000_session_retire`, node 1.26.18):
-//! disjoint tables (`revocation`/session rows vs this fresh table), disjoint
-//! control-DB state. SeaORM applies by version string, so this migration (date
-//! 2026-11-22) runs strictly after the session-retire migration whichever is
-//! installed first. No conflict.
+//! Interaction with `m20261121_000000_session_retire` (ships as node
+//! 1.26.18): disjoint tables (revocation and session rows vs this fresh
+//! table), disjoint control-DB state. SeaORM applies by version string, so
+//! this migration (date 2026-11-22) runs strictly after the session-retire
+//! migration whichever is installed first. No conflict.
 //!
-//! **[shadow only]** `down` drops the table. In store-master the row is the
-//! identity fence and `down` must be replaced by a refusing variant.
+//! `down` refuses: the row is the SQL block store's identity fence.
+//! Operators who truly want to walk this back must either prefix-delete
+//! `sql/v1/_owner/v1` with written authorization (the runbook) or restore
+//! the control-DB row from backup.
+//!
+//! TC-1491.
 
 use sea_orm_migration::prelude::*;
 
@@ -28,10 +32,19 @@ impl MigrationTrait for Migration {
         manager.create_table(owner_table()).await
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(owner::Entity).if_exists().to_owned())
-            .await
+    /// Refusing down.
+    ///
+    /// The owner row is the SQL block store's identity fence. Dropping it
+    /// alongside a retained `sql/v1/_owner/v1` object in the bucket would
+    /// let a later boot re-pair against a brand-new, randomly-minted store
+    /// ID and claim the namespace. Operators who truly want to walk this
+    /// back must either prefix-delete `sql/v1/_owner/v1` with written
+    /// authorization (the runbook) or restore the control-DB row from
+    /// backup; neither is something a blind migrator rollback should do.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Err(DbErr::Custom(
+            "sql_store_owner down is refused: the row is the SQL block store identity fence; see the runbook".into(),
+        ))
     }
 }
 
@@ -68,13 +81,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_down_then_up_runs() {
+    async fn down_is_refused() {
         let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
         Migrator::up(&conn, None).await.unwrap();
-        Migration.down(&SchemaManager::new(&conn)).await.unwrap();
-        Migration.up(&SchemaManager::new(&conn)).await.unwrap();
+        let err = Migration
+            .down(&SchemaManager::new(&conn))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("sql_store_owner down is refused"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
