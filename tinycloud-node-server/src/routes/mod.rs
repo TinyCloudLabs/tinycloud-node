@@ -368,6 +368,8 @@ fn identity_resolution_error(error: database_migration::MigrationError) -> (Stat
 
 #[derive(Serialize)]
 pub struct DidResolutionInfo {
+    /// Always `false`: no setting enables network DID methods (TC-1500).
+    /// Kept for `/info` readers.
     pub network_methods: bool,
     pub refused_total: u64,
 }
@@ -444,7 +446,7 @@ fn build_info(
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
         did_resolution: DidResolutionInfo {
-            network_methods: tinycloud_core::did_resolution::policy().network_methods,
+            network_methods: false,
             refused_total: tinycloud_core::did_resolution::refused_total(),
         },
         // Two relaxed atomic loads: `/info` is public and polled.

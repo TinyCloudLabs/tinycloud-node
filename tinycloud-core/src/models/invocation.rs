@@ -89,6 +89,8 @@ pub enum InvocationError {
     InvalidSignature,
     #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
     UnsupportedDidMethod(String),
+    #[error("did_unverifiable: this `did:{0}` identifier is malformed or names a key type this node cannot verify")]
+    UnverifiableDid(String),
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     DidUrlQueryRejected,
     #[error("Unauthorized Invoker")]
@@ -258,6 +260,7 @@ pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), E
             UcanVerifyError::MethodDisabled { method } => {
                 InvocationError::UnsupportedDidMethod(method)
             }
+            UcanVerifyError::Unverifiable { method } => InvocationError::UnverifiableDid(method),
             UcanVerifyError::QueryRejected => InvocationError::DidUrlQueryRejected,
             UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
                 InvocationError::InvalidSignature

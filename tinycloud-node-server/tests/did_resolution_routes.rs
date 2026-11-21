@@ -32,13 +32,31 @@ async fn client() -> (Client, tempfile::TempDir) {
     (Client::tracked(rocket).await.unwrap(), dir)
 }
 
-async fn assert_route_refuses(path: &str, status: Status) {
+/// The production z2D… form: an Ed25519 key behind a one-byte 0xed prefix (TC-1500).
+fn z2d_did_key() -> String {
+    use tinycloud_auth::ipld_core::cid::multibase;
+    format!(
+        "did:key:{}",
+        multibase::encode(multibase::Base::Base58Btc, [&[0xed][..], &[9; 32]].concat())
+    )
+}
+
+/// `path` refuses a UCAN from a `did:web` issuer with `did_method_disabled:`, or from a
+/// malformed `did:key` issuer with `did_unverifiable:`, without connecting anywhere.
+async fn assert_route_refuses(path: &str, status: Status, malformed_key: bool) {
     let (client, _dir) = client().await;
     let listener = bound_listener();
-    let issuer = format!(
-        "did:web:127.0.0.1%3A{}",
-        listener.local_addr().unwrap().port()
-    );
+    let (issuer, code) = if malformed_key {
+        (z2d_did_key(), "did_unverifiable:")
+    } else {
+        (
+            format!(
+                "did:web:127.0.0.1%3A{}",
+                listener.local_addr().unwrap().port()
+            ),
+            "did_method_disabled:",
+        )
+    };
     let jwk = JWK::generate_ed25519().unwrap();
     let ucan = signed_ucan(&issuer, &jwk, Algorithm::EdDSA);
     let token = if path == "/revoke" {
@@ -62,21 +80,59 @@ async fn assert_route_refuses(path: &str, status: Status) {
         .await;
     assert_eq!(response.status(), status);
     let body = response.into_string().await.unwrap();
-    assert!(body.starts_with("did_method_disabled:"), "{body}");
+    assert!(body.starts_with(code), "{body}");
     assert_no_connections(&[&listener]).await;
 }
 
 #[tokio::test]
 async fn invoke_keeps_401_with_method_disabled_body() {
-    assert_route_refuses("/invoke", Status::Unauthorized).await;
+    assert_route_refuses("/invoke", Status::Unauthorized, false).await;
 }
 #[tokio::test]
 async fn delegate_keeps_401_with_method_disabled_body() {
-    assert_route_refuses("/delegate", Status::Unauthorized).await;
+    assert_route_refuses("/delegate", Status::Unauthorized, false).await;
 }
 #[tokio::test]
 async fn revoke_keeps_403_with_method_disabled_body() {
-    assert_route_refuses("/revoke", Status::Forbidden).await;
+    assert_route_refuses("/revoke", Status::Forbidden, false).await;
+}
+#[tokio::test]
+async fn invoke_refuses_malformed_did_key_issuer_with_401() {
+    assert_route_refuses("/invoke", Status::Unauthorized, true).await;
+}
+#[tokio::test]
+async fn delegate_refuses_malformed_did_key_issuer_with_401() {
+    assert_route_refuses("/delegate", Status::Unauthorized, true).await;
+}
+#[tokio::test]
+async fn revoke_refuses_malformed_did_key_issuer_with_403() {
+    assert_route_refuses("/revoke", Status::Forbidden, true).await;
+}
+
+/// TC-1500: `/delegate` refuses a grant to a holder the node cannot verify, before any
+/// lock. Acceptance of verifiable holders is covered in `tinycloud-core`.
+#[tokio::test]
+async fn delegate_refuses_unverifiable_holder_with_401() {
+    use tinycloud_auth::resolver::DID_METHODS;
+    let (client, _dir) = client().await;
+    let key = JWK::generate_ed25519().unwrap();
+    let issuer = DID_METHODS.generate(&key, "key").unwrap().to_string();
+    for holder in [z2d_did_key(), "did:web:example.com".to_owned()] {
+        let token = signed_ucan_to(&issuer, &holder, &key, Algorithm::EdDSA, true)
+            .encode()
+            .unwrap();
+        let response = client
+            .post("/delegate")
+            .header(Header::new("Authorization", token))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "{holder}");
+        let body = response.into_string().await.unwrap();
+        assert!(
+            body.starts_with("did_holder_unverifiable:"),
+            "{holder}: {body}"
+        );
+    }
 }
 
 #[tokio::test]
