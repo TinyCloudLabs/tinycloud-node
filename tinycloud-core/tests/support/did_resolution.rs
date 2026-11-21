@@ -27,6 +27,9 @@ pub async fn assert_no_connections(listeners: &[&TcpListener]) {
     }
 }
 
+/// A valid Ed25519 `did:key` holder for fixtures that do not name one.
+pub const HOLDER: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
 pub fn signed_ucan(issuer: &str, jwk: &JWK, algorithm: Algorithm) -> Ucan {
     signed_ucan_with_proof(issuer, jwk, algorithm, true)
 }
@@ -37,10 +40,20 @@ pub fn signed_ucan_with_proof(
     algorithm: Algorithm,
     has_proof: bool,
 ) -> Ucan {
+    signed_ucan_to(issuer, HOLDER, jwk, algorithm, has_proof)
+}
+
+pub fn signed_ucan_to(
+    issuer: &str,
+    audience: &str,
+    jwk: &JWK,
+    algorithm: Algorithm,
+    has_proof: bool,
+) -> Ucan {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     Payload {
         issuer: issuer.parse().unwrap(),
-        audience: "did:key:audience".parse().unwrap(),
+        audience: audience.parse().unwrap(),
         expiration: NumericDate::try_from_seconds((now + 300) as f64).unwrap(),
         not_before: Some(NumericDate::try_from_seconds((now - 10) as f64).unwrap()),
         nonce: Some("tc1080-local-refusal".into()),

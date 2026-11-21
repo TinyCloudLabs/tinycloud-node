@@ -1,10 +1,16 @@
 //! Node UCAN issuer resolution policy. DID syntax and identity comparisons are unaffected.
+//!
+//! The node verifies a signature only when it can derive the signer's key offline. A DID is
+//! accepted when its method is `key`, `pkh` or `jwk` and its identifier names a key type or
+//! account namespace the node verifies; every other DID is refused before any resolution
+//! (TC-1500). No setting enables another method.
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -14,30 +20,15 @@ use tinycloud_auth::ssi::{
         resolution::{self, Options, Output},
         AnyDidMethod, DIDResolver, DID, DIDURL,
     },
-    jwk::{Algorithm, JWK},
+    jwk::{Algorithm, Params, JWK},
+    multicodec::MultiEncoded,
     ucan::{Ucan, UcanRevocation},
 };
 
+/// The DID methods whose verification material the node derives without network access.
 pub const OFFLINE_DID_METHODS: &[&str] = &["key", "pkh", "jwk"];
-static NETWORK_METHODS: AtomicBool = AtomicBool::new(false);
 static REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REFUSAL_OBSERVER: OnceLock<fn(&str, &str)> = OnceLock::new();
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DidResolutionPolicy {
-    pub network_methods: bool,
-}
-
-/// Set the process policy from effective startup configuration.
-pub fn configure(policy: DidResolutionPolicy) {
-    NETWORK_METHODS.store(policy.network_methods, Ordering::Relaxed);
-}
-
-pub fn policy() -> DidResolutionPolicy {
-    DidResolutionPolicy {
-        network_methods: NETWORK_METHODS.load(Ordering::Relaxed),
-    }
-}
 
 /// Process-lifetime refusal count. Public status reads never acquire a lock.
 pub fn refused_total() -> u64 {
@@ -53,6 +44,8 @@ pub fn set_refusal_observer(observer: fn(&str, &str)) {
 pub enum UcanVerifyError {
     #[error("did_method_disabled: DID method `{method}` is not resolvable on this node")]
     MethodDisabled { method: String },
+    #[error("did_unverifiable: this `did:{method}` identifier is malformed or names a key type this node cannot verify")]
+    Unverifiable { method: String },
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     QueryRejected,
     #[error("did_resolution_timeout")]
@@ -61,44 +54,232 @@ pub enum UcanVerifyError {
     Invalid,
 }
 
-/// Defence in depth for callers resolving a DID directly.
-pub struct NodeDidResolver {
-    network_methods: bool,
+/// Why [`check_verifiable`] refuses a DID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unverifiable {
+    /// The method is not one of [`OFFLINE_DID_METHODS`].
+    MethodDisabled,
+    /// The method is offline, but the identifier is malformed, too long, or names a key type
+    /// or account namespace the node cannot verify.
+    Identifier,
 }
-impl NodeDidResolver {
-    pub fn current() -> Self {
-        Self {
-            network_methods: policy().network_methods,
-        }
-    }
 
-    fn check(&self, issuer: &DIDURL) -> Result<(), UcanVerifyError> {
-        if issuer.query().is_some() {
-            refused(issuer.did(), "query_rejected");
-            return Err(UcanVerifyError::QueryRejected);
-        }
-        self.check_method(issuer.did())
-    }
-
-    fn check_method(&self, did: &DID) -> Result<(), UcanVerifyError> {
-        let method = did.method_name();
-        if !self.network_methods && !OFFLINE_DID_METHODS.contains(&method) {
-            refused(did, "method_disabled");
-            return Err(UcanVerifyError::MethodDisabled {
-                method: method.to_owned(),
-            });
-        }
+/// Whether the node can verify a signature by `did` offline:
+///
+/// - `did:key`: base58btc multibase over an Ed25519 (`0xed 0x01`), secp256k1 (`0xe7 0x01`) or
+///   P-256 (`0x80 0x24`) public key, compressed for the two elliptic curves. The identifier
+///   length is checked before the base58 decode.
+/// - `did:jwk`: an Ed25519 OKP key or a secp256k1 or P-256 EC key, public only, in an identifier
+///   of at most [`MAX_DID_JWK_ID_LEN`] characters, checked before decoding.
+/// - `did:pkh`: CAIP-10 accounts in the `eip155`, `solana` and `bip122` (Bitcoin and Dogecoin
+///   mainnet) namespaces.
+///
+/// Keys are checked to be valid points on their curve. Runs no lookup and allocates at most a
+/// bounded decode.
+pub fn check_verifiable(did: &DID) -> Result<(), Unverifiable> {
+    let id = did.method_specific_id();
+    let verifiable = match did.method_name() {
+        "key" => did_key_verifiable(id),
+        "jwk" => did_jwk_verifiable(id),
+        "pkh" => did_pkh_verifiable(id),
+        _ => return Err(Unverifiable::MethodDisabled),
+    };
+    if verifiable {
         Ok(())
+    } else {
+        Err(Unverifiable::Identifier)
     }
 }
+
+/// Characters in a `did:key` identifier: 48 for Ed25519 (34 bytes), 49 for a compressed
+/// secp256k1 or P-256 key (35 bytes).
+const DID_KEY_ID_LENS: [usize; 2] = [48, 49];
+
+fn did_key_verifiable(id: &str) -> bool {
+    // M1: base58 decoding is quadratic, so the length is checked first.
+    if !DID_KEY_ID_LENS.contains(&id.len()) || !id.starts_with('z') {
+        return false;
+    }
+    #[cfg(test)]
+    tests::count_decode();
+    let Ok((_, bytes)) = tinycloud_auth::ipld_core::cid::multibase::decode(id) else {
+        return false;
+    };
+    let supported = match bytes.as_slice() {
+        [0xed, 0x01, key @ ..] => ed25519_strong(key),
+        [0xe7, 0x01, key @ ..] | [0x80, 0x24, key @ ..] => key.len() == 33,
+        _ => false,
+    };
+    supported
+        && MultiEncoded::new(&bytes)
+            .ok()
+            .is_some_and(|encoded| JWK::from_multicodec(encoded).is_ok())
+}
+
+/// Longest `did:jwk` identifier decoded: 192 bytes of JWK JSON. A public EC key with `crv`,
+/// `kty`, `x` and `y` is 160 characters; the rest leaves room for short members such as `alg`.
+pub const MAX_DID_JWK_ID_LEN: usize = 256;
+
+fn did_jwk_verifiable(id: &str) -> bool {
+    // N1: the identifier is bounded before decoding, so no member can be oversized.
+    if id.len() > MAX_DID_JWK_ID_LEN {
+        return false;
+    }
+    #[cfg(test)]
+    tests::count_decode();
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(id) else {
+        return false;
+    };
+    let Ok(jwk) = serde_json::from_slice::<JWK>(&bytes) else {
+        return false;
+    };
+    let supported = match &jwk.params {
+        Params::OKP(okp) => {
+            okp.curve == "Ed25519" && okp.private_key.is_none() && ed25519_strong(&okp.public_key.0)
+        }
+        Params::EC(ec) => {
+            matches!(ec.curve.as_deref(), Some("secp256k1" | "P-256"))
+                && ec.ecc_private_key.is_none()
+        }
+        _ => false,
+    };
+    // The multicodec round trip checks the key is a valid point of its curve.
+    supported
+        && jwk
+            .to_multicodec()
+            .ok()
+            .is_some_and(|encoded| JWK::from_multicodec(&encoded).is_ok())
+}
+
+/// Longest `did:pkh` identifier parsed: namespace, a CAIP-2 reference of at most 32 characters
+/// and an address.
+const MAX_DID_PKH_ID_LEN: usize = 96;
+const BIP122_BITCOIN_MAINNET: &str = "000000000019d6689c085ae165831e93";
+const BIP122_DOGECOIN_MAINNET: &str = "1a91e3dace36e2be3bf030a65679fe82";
+
+fn did_pkh_verifiable(id: &str) -> bool {
+    if id.len() > MAX_DID_PKH_ID_LEN {
+        return false;
+    }
+    #[cfg(test)]
+    tests::count_decode();
+    let mut parts = id.split(':');
+    let (Some(namespace), Some(reference), Some(address), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if reference.is_empty()
+        || reference.len() > 32
+        || !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    match namespace {
+        "eip155" => {
+            reference.bytes().all(|b| b.is_ascii_digit())
+                && address.len() == 42
+                && address
+                    .strip_prefix("0x")
+                    .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        }
+        "solana" => {
+            (32..=44).contains(&address.len())
+                && base58_decode(address).is_some_and(|key| ed25519_strong(&key))
+        }
+        "bip122" => {
+            matches!(reference, BIP122_BITCOIN_MAINNET | BIP122_DOGECOIN_MAINNET)
+                && (25..=35).contains(&address.len())
+                && base58_decode(address).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn base58_decode(value: &str) -> Option<Vec<u8>> {
+    tinycloud_auth::ipld_core::cid::multibase::Base::Base58Btc
+        .decode(value)
+        .ok()
+}
+
+/// A 32-byte Ed25519 public key that decompresses and is not of small order. ssi verifies
+/// with dalek's non-strict `verify`, under which anyone can sign for a small-order key, so a
+/// grant to one would be a grant to everyone.
+fn ed25519_strong(key: &[u8]) -> bool {
+    <[u8; 32]>::try_from(key)
+        .ok()
+        .and_then(|key| ed25519_dalek::VerifyingKey::from_bytes(&key).ok())
+        .is_some_and(|key| !key.is_weak())
+}
+
+/// Refuse a DID the node cannot verify offline, counting and logging the refusal.
+fn check_did(did: &DID) -> Result<(), UcanVerifyError> {
+    match check_verifiable(did) {
+        Ok(()) => Ok(()),
+        Err(Unverifiable::MethodDisabled) => {
+            refused(did, "method_disabled");
+            Err(UcanVerifyError::MethodDisabled {
+                method: did.method_name().to_owned(),
+            })
+        }
+        Err(Unverifiable::Identifier) => {
+            refused(did, "unverifiable");
+            Err(UcanVerifyError::Unverifiable {
+                method: did.method_name().to_owned(),
+            })
+        }
+    }
+}
+
+fn check_issuer(issuer: &DIDURL) -> Result<(), UcanVerifyError> {
+    if issuer.query().is_some() {
+        refused(issuer.did(), "query_rejected");
+        return Err(UcanVerifyError::QueryRejected);
+    }
+    check_did(issuer.did())
+}
+
+/// Whether a grant may name `did` as its holder: a DID the node can verify offline, or a
+/// Policy/v3 delegate (`did:tinycloud:policy:<64 lowercase hex>`), which holds a policy root
+/// and never signs. Counted as a refusal with reason `holder_unverifiable` when it may not.
+pub fn check_holder(did: &str) -> bool {
+    if did
+        .strip_prefix("did:tinycloud:policy:")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    {
+        return true;
+    }
+    let Ok(parsed) = DID::new(did.as_bytes()) else {
+        REFUSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if let Some(observer) = REFUSAL_OBSERVER.get() {
+            observer("unknown", "holder_unverifiable");
+        }
+        return false;
+    };
+    if check_verifiable(parsed).is_ok() {
+        return true;
+    }
+    refused(parsed, "holder_unverifiable");
+    false
+}
+
+/// Defence in depth for callers resolving a DID directly: a DID the node cannot verify
+/// offline is refused before the offline resolver is consulted.
+pub struct NodeDidResolver;
 impl DIDResolver for NodeDidResolver {
     async fn resolve_representation<'a>(
         &'a self,
         did: &'a DID,
         options: Options,
     ) -> Result<Output<Vec<u8>>, resolution::Error> {
-        self.check_method(did)
-            .map_err(resolution::Error::internal)?;
+        check_did(did).map_err(resolution::Error::internal)?;
         AnyDidMethod::default()
             .resolve_representation(did, options)
             .await
@@ -111,12 +292,14 @@ where
     F: for<'de> Deserialize<'de> + Serialize,
     A: for<'de> Deserialize<'de> + Serialize,
 {
-    let resolver = NodeDidResolver::current();
-    resolver.check(&ucan.payload().issuer)?;
-    tokio::time::timeout(did_resolution_timeout(), ucan.verify_signature(&resolver))
-        .await
-        .map_err(|_| UcanVerifyError::Timeout)?
-        .map_err(|_| UcanVerifyError::Invalid)
+    check_issuer(&ucan.payload().issuer)?;
+    tokio::time::timeout(
+        did_resolution_timeout(),
+        ucan.verify_signature(&NodeDidResolver),
+    )
+    .await
+    .map_err(|_| UcanVerifyError::Timeout)?
+    .map_err(|_| UcanVerifyError::Invalid)
 }
 
 /// Equivalent entry point for the SSI revocation format (node revocations use UCANs).
@@ -125,11 +308,10 @@ pub async fn verify_ucan_revocation_signature(
     algorithm: Algorithm,
     jwk: Option<&JWK>,
 ) -> Result<(), UcanVerifyError> {
-    let resolver = NodeDidResolver::current();
-    resolver.check(&revocation.issuer)?;
+    check_issuer(&revocation.issuer)?;
     tokio::time::timeout(
         did_resolution_timeout(),
-        revocation.verify_signature(&resolver, algorithm, jwk),
+        revocation.verify_signature(&NodeDidResolver, algorithm, jwk),
     )
     .await
     .map_err(|_| UcanVerifyError::Timeout)?
@@ -236,7 +418,238 @@ pub fn did_resolution_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::{Mutex, OnceLock};
+    use tinycloud_auth::{ipld_core::cid::multibase, resolver::DID_METHODS};
+
+    thread_local! {
+        static DECODES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts identifier decodes, so tests can prove a length cap refuses before decoding.
+    pub(super) fn count_decode() {
+        DECODES.with(|decodes| decodes.set(decodes.get() + 1));
+    }
+
+    /// The verdict for `did` and the identifier decodes it took.
+    fn verdict(did: &str) -> (Result<(), Unverifiable>, usize) {
+        let before = DECODES.with(Cell::get);
+        let result = check_verifiable(DID::new(did.as_bytes()).unwrap());
+        (result, DECODES.with(Cell::get) - before)
+    }
+
+    fn did_key(bytes: &[u8]) -> String {
+        format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, bytes)
+        )
+    }
+
+    fn did_jwk(jwk: serde_json::Value) -> String {
+        format!("did:jwk:{}", URL_SAFE_NO_PAD.encode(jwk.to_string()))
+    }
+
+    fn generated(key: &JWK, method: &str) -> String {
+        DID_METHODS.generate(key, method).unwrap().to_string()
+    }
+
+    fn address(did: &str) -> &str {
+        did.rsplit(':').next().unwrap()
+    }
+
+    /// A Tezos account; the node's ssi build cannot generate one.
+    const TEZOS: &str = "did:pkh:tezos:NetXdQprcVkpaWU:tz1YwA1FwpgLtc1G8DKbbZ6e6PTb1dQMRn5x";
+
+    #[test]
+    fn accepts_every_offline_key_type_and_account_namespace() {
+        let ed = JWK::generate_ed25519().unwrap();
+        let k1 = JWK::generate_secp256k1();
+        let p256 = JWK::generate_p256();
+        let mut accepted = vec![];
+        for key in [&ed, &k1, &p256] {
+            accepted.push(generated(key, "key"));
+            accepted.push(generated(key, "jwk"));
+        }
+        let eip155 = generated(&k1, "pkh:eip155:1");
+        accepted.push(eip155.clone());
+        accepted.push(eip155.replace(":1:", ":137:").to_lowercase());
+        accepted.push(generated(
+            &k1,
+            "pkh:bip122:000000000019d6689c085ae165831e93",
+        ));
+        accepted.push(format!(
+            "did:pkh:bip122:{BIP122_DOGECOIN_MAINNET}:{}",
+            address(&generated(&k1, "pkh:doge"))
+        ));
+        accepted.push(format!(
+            "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:{}",
+            address(&generated(&ed, "pkh:sol"))
+        ));
+        assert!(accepted[0].starts_with("did:key:z6Mk"));
+        assert!(accepted[2].starts_with("did:key:zQ3s"));
+        assert!(accepted[4].starts_with("did:key:zDn"));
+        for did in accepted {
+            assert_eq!(verdict(&did).0, Ok(()), "{did}");
+            assert!(check_holder(&did), "{did}");
+        }
+    }
+
+    #[test]
+    fn refuses_unverifiable_did_keys_with_lengths_checked_before_decoding() {
+        let ed = JWK::generate_ed25519().unwrap();
+        let Params::OKP(okp) = &ed.params else {
+            unreachable!()
+        };
+        let x = &okp.public_key.0;
+        // The production z2D… host keys: a one-byte 0xed prefix, not the 0xed 0x01 varint.
+        let z2d = did_key(&[&[0xed][..], x].concat());
+        assert!(z2d.starts_with("did:key:z2D"), "{z2d}");
+        let p384 = did_key(&[&[0x81, 0x24, 0x02][..], &[7; 48]].concat());
+        let oversized = format!("did:key:z{}", "1".repeat(10_000));
+        let base64_multibase = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base64Url, [&[0xed, 0x01][..], x].concat())
+        );
+        for did in [&z2d, &p384, &oversized, &base64_multibase] {
+            assert_eq!(verdict(did), (Err(Unverifiable::Identifier), 0), "{did}");
+        }
+        // Within the length bounds: decoded once, then refused.
+        let not_on_curve = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|y| ed25519_dalek::VerifyingKey::from_bytes(y).is_err())
+            .unwrap();
+        let secp256k1_x_out_of_range = [&[0xe7, 0x01, 0x02][..], &[0xff; 32]].concat();
+        let ed25519_private = [&[0x80, 0x26][..], x].concat();
+        for bytes in [
+            [&[0xed, 0x01][..], &not_on_curve].concat(),
+            secp256k1_x_out_of_range,
+            ed25519_private,
+        ] {
+            let did = did_key(&bytes);
+            if DID_KEY_ID_LENS.contains(&did.len().saturating_sub(8)) {
+                assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 1), "{did}");
+            } else {
+                assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 0), "{did}");
+            }
+            assert!(!check_holder(&did), "{did}");
+        }
+        assert!(!check_holder(&z2d));
+    }
+
+    #[test]
+    fn refuses_unverifiable_did_jwks_with_length_checked_before_decoding() {
+        let ed = serde_json::to_value(JWK::generate_ed25519().unwrap()).unwrap();
+        let p256 = serde_json::to_value(JWK::generate_p256().to_public()).unwrap();
+        let mut off_curve = p256.clone();
+        off_curve["y"] = serde_json::json!(URL_SAFE_NO_PAD.encode([0xff; 32]));
+        let mut p384 = p256.clone();
+        p384["crv"] = serde_json::json!("P-384");
+        let mut x25519 =
+            serde_json::to_value(JWK::generate_ed25519().unwrap().to_public()).unwrap();
+        x25519["crv"] = serde_json::json!("X25519");
+        // Ed25519 private key material, `d`, makes the DID malformed.
+        for jwk in [ed, off_curve, p384, x25519] {
+            let did = did_jwk(jwk);
+            assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 1), "{did}");
+            assert!(!check_holder(&did), "{did}");
+        }
+        let mut padded = serde_json::to_value(JWK::generate_p256().to_public()).unwrap();
+        padded["kid"] = serde_json::json!("k".repeat(MAX_DID_JWK_ID_LEN));
+        let did = did_jwk(padded);
+        assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 0), "{did}");
+    }
+
+    #[test]
+    fn refuses_unverifiable_did_pkh_accounts() {
+        let k1 = JWK::generate_secp256k1();
+        let ed = JWK::generate_ed25519().unwrap();
+        let eip155 = generated(&k1, "pkh:eip155:1");
+        let account = address(&eip155);
+        for did in [
+            TEZOS.to_owned(),
+            generated(&k1, "pkh:eth"),
+            generated(&ed, "pkh:sol"),
+            generated(&k1, "pkh:btc"),
+            format!("did:pkh:eip155:1:{}", &account[..41]),
+            format!("did:pkh:eip155:1:{}g", &account[..41]),
+            format!("did:pkh:eip155:mainnet:{account}"),
+            format!("did:pkh:eip155:1:{account}:extra"),
+            format!("did:pkh:eip155::{account}"),
+            format!(
+                "did:pkh:bip122:000000000933ea01ad0ee984209779ba:{}",
+                address(&generated(&k1, "pkh:btc"))
+            ),
+            format!(
+                "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:{}",
+                multibase::Base::Base58Btc.encode([1; 31])
+            ),
+        ] {
+            assert_eq!(verdict(&did).0, Err(Unverifiable::Identifier), "{did}");
+            assert!(!check_holder(&did), "{did}");
+        }
+        let long = format!(
+            "did:pkh:eip155:{}:{account}",
+            "1".repeat(MAX_DID_PKH_ID_LEN)
+        );
+        assert_eq!(verdict(&long), (Err(Unverifiable::Identifier), 0));
+    }
+
+    /// TC-1500 review N1: small-order Ed25519 keys (identity, order 2, order 4) are refused in
+    /// every form that names an Ed25519 key, because anyone can sign for them.
+    #[test]
+    fn refuses_small_order_ed25519_keys() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mut order_two = [0xff; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        for key in [identity, order_two, [0; 32]] {
+            let point = ed25519_dalek::VerifyingKey::from_bytes(&key).unwrap();
+            assert!(point.is_weak());
+            let x = URL_SAFE_NO_PAD.encode(key);
+            for did in [
+                did_key(&[&[0xed, 0x01][..], &key].concat()),
+                did_jwk(serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": x})),
+                format!(
+                    "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:{}",
+                    multibase::Base::Base58Btc.encode(key)
+                ),
+            ] {
+                assert_eq!(verdict(&did), (Err(Unverifiable::Identifier), 1), "{did}");
+                assert!(!check_holder(&did), "{did}");
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_network_methods_and_exempts_only_policy_holders() {
+        for did in [
+            "did:web:example.com",
+            "did:ethr:0xb9c5714089478a327f09197987f16f9e5d936e8a",
+            "did:ion:EiClkZMDxPKqC9c-umQfTkR8vvZ9JPhl_xLDI9Nfk38w5w",
+            "did:tz:tz1YwA1FwpgLtc1G8DKbbZ6e6PTb1dQMRn5x",
+        ] {
+            assert_eq!(
+                verdict(did),
+                (Err(Unverifiable::MethodDisabled), 0),
+                "{did}"
+            );
+            assert!(!check_holder(did), "{did}");
+        }
+        let digest = "0123456789abcdef".repeat(4);
+        let policy = format!("did:tinycloud:policy:{digest}");
+        assert_eq!(verdict(&policy).0, Err(Unverifiable::MethodDisabled));
+        assert!(check_holder(&policy));
+        for did in [
+            format!("did:tinycloud:policy:{}", digest.to_uppercase()),
+            format!("did:tinycloud:policy:{}", &digest[..63]),
+            format!("did:tinycloud:policy:{digest}0"),
+            format!("did:tinycloud:other:{digest}"),
+            "not a did".into(),
+        ] {
+            assert!(!check_holder(&did), "{did}");
+        }
+    }
 
     #[test]
     fn refusal_limiter_counts_suppression_and_bounds_global_warnings() {

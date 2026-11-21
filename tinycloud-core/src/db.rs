@@ -2941,8 +2941,8 @@ where
             {
                 continue;
             }
-            // TC-1500 (#677): after the rebase `check_holder` runs here, in
-            // `delegation::precheck`, and again in `process_with` below, as
+            // TC-1500: `check_holder` runs in `delegation::precheck` (via
+            // `check_capability_rules`) and again in `process_with` below, as
             // for every other new delegation.
             delegation::precheck(
                 &self.conn,

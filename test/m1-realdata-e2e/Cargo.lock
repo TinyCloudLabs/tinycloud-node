@@ -7955,6 +7955,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "cacaos",
+ "ed25519-dalek 2.2.0",
  "ipld-core",
  "iri-string",
  "lazy_static",
