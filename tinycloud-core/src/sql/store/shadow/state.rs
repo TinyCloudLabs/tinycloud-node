@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use super::super::manifest::Frontier;
 
-/// The upload policy already lives in `super::super::policy::UploadPolicy` as a
-/// contract-level type; re-exported here so callers of the planner do not have
-/// to reach across modules.
+/// The upload policy already lives in `super::super::policy::UploadPolicy`;
+/// re-exported here so callers of the planner do not have to reach across
+/// modules.
 pub use super::super::policy::UploadPolicy;
 
 /// What `plan` tells the uploader to do for one capture.
@@ -30,7 +30,7 @@ pub enum Action {
         base_seq: u64,
     },
     /// Append a cumulative-WAL segment. `from_seq = base_seq + 1`, which is
-    /// the only valid shape for `wal-cum-v1` (contract 11.1).
+    /// the only valid shape for `wal-cum-v1` .
     Segment {
         base_seq: u64,
         from_seq: u64,
@@ -133,7 +133,7 @@ impl DbState {
 /// 5. Capture `revision <= frontier.last_seq` and same `cid`: `Idle`.
 /// 6. Capture `cid != frontier.base_checkpoint_cid`: `Snapshot` in a fresh
 ///    chain of the same lineage; if the capture also regressed below
-///    `last_seq`, the planner emits `Switch` (defensive, contract 3.3).
+///    `last_seq`, the planner emits `Switch` (defensive).
 /// 7. Otherwise the capture is a delta: `Segment` with `from_seq = base_seq + 1`.
 pub fn plan(
     st: &DbState,
@@ -177,7 +177,7 @@ pub fn plan(
         };
     };
 
-    // cid first (contract 11.7): a checkpoint change means the chain needs a
+    // cid first: a checkpoint change means the chain needs a
     // new snapshot, whatever the revisions say.
     if front.base_checkpoint_cid != capture.cid {
         let regressed = (capture.revision as u64) < front.last_seq;

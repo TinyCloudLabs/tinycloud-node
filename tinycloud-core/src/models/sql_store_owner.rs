@@ -12,8 +12,15 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "sql_store_owner")]
 pub struct Model {
-    /// Lowercase hex of 128 random bits (32 characters).
+    /// Fixed singleton guard: the row has exactly one id, `1`. Taking the
+    /// primary key off `store_id` and onto this column turns "there is at
+    /// most one row" into a schema-enforced invariant: a concurrent first
+    /// enable losing writer sees `ON CONFLICT DO NOTHING` and inserts
+    /// nothing, where a `WHERE NOT EXISTS` clause would race.
     #[sea_orm(primary_key, auto_increment = false)]
+    pub id: i16,
+    /// Lowercase hex of 128 random bits (32 characters). Unique by virtue
+    /// of the singleton row above, so no extra unique index is needed.
     pub store_id: String,
     /// RFC 3339 UTC timestamp of the first enable that wrote this row.
     pub created_at: String,

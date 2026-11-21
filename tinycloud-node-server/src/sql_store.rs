@@ -70,11 +70,11 @@ impl ShadowHandle {
 #[derive(Debug, thiserror::Error)]
 pub enum ShadowBuildError {
     /// The control-DB row and the bucket object disagree on the store ID.
-    /// Contract O2: refuse to start. Public message does not log the body.
+    /// Refuse to start. Public message does not log the body.
     #[error("sql_store owner marker mismatch")]
     OwnerMarkerMismatch,
     /// The control-DB row is absent but the marker is present (control DB
-    /// wiped but bucket retained). Contract O3: refuse to start.
+    /// wiped but bucket retained). Refuse to start.
     #[error("sql_store owner row is missing but the marker is present")]
     OwnerRowMissingMarkerPresent,
     #[error("sql_store owner marker system error: {0}")]

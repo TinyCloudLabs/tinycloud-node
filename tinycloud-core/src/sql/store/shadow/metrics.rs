@@ -10,7 +10,7 @@
 //! the uploader emit; the full registration (bootstrap totals, cycle
 //! histograms, breaker gauge) rides with the uploader in later milestones.
 //! Names and label vocabularies are pinned here so the registration code
-//! cannot drift from what the contract documents.
+//! cannot drift from the names used elsewhere in the module.
 
 /// Counter: `sql_store_captures_total{kind,result}`.
 pub const CAPTURES_TOTAL: &str = "sql_store_captures_total";

@@ -51,6 +51,10 @@ impl MigrationTrait for Migration {
 /// Public so tests can render the DDL for every backend.
 pub fn owner_table() -> TableCreateStatement {
     use owner::Column as C;
+    // `id` is a schema-enforced singleton guard: exactly one row ever, with
+    // `id = 1`. See the model comment for the race it closes.
+    let mut id = ColumnDef::new(C::Id);
+    id.small_integer().not_null().check(Expr::col(C::Id).eq(1));
     let mut store_id = ColumnDef::new(C::StoreId);
     store_id.string_len(32).not_null();
     let mut created_at = ColumnDef::new(C::CreatedAt);
@@ -58,9 +62,10 @@ pub fn owner_table() -> TableCreateStatement {
     Table::create()
         .table(owner::Entity)
         .if_not_exists()
+        .col(id)
         .col(store_id)
         .col(created_at)
-        .primary_key(Index::create().col(C::StoreId))
+        .primary_key(Index::create().col(C::Id))
         .to_owned()
 }
 

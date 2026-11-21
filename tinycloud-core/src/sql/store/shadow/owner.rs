@@ -24,7 +24,9 @@
 //! TC-1491.
 
 use rand::RngCore;
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait};
+use sea_orm::{
+    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DatabaseConnection, EntityTrait,
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::models::sql_store_owner as owner;
@@ -93,16 +95,16 @@ pub async fn load_owner_row<C: ConnectionTrait>(
     }
 }
 
-/// Insert the owner row if absent; return the (possibly newly stored) store
-/// ID. The invariant is exactly one row across the lifetime of the
-/// control database: a load runs first and short-circuits when a row is
-/// present, so a fresh candidate is never inserted on a second boot. On a
-/// concurrent first-enable race, the second writer's INSERT is guarded by a
-/// `WHERE NOT EXISTS (SELECT 1 FROM sql_store_owner)` clause that is
-/// evaluated by the engine at insert time; the second row is never written
-/// because the clause is false by then. One of the two store IDs wins; the
-/// other is lost (that candidate was never visible outside this function).
-/// Portable across SQLite, PostgreSQL and MySQL.
+/// The schema-enforced singleton PK on `sql_store_owner.id = 1` is what
+/// closes the race: two concurrent `INSERT ... ON CONFLICT DO NOTHING`
+/// calls both aim at primary key `1`, so the engine serializes them and
+/// the loser's row is dropped by the conflict handler. sea-orm's query
+/// builder emits the correct per-backend conflict syntax (`ON CONFLICT`
+/// for PostgreSQL and SQLite, `ON DUPLICATE KEY UPDATE id = id` for
+/// MySQL), so no raw-SQL placeholder translation is needed.
+///
+/// After the insert the function re-reads the row and returns whichever
+/// `store_id` is durably stored, which is the winner's.
 pub async fn insert_or_load_owner_row(
     conn: &DatabaseConnection,
     desired: &StoreId,
@@ -113,23 +115,26 @@ pub async fn insert_or_load_owner_row(
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|e| OwnerMarkerError::System(e.to_string()))?;
-    // Singleton guard: INSERT ... SELECT ... WHERE NOT EXISTS (...) is
-    // evaluated by the engine at insert time, so a concurrent writer that
-    // races past the `load_owner_row` short-circuit above will see the
-    // guard as false and write zero rows (sea-orm's exec_without_returning
-    // does not care). Portable across SQLite, PostgreSQL and MySQL.
-    let backend = conn.get_database_backend();
-    let stmt = sea_orm::Statement::from_sql_and_values(
-        backend,
-        "INSERT INTO sql_store_owner (store_id, created_at) \
-         SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM sql_store_owner)",
-        [desired.as_str().into(), now.into()],
-    );
-    conn.execute(stmt).await?;
+    let model = owner::ActiveModel {
+        id: Set(SINGLETON_ID),
+        store_id: Set(desired.as_str().to_owned()),
+        created_at: Set(now),
+    };
+    owner::Entity::insert(model)
+        .on_conflict(
+            OnConflict::column(owner::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(conn)
+        .await?;
     load_owner_row(conn)
         .await?
         .ok_or_else(|| OwnerMarkerError::System("owner row inserted but not readable".into()))
 }
+
+/// The one and only `id` value the singleton row ever carries.
+const SINGLETON_ID: i16 = 1;
 
 /// What the boot check decides. `Write` means the marker object is missing and
 /// the uploader must `put_if_absent` it before the first cycle; `Ok` means the
@@ -233,5 +238,99 @@ mod tests {
     fn body_is_the_hex_ascii_of_the_store_id() {
         let id = StoreId::parse("0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(id.as_body(), b"0123456789abcdef0123456789abcdef".to_vec());
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_enable_leaves_exactly_one_row() {
+        use crate::migrations::Migrator;
+        use sea_orm::{ConnectOptions, Database};
+        use sea_orm_migration::MigratorTrait;
+        use std::sync::Arc;
+
+        // One shared in-memory SQLite (cache=shared) across many tasks, so
+        // multiple insert attempts race against the same singleton row.
+        let url = "sqlite:file:owner_race_test?mode=memory&cache=shared";
+        let conn = Arc::new(
+            Database::connect(ConnectOptions::new(url.to_string()))
+                .await
+                .unwrap(),
+        );
+        Migrator::up(&*conn, None).await.unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let conn = Arc::clone(&conn);
+            handles.push(tokio::spawn(async move {
+                let candidate = StoreId::random();
+                insert_or_load_owner_row(&conn, &candidate).await
+            }));
+        }
+        let mut winners = Vec::new();
+        for h in handles {
+            winners.push(h.await.unwrap().unwrap());
+        }
+        // Every task observed the same stored ID: the singleton row's ID.
+        let first = winners[0].clone();
+        for w in &winners {
+            assert_eq!(w, &first, "all callers must see the same winning id");
+        }
+        // The stored row is, in fact, a singleton.
+        let rows = owner::Entity::find().all(&*conn).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, SINGLETON_ID);
+        assert_eq!(rows[0].store_id, first.as_str());
+    }
+
+    #[tokio::test]
+    async fn second_boot_short_circuits_and_never_inserts() {
+        use crate::migrations::Migrator;
+        use sea_orm::{ConnectOptions, Database};
+        use sea_orm_migration::MigratorTrait;
+
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let first = insert_or_load_owner_row(&conn, &StoreId::random())
+            .await
+            .unwrap();
+        // Any later candidate is ignored: the row is already there.
+        let second = insert_or_load_owner_row(&conn, &StoreId::random())
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        let rows = owner::Entity::find().all(&conn).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_first_enable_leaves_exactly_one_row() {
+        use crate::test_support::PostgresTestSchema;
+        use std::sync::Arc;
+        let Some(fixture) =
+            PostgresTestSchema::migrated_through("postgres_owner_singleton", None).await
+        else {
+            return;
+        };
+        let conn = Arc::new(fixture.connect(16).await);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let conn = Arc::clone(&conn);
+            handles.push(tokio::spawn(async move {
+                let candidate = StoreId::random();
+                insert_or_load_owner_row(&conn, &candidate).await
+            }));
+        }
+        let mut winners = Vec::new();
+        for h in handles {
+            winners.push(h.await.unwrap().unwrap());
+        }
+        let first = winners[0].clone();
+        for w in &winners {
+            assert_eq!(w, &first, "every caller must see the winning id");
+        }
+        let rows = owner::Entity::find().all(&*conn).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, SINGLETON_ID);
+        assert_eq!(rows[0].store_id, first.as_str());
     }
 }
