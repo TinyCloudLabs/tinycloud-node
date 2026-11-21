@@ -34,7 +34,7 @@ impl MigrationTrait for Migration {
         manager.create_table(owner_table()).await
     }
 
-    /// Refusing down.
+    /// Refusing down when the identity fence is populated.
     ///
     /// The owner row is the SQL block store's identity fence. Dropping it
     /// alongside a retained `sql/v1/_owner/v1` object in the bucket would
@@ -43,10 +43,25 @@ impl MigrationTrait for Migration {
     /// back must either prefix-delete `sql/v1/_owner/v1` with written
     /// authorization (the runbook) or restore the control-DB row from
     /// backup; neither is something a blind migrator rollback should do.
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        Err(DbErr::Custom(
-            "sql_store_owner down is refused: the row is the SQL block store identity fence; see the runbook".into(),
-        ))
+    ///
+    /// An empty table has no identity to protect, so an empty-table down
+    /// drops the table normally. This lets a global `Migrator::down()`
+    /// sweep on an unenabled node succeed (there is no fence yet to break),
+    /// which keeps CI sweeps happy and matches the actual security
+    /// concern.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use crate::models::sql_store_owner as owner;
+        use sea_orm::EntityTrait;
+        let conn = manager.get_connection();
+        let rows = owner::Entity::find().all(conn).await?;
+        if !rows.is_empty() {
+            return Err(DbErr::Custom(
+                "sql_store_owner down is refused while the identity fence is populated: see the runbook".into(),
+            ));
+        }
+        manager
+            .drop_table(Table::drop().table(owner::Entity).if_exists().to_owned())
+            .await
     }
 }
 
@@ -88,11 +103,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn down_is_refused() {
+    async fn down_on_empty_table_drops_normally() {
         let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
         Migrator::up(&conn, None).await.unwrap();
+        // No owner row written: down drops the table so a global
+        // Migrator::down sweep succeeds on an unenabled node.
+        Migration.down(&SchemaManager::new(&conn)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn down_refuses_while_fence_is_populated() {
+        use crate::sql::store::shadow::owner::{insert_or_load_owner_row, StoreId};
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        // Establish the identity fence.
+        insert_or_load_owner_row(&conn, &StoreId::random())
+            .await
+            .unwrap();
         let err = Migration
             .down(&SchemaManager::new(&conn))
             .await
