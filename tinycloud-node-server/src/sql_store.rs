@@ -103,11 +103,16 @@ impl From<OwnerMarkerError> for ShadowBuildError {
 /// The two operations the pairing uses are HEAD (does the marker object
 /// exist, and if so with what body) and PUT (write the marker body once,
 /// never replace).
+///
+/// Result type the [`OwnerMarkerIo::load_marker_body`] future resolves to.
+type LoadMarkerFut<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ShadowBuildError>> + Send + 'a>>;
+/// Result type the [`OwnerMarkerIo::write_marker`] future resolves to.
+type WriteMarkerFut<'a> = Pin<Box<dyn Future<Output = Result<(), ShadowBuildError>> + Send + 'a>>;
+
 pub trait OwnerMarkerIo {
     /// Return the marker object's body if it exists; `None` if absent.
-    fn load_marker_body<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ShadowBuildError>> + Send + 'a>>;
+    fn load_marker_body<'a>(&'a self) -> LoadMarkerFut<'a>;
 
     /// Write `body` to the marker object exactly once, using `put_if_absent`
     /// semantics. If the object exists with a different body the
@@ -116,10 +121,7 @@ pub trait OwnerMarkerIo {
     /// still holds). An unconditional PUT would silently overwrite a
     /// concurrent writer's claim, which is exactly the TOCTOU the marker
     /// exists to prevent.
-    fn write_marker<'a>(
-        &'a self,
-        body: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ShadowBuildError>> + Send + 'a>>;
+    fn write_marker<'a>(&'a self, body: Vec<u8>) -> WriteMarkerFut<'a>;
 }
 
 /// Pair the control-DB row with the bucket marker.

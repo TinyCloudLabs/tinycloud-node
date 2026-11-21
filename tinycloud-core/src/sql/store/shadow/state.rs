@@ -51,7 +51,7 @@ pub enum Action {
 }
 
 /// What the uploader knows about one database between cycles.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DbState {
     /// The last capture seen for this DB (if any).
     pub pending: Option<CapturePlan>,
@@ -65,18 +65,6 @@ pub struct DbState {
     /// Age of the last published snapshot, if any; `None` until the first
     /// snapshot is published or the frontier is read at boot.
     pub since_last_snapshot: Option<Duration>,
-}
-
-impl Default for DbState {
-    fn default() -> Self {
-        Self {
-            pending: None,
-            first_dirty_at: None,
-            pending_bytes: 0,
-            needs_bootstrap: false,
-            since_last_snapshot: None,
-        }
-    }
 }
 
 /// What the planner needs from the newest capture. Decoupled from
@@ -277,8 +265,10 @@ mod tests {
 
     #[test]
     fn no_capture_no_frontier_with_needs_bootstrap_is_needs_bootstrap() {
-        let mut st = DbState::default();
-        st.needs_bootstrap = true;
+        let st = DbState {
+            needs_bootstrap: true,
+            ..DbState::default()
+        };
         assert_eq!(
             plan(&st, None, &policy(), true, Instant::now()),
             Action::NeedsBootstrap
