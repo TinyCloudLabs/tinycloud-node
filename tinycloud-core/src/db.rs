@@ -1,4 +1,7 @@
 #[cfg(test)]
+#[path = "db/session_retire_tests.rs"]
+mod session_retire_tests;
+#[cfg(test)]
 #[path = "db/signature_before_locks_tests.rs"]
 mod signature_before_locks_tests;
 mod space_purge;
@@ -1017,6 +1020,42 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
             crate::renewal::verifier_now().unix_timestamp(),
         )
         .await
+    }
+
+    /// TC-3443: retire the session key `did` (a bare `did:key`) for `ttl`,
+    /// pruning expired retire rows first. Returns the key's retire time,
+    /// which a repeat call keeps.
+    pub async fn retire_session(
+        &self,
+        did: &str,
+        ttl: time::Duration,
+    ) -> Result<OffsetDateTime, DbErr>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        crate::models::session_retire::retire(
+            &self.conn,
+            did,
+            crate::models::session_retire::stored_now(),
+            ttl,
+        )
+        .await
+    }
+
+    /// TC-3443: delete retire rows that have expired.
+    pub async fn prune_session_retires(&self) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        crate::models::session_retire::prune_expired(&self.conn, OffsetDateTime::now_utc()).await
     }
 
     /// Persisted renewal identity captured during database startup.
@@ -10511,6 +10550,7 @@ mod test {
             facts: Set(None),
             serialization: Set(b"race-parent".to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10527,6 +10567,7 @@ mod test {
             facts: Set(None),
             serialization: Set(b"race-child".to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10623,6 +10664,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(&db.conn)
                 .await
@@ -10664,6 +10706,7 @@ mod test {
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10731,6 +10774,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(control_id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -10761,6 +10805,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(&db.conn)
                 .await
@@ -10790,6 +10835,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(later_id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -10989,6 +11035,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }))
             .exec(db)
             .await
@@ -11484,6 +11531,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 });
                 for ability_index in 0..6 {
                     let (resource, ability) = if delegation_index == 0 && ability_index == 0 {
@@ -11521,6 +11569,7 @@ mod test {
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         });
         ability_rows.push(abilities::ActiveModel {
             resource: Set(format!("tinycloud:{principal_suffix}:default/delegation")
@@ -11593,6 +11642,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -11696,6 +11746,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -11748,6 +11799,7 @@ mod test {
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -12766,6 +12818,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -12861,6 +12914,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -12931,6 +12985,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(ser.clone()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&tx)
             .await
@@ -12960,6 +13015,7 @@ mod test {
             facts: Set(None),
             serialization: Set(ser),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13012,6 +13068,7 @@ mod test {
             facts: Set(None),
             serialization: Set(ser),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         };
 
         let tx = db.conn.begin().await.unwrap();
@@ -13085,6 +13142,7 @@ mod test {
             facts: Set(None),
             serialization: Set(retained_hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13308,6 +13366,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13702,6 +13761,7 @@ mod test {
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await

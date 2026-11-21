@@ -54,6 +54,18 @@ pub(crate) async fn operation_actors<C: ConnectionTrait>(
     db: &C,
     actors: &[&str],
 ) -> Result<(), DbErr> {
+    operation_actors_locking(db, actors, None).await
+}
+
+/// [`operation_actors`], also taking the exclusive transaction advisory lock
+/// `extra_lock` in the same PostgreSQL statement (TC-3443: a session key's
+/// retire lock). Ignored on SQLite, whose write transaction already holds
+/// the database write lock.
+pub(crate) async fn operation_actors_locking<C: ConnectionTrait>(
+    db: &C,
+    actors: &[&str],
+    extra_lock: Option<i64>,
+) -> Result<(), DbErr> {
     if actors.is_empty() {
         return operation(db).await;
     }
@@ -62,12 +74,25 @@ pub(crate) async fn operation_actors<C: ConnectionTrait>(
             .map(|index| format!("(${index})"))
             .collect::<Vec<_>>()
             .join(",");
-        let sql=format!("WITH purge_guard AS MATERIALIZED (SELECT pg_advisory_xact_lock_shared(1413698384,2871))
-            INSERT INTO actor(id) SELECT actors.id FROM purge_guard CROSS JOIN (VALUES {placeholders}) AS actors(id) ON CONFLICT(id) DO NOTHING");
+        let (extra_cte, extra_join) = match extra_lock {
+            Some(_) => (
+                format!(
+                    ", extra_guard AS MATERIALIZED (SELECT pg_advisory_xact_lock(${}))",
+                    actors.len() + 1
+                ),
+                " CROSS JOIN extra_guard",
+            ),
+            None => (String::new(), ""),
+        };
+        let sql=format!("WITH purge_guard AS MATERIALIZED (SELECT pg_advisory_xact_lock_shared(1413698384,2871)){extra_cte}
+            INSERT INTO actor(id) SELECT actors.id FROM purge_guard{extra_join} CROSS JOIN (VALUES {placeholders}) AS actors(id) ON CONFLICT(id) DO NOTHING");
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             sql,
-            actors.iter().map(|actor| (*actor).into()),
+            actors
+                .iter()
+                .map(|actor| (*actor).into())
+                .chain(extra_lock.map(Into::into)),
         ))
         .await?;
     } else {

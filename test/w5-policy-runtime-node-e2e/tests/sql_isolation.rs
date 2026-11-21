@@ -701,6 +701,7 @@ async fn persist_grant(
         facts: Set(None),
         serialization: Set(format!("tc780-n1-test-row:{ability}").into_bytes()),
         serialization_format: Set(0),
+        first_seen_at: Default::default(),
     }
     .insert(conn)
     .await?;

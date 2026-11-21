@@ -90,6 +90,7 @@ async fn grant(
         facts: None,
         serialization: encoded,
         serialization_format: 0,
+        first_seen_at: Default::default(),
     }
     .into_active_model()
     .insert(db)

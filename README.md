@@ -38,6 +38,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `POST` | `/signed/kv` | Yes | Create an expiring signed URL for an exact KV object read |
 | `GET` | `/signed/kv/<ticketId>` | Signed URL ticket | Fetch a KV object, including single byte ranges |
 | `POST` | `/delegate` | Yes | Create capability delegations |
+| `POST` | `/session/retire` | Session-key UCAN | Sign out: retire the session key that signed the request |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
 | `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond automatic sign-in records and vault metadata (read-only; disabled unless the token is set, at least 32 bytes) |
@@ -271,6 +272,8 @@ The following common options are available:
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
+| session_retire.ttl_secs | TINYCLOUD_SESSION_RETIRE__TTL_SECS | Minimum seconds a `/session/retire` is kept; default `2592000` (30 days); `0` refuses to start. A retire also lasts until the latest-expiring delegation, renewal stamp or active renewal lease the node holds for the key ends (forever for a delegation without an expiry). |
+| session_retire.rate_limit_per_minute | TINYCLOUD_SESSION_RETIRE__RATE_LIMIT_PER_MINUTE | `/session/retire` requests allowed per client IP per minute; default `10`. Over it answers `429`. |
 | spaces.registry_v2  | TINYCLOUD_SPACES__REGISTRY_V2 | Optional signed registry v2 origin for current per-space hosting authorization and read/write mode |
 | spaces.registry_cache_max_age_seconds | TINYCLOUD_SPACES__REGISTRY_CACHE_MAX_AGE_SECONDS | Seconds the last confirmed registry record keeps admitting reads and writes during a registry outage; `0` (default) turns it off, at most `300`, requires `registry_v2` |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
@@ -454,6 +457,38 @@ If the TinyCloud Protocol instance is not able to find or establish a connection
 ## Usage
 
 TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the example DApps and tutorials for detailed information.
+
+### Sign-out: `POST /session/retire` (TC-3443)
+
+A client signs out by retiring its session key. It sends no body and an
+`Authorization: Bearer <UCAN>` header (the `Bearer ` prefix is optional). The
+UCAN is issued by the session `did:key` (bare or with a `#fragment`) to this
+node's DID, carries exactly
+`{"urn:tinycloud:session:self": {"tinycloud.session/retire": [{}]}}`, cites no
+proofs, has a nonce, and expires no more than 120 seconds from now.
+
+The node answers `200 {"did": "<did:key>", "retiredAt": "<RFC3339>"}`; a
+repeat call answers the first `retiredAt`. A bad request answers
+`401 session_retire_invalid: <reason>`; too many requests from one IP answer
+`429`. From then on, the key can no longer use any delegated authority, a
+delegation it signs that this node had not stored before the retire is
+refused, and nothing it holds is renewed. These answer
+`401 session_retired: <reason>`. Authority the key holds as a root (a space
+or network it owns itself) is not delegated and is unaffected. Signed KV URL
+tickets and open hook streams obtained before the retire keep working for up
+to 300 seconds after it.
+
+The node records a retire only when it stores a live grant for the key (a
+delegation, renewal stamp or active renewal lease whose end is still ahead).
+A retire of any other key records nothing and gets the same `200`, with
+`retiredAt` being now. A record lasts at least `session_retire.ttl_secs` and
+until the latest-expiring of those grants ends, so it never lapses while the
+key still holds one; a delegation without an expiry keeps it for good.
+
+Sign-out does not end the delegations the key made before it, or their
+descendants. Revoke ends them. A node that starts hosting the space after the
+sign-out, or that stores no grant for the key, does not know about it and
+accepts the key until its session root expires (TC-3673).
 
 ### UCAN DID resolution (TC-1080)
 

@@ -81,6 +81,7 @@ pub(crate) mod kv_sync;
 mod meeting_publication;
 pub mod node_keys;
 pub mod public;
+pub mod session;
 #[cfg(feature = "tc-bench-v1")]
 pub mod tc_bench;
 pub mod util;
@@ -6358,6 +6359,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"w1-rocket-http-parent".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -6608,6 +6610,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"w1-malformed-fact-parent".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -6989,6 +6992,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(serialization),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&conn)
             .await?;
@@ -7369,6 +7373,7 @@ mod tests {
             facts: Set(Some(Facts(facts))),
             serialization: Set(br#"{"policyId":"pol_w5_email_domain","terminal":true}"#.to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -7575,6 +7580,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"parent-delegation-bytes".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -7811,6 +7817,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&conn)
             .await?;
@@ -7825,6 +7832,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(child_serialization),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -7839,6 +7847,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"status-expired".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -7910,6 +7919,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&conn)
             .await?;
@@ -8052,6 +8062,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(bytes.to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&conn)
             .await?;
@@ -8102,6 +8113,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"foreign-account-record".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -8570,6 +8582,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(ser.as_bytes().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&conn)
             .await?;
@@ -8930,6 +8943,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(name.as_bytes().to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await?;
@@ -12504,6 +12518,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(label.as_bytes().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&self.conn)
             .await?;
@@ -13572,6 +13587,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(label.as_bytes().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&self.conn)
             .await?;
