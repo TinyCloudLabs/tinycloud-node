@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.16](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.16) - 2026-11-21
+
+### Added
+
+- *(tc-3579)* report the node identity-root source on /info ([#675](https://github.com/TinyCloudLabs/tinycloud-node/pull/675))
+
+### Fixed
+
+- refuse DIDs the node cannot verify offline (TC-1500) ([#677](https://github.com/TinyCloudLabs/tinycloud-node/pull/677))
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
