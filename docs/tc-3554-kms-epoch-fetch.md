@@ -123,6 +123,55 @@ KMS no longer serves epoch 0, the exported row is the only remaining copy of the
 sealed under a key the node can no longer derive. Open question: how long Phala keeps
 root epoch 0 retrievable.
 
+### Dependent pins: who else trusts this DID
+
+Other services pin the node DID that the compose pins
+(`docker-compose.dstack-postgres.yaml:45-46`, today
+`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`), or the renewer DID the
+node derives from the same root (`tinycloud/node/renewer/v1`, today
+`did:key:z6MkgWpiYdQV8pAr3dtHLdQsoZR3wF5wsS7fpkzAuX6q1PZj`). If the node's root
+changes, both DIDs change; update every row below in the same change window.
+
+| Pin | Where | What it does | How to change it |
+|---|---|---|---|
+| `TINYCLOUD_DEFAULT_NODE_DID` (node DID) | OpenKey `openkey-api` sealed env, once openkey#666 (TC-3657) merges; Secrets custody entry `OPENKEY_ENV_TINYCLOUD_DEFAULT_NODE_DID` | The trusted bootstrap node for account setup | full-env `phala deploy -e` on `openkey-api` under OpenKey's own GO, plus the custody entry |
+| `OPENKEY_RENEWAL_NODE_DID` (node DID) and `OPENKEY_RENEWAL_RENEWER_DID` (renewer DID) | OpenKey `docker-compose.prod.yml:55-56`, public literals, not sealed (`openkey:docs/deployment.md:247`) | Renewal leases: OpenKey makes no production lease unless both match the node's `/.well-known/tinycloud/node-keys` | reviewed OpenKey compose PR, then an `openkey-api` deploy. Leases already signed name the old renewer DID as audience, so the new node cannot use them. |
+| `CREDENTIAL_INVITATION_POLICY_ENGINE_DIDS` (node DID) | OpenCredentials `.github/workflows/phala-production.yml:495,554,599` and `scripts/verify-production-topology.mjs:10`, reviewed source | Credential invitations: the policy engines production trusts | reviewed OpenCredentials PR, then its production deploy |
+
+Searched on 2026-11-21, on every repository's default branch under
+`tinycloud-dev/repositories`, for both DIDs, excluding tests. Not found in js-sdk (tests
+only), share, secret-manager, billing, registry or courier. TinyChat names the DID only
+in a comment (`packages/core/src/tinycloud-node.ts:2`). Its node check compares origins,
+not DIDs, so a DID change leaves that comment stale but needs no TinyChat release.
+
+**The DID stays the same across:**
+- image releases;
+- OS-image changes;
+- compose-hash changes;
+- restarts.
+
+`root_wrap` opens under the same Phala-KMS app key. It read equal across the 1.26.15 and
+1.26.16 boots and one restart. A KMS move that the recovery above re-seals also keeps
+the DID, because the node seals epoch 0 again under the same DID.
+
+**The DID changes only if:**
+- the node is re-provisioned under a new app id; or
+- the KMS moves and the root cannot be recovered: the blob doesn't open, epoch 0
+  can't be fetched, and there is no escrow.
+
+In both cases the node refuses to start until the compose is changed:
+- `TINYCLOUD_KEYS__LEGACY__EXPECTED_DID` must name the new DID. It is required for
+  `DstackKmsEpoch`, and a `root_wrap` row for another DID is refused.
+- `TINYCLOUD_KEYS__EXPECTED_NODE_DID` must be changed or removed. It is optional, and
+  removing it turns that check off.
+
+A DID change is therefore always a reviewed compose change, never a silent one.
+
+**With that compose change, in the same change window:** update every row in the table
+above. Until the OpenKey rows are done:
+- OpenKey account setup publishes location records that point at the old DID;
+- OpenKey makes no new renewal leases.
+
 ## Protocol
 
 The guest agent is the dstack socket (`/var/run/dstack.sock`, v0 API). Bytes fields in
