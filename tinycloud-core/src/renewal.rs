@@ -2116,6 +2116,28 @@ mod tests {
             .unwrap();
         assert!(issued.new_end <= end);
         assert!(issued.new_end > original_expiry);
+        // TC-3443: a retire of the holder now lasts until the stamp's end,
+        // past the original's own expiry.
+        crate::models::session_retire::retire(
+            &db,
+            &original_info.delegate,
+            unix_time(now).unwrap(),
+            time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        let row = <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
+            original_info.delegate.clone(),
+        )
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.expires_at, unix_time(issued.new_end).unwrap());
+        <crate::models::session_retire::Entity as sea_orm::EntityTrait>::delete_many()
+            .exec(&db)
+            .await
+            .unwrap();
         assert!(matches!(
             issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
             Err(RenewalStoreError::Replay)

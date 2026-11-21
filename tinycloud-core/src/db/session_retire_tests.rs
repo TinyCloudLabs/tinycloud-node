@@ -65,6 +65,17 @@ impl Fx {
     /// A `kv/get` delegation from `issuer` to `audience`, citing `proof`.
     /// The owner's expire last, then the session key's, then the holder's.
     fn delegation(&self, issuer: &JWK, audience: &str, proof: Vec<Cid>) -> String {
+        self.delegation_until(issuer, audience, proof, self.expiry(issuer))
+    }
+
+    /// As [`Self::delegation`], expiring at `expiry` (unix seconds).
+    fn delegation_until(
+        &self,
+        issuer: &JWK,
+        audience: &str,
+        proof: Vec<Cid>,
+        expiry: i64,
+    ) -> String {
         let mut caps = Capabilities::<serde_json::Value>::new();
         caps.with_action(
             self.kv().parse().unwrap(),
@@ -75,7 +86,7 @@ impl Fx {
             issuer: did_vm(issuer).1.parse().unwrap(),
             audience: audience.parse().unwrap(),
             not_before: Some(NumericDate::try_from_seconds((now() - 60) as f64).unwrap()),
-            expiration: NumericDate::try_from_seconds(self.expiry(issuer) as f64).unwrap(),
+            expiration: NumericDate::try_from_seconds(expiry as f64).unwrap(),
             nonce: Some(format!("tc3443-{}", rand::random::<u64>())),
             facts: None,
             proof,
@@ -379,4 +390,90 @@ async fn expired_retire_does_not_refuse_and_is_pruned() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// A retire row outlasts every grant the key holds, so the key never comes
+/// back while one is live: retiring covers a root longer than the TTL, a
+/// root stored after the retire raises the row, a repeat retire never lowers
+/// it, and a grant with no expiry keeps the row for good.
+async fn cover_scenario(f: Fx) {
+    let session = f.session_did();
+    let row = || async {
+        crate::models::session_retire::Entity::find_by_id(session.clone())
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+    let day = 86_400;
+
+    let long_root = f.created + 60 * day;
+    let root = f.delegation_until(&f.owner, &session, vec![], long_root);
+    f.delegate(&root).await.unwrap();
+    let retired_at = f.db.retire_session(&session, TTL).await.unwrap();
+    assert_eq!(
+        row().await.expires_at,
+        at(long_root),
+        "covers the 60-day root"
+    );
+
+    // A root to the retired key stored after the retire raises the row.
+    let later_root = f.created + 90 * day;
+    let root = f.delegation_until(&f.owner, &session, vec![], later_root);
+    f.delegate(&root).await.unwrap();
+    assert_eq!(
+        row().await.expires_at,
+        at(later_root),
+        "raised by a new root"
+    );
+    // ... and one expiring earlier does not lower it.
+    let root = f.delegation_until(&f.owner, &session, vec![], f.created + 10 * day);
+    f.delegate(&root).await.unwrap();
+    assert_eq!(row().await.expires_at, at(later_root));
+
+    // A repeat retire keeps the retire time and never lowers the expiry.
+    let higher = at(f.created + 200 * day);
+    crate::models::session_retire::Entity::update_many()
+        .col_expr(
+            crate::models::session_retire::Column::ExpiresAt,
+            sea_orm::sea_query::Expr::value(higher),
+        )
+        .exec(&f.db.conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.db.retire_session(&session, TTL).await.unwrap(),
+        retired_at
+    );
+    assert_eq!(row().await.expires_at, higher, "a repeat never lowers it");
+
+    // A grant without an expiry never ends, so neither does the row.
+    delegation::Entity::update_many()
+        .col_expr(
+            delegation::Column::Expiry,
+            sea_orm::sea_query::Expr::value(Option::<OffsetDateTime>::None),
+        )
+        .filter(delegation::Column::Delegatee.eq(session.clone()))
+        .exec(&f.db.conn)
+        .await
+        .unwrap();
+    f.db.retire_session(&session, TTL).await.unwrap();
+    let never = crate::models::session_retire::never_expires();
+    assert_eq!(row().await.expires_at, never);
+    assert_eq!(f.db.prune_session_retires().await.unwrap(), 0);
+    assert_eq!(row().await.expires_at, never, "not pruned");
+}
+
+#[tokio::test]
+async fn sqlite_retire_row_outlasts_every_grant_the_key_holds() {
+    cover_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_retire_row_outlasts_every_grant_the_key_holds() {
+    let Some(f) = pg_fx("postgres_retire_row_outlasts_every_grant_the_key_holds").await else {
+        return;
+    };
+    cover_scenario(f).await;
 }

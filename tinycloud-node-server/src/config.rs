@@ -1172,8 +1172,8 @@ impl Default for PublicSpacesConfig {
 }
 
 /// TC-3443: `POST /session/retire` (sign-out). A retired session key stays
-/// refused for `ttl_secs`; keep it at least the longest session-root
-/// lifetime, or a key outlives its retire row.
+/// refused for at least `ttl_secs`, and until the latest-expiring delegation
+/// the node holds for it ends.
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SessionRetireConfig {
     #[serde(default = "default_session_retire_ttl_secs")]

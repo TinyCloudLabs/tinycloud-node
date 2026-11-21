@@ -1419,6 +1419,17 @@ async fn save<C: ConnectionTrait>(
     // same transaction; PostgreSQL uses a dependent INSERT CTE to keep the
     // existing registration round-trip budget.
     let canonical = delegation_cid_alias::canonical_hash(&serialization)?;
+    let now = session_retire::stored_now();
+    // TC-3443: a new delegation to a retired key extends its live retire row
+    // to outlast it, so the key does not come back when the row expires.
+    // Only a did:key can be retired; others cost nothing.
+    let raise_retire = session_retire::is_retirable(&delegation.delegate).then(|| {
+        session_retire::raise_expiry_statement(
+            &delegation.delegate,
+            session_retire::covering(delegation.expiry),
+            now,
+        )
+    });
     let insert = Entity::insert(ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
@@ -1431,7 +1442,7 @@ async fn save<C: ConnectionTrait>(
         serialization_format: if encryption.is_some() { 2 } else { 0 },
         // The conflict below does nothing, so a resubmission keeps the first
         // insert's time.
-        first_seen_at: Some(session_retire::stored_now()),
+        first_seen_at: Some(now),
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
     if db.get_database_backend() == DbBackend::Postgres {
@@ -1460,16 +1471,29 @@ async fn save<C: ConnectionTrait>(
                     .column(delegation_cid_alias::Column::Id)
                     .to_owned(),
             )
-            .with_cte(
-                WithClause::new()
-                    .cte(
+            .with_cte({
+                let mut with = WithClause::new();
+                with.cte(
+                    CommonTableExpression::new()
+                        .table_name(claimed.clone())
+                        .query(delegation_insert)
+                        .to_owned(),
+                );
+                // In the same statement, so no extra round trip; it runs
+                // only when the delegation row was inserted.
+                if let Some(mut raise) = raise_retire {
+                    raise.and_where(Expr::exists(
+                        Query::select().expr(Expr::val(1)).from(claimed).to_owned(),
+                    ));
+                    with.cte(
                         CommonTableExpression::new()
-                            .table_name(claimed)
-                            .query(delegation_insert)
+                            .table_name(Alias::new("raised_session_retire"))
+                            .query(raise)
                             .to_owned(),
-                    )
-                    .to_owned(),
-            );
+                    );
+                }
+                with
+            });
         if db
             .query_one(db.get_database_backend().build(&alias_insert))
             .await?
@@ -1491,6 +1515,9 @@ async fn save<C: ConnectionTrait>(
         })
         .exec(db)
         .await?;
+        if let Some(raise) = raise_retire {
+            db.execute(db.get_database_backend().build(&raise)).await?;
+        }
     }
 
     // save abilities — persist UCAN caveats with the delegation row. W1

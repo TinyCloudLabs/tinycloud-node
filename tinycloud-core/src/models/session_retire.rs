@@ -6,7 +6,12 @@
 //! before the retire. Expired rows are ignored by every lookup and pruned.
 use crate::did_resolution::verify_ucan_signature;
 use crate::encryption_network::delete_auth::CLOCK_SKEW_SECS;
-use sea_orm::{entity::prelude::*, sea_query::OnConflict, ActiveValue::Set, ConnectionTrait};
+use sea_orm::{
+    entity::prelude::*,
+    sea_query::{Alias, Expr, OnConflict, Query, UpdateStatement},
+    ActiveValue::Set,
+    ConnectionTrait, QuerySelect,
+};
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::{authorization::TinyCloudInvocation, identity::principal_did};
 
@@ -114,9 +119,112 @@ pub fn stored_now() -> OffsetDateTime {
         .unwrap_or(now)
 }
 
-/// Retire `did` at `now` until `now + ttl`, and return its retire time. A
-/// key already retired keeps, and returns, its first retire time. Expired
-/// rows are deleted first.
+/// What a retire row's `expires_at` must reach to outlast a delegation the
+/// key holds: its expiry, rounded up to the stored microsecond, or
+/// [`never_expires`] when it has none.
+pub fn covering(expiry: Option<OffsetDateTime>) -> OffsetDateTime {
+    let Some(expiry) = expiry else {
+        return never_expires();
+    };
+    let expiry = expiry.to_offset(time::UtcOffset::UTC);
+    let truncated = expiry
+        .replace_nanosecond(expiry.nanosecond() / 1_000 * 1_000)
+        .unwrap_or(expiry);
+    if truncated < expiry {
+        truncated + Duration::microseconds(1)
+    } else {
+        truncated
+    }
+}
+
+/// The far-future `expires_at` of a retire covering a delegation without an
+/// expiry: 9999-12-31T23:59:59Z, which both database backends store exactly.
+pub fn never_expires() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(253_402_300_799).expect("in range")
+}
+
+/// The latest time anything stored can still grant `did` authority: the
+/// latest expiry of a delegation it holds (a NULL expiry never ends), or of
+/// a renewal stamp extending one. `None` when it holds nothing.
+async fn latest_authority_end<C: ConnectionTrait>(
+    db: &C,
+    did: &str,
+) -> Result<Option<OffsetDateTime>, DbErr> {
+    let expiries: Vec<Option<OffsetDateTime>> = delegation::Entity::find()
+        .select_only()
+        .column(delegation::Column::Expiry)
+        .filter(delegation::Column::Delegatee.eq(did))
+        .into_tuple()
+        .all(db)
+        .await?;
+    let mut latest = expiries.into_iter().map(covering).max();
+    let stamp = Alias::new("renewal_stamp");
+    let stamped = Query::select()
+        .column((stamp.clone(), Alias::new("new_end")))
+        .from(stamp.clone())
+        .inner_join(
+            delegation_cid_alias::Entity,
+            Expr::col((
+                delegation_cid_alias::Entity,
+                delegation_cid_alias::Column::Canonical,
+            ))
+            .equals((stamp, Alias::new("original_canonical"))),
+        )
+        .inner_join(
+            delegation::Entity,
+            Expr::col((delegation::Entity, delegation::Column::Id)).equals((
+                delegation_cid_alias::Entity,
+                delegation_cid_alias::Column::Id,
+            )),
+        )
+        .and_where(Expr::col((delegation::Entity, delegation::Column::Delegatee)).eq(did))
+        .to_owned();
+    for row in db
+        .query_all(db.get_database_backend().build(&stamped))
+        .await?
+    {
+        let end: OffsetDateTime = row.try_get("", "new_end")?;
+        latest = latest.max(Some(covering(Some(end))));
+    }
+    Ok(latest)
+}
+
+/// Raise a live retire row for `did` to `until`; never lowers it. A single
+/// statement, so `delegation::save` can run it inside its own insert.
+pub fn raise_expiry_statement(
+    did: &str,
+    until: OffsetDateTime,
+    now: OffsetDateTime,
+) -> UpdateStatement {
+    Query::update()
+        .table(Entity)
+        .value(Column::ExpiresAt, until)
+        .and_where(Column::Did.eq(did))
+        .and_where(Column::ExpiresAt.gt(now))
+        .and_where(Column::ExpiresAt.lt(until))
+        .to_owned()
+}
+
+/// Run [`raise_expiry_statement`].
+pub async fn raise_expiry<C: ConnectionTrait>(
+    db: &C,
+    did: &str,
+    until: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), DbErr> {
+    db.execute(
+        db.get_database_backend()
+            .build(&raise_expiry_statement(did, until, now)),
+    )
+    .await
+    .map(drop)
+}
+
+/// Retire `did` at `now` and return its retire time. The row lasts at least
+/// `ttl`, and until the latest-expiring delegation (or renewal stamp) that
+/// grants `did` authority ends, so no stored grant outlives it. A key already
+/// retired keeps, and returns, its first retire time; its expiry is raised
+/// to cover what it holds now, never lowered. Expired rows are deleted first.
 pub async fn retire<C: ConnectionTrait>(
     db: &C,
     did: &str,
@@ -124,14 +232,19 @@ pub async fn retire<C: ConnectionTrait>(
     ttl: Duration,
 ) -> Result<OffsetDateTime, DbErr> {
     prune_expired(db, now).await?;
+    let base = now.saturating_add(ttl);
+    let expires_at = latest_authority_end(db, did)
+        .await?
+        .map_or(base, |end| end.max(base));
     Entity::insert(ActiveModel {
         did: Set(did.to_owned()),
         retired_at: Set(now),
-        expires_at: Set(now.saturating_add(ttl)),
+        expires_at: Set(expires_at),
     })
     .on_conflict(OnConflict::column(Column::Did).do_nothing().to_owned())
     .exec_without_returning(db)
     .await?;
+    raise_expiry(db, did, expires_at, now).await?;
     Entity::find_by_id(did.to_owned())
         .one(db)
         .await?
@@ -184,9 +297,16 @@ mod tests {
         assert_eq!(retire(&db, did, later, ttl).await.unwrap(), first);
         assert_eq!(live_retired_at(&db, did, later).await.unwrap(), Some(first));
 
-        // At and after expiry the row no longer counts, and the next retire
-        // call prunes it before recording a new one.
-        let expiry = first + ttl;
+        // A repeat keeps the retire time but raises the expiry to its own
+        // `now + ttl`. At and after expiry the row no longer counts, and the
+        // next retire call prunes it before recording a new one.
+        let expiry = later + ttl;
+        assert_eq!(
+            live_retired_at(&db, did, expiry - Duration::SECOND)
+                .await
+                .unwrap(),
+            Some(first)
+        );
         assert_eq!(live_retired_at(&db, did, expiry).await.unwrap(), None);
         let other = "did:key:z6MkretireOther";
         retire(&db, other, expiry, ttl).await.unwrap();
