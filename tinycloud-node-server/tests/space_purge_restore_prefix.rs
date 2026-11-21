@@ -572,7 +572,7 @@ async fn duckdb_cache_prefix_closes_live_actors_and_preserves_neighbor_export() 
             "duckdb",
             &space.to_string(),
             "main",
-            payload.clone(),
+            payload.clone().into(),
             ArtifactExpectation::Absent,
         )
         .await
