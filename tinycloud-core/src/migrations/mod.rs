@@ -53,6 +53,7 @@ pub mod m20261117_000000_hook_subscription_headers;
 pub mod m20261109_000000_hook_delivery_lease;
 pub mod m20261117_000000_renewal_switch;
 pub mod m20261120_000000_root_wrap;
+pub mod m20261122_000000_sql_store_owner;
 
 pub struct Migrator;
 
@@ -111,6 +112,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261113_020000_resource_retirement_snapshot::Migration),
             Box::new(m20261109_000000_hook_delivery_lease::Migration),
             Box::new(m20261120_000000_root_wrap::Migration),
+            Box::new(m20261122_000000_sql_store_owner::Migration),
         ]
     }
 }

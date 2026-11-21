@@ -9913,6 +9913,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bs58 0.5.1",
+ "bytes",
  "chacha20poly1305",
  "dashmap",
  "duckdb",
