@@ -4,8 +4,16 @@ use base64::Engine as _;
 use sea_orm::{Database, TransactionTrait};
 use sea_orm_migration::MigratorTrait;
 
-#[tokio::test]
-async fn frozen_proofless_owner_lease_registers_active_generation_one() {
+/// The frozen original and lease rows, with the node's renewal identity,
+/// inside an open transaction: everything a lease registration reads.
+async fn frozen_lease_graph() -> (
+    sea_orm::DatabaseConnection,
+    sea_orm::DatabaseTransaction,
+    serde_json::Value,
+    [u8; 32],
+    u64,
+    crate::events::Delegation,
+) {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
     ))
@@ -55,6 +63,12 @@ async fn frozen_proofless_owner_lease_registers_active_generation_one() {
     >(fixture["leaseToken"].as_str().unwrap())
     .unwrap();
     assert!(lease.0.parents.is_empty());
+    (db, tx, fixture, seed, epoch, lease)
+}
+
+#[tokio::test]
+async fn frozen_proofless_owner_lease_registers_active_generation_one() {
+    let (db, tx, fixture, seed, epoch, lease) = frozen_lease_graph().await;
     register_lease_at(
         &tx,
         &lease,
@@ -77,6 +91,48 @@ async fn frozen_proofless_owner_lease_registers_active_generation_one() {
         .unwrap();
     assert_eq!(row.try_get::<String>("", "state").unwrap(), "active");
     assert_eq!(row.try_get::<i64>("", "generation").unwrap(), 1);
+}
+
+/// TC-3443 (C2): an original held by a retired session key gets no renewal
+/// lease; nothing is saved.
+#[tokio::test]
+async fn lease_for_an_original_held_by_a_retired_session_key_is_refused() {
+    let (db, tx, fixture, seed, epoch, lease) = frozen_lease_graph().await;
+    let holder = fixture["holderDid"].as_str().unwrap();
+    assert!(holder.starts_with("did:key:"));
+    let now = fixture["issuedAt"].as_i64().unwrap() + 1;
+    crate::models::session_retire::retire(
+        &tx,
+        holder,
+        unix_time(now - 1).unwrap(),
+        time::Duration::days(30),
+    )
+    .await
+    .unwrap();
+    let refused = register_lease_at(
+        &tx,
+        &lease,
+        seed,
+        epoch,
+        fixture["nodeIdentityDid"].as_str().unwrap(),
+        None,
+        now,
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(RenewalStoreError::SessionRetired(_))),
+        "{refused:?}"
+    );
+    tx.commit().await.unwrap();
+    let leases = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT count(*) AS n FROM renewal_lease",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(leases.try_get::<i64>("", "n").unwrap(), 0);
 }
 
 #[derive(Clone)]

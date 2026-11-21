@@ -86,6 +86,15 @@ cors = true
     ## Env: TINYCLOUD_TELEMETRY__ENABLED
     enabled = false
 
+[global.session_retire]
+    ## POST /session/retire (sign-out, TC-3443). A retire is kept this long;
+    ## keep it at least the longest session-root lifetime.
+    ## Env: TINYCLOUD_SESSION_RETIRE__TTL_SECS
+    # ttl_secs = 2592000
+    ## Retire requests allowed per client IP per minute; over it answers 429.
+    ## Env: TINYCLOUD_SESSION_RETIRE__RATE_LIMIT_PER_MINUTE
+    # rate_limit_per_minute = 10
+
 [global.did_resolution]
     ## UCAN issuers resolve only key, pkh and jwk by default.
     ## Rollback: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true, then restart.

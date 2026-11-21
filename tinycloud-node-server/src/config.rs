@@ -53,6 +53,8 @@ pub struct Config {
     #[serde(default)]
     pub public_spaces: PublicSpacesConfig,
     #[serde(default)]
+    pub session_retire: SessionRetireConfig,
+    #[serde(default)]
     pub share_email: ShareEmailConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -1165,6 +1167,41 @@ impl Default for PublicSpacesConfig {
             rate_limit_per_minute: default_rate_limit_per_minute(),
             rate_limit_burst: default_rate_limit_burst(),
             storage_limit: default_public_storage_limit(),
+        }
+    }
+}
+
+/// TC-3443: `POST /session/retire` (sign-out). A retired session key stays
+/// refused for `ttl_secs`; keep it at least the longest session-root
+/// lifetime, or a key outlives its retire row.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SessionRetireConfig {
+    #[serde(default = "default_session_retire_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Per-client-IP requests per minute; also the burst.
+    #[serde(default = "default_session_retire_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+}
+
+fn default_session_retire_ttl_secs() -> u64 {
+    30 * 24 * 60 * 60
+}
+
+fn default_session_retire_rate_limit_per_minute() -> u32 {
+    10
+}
+
+impl SessionRetireConfig {
+    pub fn ttl(&self) -> time::Duration {
+        time::Duration::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX))
+    }
+}
+
+impl Default for SessionRetireConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_session_retire_ttl_secs(),
+            rate_limit_per_minute: default_session_retire_rate_limit_per_minute(),
         }
     }
 }

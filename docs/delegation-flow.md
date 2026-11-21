@@ -506,6 +506,20 @@ support. On the same `utf8mb4`/default-strict configuration, unmodified
 alias migration exists. That separate full-schema prerequisite must be resolved
 and exercised before claiming end-to-end support for that configuration.
 
+## Sign-out: Retiring the Session Key (TC-3443)
+
+Signing out posts `POST /session/retire` with a UCAN the session key signs to
+the node (`tinycloud.session/retire` on `urn:tinycloud:session:self`, no
+proofs, expiry within 120 seconds). The node records the key and the time.
+After that, the key's own invocations and any delegation it signs that the
+node had not stored before the retire answer `401 session_retired:`. Each
+delegation records when the node first stored it (`first_seen_at`), so a child
+that raced the retire is refused at invoke. Children the key made before the
+retire, and their descendants, keep working until they expire; revoking them
+ends them. Only the nodes that served the retire know about it: a node that
+starts hosting the space later accepts the key until its session root expires
+(TC-3673).
+
 ## Child Delegation (UCAN) Creation
 
 For sharing, child UCANs are created that delegate from the session key to another DID.

@@ -278,7 +278,9 @@ use routes::{
     node_keys::{node_keys, NodePublicKeys},
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    renewal_state_control, revoke, signed_kv_get,
+    renewal_state_control, revoke,
+    session::{retire_session, SessionRetireRuntime},
+    signed_kv_get,
     util_routes::*,
     version,
 };
@@ -818,6 +820,7 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         delegation_status,
         renewal_state_control,
         revoke,
+        retire_session,
         create_signed_kv_url,
         signed_kv_get,
         create_hook_ticket,
@@ -1340,6 +1343,13 @@ pub async fn app_with_control(
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+    // TC-3443: the retire request's audience is this node's DID, the one
+    // owner-signed key deletes are addressed to.
+    let session_retire_runtime = SessionRetireRuntime::new(
+        encryption_service.node_did().to_owned(),
+        &tinycloud_config.session_retire,
+    );
+    let retire_cleanup = tinycloud.clone();
     let webhook_dispatcher = WebhookDispatcher::new(
         tinycloud.clone(),
         tinycloud_config.hooks.clone(),
@@ -1447,12 +1457,15 @@ pub async fn app_with_control(
             "invocation-replay-cleanup",
             move |rocket| {
                 let replay_cleanup = replay_cleanup.clone();
+                let retire_cleanup = retire_cleanup.clone();
                 let shutdown = rocket.shutdown();
                 Box::pin(async move {
                     tokio::spawn(async move {
                         let _ = replay_cleanup
                             .cleanup(time::OffsetDateTime::now_utc(), replay_max_lifetime_secs)
                             .await;
+                        // TC-3443: expired session retires go on the same tick.
+                        let _ = retire_cleanup.prune_session_retires().await;
                         let period = std::time::Duration::from_secs(60);
                         let mut interval =
                             tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -1466,6 +1479,7 @@ pub async fn app_with_control(
                                             replay_max_lifetime_secs,
                                         )
                                         .await;
+                                    let _ = retire_cleanup.prune_session_retires().await;
                                 }
                                 _ = &mut shutdown => break,
                             }
@@ -1525,6 +1539,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(egress_policy)
         .manage(rate_limiter)
+        .manage(session_retire_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(policy_v3_runtime)
@@ -2394,6 +2409,7 @@ mod sqlite_tuning_tests {
             facts: Set(None),
             serialization: Set(b"synthetic database race fixture".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&transaction)
         .await

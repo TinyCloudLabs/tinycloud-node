@@ -8,6 +8,7 @@ fn graph(edges: &[(Hash, Hash)], rows: &[(Hash, &str)]) -> AuthGraphSnapshot {
     }
     AuthGraphSnapshot {
         parents,
+        retired: HashMap::new(),
         delegations: rows
             .iter()
             .map(|(id, _)| {
@@ -23,6 +24,7 @@ fn graph(edges: &[(Hash, Hash)], rows: &[(Hash, &str)]) -> AuthGraphSnapshot {
                         facts: None,
                         serialization: vec![],
                         serialization_format: 0,
+                        first_seen_at: Default::default(),
                     },
                 )
             })

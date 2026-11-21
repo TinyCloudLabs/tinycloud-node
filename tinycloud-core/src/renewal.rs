@@ -78,6 +78,10 @@ pub enum RenewalStoreError {
     InvalidInput,
     #[error("renewals are paused node-wide")]
     Paused,
+    /// TC-3443: the original's holder is a session key its holder signed
+    /// out; it gets no new lease and no new stamp.
+    #[error("session_retired: {0}")]
+    SessionRetired(String),
 }
 
 /// The node-wide renewal STOP-ALL switch (`renewal_switch`, one row).
@@ -798,6 +802,27 @@ async fn load_renewal_snapshot<C: ConnectionTrait>(
     })
 }
 
+/// TC-3443: decline when the original's holder is a session key with a live
+/// retire row. A holder that is not retired passes; so does a missing
+/// original, which the chain checks decline on their own.
+fn refuse_retired_holder(
+    snapshot: &crate::auth_graph::AuthGraphSnapshot,
+    original: &Hash,
+    now: i64,
+) -> Result<(), RenewalStoreError> {
+    let Some(holder) = snapshot.delegation(original).map(|row| &row.delegatee) else {
+        return Ok(());
+    };
+    let now =
+        OffsetDateTime::from_unix_timestamp(now).map_err(|_| RenewalStoreError::InvalidInput)?;
+    if snapshot.retired_at(holder, now).is_some() {
+        return Err(RenewalStoreError::SessionRetired(format!(
+            "holder {holder} of the renewed delegation signed out"
+        )));
+    }
+    Ok(())
+}
+
 fn live_chain_effective_ends(
     snapshot: &crate::auth_graph::AuthGraphSnapshot,
     root: &Hash,
@@ -1105,6 +1130,7 @@ async fn register_lease_checked<C: ConnectionTrait>(
         now,
     )
     .await?;
+    refuse_retired_holder(&snapshot, &original, now)?;
     live_chain_effective_ends(&snapshot, &original, now)?;
     live_chain_effective_ends(&snapshot, &lease_hash, now)?;
     let old_leases = tx
@@ -1287,6 +1313,7 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
         now,
     )
     .await?;
+    refuse_retired_holder(&snapshot, &original, now)?;
     // Compare with the precision stored by register_lease_at; caps remain floored.
     if snapshot
         .delegation(&original)
@@ -2054,6 +2081,34 @@ mod tests {
             Err(RenewalStoreError::Unauthorized)
         ));
         authorize_renewal_invocation_at(&db, &request.invocation, original_cid, &identity, now)
+            .await
+            .unwrap();
+        // TC-3443 (C2): while the original's holder is a retired session key
+        // no stamp is issued and the request spends no replay; once the
+        // retire is gone the same request is stamped below.
+        let stamps = row_count(&db, "renewal_stamp").await;
+        let replays = row_count(&db, "invocation_replay").await;
+        crate::models::session_retire::retire(
+            &db,
+            &original_info.delegate,
+            unix_time(now - 10).unwrap(),
+            time::Duration::days(30),
+        )
+        .await
+        .unwrap();
+        let declined = issue_stamp_at(&db, request.clone(), &secret, &identity, now).await;
+        assert!(
+            matches!(&declined, Err(RenewalStoreError::SessionRetired(_))),
+            "{declined:?}"
+        );
+        assert!(declined
+            .unwrap_err()
+            .to_string()
+            .starts_with("session_retired: "));
+        assert_eq!(row_count(&db, "renewal_stamp").await, stamps);
+        assert_eq!(row_count(&db, "invocation_replay").await, replays);
+        <crate::models::session_retire::Entity as sea_orm::EntityTrait>::delete_many()
+            .exec(&db)
             .await
             .unwrap();
         let issued = issue_stamp_at(&db, request.clone(), &secret, &identity, now)

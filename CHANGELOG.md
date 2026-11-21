@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 ### Changes
+- Sign-out can retire the session key. `POST /session/retire` takes a UCAN the session `did:key` signs to this node, with exactly `tinycloud.session/retire` on `urn:tinycloud:session:self`, no proofs, a nonce, and an expiry no more than 120 seconds away. It answers `200 {"did","retiredAt"}`; a repeat call answers the first `retiredAt`. A bad request gets `401 session_retire_invalid: <reason>`, and more than `session_retire.rate_limit_per_minute` (default 10) requests per minute from one IP get `429`. Once retired, on this node:
+  - the key invokes nothing;
+  - a delegation it signs that this node had not stored before the retire is refused;
+  - no renewal lease is registered and no renewal stamp is issued for a delegation it holds.
+
+  These refusals answer `401 session_retired: <reason>`. **Sign-out does NOT end the delegations the key made before it, or their descendants; they keep working until they expire. Revoke ends them.** The retire is kept for `session_retire.ttl_secs` (default 30 days), which must be at least the longest session-root lifetime; expired rows are pruned. The node stores only its own retires: **a host that starts hosting the space after the sign-out never gets the marker** and accepts the key until its session root expires (follow-up TC-3673). Adds the `session_retire` table and a nullable `delegation.first_seen_at` column, set when this node first stores a delegation; existing rows stay NULL and count as stored before any retire. Details: TC-3443.
 - `/info` and `/version` report `identityRoot` for a `keys.type = DstackKmsEpoch` node: `sealed` when this boot opened the stored `root_wrap` row, `sealed-new` when it fetched the root and sealed it. It names the path, never key material, and is omitted for every other key source. The production deploy fails unless a sidecar-free compose reports `sealed` (a compose with the key-recovery sidecar may also report `sealed-new`); images built before this field are not checked. Details: TC-3579.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;

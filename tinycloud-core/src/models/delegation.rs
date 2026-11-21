@@ -30,6 +30,9 @@ pub struct Model {
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
     pub serialization_format: i16,
+    /// TC-3443: when this node first stored the row. NULL for rows stored
+    /// before the column existed; those count as seen before any retire.
+    pub first_seen_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -197,6 +200,10 @@ pub enum DelegationError {
     /// SIWE domain.
     #[error("app_id_not_bound: the app id in a key grant under apps/ is not bound to the signing domain")]
     AppIdNotBound,
+    /// TC-3443: the delegator is a session key its holder signed out, and
+    /// this delegation was not stored before the retire.
+    #[error("session_retired: {0}")]
+    SessionRetired(String),
 }
 
 impl DelegationError {
@@ -248,15 +255,58 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(
+    let validated = validate_with(
         db,
         &delegation.0,
         delegated_sql_caveats,
         named_keys,
         renewal_identity,
     )
-    .await?;
+    .await;
+    if let Err(error) = validated {
+        // TC-3443: a delegation stored before its issuer signed out answers
+        // as already registered when resubmitted, as on the single path.
+        if matches!(
+            error,
+            Error::InvalidDelegation(DelegationError::SessionRetired(_))
+        ) && is_stored(db, delegation).await?
+        {
+            return Ok(DelegationRegistration::Existing(crate::hash::hash(
+                &delegation.1,
+            )));
+        }
+        return Err(error);
+    }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+}
+
+async fn is_stored<C: ConnectionTrait>(db: &C, delegation: &Delegation) -> Result<bool, DbErr> {
+    Ok(Entity::find_by_id(crate::hash::hash(&delegation.1))
+        .select_only()
+        .column(Column::Id)
+        .into_tuple::<Hash>()
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// TC-3443: refuse a delegation issued by a signed-out session key. Callers
+/// let one stored before the retire answer as already registered.
+async fn refuse_retired_delegator<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+) -> Result<(), Error> {
+    if session_retire::live_retired_at(db, &delegation.delegator, OffsetDateTime::now_utc())
+        .await?
+        .is_some()
+    {
+        return Err(DelegationError::SessionRetired(format!(
+            "delegator {} signed out",
+            delegation.delegator
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Save only the graph portion of a proofless renewal lease. The transaction
@@ -273,6 +323,12 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
         check_signature(&delegation.0.delegation).await?;
     }
     check_owner_renewal_lease(delegation)?;
+    if let Err(error) = refuse_retired_delegator(db, &delegation.0).await {
+        // Stored before the retire: `save` answers it as already registered.
+        if !is_stored(db, delegation).await? {
+            return Err(error);
+        }
+    }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
@@ -478,6 +534,7 @@ async fn validate_with<C: ConnectionTrait>(
     if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
     }
+    refuse_retired_delegator(db, delegation).await?;
     refuse_renewal_lease_parents(db, delegation).await?;
     check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
 
@@ -887,6 +944,7 @@ pub(crate) async fn precheck<C: ConnectionTrait>(
     if renewer_did.is_some_and(|renewer_did| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
     }
+    refuse_retired_delegator(db, delegation).await?;
     refuse_renewal_lease_parents(db, delegation).await?;
     check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
     let dependant_caps = dependant_capabilities(delegation);
@@ -1371,6 +1429,9 @@ async fn save<C: ConnectionTrait>(
         facts,
         serialization: stored_serialization,
         serialization_format: if encryption.is_some() { 2 } else { 0 },
+        // The conflict below does nothing, so a resubmission keeps the first
+        // insert's time.
+        first_seen_at: Some(session_retire::stored_now()),
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
     if db.get_database_backend() == DbBackend::Postgres {
@@ -1524,6 +1585,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -1562,6 +1624,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(ser_a.clone()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         };
 
         // First insert → row is new.
@@ -1655,6 +1718,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(ser),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             })
             .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
             .exec(&db)
@@ -2496,6 +2560,7 @@ mod tests {
             )])))),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
