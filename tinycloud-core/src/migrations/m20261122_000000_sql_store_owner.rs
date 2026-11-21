@@ -2,9 +2,11 @@
 //! `sql/v1/_owner/v1` object at boot.
 //!
 //! One empty table, no foreign keys, no index on any existing table, no
-//! backfill. MySQL-safe: `varchar(32)` primary key (128-bit hex) plus a
-//! bounded `varchar(40)` timestamp, both well under the 3,072-byte InnoDB
-//! key cap. Re-run is a no-op (IF NOT EXISTS).
+//! backfill. The primary key is a fixed-value `id SMALLINT NOT NULL CHECK
+//! (id = 1)` column: the table is a schema-enforced singleton. `store_id`
+//! (`varchar(32)`, the 128-bit hex) and `created_at` (`varchar(40)`) sit
+//! alongside it, both well under MySQL's 3,072-byte InnoDB key cap.
+//! Re-run is a no-op (IF NOT EXISTS).
 //!
 //! Interaction with `m20261121_000000_session_retire` (ships as node
 //! 1.26.18): disjoint tables (revocation and session rows vs this fresh
