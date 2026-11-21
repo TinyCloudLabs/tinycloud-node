@@ -174,6 +174,7 @@ where
                         RenewalStoreError::LeaseUnavailable
                             | RenewalStoreError::IdentityEpoch
                             | RenewalStoreError::Paused
+                            | RenewalStoreError::SessionRetired(_)
                     )
                 });
             if expected_skip {

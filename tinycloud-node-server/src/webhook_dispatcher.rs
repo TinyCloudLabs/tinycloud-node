@@ -1444,6 +1444,7 @@ mod tests {
                 facts: ActiveValue::Set(None),
                 serialization: ActiveValue::Set(vec![]),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(db)
             .await

@@ -89,6 +89,7 @@ pub const RETAINED: &[(&str, &str)] = &[
     ("renewal_identity", "this node's own renewer identity, not user data"),
     ("root_wrap", "this node's own sealed identity root, not user data; never purged (TC-3554)"),
     ("renewal_lease", "renewal state of a signed delegation, keyed by delegation CID, not by space"),
+    ("session_retire", "sign-out marker keyed by a session did:key, names no space; expires_at-bounded and pruned (TC-3443)"),
     ("space_purge_job", "the purge's own durable progress row: raw space is nulled in the terminal transaction"),
     ("resource_purge_job", "owner resource lifecycle job: its raw target belongs to the resource purge, not a space"),
 ];

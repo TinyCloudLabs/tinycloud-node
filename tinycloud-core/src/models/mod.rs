@@ -36,6 +36,7 @@ pub mod policy_v3_registration;
 pub mod policy_v3_root;
 pub mod policy_v3_session;
 pub mod revocation;
+pub mod session_retire;
 pub mod share_anonymous_challenge;
 pub mod share_email_audit;
 pub mod share_email_quota;

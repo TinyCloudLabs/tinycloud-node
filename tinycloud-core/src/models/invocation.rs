@@ -131,6 +131,11 @@ pub enum InvocationError {
     /// Code: `encryption-prefix-not-invocable`.
     #[error("encryption-prefix-not-invocable")]
     EncryptionPrefixNotInvocable,
+    /// TC-3443: the invoker is a session key its holder signed out, or a
+    /// delegation in the chain was issued by one and first seen after the
+    /// retire.
+    #[error("session_retired: {0}")]
+    SessionRetired(String),
     #[error(transparent)]
     Registry(#[from] crate::registry_admission::RegistryError),
 }
@@ -484,6 +489,20 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 }
             }
 
+            // TC-3443: a signed-out session key uses no delegated authority
+            // (root authority, checked above, is not delegated). Each cited
+            // parent's delegatee is the invoker, and the snapshot carries the
+            // live retire rows of every chain delegator and delegatee.
+            let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
+            for (p, _) in &parents {
+                if graph.retired_at(&p.delegatee, chain_now).is_some() {
+                    return Err(InvocationError::SessionRetired(format!(
+                        "invoker {invoker} signed out"
+                    ))
+                    .into());
+                }
+            }
+
             // W1 (C): fail-closed on revocation. A revoked leaf rejects the
             // invocation outright; a revoked ANCESTOR in the cited chain
             // rejects descendants. Loaded on every invocation — we must
@@ -509,11 +528,26 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 // chain window, not only the directly cited leaf. A chain
                 // node without a persisted delegation row (malformed graph)
                 // fails closed as a missing parent.
-                let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
                 for chain_id in graph.chain_ids_from(&p.id) {
                     let Some(ancestor) = graph.delegation(&chain_id) else {
                         return Err(InvocationError::MissingParents.into());
                     };
+                    // TC-3443: a delegation its signed-out issuer made after the
+                    // retire (one that raced it) authorizes nothing. NULL
+                    // `first_seen_at` predates the column, so predates the retire.
+                    if let Some(retired_at) = graph.retired_at(&ancestor.delegator, chain_now) {
+                        if ancestor
+                            .first_seen_at
+                            .is_some_and(|first_seen| first_seen > retired_at)
+                        {
+                            return Err(InvocationError::SessionRetired(format!(
+                                "delegation {} from {} was first seen after its issuer signed out",
+                                chain_id.to_cid(0x55),
+                                ancestor.delegator
+                            ))
+                            .into());
+                        }
+                    }
                     let effective_expiry = graph
                         .effective_expiry(&chain_id)
                         .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
@@ -1531,6 +1565,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db)
             .await
@@ -1712,6 +1747,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db)
         .await
@@ -2131,6 +2167,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db)
             .await
@@ -2299,6 +2336,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db)
             .await
@@ -2387,6 +2425,7 @@ mod tests {
             )))),
             serialization: Set(parent.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db)
         .await

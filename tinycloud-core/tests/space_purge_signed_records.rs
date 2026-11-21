@@ -184,6 +184,7 @@ impl Fixture {
                 facts: None,
                 serialization: bytes.clone(),
                 serialization_format: format,
+                first_seen_at: Default::default(),
             }
             .into_active_model()
             .insert(&self.db)
