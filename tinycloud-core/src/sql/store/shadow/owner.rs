@@ -95,11 +95,24 @@ pub async fn load_owner_row<C: ConnectionTrait>(
 }
 
 /// Insert the owner row if absent; return the (possibly newly stored) store
-/// ID. INSERT ... DO NOTHING keeps the first writer's ID across a race.
+/// ID. The invariant is **exactly one row** across the lifetime of the
+/// control database: a load runs first and short-circuits when a row is
+/// present, so a fresh candidate is never inserted on a second boot.
+///
+/// On a concurrent first-enable race, two workers can both see "absent" and
+/// both try to insert a row with their own `store_id` (the primary key).
+/// Different IDs leave two rows, which `load_owner_row` then rejects as
+/// malformed. The caller therefore holds a boot-time lock around this call,
+/// or accepts that only one node may initialise one `sql/v1/` namespace at
+/// a time (contract §9: one host per namespace, which the owner marker
+/// itself enforces at the bucket level).
 pub async fn insert_or_load_owner_row(
     conn: &DatabaseConnection,
     desired: &StoreId,
 ) -> Result<StoreId, OwnerMarkerError> {
+    if let Some(existing) = load_owner_row(conn).await? {
+        return Ok(existing);
+    }
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|e| OwnerMarkerError::System(e.to_string()))?;
@@ -115,10 +128,9 @@ pub async fn insert_or_load_owner_row(
         )
         .exec_without_returning(conn)
         .await?;
-    let actual = load_owner_row(conn)
+    load_owner_row(conn)
         .await?
-        .ok_or_else(|| OwnerMarkerError::System("owner row inserted but not readable".into()))?;
-    Ok(actual)
+        .ok_or_else(|| OwnerMarkerError::System("owner row inserted but not readable".into()))
 }
 
 /// What the boot check decides. `Write` means the marker object is missing and
