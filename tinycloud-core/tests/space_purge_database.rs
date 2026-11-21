@@ -47,7 +47,7 @@ async fn postgres_leaf_cleanup_is_exact_space_transactional_and_idempotent() {
             "sql",
             space,
             "main",
-            b"checkpoint".to_vec(),
+            b"checkpoint".to_vec().into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -467,7 +467,7 @@ async fn postgres_purge_erases_chunked_artifacts_and_last_owner_rows() {
                 "sql",
                 space,
                 "legacy",
-                vec![1; 128],
+                vec![1; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await

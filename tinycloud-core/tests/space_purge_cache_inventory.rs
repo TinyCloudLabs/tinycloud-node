@@ -53,7 +53,7 @@ impl DatabaseArtifactRepository for BlockHydration {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         self.inner

@@ -690,7 +690,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError>;
 
@@ -699,7 +699,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         _service: &str,
         _space: &str,
         _name: &str,
-        _payload: Vec<u8>,
+        _payload: ::bytes::Bytes,
         _expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
@@ -1272,7 +1272,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         // TC-2961: before the writer lock, the hash and any statement.
@@ -1378,7 +1378,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     )
                     .col_expr(
                         database_artifact::Column::Payload,
-                        Expr::value(payload.clone()),
+                        Expr::value(payload.to_vec()),
                     )
                     .col_expr(
                         database_artifact::Column::SizeBytes,
@@ -1439,7 +1439,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     name: Set(name.to_string()),
                     revision: Set(revision),
                     content_hash: Set(content_hash.clone()),
-                    payload: Set(payload.clone()),
+                    payload: Set(payload.to_vec()),
                     size_bytes: Set(size_bytes),
                     backend: Set("storage.database".to_string()),
                     storage_mode: Set("database-blob".to_string()),
@@ -1470,7 +1470,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         scope.commit().await?;
 
         Ok(DatabaseArtifact {
-            payload,
+            payload: payload.to_vec(),
             content_hash: content_hash.clone(),
             revision,
             size_bytes,
@@ -1489,7 +1489,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         self.check_write(payload.len())?;
@@ -1543,7 +1543,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             )
             .col_expr(
                 database_artifact::Column::DeltaPayload,
-                Expr::value(Some(payload)),
+                Expr::value(Some(payload.to_vec())),
             )
             .col_expr(
                 database_artifact::Column::DeltaContentHash,
@@ -1650,7 +1650,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![1; 100],
+            vec![1; 100].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -1660,7 +1660,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 12],
+                vec![2; 12].into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -1682,7 +1682,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![3; 80],
+            vec![3; 80].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -1712,7 +1712,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1724,7 +1724,7 @@ mod tests {
 
         // A live actor advances the database. The stale actor's base is now gone.
         let current = repo
-            .save("sql", "space", "main", vec![2; 200], stale.clone())
+            .save("sql", "space", "main", vec![2; 200].into(), stale.clone())
             .await
             .unwrap();
         assert_eq!(current.revision, 2);
@@ -1733,7 +1733,7 @@ mod tests {
         // it performs matches whatever is current — only the lineage it carries
         // says its 100 bytes never derived from these 200.
         let err = repo
-            .save("sql", "space", "main", vec![1; 100], stale.clone())
+            .save("sql", "space", "main", vec![1; 100].into(), stale.clone())
             .await
             .expect_err("a save from a superseded checkpoint must not commit");
         assert!(
@@ -1741,7 +1741,7 @@ mod tests {
             "expected a lineage rejection, got {err:?}"
         );
         let err = repo
-            .save_delta("sql", "space", "main", vec![9; 12], stale)
+            .save_delta("sql", "space", "main", vec![9; 12].into(), stale)
             .await
             .expect_err("a WAL built on a superseded checkpoint must not attach");
         assert!(
@@ -1764,7 +1764,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![3; 300],
+            vec![3; 300].into(),
             ArtifactExpectation::Derived {
                 revision: current.revision,
                 checkpoint_content_hash: current.checkpoint_content_hash,
@@ -1788,7 +1788,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![1; 4096],
+            vec![1; 4096].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1799,7 +1799,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![0; 8],
+                vec![0; 8].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1847,7 +1847,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 4097],
+                vec![1; 4097].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -1863,7 +1863,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 4096],
+                vec![1; 4096].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1873,7 +1873,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 4097],
+                vec![2; 4097].into(),
                 ArtifactExpectation::Derived {
                     revision: saved.revision,
                     checkpoint_content_hash: saved.checkpoint_content_hash,
@@ -1918,7 +1918,7 @@ mod tests {
             "sql",
             "space",
             "big",
-            vec![1; 4097],
+            vec![1; 4097].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1938,7 +1938,7 @@ mod tests {
                 "sql",
                 "space",
                 "wal",
-                vec![1; 4096],
+                vec![1; 4096].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1950,7 +1950,7 @@ mod tests {
             "sql",
             "space",
             "wal",
-            vec![2; 4097],
+            vec![2; 4097].into(),
             ArtifactExpectation::Derived {
                 revision: saved.revision,
                 checkpoint_content_hash: saved.checkpoint_content_hash,
@@ -2013,7 +2013,7 @@ mod tests {
             "sql",
             "space",
             "large",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -2022,7 +2022,7 @@ mod tests {
             "sql",
             "space",
             "small",
-            vec![1; 16],
+            vec![1; 16].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -2108,7 +2108,7 @@ mod tests {
                     "sql",
                     "t",
                     name,
-                    vec![1; large],
+                    vec![1; large].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -2136,7 +2136,7 @@ mod tests {
                         "sql",
                         "t",
                         name,
-                        vec![2; large],
+                        vec![2; large].into(),
                         ArtifactExpectation::Derived {
                             revision,
                             checkpoint_content_hash,
@@ -2216,7 +2216,7 @@ mod tests {
                 "sql",
                 "other",
                 name,
-                vec![1; large],
+                vec![1; large].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -2255,7 +2255,7 @@ mod tests {
                     "sql",
                     "victim",
                     "big",
-                    vec![2; large],
+                    vec![2; large].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -2269,7 +2269,7 @@ mod tests {
                 "sql",
                 "victim",
                 "small",
-                vec![3; 16],
+                vec![3; 16].into(),
                 ArtifactExpectation::Absent,
             ),
         )
@@ -2302,9 +2302,15 @@ mod tests {
         let repo = SeaOrmDatabaseArtifactRepository::new(conn)
             .with_max_write_bytes(4096)
             .with_max_read_bytes(4096);
-        repo.save("sql", "s", "at", vec![1; 4096], ArtifactExpectation::Absent)
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "s",
+            "at",
+            vec![1; 4096].into(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
         let meta = repo.load_meta("sql", "s", "at").await.unwrap().unwrap();
         assert_eq!(meta.checkpoint_size_bytes, 4096);
         let mut sink = MemorySink::default();
@@ -2384,7 +2390,7 @@ mod tests {
                     "sql",
                     "space",
                     "main",
-                    vec![0; 8],
+                    vec![0; 8].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -2462,16 +2468,22 @@ mod tests {
             }
         );
 
-        repo.save("sql", "space", "empty", vec![], ArtifactExpectation::Any)
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "empty",
+            vec![].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         let empty_before = repo.load_meta("sql", "space", "empty").await.unwrap();
         let result = repo
             .save(
                 "sql",
                 "space",
                 "empty",
-                vec![9; 8],
+                vec![9; 8].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -2510,7 +2522,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -2533,14 +2545,14 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 80],
+                vec![2; 80].into(),
                 ArtifactExpectation::Any
             ),
             second.save(
                 "sql",
                 "space",
                 "main",
-                vec![3; 60],
+                vec![3; 60].into(),
                 ArtifactExpectation::Any
             ),
         );
@@ -2630,16 +2642,22 @@ mod tests {
                     "sql",
                     "space",
                     &name,
-                    payload.clone(),
+                    payload.clone().into(),
                     ArtifactExpectation::Any,
                 )
                 .await
                 .unwrap();
                 let wal = delta.map(|len| bytes(len, 2));
                 if let Some(wal) = &wal {
-                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                        .await
-                        .unwrap();
+                    repo.save_delta(
+                        "sql",
+                        "space",
+                        &name,
+                        wal.clone().into(),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .unwrap();
                 }
 
                 statements.lock().unwrap().clear();
@@ -2684,7 +2702,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(CHUNK + 5, 3),
+            bytes(CHUNK + 5, 3).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2693,7 +2711,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(9, 4),
+            bytes(9, 4).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2762,12 +2780,18 @@ mod tests {
                 self.disturbances_left -= 1;
                 let (checkpoint, wal) = (self.disturb)(self.disturbances_left);
                 self.repo
-                    .save("sql", "space", "main", checkpoint, ArtifactExpectation::Any)
+                    .save(
+                        "sql",
+                        "space",
+                        "main",
+                        checkpoint.into(),
+                        ArtifactExpectation::Any,
+                    )
                     .await
                     .unwrap();
                 if let Some(wal) = wal {
                     self.repo
-                        .save_delta("sql", "space", "main", wal, ArtifactExpectation::Any)
+                        .save_delta("sql", "space", "main", wal.into(), ArtifactExpectation::Any)
                         .await
                         .unwrap();
                 }
@@ -2801,7 +2825,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2827,7 +2851,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 1, 1),
+            bytes(2 * CHUNK + 1, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2836,7 +2860,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(5, 2),
+            bytes(5, 2).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2862,7 +2886,13 @@ mod tests {
                     self.1 = true;
                     self.0
                         .repo
-                        .save_delta("sql", "space", "main", vec![7; 6], ArtifactExpectation::Any)
+                        .save_delta(
+                            "sql",
+                            "space",
+                            "main",
+                            vec![7; 6].into(),
+                            ArtifactExpectation::Any,
+                        )
                         .await
                         .unwrap();
                 }
@@ -2890,7 +2920,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 1, 1),
+            bytes(2 * CHUNK + 1, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2933,7 +2963,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2968,7 +2998,7 @@ mod tests {
                             "sql",
                             "space",
                             "main",
-                            vec![5; CHUNK + 2],
+                            vec![5; CHUNK + 2].into(),
                             ArtifactExpectation::Any,
                         )
                         .await
@@ -3013,7 +3043,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(len, 1),
+            bytes(len, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3022,7 +3052,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(20, 2),
+            bytes(20, 2).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3045,7 +3075,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                bytes(len, 1),
+                bytes(len, 1).into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -3054,7 +3084,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                bytes(20, 2),
+                bytes(20, 2).into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -3083,7 +3113,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(len, 1),
+            bytes(len, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3107,7 +3137,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            b"MAGIC-body".to_vec(),
+            b"MAGIC-body".to_vec().into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3151,16 +3181,22 @@ mod tests {
                     "sql",
                     "space",
                     &name,
-                    payload.clone(),
+                    payload.clone().into(),
                     ArtifactExpectation::Any,
                 )
                 .await
                 .unwrap();
                 let wal = delta.map(|len| bytes(len, 2));
                 if let Some(wal) = &wal {
-                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                        .await
-                        .unwrap();
+                    repo.save_delta(
+                        "sql",
+                        "space",
+                        &name,
+                        wal.clone().into(),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .unwrap();
                 }
                 let mut sink = MemorySink::default();
                 read_artifact(&repo, "sql", "space", &name, &mut sink)
@@ -3177,7 +3213,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3232,14 +3268,20 @@ mod tests {
                 "sql",
                 "space",
                 &name,
-                payload.clone(),
+                payload.clone().into(),
                 ArtifactExpectation::Any,
             )
             .await
             .unwrap();
-            repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                .await
-                .unwrap();
+            repo.save_delta(
+                "sql",
+                "space",
+                &name,
+                wal.clone().into(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
             let mut sink = MemorySink::default();
             read_artifact(&repo, "sql", "space", &name, &mut sink)
                 .await
