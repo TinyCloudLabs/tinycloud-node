@@ -2875,6 +2875,124 @@ where
         PreVerified::delegation(&self.conn, delegation, self.encryption.as_ref()).await
     }
 
+    /// TC-3443: retire the session key `did` (a bare `did:key`) for `ttl`.
+    ///
+    /// `carried` are root delegations to the key that the client holds and
+    /// sends with its sign-out, so that a root this node has not stored yet
+    /// cannot be posted later to bring the key back. There is no side door:
+    /// each is admitted exactly as `POST /delegate` admits one (signature,
+    /// pool-side precheck, chain guards, then `delegation::process_with`
+    /// inside the transaction), and one already stored is fine as it is.
+    /// Every carried delegation must be to `did`, or the whole request is
+    /// refused, so one key cannot seed rows for another.
+    ///
+    /// The carried roots are stored inside the retire's own write
+    /// transaction, after the key's retire lock and before the retire reads
+    /// what the key holds, so the retire counts them. If any is refused, or
+    /// anything fails, nothing is written. A repeat call keeps the first
+    /// retire time.
+    pub async fn retire_session(
+        &self,
+        did: &str,
+        ttl: time::Duration,
+        carried: Vec<Delegation>,
+    ) -> Result<
+        crate::models::session_retire::RetireOutcome,
+        crate::models::session_retire::SessionRetireError,
+    >
+    where
+        B::Error: std::fmt::Display,
+        K::Error: std::fmt::Display,
+    {
+        use crate::models::session_retire::{self, SessionRetireError};
+        if carried.len() > session_retire::MAX_CARRIED_DELEGATIONS {
+            return Err(SessionRetireError::Invalid(format!(
+                "at most {} delegations may be carried",
+                session_retire::MAX_CARRIED_DELEGATIONS
+            )));
+        }
+        if let Some(index) = carried
+            .iter()
+            .position(|delegation| delegation.0.delegate != did)
+        {
+            return Err(SessionRetireError::Invalid(format!(
+                "delegation {index}: its delegatee is not the retiring key"
+            )));
+        }
+        // As `delegate_verified`, before any lock: the signature, then, for
+        // one not already stored, its time window and issuer's standing.
+        let mut verified = PreVerified::default();
+        let mut to_store = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, delegation) in carried.into_iter().enumerate() {
+            let hash = delegation.content_hash();
+            if !seen.insert(hash) {
+                continue;
+            }
+            let checked = self
+                .preverify_delegation(&delegation)
+                .await
+                .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
+            verified = verified.union(checked);
+            if delegation::Entity::find_by_id(hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            // TC-1500 (#677): after the rebase `check_holder` runs here, in
+            // `delegation::precheck`, and again in `process_with` below, as
+            // for every other new delegation.
+            delegation::precheck(
+                &self.conn,
+                &delegation,
+                self.delegated_sql_caveats,
+                self.named_keys,
+                self.renewal_identity
+                    .as_ref()
+                    .map(|identity| identity.renewer_did.as_str()),
+            )
+            .await
+            .map_err(|error| {
+                carried_refusal(format!("delegation {index}"), TxError::<B, K>::from(error))
+            })?;
+            to_store.push((index, delegation));
+        }
+        let mut roots = Vec::new();
+        for (_, delegation) in &to_store {
+            let parents: Vec<Hash> = delegation
+                .0
+                .parents
+                .iter()
+                .copied()
+                .map(Hash::from)
+                .collect();
+            roots.extend(delegation_guard_roots(delegation.content_hash(), &parents));
+        }
+        roots.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        roots.dedup();
+        let _chain_guards = self
+            .acquire_chain_guards(&roots)
+            .await
+            .map_err(|error| carried_refusal("delegations".to_owned(), error))?;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        session_retire::lock_did(&tx, did).await?;
+        for (index, delegation) in to_store {
+            self.delegate_batch_in_transaction_verified(&tx, vec![delegation], &verified)
+                .await
+                .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
+        }
+        let outcome =
+            session_retire::retire_in(&tx, did, session_retire::stored_now(), ttl).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         // TC-2986: the signature is checked before any lock.
         let verified = PreVerified::revocation(&revocation).await?;
