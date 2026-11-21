@@ -52,13 +52,13 @@
 
 ## [1.26.17] - 2026-11-21
 
-The node refuses any DID it cannot verify offline (TC-1500), and `/info` reports how the node opened its identity root, which the production deploy now checks (TC-3579). The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
+The node refuses any DID it cannot verify offline (TC-1500), and `/info` reports how the node opened its identity root, which the production deploy checks (TC-3579). The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
 
 ### Upgrade notes
 
-- **No database migration.** Rolling back to 1.26.16 changes only the image, on the unchanged N0 compose. The deploy check is skipped for images built before the `identityRoot` field.
-- **New grants to `did:key:z2D…` holders are refused** with 401 `did_holder_unverifiable:` (247 stored in production; see Changes). Grants already stored still answer as registered when posted again.
-- **Deploy check:** on the sidecar-free compose the node must report `identityRoot: sealed`, or the deploy fails.
+- **No database migration.** Rolling back to 1.26.16 changes only the image, on the same N0 compose. The deploy check is skipped for images built before the `identityRoot` field.
+- **New grants to `did:key:z2D…` holders are refused** with 401 `did_holder_unverifiable:` (247 stored in production on 2026-11-21; see Changes). Posting a grant that's already stored answers as registered.
+- **Deploy check:** after the deploy, the workflow reads `/info`. On the sidecar-free compose the node must report `identityRoot: sealed`, or the deploy job fails. The new image is already running by then, so a failure means rolling back to 1.26.16.
 - `TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS` is ignored with a startup warning. Remove it from any config that sets it.
 
 ### Changes
