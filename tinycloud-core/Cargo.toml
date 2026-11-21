@@ -33,6 +33,7 @@ async-std = [
 ]
 
 [dependencies]
+bytes = "1"
 serde_jcs = "0.1"
 dashmap = "5.5"
 blake3 = "1"

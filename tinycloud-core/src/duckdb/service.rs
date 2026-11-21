@@ -341,7 +341,7 @@ impl DuckDbService {
                 "duckdb",
                 &space.to_string(),
                 db_name,
-                data.to_vec(),
+                data.to_vec().into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -533,7 +533,13 @@ impl DuckDbService {
         {
             match self
                 .artifact_repository
-                .save_delta("duckdb", &space.to_string(), db_name, wal, expected.clone())
+                .save_delta(
+                    "duckdb",
+                    &space.to_string(),
+                    db_name,
+                    wal.into(),
+                    expected.clone(),
+                )
                 .await
             {
                 Ok(saved) => {
@@ -586,7 +592,13 @@ impl DuckDbService {
         }
         let saved = self
             .artifact_repository
-            .save("duckdb", &space.to_string(), db_name, payload, expected)
+            .save(
+                "duckdb",
+                &space.to_string(),
+                db_name,
+                payload.into(),
+                expected,
+            )
             .await
             .map_err(artifact_error_to_duckdb)?;
         self.lineage.insert(

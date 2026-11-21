@@ -3131,7 +3131,7 @@ mod tests {
             "sql",
             &space.to_string(),
             &physical,
-            std::fs::read(db_path).unwrap(),
+            std::fs::read(db_path).unwrap().into(),
             ArtifactExpectation::Absent,
         )
         .await

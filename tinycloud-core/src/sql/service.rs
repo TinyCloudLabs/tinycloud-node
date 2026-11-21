@@ -127,7 +127,7 @@ impl DatabaseArtifactRepository for MetaRetry<'_> {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         self.inner
@@ -140,7 +140,7 @@ impl DatabaseArtifactRepository for MetaRetry<'_> {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         self.inner
@@ -1283,7 +1283,7 @@ impl SqlService {
                         "sql",
                         &space.to_string(),
                         db_name,
-                        wal,
+                        wal.into(),
                         expected.clone(),
                     ),
                 )
@@ -1365,7 +1365,7 @@ impl SqlService {
                     "sql",
                     &space.to_string(),
                     db_name,
-                    payload,
+                    payload.into(),
                     expected,
                 ),
             ))
@@ -1687,7 +1687,7 @@ mod tests {
                 "sql",
                 &space.to_string(),
                 "main",
-                payload.clone(),
+                payload.clone().into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1697,7 +1697,7 @@ mod tests {
                 "sql",
                 &space.to_string(),
                 super::super::publication::DATABASE,
-                payload.clone(),
+                payload.clone().into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1906,7 +1906,7 @@ mod tests {
                 "sql",
                 &space.to_string(),
                 "main",
-                payload,
+                payload.into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -3989,7 +3989,7 @@ mod tests {
             "sql",
             &space.to_string(),
             "main",
-            vec![0x37, 0x7f, 0x06, 0x82, 0, 0, 0, 0],
+            vec![0x37, 0x7f, 0x06, 0x82, 0, 0, 0, 0].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -4062,7 +4062,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -4075,7 +4075,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -4328,7 +4328,7 @@ mod tests {
                 "sql",
                 "other-tenant",
                 name,
-                vec![1; large],
+                vec![1; large].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -4466,7 +4466,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             let saved = self
@@ -4482,7 +4482,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             let saved = self
@@ -4582,7 +4582,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.fail()?;
@@ -4596,7 +4596,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.fail()?;
@@ -4919,7 +4919,7 @@ mod tests {
             _service: &str,
             _space: &str,
             _name: &str,
-            _payload: Vec<u8>,
+            _payload: ::bytes::Bytes,
             _expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             Err(DatabaseArtifactError::Backend("forced failure".to_string()))
@@ -5120,7 +5120,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.saves_waiting.fetch_add(1, Ordering::SeqCst);
@@ -5135,7 +5135,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.saves_waiting.fetch_add(1, Ordering::SeqCst);
@@ -5690,7 +5690,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -5703,7 +5703,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -6064,7 +6064,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -6077,7 +6077,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -6325,7 +6325,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.note("save");
@@ -6339,7 +6339,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.note("save_delta");
