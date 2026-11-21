@@ -112,7 +112,7 @@ impl DatabaseArtifactRepository for BlockHydration {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         self.inner
@@ -213,7 +213,7 @@ async fn duckdb_eviction_closes_actors_and_preserves_neighbour() {
             "duckdb",
             &space.to_string(),
             name,
-            payload.clone(),
+            payload.clone().into(),
             ArtifactExpectation::Absent,
         )
         .await

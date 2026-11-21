@@ -2361,7 +2361,7 @@ mod sqlite_tuning_tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -2381,7 +2381,7 @@ mod sqlite_tuning_tests {
                         "sql",
                         "space",
                         "main",
-                        vec![2; 12],
+                        vec![2; 12].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -2392,7 +2392,7 @@ mod sqlite_tuning_tests {
                         "sql",
                         "space",
                         "main",
-                        vec![3; 120],
+                        vec![3; 120].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -2880,7 +2880,7 @@ mod retry_after_fairing_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: Vec<u8>,
+            _: ::bytes::Bytes,
             _: tinycloud_core::database_artifacts::ArtifactExpectation,
         ) -> Result<
             tinycloud_core::database_artifacts::DatabaseArtifact,
@@ -2894,7 +2894,7 @@ mod retry_after_fairing_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: Vec<u8>,
+            _: ::bytes::Bytes,
             _: tinycloud_core::database_artifacts::ArtifactExpectation,
         ) -> Result<
             tinycloud_core::database_artifacts::DeltaSave,
