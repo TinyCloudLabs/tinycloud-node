@@ -1,5 +1,5 @@
 //! TC-3443: `POST /session/retire` through the real node. A signed-in
-//! session key retires itself; from then on it invokes nothing and a new
+//! session key retires itself; from then on it uses no delegated authority and a new
 //! delegation it signs is refused, while a child it made before keeps
 //! working.
 
@@ -264,7 +264,7 @@ async fn retire_returns_the_first_retire_time_and_ends_only_the_session_key() ->
     let again: Value = serde_json::from_str(&body)?;
     ensure!(again == first, "{again} != {first}");
 
-    // The session key itself invokes nothing.
+    // The session key itself uses no delegated authority.
     let (status, body) = invoke(&client, &session).await?;
     ensure!(
         status == Status::Unauthorized && body.starts_with("session_retired: "),

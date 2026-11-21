@@ -1412,8 +1412,19 @@ async fn save<C: ConnectionTrait>(
     // Actors are FK prerequisites for the delegation row and must be inserted
     // first. They use ON CONFLICT DO NOTHING so concurrent transactions writing
     // the same actors are safe. This is the only write that precedes the
-    // idempotency gate below.
-    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
+    // idempotency gate below. For a delegation to a `did:key` on PostgreSQL
+    // the same statement takes the key's session-retire lock (TC-3443 N1),
+    // so a concurrent retire either sees this delegation or is seen by the
+    // raise below; it costs no extra round trip.
+    let retire_lock = (db.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+        && session_retire::is_retirable(&delegation.delegate))
+    .then(|| session_retire::lock_key(&delegation.delegate));
+    save_actors(
+        &[&delegation.delegator, &delegation.delegate],
+        retire_lock,
+        db,
+    )
+    .await?;
 
     // The signed row remains the idempotency gate. Persist its alias in the
     // same transaction; PostgreSQL uses a dependent INSERT CTE to keep the
@@ -1552,8 +1563,12 @@ async fn save<C: ConnectionTrait>(
     Ok(DelegationRegistration::New(hash))
 }
 
-async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
-    crate::space_purge_records::operation_actors(db, actors).await
+async fn save_actors<C: ConnectionTrait>(
+    actors: &[&str],
+    retire_lock: Option<i64>,
+    db: &C,
+) -> Result<(), DbErr> {
+    crate::space_purge_records::operation_actors_locking(db, actors, retire_lock).await
 }
 
 #[cfg(test)]

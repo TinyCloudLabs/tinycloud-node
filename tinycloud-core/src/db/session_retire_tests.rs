@@ -1,4 +1,4 @@
-//! TC-3443: a retired (signed-out) session key invokes nothing and issues no
+//! TC-3443: a retired (signed-out) session key uses no delegated authority and issues no
 //! new delegation, while delegations it made before the retire, and their
 //! descendants, keep working.
 use super::*;
@@ -476,4 +476,98 @@ async fn postgres_retire_row_outlasts_every_grant_the_key_holds() {
         return;
     };
     cover_scenario(f).await;
+}
+
+/// TC-3443 F1: past its TTL a retire still holds while the key holds a
+/// longer grant. The key retires holding a 60-day root and is evaluated at
+/// retire + 31 days (TTL 30 days): its invocation is refused, the row the
+/// delegation intake reads is still live, and pruning keeps it.
+async fn past_ttl_scenario(f: Fx) {
+    let session = f.session_did();
+    let day = 86_400;
+    let root = f.delegation_until(&f.owner, &session, vec![], f.created + 60 * day);
+    f.delegate(&root).await.unwrap();
+    let retired_at = f.db.retire_session(&session, TTL).await.unwrap();
+    let later = retired_at + time::Duration::days(31);
+
+    let capability = crate::util::Capability {
+        resource: f.kv().parse().unwrap(),
+        ability: "tinycloud.kv/get".to_owned().try_into().unwrap(),
+        caveats: Default::default(),
+    };
+    let invoked = crate::models::invocation::authorize_holder(
+        &f.db.conn,
+        &session,
+        &[capability],
+        &[cid_of(&root)],
+        later,
+    )
+    .await
+    .map_err(|error| error.to_string());
+    assert_retired(invoked, "invoke at retire + 31 days");
+    assert_eq!(
+        crate::models::session_retire::live_retired_at(&f.db.conn, &session, later)
+            .await
+            .unwrap(),
+        Some(retired_at),
+        "the delegation intake still sees the retire at retire + 31 days"
+    );
+    assert_eq!(
+        crate::models::session_retire::prune_expired(&f.db.conn, later)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn sqlite_retire_holds_past_its_ttl_while_a_longer_grant_lives() {
+    past_ttl_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_retire_holds_past_its_ttl_while_a_longer_grant_lives() {
+    let Some(f) = pg_fx("postgres_retire_holds_past_its_ttl_while_a_longer_grant_lives").await
+    else {
+        return;
+    };
+    past_ttl_scenario(f).await;
+}
+
+/// TC-3443 N1: a delegation to the key stored while its retire runs is never
+/// missed. Whichever commits first, the retire row ends up covering the new,
+/// longer root: the retire counts it, or its insert raises the row.
+async fn race_with_delegation_scenario(f: Fx) {
+    let session = f.session_did();
+    let day = 86_400;
+    let (_root_cid, _child, _child_cid) = f.signed_in().await;
+    let longer = f.delegation_until(&f.owner, &session, vec![], f.created + 60 * day);
+    let (stored, retired) = tokio::join!(f.delegate(&longer), f.db.retire_session(&session, TTL));
+    retired.unwrap();
+    // A root to the key is never refused, whichever ordering won.
+    stored.unwrap();
+    let row = <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
+        session.clone(),
+    )
+    .one(&f.db.conn)
+    .await
+    .unwrap()
+    .expect("the session key holds a live root");
+    assert!(
+        row.expires_at >= time::OffsetDateTime::from_unix_timestamp(f.created + 60 * day).unwrap(),
+        "{row:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_retire_racing_a_delegation_to_the_key_covers_it() {
+    race_with_delegation_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_retire_racing_a_delegation_to_the_key_covers_it() {
+    let Some(f) = pg_fx("postgres_retire_racing_a_delegation_to_the_key_covers_it").await else {
+        return;
+    };
+    race_with_delegation_scenario(f).await;
 }

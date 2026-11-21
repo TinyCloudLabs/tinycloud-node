@@ -1184,6 +1184,23 @@ async fn register_lease_checked<C: ConnectionTrait>(
         ],
     ))
     .await?;
+    // TC-3443: a lease can renew the original up to its own expiry, so a
+    // live retire of the original's holder must outlast it. (A live retire
+    // already refused this lease above; the rule stays uniform with
+    // `delegation::save`.)
+    if let Some(holder) = snapshot
+        .delegation(&original)
+        .map(|row| row.delegatee.as_str())
+        .filter(|holder| crate::models::session_retire::is_retirable(holder))
+    {
+        crate::models::session_retire::raise_expiry(
+            tx,
+            holder,
+            crate::models::session_retire::covering(Some(lease_expiry)),
+            unix_time(now)?,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1406,14 +1423,19 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     })
 }
 
+/// PostgreSQL advisory-lock key for renewal of `original` (a canonical hash).
+pub(crate) fn original_lock_key(original: &Hash) -> i64 {
+    let bytes = crate::hash::hash(original.as_ref());
+    i64::from_be_bytes(bytes.as_ref()[..8].try_into().unwrap())
+}
+
 async fn lock_original<C: ConnectionTrait>(
     tx: &C,
     original: &Hash,
 ) -> Result<(), RenewalStoreError> {
     match tx.get_database_backend() {
         DatabaseBackend::Postgres => {
-            let bytes = crate::hash::hash(original.as_ref());
-            let key = i64::from_be_bytes(bytes.as_ref()[..8].try_into().unwrap());
+            let key = original_lock_key(original);
             tx.query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "SELECT pg_advisory_xact_lock($1)",
@@ -2085,14 +2107,16 @@ mod tests {
             .unwrap();
         // TC-3443 (C2): while the original's holder is a retired session key
         // no stamp is issued and the request spends no replay; once the
-        // retire is gone the same request is stamped below.
+        // retire is gone the same request is stamped below. The retire has a
+        // one-second TTL and is ten seconds old: past its TTL it still holds,
+        // because the original and its lease outlive it (F1).
         let stamps = row_count(&db, "renewal_stamp").await;
         let replays = row_count(&db, "invocation_replay").await;
         crate::models::session_retire::retire(
             &db,
             &original_info.delegate,
             unix_time(now - 10).unwrap(),
-            time::Duration::days(30),
+            time::Duration::seconds(1),
         )
         .await
         .unwrap();
@@ -2111,33 +2135,89 @@ mod tests {
             .exec(&db)
             .await
             .unwrap();
-        let issued = issue_stamp_at(&db, request.clone(), &secret, &identity, now)
+        // TC-3443 N1: a stamp and a retire racing each other. They serialize
+        // on the write lock (and on PostgreSQL the original's renewal lock):
+        // either the stamp is declined, or the retire counts its end.
+        let holder = original_info.delegate.clone();
+        let (stamped, raced) = tokio::join!(
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now),
+            crate::models::session_retire::retire(
+                &db,
+                &holder,
+                unix_time(now).unwrap(),
+                time::Duration::seconds(1),
+            ),
+        );
+        raced.unwrap();
+        let raced_expiry =
+            <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
+                holder.clone(),
+            )
+            .one(&db)
             .await
-            .unwrap();
-        assert!(issued.new_end <= end);
-        assert!(issued.new_end > original_expiry);
-        // TC-3443: a retire of the holder now lasts until the stamp's end,
-        // past the original's own expiry.
-        crate::models::session_retire::retire(
-            &db,
-            &original_info.delegate,
-            unix_time(now).unwrap(),
-            time::Duration::seconds(1),
-        )
-        .await
-        .unwrap();
-        let row = <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
-            original_info.delegate.clone(),
-        )
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(row.expires_at, unix_time(issued.new_end).unwrap());
+            .unwrap()
+            .unwrap()
+            .expires_at;
         <crate::models::session_retire::Entity as sea_orm::EntityTrait>::delete_many()
             .exec(&db)
             .await
             .unwrap();
+        let issued = match stamped {
+            Ok(issued) => {
+                assert!(raced_expiry >= unix_time(issued.new_end).unwrap());
+                issued
+            }
+            Err(RenewalStoreError::SessionRetired(_)) => {
+                issue_stamp_at(&db, request.clone(), &secret, &identity, now)
+                    .await
+                    .unwrap()
+            }
+            Err(error) => panic!("{error:?}"),
+        };
+        assert!(issued.new_end <= end);
+        assert!(issued.new_end > original_expiry);
+        // TC-3443 F1: a retire of the holder lasts past the original's own
+        // expiry, until the active lease (which may still renew it) ends,
+        // and without the lease until the stamp's end.
+        let retire_expiry = |db: &sea_orm::DatabaseConnection| {
+            let db = db.clone();
+            let holder = original_info.delegate.clone();
+            async move {
+                crate::models::session_retire::retire(
+                    &db,
+                    &holder,
+                    unix_time(now).unwrap(),
+                    time::Duration::seconds(1),
+                )
+                .await
+                .unwrap();
+                let row =
+                    <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
+                        holder,
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                <crate::models::session_retire::Entity as sea_orm::EntityTrait>::delete_many()
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                row.expires_at
+            }
+        };
+        assert!(lease_expiry > issued.new_end);
+        assert_eq!(retire_expiry(&db).await, unix_time(lease_expiry).unwrap());
+        let set_lease_state = |state: &'static str| {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE renewal_lease SET state = $1",
+                [Value::String(Some(Box::new(state.to_owned())))],
+            ))
+        };
+        set_lease_state("expired").await.unwrap();
+        assert_eq!(retire_expiry(&db).await, unix_time(issued.new_end).unwrap());
+        set_lease_state("active").await.unwrap();
         assert!(matches!(
             issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
             Err(RenewalStoreError::Replay)

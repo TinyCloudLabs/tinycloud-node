@@ -1,9 +1,13 @@
 //! TC-3443: session keys their holders signed out ("retired").
 //!
 //! A row names a `did:key` session key (bare DID, no fragment) and when it
-//! was retired. While the row is live (`expires_at > now`) the key invokes
-//! nothing, and a delegation it issues is refused unless it was stored
-//! before the retire. Expired rows are ignored by every lookup and pruned.
+//! was retired. While the row is live (`expires_at > now`) the key can no
+//! longer use any delegated authority, and a delegation it issues is refused
+//! unless it was stored before the retire. Authority the key holds as a root
+//! (a space or network it owns itself) is not delegated and is unaffected.
+//! A row is written only for a key holding a live grant here, and lasts
+//! until the latest of them ends. Expired rows are ignored by every lookup
+//! and pruned.
 use super::{delegation, delegation_cid_alias};
 use crate::did_resolution::verify_ucan_signature;
 use crate::encryption_network::delete_auth::CLOCK_SKEW_SECS;
@@ -11,7 +15,7 @@ use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, Expr, OnConflict, Query, UpdateStatement},
     ActiveValue::Set,
-    ConnectionTrait, QuerySelect,
+    ConnectionTrait, QuerySelect, TransactionTrait,
 };
 use time::{Duration, OffsetDateTime};
 use tinycloud_auth::{authorization::TinyCloudInvocation, identity::principal_did};
@@ -145,8 +149,11 @@ pub fn never_expires() -> OffsetDateTime {
 }
 
 /// The latest time anything stored can still grant `did` authority: the
-/// latest expiry of a delegation it holds (a NULL expiry never ends), or of
-/// a renewal stamp extending one. `None` when it holds nothing.
+/// latest expiry of a delegation it holds (a NULL expiry never ends), of a
+/// renewal stamp extending one, or of an active renewal lease that may still
+/// renew one. `None` when it holds nothing. Every lookup starts from
+/// `idx_delegation_delegatee`, then follows primary keys and the
+/// `original_canonical`-leading keys of the renewal tables.
 async fn latest_authority_end<C: ConnectionTrait>(
     db: &C,
     did: &str,
@@ -158,36 +165,55 @@ async fn latest_authority_end<C: ConnectionTrait>(
         .into_tuple()
         .all(db)
         .await?;
-    let mut latest = expiries.into_iter().map(covering).max();
-    let stamp = Alias::new("renewal_stamp");
-    let stamped = Query::select()
-        .column((stamp.clone(), Alias::new("new_end")))
-        .from(stamp.clone())
+    let renewed = renewal_ends(db, did, "renewal_stamp", "new_end", false)
+        .await?
+        .into_iter()
+        .chain(renewal_ends(db, did, "renewal_lease", "lease_expiry", true).await?);
+    Ok(expiries
+        .into_iter()
+        .map(covering)
+        .chain(renewed.map(|end| covering(Some(end))))
+        .max())
+}
+
+/// `column` of every row of the renewal `table` (stamps or leases) whose
+/// original `did` holds; with `active_only`, of active rows only.
+async fn renewal_ends<C: ConnectionTrait>(
+    db: &C,
+    did: &str,
+    table: &str,
+    column: &str,
+    active_only: bool,
+) -> Result<Vec<OffsetDateTime>, DbErr> {
+    let renewal = Alias::new(table);
+    let mut query = Query::select()
+        .column((renewal.clone(), Alias::new(column)))
+        .from(delegation::Entity)
         .inner_join(
             delegation_cid_alias::Entity,
             Expr::col((
                 delegation_cid_alias::Entity,
-                delegation_cid_alias::Column::Canonical,
+                delegation_cid_alias::Column::Id,
             ))
-            .equals((stamp, Alias::new("original_canonical"))),
+            .equals((delegation::Entity, delegation::Column::Id)),
         )
         .inner_join(
-            delegation::Entity,
-            Expr::col((delegation::Entity, delegation::Column::Id)).equals((
+            renewal.clone(),
+            Expr::col((renewal.clone(), Alias::new("original_canonical"))).equals((
                 delegation_cid_alias::Entity,
-                delegation_cid_alias::Column::Id,
+                delegation_cid_alias::Column::Canonical,
             )),
         )
         .and_where(Expr::col((delegation::Entity, delegation::Column::Delegatee)).eq(did))
         .to_owned();
-    for row in db
-        .query_all(db.get_database_backend().build(&stamped))
-        .await?
-    {
-        let end: OffsetDateTime = row.try_get("", "new_end")?;
-        latest = latest.max(Some(covering(Some(end))));
+    if active_only {
+        query.and_where(Expr::col((renewal, Alias::new("state"))).eq("active"));
     }
-    Ok(latest)
+    db.query_all(db.get_database_backend().build(&query))
+        .await?
+        .iter()
+        .map(|row| row.try_get("", column))
+        .collect()
 }
 
 /// Raise a live retire row for `did` to `until`; never lowers it. A single
@@ -221,36 +247,132 @@ pub async fn raise_expiry<C: ConnectionTrait>(
     .map(drop)
 }
 
-/// Retire `did` at `now` and return its retire time. The row lasts at least
-/// `ttl`, and until the latest-expiring delegation (or renewal stamp) that
-/// grants `did` authority ends, so no stored grant outlives it. A key already
-/// retired keeps, and returns, its first retire time; its expiry is raised
-/// to cover what it holds now, never lowered. Expired rows are deleted first.
-pub async fn retire<C: ConnectionTrait>(
+/// Retire `did` at `now` and return its retire time. A row is written only
+/// when `did` holds a live grant here: a delegation, renewal stamp or active
+/// lease whose end is after `now`. A key holding none (one this node never
+/// granted anything to, or whose grants all ended) gets no row, which bounds
+/// what the unauthenticated-in-effect route can mint; `now` is returned and
+/// nothing is revealed. The row lasts at least `ttl`, and until the
+/// latest-ending of those grants, so no stored grant outlives it. A key
+/// already retired keeps, and returns, its first retire time; its expiry is
+/// raised to cover what it holds now, never lowered. Expired rows are
+/// deleted first.
+///
+/// The whole retire is one write transaction, so a grant committed while it
+/// runs is never missed (TC-3443 N1). On SQLite the write transaction holds
+/// the database write lock from its start, so it is serialized with every
+/// other writer. On PostgreSQL it first takes [`lock_key`]'s advisory lock,
+/// which `delegation::save` also takes before storing a delegation to a
+/// `did:key`, and then the renewal lock of each original the key holds,
+/// which stamp issuance and lease registration take; a grant committed
+/// before those locks is seen here, and one after them sees this row.
+pub async fn retire<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     did: &str,
     now: OffsetDateTime,
     ttl: Duration,
 ) -> Result<OffsetDateTime, DbErr> {
-    prune_expired(db, now).await?;
-    let base = now.saturating_add(ttl);
-    let expires_at = latest_authority_end(db, did)
+    let tx = crate::db::begin_write_transaction(db, None).await?;
+    let retired_at = retire_in(&tx, did, now, ttl).await?;
+    tx.commit().await?;
+    Ok(retired_at)
+}
+
+/// PostgreSQL advisory-lock key that serializes a retire of `did` with the
+/// storing of a delegation to it.
+pub fn lock_key(did: &str) -> i64 {
+    let digest = crate::hash::hash(format!("tinycloud.session_retire:{did}").as_bytes());
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&digest.as_ref()[..8]);
+    i64::from_be_bytes(key)
+}
+
+async fn retire_in<C: ConnectionTrait>(
+    tx: &C,
+    did: &str,
+    now: OffsetDateTime,
+    ttl: Duration,
+) -> Result<OffsetDateTime, DbErr> {
+    if tx.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+        let lock = |key: i64| {
+            tx.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock($1)",
+                [key.into()],
+            ))
+        };
+        // The key's own lock first: no delegation to it is stored from here
+        // on, so the originals read next are all it will hold.
+        lock(lock_key(did)).await?;
+        let mut originals = held_originals(tx, did)
+            .await?
+            .iter()
+            .map(crate::renewal::original_lock_key)
+            .collect::<Vec<_>>();
+        originals.sort_unstable();
+        originals.dedup();
+        for key in originals {
+            lock(key).await?;
+        }
+    }
+    prune_expired(tx, now).await?;
+    let existing = || async {
+        Ok::<_, DbErr>(
+            Entity::find_by_id(did.to_owned())
+                .one(tx)
+                .await?
+                .map(|row| row.retired_at),
+        )
+    };
+    let Some(end) = latest_authority_end(tx, did)
         .await?
-        .map_or(base, |end| end.max(base));
+        .filter(|end| *end > now)
+    else {
+        return Ok(existing().await?.unwrap_or(now));
+    };
+    let expires_at = end.max(now.saturating_add(ttl));
     Entity::insert(ActiveModel {
         did: Set(did.to_owned()),
         retired_at: Set(now),
         expires_at: Set(expires_at),
     })
     .on_conflict(OnConflict::column(Column::Did).do_nothing().to_owned())
-    .exec_without_returning(db)
+    .exec_without_returning(tx)
     .await?;
-    raise_expiry(db, did, expires_at, now).await?;
-    Entity::find_by_id(did.to_owned())
-        .one(db)
+    raise_expiry(tx, did, expires_at, now).await?;
+    existing()
         .await?
-        .map(|row| row.retired_at)
         .ok_or_else(|| DbErr::RecordNotFound(format!("session_retire row for {did}")))
+}
+
+/// Canonical hashes of the delegations stored to `did`: the originals whose
+/// renewal (lease or stamp) could extend its authority.
+async fn held_originals<C: ConnectionTrait>(
+    db: &C,
+    did: &str,
+) -> Result<Vec<crate::hash::Hash>, DbErr> {
+    let query = Query::select()
+        .distinct()
+        .column((
+            delegation_cid_alias::Entity,
+            delegation_cid_alias::Column::Canonical,
+        ))
+        .from(delegation::Entity)
+        .inner_join(
+            delegation_cid_alias::Entity,
+            Expr::col((
+                delegation_cid_alias::Entity,
+                delegation_cid_alias::Column::Id,
+            ))
+            .equals((delegation::Entity, delegation::Column::Id)),
+        )
+        .and_where(Expr::col((delegation::Entity, delegation::Column::Delegatee)).eq(did))
+        .to_owned();
+    db.query_all(db.get_database_backend().build(&query))
+        .await?
+        .iter()
+        .map(|row| row.try_get("", "canonical"))
+        .collect()
 }
 
 /// Delete every row that expired at or before `now`.
@@ -284,7 +406,35 @@ mod tests {
     use super::*;
     use crate::migrations::Migrator;
     use sea_orm::Database;
+    use sea_orm::{DatabaseConnection, Statement};
     use sea_orm_migration::MigratorTrait;
+
+    /// Store a bare delegation row from an owner to `did`, ending at `expiry`.
+    async fn grant(db: &DatabaseConnection, did: &str, expiry: Option<OffsetDateTime>) {
+        for actor in ["did:key:z6MkretireOwner", did] {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "INSERT INTO actor (id) VALUES ($1) ON CONFLICT DO NOTHING",
+                [actor.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        let id = crate::hash::hash(format!("{did}{expiry:?}").as_bytes());
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO delegation (id, delegator, delegatee, expiry, serialization, serialization_format) VALUES ($1, $2, $3, $4, $5, 0)",
+            [
+                Vec::<u8>::from(id).into(),
+                "did:key:z6MkretireOwner".into(),
+                did.into(),
+                expiry.into(),
+                vec![1u8].into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn repeat_retire_keeps_the_first_time_and_expired_rows_are_ignored_and_pruned() {
@@ -293,6 +443,7 @@ mod tests {
         let did = "did:key:z6MkretireRepeat";
         let first = stored_now();
         let ttl = Duration::days(30);
+        grant(&db, did, Some(first + Duration::days(1))).await;
         assert_eq!(retire(&db, did, first, ttl).await.unwrap(), first);
         let later = first + Duration::minutes(5);
         assert_eq!(retire(&db, did, later, ttl).await.unwrap(), first);
@@ -300,7 +451,7 @@ mod tests {
 
         // A repeat keeps the retire time but raises the expiry to its own
         // `now + ttl`. At and after expiry the row no longer counts, and the
-        // next retire call prunes it before recording a new one.
+        // next retire call prunes it.
         let expiry = later + ttl;
         assert_eq!(
             live_retired_at(&db, did, expiry - Duration::SECOND)
@@ -310,6 +461,7 @@ mod tests {
         );
         assert_eq!(live_retired_at(&db, did, expiry).await.unwrap(), None);
         let other = "did:key:z6MkretireOther";
+        grant(&db, other, None).await;
         retire(&db, other, expiry, ttl).await.unwrap();
         assert!(Entity::find_by_id(did.to_owned())
             .one(&db)
@@ -327,6 +479,22 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// TC-3443 F2: a key this node granted nothing live gets no row, so a
+    /// stranger cannot fill the table; the answer is still its `now`.
+    #[tokio::test]
+    async fn retire_of_a_key_without_a_live_grant_writes_no_row() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let now = stored_now();
+        let ttl = Duration::days(30);
+        let stranger = "did:key:z6MkretireStranger";
+        assert_eq!(retire(&db, stranger, now, ttl).await.unwrap(), now);
+        let lapsed = "did:key:z6MkretireLapsed";
+        grant(&db, lapsed, Some(now - Duration::SECOND)).await;
+        assert_eq!(retire(&db, lapsed, now, ttl).await.unwrap(), now);
+        assert!(Entity::find().all(&db).await.unwrap().is_empty());
     }
 
     mod request {

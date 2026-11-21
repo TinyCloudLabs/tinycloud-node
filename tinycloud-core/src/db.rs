@@ -1031,7 +1031,7 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
         ttl: time::Duration,
     ) -> Result<OffsetDateTime, DbErr>
     where
-        C: ConnectionTrait,
+        C: ConnectionTrait + TransactionTrait,
     {
         let _guard = match &self.writer_lock {
             Some(lock) => Some(lock.lock().await),

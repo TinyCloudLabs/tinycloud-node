@@ -91,6 +91,28 @@ async fn frozen_proofless_owner_lease_registers_active_generation_one() {
         .unwrap();
     assert_eq!(row.try_get::<String>("", "state").unwrap(), "active");
     assert_eq!(row.try_get::<i64>("", "generation").unwrap(), 1);
+
+    // TC-3443 F1: the active lease may renew the original up to its own
+    // expiry, so a retire of the holder lasts at least that long, whatever
+    // its TTL.
+    let holder = fixture["holderDid"].as_str().unwrap();
+    let now = fixture["issuedAt"].as_i64().unwrap() + 2;
+    crate::models::session_retire::retire(
+        &db,
+        holder,
+        unix_time(now).unwrap(),
+        time::Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    let retire = <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(
+        holder.to_owned(),
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(retire.expires_at >= crate::models::session_retire::covering(lease.0.expiry));
 }
 
 /// TC-3443 (C2): an original held by a retired session key gets no renewal
@@ -101,11 +123,13 @@ async fn lease_for_an_original_held_by_a_retired_session_key_is_refused() {
     let holder = fixture["holderDid"].as_str().unwrap();
     assert!(holder.starts_with("did:key:"));
     let now = fixture["issuedAt"].as_i64().unwrap() + 1;
+    // Retired with a one-second TTL ten seconds ago: past its TTL, the
+    // retire still holds because the original outlives it (TC-3443 F1).
     crate::models::session_retire::retire(
         &tx,
         holder,
-        unix_time(now - 1).unwrap(),
-        time::Duration::days(30),
+        unix_time(now - 10).unwrap(),
+        time::Duration::seconds(1),
     )
     .await
     .unwrap();

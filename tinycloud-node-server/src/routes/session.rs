@@ -63,9 +63,11 @@ pub struct SessionRetired {
 /// Retire the session key that signed the request. The header carries a
 /// UCAN the session key issued to this node with exactly
 /// `tinycloud.session/retire` on `urn:tinycloud:session:self`. From then
-/// until the retire expires, the key invokes nothing and a delegation it
-/// issues is refused unless this node stored it before the retire.
-/// Delegations it made earlier keep working; Revoke ends those.
+/// until the retire expires, the key can no longer use any delegated
+/// authority and a delegation it issues is refused unless this node stored
+/// it before the retire. Delegations it made earlier keep working; Revoke
+/// ends those. A key holding no live grant on this node gets no record and
+/// the same answer, `retiredAt` being now.
 ///
 /// 200 `{"did", "retiredAt"}`, repeat calls answering the first retire
 /// time; 401 `session_retire_invalid: <reason>`; 429 over the per-IP limit.

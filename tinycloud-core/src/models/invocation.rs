@@ -486,7 +486,8 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 }
             }
 
-            // TC-3443: a signed-out session key invokes nothing. Each cited
+            // TC-3443: a signed-out session key uses no delegated authority
+            // (root authority, checked above, is not delegated). Each cited
             // parent's delegatee is the invoker, and the snapshot carries the
             // live retire rows of every chain delegator and delegatee.
             let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);

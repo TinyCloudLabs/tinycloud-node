@@ -739,6 +739,10 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
     resolved.spaces.validate().map_err(anyhow::Error::msg)?;
     resolved
+        .session_retire
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    resolved
         .encryption_network
         .validate()
         .map_err(anyhow::Error::msg)?;

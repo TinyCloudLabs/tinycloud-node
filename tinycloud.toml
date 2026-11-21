@@ -88,7 +88,8 @@ cors = true
 
 [global.session_retire]
     ## POST /session/retire (sign-out, TC-3443). The minimum time a retire is
-    ## kept; it also lasts until the key's latest-expiring delegation ends.
+    ## kept (must be > 0); it also lasts until the key's latest-expiring
+    ## delegation, renewal stamp or active renewal lease ends.
     ## Env: TINYCLOUD_SESSION_RETIRE__TTL_SECS
     # ttl_secs = 2592000
     ## Retire requests allowed per client IP per minute; over it answers 429.
