@@ -473,7 +473,8 @@ Items for the release notes of the release that ships this:
   the key path is `tinycloud/keys/primary`, derived from the app id and that
   path. The post-deploy DID and key-fingerprint gate stays. A change that
   does move the DID (a new app id, or an unrecovered KMS root) must also
-  update OpenKey's pinned node DID in the same change window; see
+  update every service that pins the node or renewer DID (OpenKey,
+  OpenCredentials) in the same change window; see
   [Dependent pins](tc-3554-kms-epoch-fetch.md#dependent-pins-who-else-trusts-this-did).
 - **(c) Rule: never delete or blank `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`
   while the name is in the CVM's `allowed_envs`.** A later deploy without it
@@ -840,10 +841,10 @@ From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
 A fresh or empty database has no row, and the node refuses to start on this
 sidecar-free compose until one boot on the sidecar compose (1.26.15's) has
 sealed it. That refusal is expected; it is not a fault in the restore.
-A restore that opens the same `root_wrap` row keeps the DID, so OpenKey's
-pinned node DID stays valid. If the node comes back under a new DID, follow
+A restore that opens the same `root_wrap` row keeps the DID, so the services
+that pin it stay valid. If the node comes back under a new DID, follow
 [Dependent pins](tc-3554-kms-epoch-fetch.md#dependent-pins-who-else-trusts-this-did)
-before the node serves account setup.
+before the node serves account setup or renewals.
 
 ### TC-1302 captured pre-N0 rollback
 
