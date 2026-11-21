@@ -2714,6 +2714,12 @@ where
             .map_err(TxError::from)
         };
         if let Err(refused) = precheck {
+            // A storage failure is not a refusal: answer it as it is, so the
+            // caller's retry sees the lost connection (TC-2610) rather than
+            // a second read spent asking whether the bytes are stored.
+            if matches!(refused, TxError::Db(_)) {
+                return Err(refused);
+            }
             // A delegation already stored answers as before, even once it
             // has expired: these exact signed bytes are already registered.
             if !renewal_lease
