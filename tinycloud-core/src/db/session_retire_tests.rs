@@ -151,6 +151,41 @@ impl Fx {
             .map_err(|error| error.to_string())
     }
 
+    /// Retire `did` carrying nothing; its retire time.
+    async fn retire(&self, did: &str) -> OffsetDateTime {
+        self.db
+            .retire_session(did, TTL, vec![])
+            .await
+            .unwrap()
+            .retired_at
+    }
+
+    async fn retire_carrying(
+        &self,
+        did: &str,
+        tokens: &[&str],
+    ) -> Result<crate::models::session_retire::RetireOutcome, String> {
+        self.db
+            .retire_session(did, TTL, tokens.iter().map(|token| deleg(token)).collect())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn retire_row(&self, did: &str) -> Option<crate::models::session_retire::Model> {
+        <crate::models::session_retire::Entity as sea_orm::EntityTrait>::find_by_id(did.to_owned())
+            .one(&self.db.conn)
+            .await
+            .unwrap()
+    }
+
+    async fn stored(&self, token: &str) -> bool {
+        delegation::Entity::find_by_id(crate::hash::hash(token.as_bytes()))
+            .one(&self.db.conn)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
     /// The session root (owner → session key) and a child the session key
     /// made before any retire (session key → holder), both stored.
     async fn signed_in(&self) -> (Cid, String, Cid) {
@@ -248,8 +283,8 @@ async fn retire_scenario(f: Fx) {
     f.invoke(&f.session, root_cid).await.unwrap();
     f.invoke(&f.holder, child_cid).await.unwrap();
 
-    let first = f.db.retire_session(&f.session_did(), TTL).await.unwrap();
-    let again = f.db.retire_session(&f.session_did(), TTL).await.unwrap();
+    let first = f.retire(&f.session_did()).await;
+    let again = f.retire(&f.session_did()).await;
     assert_eq!(first, again, "a repeat retire keeps the first time");
 
     // The session key's own invocation is refused.
@@ -305,7 +340,7 @@ async fn postgres_retired_session_refuses_itself_and_new_children_only() {
 /// that raced it) is refused at invoke; a NULL first-seen time passes.
 async fn race_scenario(f: Fx) {
     let (_, child, child_cid) = f.signed_in().await;
-    let retired_at = f.db.retire_session(&f.session_did(), TTL).await.unwrap();
+    let retired_at = f.retire(&f.session_did()).await;
     let conn = &f.db.conn;
     let child_id = crate::hash::hash(child.as_bytes());
     let set_first_seen = move |first_seen: Option<OffsetDateTime>| {
@@ -369,7 +404,7 @@ async fn first_seen_is_set_on_insert_and_kept_on_resubmit() {
 async fn expired_retire_does_not_refuse_and_is_pruned() {
     let f = sqlite_fx().await;
     let (root_cid, _, _) = f.signed_in().await;
-    f.db.retire_session(&f.session_did(), TTL).await.unwrap();
+    f.retire(&f.session_did()).await;
     assert_retired(f.invoke(&f.session, root_cid).await, "live retire");
 
     crate::models::session_retire::Entity::update_many()
@@ -411,7 +446,7 @@ async fn cover_scenario(f: Fx) {
     let long_root = f.created + 60 * day;
     let root = f.delegation_until(&f.owner, &session, vec![], long_root);
     f.delegate(&root).await.unwrap();
-    let retired_at = f.db.retire_session(&session, TTL).await.unwrap();
+    let retired_at = f.retire(&session).await;
     assert_eq!(
         row().await.expires_at,
         at(long_root),
@@ -442,10 +477,7 @@ async fn cover_scenario(f: Fx) {
         .exec(&f.db.conn)
         .await
         .unwrap();
-    assert_eq!(
-        f.db.retire_session(&session, TTL).await.unwrap(),
-        retired_at
-    );
+    assert_eq!(f.retire(&session).await, retired_at);
     assert_eq!(row().await.expires_at, higher, "a repeat never lowers it");
 
     // A grant without an expiry never ends, so neither does the row.
@@ -458,7 +490,7 @@ async fn cover_scenario(f: Fx) {
         .exec(&f.db.conn)
         .await
         .unwrap();
-    f.db.retire_session(&session, TTL).await.unwrap();
+    f.retire(&session).await;
     let never = crate::models::session_retire::never_expires();
     assert_eq!(row().await.expires_at, never);
     assert_eq!(f.db.prune_session_retires().await.unwrap(), 0);
@@ -487,7 +519,7 @@ async fn past_ttl_scenario(f: Fx) {
     let day = 86_400;
     let root = f.delegation_until(&f.owner, &session, vec![], f.created + 60 * day);
     f.delegate(&root).await.unwrap();
-    let retired_at = f.db.retire_session(&session, TTL).await.unwrap();
+    let retired_at = f.retire(&session).await;
     let later = retired_at + time::Duration::days(31);
 
     let capability = crate::util::Capability {
@@ -542,7 +574,10 @@ async fn race_with_delegation_scenario(f: Fx) {
     let day = 86_400;
     let (_root_cid, _child, _child_cid) = f.signed_in().await;
     let longer = f.delegation_until(&f.owner, &session, vec![], f.created + 60 * day);
-    let (stored, retired) = tokio::join!(f.delegate(&longer), f.db.retire_session(&session, TTL));
+    let (stored, retired) = tokio::join!(
+        f.delegate(&longer),
+        f.db.retire_session(&session, TTL, vec![])
+    );
     retired.unwrap();
     // A root to the key is never refused, whichever ordering won.
     stored.unwrap();
@@ -570,4 +605,125 @@ async fn postgres_retire_racing_a_delegation_to_the_key_covers_it() {
         return;
     };
     race_with_delegation_scenario(f).await;
+}
+
+/// TC-3443 N2, the thief case: the node has stored no grant for the key, and
+/// the client carries its root with the sign-out. The root is admitted and
+/// covered, so posting it afterwards (it is already stored) does not bring
+/// the key back, even past the TTL.
+async fn carried_root_scenario(f: Fx) {
+    let session = f.session_did();
+    let day = 86_400;
+    let root_expiry = f.created + 60 * day;
+    let root = f.delegation_until(&f.owner, &session, vec![], root_expiry);
+    assert!(!f.stored(&root).await);
+    let outcome = f.retire_carrying(&session, &[&root]).await.unwrap();
+    assert!(outcome.recorded());
+    assert!(f.stored(&root).await, "the carried root is admitted");
+    let row = f.retire_row(&session).await.unwrap();
+    assert_eq!(Some(row.expires_at), outcome.expires_at);
+    assert!(row.expires_at >= OffsetDateTime::from_unix_timestamp(root_expiry).unwrap());
+
+    // The thief posts the root: already stored, so it registers as before.
+    f.delegate(&root).await.unwrap();
+    assert_retired(f.invoke(&f.session, cid_of(&root)).await, "carried root");
+    let later = outcome.retired_at + time::Duration::days(31);
+    let capability = crate::util::Capability {
+        resource: f.kv().parse().unwrap(),
+        ability: "tinycloud.kv/get".to_owned().try_into().unwrap(),
+        caveats: Default::default(),
+    };
+    let invoked = crate::models::invocation::authorize_holder(
+        &f.db.conn,
+        &session,
+        &[capability],
+        &[cid_of(&root)],
+        later,
+    )
+    .await
+    .map_err(|error| error.to_string());
+    assert_retired(invoked, "carried root at retire + 31 days");
+
+    // A repeat, carrying it again, answers the stored values.
+    let again = f.retire_carrying(&session, &[&root]).await.unwrap();
+    assert_eq!(again, outcome);
+}
+
+/// TC-3443 N2: no grant here and none carried records nothing, honestly.
+async fn nothing_to_record_scenario(f: Fx) {
+    let session = f.session_did();
+    let outcome = f.retire_carrying(&session, &[]).await.unwrap();
+    assert!(!outcome.recorded());
+    assert_eq!(outcome.expires_at, None);
+    assert!(f.retire_row(&session).await.is_none());
+}
+
+/// TC-3443 N2: one key cannot seed rows for another, and an invalid carried
+/// delegation refuses the whole request; nothing is written either way.
+async fn refused_carry_scenario(f: Fx) {
+    let session = f.session_did();
+    let root = f.delegation(&f.owner, &session, vec![]);
+    let to_holder = f.delegation(&f.owner, &f.holder_did(), vec![]);
+    let error = f
+        .retire_carrying(&session, &[&root, &to_holder])
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("session_retire_invalid: delegation 1: "),
+        "{error}"
+    );
+    // Not the owner: the holder cannot root the space.
+    let forged = f.delegation(&f.holder, &session, vec![]);
+    let error = f
+        .retire_carrying(&session, &[&root, &forged])
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("session_retire_invalid: delegation 1: "),
+        "{error}"
+    );
+    for token in [&root, &to_holder, &forged] {
+        assert!(!f.stored(token).await);
+    }
+    assert!(f.retire_row(&session).await.is_none());
+    assert!(f.retire_row(&f.holder_did()).await.is_none());
+}
+
+#[tokio::test]
+async fn sqlite_carried_root_is_admitted_and_covered() {
+    carried_root_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_carried_root_is_admitted_and_covered() {
+    let Some(f) = pg_fx("postgres_carried_root_is_admitted_and_covered").await else {
+        return;
+    };
+    carried_root_scenario(f).await;
+}
+
+#[tokio::test]
+async fn sqlite_retire_with_nothing_to_record_writes_nothing() {
+    nothing_to_record_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_retire_with_nothing_to_record_writes_nothing() {
+    let Some(f) = pg_fx("postgres_retire_with_nothing_to_record_writes_nothing").await else {
+        return;
+    };
+    nothing_to_record_scenario(f).await;
+}
+
+#[tokio::test]
+async fn sqlite_refused_carried_delegation_writes_nothing() {
+    refused_carry_scenario(sqlite_fx().await).await;
+}
+
+#[tokio::test]
+async fn postgres_refused_carried_delegation_writes_nothing() {
+    let Some(f) = pg_fx("postgres_refused_carried_delegation_writes_nothing").await else {
+        return;
+    };
+    refused_carry_scenario(f).await;
 }

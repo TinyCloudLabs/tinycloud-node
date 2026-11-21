@@ -247,22 +247,37 @@ pub async fn raise_expiry<C: ConnectionTrait>(
     .map(drop)
 }
 
-/// Retire `did` at `now` and return its retire time. A row is written only
-/// when `did` holds a live grant here: a delegation, renewal stamp or active
-/// lease whose end is after `now`. A key holding none (one this node never
-/// granted anything to, or whose grants all ended) gets no row, which bounds
-/// what the unauthenticated-in-effect route can mint; `now` is returned and
-/// nothing is revealed. The row lasts at least `ttl`, and until the
-/// latest-ending of those grants, so no stored grant outlives it. A key
-/// already retired keeps, and returns, its first retire time; its expiry is
-/// raised to cover what it holds now, never lowered. Expired rows are
-/// deleted first.
+/// What a retire did: the key's retire time and, when a row records it, the
+/// row's expiry. `expires_at` is `None` when the key held no live grant
+/// here, so nothing was written and `retired_at` is just the request's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireOutcome {
+    pub retired_at: OffsetDateTime,
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+impl RetireOutcome {
+    /// Whether a row records the retire.
+    pub fn recorded(&self) -> bool {
+        self.expires_at.is_some()
+    }
+}
+
+/// Retire `did` at `now`. A row is written only when `did` holds a live
+/// grant here: a delegation, renewal stamp or active lease whose end is
+/// after `now`. A key holding none (one this node never granted anything
+/// to, or whose grants all ended) gets no row, which bounds what the route
+/// can mint; the outcome then says nothing was recorded. The row lasts at
+/// least `ttl`, and until the latest-ending of those grants, so no stored
+/// grant outlives it. A key already retired keeps its first retire time;
+/// its expiry is raised to cover what it holds now, never lowered. Expired
+/// rows are deleted first.
 ///
 /// The whole retire is one write transaction, so a grant committed while it
 /// runs is never missed (TC-3443 N1). On SQLite the write transaction holds
 /// the database write lock from its start, so it is serialized with every
-/// other writer. On PostgreSQL it first takes [`lock_key`]'s advisory lock,
-/// which `delegation::save` also takes before storing a delegation to a
+/// other writer. On PostgreSQL it first takes [`lock_did`], which
+/// `delegation::save` also takes before storing a delegation to a
 /// `did:key`, and then the renewal lock of each original the key holds,
 /// which stamp issuance and lease registration take; a grant committed
 /// before those locks is seen here, and one after them sees this row.
@@ -271,11 +286,11 @@ pub async fn retire<C: ConnectionTrait + TransactionTrait>(
     did: &str,
     now: OffsetDateTime,
     ttl: Duration,
-) -> Result<OffsetDateTime, DbErr> {
+) -> Result<RetireOutcome, DbErr> {
     let tx = crate::db::begin_write_transaction(db, None).await?;
-    let retired_at = retire_in(&tx, did, now, ttl).await?;
+    let outcome = retire_in(&tx, did, now, ttl).await?;
     tx.commit().await?;
-    Ok(retired_at)
+    Ok(outcome)
 }
 
 /// PostgreSQL advisory-lock key that serializes a retire of `did` with the
@@ -287,23 +302,37 @@ pub fn lock_key(did: &str) -> i64 {
     i64::from_be_bytes(key)
 }
 
-async fn retire_in<C: ConnectionTrait>(
+async fn advisory_lock<C: ConnectionTrait>(tx: &C, key: i64) -> Result<(), DbErr> {
+    tx.execute(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1)",
+        [key.into()],
+    ))
+    .await
+    .map(drop)
+}
+
+/// On PostgreSQL, take `did`'s retire lock for the rest of `tx`: from here
+/// on no other transaction stores a delegation to it. (SQLite write
+/// transactions are already serialized.) Re-entrant.
+pub async fn lock_did<C: ConnectionTrait>(tx: &C, did: &str) -> Result<(), DbErr> {
+    if tx.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
+        advisory_lock(tx, lock_key(did)).await?;
+    }
+    Ok(())
+}
+
+/// [`retire`] inside the caller's write transaction `tx`.
+pub(crate) async fn retire_in<C: ConnectionTrait>(
     tx: &C,
     did: &str,
     now: OffsetDateTime,
     ttl: Duration,
-) -> Result<OffsetDateTime, DbErr> {
+) -> Result<RetireOutcome, DbErr> {
     if tx.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
-        let lock = |key: i64| {
-            tx.execute(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT pg_advisory_xact_lock($1)",
-                [key.into()],
-            ))
-        };
         // The key's own lock first: no delegation to it is stored from here
         // on, so the originals read next are all it will hold.
-        lock(lock_key(did)).await?;
+        lock_did(tx, did).await?;
         let mut originals = held_originals(tx, did)
             .await?
             .iter()
@@ -312,7 +341,7 @@ async fn retire_in<C: ConnectionTrait>(
         originals.sort_unstable();
         originals.dedup();
         for key in originals {
-            lock(key).await?;
+            advisory_lock(tx, key).await?;
         }
     }
     prune_expired(tx, now).await?;
@@ -321,14 +350,20 @@ async fn retire_in<C: ConnectionTrait>(
             Entity::find_by_id(did.to_owned())
                 .one(tx)
                 .await?
-                .map(|row| row.retired_at),
+                .map(|row| RetireOutcome {
+                    retired_at: row.retired_at,
+                    expires_at: Some(row.expires_at),
+                }),
         )
     };
     let Some(end) = latest_authority_end(tx, did)
         .await?
         .filter(|end| *end > now)
     else {
-        return Ok(existing().await?.unwrap_or(now));
+        return Ok(existing().await?.unwrap_or(RetireOutcome {
+            retired_at: now,
+            expires_at: None,
+        }));
     };
     let expires_at = end.max(now.saturating_add(ttl));
     Entity::insert(ActiveModel {
@@ -343,6 +378,28 @@ async fn retire_in<C: ConnectionTrait>(
     existing()
         .await?
         .ok_or_else(|| DbErr::RecordNotFound(format!("session_retire row for {did}")))
+}
+
+/// Most root delegations a retire request may carry.
+pub const MAX_CARRIED_DELEGATIONS: usize = 8;
+
+/// A retire that carried delegations and did not happen; nothing was
+/// written.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRetireError {
+    /// The request is refused: a carried delegation is invalid, not to the
+    /// retiring key, or there are too many.
+    #[error("session_retire_invalid: {0}")]
+    Invalid(String),
+    /// Storage failed.
+    #[error("session_retire_unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl From<DbErr> for SessionRetireError {
+    fn from(error: DbErr) -> Self {
+        Self::Unavailable(error.to_string())
+    }
 }
 
 /// Canonical hashes of the delegations stored to `did`: the originals whose
@@ -444,9 +501,15 @@ mod tests {
         let first = stored_now();
         let ttl = Duration::days(30);
         grant(&db, did, Some(first + Duration::days(1))).await;
-        assert_eq!(retire(&db, did, first, ttl).await.unwrap(), first);
+        assert_eq!(
+            retire(&db, did, first, ttl).await.unwrap().retired_at,
+            first
+        );
         let later = first + Duration::minutes(5);
-        assert_eq!(retire(&db, did, later, ttl).await.unwrap(), first);
+        assert_eq!(
+            retire(&db, did, later, ttl).await.unwrap().retired_at,
+            first
+        );
         assert_eq!(live_retired_at(&db, did, later).await.unwrap(), Some(first));
 
         // A repeat keeps the retire time but raises the expiry to its own
@@ -490,10 +553,14 @@ mod tests {
         let now = stored_now();
         let ttl = Duration::days(30);
         let stranger = "did:key:z6MkretireStranger";
-        assert_eq!(retire(&db, stranger, now, ttl).await.unwrap(), now);
+        let nothing = RetireOutcome {
+            retired_at: now,
+            expires_at: None,
+        };
+        assert_eq!(retire(&db, stranger, now, ttl).await.unwrap(), nothing);
         let lapsed = "did:key:z6MkretireLapsed";
         grant(&db, lapsed, Some(now - Duration::SECOND)).await;
-        assert_eq!(retire(&db, lapsed, now, ttl).await.unwrap(), now);
+        assert_eq!(retire(&db, lapsed, now, ttl).await.unwrap(), nothing);
         assert!(Entity::find().all(&db).await.unwrap().is_empty());
     }
 

@@ -460,35 +460,51 @@ TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the e
 
 ### Sign-out: `POST /session/retire` (TC-3443)
 
-A client signs out by retiring its session key. It sends no body and an
+A client signs out by retiring its session key. It sends an
 `Authorization: Bearer <UCAN>` header (the `Bearer ` prefix is optional). The
 UCAN is issued by the session `did:key` (bare or with a `#fragment`) to this
 node's DID, carries exactly
 `{"urn:tinycloud:session:self": {"tinycloud.session/retire": [{}]}}`, cites no
 proofs, has a nonce, and expires no more than 120 seconds from now.
 
-The node answers `200 {"did": "<did:key>", "retiredAt": "<RFC3339>"}`; a
-repeat call answers the first `retiredAt`. A bad request answers
-`401 session_retire_invalid: <reason>`; too many requests from one IP answer
-`429`. From then on, the key can no longer use any delegated authority, a
-delegation it signs that this node had not stored before the retire is
-refused, and nothing it holds is renewed. These answer
+The optional JSON body `{"delegations": ["<delegation>", ...]}` carries the
+session's root delegations (at most 8), each encoded exactly as
+`POST /delegate` takes it in its `Authorization` header. **The client must
+send every root it holds for the session key: one per space, including any
+it signed but never posted.** Each must be to the retiring key, or the whole
+request is refused. Each is admitted as `POST /delegate` admits it, inside
+the retire, so the retire covers it and posting it later cannot bring the
+key back; one already stored is fine. If any is refused, the request answers
+`401 session_retire_invalid: delegation <i>: <reason>` and nothing is
+written.
+
+The node answers `200 {"did": "<did:key>", "retiredAt": "<RFC3339>",
+"recorded": true, "expiresAt": "<RFC3339>"}`; a repeat call answers the first
+`retiredAt`. `"recorded": false` (and no `expiresAt`) means this node holds no
+live grant for the key and none was carried, so nothing was written. A bad
+request answers `401 session_retire_invalid: <reason>`; too many requests from
+one IP answer `429`. From then on, the key can no longer use any delegated
+authority, a delegation it signs that this node had not stored before the
+retire is refused, and nothing it holds is renewed. These answer
 `401 session_retired: <reason>`. Authority the key holds as a root (a space
 or network it owns itself) is not delegated and is unaffected. Signed KV URL
 tickets and open hook streams obtained before the retire keep working for up
 to 300 seconds after it.
 
-The node records a retire only when it stores a live grant for the key (a
-delegation, renewal stamp or active renewal lease whose end is still ahead).
-A retire of any other key records nothing and gets the same `200`, with
-`retiredAt` being now. A record lasts at least `session_retire.ttl_secs` and
-until the latest-expiring of those grants ends, so it never lapses while the
-key still holds one; a delegation without an expiry keeps it for good.
+A retire is recorded only when the node holds a live grant for the key (a
+delegation, renewal stamp or active renewal lease whose end is still ahead),
+counting the roots carried with it. It lasts at least
+`session_retire.ttl_secs` and until the latest-expiring of those grants ends,
+so it never lapses while the key still holds one; a delegation without an
+expiry keeps it for good.
 
-Sign-out does not end the delegations the key made before it, or their
-descendants. Revoke ends them. A node that starts hosting the space after the
-sign-out, or that stores no grant for the key, does not know about it and
-accepts the key until its session root expires (TC-3673).
+Sign-out covers only the grants this node holds or was given in the request.
+**A root the client does not send and this node does not hold is not
+covered:** posting it later makes the key usable here again until it
+expires. Sign-out does not end the delegations the key made before it, or
+their descendants; Revoke ends them. A node that starts hosting the space
+after the sign-out does not know about it and accepts the key until its
+session root expires (TC-3673).
 
 ### UCAN DID resolution (TC-1080)
 

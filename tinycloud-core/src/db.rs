@@ -1022,30 +1022,6 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
         .await
     }
 
-    /// TC-3443: retire the session key `did` (a bare `did:key`) for `ttl`,
-    /// pruning expired retire rows first. Returns the key's retire time,
-    /// which a repeat call keeps.
-    pub async fn retire_session(
-        &self,
-        did: &str,
-        ttl: time::Duration,
-    ) -> Result<OffsetDateTime, DbErr>
-    where
-        C: ConnectionTrait + TransactionTrait,
-    {
-        let _guard = match &self.writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        crate::models::session_retire::retire(
-            &self.conn,
-            did,
-            crate::models::session_retire::stored_now(),
-            ttl,
-        )
-        .await
-    }
-
     /// TC-3443: delete retire rows that have expired.
     pub async fn prune_session_retires(&self) -> Result<u64, DbErr>
     where
@@ -4737,6 +4713,30 @@ async fn reconcile_pk_epoch_delegation<C: ConnectionTrait, S: StorageSetup, K: S
     }
 
     Ok(already_registered_result(retained_hash))
+}
+
+/// TC-3443: a carried delegation's failure, for `what` ("delegation <i>").
+/// Storage failures are unavailable; every other refusal makes the retire
+/// request invalid.
+fn carried_refusal<B: StorageSetup, K: Secrets>(
+    what: String,
+    error: TxError<B, K>,
+) -> crate::models::session_retire::SessionRetireError
+where
+    B::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    use crate::models::session_retire::SessionRetireError;
+    match error {
+        TxError::Db(_)
+        | TxError::EpochInsert(_)
+        | TxError::StoreSetup(_)
+        | TxError::Secrets(_)
+        | TxError::LifecycleUnavailable
+        | TxError::Encryption(_)
+        | TxError::ReadAudit(_) => SessionRetireError::Unavailable(format!("{what}: {error}")),
+        error => SessionRetireError::Invalid(format!("{what}: {error}")),
+    }
 }
 
 /// Returns the sorted, deduplicated set of roots to lock for a delegation.

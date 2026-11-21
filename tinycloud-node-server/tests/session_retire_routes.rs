@@ -93,8 +93,24 @@ async fn post(client: &Client, path: &str, authorization: &str) -> (Status, Stri
     )
 }
 
-/// A space and a session key that may get any key in it.
-async fn sign_in(client: &Client) -> Result<Session> {
+async fn retire_with_body(client: &Client, authorization: &str, body: String) -> (Status, String) {
+    let response = client
+        .post("/session/retire")
+        .remote("127.0.0.1:9000".parse().unwrap())
+        .header(Header::new("Authorization", authorization.to_owned()))
+        .header(ContentType::JSON)
+        .body(body)
+        .dispatch()
+        .await;
+    (
+        response.status(),
+        response.into_string().await.unwrap_or_default(),
+    )
+}
+
+/// A space and a session key that may get any key in it. The session's root
+/// is posted only when `post_root`.
+async fn sign_in(client: &Client, post_root: bool) -> Result<Session> {
     let key = SigningKey::from_bytes(&[78; 32].into())?;
     let public = key.verifying_key().to_encoded_point(false);
     let address: [u8; 20] = Keccak256::digest(&public.as_bytes()[1..])[12..].try_into()?;
@@ -145,13 +161,15 @@ async fn sign_in(client: &Client) -> Result<Session> {
         session: prepared,
         signature: Signature::from(signature),
     })?;
-    let (status, body) = post(
-        client,
-        "/delegate",
-        &authorization(&session.delegation_header)?,
-    )
-    .await;
-    ensure!(status == Status::Ok, "session delegate: {status} {body}");
+    if post_root {
+        let (status, body) = post(
+            client,
+            "/delegate",
+            &authorization(&session.delegation_header)?,
+        )
+        .await;
+        ensure!(status == Status::Ok, "session delegate: {status} {body}");
+    }
     Ok(session)
 }
 
@@ -230,7 +248,7 @@ fn session_retire_token(session: &Session, edit: impl FnOnce(&mut Payload<Value>
 #[tokio::test]
 async fn retire_returns_the_first_retire_time_and_ends_only_the_session_key() -> Result<()> {
     let (client, _dir) = node(100).await?;
-    let session = sign_in(&client).await?;
+    let session = sign_in(&client, true).await?;
     let (early, early_child) = child_of(&session)?;
     let (status, body) = post(&client, "/delegate", &early).await;
     ensure!(status == Status::Ok, "pre-retire child: {status} {body}");
@@ -251,6 +269,8 @@ async fn retire_returns_the_first_retire_time_and_ends_only_the_session_key() ->
     let did = session.verification_method.split('#').next().unwrap();
     ensure!(first["did"] == did, "{first}");
     let retired_at = first["retiredAt"].as_str().context("retiredAt")?;
+    ensure!(first["recorded"] == true, "{first}");
+    first["expiresAt"].as_str().context("expiresAt")?;
     time::OffsetDateTime::parse(retired_at, &time::format_description::well_known::Rfc3339)?;
 
     // Without the Bearer prefix, a repeat answers the first retire time.
@@ -262,7 +282,20 @@ async fn retire_returns_the_first_retire_time_and_ends_only_the_session_key() ->
     .await;
     ensure!(status == Status::Ok, "repeat retire: {status} {body}");
     let again: Value = serde_json::from_str(&body)?;
-    ensure!(again == first, "{again} != {first}");
+    // It keeps the first retire time; its expiry may only be raised.
+    ensure!(
+        again["did"] == first["did"]
+            && again["retiredAt"] == first["retiredAt"]
+            && again["recorded"] == true,
+        "{again} vs {first}"
+    );
+    let expiry = |value: &Value| -> Result<time::OffsetDateTime> {
+        Ok(time::OffsetDateTime::parse(
+            value["expiresAt"].as_str().context("expiresAt")?,
+            &time::format_description::well_known::Rfc3339,
+        )?)
+    };
+    ensure!(expiry(&again)? >= expiry(&first)?, "{again} vs {first}");
 
     // The session key itself uses no delegated authority.
     let (status, body) = invoke(&client, &session).await?;
@@ -289,6 +322,87 @@ async fn retire_returns_the_first_retire_time_and_ends_only_the_session_key() ->
     Ok(())
 }
 
+/// TC-3443 N2: the node has not stored the session's root. A retire that
+/// carries it admits and covers it, so the root posted afterwards brings
+/// nothing back; without it nothing is recorded, and the answer says so.
+#[tokio::test]
+async fn retire_carrying_the_session_root_covers_a_root_posted_later() -> Result<()> {
+    let (client, _dir) = node(100).await?;
+    let session = sign_in(&client, false).await?;
+    let root = authorization(&session.delegation_header)?;
+    let carrying = |roots: Vec<String>| json!({ "delegations": roots }).to_string();
+
+    // Nothing stored, nothing carried: nothing recorded.
+    let (status, body) = post(
+        &client,
+        "/session/retire",
+        &session_retire_token(&session, |_| ()),
+    )
+    .await;
+    ensure!(status == Status::Ok, "bare retire: {status} {body}");
+    let bare: Value = serde_json::from_str(&body)?;
+    ensure!(
+        bare["recorded"] == false && bare.get("expiresAt").is_none(),
+        "{bare}"
+    );
+
+    // Another key cannot carry this session's root.
+    let other = JWK::generate_ed25519()?;
+    let other_did = DID_METHODS.generate(&other, "key")?.to_string();
+    let other_vm = format!("{other_did}#{}", other_did.rsplit(':').next().unwrap());
+    let (status, body) = retire_with_body(
+        &client,
+        &retire_token(&other, &other_vm, |_| ()),
+        carrying(vec![root.clone()]),
+    )
+    .await;
+    ensure!(
+        status == Status::Unauthorized
+            && body.starts_with("session_retire_invalid: delegation 0: "),
+        "foreign carry: {status} {body}"
+    );
+    // A malformed body and too many delegations are refused.
+    for (case, body) in [
+        ("not JSON", "nope".to_owned()),
+        ("too many", carrying(vec![root.clone(); 9])),
+        ("not a delegation", carrying(vec!["nope".to_owned()])),
+    ] {
+        let (status, body) =
+            retire_with_body(&client, &session_retire_token(&session, |_| ()), body).await;
+        ensure!(
+            status == Status::Unauthorized && body.starts_with("session_retire_invalid: "),
+            "{case}: {status} {body}"
+        );
+    }
+
+    let (status, body) = retire_with_body(
+        &client,
+        &session_retire_token(&session, |_| ()),
+        carrying(vec![root.clone()]),
+    )
+    .await;
+    ensure!(status == Status::Ok, "carrying retire: {status} {body}");
+    let carried: Value = serde_json::from_str(&body)?;
+    ensure!(carried["recorded"] == true, "{carried}");
+    let expires_at = carried["expiresAt"].as_str().context("expiresAt")?;
+    let rfc3339 = &time::format_description::well_known::Rfc3339;
+    ensure!(
+        time::OffsetDateTime::parse(expires_at, rfc3339)?
+            >= time::OffsetDateTime::now_utc() + time::Duration::days(29),
+        "{carried}"
+    );
+
+    // The thief posts the root: already stored, and the key stays retired.
+    let (status, body) = post(&client, "/delegate", &root).await;
+    ensure!(status == Status::Ok, "posted root: {status} {body}");
+    let (status, body) = invoke(&client, &session).await?;
+    ensure!(
+        status == Status::Unauthorized && body.starts_with("session_retired: "),
+        "self invoke: {status} {body}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn malformed_retire_requests_are_refused_401() -> Result<()> {
     let (client, _dir) = node(100).await?;
@@ -307,7 +421,10 @@ async fn malformed_retire_requests_are_refused_401() -> Result<()> {
         (
             "exp beyond 120 s",
             retire_token(&key, &vm, |p| {
-                p.expiration = NumericDate::try_from_seconds((now() + 121) as f64).unwrap()
+                // Well past 120 s, so a second ticking between signing and
+                // checking cannot bring it within bounds; the exact
+                // boundary is unit-tested in tinycloud-core.
+                p.expiration = NumericDate::try_from_seconds((now() + 180) as f64).unwrap()
             }),
         ),
         (

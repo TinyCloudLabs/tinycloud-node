@@ -2728,6 +2728,74 @@ mod tests {
         assert_eq!(row_count(&db, "invocation_replay").await, 0);
     }
 
+    /// TC-3443 N1 on PostgreSQL: a retire of an original's holder waits for
+    /// a stamp transaction in flight on that original (it takes the same
+    /// renewal lock), so it reads the stamp's end once that commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_retire_waits_for_a_stamp_in_flight_on_an_original_it_holds() {
+        const TEST: &str = "postgres_retire_waits_for_a_stamp_in_flight_on_an_original_it_holds";
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let db = fixture.conn.clone();
+        let owner = "did:key:z6MkretireStampRaceOwner";
+        let holder = "did:key:z6MkretireStampRaceHolder";
+        let now = time::OffsetDateTime::now_utc();
+        for actor in [owner, holder] {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO actor (id) VALUES ($1)",
+                [Value::String(Some(Box::new(actor.to_owned())))],
+            ))
+            .await
+            .unwrap();
+        }
+        let original = hash(b"retire stamp race original");
+        let original_bytes = Vec::<u8>::from(original);
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO delegation (id, delegator, delegatee, expiry, serialization, serialization_format) VALUES ($1,$2,$3,$4,$5,0)",
+            [
+                Value::Bytes(Some(Box::new(original_bytes.clone()))),
+                Value::String(Some(Box::new(owner.to_owned()))),
+                Value::String(Some(Box::new(holder.to_owned()))),
+                Value::TimeDateTimeWithTimeZone(Some(Box::new(now + time::Duration::days(1)))),
+                Value::Bytes(Some(Box::new(vec![1]))),
+            ],
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1,$1,FALSE)",
+            [Value::Bytes(Some(Box::new(original_bytes)))],
+        ))
+        .await
+        .unwrap();
+
+        let stamp_tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+        lock_original(&stamp_tx, &original).await.unwrap();
+        let retire = tokio::spawn({
+            let db = db.clone();
+            async move {
+                crate::models::session_retire::retire(&db, holder, now, time::Duration::days(30))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !retire.is_finished(),
+            "a retire must wait for the stamp in flight on an original its key holds"
+        );
+        stamp_tx.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), retire)
+            .await
+            .expect("the retire finishes once the stamp transaction ends")
+            .unwrap()
+            .unwrap();
+        assert!(outcome.recorded());
+    }
+
     /// TC-3000 (F5): a stored original is used only when its bytes hash to
     /// the address the lease names, so a replaced or tampered row is refused
     /// before and inside the lease's transaction.

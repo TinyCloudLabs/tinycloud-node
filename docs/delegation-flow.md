@@ -510,19 +510,28 @@ and exercised before claiming end-to-end support for that configuration.
 
 Signing out posts `POST /session/retire` with a UCAN the session key signs to
 the node (`tinycloud.session/retire` on `urn:tinycloud:session:self`, no
-proofs, expiry within 120 seconds). The node records the key and the time,
-but only when it stores a live grant for the key; a node holding none
-records nothing. After that, the key can no longer use any delegated
-authority, and any delegation it signs that the node had not stored before
-the retire answers `401 session_retired:`. Authority the key holds as a root
-(a space or network it owns itself) is not delegated and is unaffected. The
-record lasts at least `session_retire.ttl_secs` and until the key's
-latest-expiring delegation, renewal stamp or active renewal lease ends. Each
-delegation records when the node first stored it (`first_seen_at`), so a child
-that raced the retire is refused at invoke. Children the key made before the
-retire, and their descendants, keep working until they expire; revoking them
-ends them. Only the nodes that served the retire know about it: a node that
-starts hosting the space later accepts the key until its session root expires
+proofs, expiry within 120 seconds). Its optional body
+`{"delegations": [...]}` carries the session's root delegations, each encoded
+as `POST /delegate` takes it; the client must send every root it holds for
+the key, for all its spaces, posted or not. Each must be to the retiring key,
+and each is admitted exactly as `/delegate` admits it, inside the retire's
+transaction, so the retire covers it and posting it later cannot bring the
+key back; any refusal writes nothing. The node records the key and the time
+only when it then holds a live grant for the key, and says so
+(`"recorded"`); a node holding none records nothing. After that, the key can
+no longer use any delegated authority, and any delegation it signs that the
+node had not stored before the retire answers `401 session_retired:`.
+Authority the key holds as a root (a space or network it owns itself) is not
+delegated and is unaffected. The record lasts at least
+`session_retire.ttl_secs` and until the key's latest-expiring delegation,
+renewal stamp or active renewal lease ends. Each delegation records when the
+node first stored it (`first_seen_at`), so a child that raced the retire is
+refused at invoke. Children the key made before the retire, and their
+descendants, keep working until they expire; revoking them ends them.
+Sign-out covers only the grants the node holds or was given in the request:
+a root the client does not send and the node does not hold is not covered.
+Only the nodes that served the retire know about it: a node that starts
+hosting the space later accepts the key until its session root expires
 (TC-3673).
 
 ## Child Delegation (UCAN) Creation
