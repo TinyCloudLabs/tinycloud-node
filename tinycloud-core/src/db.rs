@@ -1,4 +1,7 @@
 #[cfg(test)]
+#[path = "db/session_retire_tests.rs"]
+mod session_retire_tests;
+#[cfg(test)]
 #[path = "db/signature_before_locks_tests.rs"]
 mod signature_before_locks_tests;
 mod space_purge;
@@ -1017,6 +1020,18 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
             crate::renewal::verifier_now().unix_timestamp(),
         )
         .await
+    }
+
+    /// TC-3443: delete retire rows that have expired.
+    pub async fn prune_session_retires(&self) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let _guard = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        crate::models::session_retire::prune_expired(&self.conn, OffsetDateTime::now_utc()).await
     }
 
     /// Persisted renewal identity captured during database startup.
@@ -2699,6 +2714,12 @@ where
             .map_err(TxError::from)
         };
         if let Err(refused) = precheck {
+            // A storage failure is not a refusal: answer it as it is, so the
+            // caller's retry sees the lost connection (TC-2610) rather than
+            // a second read spent asking whether the bytes are stored.
+            if matches!(refused, TxError::Db(_)) {
+                return Err(refused);
+            }
             // A delegation already stored answers as before, even once it
             // has expired: these exact signed bytes are already registered.
             if !renewal_lease
@@ -2858,6 +2879,217 @@ where
         delegation: &Delegation,
     ) -> Result<PreVerified, TxError<B, K>> {
         PreVerified::delegation(&self.conn, delegation, self.encryption.as_ref()).await
+    }
+
+    /// TC-3443: retire the session key `did` (a bare `did:key`) for `ttl`.
+    ///
+    /// `carried` are root delegations to the key that the client holds and
+    /// sends with its sign-out, so that a root this node has not stored yet
+    /// cannot be posted later to bring the key back. There is no side door:
+    /// each is admitted exactly as `POST /delegate` admits one (signature,
+    /// pool-side precheck, chain guards, then `delegation::process_with`
+    /// inside the transaction), and one already stored is fine as it is.
+    /// Every carried delegation must be to `did`, or the whole request is
+    /// refused, so one key cannot seed rows for another.
+    ///
+    /// The carried roots are stored inside the retire's own write
+    /// transaction, before the retire reads what the key holds, so the
+    /// retire counts them. If any is refused, or anything fails, nothing is
+    /// written. A repeat call keeps the first retire time.
+    ///
+    /// A carried root that has expired is skipped (it can never be posted)
+    /// and its index reported. One not valid yet is not stored (`/delegate`
+    /// would refuse it too) but is covered: its signature and issuer's
+    /// standing are checked as for any other, and the retire lasts at least
+    /// until it expires, so posting it later finds the key retired.
+    ///
+    /// Locks are taken as `transact_verified` takes them: chain guards, the
+    /// in-process space sequence guards, the SQLite writer lock, then, inside
+    /// the transaction, the PostgreSQL space sequence locks, then the key's
+    /// retire lock, then (in `retire_in`) its originals' renewal locks.
+    /// `/delegate` takes a space's sequence lock before a delegatee's lock
+    /// too, so the two never wait on each other in a cycle.
+    pub async fn retire_session(
+        &self,
+        did: &str,
+        ttl: time::Duration,
+        carried: Vec<Delegation>,
+    ) -> Result<
+        crate::models::session_retire::RetireOutcome,
+        crate::models::session_retire::SessionRetireError,
+    >
+    where
+        B::Error: std::fmt::Display,
+        K::Error: std::fmt::Display,
+    {
+        use crate::models::session_retire::{self, SessionRetireError};
+        if carried.len() > session_retire::MAX_CARRIED_DELEGATIONS {
+            return Err(SessionRetireError::Invalid(format!(
+                "at most {} delegations may be carried",
+                session_retire::MAX_CARRIED_DELEGATIONS
+            )));
+        }
+        if let Some(index) = carried
+            .iter()
+            .position(|delegation| delegation.0.delegate != did)
+        {
+            return Err(SessionRetireError::Invalid(format!(
+                "delegation {index}: its delegatee is not the retiring key"
+            )));
+        }
+        // As `delegate_verified`, before any lock: the signature, then, for
+        // one not already stored, its time window and issuer's standing.
+        let now = OffsetDateTime::now_utc();
+        let renewal_seed_did = self
+            .secrets
+            .renewal_seed()
+            .map(|seed| crate::renewal::renewal_identity_from_seed(seed).0);
+        let mut verified = PreVerified::default();
+        let mut to_store = Vec::new();
+        let mut pending_end = None;
+        let mut skipped = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, delegation) in carried.into_iter().enumerate() {
+            let hash = delegation.content_hash();
+            if !seen.insert(hash) {
+                continue;
+            }
+            if delegation.0.expiry.is_some_and(|expiry| expiry <= now) {
+                skipped.push(index);
+                continue;
+            }
+            let refused =
+                |error: TxError<B, K>| carried_refusal(format!("delegation {index}"), error);
+            let checked = self
+                .preverify_delegation(&delegation)
+                .await
+                .map_err(refused)?;
+            verified = verified.union(checked);
+            if delegation::Entity::find_by_id(hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            // As `delegate_batch_in_transaction_verified`.
+            if renewal_seed_did.as_ref() == Some(&delegation.0.delegator) {
+                return Err(refused(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(
+                        delegation.0.delegator.clone(),
+                    ),
+                )));
+            }
+            let renewer_did = self
+                .renewal_identity
+                .as_ref()
+                .map(|identity| identity.renewer_did.as_str());
+            if delegation::verify_time(&delegation.0.delegation).is_err() {
+                // Not valid yet: every check but the time window, then
+                // cover it without storing it.
+                delegation::precheck_standing(
+                    &self.conn,
+                    &delegation,
+                    self.delegated_sql_caveats,
+                    self.named_keys,
+                    renewer_did,
+                )
+                .await
+                .map_err(|error| refused(TxError::from(error)))?;
+                let end = session_retire::covering(delegation.0.expiry);
+                pending_end = pending_end.max(Some(end));
+                continue;
+            }
+            // TC-1500: `check_holder` runs in `delegation::precheck` (via
+            // `check_capability_rules`) and again in `process_with` below, as
+            // for every other new delegation.
+            delegation::precheck(
+                &self.conn,
+                &delegation,
+                self.delegated_sql_caveats,
+                self.named_keys,
+                renewer_did,
+            )
+            .await
+            .map_err(|error| refused(TxError::from(error)))?;
+            to_store.push((index, delegation));
+        }
+        let mut roots = Vec::new();
+        for (_, delegation) in &to_store {
+            let parents: Vec<Hash> = delegation
+                .0
+                .parents
+                .iter()
+                .copied()
+                .map(Hash::from)
+                .collect();
+            roots.extend(delegation_guard_roots(delegation.content_hash(), &parents));
+        }
+        roots.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        roots.dedup();
+        let (indexes, events): (Vec<usize>, Vec<Event>) = to_store
+            .into_iter()
+            .map(|(index, delegation)| (index, Event::Delegation(Box::new(delegation))))
+            .unzip();
+        let registry_spaces =
+            self.registry_registration_spaces(&events)
+                .await
+                .map_err(|error| {
+                    carried_refusal("delegations".to_owned(), TxError::<B, K>::from(error))
+                })?;
+        let spaces = sequence_spaces(&self.conn, &events).await?;
+        let _chain_guards = self
+            .acquire_chain_guards(&roots)
+            .await
+            .map_err(|error| carried_refusal("delegations".to_owned(), error))?;
+        let _sequence_guards = self.acquire_space_sequence_guards(&spaces).await;
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self.begin_graph_transaction().await?;
+        // The space sequence locks `transact_verified` would take, first,
+        // then the key's own lock; the stores below take no lock again.
+        let events: Vec<(Hash, Event)> = events
+            .into_iter()
+            .map(|event| (event.hash(), event))
+            .collect();
+        let held: Vec<SpaceId> = event_spaces(&tx, &events)
+            .await?
+            .into_keys()
+            .filter(|space| {
+                registry_spaces
+                    .as_ref()
+                    .is_none_or(|served| served.contains(space))
+            })
+            .collect();
+        crate::kv_sync::lock_space_sequences_not_held(&tx, held.iter(), &[]).await?;
+        session_retire::lock_did(&tx, did).await?;
+        for (index, (_, event)) in indexes.into_iter().zip(events) {
+            transact_verified(
+                &tx,
+                &self.storage,
+                &self.secrets,
+                self.renewal_identity.as_ref(),
+                vec![event],
+                self.encryption.as_ref(),
+                None,
+                &held,
+                self.delegated_sql_caveats,
+                self.named_keys,
+                self.space_purge_fence.as_deref(),
+                &verified,
+                registry_spaces.as_ref(),
+            )
+            .await
+            .map_err(|error| carried_refusal(format!("delegation {index}"), error))?;
+        }
+        let mut outcome =
+            session_retire::retire_in(&tx, did, session_retire::stored_now(), ttl, pending_end)
+                .await?;
+        tx.commit().await?;
+        outcome.skipped = skipped;
+        Ok(outcome)
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -4698,6 +4930,30 @@ async fn reconcile_pk_epoch_delegation<C: ConnectionTrait, S: StorageSetup, K: S
     }
 
     Ok(already_registered_result(retained_hash))
+}
+
+/// TC-3443: a carried delegation's failure, for `what` ("delegation <i>").
+/// Storage failures are unavailable; every other refusal makes the retire
+/// request invalid.
+fn carried_refusal<B: StorageSetup, K: Secrets>(
+    what: String,
+    error: TxError<B, K>,
+) -> crate::models::session_retire::SessionRetireError
+where
+    B::Error: std::fmt::Display,
+    K::Error: std::fmt::Display,
+{
+    use crate::models::session_retire::SessionRetireError;
+    match error {
+        TxError::Db(_)
+        | TxError::EpochInsert(_)
+        | TxError::StoreSetup(_)
+        | TxError::Secrets(_)
+        | TxError::LifecycleUnavailable
+        | TxError::Encryption(_)
+        | TxError::ReadAudit(_) => SessionRetireError::Unavailable(format!("{what}: {error}")),
+        error => SessionRetireError::Invalid(format!("{what}: {error}")),
+    }
 }
 
 /// Returns the sorted, deduplicated set of roots to lock for a delegation.
@@ -10511,6 +10767,7 @@ mod test {
             facts: Set(None),
             serialization: Set(b"race-parent".to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10527,6 +10784,7 @@ mod test {
             facts: Set(None),
             serialization: Set(b"race-child".to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10623,6 +10881,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(&db.conn)
                 .await
@@ -10664,6 +10923,7 @@ mod test {
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -10731,6 +10991,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(control_id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -10761,6 +11022,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(&db.conn)
                 .await
@@ -10790,6 +11052,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(later_id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -10989,6 +11252,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }))
             .exec(db)
             .await
@@ -11484,6 +11748,7 @@ mod test {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 });
                 for ability_index in 0..6 {
                     let (resource, ability) = if delegation_index == 0 && ability_index == 0 {
@@ -11521,6 +11786,7 @@ mod test {
             facts: Set(None),
             serialization: Set(later_id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         });
         ability_rows.push(abilities::ActiveModel {
             resource: Set(format!("tinycloud:{principal_suffix}:default/delegation")
@@ -11593,6 +11859,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -11696,6 +11963,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db.conn)
             .await
@@ -11748,6 +12016,7 @@ mod test {
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db.conn)
         .await
@@ -12766,6 +13035,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -12861,6 +13131,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -12931,6 +13202,7 @@ mod test {
                 facts: Set(None),
                 serialization: Set(ser.clone()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&tx)
             .await
@@ -12960,6 +13232,7 @@ mod test {
             facts: Set(None),
             serialization: Set(ser),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13012,6 +13285,7 @@ mod test {
             facts: Set(None),
             serialization: Set(ser),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         };
 
         let tx = db.conn.begin().await.unwrap();
@@ -13085,6 +13359,7 @@ mod test {
             facts: Set(None),
             serialization: Set(retained_hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13308,6 +13583,7 @@ mod test {
             facts: Set(None),
             serialization: Set(hash.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         })
         .on_conflict(
             OnConflict::column(delegation::Column::Id)
@@ -13702,6 +13978,7 @@ mod test {
             facts: Set(None),
             serialization: Set(label.as_bytes().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await

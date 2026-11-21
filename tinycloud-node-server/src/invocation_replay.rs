@@ -426,6 +426,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"synthetic database race fixture".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&transaction)
         .await

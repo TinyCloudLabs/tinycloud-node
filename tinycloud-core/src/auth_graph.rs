@@ -8,7 +8,7 @@
 //! against that consistent view.
 
 use crate::hash::Hash;
-use crate::models::{abilities, delegation, delegation_cid_alias, revocation};
+use crate::models::{abilities, delegation, delegation_cid_alias, revocation, session_retire};
 use crate::relationships::parent_delegations;
 use sea_orm::{
     entity::prelude::*,
@@ -292,6 +292,14 @@ fn snapshot_branch<const N: usize>(kind: i32, fields: [SimpleExpr; N]) -> Select
             query.expr_as(expr, Alias::new(*name));
         }
     }
+    // TC-3443: every branch ends with the delegation's first-seen time; only
+    // the anchor and delegation rows carry one.
+    let first_seen_at: SimpleExpr = if matches!(kind, 1 | 4) {
+        Expr::col((delegation::Entity, delegation::Column::FirstSeenAt)).into()
+    } else {
+        Expr::cust("NULL")
+    };
+    query.expr_as(first_seen_at, Alias::new("first_seen_at"));
     query
 }
 
@@ -657,6 +665,48 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             "renewal_lease.lease_cid = renewal_stamp.lease_cid",
         ));
     query.union(UnionType::All, renewal_rows);
+    // TC-3443: the retire row, if any, of every delegator and delegatee in
+    // the closure. `delegator` carries the retired DID, `expiry` the retire
+    // time and `issued_at` the row's expiry; Rust ignores expired rows. It
+    // rides the snapshot's one round trip over the `session_retire` key.
+    let mut retired_rows = snapshot_branch(
+        6,
+        [
+            node(lookup_name.clone()),
+            null(),
+            Expr::col((session_retire::Entity, session_retire::Column::Did)).into(),
+            null(),
+            Expr::col((session_retire::Entity, session_retire::Column::RetiredAt)).into(),
+            Expr::col((session_retire::Entity, session_retire::Column::ExpiresAt)).into(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+        ],
+    );
+    retired_rows
+        .from(lookup_name.clone())
+        .join(
+            JoinType::InnerJoin,
+            delegation::Entity,
+            Expr::col((delegation::Entity, delegation::Column::Id))
+                .equals((lookup_name.clone(), id.clone())),
+        )
+        .join(
+            JoinType::InnerJoin,
+            session_retire::Entity,
+            Expr::col((session_retire::Entity, session_retire::Column::Did))
+                .equals((delegation::Entity, delegation::Column::Delegator))
+                .or(
+                    Expr::col((session_retire::Entity, session_retire::Column::Did))
+                        .equals((delegation::Entity, delegation::Column::Delegatee)),
+                ),
+        )
+        .and_where(within_budget());
+    query.union(UnionType::All, retired_rows);
     query.with(
         WithClause::new()
             .recursive(true)
@@ -812,6 +862,9 @@ pub(crate) struct AuthGraphSnapshot {
     abilities: HashMap<Hash, Vec<abilities::Model>>,
     revoked: HashSet<Hash>,
     renewal_effective_ends: HashMap<Hash, i64>,
+    /// TC-3443: retire time and row expiry of each retired DID among the
+    /// closure's delegators and delegatees, expired rows included.
+    retired: HashMap<String, (time::OffsetDateTime, time::OffsetDateTime)>,
 }
 
 impl AuthGraphSnapshot {
@@ -857,6 +910,7 @@ impl AuthGraphSnapshot {
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
                 renewal_effective_ends: HashMap::new(),
+                retired: HashMap::new(),
             });
         }
 
@@ -868,6 +922,7 @@ impl AuthGraphSnapshot {
         let mut abilities: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         let mut revoked = HashSet::new();
         let mut renewal_candidates = Vec::new();
+        let mut retired = HashMap::new();
         let mut edge_count = 0;
         for row in rows {
             let node: Hash = row.try_get("", "node")?;
@@ -895,6 +950,7 @@ impl AuthGraphSnapshot {
                             facts: row.try_get("", "facts")?,
                             serialization: row.try_get("", "serialization")?,
                             serialization_format: row.try_get("", "serialization_format")?,
+                            first_seen_at: row.try_get("", "first_seen_at")?,
                         },
                     );
                 }
@@ -966,6 +1022,12 @@ impl AuthGraphSnapshot {
                         original_expiry: original_expiry.unix_timestamp(),
                     });
                 }
+                6 => {
+                    retired.insert(
+                        row.try_get::<String>("", "delegator")?,
+                        (row.try_get("", "expiry")?, row.try_get("", "issued_at")?),
+                    );
+                }
                 _ => return Err(DbErr::Type("unknown authorization graph row".into()).into()),
             }
         }
@@ -1026,8 +1088,22 @@ impl AuthGraphSnapshot {
             abilities,
             revoked,
             renewal_effective_ends,
+            retired,
         })
     }
+
+    /// TC-3443: when `did` was retired, if its retire row is live at `now`.
+    pub(crate) fn retired_at(
+        &self,
+        did: &str,
+        now: time::OffsetDateTime,
+    ) -> Option<time::OffsetDateTime> {
+        self.retired
+            .get(did)
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(retired_at, _)| *retired_at)
+    }
+
     pub(crate) fn effective_expiry(&self, id: &Hash) -> Option<i64> {
         self.renewal_effective_ends.get(id).copied()
     }
@@ -1553,14 +1629,26 @@ mod tests {
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
                 renewal_effective_ends: HashMap::new(),
+                retired: HashMap::new(),
             });
         }
-        let delegations = delegation::Entity::find()
+        let delegations: HashMap<Hash, delegation::Model> = delegation::Entity::find()
             .filter(delegation::Column::Id.is_in(nodes.iter().copied()))
             .all(db)
             .await?
             .into_iter()
             .map(|row| (row.id, row))
+            .collect();
+        let principals: HashSet<String> = delegations
+            .values()
+            .flat_map(|row| [row.delegator.clone(), row.delegatee.clone()])
+            .collect();
+        let retired = session_retire::Entity::find()
+            .filter(session_retire::Column::Did.is_in(principals))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| (row.did, (row.retired_at, row.expires_at)))
             .collect();
         let mut ability_rows: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         for row in abilities::Entity::find()
@@ -1586,6 +1674,7 @@ mod tests {
             abilities: ability_rows,
             revoked,
             renewal_effective_ends: HashMap::new(),
+            retired,
         })
     }
 
@@ -1704,6 +1793,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -1906,6 +1996,7 @@ mod tests {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(db)
                 .await
@@ -2122,6 +2213,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
