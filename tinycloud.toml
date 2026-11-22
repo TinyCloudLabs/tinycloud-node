@@ -120,6 +120,17 @@ cors = true
     ## `tinycloud node deletion-ledger replay`.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH
     # deletion_ledger_path = "/var/lib/tinycloud/deletion-ledger.jsonl"
+    ## Caps on live (not deleted) named keys per network; a create or a
+    ## reinstall over a cap answers 403 `key_limit_exceeded`. Each must be
+    ## above 0. Keys outside `secrets`:
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_CAP_PER_NETWORK
+    # key_cap_per_network = 1000
+    ## Keys under one `apps/<app id>/` prefix (they also count per network):
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_CAP_PER_APP_PREFIX
+    # key_cap_per_app_prefix = 100
+    ## Keys at or under `secrets` (they do not count per network):
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__KEY_CAP_SECRETS
+    # key_cap_secrets = 1000
 
 [global.sql]
     ## Accept the `tables` / `columns` / `readOnly` caveat form on

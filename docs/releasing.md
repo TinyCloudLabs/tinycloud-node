@@ -74,6 +74,10 @@ deploy, unless the `tinycloud-node` CVM reports one of:
 Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
 or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is
 `scripts/ci/phala-os-guard.sh`, tested by `scripts/ci/test-phala-os-guard.sh`.
+The CVM is read through `scripts/ci/phala-cvm-json.sh` (tested by
+`scripts/ci/test-phala-cvm-json.sh`), which retries an empty or non-JSON Phala
+read up to 4 times. The check after the deploy runs last, after the quota
+restore, so a failed read there fails the run without skipping the restore.
 CI never changes the OS. If the check fails, set it by hand, then re-run:
 
 ```sh

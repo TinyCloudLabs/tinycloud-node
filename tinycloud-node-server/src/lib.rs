@@ -1087,7 +1087,25 @@ pub async fn app_with_control(
         encryption_backend,
     )
     .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
-    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2);
+    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2)
+    .with_key_cap_per_network(
+        tinycloud_config
+            .encryption_network
+            .key_cap_per_network
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_PER_NETWORK),
+    )
+    .with_key_cap_per_app_prefix(
+        tinycloud_config
+            .encryption_network
+            .key_cap_per_app_prefix
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_PER_APP_PREFIX),
+    )
+    .with_key_cap_secrets(
+        tinycloud_config
+            .encryption_network
+            .key_cap_secrets
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_SECRETS),
+    );
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.

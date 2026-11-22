@@ -72,15 +72,25 @@ seed, and a row whose kind the path does not imply, is a corrupt row (500).
 `POST /encryption/networks/<network>/keys` with `{ "keyPath": "...", "deletable": bool }`.
 `deletable` must equal the kind the path implies (`true` under `apps/` and `secrets/`, `false`
 elsewhere), otherwise 400 `key_path_invalid`. Unknown fields are refused with
-400. Per network at most 1000 key rows, and per `apps/<app id>/` prefix at most
-100, count towards `key_limit_exceeded`; `deleted` rows count until they are
-reused.
+400. Live keys (every state but `deleted`) are capped per network, each over
+the limit answering 403 `key_limit_exceeded`:
+
+| Budget | Counts | Default | Setting (`[global.encryption_network]`, env `TINYCLOUD_ENCRYPTION_NETWORK__…`) |
+|---|---|---|---|
+| per network | every key not at or under `secrets` | 1000 | `key_cap_per_network` / `KEY_CAP_PER_NETWORK` |
+| per app | keys under one `apps/<app id>/`, `apps/<app id>/secrets/…` included (they also count per network) | 100 | `key_cap_per_app_prefix` / `KEY_CAP_PER_APP_PREFIX` |
+| secrets | keys at `secrets` or under `secrets/` (they do not count per network) | 1000 | `key_cap_secrets` / `KEY_CAP_SECRETS` |
+
+Each setting must be above 0; 0 stops the node from starting. Prefixes are
+compared byte for byte (`substr`), never with `LIKE`. A `deleted` row counts
+in no budget, so reusing one is checked like a new key.
 
 - A new path creates the row (`keyVersion` 1, state `active`).
 - An existing `active` deterministic key answers with its descriptor.
 - Any other existing row answers `key_exists` (409). A `blocked` row is not
   changed.
-- A `deleted` deletable row is reused: new seed, state `active`, `keyVersion` + 1.
+- A `deleted` deletable row is reused if the caps allow: new seed, state
+  `active`, `keyVersion` + 1.
 - A `deleted` deterministic row answers `key_deleted` (403).
 
 ### Share keys recorded by a policy registration
