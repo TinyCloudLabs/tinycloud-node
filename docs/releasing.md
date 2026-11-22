@@ -673,10 +673,14 @@ its branch policy before any workflow that names it runs.
      Details: `test/caveat-probe/src/main.rs`.
    - Named keys under `secrets/` (TC-3284): after every deploy or restart of
      a node with `named_keys_v1` on (1.26.21 and later), run the named-key
-     probe against each hostname. It signs with throwaway keys written to a
-     key file you name, outside any repository; the file must not exist yet,
-     is created with mode 0600 and is removed when the run ends, so every run
-     uses a fresh owner, space and network. The smoke key it creates is
+     probe against each hostname. It accepts only an `https://` origin (or
+     `http://` to localhost, 127.0.0.1 or [::1]). It signs with throwaway
+     keys written to a key file you name, outside any repository; the file
+     must not exist yet, is created with mode 0600 and is removed when the
+     run ends, even after an error or a panic. Every run creates a fresh
+     probe-owned owner, space and network on the target node, and prints
+     that owner's wallet address once as `probe-owner address=0x…`; Amos
+     records the address in the deploy log. The smoke key it creates is
      deleted at the end of the run, even after a failed step:
 
      ```sh

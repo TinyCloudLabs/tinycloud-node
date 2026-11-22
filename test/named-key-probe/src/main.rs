@@ -295,10 +295,24 @@ fn authorization(headers: impl serde::Serialize) -> Result<String> {
         .ok_or_else(|| anyhow!("headers carry no Authorization"))
 }
 
+/// The state file of this run. Dropping it removes the file, so the keys
+/// outlive no run: not after an early return, not after a panic.
+struct StateFile<'a>(&'a Path);
+
+impl Drop for StateFile<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(self.0) {
+            println!("state file not removed: {}", error.kind());
+        }
+    }
+}
+
 /// Creates the state file with mode 0600 in one step (`create_new`, so two
 /// concurrent runs cannot share it), holding this run's throwaway wallet and
 /// delegatee key. A file left by an interrupted run is refused: remove it.
-fn create_state(path: &Path) -> Result<(SigningKey, JWK)> {
+/// The returned guard removes the file; it exists from the moment the file
+/// does.
+fn create_state(path: &Path) -> Result<(StateFile<'_>, SigningKey, JWK)> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -309,6 +323,7 @@ fn create_state(path: &Path) -> Result<(SigningKey, JWK)> {
     let mut file = options
         .open(path)
         .context("create state file (a leftover from an earlier run must be removed)")?;
+    let guard = StateFile(path);
     let mut seed = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut seed);
     let wallet = SigningKey::from_slice(&seed)?;
@@ -320,7 +335,21 @@ fn create_state(path: &Path) -> Result<(SigningKey, JWK)> {
     });
     std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&state)?)?;
     file.sync_all()?;
-    Ok((wallet, delegatee))
+    Ok((guard, wallet, delegatee))
+}
+
+/// Only `https`, or plain `http` to this machine: a typo must never send an
+/// `Authorization` header in cleartext.
+fn origin_allowed(origin: &str) -> bool {
+    let origin = origin.trim_end_matches('/');
+    origin.starts_with("https://")
+        || ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+            .iter()
+            .any(|local| {
+                origin
+                    .strip_prefix(local)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            })
 }
 
 struct Probe {
@@ -343,6 +372,8 @@ impl Probe {
         let mut address = [0u8; 20];
         address.copy_from_slice(&hash[12..]);
         let owner = format!("did:pkh:eip155:1:{}", checksummed(&address));
+        // Public, throwaway and probe-owned: recorded in the deploy log.
+        println!("probe-owner address={}", checksummed(&address));
         let space = SpaceId::new(
             DIDBuf::from_str(&owner).map_err(|e| anyhow!("did: {e}"))?,
             SPACE_NAME
@@ -964,21 +995,21 @@ fn main() {
         eprintln!("usage: tinycloud-named-key-probe <node origin> <state file>");
         std::process::exit(2);
     }
+    if !origin_allowed(&args[1]) {
+        eprintln!("refused origin: use https://, or http:// to localhost, 127.0.0.1 or [::1]");
+        std::process::exit(2);
+    }
     let state = Path::new(&args[2]);
-    let outcome = create_state(state).and_then(|(wallet, delegatee)| {
-        let result = Probe::new(&args[1], wallet, delegatee).map(|mut probe| {
+    let outcome = create_state(state).and_then(|(_guard, wallet, delegatee)| {
+        // `_guard` drops when this closure returns and removes the file.
+        Probe::new(&args[1], wallet, delegatee).map(|mut probe| {
             if let Err(error) = probe.run() {
                 // Errors name the step, never a key or token.
                 println!("stopped: {error}");
                 probe.failures = probe.failures.max(1);
             }
             probe.failures
-        });
-        // The keys outlive no run.
-        if let Err(error) = fs::remove_file(state) {
-            println!("state file not removed: {}", error.kind());
-        }
-        result
+        })
     });
     match outcome {
         Ok(0) => println!("result PASS"),
