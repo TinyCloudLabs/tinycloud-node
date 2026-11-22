@@ -1572,6 +1572,15 @@ where
             stats.elapsed_ms = started.elapsed().as_millis() as u64;
             return Ok(stats);
         }
+        // Run both the page SELECT and its UPDATEs inside one transaction with
+        // `EXEMPT_STATEMENT_TIMEOUT` on Postgres (same pattern as the alias
+        // backfill in `db.rs`) so an unindexed boot scan never trips the 30s
+        // pooled session `statement_timeout`.
+        let tx = crate::db::begin_write_transaction(pool, None).await?;
+        if backend == DbBackend::Postgres {
+            tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                .await?;
+        }
         let mut query = Entity::find()
             .select_only()
             .column(Column::Id)
@@ -1586,9 +1595,10 @@ where
         }
         let rows = query
             .into_tuple::<(Hash, Option<Facts>, Vec<u8>, i16)>()
-            .all(pool)
+            .all(&tx)
             .await?;
         if rows.is_empty() {
+            tx.commit().await?;
             stats.completed = true;
             stats.elapsed_ms = started.elapsed().as_millis() as u64;
             tracing::info!(
@@ -1647,23 +1657,16 @@ where
             updates.push((id, Facts(map)));
         }
 
-        if !updates.is_empty() {
-            let tx = crate::db::begin_write_transaction(pool, None).await?;
-            if backend == DbBackend::Postgres {
-                tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
-                    .await?;
+        for (id, facts) in updates {
+            ActiveModel {
+                id: sea_orm::ActiveValue::Unchanged(id),
+                facts: Set(Some(facts)),
+                ..Default::default()
             }
-            for (id, facts) in updates {
-                ActiveModel {
-                    id: sea_orm::ActiveValue::Unchanged(id),
-                    facts: Set(Some(facts)),
-                    ..Default::default()
-                }
-                .update(&tx)
-                .await?;
-            }
-            tx.commit().await?;
+            .update(&tx)
+            .await?;
         }
+        tx.commit().await?;
         pages += 1;
     }
 }

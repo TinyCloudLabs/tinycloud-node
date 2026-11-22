@@ -300,20 +300,36 @@ impl DelegationInfo {
     /// must always use [`TryFrom<TinyCloudDelegation>`], and callers must never
     /// authorize a grant whose mode is [`DelegationMode::Invalid`].
     pub fn try_from_stored(d: TinyCloudDelegation) -> Result<Self, DelegationError> {
-        match Self::try_from(d.clone()) {
-            Ok(info) => Ok(info),
-            Err(DelegationError::InvalidDelegationMode) => {
-                let TinyCloudDelegation::Cacao(ref c) = d else {
-                    return Err(DelegationError::InvalidDelegationMode);
-                };
+        match d {
+            TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
-                let maybe_siwe_cap =
-                    SiweCap::<SiweCaveatValue>::extract_and_verify_ignoring_mode(&m)
-                        .map_err(siwe_decode_error)?;
-                let (capabilities, parents) = match maybe_siwe_cap {
-                    Some(siwe_cap) => extract_siwe_cap(siwe_cap),
-                    None => (vec![], vec![]),
-                };
+                let (capabilities, parents, delegation_mode) =
+                    match SiweCap::<SiweCaveatValue>::extract_and_verify(&m)
+                        .map_err(siwe_decode_error)
+                    {
+                        Ok(Some(siwe_cap)) => {
+                            let mode = match siwe_cap.delegation_mode() {
+                                Some(DelegationModeFact::Terminal) => DelegationMode::Terminal,
+                                Some(DelegationModeFact::Attenuable) | None => {
+                                    DelegationMode::Attenuable
+                                }
+                            };
+                            let (capabilities, parents) = extract_siwe_cap(siwe_cap);
+                            (capabilities, parents, mode)
+                        }
+                        Ok(None) => (vec![], vec![], DelegationMode::Attenuable),
+                        Err(DelegationError::InvalidDelegationMode) => {
+                            let maybe_siwe_cap =
+                                SiweCap::<SiweCaveatValue>::extract_and_verify_ignoring_mode(&m)
+                                    .map_err(siwe_decode_error)?;
+                            let (capabilities, parents) = match maybe_siwe_cap {
+                                Some(siwe_cap) => extract_siwe_cap(siwe_cap),
+                                None => (vec![], vec![]),
+                            };
+                            (capabilities, parents, DelegationMode::Invalid)
+                        }
+                        Err(err) => return Err(err),
+                    };
                 Ok(Self {
                     capabilities,
                     delegator: strip_fragment(c.payload().iss.as_ref()),
@@ -322,11 +338,11 @@ impl DelegationInfo {
                     expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
                     not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
                     issued_at: Some(*c.payload().iat.as_ref()),
-                    delegation_mode: DelegationMode::Invalid,
+                    delegation_mode,
                     delegation: d,
                 })
             }
-            Err(err) => Err(err),
+            TinyCloudDelegation::Ucan(_) => Self::try_from(d),
         }
     }
 }

@@ -194,6 +194,9 @@ async fn signed_artifact<C: sea_orm::ConnectionTrait>(
         return Err(ControlError("renewal_state_unavailable"));
     }
     let info = super::signed_delegation_info(&bytes)?;
+    if info.delegation_mode == crate::util::DelegationMode::Invalid {
+        return Err(super::RenewalStoreError::InvalidInput.into());
+    }
     super::verify_signed_signature(&info).await?;
     if row.try_get::<String>("", "delegator")? != info.delegator
         || row.try_get::<String>("", "delegatee")? != info.delegate

@@ -253,6 +253,76 @@ fn must_err<T, E>(result: Result<T, E>) -> E {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn insert_pre_upgrade_row_on<C: ConnectionTrait>(
+    conn: &C,
+    id: Hash,
+    delegator: &str,
+    delegatee: &str,
+    plaintext: &[u8],
+    grants: &[(&str, &str)],
+    parents: &[Hash],
+    encryption: Option<&ColumnEncryption>,
+) {
+    for did in [delegator, delegatee] {
+        actor::ActiveModel {
+            id: Set(did.to_string()),
+        }
+        .insert(conn)
+        .await
+        .ok();
+    }
+    let stored = crate::encryption::maybe_encrypt(
+        encryption,
+        plaintext,
+        crate::encryption::RowBinding::new("delegation", "serialization", &[&Vec::<u8>::from(id)]),
+    );
+    let now = OffsetDateTime::now_utc();
+    delegation::ActiveModel {
+        id: Set(id),
+        delegator: Set(delegator.to_string()),
+        delegatee: Set(delegatee.to_string()),
+        expiry: Set(Some(now + time::Duration::hours(1))),
+        issued_at: Set(Some(now)),
+        not_before: Set(Some(now - time::Duration::minutes(1))),
+        facts: Set(None),
+        serialization: Set(stored),
+        serialization_format: Set(if encryption.is_some() { 2 } else { 0 }),
+        first_seen_at: Set(Some(now)),
+    }
+    .insert(conn)
+    .await
+    .unwrap();
+    delegation_cid_alias::ActiveModel {
+        id: Set(id),
+        canonical: Set(id),
+        encrypted: Set(encryption.is_some()),
+    }
+    .insert(conn)
+    .await
+    .unwrap();
+    for (resource, ability) in grants {
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(id),
+            resource: Set(resource.parse().unwrap()),
+            ability: Set((*ability).to_owned().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+    for parent in parents {
+        parent_delegations::ActiveModel {
+            child: Set(id),
+            parent: Set(*parent),
+        }
+        .insert(conn)
+        .await
+        .unwrap();
+    }
+}
+
 struct Fixture {
     db: SpaceDatabase<sea_orm::DatabaseConnection, MemoryStore, StaticSecret>,
     url: String,
@@ -351,67 +421,17 @@ impl Fixture {
         parents: &[Hash],
         encryption: Option<&ColumnEncryption>,
     ) {
-        for did in [delegator, delegatee] {
-            actor::ActiveModel {
-                id: Set(did.to_string()),
-            }
-            .insert(&self.db.conn)
-            .await
-            .ok();
-        }
-        let stored = crate::encryption::maybe_encrypt(
-            encryption,
+        insert_pre_upgrade_row_on(
+            &self.db.conn,
+            id,
+            delegator,
+            delegatee,
             plaintext,
-            crate::encryption::RowBinding::new(
-                "delegation",
-                "serialization",
-                &[&Vec::<u8>::from(id)],
-            ),
-        );
-        let now = OffsetDateTime::now_utc();
-        delegation::ActiveModel {
-            id: Set(id),
-            delegator: Set(delegator.to_string()),
-            delegatee: Set(delegatee.to_string()),
-            expiry: Set(Some(now + time::Duration::hours(1))),
-            issued_at: Set(Some(now)),
-            not_before: Set(Some(now - time::Duration::minutes(1))),
-            facts: Set(None),
-            serialization: Set(stored),
-            serialization_format: Set(if encryption.is_some() { 2 } else { 0 }),
-            first_seen_at: Set(Some(now)),
-        }
-        .insert(&self.db.conn)
-        .await
-        .unwrap();
-        delegation_cid_alias::ActiveModel {
-            id: Set(id),
-            canonical: Set(id),
-            encrypted: Set(encryption.is_some()),
-        }
-        .insert(&self.db.conn)
-        .await
-        .unwrap();
-        for (resource, ability) in grants {
-            abilities::Entity::insert(abilities::ActiveModel {
-                delegation: Set(id),
-                resource: Set(resource.parse().unwrap()),
-                ability: Set((*ability).to_owned().try_into().unwrap()),
-                caveats: Set(Default::default()),
-            })
-            .exec(&self.db.conn)
-            .await
-            .unwrap();
-        }
-        for parent in parents {
-            parent_delegations::ActiveModel {
-                child: Set(id),
-                parent: Set(*parent),
-            }
-            .insert(&self.db.conn)
-            .await
-            .unwrap();
-        }
+            grants,
+            parents,
+            encryption,
+        )
+        .await;
     }
 }
 
@@ -1394,7 +1414,16 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         )]
     );
 
-    // Renewal registration must refuse a malformed stored original.
+    // Renewal registration must refuse a malformed stored original. Assert the
+    // original row exists so InvalidInput proves mode refusal, not a missing row.
+    assert!(
+        delegation::Entity::find_by_id(bad_hash)
+            .one(&reopened.conn)
+            .await
+            .unwrap()
+            .is_some(),
+        "malformed original row must exist before testing renewal refusal"
+    );
     let renew_res = format!("urn:cid:{bad_cid}");
     let (renew_lease_tok, _, _) = signed_cacao_token(
         &f.wallet,
@@ -1539,4 +1568,190 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
             ))
         ));
     }
+}
+
+/// TC-3810 (F6): exercise the PostgreSQL `facts::jsonb ->> 'xyz.tinycloud.policy/delegationMode'`
+/// filter and per-page `EXEMPT_STATEMENT_TIMEOUT` transaction during boot
+/// reindex, verifying scan, mark (`terminal`, `invalid`, `attenuable`), and
+/// that a second boot scans 0 rows. Runs in `.github/workflows/rust.yml`
+/// (`test (workspace, PostgreSQL-backed, unit)`).
+#[tokio::test]
+async fn postgres_cacao_delegation_mode_boot_reindex() {
+    let Some(pg) =
+        crate::test_support::PostgresTestSchema::new("postgres_cacao_delegation_mode_boot_reindex")
+            .await
+    else {
+        return;
+    };
+
+    let wallet = Wallet::from_seed(0x91);
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        wallet.did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space.clone())),
+    }
+    .insert(&pg.conn)
+    .await
+    .unwrap();
+    let kv_res = space
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("secrets/pg".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+
+    let k_term = JWK::generate_ed25519().unwrap();
+    let (d_term, _) = verification_method(&k_term);
+    let k_bad = JWK::generate_ed25519().unwrap();
+    let (d_bad, _) = verification_method(&k_bad);
+    let k_ok = JWK::generate_ed25519().unwrap();
+    let (d_ok, _) = verification_method(&k_ok);
+    let k_ucan = JWK::generate_ed25519().unwrap();
+    let (d_ucan, _) = verification_method(&k_ucan);
+
+    let (t_token, t_cid, _) = signed_cacao_token(
+        &wallet,
+        &d_term,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "pgreidxterm",
+    );
+    let (_, t_bytes) = TinyCloudDelegation::decode(&t_token).unwrap();
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        Hash::from(t_cid),
+        &wallet.did,
+        &d_term,
+        &t_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    let (bad_bytes, bad_hash, _) = signed_cacao_with_raw_recap_tail(
+        &wallet,
+        &d_bad,
+        &[(&kv_res, "tinycloud.kv/get")],
+        r#""xyz.tinycloud.policy/delegationMode":"bogus""#,
+        "pgreidxbad1",
+    );
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        bad_hash,
+        &wallet.did,
+        &d_bad,
+        &bad_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    let (ok_token, ok_cid, _) = signed_cacao_token(
+        &wallet,
+        &d_ok,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+        "pgreidxok01",
+    );
+    let (_, ok_bytes) = TinyCloudDelegation::decode(&ok_token).unwrap();
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        Hash::from(ok_cid),
+        &wallet.did,
+        &d_ok,
+        &ok_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    let (ucan_child, _) = signed_ucan_delegation(
+        &k_ok,
+        &d_ucan,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[ok_cid],
+        false,
+    );
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        ucan_child.content_hash(),
+        &d_ok,
+        &d_ucan,
+        ucan_child.serialized_bytes(),
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[Hash::from(ok_cid)],
+        None,
+    )
+    .await;
+
+    // First boot reindex against Postgres.
+    let first = delegation::reindex_cacao_modes(&pg.conn, None)
+        .await
+        .unwrap();
+    assert!(first.completed);
+    assert_eq!(first.scanned, 4);
+    assert_eq!(first.reindexed_terminal, 1);
+    assert_eq!(first.marked_invalid, 1);
+    assert_eq!(first.marked_attenuable, 2);
+
+    let t_row = delegation::Entity::find_by_id(Hash::from(t_cid))
+        .one(&pg.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(delegation::parent_is_terminal(&t_row));
+    assert!(!delegation::delegation_mode_is_invalid(&t_row));
+
+    let bad_row = delegation::Entity::find_by_id(bad_hash)
+        .one(&pg.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(delegation::parent_is_terminal(&bad_row));
+    assert!(delegation::delegation_mode_is_invalid(&bad_row));
+
+    for id in [Hash::from(ok_cid), ucan_child.content_hash()] {
+        let row = delegation::Entity::find_by_id(id)
+            .one(&pg.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!delegation::parent_is_terminal(&row));
+        assert!(!delegation::delegation_mode_is_invalid(&row));
+        assert_eq!(
+            row.facts
+                .as_ref()
+                .and_then(|crate::types::Facts(m)| m.get(crate::util::DelegationMode::FACT_KEY))
+                .and_then(|v| v.as_str()),
+            Some("attenuable")
+        );
+    }
+
+    // Second boot reindex via SpaceDatabase::new + direct check must scan 0 rows.
+    let db = SpaceDatabase::new(
+        pg.conn.clone(),
+        MemoryStore::default(),
+        StaticSecret::new(vec![0x55; 32]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let second = delegation::reindex_cacao_modes(&db.conn, None)
+        .await
+        .unwrap();
+    assert!(second.completed);
+    assert_eq!(second.scanned, 0, "second Postgres boot must scan 0 rows");
+    assert_eq!(second.reindexed_terminal, 0);
+    assert_eq!(second.marked_attenuable, 0);
+    assert_eq!(second.marked_invalid, 0);
 }
