@@ -278,7 +278,10 @@ impl fmt::Display for ObjectKey {
     }
 }
 
-fn lineage_prefix(db: &DbRef<'_>, lineage: &Lineage) -> Result<String, KeyError> {
+/// `sql/v1/{space}/{db}/{lineage}/`: every object of one lineage of one
+/// database. A key read back from the manifest or the inventory must start
+/// with the prefix of the database it is used for.
+pub fn lineage_prefix(db: &DbRef<'_>, lineage: &Lineage) -> Result<String, KeyError> {
     Ok(format!("{}{lineage}/", ObjectKey::db_prefix(db)?))
 }
 
