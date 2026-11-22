@@ -19,4 +19,4 @@ pub use manifest::{
 pub use memory::MemorySqlObjectStore;
 pub use object::{ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError};
 pub use policy::{PendingState, RetentionPolicy, SpaceAllowlist, UploadPolicy};
-pub use shadow::{Notice, NoopSink, ShadowSink};
+pub use shadow::{NoopSink, Notice, ShadowSink};

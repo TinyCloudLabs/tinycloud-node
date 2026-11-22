@@ -1267,7 +1267,12 @@ impl SqlService {
                 },
             );
             // Shadow hook (TC-1491): metadata only, on the Ok arm only.
-            self.notify_shadow(space, db_name, saved.revision, &saved.checkpoint_content_hash);
+            self.notify_shadow(
+                space,
+                db_name,
+                saved.revision,
+                &saved.checkpoint_content_hash,
+            );
             return Ok(());
         }
 
@@ -1393,7 +1398,12 @@ impl SqlService {
             },
         );
         // Shadow hook (TC-1491): metadata only, on the Ok arm only.
-        self.notify_shadow(space, db_name, saved.revision, &saved.checkpoint_content_hash);
+        self.notify_shadow(
+            space,
+            db_name,
+            saved.revision,
+            &saved.checkpoint_content_hash,
+        );
         tracing::info!(
             service = "sql",
             mode = "checkpoint",
@@ -1964,13 +1974,9 @@ mod tests {
         let space = test_space_id("tc1491-notice-checkpoint");
         let sink = Arc::new(ProbeSink::default());
         let repo = artifact_repository().await;
-        let service = SqlService::new(
-            cache.path().to_string_lossy().into_owned(),
-            0,
-            repo.clone(),
-        )
-        .with_ddl_policy(DdlPolicy::Log)
-        .with_shadow(sink.clone());
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
         execute_insert(&service, &space, "first").await;
         let meta = repo
             .load_meta("sql", &space.to_string(), "main")
@@ -1995,13 +2001,9 @@ mod tests {
         let space = test_space_id("tc1491-notice-delta");
         let sink = Arc::new(ProbeSink::default());
         let repo = artifact_repository().await;
-        let service = SqlService::new(
-            cache.path().to_string_lossy().into_owned(),
-            0,
-            repo.clone(),
-        )
-        .with_ddl_policy(DdlPolicy::Log)
-        .with_shadow(sink.clone());
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
         execute_insert(&service, &space, "first").await;
         execute_insert(&service, &space, "second").await;
         let meta = repo
@@ -2038,7 +2040,10 @@ mod tests {
         .with_ddl_policy(DdlPolicy::Log)
         .with_shadow(board.clone());
         execute_insert(&service, &space, "x").await;
-        assert!(board.take().is_empty(), "an empty allowlist records nothing");
+        assert!(
+            board.take().is_empty(),
+            "an empty allowlist records nothing"
+        );
     }
 
     #[tokio::test]

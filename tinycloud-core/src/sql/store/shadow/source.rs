@@ -262,7 +262,10 @@ pub(crate) mod tests {
 
     pub(crate) const SPACE: &str = "tinycloud:pkh:eip155:1:0xAb://default";
 
-    pub(crate) async fn repository() -> (sea_orm::DatabaseConnection, Arc<SeaOrmDatabaseArtifactRepository>) {
+    pub(crate) async fn repository() -> (
+        sea_orm::DatabaseConnection,
+        Arc<SeaOrmDatabaseArtifactRepository>,
+    ) {
         let mut options = ConnectOptions::new("sqlite::memory:".to_string());
         options.max_connections(1).sqlx_logging(false);
         let conn = Database::connect(options).await.unwrap();

@@ -176,9 +176,12 @@ mod tests {
     use crate::sql::store::shadow::source::tests::{repository, saved, SPACE};
 
     async fn publish_at(m: &DbSqlManifest, db: &str, at: u64, cid: &str) -> Frontier {
-        let dbref = DbRef { space: SPACE, db_id: db };
-        let key = ObjectKey::snapshot(&dbref, &Lineage::random(), at, &sha256(db.as_bytes()))
-            .unwrap();
+        let dbref = DbRef {
+            space: SPACE,
+            db_id: db,
+        };
+        let key =
+            ObjectKey::snapshot(&dbref, &Lineage::random(), at, &sha256(db.as_bytes())).unwrap();
         let PublishOutcome::Published(f) = m
             .publish_chain(
                 &dbref,

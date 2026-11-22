@@ -737,7 +737,9 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
         if part == ArtifactPart::Wal && !meta.has_delta() {
-            return Err(DatabaseArtifactError::Sink("the artifact has no WAL delta".into()));
+            return Err(DatabaseArtifactError::Sink(
+                "the artifact has no WAL delta".into(),
+            ));
         }
         let mut only = OnePartSink {
             part,
