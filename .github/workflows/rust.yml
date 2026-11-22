@@ -434,6 +434,9 @@ jobs:
     - name: Fetch pinned MinIO and mc (sha256-verified)
       run: bash scripts/at-rest-harness/harness.sh bins
 
+    - name: Harness stop tests (pid-reuse guard, vanished process)
+      run: bash scripts/at-rest-harness/test-stop.sh
+
     - name: Start the harness (native PostgreSQL, MinIO, tinycloud-node)
       run: bash scripts/at-rest-harness/harness.sh up
 
