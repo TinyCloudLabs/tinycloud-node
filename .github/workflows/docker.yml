@@ -562,10 +562,33 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # require-green reads the check runs and workflow runs of the shipped commit.
+      checks: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+
+      # Pre-release security gate: refuse to ship unless main CI passed on the
+      # exact commit being shipped, before this job touches a deploy secret.
+      # A build ships GITHUB_SHA. A rollback or digest promotion with recorded
+      # labels ships ROLLBACK_REVISION, which must itself have passed the
+      # test and capability checks; gitleaks is then read on GITHUB_SHA, whose
+      # main run scans the full history, including that ancestor (the next
+      # step proves ancestry). Required names: docs/security/required-checks.md.
+      - name: Require green main CI on the shipped commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+        run: |
+          set -euo pipefail
+          SHIPPED="${ROLLBACK_REVISION:-${GITHUB_SHA}}"
+          node .github/scripts/require-green.mjs "${GITHUB_REPOSITORY}" "${SHIPPED}" \
+            ".github/workflows/rust.yml=test (workspace, PostgreSQL-backed)" \
+            ".github/workflows/rust.yml=capabilities"
+          node .github/scripts/require-green.mjs "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" \
+            ".github/workflows/security.yml=gitleaks"
 
       # TC-940: production is built and promoted only from main. Refuse any
       # other dispatched ref before this job touches a deploy secret.
