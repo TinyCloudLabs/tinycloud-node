@@ -83,6 +83,26 @@ if label == "tinycloud-node" {
     if match(account, r'^[0-9a-f]{64}$') { out.account_hash = account }
     space = string(f.space_hash) ?? ""
     if match(space, r'^[0-9a-f]{64}$') { out.space_hash = space }
+    # TC-3739: per-request DB accounting, on status below 400 only (4xx/5xx are the capped classes; DB-caused 5xx
+    # already carry elapsed_ms on db_failure_5xx). Copied only as plain numbers inside the canonical bounds; anything
+    # else is dropped (the event still ships). They are driver wall times and an attempt count, never identifiers.
+    if status < 400 {
+      pool_wait = f.pool_wait_ms
+      if is_float(pool_wait) || is_integer(pool_wait) {
+        pool_wait = to_float!(pool_wait)
+        if pool_wait >= 0.0 && pool_wait <= 86400000.0 { out.pool_wait_ms = pool_wait }
+      }
+      query_time = f.query_time_ms
+      if is_float(query_time) || is_integer(query_time) {
+        query_time = to_float!(query_time)
+        if query_time >= 0.0 && query_time <= 86400000.0 { out.query_time_ms = query_time }
+      }
+      query_count = f.query_count
+      if is_integer(query_count) {
+        query_count = int!(query_count)
+        if query_count >= 0 && query_count <= 9007199254740991 { out.query_count = query_count }
+      }
+    }
   } else if is_object(db_event) {
     out = db_event
   } else if is_object(headroom) {
