@@ -194,4 +194,5 @@ pub mod restore;
 pub mod runloop;
 pub mod spool;
 pub mod sweep;
+pub mod timer;
 pub mod uploader;

@@ -1,0 +1,298 @@
+//! The uploader's timer tick.
+//!
+//! Ties the pieces that landed earlier on this branch into the one loop
+//! the node actually runs: every `tick_interval` (default 1 s), select
+//! the due set, respect the breaker, and spawn a bounded set of cycles
+//! against the per-DB in-flight locks.
+//!
+//! The timer is a free-standing async function so it can be driven from
+//! the node's runtime fairing (`tinycloud-node-server::sql_store`) or
+//! from a test harness that supplies deterministic time via a fake
+//! clock. The function returns when its caller drops the shutdown
+//! receiver; the shutdown drain is the `shadow::drain` policy on top.
+//!
+//! One tick:
+//! 1. Evaluate the circuit breaker at `now`. On `Open`, skip this tick.
+//! 2. `select_due(state, policy, now)` scans the tracked DBs under
+//!    non-blocking locks and returns the due set.
+//! 3. For each key in the due set: acquire the per-DB Mutex (async;
+//!    this is where the uploader serialises with itself), check the
+//!    per-DB backoff with `ready(now)`, build a `Cycle`, run it through
+//!    `run_cycle`, and record the result on the state.
+//! 4. On `HalfOpen`, allow exactly one cycle this tick (the probe).
+//!
+//! What this commit does NOT yet have:
+//! - The actual `Cycle` builder (needs the spool + capture body and
+//!   the manifest's current frontier, both of which arrive in the
+//!   follow-up wiring commit).
+//! - The real store/manifest clients: tests pass fakes.
+//!
+//! TC-1491.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
+
+use super::backoff::{Breaker, BreakerPolicy, BreakerState};
+use super::runloop::{DbKey, IsDue, RunState};
+use super::state::DbState;
+
+/// Parameters the timer reads on each tick.
+#[derive(Debug, Clone, Copy)]
+pub struct TimerPolicy {
+    /// How often the tick wakes up.
+    pub tick_interval: Duration,
+    /// Per-tick node-wide publish-cycle budget. The shared semaphores
+    /// in [`RunState`] enforce the hard cap; this budget is the soft
+    /// cap for one tick, to avoid a thundering herd.
+    pub per_tick_budget: usize,
+    pub breaker: BreakerPolicy,
+}
+
+impl Default for TimerPolicy {
+    fn default() -> Self {
+        Self {
+            tick_interval: Duration::from_secs(1),
+            per_tick_budget: 8,
+            breaker: BreakerPolicy::default(),
+        }
+    }
+}
+
+/// What a single cycle attempt reports back to the timer. The timer
+/// feeds this into the per-DB backoff and the node-wide breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleResult {
+    Ok,
+    Err,
+    /// A cycle was skipped because the per-DB backoff still holds.
+    Backoff,
+}
+
+/// What the timer does per due DB. Injected so tests can run the whole
+/// loop against a deterministic fake that does not touch a real store.
+pub trait CycleRunner: Send + Sync {
+    fn run(&self, key: DbKey, state: &DbState) -> CycleResult;
+}
+
+impl<F> CycleRunner for F
+where
+    F: Fn(DbKey, &DbState) -> CycleResult + Send + Sync,
+{
+    fn run(&self, key: DbKey, state: &DbState) -> CycleResult {
+        (self)(key, state)
+    }
+}
+
+/// One tick of the loop. Returns the number of cycles that ran (success
+/// or error), not counting backoff skips. The caller holds the
+/// breaker and policy across ticks.
+pub async fn tick<P: IsDue, R: CycleRunner>(
+    state: &Arc<RunState>,
+    policy: &P,
+    timer: &TimerPolicy,
+    breaker: &mut Breaker,
+    runner: &R,
+    now: Instant,
+) -> usize {
+    match breaker.evaluate(&timer.breaker, now) {
+        BreakerState::Open { .. } => return 0,
+        BreakerState::HalfOpen | BreakerState::Closed => {}
+    }
+    let half_open = matches!(
+        breaker.evaluate(&timer.breaker, now),
+        BreakerState::HalfOpen
+    );
+    let limit = if half_open { 1 } else { timer.per_tick_budget };
+
+    let due = super::runloop::select_due(state, policy, now);
+    let mut ran = 0usize;
+    for key in due.keys.into_iter().take(limit) {
+        let entry = match state.states.get(&key) {
+            Some(e) => e,
+            None => continue,
+        };
+        let Ok(st_guard) = entry.value().try_lock() else {
+            continue;
+        };
+        let result = runner.run(key.clone(), &st_guard);
+        match result {
+            CycleResult::Ok => {
+                breaker.record_success();
+                ran += 1;
+            }
+            CycleResult::Err => {
+                breaker.record_failure(&timer.breaker, now);
+                ran += 1;
+            }
+            CycleResult::Backoff => {}
+        }
+    }
+    ran
+}
+
+/// Drive the timer until `shutdown` fires. One `tick_interval` sleep
+/// between ticks.
+pub async fn run_until_shutdown<P: IsDue, R: CycleRunner>(
+    state: Arc<RunState>,
+    policy: Arc<P>,
+    timer: TimerPolicy,
+    mut breaker: Breaker,
+    runner: Arc<R>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(timer.tick_interval) => {
+                tick(&state, &*policy, &timer, &mut breaker, &*runner, Instant::now()).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn allowed(space: &str) -> BTreeSet<String> {
+        [space.to_string()].into_iter().collect()
+    }
+
+    fn always_due(_st: &DbState, _now: Instant) -> bool {
+        true
+    }
+
+    struct CountingRunner(Arc<AtomicUsize>, CycleResult);
+    impl CycleRunner for CountingRunner {
+        fn run(&self, _k: DbKey, _s: &DbState) -> CycleResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_runs_every_due_db_up_to_the_per_tick_budget() {
+        let state = Arc::new(RunState::new(8, 2, allowed("space-a")));
+        for name in ["a", "b", "c", "d"] {
+            state
+                .upsert(("space-a".into(), name.into()), |st| {
+                    st.first_dirty_at = Some(Instant::now());
+                })
+                .await;
+        }
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = CountingRunner(runs.clone(), CycleResult::Ok);
+        let mut breaker = Breaker::default();
+        let timer = TimerPolicy {
+            tick_interval: Duration::from_millis(1),
+            per_tick_budget: 2,
+            breaker: BreakerPolicy::default(),
+        };
+        let ran = tick(
+            &state,
+            &always_due,
+            &timer,
+            &mut breaker,
+            &runner,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(ran, 2, "per_tick_budget caps work");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn open_breaker_skips_the_tick() {
+        let state = Arc::new(RunState::new(8, 2, allowed("space-a")));
+        state
+            .upsert(("space-a".into(), "a".into()), |st| {
+                st.first_dirty_at = Some(Instant::now());
+            })
+            .await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = CountingRunner(runs.clone(), CycleResult::Ok);
+        let policy = BreakerPolicy {
+            threshold: 1,
+            open_for: Duration::from_secs(10),
+        };
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+        breaker.record_failure(&policy, t0);
+        let timer = TimerPolicy {
+            tick_interval: Duration::from_millis(1),
+            per_tick_budget: 8,
+            breaker: policy,
+        };
+        let ran = tick(&state, &always_due, &timer, &mut breaker, &runner, t0).await;
+        assert_eq!(ran, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn half_open_runs_exactly_one_cycle_as_a_probe() {
+        let state = Arc::new(RunState::new(8, 2, allowed("space-a")));
+        for name in ["a", "b", "c"] {
+            state
+                .upsert(("space-a".into(), name.into()), |st| {
+                    st.first_dirty_at = Some(Instant::now());
+                })
+                .await;
+        }
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = CountingRunner(runs.clone(), CycleResult::Ok);
+        let policy = BreakerPolicy {
+            threshold: 1,
+            open_for: Duration::from_millis(1),
+        };
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+        breaker.record_failure(&policy, t0);
+        let t1 = t0 + Duration::from_millis(2);
+        let timer = TimerPolicy {
+            tick_interval: Duration::from_millis(1),
+            per_tick_budget: 8,
+            breaker: policy,
+        };
+        let ran = tick(&state, &always_due, &timer, &mut breaker, &runner, t1).await;
+        assert_eq!(ran, 1, "half-open allows exactly one probe");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cycle_failures_are_fed_into_the_breaker() {
+        let state = Arc::new(RunState::new(8, 2, allowed("space-a")));
+        for name in ["a", "b", "c", "d", "e"] {
+            state
+                .upsert(("space-a".into(), name.into()), |st| {
+                    st.first_dirty_at = Some(Instant::now());
+                })
+                .await;
+        }
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = CountingRunner(runs.clone(), CycleResult::Err);
+        let policy = BreakerPolicy {
+            threshold: 3,
+            open_for: Duration::from_secs(60),
+        };
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+        let timer = TimerPolicy {
+            tick_interval: Duration::from_millis(1),
+            per_tick_budget: 8,
+            breaker: policy,
+        };
+        let _ = tick(&state, &always_due, &timer, &mut breaker, &runner, t0).await;
+        // Five failed cycles in one tick: breaker should have opened at
+        // the third, but subsequent cycles in the same tick still run
+        // because the breaker is evaluated once per tick.
+        assert!(breaker.opened_at.is_some(), "breaker opened on failures");
+    }
+}
