@@ -6,6 +6,12 @@ use sea_orm_migration::prelude::*;
 /// It is NULL for rows stored before this migration, which count as seen
 /// before any retire. `session_retire` holds each retired session key until
 /// `expires_at`, after which the row is ignored and pruned.
+///
+/// `up` is idempotent (TC-3755). Each step skips what already exists, so a
+/// node can migrate again after this migration's `seaql_migrations` row was
+/// deleted with its schema left in place. That is the deregister-only
+/// rollback to 1.26.17: an operator role can't drop these tables, because
+/// they are owned by the node's own database role.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -28,22 +34,25 @@ const EXPIRES_AT_INDEX: &str = "idx_session_retire_expires_at";
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Delegation::Table)
-                    .add_column(
-                        ColumnDef::new(Delegation::FirstSeenAt)
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
-                    .to_owned(),
-            )
-            .await?;
+        if !manager.has_column("delegation", "first_seen_at").await? {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Delegation::Table)
+                        .add_column(
+                            ColumnDef::new(Delegation::FirstSeenAt)
+                                .timestamp_with_time_zone()
+                                .null(),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+        }
         manager
             .create_table(
                 Table::create()
                     .table(SessionRetire::Table)
+                    .if_not_exists()
                     .col(
                         ColumnDef::new(SessionRetire::Did)
                             .string()
@@ -63,6 +72,9 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
+        if manager.has_index("session_retire", EXPIRES_AT_INDEX).await? {
+            return Ok(());
+        }
         manager
             .create_index(
                 Index::create()
@@ -195,5 +207,67 @@ mod tests {
             return;
         };
         assert_up_down_up(&fixture.conn).await;
+    }
+
+    // test-ruling: TC-3755 new tests only (Naomi GO 2026-11-22 04:23Z);
+    // the existing tests above are unchanged.
+    /// Deregister-only rollback, then forward again. Deleting the 1.26.18
+    /// migrations' `seaql_migrations` rows leaves their schema and rows in
+    /// place, and is what lets 1.26.17 boot. Running `up` a second time must
+    /// then succeed and keep the retired sessions.
+    async fn assert_up_again_after_deregister(db: &DatabaseConnection) {
+        let backend = db.get_database_backend();
+        assert_applied(db, true).await;
+        for sql in [
+            "INSERT INTO session_retire (did, retired_at, expires_at) \
+             VALUES ('did:key:z6Mkretired', '2026-11-21T00:00:00Z', '2026-12-21T00:00:00Z')",
+            "DELETE FROM seaql_migrations WHERE version IN \
+             ('m20261121_000000_session_retire', 'm20261122_000000_sql_store_owner')",
+        ] {
+            db.execute(Statement::from_string(backend, sql))
+                .await
+                .unwrap();
+        }
+        assert_eq!(registered(db).await, 0);
+
+        Migrator::up(db, None).await.unwrap();
+
+        assert_eq!(registered(db).await, 2);
+        assert_applied(db, true).await;
+        let txn = db.begin().await.unwrap();
+        assert_eq!(count(&txn).await, 1, "retired sessions survive");
+        txn.rollback().await.unwrap();
+    }
+
+    async fn registered(db: &DatabaseConnection) -> i64 {
+        db.query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM seaql_migrations WHERE version IN \
+             ('m20261121_000000_session_retire', 'm20261122_000000_sql_store_owner')",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_session_retire_up_again_after_deregister() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        assert_up_again_after_deregister(&db).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_session_retire_up_again_after_deregister() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_session_retire_up_again_after_deregister",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_up_again_after_deregister(&fixture.conn).await;
     }
 }
