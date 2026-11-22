@@ -294,6 +294,54 @@ impl ArtifactSink for MemorySink {
     }
 }
 
+/// Passes one part through to `inner` and drops the other
+/// ([`DatabaseArtifactRepository::read_part_chunks`]'s default).
+struct OnePartSink<'a> {
+    part: ArtifactPart,
+    active: bool,
+    inner: &'a mut dyn ArtifactSink,
+}
+
+#[async_trait]
+impl ArtifactSink for OnePartSink<'_> {
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+        self.active = false;
+        self.inner.reset().await
+    }
+
+    async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        self.active = part == self.part;
+        if self.active {
+            self.inner.begin_part(part).await?;
+        }
+        Ok(())
+    }
+
+    fn size_hint(&mut self, part: ArtifactPart, bytes: u64) {
+        if part == self.part {
+            self.inner.size_hint(part, bytes);
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+        if self.active {
+            self.inner.write(bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+        if std::mem::take(&mut self.active) {
+            self.inner.finish_part().await?;
+        }
+        Ok(())
+    }
+
+    fn buffers_in_memory(&self) -> bool {
+        self.inner.buffers_in_memory()
+    }
+}
+
 /// An [`ArtifactSink`] that stages the checkpoint and WAL as temp files next
 /// to their final paths: nothing is visible at a final path until
 /// [`CacheFileSink::commit`], which the caller runs only after
@@ -669,6 +717,36 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError>;
+
+    /// Stream one stored part of the row `meta` describes into `sink`:
+    /// `begin_part(part)`, `write`*, `finish_part`, nothing for the other
+    /// part. The bytes are verified against the part's stored hash, and a row
+    /// that moved on yields [`DatabaseArtifactError::ArtifactChanged`], as in
+    /// [`Self::read_chunks`]. Asking for the WAL of a row without a delta is
+    /// an error.
+    ///
+    /// The default reads the whole artifact and drops the other part; a
+    /// backend that can read one column on its own overrides it.
+    async fn read_part_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        part: ArtifactPart,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        if part == ArtifactPart::Wal && !meta.has_delta() {
+            return Err(DatabaseArtifactError::Sink("the artifact has no WAL delta".into()));
+        }
+        let mut only = OnePartSink {
+            part,
+            active: false,
+            inner: sink,
+        };
+        self.read_chunks(service, space, name, meta, &mut only)
+            .await
+    }
 
     fn chunked_checkpoints(&self, _service: &str, _space: &str, _name: &str) -> bool {
         false
@@ -1241,6 +1319,53 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         if logical != meta.content_hash {
             return Err(DatabaseArtifactError::HashMismatch { part: "content" });
         }
+        Ok(())
+    }
+
+    async fn read_part_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        part: ArtifactPart,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        self.check_space_read(space).await?;
+        // The chunked layout carries only a checkpoint (never a delta).
+        if part == ArtifactPart::Checkpoint
+            && self
+                .read_chunk_layout(service, space, name, meta, sink)
+                .await?
+        {
+            return Ok(());
+        }
+        let (size_bytes, expected_hash) = match part {
+            ArtifactPart::Checkpoint => (
+                meta.checkpoint_size_bytes,
+                meta.checkpoint_content_hash.as_str(),
+            ),
+            ArtifactPart::Wal => (
+                meta.delta_size_bytes,
+                meta.delta_content_hash.as_deref().ok_or_else(|| {
+                    DatabaseArtifactError::Sink("the artifact has no WAL delta".into())
+                })?,
+            ),
+        };
+        let bytes = u64::try_from(size_bytes).unwrap_or(0);
+        if self.max_read_bytes != 0 && bytes > self.max_read_bytes {
+            return Err(DatabaseArtifactError::ReadLimitExceeded {
+                part: part.as_str(),
+            });
+        }
+        let _large = self.large_transfer_permit(bytes).await;
+        let key = ArtifactKey {
+            service,
+            space,
+            name,
+        };
+        self.read_part(&key, meta, part, size_bytes, expected_hash, sink)
+            .await?;
         Ok(())
     }
 

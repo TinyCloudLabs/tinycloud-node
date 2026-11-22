@@ -65,7 +65,7 @@ toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util", "fs"] }
 tokio-stream = { version = "0.1", features = ["fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
