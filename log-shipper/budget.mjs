@@ -31,9 +31,9 @@ export const CAPPED_ALLOCATION_BYTES = 600_000_000;
  */
 export const CAPPED_CLASSES = Object.freeze({
   db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
-  node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'node' }),
+  node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'nodeCapped' }),
   ingress_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'ingress' }),
-  node_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'node' }),
+  node_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'nodeCapped' }),
   ingress_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'ingress' }),
 });
 
@@ -42,6 +42,13 @@ const common = { level: 'info', ts: '9999-12-31T23:59:59.999Z' };
 const correlation = {
   request_id: 'ffffffff-ffff-8fff-bfff-ffffffffffff', request_id_replaced: true,
   account_hash: 'f'.repeat(64), space_hash: 'f'.repeat(64),
+};
+// Worst-valid per-request DB accounting (TC-3739): two long round-trippable fractional timings and the widest
+// attempt count. The shipper copies them onto node_request lines with status below 400 only, so they count against
+// the request allocation and never against the capped classes.
+const dbAccounting = {
+  pool_wait_ms: 0.0000010000000000000002, query_time_ms: 0.0000010000000000000002,
+  query_count: schema.fields.query_count.max,
 };
 const request = {
   method: longest(schema.fields.method.values), route: longest(schema.fields.route.values),
@@ -55,12 +62,15 @@ const request = {
  * space_hash); the ingress log carries none. db_hash is emitted by the F6 typed events only. The node's 5xx
  * diagnostic (dbFailure) ships individually, one event per failing request: it is not an aggregated code. The
  * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window. The
- * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes.
+ * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes. `node` is the request
+ * allocation's node line (status below 400, so it also carries the TC-3739 DB accounting); `nodeCapped` is the
+ * capped classes' node line (status 400 and above), which the shipper never gives DB accounting.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
 export const representativeEvents = Object.freeze({
-  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation }),
+  node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, status: 399, latency_us: schema.fields.latency_us.max, ...correlation, ...dbAccounting }),
+  nodeCapped: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation }),
   ingress: Object.freeze({ ...common, event: 'ingress_request', svc: 'ingress', ...request, request_time_seconds: 0.0000010000000000000002 }),
   diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(aggregatedCodes), event_count: schema.fields.event_count.max }),
   dbFailure: Object.freeze({
