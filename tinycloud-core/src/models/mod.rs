@@ -54,6 +54,7 @@ pub mod space_purge_tombstone;
 pub mod space_retirement;
 pub mod sql_store_manifest;
 pub mod sql_store_object;
+pub mod sql_store_owner;
 
 pub mod space_purge_shared_residue;
 

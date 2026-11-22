@@ -95,7 +95,7 @@ mod tests {
     use sea_orm::{
         ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement, TransactionTrait,
     };
-    use sea_orm_migration::MigratorTrait;
+    use sea_orm_migration::{MigrationName, MigratorTrait};
 
     async fn columns(db: &DatabaseConnection, table: &str) -> Vec<String> {
         let sql = match db.get_database_backend() {
@@ -141,7 +141,18 @@ mod tests {
             .await
             .unwrap();
 
-        Migrator::down(db, Some(1)).await.unwrap();
+        // test-ruling: TC-1491 m20261121_000000_session_retire.rs
+        // assert_up_down_up rolls back every migration from
+        // m20261121_000000_session_retire onward (count computed from
+        // Migrator::migrations()) instead of a fixed 1; its applied/
+        // unapplied assertions stay unchanged (2026-11-21).
+        let steps = Migrator::migrations()
+            .iter()
+            .rev()
+            .position(|m| m.name() == super::Migration.name())
+            .map(|i| (i + 1) as u32)
+            .expect("session_retire migration is registered");
+        Migrator::down(db, Some(steps)).await.unwrap();
         assert_applied(db, false).await;
 
         Migrator::up(db, None).await.unwrap();
