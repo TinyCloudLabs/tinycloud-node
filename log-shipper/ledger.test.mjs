@@ -15,13 +15,10 @@ test('the allowlisted error kinds are exactly DeletionLedgerError::kind(), in or
   assert.deepEqual([...arms].map(([, kind]) => kind), [...LEDGER_ERROR_KINDS]);
 });
 
-test('every ledger event is declared by the canonical schema, and every kind fits its error_kind pattern', () => {
+test('every ledger event is declared by the canonical schema, whose error_kind enum is exactly the node\'s kinds', () => {
   for (const event of LEDGER_EVENTS) assert.ok(nodeSchema.events.includes(event), event);
-  const pattern = new RegExp(nodeSchema.fields.error_kind.regex);
-  for (const kind of LEDGER_ERROR_KINDS) {
-    assert.match(kind, pattern);
-    assert.ok(kind.length <= nodeSchema.fields.error_kind.max_len);
-  }
+  assert.equal(nodeSchema.fields.error_kind.type, 'enum');
+  assert.deepEqual(nodeSchema.fields.error_kind.values, [...LEDGER_ERROR_KINDS]);
 });
 
 test('each event is emitted, with error_kind, from the target the shipper expects', async () => {
