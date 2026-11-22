@@ -27,6 +27,23 @@ test('request representatives use the schema longest route and method; only node
   assert.ok(representativeEvents.ingress.request_time_seconds >= 0 && representativeEvents.ingress.request_time_seconds <= 86400);
 });
 
+// test-ruling: TC-3739 log-shipper/budget.test.mjs new test only (2026-11-22)
+test('DB accounting sizes only the status < 400 node line; the capped node line is the same record without it', () => {
+  const dbKeys = ['pool_wait_ms', 'query_time_ms', 'query_count'];
+  const { node, nodeCapped } = representativeEvents;
+  assert.ok(node.status < 400 && nodeCapped.status >= 400);
+  for (const key of dbKeys) {
+    assert.equal(Object.hasOwn(node, key), true);
+    assert.equal(Object.hasOwn(nodeCapped, key), false);
+    const field = nodeSchema.fields[key];
+    assert.ok(node[key] >= field.min && node[key] <= field.max);
+  }
+  assert.equal(node.query_count, nodeSchema.fields.query_count.max);
+  const strip = ({ status, pool_wait_ms, query_time_ms, query_count, ...rest }) => rest;
+  assert.deepEqual(strip(node), strip(nodeCapped));
+  assert.ok(serializedEventBytes(node) > serializedEventBytes(nodeCapped));
+});
+
 test('exact serialized bytes account for newlines or singleton JSON array overhead', () => {
   for (const row of Object.values(representativeEvents)) {
     assert.equal(serializedEventBytes(row, 'ndjson'), Buffer.byteLength(`${JSON.stringify(row)}\n`));
@@ -122,9 +139,10 @@ test('capped classes: worst case is cap x worst-valid bytes x 43,200 minutes plu
     const budget = calculateBudget({ requestsPerMinute: 0, framing });
     const bytes = name => serializedEventBytes(representativeEvents[name], framing);
     assert.equal(budget.cappedClasses.db_failure_5xx.bytes30Days, CAPPED_CLASSES.db_failure_5xx.capPerMinute * bytes('dbFailure') * 43200);
-    assert.equal(budget.cappedClasses.node_request_5xx.bytes30Days, CAPPED_CLASSES.node_request_5xx.capPerMinute * bytes('node') * 43200);
+    // test-ruling: TC-3739 log-shipper/budget.test.mjs capped node classes size from nodeCapped (status >= 400, no DB accounting), not node (2026-11-22)
+    assert.equal(budget.cappedClasses.node_request_5xx.bytes30Days, CAPPED_CLASSES.node_request_5xx.capPerMinute * bytes('nodeCapped') * 43200);
     assert.equal(budget.cappedClasses.ingress_request_5xx.bytes30Days, CAPPED_CLASSES.ingress_request_5xx.capPerMinute * bytes('ingress') * 43200);
-    assert.equal(budget.cappedClasses.node_request_4xx.bytes30Days, CAPPED_CLASSES.node_request_4xx.capPerMinute * bytes('node') * 43200);
+    assert.equal(budget.cappedClasses.node_request_4xx.bytes30Days, CAPPED_CLASSES.node_request_4xx.capPerMinute * bytes('nodeCapped') * 43200);
     assert.equal(budget.cappedClasses.ingress_request_4xx.bytes30Days, CAPPED_CLASSES.ingress_request_4xx.capPerMinute * bytes('ingress') * 43200);
     assert.equal(budget.droppedCountBytes30Days, 5 * bytes('errorsDropped') * 43200);
     assert.equal(budget.cappedReserveBytes30Days, budget.cappedEventBytes30Days + budget.droppedCountBytes30Days);
