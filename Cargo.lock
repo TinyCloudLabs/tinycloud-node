@@ -9902,6 +9902,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinycloud-caveat-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "k256",
+ "rand 0.8.6",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "sha3",
+ "tinycloud-auth",
+ "tinycloud-sdk-rs",
+ "tinycloud-sdk-wasm",
+ "uuid",
+]
+
+[[package]]
 name = "tinycloud-core"
 version = "1.3.0"
 dependencies = [
