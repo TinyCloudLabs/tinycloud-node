@@ -94,6 +94,37 @@ struct PurgeReconcileArgs {
     json: JsonArgs,
 }
 
+#[derive(Debug, Args)]
+struct SqlStoreArgs {
+    #[command(subcommand)]
+    command: SqlStoreCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SqlStoreCommand {
+    /// Sample N published databases, fetch each one's snapshot (and the
+    /// highest published segment, when the frontier names one), run the
+    /// restore module on the materialised bytes, and report the result.
+    /// Exits nonzero on any mismatch.
+    RestoreCheck(RestoreCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct RestoreCheckArgs {
+    /// Base config file to load (database, stores and the sql_store
+    /// settings come from it).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// How many databases to sample out of the published manifest.
+    #[arg(long, default_value_t = 1)]
+    sample: u32,
+    /// Seed for the sampler. Omit for OS entropy.
+    #[arg(long)]
+    seed: Option<u64>,
+    #[command(flatten)]
+    json: JsonArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
     Service(ServiceArgs),
@@ -111,6 +142,8 @@ enum NodeCommand {
     DeletionLedger(DeletionLedgerArgs),
     /// The space purge ledger (TC-2871).
     PurgeLedger(PurgeLedgerArgs),
+    /// Shadow uploader diagnostics.
+    SqlStore(SqlStoreArgs),
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +311,7 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Tunnel(args) => run_tunnel(args.command),
         NodeCommand::DeletionLedger(args) => run_deletion_ledger(args.command),
         NodeCommand::PurgeLedger(args) => run_purge_ledger(args.command),
+        NodeCommand::SqlStore(args) => run_sql_store(args.command),
     }
 }
 
@@ -417,6 +451,27 @@ async fn reconcile_purge_ledger(args: PurgeReconcileArgs) -> Result<()> {
     let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
     let report = crate::reconcile_purge_ledger(&config).await?;
     emit_json(&report, args.json.json)
+}
+
+fn run_sql_store(command: SqlStoreCommand) -> Result<()> {
+    match command {
+        SqlStoreCommand::RestoreCheck(args) => block_on(restore_check(args)),
+    }
+}
+
+async fn restore_check(args: RestoreCheckArgs) -> Result<()> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| runtime::serve_profile_config_path(Profile::default_for_host()));
+    let figment = runtime::serve_config_figment(&config_path)?;
+    let config = figment.extract::<crate::config::Config>()?;
+    let (report, exit_code) =
+        crate::sql_restore_check::run_restore_check(&config, args.sample, args.seed).await?;
+    emit_json(&report, args.json.json)?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 fn emit_json<T: serde::Serialize>(value: &T, json: bool) -> Result<()> {
