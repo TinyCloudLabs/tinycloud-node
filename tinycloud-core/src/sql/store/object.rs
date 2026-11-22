@@ -23,6 +23,10 @@ pub enum SqlStoreError {
     /// The bytes handed in do not hash to the key's `content_hash`.
     #[error("sql store body does not match its key")]
     BodyMismatch,
+    /// A download delivered more bytes than the caller's cap (the recorded
+    /// size); it was aborted.
+    #[error("sql store object is larger than its recorded size")]
+    Oversize,
     #[error("sql store backend error: {0}")]
     Backend(String),
     /// The local file a body is read from or written to failed.
@@ -85,12 +89,17 @@ pub trait SqlObjectStore: Send + Sync {
     ) -> Result<PutOutcome, SqlStoreError>;
 
     /// Stream the object into `path` (created or truncated). The bytes are
-    /// checked against the key's SHA-256 while they stream (`BodyMismatch`).
-    /// `None` when the object does not exist.
+    /// checked against the key's SHA-256 while they stream (`BodyMismatch`),
+    /// and the download aborts once more than `max_bytes` arrive
+    /// (`Oversize`; a backend that announces a larger length refuses before
+    /// streaming). On any `Err` the target is left empty or removed
+    /// ([`discard_download`]), so no unverified byte stays behind. `None`
+    /// when the object does not exist.
     async fn get_to_file(
         &self,
         key: &ObjectKey,
         path: &Path,
+        max_bytes: u64,
     ) -> Result<Option<ObjectMeta>, SqlStoreError>;
 
     async fn get_range(
@@ -100,6 +109,36 @@ pub trait SqlObjectStore: Send + Sync {
     ) -> Result<Option<ObjectRange>, SqlStoreError>;
 
     async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError>;
+}
+
+/// Empty the target of a failed download: truncate it, or remove it when it
+/// cannot be truncated. A missing file is fine. Best effort by design: the
+/// caller is already returning the download's error, and a caller that must
+/// never read the file (the restore check) discards it again itself.
+pub fn discard_download(path: &Path) {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => {
+            if file.set_len(0).is_err() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Options that create (or truncate) a download target readable by its owner
+/// only (`0600` on unix): a downloaded object is a tenant database in
+/// plaintext. Add `read`, or `create_new` (which replaces create and
+/// truncate), as the caller needs.
+pub fn private_file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
 }
 
 /// SHA-256 of `body`; shared by backends to check a body against its key.

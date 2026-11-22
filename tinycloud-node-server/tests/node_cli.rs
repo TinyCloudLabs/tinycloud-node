@@ -184,6 +184,45 @@ fn unrecognised_arguments_are_a_usage_error_and_never_start_a_server() {
 }
 
 #[test]
+fn sql_store_restore_check_is_a_node_subcommand() {
+    let args = ["node", "sql-store", "restore-check", "--help"];
+    let run = run_tinycloud(&args, &[]);
+    assert_cli_handled(&args, &run);
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    for flag in [
+        "--config",
+        "--sample",
+        "--seed",
+        "--scratch-dir",
+        "--scratch-bytes",
+        "--metrics-file",
+        "--json",
+    ] {
+        assert!(run.stdout.contains(flag), "{flag} missing:\n{}", run.stdout);
+    }
+}
+
+#[test]
+fn sql_store_restore_check_refuses_an_empty_allowlist_before_connecting() {
+    let args = ["node", "sql-store", "restore-check", "--json"];
+    let run = run_tinycloud(
+        &args,
+        &[
+            ("TINYCLOUD_KEYS__TYPE", "static"),
+            ("TINYCLOUD_KEYS__SECRET", TEST_SECRET),
+        ],
+    );
+    assert_cli_handled(&args, &run);
+    assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("[sql_store] spaces is empty"),
+        "stderr: {}",
+        run.stderr
+    );
+    assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
+}
+
+#[test]
 fn validate_config_still_checks_the_configuration_without_the_cli() {
     let args = ["--validate-config"];
     let valid = run_tinycloud(
