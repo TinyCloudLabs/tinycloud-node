@@ -189,7 +189,7 @@ export const vectorTests = [
   ...['tinycloud::request', 'tinycloud::storage', 'tinycloud::disk_headroom_x', 'tinycloud::disk_headroom::sub', 'tinycloud::disk'].map(target => rejectFor(`disk headroom on target ${target} is dropped at the gate`, envelope(storageHeadroom({}, { target })), target === 'tinycloud::request' ? 'invalid_fields' : 'filtered_level')),
   rejectFor('an unrelated info line on the headroom target is dropped', envelope(storageHeadroom({ message: canary, store: undefined, free_bytes: undefined })), 'invalid_fields'),
   check('disk headroom at warn level is a plain unclassified warning', envelope(storageHeadroom({}, { level: 'WARN' })), `.event == "node_warning" && .event_code == "unclassified" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`),
-  // test-ruling: TC-3284 log-shipper/cases.mjs new cases only (2026-11-24)
+  // TC-3284: the deletion ledger's error events.
   ...LEDGER_EVENTS.map(event => check(`${event} ships as an individual error with exactly its error_kind`, envelope(ledgerError(event)), `.event == "${event}" && .svc == "api" && .level == "error" && .error_kind == "io" && ${keysAre(ledgerShipped)}`)),
   ...LEDGER_EVENTS.flatMap(event => LEDGER_ERROR_KINDS.map(kind => check(`${event} ships error_kind ${kind}`, envelope(ledgerError(event, { error_kind: kind })), `.event == "${event}" && .error_kind == "${kind}" && ${keysAre(ledgerShipped)}`))),
   ...LEDGER_EVENTS.flatMap(event => [
