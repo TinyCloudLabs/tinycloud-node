@@ -164,6 +164,8 @@ jobs:
         run: python3 scripts/ci/test-deploy-recovery.py
       - name: Test the Phala OS image guard
         run: bash scripts/ci/test-phala-os-guard.sh
+      - name: Test the Phala CVM read retry
+        run: bash scripts/ci/test-phala-cvm-json.sh
 
       - name: Validate image version against Cargo.toml
         id: check
@@ -608,7 +610,7 @@ jobs:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
         run: |
           set -euo pipefail
-          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+          if ! cvm="$(bash scripts/ci/phala-cvm-json.sh tinycloud-node)"; then
             echo "::error::Cannot read the OS image of tinycloud-node from Phala"
             exit 1
           fi
@@ -631,7 +633,7 @@ jobs:
             exit 1
           fi
           trap 'rm -f "${CVM_JSON}"' EXIT
-          if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
+          if ! bash scripts/ci/phala-cvm-json.sh tinycloud-node >"${CVM_JSON}"; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
@@ -1263,18 +1265,6 @@ jobs:
         if: always()
         run: rm -f .phala-prod.env
 
-      # Fail closed if the deploy left the CVM on a different OS image (same rule as the check before the deploy).
-      - name: Verify the OS image after deploy
-        env:
-          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
-        run: |
-          set -euo pipefail
-          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
-            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
-            exit 1
-          fi
-          bash scripts/ci/phala-os-guard.sh <<<"${cvm}"
-
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
       # previously confirmed the running CVM serves it — the incident where prod
@@ -1470,6 +1460,21 @@ jobs:
             echo "${host}: named-keys gate matches named_keys_v1=${NAMED_KEYS_V1}."
             echo "Named-keys gate on ${host}: \`${NAMED_KEYS_V1}\`" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      # Fail closed if the deploy left the CVM on a different OS image (same rule as the check before the deploy).
+      # TC-3928: it runs last, after the quota restore and the other verifications, so a Phala read failure here
+      # can no longer skip "Restore storage quota overrides" (node 1.26.21). It still fails the run.
+      - name: Verify the OS image after deploy
+        if: ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' }}
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(bash scripts/ci/phala-cvm-json.sh tinycloud-node)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
+            exit 1
+          fi
+          bash scripts/ci/phala-os-guard.sh <<<"${cvm}"
 
       - name: Report unverified storage overrides
         if: >-
