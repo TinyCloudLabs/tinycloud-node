@@ -129,6 +129,18 @@ pub fn discard_download(path: &Path) {
     }
 }
 
+/// Options that create (or truncate) a download target readable by its owner
+/// only (`0600` on unix): a downloaded object is a tenant database in
+/// plaintext. Add `read`, or `create_new` (which replaces create and
+/// truncate), as the caller needs.
+pub fn private_file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
 /// SHA-256 of `body`; shared by backends to check a body against its key.
 pub fn sha256(body: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};

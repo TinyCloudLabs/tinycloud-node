@@ -70,14 +70,17 @@ impl Reservation {
             .tempfile_in(self.dir())
     }
 
-    /// A new, empty scratch directory in the budget's directory, removed with
-    /// its contents on drop: for a file set that must sit side by side (a
-    /// restored database and its `-wal`). The caller writes at most the
-    /// reserved bytes into it.
+    /// A new, empty scratch directory in the budget's directory, readable by
+    /// its owner only (`0700` on unix: it holds tenant databases in
+    /// plaintext) and removed with its contents on drop, on every exit path:
+    /// for a file set that must sit side by side (a restored database and its
+    /// `-wal`). The caller writes at most the reserved bytes into it.
     pub fn scratch_dir(&self) -> std::io::Result<tempfile::TempDir> {
-        tempfile::Builder::new()
-            .prefix("sql-restore-")
-            .tempdir_in(self.dir())
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("sql-restore-");
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        builder.tempdir_in(self.dir())
     }
 
     fn dir(&self) -> &Path {

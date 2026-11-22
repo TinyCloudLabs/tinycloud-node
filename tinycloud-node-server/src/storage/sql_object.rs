@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use tinycloud_core::{
     sql::store::{
         key::KEY_ROOT,
-        object::{check_body_file, discard_download, sha256},
+        object::{check_body_file, discard_download, private_file_options, sha256},
         ObjectKey, ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError,
     },
     storage::ByteRangeSpec,
@@ -525,7 +525,8 @@ impl SqlObjectStore for S3SqlObjectStore {
             return Err(SqlStoreError::Oversize);
         }
         let result = async {
-            let mut file = tokio::fs::File::create(path)
+            let mut file = tokio::fs::OpenOptions::from(private_file_options())
+                .open(path)
                 .await
                 .map_err(|e| SqlStoreError::file("create", &e))?;
             let mut body = output.body;
@@ -941,7 +942,9 @@ fn fs_get_to_file(
         if metadata.len() > max_bytes {
             return Err(SqlStoreError::Oversize);
         }
-        let mut out = File::create(target).map_err(|e| SqlStoreError::file("create", &e))?;
+        let mut out = private_file_options()
+            .open(target)
+            .map_err(|e| SqlStoreError::file("create", &e))?;
         let meta = copy_hashed(
             &mut file,
             &mut out,

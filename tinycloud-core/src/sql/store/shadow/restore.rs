@@ -48,7 +48,7 @@ use crate::sql::store::manifest::{
     object_pk, DbSqlManifest, Frontier, ObjectState, SqlManifest, SEGMENT_FORMAT, SNAPSHOT_FORMAT,
 };
 use crate::sql::store::object::{
-    discard_download, sha256_file, ObjectMeta, SqlObjectStore, SqlStoreError,
+    discard_download, private_file_options, sha256_file, ObjectMeta, SqlObjectStore, SqlStoreError,
 };
 
 /// The reason given for a key that does not belong to the database.
@@ -543,11 +543,11 @@ async fn pg_copy(
     Ok(())
 }
 
+/// A new scratch file for Postgres's copy, owner-only (`0600` on unix).
 async fn create(path: &Path) -> Result<tokio::fs::File, Verdict> {
-    tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
+    let mut options = private_file_options();
+    options.read(true).create_new(true);
+    tokio::fs::OpenOptions::from(options)
         .open(path)
         .await
         .map_err(scratch_verdict)
@@ -1293,6 +1293,92 @@ mod tests {
                 && reason.ends_with("fails its checksum"),
             "{reason}"
         );
+    }
+
+    /// Records, per download, the scratch directory and the modes of it and
+    /// of the file written into it.
+    #[cfg(unix)]
+    struct Inspecting {
+        inner: Arc<MemorySqlObjectStore>,
+        seen: Mutex<Vec<(PathBuf, u32, u32)>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl SqlObjectStore for Inspecting {
+        async fn put_file(
+            &self,
+            key: &ObjectKey,
+            path: &Path,
+            size: u64,
+        ) -> Result<crate::sql::store::object::PutOutcome, SqlStoreError> {
+            self.inner.put_file(key, path, size).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &ObjectKey,
+            path: &Path,
+            max_bytes: u64,
+        ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+            use std::os::unix::fs::PermissionsExt;
+            let result = self.inner.get_to_file(key, path, max_bytes).await;
+            let dir = path.parent().unwrap().to_path_buf();
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let entry = (dir.clone(), mode(&dir), mode(path));
+            self.seen.lock().unwrap().push(entry);
+            result
+        }
+        async fn get_range(
+            &self,
+            key: &ObjectKey,
+            range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::sql::store::object::ObjectRange>, SqlStoreError> {
+            self.inner.get_range(key, range).await
+        }
+        async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError> {
+            self.inner.head(key).await
+        }
+    }
+
+    /// Restore scratch holds tenant databases in plaintext: the directory is
+    /// 0700, each file 0600, and both are gone once a check fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_scratch_is_owner_only_and_removed_when_the_check_fails() {
+        let rig = rig().await;
+        let (checkpoint, wal1, wal2) = bootstrap_fixture();
+        // A byte flipped before upload: the downloads succeed, then the WAL
+        // walk refuses the frame whose checksum fails.
+        let mut torn = wal2.clone();
+        let at = torn.len() - 10;
+        torn[at] ^= 0x40;
+        saved(&rig.repo, "main", &checkpoint, &[&wal1, &torn]).await;
+        rig.upload("main", 3).await;
+        let store = Arc::new(Inspecting {
+            inner: rig.store.clone(),
+            seen: Mutex::default(),
+        });
+        let deps = RestoreDeps {
+            store: store.clone(),
+            ..rig.deps()
+        };
+        let report = check_database(&deps, &db("main")).await;
+        assert_result(&report, RestoreResult::Unreadable);
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .unwrap()
+                .ends_with("fails its checksum"),
+            "{report:?}"
+        );
+        let seen = store.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the snapshot and the segment");
+        for (dir, dir_mode, file_mode) in seen.iter() {
+            assert_eq!((*dir_mode, *file_mode), (0o700, 0o600), "{dir:?}");
+            assert!(!dir.exists(), "{dir:?} outlived the failed check");
+        }
+        assert!(rig.scratch_is_empty());
     }
 
     #[test]

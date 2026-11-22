@@ -76,14 +76,13 @@ pub async fn run(config: &Config, options: &RestoreCheckOptions) -> Result<RunRe
             artifact_bytes: sql.chunked_artifact_max_bytes,
             account_bytes: sql.chunked_account_max_bytes,
         }));
-    std::fs::create_dir_all(&options.scratch_dir)
-        .with_context(|| format!("scratch directory {}", options.scratch_dir.display()))?;
+    let run_dir = scratch_run_dir(&options.scratch_dir)?;
     let metrics = Arc::new(PrometheusRestoreMetrics::new()?);
     let deps = RestoreDeps {
         control: conn.sea_orm_connection().clone(),
         store,
         source: Arc::new(PgArtifactSource::new(Arc::new(artifacts))),
-        disk: DiskBudget::new(options.scratch_dir.clone(), options.scratch_bytes),
+        disk: DiskBudget::new(run_dir.path(), options.scratch_bytes),
         metrics: metrics.clone(),
     };
     let report = check_sample(&deps, spaces, options.sample, options.seed).await?;
@@ -91,6 +90,25 @@ pub async fn run(config: &Config, options: &RestoreCheckOptions) -> Result<RunRe
         metrics.write_textfile(path)?;
     }
     Ok(report)
+}
+
+/// This run's scratch directory, a fresh owner-only (`0700` on unix)
+/// directory under `root` (created `0700` when missing). Restored copies are
+/// tenant databases in plaintext; the directory and anything left in it are
+/// removed when the returned guard drops, on every exit path of the run.
+fn scratch_run_dir(root: &Path) -> Result<tempfile::TempDir> {
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dirs, 0o700);
+    dirs.create(root)
+        .with_context(|| format!("scratch directory {}", root.display()))?;
+    let mut run = tempfile::Builder::new();
+    run.prefix("run-");
+    #[cfg(unix)]
+    run.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    run.tempdir_in(root)
+        .with_context(|| format!("scratch directory {}", root.display()))
 }
 
 /// Sample up to `sample` databases from `spaces` and check each.

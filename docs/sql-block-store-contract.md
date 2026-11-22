@@ -687,7 +687,10 @@ or not the store is enabled, and checks each:
    `not_comparable` ("not comparable at this revision") and nothing is read.
    The check never compares across revisions.
 3. **Restore.** Scratch space for both copies is reserved from a disk budget
-   (`--scratch-dir`, `--scratch-bytes`) before streaming. The snapshot and the
+   (`--scratch-dir`, `--scratch-bytes`) before streaming. Scratch holds
+   tenant databases in plaintext: every scratch directory is `0700`, every
+   file `0600`, and each directory is removed by its drop guard on every exit
+   path (success, error, early return). The snapshot and the
    segment are streamed with `get_to_file`, capped at their recorded sizes; a
    refused download is removed and never opened. Before SQLite opens the
    pair, the database header and the WAL are checked: page sizes equal (the

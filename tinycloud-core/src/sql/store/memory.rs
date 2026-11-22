@@ -6,7 +6,8 @@ use async_trait::async_trait;
 
 use super::key::ObjectKey;
 use super::object::{
-    discard_download, sha256, ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError,
+    discard_download, private_file_options, sha256, ObjectMeta, ObjectRange, PutOutcome,
+    SqlObjectStore, SqlStoreError,
 };
 use crate::storage::ByteRangeSpec;
 
@@ -74,7 +75,14 @@ impl SqlObjectStore for MemorySqlObjectStore {
         // refusal must leave the target empty.
         let result = async {
             let delivered = &body[..body.len().min(max_bytes.saturating_add(1) as usize)];
-            tokio::fs::write(path, delivered)
+            let mut file = tokio::fs::OpenOptions::from(private_file_options())
+                .open(path)
+                .await
+                .map_err(|e| SqlStoreError::file("create", &e))?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, delivered)
+                .await
+                .map_err(|e| SqlStoreError::file("write", &e))?;
+            tokio::io::AsyncWriteExt::flush(&mut file)
                 .await
                 .map_err(|e| SqlStoreError::file("write", &e))?;
             if body.len() as u64 > max_bytes {
