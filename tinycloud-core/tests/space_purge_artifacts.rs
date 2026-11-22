@@ -41,7 +41,7 @@ async fn rejects_after_fence(db: &DatabaseConnection) {
         "sql",
         &raw,
         "main",
-        vec![1; 10],
+        vec![1; 10].into(),
         ArtifactExpectation::Absent,
     )
     .await
@@ -58,13 +58,25 @@ async fn rejects_after_fence(db: &DatabaseConnection) {
         Err(DatabaseArtifactError::SpaceDeleted)
     ));
     assert!(matches!(
-        repo.save("sql", &raw, "main", vec![2; 10], ArtifactExpectation::Any)
-            .await,
+        repo.save(
+            "sql",
+            &raw,
+            "main",
+            vec![2; 10].into(),
+            ArtifactExpectation::Any
+        )
+        .await,
         Err(DatabaseArtifactError::SpaceDeleted)
     ));
     assert!(matches!(
-        repo.save_delta("sql", &raw, "main", vec![3; 10], ArtifactExpectation::Any)
-            .await,
+        repo.save_delta(
+            "sql",
+            &raw,
+            "main",
+            vec![3; 10].into(),
+            ArtifactExpectation::Any
+        )
+        .await,
         Err(DatabaseArtifactError::SpaceDeleted)
     ));
     let unrestricted = SeaOrmDatabaseArtifactRepository::new(db.clone());
@@ -116,7 +128,7 @@ async fn postgres_artifact_save_cannot_cross_an_accepted_fence() {
         "sql",
         &raw,
         "main",
-        vec![1; 10],
+        vec![1; 10].into(),
         ArtifactExpectation::Absent,
     )
     .await
@@ -135,7 +147,7 @@ async fn postgres_artifact_save_cannot_cross_an_accepted_fence() {
                 "sql",
                 &target,
                 "main",
-                vec![2; 10],
+                vec![2; 10].into(),
                 ArtifactExpectation::Any,
             )
             .await

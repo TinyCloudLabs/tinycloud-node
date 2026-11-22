@@ -238,6 +238,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(serialization),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await

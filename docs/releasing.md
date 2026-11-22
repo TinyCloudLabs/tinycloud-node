@@ -667,8 +667,9 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`6c9ff33f56981a955268869a5df77e1ab73487d61fb779c59190a6c182751ea9`**
-  (raw `c64a6e2b84aec787e97cf57c6ea99af2183946dd8d4fd7599549b0109ae2e367` normalized). Before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`
+  **`e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`**
+  (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized). Before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
+  (raw `f4f51e75076f21c7bd05e93e24d08ffe7290e2f9567fe1ed4daca7ec0e9ad7a5` normalized); before the TC-287 `TINYCLOUD_RETENTION__ENABLED` env line the template was `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`
   (raw `272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468` normalized). With the TC-3554 key-recovery sidecar (1.26.14), before the node opened its root from `root_wrap`, the template was `70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`
   (raw `8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9` normalized); before the TC-3554 key-recovery sidecar and `DstackKmsEpoch` epoch-0 pins the template was `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da`
   (raw `d6af7a704ba532a2f9fce5166f4c7f05125e31f33e5cabf885b35efac61aa8b9` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES` env line the template was `90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51`
@@ -824,8 +825,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`c64a6e2b84aec787e97cf57c6ea99af2183946dd8d4fd7599549b0109ae2e367`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, and the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line), whatever digest
+`d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line and the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**
 1.26.14 needs the sidecar this compose lacks,

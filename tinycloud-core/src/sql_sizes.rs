@@ -150,7 +150,7 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         let artifact = self
@@ -168,7 +168,7 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         let saved = self
@@ -243,9 +243,15 @@ mod tests {
         let space = test_space_id("records");
         let key = space.to_string();
         const N: usize = 4096;
-        repo.save("sql", &key, "main", vec![0u8; N], ArtifactExpectation::Any)
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            &key,
+            "main",
+            vec![0u8; N].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         assert_eq!(sizes.space_total(&space).await, N as u64);
     }
 
@@ -260,7 +266,7 @@ mod tests {
             "sql",
             &key,
             "one",
-            vec![0u8; first],
+            vec![0u8; first].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -269,7 +275,7 @@ mod tests {
             "sql",
             &key,
             "two",
-            vec![0u8; second],
+            vec![0u8; second].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -285,7 +291,7 @@ mod tests {
             "sql",
             &key,
             "one",
-            vec![0u8; third],
+            vec![0u8; third].into(),
             ArtifactExpectation::Any,
         )
         .await

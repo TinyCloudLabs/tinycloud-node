@@ -17,6 +17,7 @@ name = "tinycloud"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 anyhow = "1"
 # Canonical-point check for pinned issuer keys (issuer_set.rs).
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

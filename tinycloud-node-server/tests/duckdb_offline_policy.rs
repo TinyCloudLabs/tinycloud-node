@@ -264,7 +264,7 @@ async fn persist_snapshot(metadata: &DatabaseConnection, path: &Path) {
             "duckdb",
             "synthetic-space",
             "default",
-            std::fs::read(path).unwrap(),
+            std::fs::read(path).unwrap().into(),
             ArtifactExpectation::Any,
         )
         .await

@@ -732,7 +732,7 @@ async fn postgres_checkpoint_saves_send_no_begin() {
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -742,7 +742,7 @@ async fn postgres_checkpoint_saves_send_no_begin() {
             "sql",
             "space",
             "main",
-            vec![2; large],
+            vec![2; large].into(),
             ArtifactExpectation::Derived {
                 revision: created.revision,
                 checkpoint_content_hash: created.checkpoint_content_hash,
@@ -790,7 +790,7 @@ async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -809,7 +809,7 @@ async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
         let (repository, expected) = (repository.clone(), derived(&seed));
         tokio::spawn(async move {
             repository
-                .save("sql", "space", "main", vec![9; large], expected)
+                .save("sql", "space", "main", vec![9; large].into(), expected)
                 .await
         })
     };
@@ -867,15 +867,21 @@ async fn postgres_a_timed_out_checkpoint_update_is_refused_once_and_not_applied(
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
         .unwrap();
     schema.slow_updates(1.5).await;
 
-    let (result, applied) =
-        track_writes(repository.save("sql", "space", "main", vec![2; large], derived(&seed))).await;
+    let (result, applied) = track_writes(repository.save(
+        "sql",
+        "space",
+        "main",
+        vec![2; large].into(),
+        derived(&seed),
+    ))
+    .await;
     let class = match &result {
         Err(DatabaseArtifactError::Db(error)) => transient_error_class(error),
         _ => None,

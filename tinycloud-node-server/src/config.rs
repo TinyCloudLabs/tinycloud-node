@@ -51,6 +51,8 @@ pub struct Config {
     #[serde(default)]
     pub public_spaces: PublicSpacesConfig,
     #[serde(default)]
+    pub session_retire: SessionRetireConfig,
+    #[serde(default)]
     pub share_email: ShareEmailConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -1163,6 +1165,50 @@ impl Default for PublicSpacesConfig {
             rate_limit_per_minute: default_rate_limit_per_minute(),
             rate_limit_burst: default_rate_limit_burst(),
             storage_limit: default_public_storage_limit(),
+        }
+    }
+}
+
+/// TC-3443: `POST /session/retire` (sign-out). A retired session key stays
+/// refused for at least `ttl_secs`, and until the latest-expiring delegation
+/// the node holds for it ends.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SessionRetireConfig {
+    #[serde(default = "default_session_retire_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Per-client-IP requests per minute; also the burst.
+    #[serde(default = "default_session_retire_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+}
+
+fn default_session_retire_ttl_secs() -> u64 {
+    30 * 24 * 60 * 60
+}
+
+fn default_session_retire_rate_limit_per_minute() -> u32 {
+    10
+}
+
+impl SessionRetireConfig {
+    pub fn ttl(&self) -> time::Duration {
+        time::Duration::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX))
+    }
+
+    /// A zero TTL would let a retire lapse at once for a key holding no
+    /// longer grant, so the node refuses to start with it.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ttl_secs == 0 {
+            return Err("session_retire.ttl_secs must be greater than 0");
+        }
+        Ok(())
+    }
+}
+
+impl Default for SessionRetireConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_session_retire_ttl_secs(),
+            rate_limit_per_minute: default_session_retire_rate_limit_per_minute(),
         }
     }
 }
@@ -2572,6 +2618,23 @@ mod tests {
                 ok,
                 "{wait_ms}"
             );
+        }
+    }
+
+    /// TC-3443: a zero session-retire TTL refuses to start.
+    #[test]
+    fn tc3443_startup_rejects_a_zero_session_retire_ttl() {
+        for (ttl_secs, ok) in [(0, false), (1, true), (2_592_000, true)] {
+            let mut config = Config::default();
+            config.session_retire.ttl_secs = ttl_secs;
+            let resolved = crate::resolve_runtime_config(&config);
+            assert_eq!(resolved.is_ok(), ok, "{ttl_secs}");
+            if !ok {
+                assert!(resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("session_retire.ttl_secs must be greater than 0"));
+            }
         }
     }
 

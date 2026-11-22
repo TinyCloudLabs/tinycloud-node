@@ -519,7 +519,7 @@ mod tests {
                 "sql",
                 first,
                 "legacy",
-                vec![1; 128],
+                vec![1; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -571,7 +571,13 @@ mod tests {
         assert_eq!(sink.checkpoint, payload);
         assert!(matches!(
             legacy
-                .save("sql", space, "main", vec![1], ArtifactExpectation::Any)
+                .save(
+                    "sql",
+                    space,
+                    "main",
+                    vec![1].into(),
+                    ArtifactExpectation::Any
+                )
                 .await,
             Err(DatabaseArtifactError::StaleLineage)
         ));
@@ -613,7 +619,7 @@ mod tests {
                 "sql",
                 space,
                 "main",
-                vec![0; 128],
+                vec![0; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -758,7 +764,7 @@ mod tests {
                     "duckdb",
                     space,
                     "main",
-                    vec![1; 600],
+                    vec![1; 600].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -794,7 +800,7 @@ mod tests {
                 "duckdb",
                 parent,
                 "second",
-                vec![2; 400],
+                vec![2; 400].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -804,7 +810,7 @@ mod tests {
                 "duckdb",
                 parent,
                 "third",
-                vec![3; 1],
+                vec![3; 1].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -817,7 +823,7 @@ mod tests {
                 "duckdb",
                 child,
                 "second",
-                vec![4; 400],
+                vec![4; 400].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1344,7 +1350,7 @@ mod tests {
                         "sql",
                         space,
                         "main",
-                        vec![1; 512],
+                        vec![1; 512].into(),
                         ArtifactExpectation::Absent,
                     )
                     .await
@@ -1515,7 +1521,7 @@ mod tests {
                     if i % 2 == 0 { "sql" } else { "duckdb" },
                     if i % 2 == 0 { first } else { second },
                     &format!("db-{i}"),
-                    vec![],
+                    vec![].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -1549,7 +1555,7 @@ mod tests {
                         if i % 2 == 0 { "sql" } else { "duckdb" },
                         if i % 2 == 0 { first } else { second },
                         &format!("db-{i}"),
-                        vec![7; 256],
+                        vec![7; 256].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -1768,7 +1774,7 @@ mod tests {
                 "sql",
                 space,
                 "legacy",
-                vec![3; over],
+                vec![3; over].into(),
                 ArtifactExpectation::Absent,
             )
             .await
