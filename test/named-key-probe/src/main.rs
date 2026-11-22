@@ -1023,3 +1023,40 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file already at the state path is never the probe's: a refused
+    /// run leaves it byte for byte, because no guard exists until the probe's
+    /// own `create_new` succeeds.
+    #[test]
+    fn a_refused_run_leaves_a_pre_existing_state_path_untouched() {
+        let dir = std::env::temp_dir().join(format!("nkprobe-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.json");
+        let original = b"not the probe's file\n";
+        fs::write(&path, original).unwrap();
+
+        assert!(create_state(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The probe's own file is removed when its guard drops.
+    #[test]
+    fn the_probe_s_own_state_file_is_removed_when_the_guard_drops() {
+        let dir = std::env::temp_dir().join(format!("nkprobe-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let (guard, _, _) = create_state(&path).unwrap();
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
