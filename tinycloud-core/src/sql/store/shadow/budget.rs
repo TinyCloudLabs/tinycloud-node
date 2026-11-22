@@ -70,6 +70,16 @@ impl Reservation {
             .tempfile_in(self.dir())
     }
 
+    /// A new, empty scratch directory in the budget's directory, removed with
+    /// its contents on drop: for a file set that must sit side by side (a
+    /// restored database and its `-wal`). The caller writes at most the
+    /// reserved bytes into it.
+    pub fn scratch_dir(&self) -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .prefix("sql-restore-")
+            .tempdir_in(self.dir())
+    }
+
     fn dir(&self) -> &Path {
         &self.budget.dir
     }

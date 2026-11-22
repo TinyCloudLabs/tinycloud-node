@@ -67,6 +67,7 @@ pub mod share_v2 {
 }
 pub mod private_file;
 pub mod signed_urls;
+pub mod sql_restore_check;
 pub mod sql_store;
 pub mod storage;
 pub mod tee;

@@ -622,6 +622,7 @@ fn store_failure(error: SqlStoreError) -> JobError {
         SqlStoreError::Key(_)
         | SqlStoreError::Conflict
         | SqlStoreError::BodyMismatch
+        | SqlStoreError::Oversize
         | SqlStoreError::Invalid(_) => JobError::Policy(PolicyReason::Refused),
         SqlStoreError::ObjectNotUploaded => JobError::Transient {
             infra: false,
