@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Tests: `test/caveat-probe` checks delegated SQL caveats on a live node with throwaway keys: a `tables` grant is admitted and enforced, a `[{}]` grant is unchanged, a constrained-statements grant runs only its named statement, and a delegation citing an unstored parent answers 401. `docs/releasing.md` says when to run it. No node change. Details: TC-1791.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
