@@ -99,6 +99,12 @@ impl SpaceAllowlist {
     pub fn allows(&self, space: &str) -> bool {
         self.0.contains(space)
     }
+    pub fn spaces(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]

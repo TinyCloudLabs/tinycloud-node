@@ -1,7 +1,7 @@
 //! Owner marker: one host per `sql/v1/` namespace. At first enable the
 //! uploader allocates a random 128-bit store ID, persists it in the control
 //! database's `sql_store_owner` table and writes the object
-//! `sql/v1/_owner/v1` with that ID as the body via `put_if_absent`. At
+//! `sql/v1/_owner/v1` with that ID as the body with a create-once write. At
 //! every subsequent boot the pair is re-checked:
 //!
 //! - both present and equal: ok.
@@ -137,7 +137,7 @@ pub async fn insert_or_load_owner_row(
 const SINGLETON_ID: i16 = 1;
 
 /// What the boot check decides. `Write` means the marker object is missing and
-/// the uploader must `put_if_absent` it before the first cycle; `Ok` means the
+/// the uploader must create it once before the first cycle; `Ok` means the
 /// marker matches and nothing needs to be written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootOutcome {
