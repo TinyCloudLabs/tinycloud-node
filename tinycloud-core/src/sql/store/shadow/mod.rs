@@ -185,4 +185,6 @@ mod tests {
 
 pub mod bootstrap;
 pub mod drain;
+pub mod reconciler;
+pub mod restore;
 pub mod sweep;

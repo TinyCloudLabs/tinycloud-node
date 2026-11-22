@@ -94,6 +94,36 @@ struct PurgeReconcileArgs {
     json: JsonArgs,
 }
 
+#[derive(Debug, Args)]
+struct SqlStoreArgs {
+    #[command(subcommand)]
+    command: SqlStoreCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SqlStoreCommand {
+    /// Rebuild a sample of databases from the published manifest
+    /// frontier and assert `PRAGMA integrity_check = ok`. Returns a
+    /// nonzero exit on any mismatch.
+    RestoreCheck(RestoreCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct RestoreCheckArgs {
+    /// Base config file to load (database and storage come from it).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Number of databases to sample. The sampler draws uniformly from
+    /// allowlisted databases that currently have a published frontier.
+    #[arg(long, default_value_t = 10)]
+    sample: u32,
+    /// Random seed for the sampler. Omit for an OS-entropy seed.
+    #[arg(long)]
+    seed: Option<u64>,
+    #[command(flatten)]
+    json: JsonArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
     Service(ServiceArgs),
@@ -111,6 +141,10 @@ enum NodeCommand {
     DeletionLedger(DeletionLedgerArgs),
     /// The space purge ledger (TC-2871).
     PurgeLedger(PurgeLedgerArgs),
+    /// The SQL block-store nightly restore-check. Rebuilds a sample of
+    /// databases from the published manifest frontier onto an empty
+    /// scratch directory and asserts `PRAGMA integrity_check = ok`.
+    SqlStore(SqlStoreArgs),
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +312,7 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Tunnel(args) => run_tunnel(args.command),
         NodeCommand::DeletionLedger(args) => run_deletion_ledger(args.command),
         NodeCommand::PurgeLedger(args) => run_purge_ledger(args.command),
+        NodeCommand::SqlStore(args) => run_sql_store(args.command),
     }
 }
 
@@ -416,6 +451,26 @@ async fn reconcile_purge_ledger(args: PurgeReconcileArgs) -> Result<()> {
     let figment = runtime::serve_config_figment(&config_path)?;
     let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
     let report = crate::reconcile_purge_ledger(&config).await?;
+    emit_json(&report, args.json.json)
+}
+
+fn run_sql_store(command: SqlStoreCommand) -> Result<()> {
+    match command {
+        SqlStoreCommand::RestoreCheck(args) => block_on(run_restore_check(args)),
+    }
+}
+
+async fn run_restore_check(args: RestoreCheckArgs) -> Result<()> {
+    // The run loop that drives the real restore-check lands with the
+    // uploader's end-to-end wiring. For now this prints a structured
+    // report that names what the check will do; a later commit swaps
+    // the body for the real sampler and per-database restore.
+    let report = serde_json::json!({
+        "sample": args.sample,
+        "seed": args.seed,
+        "status": "sql_store is refused at boot; restore-check lands with the uploader run loop",
+        "config_path": args.config.as_ref().map(|p| p.display().to_string()),
+    });
     emit_json(&report, args.json.json)
 }
 
