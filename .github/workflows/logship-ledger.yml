@@ -1,0 +1,41 @@
+name: logship-ledger
+
+# TC-3284: the shipper's deletion ledger allowlist is pinned to the node's emit sites (lib.rs, deletion_ledger.rs, the
+# `tinycloud` crate name in Cargo.toml). Node-only edits run just this test, not the full Vector boundary job.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
+      - 'tinycloud-node-server/src/lib.rs'
+      - 'tinycloud-node-server/Cargo.toml'
+      - '.github/workflows/logship-ledger.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
+      - 'tinycloud-node-server/src/lib.rs'
+      - 'tinycloud-node-server/Cargo.toml'
+      - '.github/workflows/logship-ledger.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ledger-pin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Pin the shipper's ledger events, targets and kinds to the node's emit sites
+        run: node --test log-shipper/ledger.test.mjs

@@ -1041,10 +1041,9 @@ async fn find_parent_expiry(
         return Ok(None);
     }
 
-    let tx = tinycloud
-        .readable()
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let tx = tinycloud.readable().await.map_err(super::internal_error(
+        tinycloud_core::failure_diagnostic::ErrorCode::ReadTxError,
+    ))?;
 
     let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
 
