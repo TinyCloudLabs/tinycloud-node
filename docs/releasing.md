@@ -721,11 +721,13 @@ Before any CVM mutation the workflow requires:
   refused;
 - the release revision to be a **strict descendant** of the revision running
   in production (read from the CVM's pinned image by the ancestry guard).
-  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
-  or an unknown running revision is refused. The same ancestry rule makes
-  the 12c same-image command refuse an image older than the running
-  revision once 1.21.0 is live, so it cannot downgrade across migrations.
-  The captured pre-N0 rollback is the only intentional downgrade route.
+  A downgrade (for example 1.20.5 or 1.0.0) or an unknown running revision is
+  refused. The same revision as running is accepted only for the exact image
+  digest Phala's current compose runs: a config-only deployment (TC-3765, see
+  [A compose-only change on the running image](#a-compose-only-change-on-the-running-image)).
+  The same ancestry rule makes the 12c same-image command refuse an image older
+  than the running revision once 1.21.0 is live, so it cannot downgrade across
+  migrations. The captured pre-N0 rollback is the only intentional downgrade route.
 
 Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
 `allowed_envs` sync, and the general quota reconciliation run as on every
@@ -755,32 +757,37 @@ The downstream watcher cannot skip quota restoration.
 For column encryption cutovers, use the backup-based rollback in
 [Column encryption cutover](#column-encryption-cutover-tc-2682).
 
-### A compose-only change ships as a release
+### A compose-only change on the running image
 
 The production compose is the reviewed N0 template (locked by the template
 hash in `docker.yml`), and the compose on `main` is the one that gets
 deployed. For any image digest other than the reviewed 1.20.6 image, the
-N0-template path requires a released image (`require_release`): the tag commit
-must be a strict descendant of the revision running in production. So a change
-to the production compose (for example the database pool in TC-950) reaches
-production with a release, which means a version bump even when the node code
-is unchanged. A digest promotion of the revision that is already running, with
-a changed compose, is refused by the ancestry guard ("Released image must be a
-strict descendant of the running production revision").
+N0-template path requires a released image (`require_release`): its tag commit
+must descend from the revision running in production. A compose change (for
+example a flag turn-on) can ship without a new release by promoting the image
+that is already running: the release revision may equal the running revision
+only when the selected digest equals the digest pinned in Phala's current
+compose (TC-3765). The same revision under any other digest, or a running image
+the ancestry guard cannot read, is refused ("…or the exact running image digest
+for a config-only deployment"). `allow_non_descendant` does not help here: it
+skips the ancestry guard, so the running image is unknown and the pin step
+refuses.
 
 1. Merge the compose change (the compose, its byte-identical fixture
    `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
    `docker.yml` and the hashes in this file move together).
-2. Cut the release PR (version bump in `Cargo.toml` and the three lockfiles,
-   `[Unreleased]` moved under the new version) and let the tag build finish.
-3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
-   promotion command above with that digest, version and revision.
+2. Use the promotion command above with the **running** image's digest,
+   version and revision (from the `Deployment image:` line of the run that
+   deployed it).
 
-A rollback of a compose-only change still follows the same path: revert plus a
-new release. To restore an earlier node image while retaining the current N0
-compose, use the explicit audited rollback below. The same-image recovery
-command below is for the reviewed 1.20.6 image only and is refused once a later
-release is running.
+Rolling back a compose-only change is the same path in reverse: revert the
+compose change on `main` (compose, fixture, template hash), then promote the
+running digest again. A change that needs new node code still ships as a
+release (version bump in `Cargo.toml` and the three lockfiles, `[Unreleased]`
+moved under the new version). To restore an earlier node image while retaining
+the current N0 compose, use the explicit audited rollback below. The same-image
+recovery command below is for the reviewed 1.20.6 image only and is refused
+once a later release is running.
 
 ### Audited rollback to a prior N0 release
 
