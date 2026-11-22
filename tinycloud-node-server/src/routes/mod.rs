@@ -939,6 +939,7 @@ pub async fn delegate(
                     commits,
                     skipped_spaces,
                     delegation_cids,
+                    ..
                 } = result;
                 let activated: Vec<String> = commits.keys().map(|s| s.to_string()).collect();
                 let skipped: Vec<String> = skipped_spaces.iter().map(|s| s.to_string()).collect();
@@ -2335,13 +2336,15 @@ async fn invoke_impl(
             // Reject quarantined paths and an active cutover fence before
             // verify_auth_admitted persists invoked_abilities. A rejected
             // request must never become migration attribution evidence.
+            // These are the request's only fence check and identity resolve:
+            // `handle_sql_invoke` runs against this `db_name` (TC-3739).
             request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
             if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
                 return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
             }
             let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
-            database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
+            let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
                 .await.map_err(identity_resolution_error)?;
             request_cancel::set_stage(request_cancel::Stage::Other);
             if policy_session_invocation {
@@ -2362,6 +2365,7 @@ async fn invoke_impl(
                 quota_cache,
                 config,
                 &sql_caps,
+                db_name,
             )
             .await;
             if let Some(timer) = timer {
@@ -3147,20 +3151,11 @@ async fn handle_sql_invoke(
     quota_cache: &State<QuotaCache>,
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    // Resolved by `invoke_impl` behind the cutover fence check, before the
+    // replay insert; this handler neither re-checks the fence nor resolves
+    // the identity again (TC-3739).
+    db_name: String,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
-    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
-    if tinycloud
-        .effective_database_fence(config.database.write_fence)
-        .await
-        .map_err(identity_resolution_error)?
-    {
-        return Err((
-            Status::ServiceUnavailable,
-            "SQL identity cutover fence is active".into(),
-        )
-            .into());
-    }
-    request_cancel::set_stage(request_cancel::Stage::Other);
     // Retain the signed invocation identity before admission is consumed;
     // allocate its textual event epoch only for supported database writes.
     let event_hash = admitted.invocation().content_hash();
@@ -3216,8 +3211,14 @@ async fn handle_sql_invoke(
     // boundary; `verify_auth_admitted` uses the admitted core entry point so this
     // shared SQL/DuckDB authorization path does not re-run signature
     // verification a second time.
-    verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
-    let constrained = resolve_sql_profile(own_profiles, tinycloud, &parent_cids).await?;
+    let authorized = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
+    let constrained = resolve_sql_profile(
+        own_profiles,
+        tinycloud,
+        &parent_cids,
+        authorized.proof_abilities.as_ref(),
+    )
+    .await?;
     // TC-1791: with the node setting on, the effective caveat is the
     // intersection over every stored delegation on the cited chain; the
     // invocation's own `sqlCaveats` fact only narrows it further.
@@ -3265,14 +3266,7 @@ async fn handle_sql_invoke(
     // and schema-changing statements.
     let authority = SqlAuthority::new(sql_caps.iter().map(|(_, _, held)| held.as_str()))
         .with_delegated_caveats(delegated_mode);
-    // N3 will resolve this logical identity through an explicit alias table.
-    // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
-    request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
-    let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space_id, path)
-        .await
-        .map_err(identity_resolution_error)?;
-    request_cancel::set_stage(request_cancel::Stage::Other);
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
@@ -3483,20 +3477,56 @@ fn sql_request_requires_admin(request: &SqlRequest) -> bool {
 /// `own_profiles` holds the distinct profiles of the invocation's SQL
 /// capabilities; `None` marks a capability without a profile. The validated
 /// delegation chain is consulted only when the invocation carries no profile.
+/// `proof_abilities` is the chain's ability rows as authorization loaded
+/// them; the chain is walked again only when authorization returned none,
+/// as for an invocation that also writes KV (TC-3739).
 async fn resolve_sql_profile(
     own_profiles: Vec<Option<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>>,
     tinycloud: &State<TinyCloud>,
     parent_cids: &[tinycloud_auth::authorization::Cid],
+    proof_abilities: Option<
+        &HashMap<tinycloud_core::hash::Hash, Vec<tinycloud_core::models::abilities::Model>>,
+    >,
 ) -> Result<
     Option<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>,
     (Status, String),
 > {
-    let chain_profiles = if matches!(own_profiles.as_slice(), [] | [None]) {
-        derive_chain_sql_profiles(tinycloud, parent_cids).await?
-    } else {
+    let chain_profiles = if !matches!(own_profiles.as_slice(), [] | [None]) {
         Vec::new()
+    } else if let Some(rows) = proof_abilities {
+        let mut profiles = Vec::new();
+        push_sql_profiles(rows.values().flatten(), &mut profiles);
+        profiles
+    } else {
+        derive_chain_sql_profiles(tinycloud, parent_cids).await?
     };
     select_sql_profile(&own_profiles, chain_profiles)
+}
+
+/// Adds each constrained-statement profile found in `rows`' persisted
+/// `caveats` JSON to `profiles`, once.
+fn push_sql_profiles<'a>(
+    rows: impl IntoIterator<Item = &'a tinycloud_core::models::abilities::Model>,
+    profiles: &mut Vec<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>,
+) {
+    use tinycloud_core::policy_capability::sql_caveat;
+
+    for row in rows {
+        for v in row.caveats.0.values() {
+            let found = match sql_caveat::parse(v) {
+                Ok(caveat) => Some(caveat),
+                Err(_) => v
+                    .as_object()
+                    .and_then(|o| o.get("constrained-statements"))
+                    .and_then(|inner| sql_caveat::parse(inner).ok()),
+            };
+            if let Some(caveat) = found {
+                if !profiles.contains(&caveat) {
+                    profiles.push(caveat);
+                }
+            }
+        }
+    }
 }
 
 /// Refuses a SQL or DuckDB invocation that cites more than one proof carrying
@@ -3620,7 +3650,6 @@ async fn derive_chain_sql_profiles_with_conn<C: tinycloud_core::sea_orm::Connect
     use std::collections::HashSet;
     use tinycloud_core::hash::Hash;
     use tinycloud_core::models::abilities;
-    use tinycloud_core::policy_capability::sql_caveat;
     use tinycloud_core::relationships::parent_delegations;
 
     let mut profiles = Vec::new();
@@ -3643,22 +3672,7 @@ async fn derive_chain_sql_profiles_with_conn<C: tinycloud_core::sea_orm::Connect
             .all(conn)
             .await
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        for row in rows {
-            for v in row.caveats.0.values() {
-                let found = match sql_caveat::parse(v) {
-                    Ok(caveat) => Some(caveat),
-                    Err(_) => v
-                        .as_object()
-                        .and_then(|o| o.get("constrained-statements"))
-                        .and_then(|inner| sql_caveat::parse(inner).ok()),
-                };
-                if let Some(caveat) = found {
-                    if !profiles.contains(&caveat) {
-                        profiles.push(caveat);
-                    }
-                }
-            }
-        }
+        push_sql_profiles(&rows, &mut profiles);
 
         // Climb to parents of the batch we just scanned.
         let parents = parent_delegations::Entity::find()
@@ -6520,6 +6534,238 @@ mod tests {
             "expected delegation-revoked error body, got {body}"
         );
 
+        Ok(())
+    }
+
+    // test-ruling: TC-3739 tinycloud-node-server/src/routes/mod.rs new test only (2026-11-22)
+    /// TC-3739: an invocation without a profile is governed by a profile
+    /// that only a grandparent's ability row carries. `/invoke` reads it from
+    /// the ability rows authorization already loaded, not from a second
+    /// chain walk, so a raw query is refused and the named statement runs
+    /// with its pinned parameter.
+    #[tokio::test]
+    async fn tc3739_ancestor_profile_from_authorization_graph_governs_raw_invocation() -> Result<()>
+    {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use serde_json::json;
+        use tinycloud_auth::authorization::Cid as AuthCid;
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, space as space_model,
+        };
+        use tinycloud_core::relationships::parent_delegations;
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::sea_orm::ActiveValue::Set;
+        use tinycloud_core::types::{Caveats, SpaceIdWrap};
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let tinycloud = TinyCloud::new(
+            db.clone().into(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        let conn = db;
+        let (_cache, sql_service) = fresh_sql_service().await;
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
+        let space = test_space_id("tc3739-ancestor-profile");
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+        sql_service
+            .execute(
+                &space,
+                &SqlService::db_name_from_path(Some("main")),
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
+                            .to_string(),
+                    ]),
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+            )
+            .await?;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let invoker = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .to_string();
+        let owner_did = space.did().to_string();
+        let middle_did = "did:key:zTc3739Middle".to_string();
+        for did in [&owner_did, &middle_did, &invoker] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        // Owner -> middle -> invoker. Only the grandparent carries the
+        // profile, on its `sql/read` row; both hops grant `sql/write`
+        // without caveats, which is what the invocation uses.
+        let grandparent = tinycloud_core::hash::hash(b"tc3739-grandparent");
+        let parent = tinycloud_core::hash::hash(b"tc3739-parent");
+        for (id, delegator, delegatee) in [
+            (grandparent, &owner_did, &middle_did),
+            (parent, &middle_did, &invoker),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.clone()),
+                delegatee: Set(delegatee.clone()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+                serialization_format: Set(0),
+                first_seen_at: Default::default(),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        parent_delegations::ActiveModel {
+            child: Set(parent),
+            parent: Set(grandparent),
+        }
+        .insert(&conn)
+        .await?;
+
+        let sql_resource: ResourceId = space.clone().to_resource(
+            "sql".parse::<Service>()?,
+            Some("main".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let mut profile = std::collections::BTreeMap::new();
+        profile.insert(
+            "0".to_string(),
+            json!({
+                "mode": "constrained-statements",
+                "readOnly": true,
+                "statements": [{
+                    "name": "get_val",
+                    "sql": "SELECT val FROM labels WHERE label=?",
+                    "fixedParams": [{"index": 0, "value": "alpha"}]
+                }]
+            }),
+        );
+        for (delegation, ability, caveats) in [
+            (grandparent, "tinycloud.sql/read", Caveats(profile)),
+            (grandparent, "tinycloud.sql/write", Caveats::default()),
+            (parent, "tinycloud.sql/write", Caveats::default()),
+        ] {
+            abilities::ActiveModel {
+                delegation: Set(delegation),
+                resource: Set(Resource::TinyCloud(sql_resource.clone())),
+                ability: Set(Ability::try_from(ability.to_string()).unwrap()),
+                caveats: Set(caveats),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        let parent_cid: AuthCid = parent.to_cid(0x55);
+        let make_auth_header = |nonce: &str| -> Result<String> {
+            let mut capabilities = Capabilities::<serde_json::Value>::new();
+            capabilities.with_action(
+                sql_resource.as_uri(),
+                "tinycloud.sql/write".parse::<UcanAbility>()?,
+                [],
+            );
+            let invocation = Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: invoker.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(nonce.to_string()),
+                facts: None::<Vec<serde_json::Value>>,
+                proof: vec![parent_cid],
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?;
+            Ok(invocation.encode()?)
+        };
+
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![invoke])
+            .attach(crate::tracing::TracingFairing::for_test(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new(conn.clone()))
+            .manage(hook_runtime)
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let client = Client::tracked(rocket).await?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                make_auth_header("urn:uuid:00000000-0000-4000-8000-000000003739")?,
+            ))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Query {
+                sql: "SELECT val FROM labels".to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            })?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "raw query must be refused: {body}"
+        );
+        assert!(
+            body.contains("sql-raw-query-blocked"),
+            "expected sql-raw-query-blocked, got {body}"
+        );
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new(
+                "Authorization",
+                make_auth_header("urn:uuid:00000000-0000-4000-8000-000000003740")?,
+            ))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "unexpected /invoke response: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(json["rowCount"], 1);
+        assert_eq!(json["rows"][0][0], 111);
         Ok(())
     }
 

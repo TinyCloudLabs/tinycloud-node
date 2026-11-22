@@ -1117,6 +1117,12 @@ impl AuthGraphSnapshot {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every proof's ability rows, moved out of a graph that is done with
+    /// authorization (TC-3739).
+    pub(crate) fn into_abilities(self) -> HashMap<Hash, Vec<abilities::Model>> {
+        self.abilities
+    }
+
     /// Whether one cited proof reaches a parentless or owner-issued authority
     /// through nodes whose abilities all cover the invoked capability.
     /// Results are memoized across branches and cited proofs; cycles, missing

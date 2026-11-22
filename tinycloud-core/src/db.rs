@@ -412,6 +412,11 @@ pub struct TransactResult {
     /// CIDs of delegations that were processed (saved) regardless of space existence.
     /// Used to return a CID even when all spaces were skipped.
     pub delegation_cids: Vec<Hash>,
+    /// The ability rows of every proof a read invocation was authorized
+    /// against, as its authorization graph loaded them, so a caller can read
+    /// the chain's caveats without walking it again (TC-3739). `None` on the
+    /// paths that load no such graph: writes and delegations.
+    pub proof_abilities: Option<HashMap<Hash, Vec<abilities::Model>>>,
 }
 
 pub type DelegationStatusSnapshot = (
@@ -4584,6 +4589,7 @@ where
                 commits: HashMap::new(),
                 skipped_spaces: Vec::new(),
                 delegation_cids: Vec::new(),
+                proof_abilities: Some(auth_graph.into_abilities()),
             },
             results,
         ))
@@ -4777,6 +4783,7 @@ fn already_registered_result(retained_hash: Hash) -> TransactResult {
         commits: HashMap::new(),
         skipped_spaces: Vec::new(),
         delegation_cids: vec![retained_hash],
+        proof_abilities: None,
     }
 }
 
@@ -5901,6 +5908,7 @@ pub(crate) async fn transact_verified<S: StorageSetup, K: Secrets>(
                 .collect(),
             skipped_spaces,
             delegation_cids,
+            proof_abilities: None,
         })
     } else {
         // All spaces were skipped (delegation-only with no existing spaces).
@@ -5959,6 +5967,7 @@ pub(crate) async fn transact_verified<S: StorageSetup, K: Secrets>(
             commits: HashMap::new(),
             skipped_spaces,
             delegation_cids,
+            proof_abilities: None,
         })
     }
 }

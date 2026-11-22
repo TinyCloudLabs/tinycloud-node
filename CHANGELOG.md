@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- A delegated SQL `/invoke` makes fewer PostgreSQL round trips. It checks the identity cutover fence and resolves the database identity once instead of twice, and it reads the statements profile from the delegation chain that authorization already loaded instead of walking the chain again in its own read-only transaction (`BEGIN`, `SET TRANSACTION READ ONLY`, two `SELECT`s per chain level, `ROLLBACK`). A warm `SELECT 1` through a 1-hop delegation goes from 16 to 9 sequential statements, through a 2-hop delegation from 18 to 9, and a cold one from 18 or 20 to 11. Answers, refusals and error messages are unchanged. Details: TC-3739.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
