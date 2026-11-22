@@ -689,6 +689,89 @@ async fn a_failing_ledger_stops_the_start(
         "a_failing_ledger_stops_the_start",
         on,
     )
+    .await
+    {
+        Ok(None) => return Ok(()),
+        Ok(Some(_)) => panic!("the node started with named keys on and a failing ledger"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.starts_with(&format!("{event}: ")), "{error}");
+    assert!(
+        error.contains(&ledger_path.display().to_string()),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("error_kind {error_kind}")),
+        "{error}"
+    );
+    assert!(error.contains("named_keys_v1 is on"), "{error}");
+    assert_one_ledger_alert(&events, event, error_kind);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ledger_with_a_malformed_line_stops_the_start() -> anyhow::Result<()> {
+    a_failing_ledger_stops_the_start(malformed_ledger).await
+}
+
+#[tokio::test]
+async fn a_ledger_that_cannot_be_opened_stops_the_start() -> anyhow::Result<()> {
+    a_failing_ledger_stops_the_start(unopenable_ledger).await
+}
+
+/// A ledger whose second line is not a ledger line: replay fails `malformed`.
+fn malformed_ledger(dir: &std::path::Path) -> (std::path::PathBuf, &'static str, &'static str) {
+    let path = dir.join("deletion-ledger.jsonl");
+    let op = ledger_op(
+        "o",
+        "urn:tinycloud:encryption:did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:mainnet",
+        &["apps/a/x"],
+    );
+    std::fs::write(&path, format!("{op}\nnot a ledger line\n{op}\n")).expect("write ledger");
+    (path, "deletion_ledger_replay_failed", "malformed")
+}
+
+/// A ledger in a directory that does not exist, so the file cannot be
+/// created: open fails `io`.
+fn unopenable_ledger(dir: &std::path::Path) -> (std::path::PathBuf, &'static str, &'static str) {
+    (
+        dir.join("missing").join("deletion-ledger.jsonl"),
+        "deletion_ledger_open_failed",
+        "io",
+    )
+}
+
+/// A ledger whose lock another holder keeps through the start: open fails
+/// `lock_held` once the (test-short) lock wait runs out.
+#[tokio::test]
+async fn a_locked_ledger_stops_the_start() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("deletion-ledger.jsonl");
+    let _held = tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open(&path)?;
+    a_failing_ledger_stops_the_start(|_| (path.clone(), "deletion_ledger_open_failed", "lock_held"))
+        .await
+}
+
+/// With `named_keys_v1` off, a failing ledger keeps today's behaviour: one
+/// alert event, and the node starts and serves with the key routes off as
+/// configured.
+async fn with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(
+    ledger: impl FnOnce(&std::path::Path) -> (std::path::PathBuf, &'static str, &'static str),
+) -> anyhow::Result<()> {
+    let events = EventLog::default();
+    let _subscriber = ::tracing::subscriber::set_default(events.clone());
+    let ledger_dir = tempfile::tempdir()?;
+    let (ledger_path, event, error_kind) = ledger(ledger_dir.path());
+    let off = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = false;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
+    let Some(h) = Harness::new_with(
+        Backend::Sqlite,
+        Shape::KeySession,
+        "with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves",
+        off,
+    )
     .await?
     else {
         return Ok(());
@@ -727,14 +810,9 @@ async fn a_failing_ledger_stops_the_start(
 }
 
 #[tokio::test]
-async fn a_ledger_with_a_malformed_line_turns_the_key_routes_off() -> anyhow::Result<()> {
-    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
-        let path = dir.join("deletion-ledger.jsonl");
-        let op = ledger_op("o", "urn:tinycloud:encryption:did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:mainnet", &["apps/a/x"]);
-        std::fs::write(&path, format!("{op}\nnot a ledger line\n{op}\n")).expect("write ledger");
-        (path, "deletion_ledger_replay_failed", "malformed")
-    })
-    .await
+async fn with_named_keys_off_a_malformed_ledger_is_logged_and_the_node_serves() -> anyhow::Result<()>
+{
+    with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(malformed_ledger).await
 }
 
 #[tokio::test]
