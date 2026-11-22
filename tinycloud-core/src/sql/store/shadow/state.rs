@@ -137,6 +137,16 @@ impl DbState {
     ///   ignore (stale delta on the newer base).
     /// - Else, install `c` as `pending_delta` if the slot is empty or
     ///   `c.revision > pending_delta.revision`; otherwise ignore.
+    ///
+    /// Edge case the planner must still check (no pending_base, but
+    /// the manifest's frontier already published a newer checkpoint
+    /// than the incoming WAL): the WAL installs as `pending_delta`
+    /// here, because this function does not see the frontier. The
+    /// planner MUST reject a delta whose `base_checkpoint_cid` is not
+    /// the manifest's current base and MUST drop it via
+    /// `clear_after_publish(current_revision)` rather than retry
+    /// forever. A test covers this when the planner's cid check wires
+    /// in (TC-1491).
     pub fn mark_capture(&mut self, c: CapturePlan, now: Instant) {
         if self.first_dirty_at.is_none() {
             self.first_dirty_at = Some(now);
