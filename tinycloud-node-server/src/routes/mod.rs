@@ -824,6 +824,23 @@ pub async fn delegation_status(
                 "Invalid status invocation".to_string(),
             )
         })?;
+    // TC-3810: enforce the same delegation-mode rules as `/invoke` on
+    // proof-bearing status requests (leaf must not be `invalid`; strict
+    // ancestors must not be `terminal` or `invalid`). Proofless party access
+    // (`auth.parents.is_empty()`) is unaffected.
+    if !auth.parents.is_empty() {
+        tinycloud
+            .preflight_proof_modes(&auth.parents)
+            .await
+            .map_err(|error| match error {
+                invocation_model::Error::Db(_) => {
+                    (Status::ServiceUnavailable, "Status unavailable".to_string())
+                }
+                invocation_model::Error::InvalidInvocation(_) => {
+                    (Status::Unauthorized, error.to_string())
+                }
+            })?;
+    }
 
     let expected_resource = format!("urn:cid:{}", request.cid);
     let bound = auth.capabilities.len() == 1

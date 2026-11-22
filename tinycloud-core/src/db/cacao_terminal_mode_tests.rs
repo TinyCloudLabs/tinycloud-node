@@ -1023,7 +1023,7 @@ async fn prelock_enforcement_single_repost_batch_and_core_read_write_invocations
     );
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        f.db.delegate_batch(vec![parse_delegation(&t2_token), child_of_t2]),
+        f.db.delegate_batch(vec![parse_delegation(&t2_token), child_of_t2.clone()]),
     )
     .await
     .expect("in-memory batch parent must refuse before locks");
@@ -1113,6 +1113,31 @@ async fn prelock_enforcement_single_repost_batch_and_core_read_write_invocations
             invocation::InvocationError::TerminalParentCannotRedelegate
         )))
     ));
+
+    // 6. Reverse-order core batch [child_of_T2, T2] is refused with
+    // MissingParents and stores neither row.
+    drop(_writer_guard);
+    drop(_chain_guards);
+    drop(_space_guards);
+    let res_rev =
+        f.db.delegate_batch(vec![child_of_t2, parse_delegation(&t2_token)])
+            .await;
+    assert!(matches!(
+        res_rev,
+        Err(TxError::InvalidDelegation(
+            delegation::DelegationError::MissingParents
+        ))
+    ));
+    assert!(delegation::Entity::find_by_id(Hash::from(t2_cid))
+        .one(&f.db.conn)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(delegation::Entity::find_by_id(Hash::from(child_of_t2_cid))
+        .one(&f.db.conn)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1336,6 +1361,24 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
             delegation::DelegationError::TerminalParentCannotRedelegate
         ))
     ));
+    // Core delegation_status also denies an invalid-marked proof and a
+    // terminal-ancestor proof (defense in depth in control_proof_decision_at).
+    assert_eq!(
+        must_ok(
+            reopened
+                .delegation_status(Hash::from(ok_cid), &d_bad, &[bad_cid])
+                .await
+        ),
+        None
+    );
+    assert_eq!(
+        must_ok(
+            reopened
+                .delegation_status(Hash::from(ok_cid), &d_term_child, &[t_child_cid])
+                .await
+        ),
+        None
+    );
 
     // 3. Normal attenuable row & its child are marked explicitly "attenuable",
     // never treated as terminal (including by older-node rollback checks), and

@@ -3308,6 +3308,16 @@ where
         Ok(Some((status, expiry, history)))
     }
 
+    /// Lock-free, read-only delegation-mode check for proof-bearing control
+    /// requests such as `/delegation/status` (TC-3810): refuses if any cited
+    /// leaf is `invalid` or any strict ancestor is `terminal`/`invalid`.
+    pub async fn preflight_proof_modes(
+        &self,
+        parents: &[tinycloud_auth::authorization::Cid],
+    ) -> Result<(), invocation::Error> {
+        invocation::preflight_terminal_ancestors(&self.conn, parents).await
+    }
+
     async fn delegation_status_on<D: ConnectionTrait>(
         &self,
         conn: &D,

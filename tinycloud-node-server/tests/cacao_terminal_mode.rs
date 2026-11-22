@@ -645,3 +645,293 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
 
     Ok(())
 }
+
+/// TC-3810 (P2): `/delegation/status` enforces the same delegation-mode rules
+/// as `/invoke` on proof-bearing status grants: an `invalid`-marked status
+/// grant returns 401, a status grant whose strict ancestor is terminal returns
+/// 401, while a valid status grant (attenuable or direct terminal) and
+/// proofless party access remain unaffected.
+#[tokio::test]
+async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() -> Result<()> {
+    let (client, db_url, _dir) = start_node().await?;
+    let db = Database::connect(&db_url).await?;
+
+    let wallet = Wallet::from_seed(0x73);
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        wallet.did.strip_prefix("did:").unwrap()
+    )
+    .parse()?;
+    let space_res = format!("{space}/space");
+    let del_scope_res = format!("{space}/delegation");
+    let kv_res = space
+        .clone()
+        .to_resource("kv".parse()?, Some("secrets/status".parse()?), None, None)
+        .to_string();
+
+    let target_holder = JWK::generate_ed25519()?;
+    let (target_holder_did, _) = verification_method(&target_holder);
+    let (target_tok, target_cid) = signed_cacao_token(
+        &wallet,
+        &target_holder_did,
+        &[
+            (&space_res, "tinycloud.space/host"),
+            (&kv_res, "tinycloud.kv/get"),
+        ],
+        &[],
+        Some(DelegationModeFact::Attenuable),
+        "sttarget001",
+    )?;
+    let (status, body) =
+        post_auth(&client, "/delegate", &target_tok, None, ContentType::Plain).await;
+    assert_eq!(status, Status::Ok, "target delegate: {body}");
+    let target_status_res = format!("urn:cid:{target_cid}");
+    let status_body = json!({ "cid": target_cid.to_string() }).to_string();
+
+    // 1. Invalid-marked status grant on `<space>/delegation` -> 401 invalid-delegation-mode.
+    let bad_holder = JWK::generate_ed25519()?;
+    let (bad_holder_did, _) = verification_method(&bad_holder);
+    let bad_tok = signed_cacao_malformed_mode(
+        &wallet,
+        &bad_holder_did,
+        &[(&del_scope_res, "tinycloud.delegation/status")],
+        r#""xyz.tinycloud.policy/delegationMode":"bogus""#,
+        "stbad000001",
+    )?;
+    let (_, bad_bytes) = TinyCloudDelegation::decode(&bad_tok)?;
+    let bad_hash = tinycloud_core::hash::hash(&bad_bytes);
+    let bad_cid = bad_hash.to_cid(0x55);
+    for did in [&wallet.did, &bad_holder_did] {
+        actor::ActiveModel {
+            id: Set(did.clone()),
+        }
+        .insert(&db)
+        .await
+        .ok();
+    }
+    let now = OffsetDateTime::now_utc();
+    let mut invalid_facts = BTreeMap::new();
+    invalid_facts.insert(
+        tinycloud_core::util::DelegationMode::FACT_KEY.to_string(),
+        json!("invalid"),
+    );
+    delegation::ActiveModel {
+        id: Set(bad_hash),
+        delegator: Set(wallet.did.clone()),
+        delegatee: Set(bad_holder_did.clone()),
+        expiry: Set(Some(now + time::Duration::hours(1))),
+        issued_at: Set(Some(now)),
+        not_before: Set(Some(now - time::Duration::minutes(1))),
+        facts: Set(Some(tinycloud_core::types::Facts(invalid_facts))),
+        serialization: Set(bad_bytes),
+        serialization_format: Set(0),
+        first_seen_at: Set(Some(now)),
+    }
+    .insert(&db)
+    .await?;
+    delegation_cid_alias::ActiveModel {
+        id: Set(bad_hash),
+        canonical: Set(bad_hash),
+        encrypted: Set(false),
+    }
+    .insert(&db)
+    .await?;
+    abilities::ActiveModel {
+        delegation: Set(bad_hash),
+        resource: Set(del_scope_res.parse().unwrap()),
+        ability: Set("tinycloud.delegation/status"
+            .to_string()
+            .try_into()
+            .unwrap()),
+        caveats: Set(Default::default()),
+    }
+    .insert(&db)
+    .await?;
+
+    let inv_bad = signed_invocation(
+        &bad_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[bad_cid],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_bad,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "invalid-marked status grant must return 401: {body}"
+    );
+    assert_eq!(body, "invalid-delegation-mode");
+
+    // 2. Status grant whose strict ancestor is a terminal CACAO -> 401 terminal-parent-cannot-redelegate.
+    let term_holder = JWK::generate_ed25519()?;
+    let (term_holder_did, _) = verification_method(&term_holder);
+    let sub_holder = JWK::generate_ed25519()?;
+    let (sub_holder_did, _) = verification_method(&sub_holder);
+    let (term_tok, term_cid) = signed_cacao_token(
+        &wallet,
+        &term_holder_did,
+        &[(&del_scope_res, "tinycloud.delegation/status")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "stterm00001",
+    )?;
+    let (status, body) = post_auth(&client, "/delegate", &term_tok, None, ContentType::Plain).await;
+    assert_eq!(status, Status::Ok, "terminal status grant delegate: {body}");
+
+    let (_, child_cid, child_bytes) = signed_ucan_delegation(
+        &term_holder,
+        &sub_holder_did,
+        &[(&del_scope_res, "tinycloud.delegation/status")],
+        &[term_cid],
+    )?;
+    let child_hash = Hash::from(child_cid);
+    for did in [&term_holder_did, &sub_holder_did] {
+        actor::ActiveModel {
+            id: Set(did.clone()),
+        }
+        .insert(&db)
+        .await
+        .ok();
+    }
+    delegation::ActiveModel {
+        id: Set(child_hash),
+        delegator: Set(term_holder_did.clone()),
+        delegatee: Set(sub_holder_did.clone()),
+        expiry: Set(Some(now + time::Duration::hours(1))),
+        issued_at: Set(None),
+        not_before: Set(Some(now - time::Duration::minutes(1))),
+        facts: Set(None),
+        serialization: Set(child_bytes),
+        serialization_format: Set(0),
+        first_seen_at: Set(Some(now)),
+    }
+    .insert(&db)
+    .await?;
+    delegation_cid_alias::ActiveModel {
+        id: Set(child_hash),
+        canonical: Set(child_hash),
+        encrypted: Set(false),
+    }
+    .insert(&db)
+    .await?;
+    abilities::ActiveModel {
+        delegation: Set(child_hash),
+        resource: Set(del_scope_res.parse().unwrap()),
+        ability: Set("tinycloud.delegation/status"
+            .to_string()
+            .try_into()
+            .unwrap()),
+        caveats: Set(Default::default()),
+    }
+    .insert(&db)
+    .await?;
+    parent_delegations::ActiveModel {
+        child: Set(child_hash),
+        parent: Set(Hash::from(term_cid)),
+    }
+    .insert(&db)
+    .await?;
+
+    let inv_term_child = signed_invocation(
+        &sub_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[child_cid],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_term_child,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "status grant with terminal ancestor must return 401: {body}"
+    );
+    assert_eq!(body, "terminal-parent-cannot-redelegate");
+
+    // 3. Valid status grants (direct terminal leaf AND attenuable grant) succeed -> 200 OK.
+    let inv_direct_term = signed_invocation(
+        &term_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[term_cid],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_direct_term,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "direct terminal status grant: {body}");
+    let parsed: Value = serde_json::from_str(&body)?;
+    assert_eq!(parsed["active"], json!(true));
+
+    let ok_holder = JWK::generate_ed25519()?;
+    let (ok_holder_did, _) = verification_method(&ok_holder);
+    let (ok_tok, ok_cid) = signed_cacao_token(
+        &wallet,
+        &ok_holder_did,
+        &[(&del_scope_res, "tinycloud.delegation/status")],
+        &[],
+        None,
+        "stok0000001",
+    )?;
+    let (status, body) = post_auth(&client, "/delegate", &ok_tok, None, ContentType::Plain).await;
+    assert_eq!(status, Status::Ok, "valid status grant delegate: {body}");
+    let inv_ok = signed_invocation(
+        &ok_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[ok_cid],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_ok,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "valid status grant: {body}");
+    let parsed: Value = serde_json::from_str(&body)?;
+    assert_eq!(parsed["active"], json!(true));
+
+    // 4. Proofless party access (target's delegatee, parents = []) remains unaffected -> 200 OK.
+    let inv_party = signed_invocation(
+        &target_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_party,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "proofless party status access: {body}");
+    let parsed: Value = serde_json::from_str(&body)?;
+    assert_eq!(parsed["active"], json!(true));
+
+    Ok(())
+}

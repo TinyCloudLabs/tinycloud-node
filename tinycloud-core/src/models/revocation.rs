@@ -605,6 +605,16 @@ pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
         return Ok(ControlProofDecision::Denied);
     }
 
+    if action == ControlAction::Status {
+        match crate::models::invocation::preflight_terminal_ancestors(db, &[proofs[0]]).await {
+            Ok(()) => {}
+            Err(crate::models::invocation::Error::Db(error)) => return Err(error),
+            Err(crate::models::invocation::Error::InvalidInvocation(_)) => {
+                return Ok(ControlProofDecision::Denied);
+            }
+        }
+    }
+
     let chain_nodes = match ancestor_chain_ids(db, &proof_id).await {
         Ok(nodes) => nodes,
         Err(ChainTraversalError::Db(error)) => return Err(error),
