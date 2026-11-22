@@ -1,7 +1,7 @@
 //! Bootstrap: seed a database's shadow from Postgres.
 //!
 //! Used when a shadow uploader is enabled on a database with no in-hand
-//! capture — the natural case is enabling the flag on an already-running
+//! capture: the natural case is enabling the flag on an already-running
 //! node. The uploader cannot wait for the next natural checkpoint because
 //! some databases never checkpoint again (idle actors). Bootstrap reads
 //! the stored checkpoint (and the WAL delta, when the database has one)
