@@ -16,7 +16,9 @@ use std::{
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
-    failure_diagnostic::{FailureCode, FailureNote, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT},
+    failure_diagnostic::{
+        ErrorCode, FailureCode, FailureNote, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
+    },
     request_telemetry::{self, RequestContext},
     telemetry::Pseudonymizer,
 };
@@ -691,6 +693,15 @@ impl Fairing for TracingFairing {
         let mut space_buffer = [0; 64];
         let account_hash = hash_field(hashes.account_hash.as_ref(), &mut account_buffer);
         let space_hash = hash_field(hashes.space_hash.as_ref(), &mut space_buffer);
+        // TC-3834: a 5xx names its origin by a closed code, `internal` when
+        // no origin recorded one; 1xx-4xx carry none.
+        let error_code = (status >= 500).then(|| {
+            telemetry
+                .context
+                .error_code()
+                .unwrap_or(ErrorCode::Internal)
+                .as_str()
+        });
         tracing::info!(
             target: REQUEST_LOG_TARGET,
             event = "node_request",
@@ -706,6 +717,7 @@ impl Fairing for TracingFairing {
             query_count = database.query_count,
             account_hash,
             space_hash,
+            error_code,
             "request"
         );
         if status >= 500 {
@@ -1549,6 +1561,238 @@ mod tests {
             "0x1234",
         ] {
             assert!(!output.contains(secret), "{secret} in {output}");
+        }
+    }
+
+    /// Error text of every forced TC-3834 failure: a message, a DID, SQL and
+    /// a path, none of which may reach a log line.
+    const TC3834_SECRET: &str =
+        "secret-error-text did:pkh:eip155:1:0xabc SELECT secret FROM t /var/secret/path";
+
+    fn tc3834_db_err() -> tinycloud_core::sea_orm::DbErr {
+        tinycloud_core::sea_orm::DbErr::Custom(TC3834_SECRET.to_string())
+    }
+
+    #[rocket::get("/tc3834-db")]
+    fn tc3834_db() -> (Status, String) {
+        crate::routes::database_failure(
+            tinycloud_core::failure_diagnostic::Service::Kv,
+            &tc3834_db_err(),
+            false,
+            TC3834_SECRET.to_string(),
+        )
+    }
+
+    #[rocket::get("/tc3834-db-timeout")]
+    fn tc3834_db_timeout() -> (Status, String) {
+        crate::routes::database_failure(
+            tinycloud_core::failure_diagnostic::Service::Sql,
+            &tinycloud_core::sea_orm::DbErr::ConnectionAcquire(
+                tinycloud_core::sea_orm::error::ConnAcquireErr::Timeout,
+            ),
+            false,
+            TC3834_SECRET.to_string(),
+        )
+    }
+
+    #[rocket::get("/tc3834-caveat")]
+    fn tc3834_caveat() -> (Status, String) {
+        crate::routes::chain_caveat_refusal(
+            tinycloud_core::sql::delegated_caveats::ChainCaveatError::Db(tc3834_db_err()),
+        )
+    }
+
+    #[rocket::get("/tc3834-readable")]
+    fn tc3834_readable() -> (Status, String) {
+        crate::routes::internal_error(ErrorCode::ReadTxError)(tc3834_db_err())
+    }
+
+    #[rocket::get("/tc3834-storage")]
+    fn tc3834_storage() -> (Status, String) {
+        crate::routes::store_internal_error(tinycloud_core::storage::either::EitherError::<
+            tinycloud_core::sea_orm::DbErr,
+            std::io::Error,
+        >::B(std::io::Error::other(TC3834_SECRET)))
+    }
+
+    #[rocket::get("/tc3834-deletion-ledger")]
+    fn tc3834_deletion_ledger() -> (Status, String) {
+        crate::routes::encryption::map_service_err(
+            tinycloud_core::encryption_network::EncryptionServiceError::DeletionLedger(
+                TC3834_SECRET.to_string(),
+            ),
+        )
+    }
+
+    /// A request that recorded a code but was answered `4xx`.
+    #[rocket::get("/tc3834-coded-404")]
+    fn tc3834_coded_404() -> (Status, &'static str) {
+        crate::routes::note_error_code(ErrorCode::DbError);
+        (Status::NotFound, "no")
+    }
+
+    /// The fields of the `node_request` events of INFO-level JSON `output`.
+    fn node_request_events(output: &str) -> Vec<Value> {
+        output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "node_request")
+            .map(|event| event["fields"].clone())
+            .collect()
+    }
+
+    /// Dispatch `paths` in order; the INFO-level JSON log output and the
+    /// response statuses.
+    async fn tc3834_output(paths: &[&str]) -> (String, Vec<Status>) {
+        let captured = Captured::default();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(captured.clone())
+                .with_max_level(Level::INFO)
+                .finish(),
+        );
+        let routes: Vec<_> = rocket::routes![
+            tc3834_db,
+            tc3834_db_timeout,
+            tc3834_caveat,
+            tc3834_readable,
+            tc3834_storage,
+            tc3834_deletion_ledger,
+            tc3834_coded_404,
+            plain_500,
+            answered_404,
+            known
+        ]
+        .into_iter()
+        .map(instrument_route)
+        .collect();
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes)
+                .attach(disabled_fairing()),
+        )
+        .await
+        .expect("valid rocket instance");
+        let mut statuses = Vec::new();
+        for path in paths {
+            statuses.push(client.get(*path).dispatch().await.status());
+        }
+        let output = String::from_utf8(captured.0.lock().clone()).unwrap();
+        (output, statuses)
+    }
+
+    /// TC-3834: each forced 5xx origin's `node_request` event carries its
+    /// code; a 5xx no origin classified carries `internal`.
+    #[tokio::test]
+    async fn each_5xx_origin_puts_its_code_on_node_request() {
+        let expected = [
+            ("/tc3834-db", 500, "db_error"),
+            ("/tc3834-db-timeout", 503, "db_timeout"),
+            ("/tc3834-caveat", 500, "caveat_db"),
+            ("/tc3834-readable", 500, "read_tx_error"),
+            ("/tc3834-storage", 500, "storage_io"),
+            ("/tc3834-deletion-ledger", 500, "key_ledger"),
+            ("/tc2073-plain-500", 500, "internal"),
+        ];
+        let paths: Vec<&str> = expected.iter().map(|(path, ..)| *path).collect();
+        let (output, statuses) = tc3834_output(&paths).await;
+        let events = node_request_events(&output);
+        assert_eq!(events.len(), expected.len(), "{output}");
+        for ((event, status), (path, code_status, code)) in
+            events.iter().zip(statuses).zip(expected)
+        {
+            assert_eq!(status.code, code_status, "{path}");
+            assert_eq!(event["route"], path);
+            assert_eq!(event["status"], code_status, "{path}");
+            assert_eq!(event["error_code"], code, "{path}: {event}");
+        }
+    }
+
+    /// TC-3834: a 5xx event's `error_code` is always one of the closed set's
+    /// strings, and no error text, DID, SQL or path reaches any line.
+    #[tokio::test]
+    async fn a_5xx_error_code_is_only_ever_a_closed_set_string() {
+        let allowed: Vec<&str> = ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
+        let (output, _) = tc3834_output(&[
+            "/tc3834-db",
+            "/tc3834-db-timeout",
+            "/tc3834-caveat",
+            "/tc3834-readable",
+            "/tc3834-storage",
+            "/tc3834-deletion-ledger",
+            "/tc2073-plain-500",
+        ])
+        .await;
+        let events = node_request_events(&output);
+        assert_eq!(events.len(), 7, "{output}");
+        for event in &events {
+            assert!(event["status"].as_u64().unwrap() >= 500);
+            let code = event["error_code"].as_str().expect("a string code");
+            assert!(allowed.contains(&code), "free-text error_code {code}");
+            assert!(
+                code.len() <= tinycloud_core::failure_diagnostic::MAX_ERROR_CODE_LEN,
+                "{code}"
+            );
+        }
+        for secret in ["secret", "did:pkh", "SELECT", "/var/"] {
+            assert!(!output.contains(secret), "{secret} in {output}");
+        }
+    }
+
+    /// TC-3834: the log shipper's `error_code` allowlist is exactly the
+    /// node's closed set, so a code the node emits is never dropped and the
+    /// shipper admits nothing else; and the node's length bound is the one
+    /// the shipper's capped reserve was sized for.
+    #[test]
+    fn the_shipper_allowlist_is_the_error_code_set() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../log-shipper/fields.json")).unwrap();
+        let shipped: Vec<&str> = schema["services"]["tinycloud-node"]["fields"]["error_code"]
+            ["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        let codes: Vec<&str> = ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
+        assert_eq!(shipped, codes);
+        let budget_bound = include_str!("../../log-shipper/budget.mjs")
+            .lines()
+            .find_map(|line| line.strip_prefix("export const MAX_ERROR_CODE_LEN = "))
+            .and_then(|rest| rest.strip_suffix(';'))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("budget.mjs declares MAX_ERROR_CODE_LEN");
+        assert_eq!(
+            budget_bound,
+            tinycloud_core::failure_diagnostic::MAX_ERROR_CODE_LEN
+        );
+    }
+
+    /// TC-3834: 1xx-4xx `node_request` events are unchanged: no
+    /// `error_code`, even when the request recorded one.
+    #[tokio::test]
+    async fn a_4xx_or_2xx_node_request_has_no_error_code() {
+        let (output, statuses) = tc3834_output(&[
+            "/tc3834-coded-404",
+            "/tc2073-not-found",
+            "/no-such-route",
+            "/tc286-known",
+        ])
+        .await;
+        assert_eq!(
+            statuses,
+            [
+                Status::NotFound,
+                Status::NotFound,
+                Status::NotFound,
+                Status::Ok
+            ]
+        );
+        let events = node_request_events(&output);
+        assert_eq!(events.len(), 4, "{output}");
+        for event in &events {
+            assert!(event.get("error_code").is_none(), "{event}");
         }
     }
 }
