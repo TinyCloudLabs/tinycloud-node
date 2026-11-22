@@ -764,6 +764,29 @@ Rolling this release back means a database snapshot restore (a separate
 decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
 to 1.20.6 with Sam's explicit privacy mode.
 
+## What each deploy publishes (TC-3839)
+
+- **Build provenance.** `build-dstack` and `build-ingress` sign SLSA provenance
+  for every pushed image with `actions/attest-build-provenance`, which needs
+  `id-token: write` and `attestations: write` on those two jobs only. The
+  provenance is pushed to GHCR next to the image. Check it with
+  `gh attestation verify oci://ghcr.io/tinycloudlabs/tinycloud-node@<digest> -R TinyCloudLabs/tinycloud-node`.
+  PR builds of the ingress image are not pushed, so they are not attested.
+- **The measured manifest.** After every check of a successful `deploy-phala`:
+  1. *Capture the deployed app-compose.json* reads the CVM's compose file
+     (`phala api /cvms/tinycloud-node/compose_file`) and writes it as compact,
+     key-sorted JSON (`jq -cjS .`). Those are the bytes dstack hashes: on
+     1.26.19 they hashed to the attested `1dc2fe4a…`, while the pretty-printed
+     response does not.
+  2. It requires that their SHA-256 equals the `compose_hash` the live node
+     returns from `/attestation`, so the file is exactly what dstack measured.
+  3. The separate `publish-compose` job, the only one with `contents: write`,
+     attaches the file to release `v<version>` as `app-compose-<hash>.json`.
+  A promotion or rollback that runs an earlier version under a different
+  compose adds a second file. Nothing is replaced. A mismatch fails the deploy
+  run after the deploy: production already runs the new compose, and nothing
+  is published until the cause is understood.
+
 ## Rolling back
 
 Keep the digest, actual OCI version and actual revision of every promoted

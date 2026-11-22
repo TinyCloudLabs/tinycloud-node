@@ -77,3 +77,19 @@ or TCB status, so a 200 response proves nothing on its own.
 The digest only binds what the verifier recomputes in steps 2 and 3, so
 always derive the preimage from your own nonce and expected DID rather than
 trusting the returned string.
+
+## Where the trusted values come from
+
+- **Manifest:** each production deploy attaches the manifest it ran, as
+  `app-compose-<compose hash>.json`, to that version's GitHub release (TC-3839).
+  CI publishes it only when its SHA-256 equals the compose hash the running node
+  attests. Hash the file yourself and compare it with the replayed
+  `compose-hash`. Its `docker_compose_file` pins each image by digest.
+- **Images:** each digest has signed build provenance from this repository's
+  `Docker Container` workflow:
+  `gh attestation verify oci://ghcr.io/tinycloudlabs/tinycloud-node@<digest> -R TinyCloudLabs/tinycloud-node`
+  (likewise for `tinycloud-node-ingress`). It names the commit and the workflow
+  run that built the image.
+- `tinycloud-tee-verify <url>` (`@tinycloud/tee-verify`, js-sdk) runs steps
+  1-6 against published lists of production OS measurements and released
+  compose hashes.
