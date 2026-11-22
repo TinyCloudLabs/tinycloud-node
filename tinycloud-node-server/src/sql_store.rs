@@ -7,7 +7,8 @@
 //! the node pays nothing: no owner-marker IO, no object store, no task.
 //!
 //! Ships off. Uploading databases unencrypted is not cleared yet, and the
-//! restore check (TC-1491 P2) does not exist yet, so
+//! restore check (TC-1491 P2, `tinycloud node sql-store restore-check`, in
+//! `sql_restore_check`) has not passed on any space yet, so
 //! `SqlStoreConfig::validate_for_database` keeps its terminating
 //! `"sql_store is not available in this build"` refusal in this build. The
 //! acceptance tests exercise this module directly, bypassing that gate.
