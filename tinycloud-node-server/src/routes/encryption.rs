@@ -832,12 +832,22 @@ fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
 }
 
 pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
-    let status = match err {
+    use tinycloud_core::failure_diagnostic::ErrorCode;
+    let status = match &err {
         EncryptionServiceError::NetworkNotFound => Status::NotFound,
         EncryptionServiceError::NetworkAlreadyExists => Status::Conflict,
-        EncryptionServiceError::Db(_) => Status::InternalServerError,
-        EncryptionServiceError::Backend(_) => Status::InternalServerError,
-        EncryptionServiceError::Signing(_) => Status::InternalServerError,
+        EncryptionServiceError::Db(error) => {
+            super::note_error_code(ErrorCode::for_db(error));
+            Status::InternalServerError
+        }
+        EncryptionServiceError::Backend(_)
+        | EncryptionServiceError::Signing(_)
+        | EncryptionServiceError::CorruptKeyRow
+        | EncryptionServiceError::StrayAppKeyRows(_)
+        | EncryptionServiceError::StraySecretKeyRows(_) => {
+            super::note_error_code(ErrorCode::Encryption);
+            Status::InternalServerError
+        }
         EncryptionServiceError::AudienceMismatch
         | EncryptionServiceError::TargetNodeMismatch
         | EncryptionServiceError::OwnerMismatch
@@ -860,9 +870,10 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_)
         | EncryptionServiceError::OwnerOnly(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow
-        | EncryptionServiceError::StrayAppKeyRows(_)
-        | EncryptionServiceError::DeletionLedger(_) => Status::InternalServerError,
+        EncryptionServiceError::DeletionLedger(_) => {
+            super::note_error_code(ErrorCode::KeyLedger);
+            Status::InternalServerError
+        }
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey

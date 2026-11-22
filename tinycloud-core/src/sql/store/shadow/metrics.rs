@@ -31,6 +31,15 @@ pub const BREAKER_OPEN: &str = "sql_store_breaker_open";
 /// Histogram: `sql_store_cycle_seconds{stage}`.
 pub const CYCLE_SECONDS: &str = "sql_store_cycle_seconds";
 
+/// Counter: `sql_store_restore_checks_total{result}`, one per database the
+/// restore check (`restore`) looked at.
+pub const RESTORE_CHECKS_TOTAL: &str = "sql_store_restore_checks_total";
+/// Counter: `sql_store_restore_segments_unverified_total`: segments a
+/// frontier needs that the restore check did not read and replay.
+pub const RESTORE_SEGMENTS_UNVERIFIED_TOTAL: &str = "sql_store_restore_segments_unverified_total";
+/// Histogram: `sql_store_restore_check_seconds`, per database.
+pub const RESTORE_CHECK_SECONDS: &str = "sql_store_restore_check_seconds";
+
 /// Values of the `result` label on `sql_store_notices_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeResult {
@@ -88,6 +97,41 @@ impl PublishResult {
     }
 }
 
+/// The restore check's verdict on one database; also the `result` label on
+/// `sql_store_restore_checks_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreResult {
+    /// Restored at the frontier, sound, and equal to Postgres's artifact at
+    /// the same revision.
+    Ok,
+    /// Restored and sound, but not equal to Postgres's artifact.
+    Mismatch,
+    /// Postgres is not at the frontier's revision (or moved on mid-check):
+    /// nothing was compared.
+    NotComparable,
+    /// The frontier could not be restored, or a copy was refused or unsound.
+    Unreadable,
+}
+
+impl RestoreResult {
+    pub const ALL: [Self; 4] = [
+        Self::Ok,
+        Self::Mismatch,
+        Self::NotComparable,
+        Self::Unreadable,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Mismatch => "mismatch",
+            Self::NotComparable => "not_comparable",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
 /// The uploader's metrics sink. In tests an in-memory implementation counts
 /// calls; in production the node wires it to Prometheus.
 pub trait ShadowMetrics: Send + Sync {
@@ -122,6 +166,16 @@ impl ShadowMetrics for NoopMetrics {
     fn inflight_bytes(&self, _: u64) {}
     fn breaker_open(&self, _: bool) {}
     fn record_cycle_seconds(&self, _: &'static str, _: f64) {}
+}
+
+/// The restore check's metrics sink (the check is not the uploader, so it
+/// has its own).
+pub trait RestoreMetrics: Send + Sync {
+    fn restore_check(&self, result: RestoreResult, segments_unverified: u64, seconds: f64);
+}
+
+impl RestoreMetrics for NoopMetrics {
+    fn restore_check(&self, _: RestoreResult, _: u64, _: f64) {}
 }
 
 #[cfg(test)]
@@ -160,6 +214,21 @@ mod tests {
         ] {
             assert_eq!(v.label(), l);
         }
+    }
+
+    #[test]
+    fn restore_result_labels_match_their_serialised_form() {
+        for (v, l) in [
+            (RestoreResult::Ok, "ok"),
+            (RestoreResult::Mismatch, "mismatch"),
+            (RestoreResult::NotComparable, "not_comparable"),
+            (RestoreResult::Unreadable, "unreadable"),
+        ] {
+            assert_eq!(v.label(), l);
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{l}\""));
+        }
+        assert_eq!(RestoreResult::ALL.len(), 4);
+        RestoreMetrics::restore_check(&NoopMetrics, RestoreResult::Ok, 0, 0.1);
     }
 
     #[test]

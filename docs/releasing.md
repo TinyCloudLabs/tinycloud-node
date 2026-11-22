@@ -569,6 +569,17 @@ malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
+In `authority=billing`, when the deploy mutated nothing quota-related and only
+the verification did not run (for example a transient read failed earlier in
+the job), clear it without redeploying: on the operator's GO, dispatch
+
+```sh
+gh workflow run quota-verify.yml -R TinyCloudLabs/tinycloud-node --ref main
+```
+
+It runs only `scripts/ci/reconcile-quota.py` (GET-only in billing mode) and
+refuses under any other authority or ref. A green run is the verification; a
+red one stays OVERRIDES UNVERIFIED (TC-3881).
 
 If a job that names the environment ever runs before the environment exists,
 GitHub creates `production` with no branch policy. Create the environment and
@@ -717,9 +728,11 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`cbd46ff56f20b7c987fef9694931d63788e453f70609a6e4d74f10f3742d5abf`**
-  (raw `a0f270435e230315b08b0d3b5ef13da21f616e42f61c18091505d54ab854bb48` normalized). Before the TC-3838 removal of the `ssh-gateway` service the template was `cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249`
-  (raw `02d907552b74066b0d49f1088cc0b7ba9ca3e842eb9c1444b3cd778474498eb9` normalized). Before the TC-3739 `node_request` DB timing fields (`pool_wait_ms`, `query_time_ms`, `query_count`) in the Vector config the template was `c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46`
+  **`dff38c1ea38e67ae94aeb235bd1e50f5f73c3b5a286e3dc1ec69ec7fd6896630`**
+  (raw `4982f4fdab7d3e6fdfbb5e93442dbc25b0087833fc3cb55334b9736150915923` normalized). Before the TC-3838 removal of the `ssh-gateway` service the template was `97a180a43ec70c7950e717417c5455b13ede1a3adab5a196f65b5aa21dcc5271`
+  (raw `bced82d3f0e975c176cf35b72cea0bc26c9aa4acf5212304b946c068db1d6394` normalized); before the TC-3284 deletion ledger error events (`deletion_ledger_open_failed`, `deletion_ledger_replay_failed`, `deletion_ledger_unrepaired`) in the Vector config the template was `db348152c6b7a03beb42373299400b35bc0badf8b188988d9406192b4b88a540`
+  (raw `27287a3823d35deb91ebfd4f28dc56ace262d6044313134e23c65e2216cf379f` normalized); before the TC-3834 `node_request` `error_code` in the Vector config the template was `cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249`
+  (raw `02d907552b74066b0d49f1088cc0b7ba9ca3e842eb9c1444b3cd778474498eb9` normalized); before the TC-3739 `node_request` DB timing fields (`pool_wait_ms`, `query_time_ms`, `query_count`) in the Vector config the template was `c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46`
   (raw `46287bc31dc09649b0679bacfe611ee24ad5ced5c51cd7909821dee895c1f6d2` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` / `MIN_FREE_BYTES` env lines the template was `e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`
   (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized); before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
   (raw `f4f51e75076f21c7bd05e93e24d08ffe7290e2f9567fe1ed4daca7ec0e9ad7a5` normalized); before the TC-287 `TINYCLOUD_RETENTION__ENABLED` env line the template was `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`
@@ -885,8 +898,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`a0f270435e230315b08b0d3b5ef13da21f616e42f61c18091505d54ab854bb48`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom` and TC-3739 `node_request` DB timing Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines, and without the TC-3838 `ssh-gateway` service), whatever digest
+`4982f4fdab7d3e6fdfbb5e93442dbc25b0087833fc3cb55334b9736150915923`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code` and TC-3284 deletion ledger error event Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines, and without the TC-3838 `ssh-gateway` service), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**
 1.26.14 needs the sidecar this compose lacks,
