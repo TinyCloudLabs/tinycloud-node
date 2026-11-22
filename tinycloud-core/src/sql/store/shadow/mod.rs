@@ -192,5 +192,6 @@ pub mod ingress;
 pub mod reconciler;
 pub mod restore;
 pub mod runloop;
+pub mod spool;
 pub mod sweep;
 pub mod uploader;
