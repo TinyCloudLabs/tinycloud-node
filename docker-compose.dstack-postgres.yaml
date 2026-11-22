@@ -74,6 +74,10 @@ services:
       # slice. The 64 MiB save limit (max_artifact_write_bytes) is unchanged:
       # a write that needs a whole checkpoint over it still answers 507.
       TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"
+      # TC-1791: enforce the tables / columns / readOnly caveats of delegated
+      # SQL grants. Off, such a grant is refused at /delegate, so no stored
+      # chain carries them and un-caveated SQL is unchanged.
+      TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"
       # TC-1274: production boots with the epoch_head backfill off while the
       # database is CPU-bound. Writes stay correct without it. Re-enable later
       # by setting "true" (or removing this line); the pace keys are
