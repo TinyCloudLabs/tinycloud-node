@@ -1,0 +1,17 @@
+# gitleaks configuration for the `gitleaks` CI job (.github/workflows/security.yml).
+# The default ruleset applies; the allowlists below only remove findings that
+# are public by construction. Reviewed historical findings are fingerprinted in
+# .gitleaksignore. See docs/security/required-checks.md for how to handle a new
+# false positive.
+
+[extend]
+useDefault = true
+
+# A did:key identifier is a multibase-encoded public key (z6Mk… Ed25519,
+# zQ3s… secp256k1, zDn… P-256). generic-api-key matches the `key:z…` tail of
+# every one of them; they are public identifiers, never credentials.
+[[allowlists]]
+description = "did:key public-key identifiers"
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = ['''^key:z[1-9A-HJ-NP-Za-km-z]+(["`\s]|\\n)?$''']

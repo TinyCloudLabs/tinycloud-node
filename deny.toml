@@ -1,0 +1,86 @@
+# Workspace dependency policy for the `cargo-deny` job in
+# .github/workflows/security.yml:
+#   cargo deny --workspace --locked check advisories bans sources
+# tinycloud-threshold keeps its own stricter policy (tinycloud-threshold/deny.toml),
+# selected explicitly by the `threshold` job in rust.yml.
+
+[graph]
+# Every optional feature (duckdb, dstack, tc-bench-v1, ...) ships in some image.
+all-features = true
+
+[advisories]
+version = 2
+# Baseline: every advisory open against Cargo.lock at ccc14ec4 (advisory-db as
+# of 2026-11-22). Each is known debt to fix by upgrading, not an accepted risk;
+# delete its entry when the upgrade lands. Any advisory not listed here fails
+# the job, so only new ones block. Never add an entry without a security review.
+ignore = [
+    { id = "RUSTSEC-2021-0127", reason = "unmaintained, no fix: serde_cbor 0.11.2 via tinycloudlabs/ssi" },
+    { id = "RUSTSEC-2022-0040", reason = "no fix: owning_ref 0.4.1 via json-ld-context-processing (ssi); none of the unsound OwningRef APIs is called by our code" },
+    { id = "RUSTSEC-2023-0071", reason = "unreachable: rsa 0.9 only generates a key and signs a CSR locally (tinycloud-node-server/src/link/csr.rs), 0.6 via ssi; no network-observable RSA decryption (Marvin needs a decryption oracle); fix is the 0.10 major" },
+    { id = "RUSTSEC-2024-0370", reason = "unmaintained, no fix, build-time only: proc-macro-error (proc macros)" },
+    { id = "RUSTSEC-2024-0384", reason = "unmaintained, no fix: instant 0.1.13 via fastrand 1 / libp2p" },
+    { id = "RUSTSEC-2024-0388", reason = "unmaintained, no fix: derivative via tinycloudlabs/ssi" },
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, no fix, dev/build only: paste via alloy (not in the shipped node graph)" },
+    { id = "RUSTSEC-2024-0437", reason = "unreachable: protobuf 2.28 via prometheus 0.13, which only encodes metrics; the node never parses protobuf input; fix is the 3.x major" },
+    { id = "RUSTSEC-2025-0052", reason = "unmaintained, no fix, dev-only: async-std (not in the shipped node graph)" },
+    { id = "RUSTSEC-2025-0073", reason = "dev-only: alloy-dyn-abi 0.7.7 (not in the shipped node graph)" },
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, no fix: rustls-pemfile 1/2 via reqwest 0.11, rocket_http and tinycloud-node" },
+    { id = "RUSTSEC-2026-0098", reason = "no fix in the 0.101 line: rustls-webpki 0.101.7 via rustls 0.21 (reqwest 0.11, rocket_http); needs CA misissuance" },
+    { id = "RUSTSEC-2026-0099", reason = "no fix in the 0.101 line: rustls-webpki 0.101.7 via rustls 0.21; needs CA misissuance" },
+    { id = "RUSTSEC-2026-0104", reason = "unreachable: CRL parsing in rustls-webpki 0.101.7; the node never loads CRLs; no fix in the 0.101 line" },
+    { id = "RUSTSEC-2026-0105", reason = "unmaintained (yanked), no fix: core2 0.4 via cid/multihash" },
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained, no fix, build-time only: proc-macro-error2 via sea-bae (proc macro)" },
+    { id = "RUSTSEC-2026-0190", reason = "unreachable: anyhow Error::downcast_mut after context; no downcast_mut anywhere in the workspace" },
+    { id = "RUSTSEC-2026-0215", reason = "unmaintained, no fix: smallstr via json-syntax (ssi)" },
+    { id = "RUSTSEC-2026-0220", reason = "dev-only: ruint via alloy (not in the shipped node graph)" },
+    { id = "RUSTSEC-2026-0247", reason = "unmaintained, no fix: bitmaps via im (ssi linked-data)" },
+    { id = "RUSTSEC-2026-0248", reason = "unmaintained, no fix: im via linked-data (ssi)" },
+    { id = "RUSTSEC-2026-0251", reason = "unmaintained, no fix: sized-chunks via im (ssi linked-data)" },
+    { id = "RUSTSEC-2026-0283", reason = "unmaintained, no fix: clear_on_drop via ssi-jws" },
+    { id = "RUSTSEC-2026-0346", reason = "unreachable: rustls Debug of client session values only leaks via a custom ClientSessionStore that logs them; the workspace has none" },
+    { id = "RUSTSEC-2026-0347", reason = "unreachable: rustls ECH rejection path; the node never configures Encrypted Client Hello" },
+    { id = "RUSTSEC-2026-0348", reason = "unreachable: rustls brotli certificate decompression; the brotli feature is not enabled" },
+    { id = "RUSTSEC-2026-0367", reason = "build-time only: zip 6 in the libduckdb-sys build script (not in the shipped node graph)" },
+    { id = "RUSTSEC-2026-0368", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
+    { id = "RUSTSEC-2026-0369", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
+    { id = "RUSTSEC-2026-0386", reason = "unreachable: tokio AsyncFd::new I/O-safety; no AsyncFd anywhere in the workspace" },
+    { id = "RUSTSEC-2026-0387", reason = "no fix in the used lines (0.3/0.5; fix is the 0.7 major, behind elliptic-curve 0.13/der 0.5); the only secret use is one-shot k256 app-key derivation at startup (dstack_kms.rs), not network-timeable" },
+    { id = "RUSTSEC-2026-0429", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no fix: pin-utils via futures/aws-smithy" },
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no fix: chrono (pervasive: arrow, sqlx, ssi, ...)" },
+    { id = "RUSTSEC-2026-0545", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
+    { id = "RUSTSEC-2026-0547", reason = "build-time only: zip 6 in the libduckdb-sys build script (legacy-zip feature off)" },
+    { id = "RUSTSEC-2026-0548", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: fix needs sqlx upgrade (vendored sqlx 0.8.6); reachability check with the node lead (does the node open an attacker-supplied SQLite DB + WAL pair?)" },
+    # Old lines with no fix. cargo-deny ignores by advisory ID only, so these
+    # four IDs are listed here and their fixable newer lines are held below
+    # the fix by [bans] deny instead: a fixable instance still fails the job.
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12: no fix in this line; clears when reqwest 0.11 and rocket_http are removed (0.23 line held >= 0.23.46 by [bans])" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7: no fix in this line; clears when reqwest 0.11 and rocket_http are removed (0.103 line held >= 0.103.16 by [bans])" },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.25.4: no fix in this line; clears when reqwest 0.11 and rocket_http are removed (1.x line held >= 1.0.10 by [bans])" },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27: no fix in this line; clears when reqwest 0.11 and rocket_http are removed (0.4 line held >= 0.4.16 by [bans])" },
+]
+
+[bans]
+multiple-versions = "warn"
+# Floors for the fixable lines of the four advisory IDs ignored above for their
+# unfixable old lines. Delete an entry with its ignore when the old line goes.
+deny = [
+    { crate = "rustls:>=0.22, <0.23.46", reason = "RUSTSEC-2026-0349 is fixed in 0.23.46" },
+    { crate = "rustls-webpki:>=0.102, <0.103.16", reason = "RUSTSEC-2026-0382 is fixed in 0.103.16" },
+    { crate = "webpki-roots:>=1.0.0, <1.0.10", reason = "RUSTSEC-2026-0381 is fixed in 1.0.10" },
+    { crate = "h2:>=0.4.0, <0.4.16", reason = "RUSTSEC-2026-0258 is fixed in 0.4.16" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Baseline: the git sources in Cargo.lock at ccc14ec4.
+allow-git = [
+    "https://github.com/tinycloudlabs/ssi",
+    "https://github.com/tinycloudlabs/ucan-capabilities-object",
+    # Cargo.toml [patch.crates-io] security patch, pinned to tag v0.4.11.
+    "https://github.com/tokio-rs/slab",
+]

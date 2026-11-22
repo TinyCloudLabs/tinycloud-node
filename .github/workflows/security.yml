@@ -1,0 +1,91 @@
+name: security
+
+# Pre-release security checks. Both jobs run on every PR to main and every push
+# to main, with no path filter, so they can be required checks. Tools are
+# pinned release binaries whose sha256 is checked before use; any missing tool
+# or failed check fails the job. See docs/security/required-checks.md.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Secret scan. A PR scans only its own commits (base..head); main scans the
+  # whole history against the reviewed baseline in .gitleaksignore. The
+  # did:key allowlist lives in .gitleaks.toml.
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Install pinned gitleaks
+      run: |
+        set -euo pipefail
+        tool_dir="${RUNNER_TEMP}/gitleaks"
+        mkdir -p "${tool_dir}"
+        curl --fail --location --silent --show-error \
+          https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+          --output "${tool_dir}/gitleaks.tar.gz"
+        echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  ${tool_dir}/gitleaks.tar.gz" | sha256sum --check -
+        tar -xzf "${tool_dir}/gitleaks.tar.gz" -C "${tool_dir}" gitleaks
+        echo "${tool_dir}" >> "${GITHUB_PATH}"
+    - name: Scan for secrets
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        gitleaks version
+        args=(git --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner --exit-code 1)
+        if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+          [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ && "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::PR base/head SHA missing"; exit 1; }
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          gitleaks "${args[@]}" --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+        else
+          gitleaks "${args[@]}" .
+        fi
+
+  # Whole-workspace dependency policy (deny.toml): RustSec advisories, bans and
+  # sources, with every feature enabled. deny.toml lists the advisories open
+  # when this job was added, so a new advisory fails it. The tinycloud-threshold
+  # crate keeps its stricter policy in rust.yml's `threshold` job.
+  cargo-deny:
+    name: cargo-deny (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
+    - name: Install pinned cargo-deny
+      run: |
+        set -euo pipefail
+        tool_dir="${RUNNER_TEMP}/cargo-deny"
+        mkdir -p "${tool_dir}"
+        curl --fail --location --silent --show-error \
+          https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+          --output "${tool_dir}/cargo-deny.tar.gz"
+        echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  ${tool_dir}/cargo-deny.tar.gz" | sha256sum --check -
+        tar -xzf "${tool_dir}/cargo-deny.tar.gz" --strip-components=1 -C "${tool_dir}"
+        echo "${tool_dir}" >> "${GITHUB_PATH}"
+    - name: Check workspace advisories, bans and sources
+      run: cargo deny --workspace --locked check advisories bans sources
