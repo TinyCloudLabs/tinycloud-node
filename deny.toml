@@ -52,7 +52,7 @@ ignore = [
     { id = "RUSTSEC-2026-0545", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
     { id = "RUSTSEC-2026-0547", reason = "build-time only: zip 6 in the libduckdb-sys build script (legacy-zip feature off)" },
     { id = "RUSTSEC-2026-0548", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
-    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: fix needs sqlx upgrade (vendored sqlx 0.8.6); reachability check with the node lead (does the node open an attacker-supplied SQLite DB + WAL pair?)" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1: unreachable by tenants (node lead, 2026-11-22): SQLite only opens db+WAL pairs the node's own SQLite wrote; tenant SQL cannot ATTACH, VACUUM INTO or set page_size; no raw-SQLite import. Fix needs the vendored sqlx upgrade (still wanted)" },
     # Old lines with no fix. cargo-deny ignores by advisory ID only, so these
     # four IDs are listed here and their fixable newer lines are held below
     # the fix by [bans] deny instead: a fixable instance still fails the job.
