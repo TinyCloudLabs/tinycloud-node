@@ -61,10 +61,9 @@ pub(super) async fn require_unconstrained_chain(
     parents: &[tinycloud_auth::authorization::Cid],
 ) -> Result<(), (Status, String)> {
     use tinycloud_core::{hash::Hash, models::abilities, relationships::parent_delegations};
-    let conn = tinycloud
-        .readable()
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let conn = tinycloud.readable().await.map_err(super::internal_error(
+        tinycloud_core::failure_diagnostic::ErrorCode::ReadTxError,
+    ))?;
     let mut frontier: Vec<Hash> = parents.iter().copied().map(Hash::from).collect();
     let mut visited = HashSet::new();
     while !frontier.is_empty() {
