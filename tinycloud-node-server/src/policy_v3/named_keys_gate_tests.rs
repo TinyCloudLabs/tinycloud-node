@@ -605,6 +605,54 @@ async fn a_start_with_an_empty_ledger_changes_nothing(backend: Backend) -> anyho
 }
 on_both_backends!(a_start_with_an_empty_ledger_changes_nothing);
 
+/// The three key caps a node starts with come from its configuration.
+async fn configured_key_caps_bound_the_service_the_node_starts(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{key_id::KeyLocation, EncryptionServiceError};
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "configured_key_caps_bound_the_service_the_node_starts",
+        |config| {
+            config.encryption_network.key_cap_per_network = Some(2);
+            config.encryption_network.key_cap_per_app_prefix = Some(1);
+            config.encryption_network.key_cap_secrets = Some(1);
+        },
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let network = network_with_keys(&h, &["apps/a/x", "secrets/a"]).await?;
+    let service = h
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    let create = |path: &'static str, deletable: bool| {
+        let loc = KeyLocation::new(&network, path).expect("a valid key path");
+        async move { service.create_key(&loc, deletable).await.map(|_| ()) }
+    };
+    assert!(matches!(
+        create("apps/a/y", true).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    assert!(matches!(
+        create("secrets/b", true).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    create("docs/a", false)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert!(matches!(
+        create("docs/b", false).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    Ok(())
+}
+on_both_backends!(configured_key_caps_bound_the_service_the_node_starts);
+
 /// The events a test run logged, with their fields.
 #[derive(Clone, Default)]
 struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);

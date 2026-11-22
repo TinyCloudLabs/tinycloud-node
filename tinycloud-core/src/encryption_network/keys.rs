@@ -7,25 +7,31 @@
 //! create, block and unblock writes all run under the network row lock.
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
-    DatabaseTransaction, DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+    sea_query::{Alias, Expr, Func, SimpleExpr},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter, QuerySelect,
 };
 
 use crate::db::begin_write_transaction;
 use crate::models::{encryption_network, encryption_network_key, encryption_network_member};
 
 use super::backend::{KeyBackendError, KeySeed, KeyWrapContext, KeyWrapPurpose};
-use super::key_id::{app_id_of, EncryptionResource, KeyKind, KeyLocation};
+use super::key_id::{app_id_of, is_secrets_path, EncryptionResource, KeyKind, KeyLocation};
 use super::network_id::NetworkId;
 use super::service::{is_unique_violation, now_rfc3339, EncryptionService, EncryptionServiceError};
 use super::types::{NetworkState, ALG_X25519_AES256GCM};
 
-/// Interim hard cap per network. Counts every key row per network, deleted
-/// rows included. Placeholder value pending the node-config owner.
+/// Default cap on live keys per network outside `secrets`. Deleted rows do
+/// not count; keys at or under `secrets` count against their own cap.
 pub const DEFAULT_KEY_CAP_PER_NETWORK: u64 = 1000;
-/// Interim hard cap per `apps/<app id>/` prefix. Counts every key row under
-/// the prefix, deleted rows included, until a deleted row is reused.
+/// Default cap on live keys under one `apps/<app id>/` prefix. Deleted rows
+/// do not count.
 pub const DEFAULT_KEY_CAP_PER_APP_PREFIX: u64 = 100;
+/// Default cap on live keys at or under `secrets` per network. Deleted rows
+/// do not count; these keys do not count against the per-network cap.
+pub const DEFAULT_KEY_CAP_SECRETS: u64 = 1000;
 const KEY_VERSION_INITIAL: i64 = 1;
 
 /// Key row state. Any stored state other than `active`, `blocked` or `deleted`
@@ -311,6 +317,9 @@ impl EncryptionService {
         if let Some(row) = find_key_row(tx, network, loc.path()).await? {
             let checked = check_row(row)?;
             if checked.state == KeyState::Deleted && checked.kind == KeyKind::Deletable {
+                // A deleted row is not counted, so its reinstall is checked
+                // like a new row.
+                self.check_key_caps(tx, network, loc).await?;
                 return self.reinstall_key_in(tx, &net, loc, checked.row).await;
             }
             return Ok(CreateStep::Existing(checked.row));
@@ -367,31 +376,45 @@ impl EncryptionService {
         }
     }
 
-    /// The per-network and per-app-prefix caps for a new row.
+    /// The caps a new or reinstalled row must fit under. Only live rows
+    /// count (`state <> 'deleted'`; blocked rows count). A key at or under
+    /// `secrets` counts against the secrets cap and not the per-network cap.
+    /// Every other key counts against the per-network cap, and one under
+    /// `apps/<app id>/` also against that prefix's cap, `apps/<app id>/secrets/`
+    /// included.
     async fn check_key_caps(
         &self,
         tx: &DatabaseTransaction,
         network: &NetworkId,
         loc: &KeyLocation,
     ) -> Result<(), EncryptionServiceError> {
-        let count = encryption_network_key::Entity::find()
-            .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-            .count(tx)
-            .await?;
-        if count >= self.key_cap_per_network {
+        let live = || {
+            encryption_network_key::Entity::find()
+                .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
+                .filter(encryption_network_key::Column::State.ne(KeyState::Deleted.as_str()))
+        };
+        let in_secrets = encryption_network_key::Column::KeyPath
+            .eq("secrets")
+            .or(path_starts_with("secrets/"));
+        let (count, cap) = if is_secrets_path(loc.path()) {
+            (
+                live().filter(in_secrets).count(tx).await?,
+                self.key_cap_secrets,
+            )
+        } else {
+            (
+                live().filter(in_secrets.not()).count(tx).await?,
+                self.key_cap_per_network,
+            )
+        };
+        if count >= cap {
             return Err(EncryptionServiceError::KeyLimitExceeded);
         }
         if let Some(app_id) = app_id_of(loc.path()) {
-            let prefix = format!("apps/{app_id}/");
-            // Compared as bytes here, never with a LIKE pattern or a range.
-            let paths: Vec<String> = encryption_network_key::Entity::find()
-                .select_only()
-                .column(encryption_network_key::Column::KeyPath)
-                .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-                .into_tuple()
-                .all(tx)
+            let under_prefix = live()
+                .filter(path_starts_with(&format!("apps/{app_id}/")))
+                .count(tx)
                 .await?;
-            let under_prefix = paths.iter().filter(|p| p.starts_with(&prefix)).count() as u64;
             if under_prefix >= self.key_cap_per_app_prefix {
                 return Err(EncryptionServiceError::KeyLimitExceeded);
             }
@@ -660,6 +683,19 @@ pub async fn ensure_no_deterministic_app_keys<C: ConnectionTrait>(
         return Err(EncryptionServiceError::StraySecretKeyRows(secrets));
     }
     Ok(())
+}
+
+/// `substr(key_path, 1, n) = prefix`: an exact comparison of the first n
+/// characters, the same SQL on SQLite and PostgreSQL. Never `LIKE` (it treats
+/// `_` and `%` as wildcards, and SQLite's ignores case) and never a range
+/// (collation dependent). Key paths are ASCII, so characters are bytes.
+pub(super) fn path_starts_with(prefix: &str) -> SimpleExpr {
+    Expr::expr(Func::cust(Alias::new("substr")).args([
+        Expr::col(encryption_network_key::Column::KeyPath).into(),
+        SimpleExpr::from(1i32),
+        SimpleExpr::from(prefix.len() as i32),
+    ]))
+    .eq(prefix.to_string())
 }
 
 /// Rows at the path `segment` or under `segment/` whose kind is not

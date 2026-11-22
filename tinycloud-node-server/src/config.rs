@@ -160,6 +160,11 @@ pub struct ColumnEncryptionConfig {
 /// `deletion_ledger_path` is the append-only file, outside the database, that
 /// records every deleted key (one JSON line each). It is required while
 /// `named_keys_v1` is on, and must be an absolute path.
+///
+/// `key_cap_per_network`, `key_cap_per_app_prefix` and `key_cap_secrets` cap
+/// the live (not deleted) named keys of one network: outside `secrets`,
+/// under one `apps/<app id>/` prefix, and at or under `secrets`. Unset means
+/// the node's default (1000, 100, 1000); a set value must be above 0.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
@@ -172,12 +177,27 @@ pub struct EncryptionNetworkConfig {
     pub key_wrap_require_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub key_cap_per_network: Option<u64>,
+    #[serde(default)]
+    pub key_cap_per_app_prefix: Option<u64>,
+    #[serde(default)]
+    pub key_cap_secrets: Option<u64>,
 }
 
 impl EncryptionNetworkConfig {
     /// Startup validation. Does not touch the filesystem; the ledger file is
     /// opened when the node starts.
     pub fn validate(&self) -> Result<(), String> {
+        for (name, cap) in [
+            ("key_cap_per_network", self.key_cap_per_network),
+            ("key_cap_per_app_prefix", self.key_cap_per_app_prefix),
+            ("key_cap_secrets", self.key_cap_secrets),
+        ] {
+            if cap == Some(0) {
+                return Err(format!("encryption_network.{name} must be above 0"));
+            }
+        }
         match (&self.deletion_ledger_path, self.named_keys_v1) {
             (None, true) => Err(
                 "encryption_network.deletion_ledger_path is required when named_keys_v1 is on"
@@ -2791,8 +2811,34 @@ mod tests {
                 key_wrap_v2: false,
                 key_wrap_require_v2: false,
                 deletion_ledger_path: Some(bad.into()),
+                ..Default::default()
             };
             assert!(config.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_caps_are_unset_by_default_and_refuse_zero() {
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert_eq!(default.key_cap_per_network, None);
+        assert_eq!(default.key_cap_per_app_prefix, None);
+        assert_eq!(default.key_cap_secrets, None);
+        let set: EncryptionNetworkConfig = toml::from_str(
+            "key_cap_per_network = 5\nkey_cap_per_app_prefix = 2\nkey_cap_secrets = 3",
+        )
+        .unwrap();
+        assert_eq!(set.key_cap_per_network, Some(5));
+        assert_eq!(set.key_cap_per_app_prefix, Some(2));
+        assert_eq!(set.key_cap_secrets, Some(3));
+        assert!(set.validate().is_ok());
+        for name in [
+            "key_cap_per_network",
+            "key_cap_per_app_prefix",
+            "key_cap_secrets",
+        ] {
+            let zero: EncryptionNetworkConfig = toml::from_str(&format!("{name} = 0")).unwrap();
+            let err = zero.validate().unwrap_err();
+            assert!(err.contains(name) && err.contains("above 0"), "{err}");
         }
     }
 
