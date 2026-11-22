@@ -9962,7 +9962,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.26.18"
+version = "1.26.19"
 dependencies = [
  "aes-gcm",
  "anyhow",
