@@ -111,6 +111,55 @@ enum NodeCommand {
     DeletionLedger(DeletionLedgerArgs),
     /// The space purge ledger (TC-2871).
     PurgeLedger(PurgeLedgerArgs),
+    /// The SQL-store shadow copy (TC-1491).
+    SqlStore(SqlStoreArgs),
+}
+
+#[derive(Debug, Args)]
+struct SqlStoreArgs {
+    #[command(subcommand)]
+    command: SqlStoreCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SqlStoreCommand {
+    /// Restore a sample of allowlisted databases from their published
+    /// frontier and compare each with Postgres at the same revision. Prints
+    /// a per-database report; fails when any database is `mismatch` or
+    /// `unreadable`.
+    RestoreCheck(RestoreCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct RestoreCheckArgs {
+    /// Base config file to load (database, stores and `[sql_store] spaces`
+    /// come from it).
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Databases to check, chosen uniformly over the allowlisted spaces.
+    #[arg(long, default_value_t = 10)]
+    sample: usize,
+
+    /// Seed for the sample (a fixed seed checks the same databases again).
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Scratch directory; defaults to `{storage.datadir}/sql-store-restore-check`.
+    #[arg(long = "scratch-dir")]
+    scratch_dir: Option<PathBuf>,
+
+    /// Bytes the scratch copies may hold at once; defaults to
+    /// `[sql_store] spool_cap`.
+    #[arg(long = "scratch-bytes")]
+    scratch_bytes: Option<u64>,
+
+    /// Write the run's metrics to this Prometheus textfile.
+    #[arg(long = "metrics-file")]
+    metrics_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    json: JsonArgs,
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +327,9 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Tunnel(args) => run_tunnel(args.command),
         NodeCommand::DeletionLedger(args) => run_deletion_ledger(args.command),
         NodeCommand::PurgeLedger(args) => run_purge_ledger(args.command),
+        NodeCommand::SqlStore(args) => match args.command {
+            SqlStoreCommand::RestoreCheck(args) => block_on(sql_store_restore_check(args)),
+        },
     }
 }
 
@@ -417,6 +469,36 @@ async fn reconcile_purge_ledger(args: PurgeReconcileArgs) -> Result<()> {
     let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
     let report = crate::reconcile_purge_ledger(&config).await?;
     emit_json(&report, args.json.json)
+}
+
+async fn sql_store_restore_check(args: RestoreCheckArgs) -> Result<()> {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| runtime::serve_profile_config_path(Profile::default_for_host()));
+    let figment = runtime::serve_config_figment(&config_path)?;
+    let config = crate::resolve_runtime_config(&figment.extract::<crate::config::Config>()?)?;
+    let options = crate::sql_restore_check::RestoreCheckOptions {
+        sample: args.sample,
+        seed: args.seed,
+        scratch_dir: args
+            .scratch_dir
+            .unwrap_or_else(|| config.storage.datadir.join("sql-store-restore-check")),
+        scratch_bytes: args
+            .scratch_bytes
+            .unwrap_or_else(|| config.sql_store.spool_cap.as_u64()),
+        metrics_file: args.metrics_file,
+    };
+    let report = crate::sql_restore_check::run(&config, &options).await?;
+    emit_json(&report, args.json.json)?;
+    if !report.passed() {
+        anyhow::bail!(
+            "restore check failed: {} mismatch, {} unreadable of {} sampled",
+            report.mismatch,
+            report.unreadable,
+            report.sampled
+        );
+    }
+    Ok(())
 }
 
 fn emit_json<T: serde::Serialize>(value: &T, json: bool) -> Result<()> {
