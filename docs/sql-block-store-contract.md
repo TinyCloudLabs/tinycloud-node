@@ -159,7 +159,10 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:
   **only while nothing in the system deletes SQL objects** (this phase);
   slice 4 must require the conditional PUT, or a generation/pin fence, before
   `AlreadyPresent` may count toward a publish (the race TC-735 had).
-  `get_to_file(key, path)` is the streaming read; it verifies the SHA-256.
+  `get_to_file(key, path, max_bytes)` is the streaming read; it verifies the
+  SHA-256, stops with `Oversize` once more than `max_bytes` arrive (a caller
+  passes the inventory's recorded size), and empties the target file on any
+  error, so a refused download is never read.
 - **Orphan = an object not referenced by any published manifest frontier.** A
   PUT that completed but whose CAS did not (crash, lost response, lost the
   race) is an orphan. Nothing reads it. This phase neither marks nor deletes
@@ -490,7 +493,8 @@ pub trait SqlObjectStore: Send + Sync {
     async fn put_file(&self, key: &ObjectKey, path: &Path, size: u64)
         -> Result<PutOutcome, SqlStoreError>;
     /// Stream the whole object into `path`, verified; None when absent.
-    async fn get_to_file(&self, key: &ObjectKey, path: &Path)
+    /// More than `max_bytes` => Err(Oversize). On any Err `path` is emptied.
+    async fn get_to_file(&self, key: &ObjectKey, path: &Path, max_bytes: u64)
         -> Result<Option<ObjectMeta>, SqlStoreError>;
     async fn get_range(&self, key: &ObjectKey, range: ByteRangeSpec)
         -> Result<Option<ObjectRange>, SqlStoreError>;   // reuses storage::ByteRangeSpec
@@ -640,12 +644,9 @@ transaction is rejected before COMMIT, counted against an external ack log.
 
 **Slice 1b tests (separate PR):** fault-injecting `SqlObjectStore` /
 `SqlManifest` wrappers drive every row above in process; `kill -9` of a real
-node at PUT, `I`, CAS and drain. Nightly **restore check**: rebuild sampled
-databases from the published chain onto an empty disk, `PRAGMA
-integrity_check` = `ok`, and per-table row count + ordered row digest equal to
-`P` replayed to the same `seq` (or restricted to databases quiescent for a
-window). Flag-off test: no store requests, no manifest queries. Allowlist test:
-empty allowlist uploads nothing even with `enabled = true`.
+node at PUT, `I`, CAS and drain. Nightly **restore check**: see 8.1. Flag-off
+test: no store requests, no manifest queries. Allowlist test: empty allowlist
+uploads nothing even with `enabled = true`.
 
 **Slice 0 tests (this PR):** key properties (injective over the generated
 space/db/lineage/seq/hash domain; **also injective after ASCII case folding**;
@@ -659,6 +660,64 @@ rejected, concurrent publishers yield exactly one winner, segment gap and
 keeps `revision` monotonic, first publish is `ON CONFLICT DO NOTHING`, a
 conditional state flip with 0 rows rolls the CAS back, orphan revive;
 migration idempotence and MySQL DDL (section 7).
+
+### 8.1 Restore check (TC-1491 P2)
+
+`tinycloud node sql-store restore-check` (`shadow::restore` in the core,
+`sql_restore_check` in the node) gates turning the shadow on for a space. It
+samples up to `--sample` databases (reservoir sampling over keyset pages of
+the manifest primary key) from `[sql_store] spaces`, which it reads whether
+or not the store is enabled, and checks each:
+
+1. **Frontier only.** It reads the manifest row and resolves the chain of
+   4.2 by primary-key lookups in `sql_store_object`: the base snapshot by its
+   full key (rebuilt from the frontier's columns and the hash its key ends
+   in), and for `last_seq > base_seq` the published `wal-cum-v1` segment
+   `base_seq+1 ..= last_seq` by the key prefix `(space, db_id, lineage,
+   'segment', base_seq, from_seq, to_seq)`. Restore = snapshot + that one
+   segment. A frontier at `last_seq = 0` is `unreadable` (a snapshot at
+   `at_seq = 0` is never a restore point, 4.2 and 11.6). Without the segment,
+   the reason names the highest published `to_seq` on the base (the
+   shortfall). Every key read from the manifest or the inventory must start
+   with the database's own `{db_prefix}{lineage}/`, else `unreadable: key
+   outside db prefix`. The formats, `published` state and `frontier_bytes`
+   must agree with the inventory.
+2. **Same revision or nothing.** Postgres's head must be at revision
+   `last_seq` with the frontier's checkpoint CID; otherwise the database is
+   `not_comparable` ("not comparable at this revision") and nothing is read.
+   The check never compares across revisions.
+3. **Restore.** Scratch space for both copies is reserved from a disk budget
+   (`--scratch-dir`, `--scratch-bytes`) before streaming. Scratch holds
+   tenant databases in plaintext: every scratch directory is `0700`, every
+   file `0600`, and each directory is removed by its drop guard on every exit
+   path (success, error, early return). The snapshot and the
+   segment are streamed with `get_to_file`, capped at their recorded sizes; a
+   refused download is removed and never opened. Before SQLite opens the
+   pair, the database header and the WAL are checked: page sizes equal (the
+   guard against RUSTSEC-2026-0459, libsqlite3-sys < 0.39), WAL magic,
+   version, header checksum, every frame's salts, page number and cumulative
+   checksum, whole frames ending on a commit. SQLite would otherwise ignore a
+   bad header or stop at the first bad frame and silently restore an older
+   state. Then `wal_checkpoint(PASSIVE)` must have replayed every frame,
+   `wal_checkpoint(TRUNCATE)` must report `busy = 0` and `log =
+   checkpointed` and leave the WAL empty, and `PRAGMA integrity_check` must
+   be exactly `ok`.
+4. **Compare.** Postgres's checkpoint and WAL are streamed through
+   `ShadowSource` and materialised the same way; the SHA-256 of the two
+   materialised files must be equal.
+
+Results per database: `ok`; `mismatch` (a sound restore that differs from
+Postgres); `not_comparable`; `unreadable` (missing or refused objects, chain
+faults, a refused WAL, an SQLite error or an integrity failure). Reasons are
+fixed phrases with numbers; the report carries no keys, SQL or payload
+bytes. `segments_unverified` = segments the frontier needs minus segments
+streamed, checked and replayed; it is computed per database and summed.
+Metrics (`--metrics-file`, a node-exporter textfile):
+`sql_store_restore_checks_total{result}`,
+`sql_store_restore_segments_unverified_total`,
+`sql_store_restore_check_seconds`. The command fails (exit 1) when any
+database is `mismatch` or `unreadable`; `not_comparable` is reported, not
+failed.
 
 ## 9. Open decisions and gates
 

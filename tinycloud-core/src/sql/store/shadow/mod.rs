@@ -11,6 +11,8 @@
 //! - `budget`: scratch-disk reservations for streamed uploads.
 //! - `scan`: the durable lag scan (artifact head vs manifest frontier).
 //! - `scheduler`: the one task that steps the machines, runs uploads and drains.
+//! - `restore`: the restore check (P2): rebuild a database from its frontier
+//!   and compare it with Postgres at the same revision.
 //!
 //! `NoopSink` is the default; every `SqlService` holds one unless the node
 //! runtime builds a shadow handle and calls `SqlService::with_shadow`.
@@ -22,6 +24,7 @@ pub mod budget;
 pub mod machine;
 pub mod metrics;
 pub mod owner;
+pub mod restore;
 pub mod scan;
 pub mod scheduler;
 pub mod source;

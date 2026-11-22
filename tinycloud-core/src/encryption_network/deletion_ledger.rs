@@ -347,7 +347,9 @@ impl DeletionLedger {
     }
 
     /// [`DeletionLedger::open`] with the lock retry interval and limit given.
-    pub(super) fn open_waiting(
+    /// Test seam: production opens with [`DeletionLedger::open`].
+    #[doc(hidden)]
+    pub fn open_waiting(
         path: &Path,
         lock_interval: Duration,
         lock_limit: Duration,

@@ -236,10 +236,9 @@ While the node runs, the ledger is locked: it takes an exclusive lock (`flock`)
 on the file `<deletion_ledger_path>.lock`, created with mode 0600 and never
 removed. A second process that opens the same ledger tries the lock every
 500 ms for up to 60 seconds and logs `deletion_ledger_lock_wait` once. After
-that it fails to open the ledger: the node logs `deletion_ledger_open_failed`
-with `error_kind` `lock_held`, the named-key routes stay off, and the rest of
-the node serves. A failed append that could not be cut back logs
-`deletion_ledger_unrepaired`, and later appends fail.
+that it fails to open the ledger with `error_kind` `lock_held`, which is
+handled as any other open failure (below). A failed append that could not be
+cut back logs `deletion_ledger_unrepaired`, and later appends fail.
 
 The node image contains the directory `/var/lib/tinycloud/ledger`, owned by
 uid 1000 (the node's user) with mode 0700; a volume mounted there is writable
@@ -248,10 +247,13 @@ by the node.
 At every start, before any route is served, the node replays the ledger onto
 the database (as `tinycloud node deletion-ledger replay` does) and closes each
 operation that was still open with a `committed` line. If the ledger cannot be
-opened or replayed, the named-key routes stay off, as with `named_keys_v1` off,
-the node logs the event `deletion_ledger_open_failed` or
-`deletion_ledger_replay_failed` with an `error_kind`, and the rest of the node
-serves.
+opened or replayed, the node logs the event `deletion_ledger_open_failed` or
+`deletion_ledger_replay_failed` with an `error_kind`, and then:
+
+- with `named_keys_v1` on, the start fails with an error naming the event, the
+  ledger path and the `error_kind`; the node never serves with the gate quietly
+  off;
+- with `named_keys_v1` off, the rest of the node starts and serves.
 
 **When restoring the node DB from a PlanetScale backup, keep the node's existing disk (and its ledger) in place and boot normally, so the ledger replay re-shreds keys deleted after the backup. Never restore the DB onto a fresh disk without the ledger unless you accept that later deletions are undone.**
 
