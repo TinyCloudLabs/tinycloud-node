@@ -85,10 +85,10 @@ on:
         type: boolean
         default: true
       named_keys_v1:
-        description: 'Turn on named keys (TC-1777): sets NAMED_KEYS_V1 in the sealed Phala env. false keeps the routes off.'
+        description: 'Named keys (TC-1777): sets NAMED_KEYS_V1 in the sealed Phala env. Production runs true; false turns the routes off and breaks Share v3 decrypt (TC-3284).'
         required: false
         type: boolean
-        default: false
+        default: true
       image_version:
         description: 'Image version without leading v. Builds must match the selected crate; digest promotions must match the recorded image version (rollback_image_version when supplied).'
         required: false
@@ -1431,6 +1431,45 @@ jobs:
               exit 1
               ;;
           esac
+
+      # TC-3284: a clean boot does not prove the named-keys gate is on. A
+      # deletion ledger that cannot be opened or replayed leaves the node
+      # serving with the gate off, and a dispatch with the wrong input turns
+      # it off (Share v3 decrypt and per-secret keys stop). Both hostnames
+      # must list `encryption-named-keys-v1` in /info exactly when the input
+      # asked for it; otherwise the deploy fails. An image built before the
+      # feature, or the captured pre-N0 rollback (its compose has no gate), is
+      # not checked.
+      - name: Verify named-keys gate
+        if: ${{ success() && !inputs.rollback_pre_n0 }}
+        env:
+          IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
+          NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+        run: |
+          set -euo pipefail
+          case "${NAMED_KEYS_V1}" in true) WANT=1 ;; false) WANT=0 ;; *) echo "::error::named_keys_v1 must be exactly true or false"; exit 1 ;; esac
+          if ! git cat-file -e "${IMAGE_REVISION}^{commit}"; then
+            echo "::error::Image revision ${IMAGE_REVISION} is not in this checkout's history."
+            exit 1
+          fi
+          if ! git grep -q encryption-named-keys-v1 "${IMAGE_REVISION}" -- tinycloud-node-server/src/routes/mod.rs; then
+            echo "Image revision ${IMAGE_REVISION} predates the named-keys feature; not checked."
+            exit 0
+          fi
+          for host in node.tinycloud.xyz tee.node.tinycloud.xyz; do
+            LISTED=""
+            for attempt in $(seq 1 6); do
+              LISTED="$(curl -fsS --max-time 10 "https://${host}/info" | jq -r '[.features[]? | select(. == "encryption-named-keys-v1")] | length' || true)"
+              if [ -n "${LISTED}" ]; then break; fi
+              sleep 5
+            done
+            if [ "${LISTED}" != "${WANT}" ]; then
+              echo "::error::${host} /info lists encryption-named-keys-v1 ${LISTED:-unreadable} time(s), expected ${WANT} for named_keys_v1=${NAMED_KEYS_V1}. Check Better Stack for deletion_ledger_open_failed / deletion_ledger_replay_failed."
+              exit 1
+            fi
+            echo "${host}: named-keys gate matches named_keys_v1=${NAMED_KEYS_V1}."
+            echo "Named-keys gate on ${host}: \`${NAMED_KEYS_V1}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Report unverified storage overrides
         if: >-
