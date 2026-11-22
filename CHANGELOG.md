@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- With `named_keys_v1` on, a deletion ledger that cannot be opened (including a lock another process holds past the 60-second wait) or replayed now stops the node from starting, with an error naming `deletion_ledger_open_failed` or `deletion_ledger_replay_failed`, the ledger path and the `error_kind`. Before, the node started with the named-key routes quietly off and `/info` without `encryption-named-keys-v1`. With `named_keys_v1` off, a failing ledger is logged and the node serves, as before. No config change, no migration. Details: TC-3284.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;

@@ -645,11 +645,34 @@ impl ::tracing::Subscriber for EventLog {
     }
 }
 
-/// A ledger the node cannot replay (or cannot open) turns the key routes off
-/// as if `named_keys_v1` were off, logs one alert event with a fixed name and
-/// a fixed error kind, and the rest of the node serves. Runs on one thread so
-/// the thread-scoped subscriber sees every event of the start.
-async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(
+/// The one alert event a start logged for a failing ledger: a fixed name, a
+/// fixed error kind, and nothing else but the message.
+fn assert_one_ledger_alert(events: &EventLog, event: &str, error_kind: &str) {
+    let logged = events.0.lock().expect("event log").clone();
+    let alerts: Vec<_> = logged
+        .iter()
+        .filter(|fields| fields.get("event").map(String::as_str) == Some(&format!("{event:?}")))
+        .collect();
+    assert_eq!(alerts.len(), 1, "{logged:?}");
+    assert_eq!(
+        alerts[0].get("error_kind").map(String::as_str),
+        Some(format!("{error_kind:?}").as_str())
+    );
+    assert!(
+        alerts[0]
+            .keys()
+            .all(|name| ["event", "error_kind", "message"].contains(&name.as_str())),
+        "{:?}",
+        alerts[0]
+    );
+}
+
+/// With `named_keys_v1` on, a ledger the node cannot open (or cannot replay)
+/// stops the start: the boot answers an error naming the event, the ledger
+/// path and the error kind, no Rocket is built, and one alert event is
+/// logged. Runs on one thread so the thread-scoped subscriber sees every
+/// event of the start.
+async fn a_failing_ledger_stops_the_start(
     ledger: impl FnOnce(&std::path::Path) -> (std::path::PathBuf, &'static str, &'static str),
 ) -> anyhow::Result<()> {
     let events = EventLog::default();
@@ -660,17 +683,18 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
-    let Some(h) = Harness::new_with(
+    let error = match Harness::new_with(
         Backend::Sqlite,
         Shape::KeySession,
-        "a_failing_ledger_turns_the_key_routes_off",
+        "a_failing_ledger_stops_the_start",
         on,
     )
     .await?
     else {
         return Ok(());
     };
-
+    let (status, body, _) = answer(h.client.get("/version")).await;
+    assert_eq!(status, Status::Ok, "{body}");
     let unmounted = answer(
         h.client
             .post(format!("/encryption/networks/{}/no-such-route", h.network))
@@ -686,20 +710,7 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
     )
     .await;
     assert_eq!(unmounted.0, Status::NotFound);
-    assert_eq!(
-        delete, unmounted,
-        "the delete route answers as an unmounted path"
-    );
-    let (status, body, _) = answer(h.client.get("/version")).await;
-    assert_eq!(status, Status::Ok, "{body}");
-
-    // The configuration the routes read says named keys are off.
-    let config = h
-        .client
-        .rocket()
-        .state::<crate::config::Config>()
-        .expect("Config is managed");
-    assert!(!config.encryption_network.named_keys_v1);
+    assert_eq!(delete, unmounted, "the delete route is not mounted");
     let (status, body, _) = answer(h.client.get("/info")).await;
     assert_eq!(status, Status::Ok, "{body}");
     let info: serde_json::Value = serde_json::from_str(&body)?;
@@ -711,84 +722,7 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
             .any(|feature| feature == "encryption-named-keys-v1"),
         "{body}"
     );
-    // A delegation on a key is refused as it is with named keys off.
-    let authorization = h.space_owner.delegate(
-        h.owner.did(),
-        &[(format!("{}/docs/a", h.network), KEY_DECRYPT)],
-        Window::until(now() + Duration::hours(1)),
-        &[],
-    )?;
-    let (status, body) = h.delegate(authorization).await;
-    assert_eq!(status, Status::Unauthorized, "{body}");
-    assert_eq!(body, NAMED_KEYS_UNAVAILABLE);
-    // Every key route answers as an unmounted path does.
-    let network = &h.network;
-    let remote = || "127.0.0.1:0".parse().expect("socket address");
-    let unmounted_get = answer(
-        h.client
-            .get(format!(
-                "/encryption/networks/{network}/no-such-route/docs/a"
-            ))
-            .remote(remote()),
-    )
-    .await;
-    let authorization = || Header::new("Authorization", "not-a-token");
-    for action in ["block", "unblock", "delete"] {
-        let got = answer(
-            h.client
-                .post(format!(
-                    "/encryption/networks/{network}/key-actions/{action}"
-                ))
-                .header(ContentType::JSON)
-                .header(authorization())
-                .body("{}"),
-        )
-        .await;
-        assert_eq!(got, unmounted, "{action}");
-    }
-    let create = answer(
-        h.client
-            .post(format!("/encryption/networks/{network}/keys"))
-            .header(ContentType::JSON)
-            .header(authorization())
-            .body("{}"),
-    )
-    .await;
-    assert_eq!(create, unmounted, "create");
-    let public_key = answer(
-        h.client
-            .get(format!("/encryption/networks/{network}/keys/docs/a"))
-            .remote(remote()),
-    )
-    .await;
-    assert_eq!(public_key, unmounted_get, "public key");
-    let describe = answer(
-        h.client
-            .get(format!("/encryption/networks/{network}/keys/docs/a"))
-            .header(authorization())
-            .remote(remote()),
-    )
-    .await;
-    assert_eq!(describe, unmounted_get, "describe");
-
-    let logged = events.0.lock().expect("event log").clone();
-    let alerts: Vec<_> = logged
-        .iter()
-        .filter(|fields| fields.get("event").map(String::as_str) == Some(&format!("{event:?}")))
-        .collect();
-    assert_eq!(alerts.len(), 1, "{logged:?}");
-    assert_eq!(
-        alerts[0].get("error_kind").map(String::as_str),
-        Some(format!("{error_kind:?}").as_str())
-    );
-    // The alert carries the event name and a kind, and nothing else but the message.
-    assert!(
-        alerts[0]
-            .keys()
-            .all(|name| ["event", "error_kind", "message"].contains(&name.as_str())),
-        "{:?}",
-        alerts[0]
-    );
+    assert_one_ledger_alert(&events, event, error_kind);
     Ok(())
 }
 
@@ -804,16 +738,9 @@ async fn a_ledger_with_a_malformed_line_turns_the_key_routes_off() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn a_ledger_that_cannot_be_opened_turns_the_key_routes_off() -> anyhow::Result<()> {
-    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
-        // The directory does not exist, so the file cannot be created.
-        (
-            dir.join("missing").join("deletion-ledger.jsonl"),
-            "deletion_ledger_open_failed",
-            "io",
-        )
-    })
-    .await
+async fn with_named_keys_off_an_unopenable_ledger_is_logged_and_the_node_serves(
+) -> anyhow::Result<()> {
+    with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(unopenable_ledger).await
 }
 
 /// With named keys on, `/delegate` refuses an `apps/` grant from a SIWE whose

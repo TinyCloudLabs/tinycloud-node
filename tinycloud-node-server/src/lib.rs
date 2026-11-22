@@ -866,6 +866,25 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
     routes
 }
 
+/// Opens the deletion ledger for a node start. Unit tests wait for a held
+/// lock for a fraction of a second instead of a minute.
+fn open_deletion_ledger(
+    path: &std::path::Path,
+) -> Result<
+    tinycloud_core::encryption_network::deletion_ledger::DeletionLedger,
+    tinycloud_core::encryption_network::deletion_ledger::DeletionLedgerError,
+> {
+    use tinycloud_core::encryption_network::deletion_ledger::DeletionLedger;
+    #[cfg(test)]
+    return DeletionLedger::open_waiting(
+        path,
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+    );
+    #[cfg(not(test))]
+    DeletionLedger::open(path)
+}
+
 /// Settings the node no longer reads that a deployment may still set, in
 /// its file or environment. Configuration extraction ignores unknown keys,
 /// so each is named once at startup instead of being dropped silently.
@@ -1118,22 +1137,31 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let mut named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    // With `named_keys_v1` on, a deletion ledger that cannot be opened or
+    // replayed stops the start: the node never serves with the gate quietly
+    // off. With it off, the failure is logged and the rest of the node serves.
+    let named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
     let deletion_ledger = match tinycloud_config
         .encryption_network
         .deletion_ledger_path
         .as_deref()
-        .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
+        .map(|path| open_deletion_ledger(path).map_err(|error| (path, error)))
         .transpose()
     {
         Ok(ledger) => ledger.map(Arc::new),
-        Err(error) => {
-            named_keys_enabled = false;
+        Err((path, error)) => {
             ::tracing::error!(
                 event = "deletion_ledger_open_failed",
                 error_kind = error.kind(),
                 "deletion ledger could not be opened: the named-key routes are off"
             );
+            if named_keys_enabled {
+                anyhow::bail!(
+                    "deletion_ledger_open_failed: {error} ({}, error_kind {}); named_keys_v1 is on, so the node does not start",
+                    path.display(),
+                    error.kind()
+                );
+            }
             None
         }
     };
@@ -1145,9 +1173,7 @@ pub async fn app_with_control(
     tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
     // The deletion ledger is replayed onto the database before any route is
     // served, so a delete that a restore or a crash left out is applied
-    // first. If the replay fails the named-key routes stay off (as with
-    // `named_keys_v1` off) and the rest of the node serves.
-    // (`named_keys_enabled` is false if the ledger could not be opened.)
+    // first.
     if let Some(ledger) = &deletion_ledger {
         match ledger.replay_at_start(&seed_conn).await {
             Ok(report) => {
@@ -1166,29 +1192,22 @@ pub async fn app_with_control(
                 }
             }
             Err(error) => {
-                named_keys_enabled = false;
                 ::tracing::error!(
                     event = "deletion_ledger_replay_failed",
                     error_kind = error.kind(),
                     "deletion ledger replay failed: the named-key routes are off"
                 );
+                if named_keys_enabled {
+                    anyhow::bail!(
+                        "deletion_ledger_replay_failed: {error} ({}, error_kind {}); named_keys_v1 is on, so the node does not start",
+                        ledger.path().display(),
+                        error.kind()
+                    );
+                }
             }
         }
     }
     let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
-    let figment_named_keys_off;
-    let config = if named_keys_enabled == tinycloud_config.encryption_network.named_keys_v1 {
-        config
-    } else {
-        figment_named_keys_off =
-            config
-                .clone()
-                .merge(rocket::figment::providers::Serialized::global(
-                    "encryption_network.named_keys_v1",
-                    false,
-                ));
-        &figment_named_keys_off
-    };
     let routes = production_routes(named_keys_enabled);
     #[cfg(feature = "tc-bench-v1")]
     let mut routes = routes;
