@@ -419,6 +419,7 @@ impl DeletionLedger {
         self.refuse_if_unrepaired()?;
         let length_before = file.metadata()?.len();
         if let Err(error) = write(&mut file, line).and_then(|()| file.sync_all()) {
+            let error = DeletionLedgerError::from(error);
             let unchanged = file
                 .metadata()
                 .is_ok_and(|metadata| metadata.len() == length_before);
@@ -429,12 +430,14 @@ impl DeletionLedger {
                     .is_err()
             {
                 self.unrepaired.store(true, Ordering::SeqCst);
+                // `error_kind` is the fixed name of the failed append, never its text.
                 ::tracing::error!(
                     event = "deletion_ledger_unrepaired",
+                    error_kind = error.kind(),
                     "a failed ledger append left bytes that could not be removed: later appends fail"
                 );
             }
-            return Err(error.into());
+            return Err(error);
         }
         Ok(())
     }

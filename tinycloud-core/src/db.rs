@@ -3340,13 +3340,9 @@ where
         {
             revocation::ControlProofDecision::DirectSigner(principal) => {
                 revocation::ControlAction::Status.party_may_act(&delegation, &principal)
-                    || abilities.iter().any(|ability| {
-                        ability
-                            .resource
-                            .space()
-                            .map(|space| did_principal_matches(space.did().as_str(), &principal))
-                            .unwrap_or(false)
-                    })
+                    || abilities
+                        .iter()
+                        .any(|ability| ability.resource.owned_by(&principal))
             }
             revocation::ControlProofDecision::Scoped(control) => {
                 control.authorizes_target(&target, &delegation, &abilities)

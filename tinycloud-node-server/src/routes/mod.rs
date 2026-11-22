@@ -52,7 +52,8 @@ use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
     failure_diagnostic::{
-        failure_kind, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY, KIND_REQUEST_TIMEOUT,
+        failure_kind, ErrorCode, FailureCode, FailureNote, Service, KIND_READ_AUDIT_BUSY,
+        KIND_REQUEST_TIMEOUT,
     },
     keys::Secrets,
     models::{
@@ -177,7 +178,43 @@ fn read_audit_failure(
             None,
         ));
     }
+    note_error_code(ErrorCode::ReadAudit);
     (status, error.to_string())
+}
+
+/// Record `code` as the origin of the 5xx the current request answers; the
+/// node's `node_request` event carries it as `error_code` (TC-3834).
+pub(crate) fn note_error_code(code: ErrorCode) {
+    tinycloud_core::request_telemetry::note_error_code(code);
+}
+
+/// A `500` with `error`'s text as its body, recorded as `code` (TC-3834).
+pub(crate) fn internal_error<E: std::fmt::Display>(
+    code: ErrorCode,
+) -> impl FnOnce(E) -> (Status, String) {
+    move |error| {
+        note_error_code(code);
+        (Status::InternalServerError, error.to_string())
+    }
+}
+
+/// A `500` for a database error outside [`database_failure`], recorded as
+/// its class ([`ErrorCode::for_db`]).
+pub(crate) fn db_internal_error(error: DbErr) -> (Status, String) {
+    internal_error(ErrorCode::for_db(&error))(error)
+}
+
+/// A `500` for a failure of the metadata database (`A`) or the block store
+/// (`B`), recorded as its class.
+pub(crate) fn store_internal_error<B: std::fmt::Display>(
+    error: tinycloud_core::storage::either::EitherError<DbErr, B>,
+) -> (Status, String) {
+    use tinycloud_core::storage::either::EitherError;
+    let code = match &error {
+        EitherError::A(db) => ErrorCode::for_db(db),
+        EitherError::B(_) => ErrorCode::StorageIo,
+    };
+    internal_error(code)(error)
 }
 
 /// The response to a database failure of an operation (TC-1054):
@@ -234,6 +271,7 @@ pub(crate) fn database_failure(
         write_may_have_applied,
         db_hash: None,
     });
+    note_error_code(ErrorCode::for_db(error));
     (status, body)
 }
 
@@ -252,7 +290,10 @@ pub(crate) fn registry_failure(
     (
         match error {
             RegistryError::Denied => Status::Forbidden,
-            RegistryError::Unavailable => Status::ServiceUnavailable,
+            RegistryError::Unavailable => {
+                note_error_code(ErrorCode::RegistryDown);
+                Status::ServiceUnavailable
+            }
         },
         error.to_string(),
     )
@@ -294,6 +335,7 @@ where
         return InvokeError::Deleted("space_deleted");
     }
     if matches!(error, TxError::LifecycleUnavailable) {
+        note_error_code(ErrorCode::Lifecycle);
         return (
             Status::ServiceUnavailable,
             "Space lifecycle unavailable".into(),
@@ -360,8 +402,14 @@ fn identity_resolution_error(error: database_migration::MigrationError) -> (Stat
     let status = match &error {
         database_migration::MigrationError::Quarantined
         | database_migration::MigrationError::Collision => Status::Conflict,
-        database_migration::MigrationError::Database(_)
-        | database_migration::MigrationError::MissingLegacyArtifact => Status::ServiceUnavailable,
+        database_migration::MigrationError::Database(db) => {
+            note_error_code(ErrorCode::for_db(db));
+            Status::ServiceUnavailable
+        }
+        database_migration::MigrationError::MissingLegacyArtifact => {
+            note_error_code(ErrorCode::StorageIo);
+            Status::ServiceUnavailable
+        }
         _ => Status::InternalServerError,
     };
     (status, error.to_string())
@@ -524,6 +572,7 @@ pub mod util_routes {
         if s.check_db_connection().await.is_ok() {
             Status::Ok
         } else {
+            super::note_error_code(super::ErrorCode::DbError);
             Status::InternalServerError
         }
     }
@@ -620,7 +669,7 @@ pub async fn signed_kv_get(
             if kv_result.is_ok() { "ok" } else { "error" },
             kv_start.elapsed(),
         );
-        return match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+        return match kv_result.map_err(store_internal_error)? {
             Some((metadata, hash, content)) => {
                 validate_signed_kv_hash_binding(&ticket, &hash)?;
                 Ok(SignedKvReadResponse::from_range(metadata, hash, content))
@@ -635,7 +684,7 @@ pub async fn signed_kv_get(
         if kv_result.is_ok() { "ok" } else { "error" },
         kv_start.elapsed(),
     );
-    match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+    match kv_result.map_err(store_internal_error)? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
             Ok(SignedKvReadResponse::Full {
@@ -1840,7 +1889,7 @@ async fn storage_check(
     let used = tinycloud
         .store_size_or_init(space)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .map_err(store_internal_error)?
         .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
     Ok(Some(StorageCheck { used, limit }))
 }
@@ -1857,7 +1906,7 @@ async fn storage_usage(
     let used_bytes = tinycloud
         .store_size(space)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .map_err(internal_error(ErrorCode::StorageIo))?
         .unwrap_or(0);
     Ok(StorageUsage {
         space: SpaceStorage {
@@ -1927,7 +1976,7 @@ async fn copy_multipart_field_to_stage(
         stage
             .write_all(&chunk)
             .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            .map_err(internal_error(ErrorCode::StorageIo))?;
     }
 
     Ok(())
@@ -1999,7 +2048,7 @@ async fn build_batch_kv_inputs(
             let mut stage = staging
                 .stage(space)
                 .await
-                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+                .map_err(internal_error(ErrorCode::StorageIo))?;
             copy_multipart_field_to_stage(field, &mut stage, space, &mut remaining).await?;
             inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
         }
@@ -2069,6 +2118,7 @@ async fn prepare_space_purge_leases(
             .probe(tinycloud.connection(), space)
             .await
             .map_err(|_| {
+                note_error_code(ErrorCode::Lifecycle);
                 (
                     Status::ServiceUnavailable,
                     "Space lifecycle unavailable".to_string(),
@@ -2088,11 +2138,12 @@ async fn prepare_space_purge_leases(
         // fenced target through its absent-space path; never reveal it here.
         Err(tinycloud_core::space_purge_fence::FenceError::Deleted) => {}
         Err(_) => {
+            note_error_code(ErrorCode::Lifecycle);
             return Err((
                 Status::ServiceUnavailable,
                 "Space lifecycle unavailable".into(),
             )
-                .into())
+                .into());
         }
     }
     Ok(())
@@ -2359,6 +2410,7 @@ async fn invoke_impl(
             request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
             if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
+                note_error_code(ErrorCode::CutoverFence);
                 return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
             }
             let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
@@ -2422,6 +2474,7 @@ async fn invoke_impl(
                 request_cancel::set_stage(request_cancel::Stage::IdentityResolution);
                 if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
+                    note_error_code(ErrorCode::CutoverFence);
                     return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()).into());
                 }
                 let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
@@ -2534,7 +2587,7 @@ async fn invoke_impl(
                     let mut stage = staging
                         .stage(space)
                         .await
-                        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+                        .map_err(internal_error(ErrorCode::StorageIo))?;
                     let open_data = open_upload_body(d).compat();
 
                     // Public spaces use their storage cap, others the per-space quota.
@@ -2547,7 +2600,7 @@ async fn invoke_impl(
                                 if e.to_string().contains("storage limit") {
                                     check.reject(StorageRejectionKind::LimitReached, space).into()
                                 } else {
-                                    (Status::InternalServerError, e.to_string()).into()
+                                    internal_error(ErrorCode::StorageIo)(e).into()
                                 }
                             });
                         crate::prometheus::observe_stage(
@@ -2561,7 +2614,7 @@ async fn invoke_impl(
                         let decode_start = Instant::now();
                         let result = copy_upload(open_data, &mut stage)
                             .await
-                            .map_err(|e| InvokeError::from((Status::InternalServerError, e.to_string())));
+                            .map_err(|e| InvokeError::from(internal_error(ErrorCode::StorageIo)(e)));
                         crate::prometheus::observe_stage(
                             crate::prometheus::InvocationStage::RequestDecode,
                             crate::prometheus::StageOutcome::from(result.is_ok()),
@@ -2796,9 +2849,7 @@ async fn invoke_impl(
                                     let mut bytes = Vec::with_capacity(data.len() as usize);
                                     FuturesAsyncReadExt::read_to_end(&mut data, &mut bytes)
                                         .await
-                                        .map_err(|error| {
-                                            (Status::InternalServerError, error.to_string())
-                                        })?;
+                                        .map_err(internal_error(ErrorCode::StorageIo))?;
                                     Some(KvBatchReadValue {
                                         metadata,
                                         hash,
@@ -2877,6 +2928,7 @@ async fn invoke_impl(
                     // The attempted blob cannot be committed: its durable
                     // registration expired or a prior DELETE is in flight.
                     // No KV write landed; retry with a fresh invocation.
+                    note_error_code(ErrorCode::KvCandidate);
                     return Err((
                         Status::ServiceUnavailable,
                         format!("{UNAVAILABLE_RETRYABLE}: {e}"),
@@ -3248,7 +3300,7 @@ async fn handle_sql_invoke(
         let conn = tinycloud
             .readable()
             .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            .map_err(internal_error(ErrorCode::ReadTxError))?;
         let roots: Vec<tinycloud_core::hash::Hash> = parent_cids
             .iter()
             .copied()
@@ -3565,7 +3617,7 @@ async fn refuse_multi_database_proof_invocation(
     let conn = tinycloud
         .readable()
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(internal_error(ErrorCode::ReadTxError))?;
     refuse_multi_database_proof_invocation_with_conn(&conn, parent_cids).await
 }
 
@@ -3589,7 +3641,7 @@ async fn refuse_multi_database_proof_invocation_with_conn<
         .filter(abilities::Column::Delegation.is_in(parents))
         .all(conn)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(db_internal_error)?;
     let database_proofs: HashSet<Hash> = rows
         .iter()
         .filter(|row| is_database_ability(&row.ability.to_string()))
@@ -3658,7 +3710,7 @@ async fn derive_chain_sql_profiles(
     let conn = tinycloud
         .readable()
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(internal_error(ErrorCode::ReadTxError))?;
     derive_chain_sql_profiles_with_conn(&conn, parent_cids).await
 }
 
@@ -3693,7 +3745,7 @@ async fn derive_chain_sql_profiles_with_conn<C: tinycloud_core::sea_orm::Connect
             .filter(abilities::Column::Delegation.is_in(batch.clone()))
             .all(conn)
             .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            .map_err(db_internal_error)?;
         push_sql_profiles(&rows, &mut profiles);
 
         // Climb to parents of the batch we just scanned.
@@ -3701,7 +3753,7 @@ async fn derive_chain_sql_profiles_with_conn<C: tinycloud_core::sea_orm::Connect
             .filter(parent_delegations::Column::Child.is_in(batch))
             .all(conn)
             .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            .map_err(db_internal_error)?;
         for link in parents {
             if !visited.contains(&link.parent) {
                 frontier.push(link.parent);
@@ -3936,9 +3988,13 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
         // TC-1012's 413 is the request body cap. Neither is true here.
         SqlError::DatabaseSizeLimit
         | SqlError::DatabaseReadOnlySizeLimit
-        | SqlError::DatabaseTooLargeToLoad => Status::new(507),
+        | SqlError::DatabaseTooLargeToLoad => {
+            note_error_code(ErrorCode::SizeLimit);
+            Status::new(507)
+        }
         SqlError::DiskHeadroom => {
             crate::prometheus::observe_disk_headroom_refusal("sql");
+            note_error_code(ErrorCode::DiskHeadroom);
             Status::new(507)
         }
         SqlError::InvalidStatement(_) => Status::BadRequest,
@@ -3949,10 +4005,12 @@ pub(crate) fn sql_error_to_status(err: &SqlError) -> Status {
             // The only SQL 500 that names no database failure of its own:
             // recorded for the node's diagnostic line (TC-1796).
             tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
+            note_error_code(ErrorCode::EngineError);
             Status::InternalServerError
         }
         SqlError::CommitFailed => {
             tinycloud_core::request_telemetry::note_failure(FailureNote::internal(Service::Sql));
+            note_error_code(ErrorCode::DbError);
             Status::InternalServerError
         }
         SqlError::Unavailable => Status::ServiceUnavailable,
@@ -3969,12 +4027,12 @@ fn caveat_violation(arm: CaveatArm) -> (Status, String) {
     (sql_error_to_status(&error), error.to_string())
 }
 
-fn chain_caveat_refusal(
+pub(crate) fn chain_caveat_refusal(
     error: tinycloud_core::sql::delegated_caveats::ChainCaveatError,
 ) -> (Status, String) {
     use tinycloud_core::sql::delegated_caveats::ChainCaveatError;
     match error {
-        ChainCaveatError::Db(error) => (Status::InternalServerError, error.to_string()),
+        ChainCaveatError::Db(error) => internal_error(ErrorCode::CaveatDb)(error),
         ChainCaveatError::Unevaluable | ChainCaveatError::LimitExceeded => {
             caveat_violation(CaveatArm::Chain)
         }
@@ -4199,6 +4257,7 @@ async fn handle_duckdb_invoke(
         .await
         .map_err(identity_resolution_error)?
     {
+        note_error_code(ErrorCode::CutoverFence);
         return Err((
             Status::ServiceUnavailable,
             "DuckDB identity cutover fence is active".into(),
@@ -4413,7 +4472,10 @@ async fn handle_duckdb_invoke(
 fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     match err {
         DuckDbError::SpaceDeleted => Status::Gone,
-        DuckDbError::LifecycleUnavailable => Status::ServiceUnavailable,
+        DuckDbError::LifecycleUnavailable => {
+            note_error_code(ErrorCode::Lifecycle);
+            Status::ServiceUnavailable
+        }
         DuckDbError::DuckDb(_) => Status::BadRequest,
         DuckDbError::InvalidStatement(_) => Status::BadRequest,
         DuckDbError::SchemaError(_) => Status::BadRequest,
@@ -4424,11 +4486,17 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ResponseTooLarge(..) => Status::new(413),
         DuckDbError::QuotaExceeded => Status::new(429),
         DuckDbError::StorageWouldGrow => Status::new(402),
-        DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => Status::new(507),
-        DuckDbError::IngestError(_) => Status::InternalServerError,
-        DuckDbError::ExportError(_) => Status::InternalServerError,
-        DuckDbError::ImportError(_) => Status::InternalServerError,
-        DuckDbError::Internal(_) => Status::InternalServerError,
+        DuckDbError::DatabaseSizeLimit | DuckDbError::DatabaseTooLargeToLoad => {
+            note_error_code(ErrorCode::SizeLimit);
+            Status::new(507)
+        }
+        DuckDbError::IngestError(_)
+        | DuckDbError::ExportError(_)
+        | DuckDbError::ImportError(_)
+        | DuckDbError::Internal(_) => {
+            note_error_code(ErrorCode::EngineError);
+            Status::InternalServerError
+        }
     }
 }
 
@@ -4830,13 +4898,14 @@ fn purge_refusal(
 ) -> Option<InvokeError> {
     match error {
         TxStoreError::Tx(TxError::SpaceDeleted) => Some(InvokeError::Deleted("space_deleted")),
-        TxStoreError::Tx(TxError::LifecycleUnavailable) => Some(
+        TxStoreError::Tx(TxError::LifecycleUnavailable) => Some({
+            note_error_code(ErrorCode::Lifecycle);
             (
                 Status::ServiceUnavailable,
                 "Space lifecycle unavailable".into(),
             )
-                .into(),
-        ),
+                .into()
+        }),
         _ => None,
     }
 }

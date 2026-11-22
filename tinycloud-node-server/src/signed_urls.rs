@@ -618,13 +618,15 @@ async fn find_parent_expiry(
     let tx = tinycloud
         .readable()
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(crate::routes::internal_error(
+            tinycloud_core::failure_diagnostic::ErrorCode::ReadTxError,
+        ))?;
     let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
     let signed = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
         .all(&tx)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        .map_err(crate::routes::db_internal_error)?;
     drop(tx);
 
     let mut end = None;
