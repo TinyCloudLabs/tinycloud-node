@@ -11,7 +11,8 @@ import { gunzipSync } from 'node:zlib';
 import { buildConfig } from '../scripts/tc959-logship.mjs';
 import { assertCapture } from '../scripts/tc959-docker.mjs';
 import { hasUdpListener } from '../scripts/tc959-readiness.mjs';
-import { canary, nodeRequest, ingressRequest, dbFailure } from './cases.mjs';
+import { canary, nodeRequest, ingressRequest, dbFailure, ledgerError } from './cases.mjs';
+import { LEDGER_EVENTS } from './ledger.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -77,9 +78,14 @@ export async function checkNativeVector(vector, baseline) {
       await send(`{"version":"1.1","short_message":"${canary}`);
       // TC-1840: the individual 5xx diagnostic must reach the HTTP sink through the real route, not the count reducer.
       await send(frame(dbFailure()));
+      // TC-3284: each deletion ledger event reaches the HTTP sink with its fixed error_kind; a kind outside the
+      // allowlist (unlisted, `lock_wait`, a path) is only a count and never reaches the wire.
+      for (const event of LEDGER_EVENTS) await send(frame(ledgerError(event, { error_kind: 'lock_held' })));
+      for (const error_kind of ['xyz', 'lock_wait', '/var/lib/tinycloud/ledger/deletion-ledger.jsonl']) await send(frame(ledgerError('deletion_ledger_unrepaired', { error_kind })));
     } finally { sender.close(); }
+    const isLedger = event => LEDGER_EVENTS.includes(event.event);
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5 && events.some(event => event.event_code === 'db_failure_5xx')) break;
+      if (events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length >= 5 && events.some(event => event.event_code === 'db_failure_5xx') && events.filter(isLedger).length >= LEDGER_EVENTS.length) break;
       await sleep(30);
     }
     child.kill('SIGTERM');
@@ -90,8 +96,12 @@ export async function checkNativeVector(vector, baseline) {
     try { assertCapture(events, schema.services['tinycloud-node'].fields); } catch { wireSafe = false; }
     const requests = events.filter(event => event.event === 'node_request' || event.event === 'ingress_request').length;
     const dbFailures = events.filter(event => event.event_code === 'db_failure_5xx').length;
+    const ledgerEvents = events.filter(event => isLedger(event) && event.error_kind === 'lock_held').length;
+    // `lock_wait` is also a valid db_failure_5xx failure_kind, so it is looked for only as an error_kind.
+    const wire = JSON.stringify(events);
+    const hostileKindHits = events.filter(event => 'error_kind' in event && event.error_kind !== 'lock_held').length + ['xyz', '/var/lib/'].filter(value => wire.includes(value)).length;
     const consoleHits = consoleText.split(canary).length - 1;
-    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && dbFailures === 1 && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, db_failure_events: dbFailures, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 6, console_overflow: overflow };
+    return { status: wireSafe && !malformedHttp && !overflow && requests === 5 && dbFailures === 1 && ledgerEvents === LEDGER_EVENTS.length && events.filter(isLedger).length === LEDGER_EVENTS.length && hostileKindHits === 0 && consoleHits === 0 ? 'passed' : 'failed', request_events: requests, db_failure_events: dbFailures, ledger_events: ledgerEvents, hostile_kind_wire_hits: hostileKindHits, console_canary_hits: consoleHits, wire_safe: wireSafe, positive_controls: 6 + LEDGER_EVENTS.length, console_overflow: overflow };
   } finally {
     if (child) { child.kill('SIGTERM'); await closed; }
     server.closeAllConnections();
