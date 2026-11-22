@@ -568,8 +568,9 @@ async fn validate_with<C: ConnectionTrait>(
     let dependant_caps = dependant_capabilities(delegation);
 
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
-        // no dependant caps, no parents needed, must be valid
-        (true, _) => Ok(()),
+        // no dependant caps, so no parent's authority is needed; any cited
+        // parent must still be stored (TC-3663)
+        (true, _) => refuse_unstored_parents(db, delegation).await,
         // Policy roots are owner-signed control-plane roots.  They are
         // admitted into the ordinary graph during policy registration, but
         // they are never a usable grant on their own: the route gate rejects
@@ -947,6 +948,33 @@ fn dependant_capabilities(delegation: &util::DelegationInfo) -> Vec<&util::Capab
         .collect()
 }
 
+/// TC-3663: a delegation is stored with an edge to each parent it cites,
+/// even when none of its capabilities needs a parent's authority, so every
+/// cited parent must already be stored. A missing one is refused as
+/// [`DelegationError::MissingParents`], as for any other delegation, instead
+/// of failing the edge insert on its foreign key with a database error.
+async fn refuse_unstored_parents<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+) -> Result<(), Error> {
+    if delegation.parents.is_empty() {
+        return Ok(());
+    }
+    let parent_ids: Vec<Hash> = delegation.parents.iter().copied().map(Hash::from).collect();
+    let stored: Vec<Hash> = Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(Column::Id.is_in(parent_ids.iter().copied()))
+        .into_tuple::<Hash>()
+        .all(db)
+        .await?;
+    if parent_ids.iter().all(|id| stored.contains(id)) {
+        Ok(())
+    } else {
+        Err(DelegationError::MissingParents.into())
+    }
+}
+
 /// The checks of [`process_with`] that need no lock, run on the pool before
 /// a delegation takes any chain guard, space write order or transaction
 /// (TC-3000): its signed time window, and the issuer's standing. A stranger
@@ -996,7 +1024,7 @@ pub(crate) async fn precheck_standing<C: ConnectionTrait>(
     check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
     let dependant_caps = dependant_capabilities(delegation);
     if dependant_caps.is_empty() {
-        return Ok(());
+        return refuse_unstored_parents(db, delegation).await;
     }
     if delegation.parents.is_empty() {
         if is_policy_root(&delegation.delegation)
@@ -2267,6 +2295,44 @@ mod tests {
         validate(&db, &info)
             .await
             .expect("owner is root authority for own keys");
+    }
+
+    // test-ruling: TC-3663 tinycloud-core/src/models/delegation.rs new test only (2026-11-22)
+    /// TC-3663: a grant that needs no parent's authority, citing a parent
+    /// that is not stored, is refused as a missing parent by both the
+    /// lock-free precheck and the transaction's validation. Before, it passed
+    /// both, and the edge insert failed on its foreign key: a 500, not a 401.
+    #[tokio::test]
+    async fn root_grant_citing_an_unstored_parent_is_refused_as_missing() {
+        let db = database().await;
+        use crate::events::SerializedEvent;
+        let ability = "tinycloud.encryption/key.create";
+        let unstored = crate::hash::hash(b"tc3663 unstored parent");
+        let info = key_grant_info(KEY_OWNER, KEY_RESOURCE, ability, &[unstored]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+        // `validate`'s flags: SQL caveats off, named keys on.
+        let prechecked =
+            precheck_standing(&db, &SerializedEvent(info, Vec::new()), false, true, None).await;
+        assert!(
+            matches!(
+                prechecked,
+                Err(Error::InvalidDelegation(DelegationError::MissingParents))
+            ),
+            "{prechecked:?}"
+        );
+
+        let stored = crate::hash::hash(b"tc3663 stored parent");
+        insert_delegation(&db, stored, OTHER_DID, KEY_OWNER).await;
+        let info = key_grant_info(KEY_OWNER, KEY_RESOURCE, ability, &[stored]);
+        validate(&db, &info)
+            .await
+            .expect("a stored parent is accepted as before");
+        precheck_standing(&db, &SerializedEvent(info, Vec::new()), false, true, None)
+            .await
+            .expect("a stored parent passes the precheck as before");
     }
 
     /// A delegator that does not own the key must cite parents.
