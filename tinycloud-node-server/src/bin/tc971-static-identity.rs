@@ -25,7 +25,8 @@ fn public_identity_lines(secret: &StaticSecret) -> String {
 }
 
 fn secret_from_env() -> Result<StaticSecret, &'static str> {
-    let rendered = env::var(SECRET_ENV).map_err(|_| "TINYCLOUD_KEYS_SECRET is unset or not UTF-8")?;
+    let rendered =
+        env::var(SECRET_ENV).map_err(|_| "TINYCLOUD_KEYS_SECRET is unset or not UTF-8")?;
     let decoded = base64::decode_config(rendered.trim(), URL_SAFE_NO_PAD)
         .map_err(|_| "TINYCLOUD_KEYS_SECRET is not url-safe base64")?;
     StaticSecret::new(decoded).map_err(|_| "TINYCLOUD_KEYS_SECRET decodes to fewer than 32 bytes")
@@ -60,11 +61,18 @@ mod tests {
         assert_eq!(lines[1], format!("renewer_did={}", secret.renewal_did()));
         assert!(lines[0].starts_with("node_did=did:key:z6Mk"));
         assert!(lines[1].starts_with("renewer_did=did:key:z6Mk"));
-        assert_ne!(lines[0]["node_did=".len()..], lines[1]["renewer_did=".len()..]);
-        let prefix = lines[2].strip_prefix("invitation_key_prefix=").expect("prefix line");
+        assert_ne!(
+            lines[0]["node_did=".len()..],
+            lines[1]["renewer_did=".len()..]
+        );
+        let prefix = lines[2]
+            .strip_prefix("invitation_key_prefix=")
+            .expect("prefix line");
         assert_eq!(prefix.len(), 8);
-        assert!(encode_config(secret.share_invitation_public_key(), URL_SAFE_NO_PAD)
-            .starts_with(prefix));
+        assert!(
+            encode_config(secret.share_invitation_public_key(), URL_SAFE_NO_PAD)
+                .starts_with(prefix)
+        );
         assert!(!out.contains(&encode_config(&raw, URL_SAFE_NO_PAD)));
     }
 }
