@@ -14,6 +14,9 @@ from uuid import UUID
 
 
 CLOSED_PORTS = {443, 8000}
+# The SSH management relay's port. Since TC-3838 the compose publishes nothing
+# there; the switch keeps its prior policy entry so it neither widens nor
+# narrows anything beyond the node HTTP ports.
 MANAGEMENT_PORT = 10022
 
 

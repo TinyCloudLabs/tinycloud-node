@@ -1250,8 +1250,8 @@ jobs:
           # The CLI/SDK can include request details in errors. Never forward
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
-          # No --image/--no-dev-os: the CVM keeps its OS class (TC-3554: it runs
-          # dstack-dev-0.5.15); the guards before and after check the OS.
+          # No --image/--no-dev-os: the deploy never changes the OS; the guards
+          # before and after require the production image (TC-3838).
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
           if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"

@@ -84,6 +84,12 @@ phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15
 The deploy does not pass `--image`/`--no-dev-os` (they are ignored for an
 existing CVM anyway); the PATCH is what changes the OS.
 
+After the OS move and the first deploy of this compose, Amos confirms on the
+live CVM, read-only and without printing env values, that port 10022 is closed
+on the app and instance gateway URLs, and that `DSTACK_AUTHORIZED_KEYS` is not
+in the CVM's `allowed_envs` (`phala cvms get tinycloud-node --json`, names only).
+Until both hold, record the CVM as still reachable over SSH (TC-3838).
+
 ## Operator steps before a node deploy
 
 A migration that indexes a large PostgreSQL table cannot be built by the boot:
@@ -911,6 +917,13 @@ Its provenance was reconstructed from the frozen public template with only
 the immutable node pin; the private saved file's contents were not read.
 The node/ingress images, app env, storage and ingress topology stay fixed.
 Other paths, symlinks, source drift and edited variants fail before mutation.
+
+**The pre-N0 composes still publish the SSH relay.** Both files predate the
+TC-3838 removal and keep their `ssh-gateway` service, which publishes 10022
+and relays it to guest sshd. They are hash-pinned, so the bytes stay. Rolling
+back to either re-opens 10022, and on a dev OS it reaches sshd again. It
+needs Naomi's explicit word, and an immediate roll-forward to a compose
+without the relay once the incident allows.
 
 **Privacy choice remains pending Sam's explicit card answer.** The default
 is `unselected`, which refuses rollback. Amos records the approved choice in
