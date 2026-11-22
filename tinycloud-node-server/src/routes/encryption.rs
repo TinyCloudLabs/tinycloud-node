@@ -862,6 +862,7 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::OwnerOnly(_) => Status::Forbidden,
         EncryptionServiceError::CorruptKeyRow
         | EncryptionServiceError::StrayAppKeyRows(_)
+        | EncryptionServiceError::StraySecretKeyRows(_)
         | EncryptionServiceError::DeletionLedger(_) => Status::InternalServerError,
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
