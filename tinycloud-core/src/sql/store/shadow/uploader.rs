@@ -5,14 +5,14 @@
 //! to upload, the object-store client, the manifest, and a failpoint hook,
 //! `publish_cycle` runs the four steps in order:
 //!
-//! 1. `store.put_if_absent(key, body)` — content-addressed, so a retry
+//! 1. `store.put_if_absent(key, body)`: content-addressed, so a retry
 //!    reuses the same object. `AlreadyPresent` is as good as `Created`.
-//! 2. `manifest.record_object(record)` — INSERT-ON-CONFLICT-DO-NOTHING.
+//! 2. `manifest.record_object(record)`: INSERT-ON-CONFLICT-DO-NOTHING.
 //!    An existing orphan row is revived first (the manifest does that
 //!    inside `record_object` today).
 //! 3. Failpoint `before_cas`: a kill -9 harness arms this for the crash
 //!    matrix.
-//! 4. `manifest.publish_cas(expected, publish)` — single CAS. On
+//! 4. `manifest.publish_cas(expected, publish)`: single CAS. On
 //!    `Lost(current)` the caller re-plans from the new frontier.
 //!
 //! The function returns one of three outcomes:
@@ -93,7 +93,7 @@ pub async fn publish_cycle<'a, S: SqlObjectStore, M: SqlManifest>(
 
     if matches!(put, PutOutcome::Created | PutOutcome::AlreadyPresent) {
         // Verify the stored object's length and hash. A mismatch means
-        // someone else wrote different bytes at the same key — the
+        // someone else wrote different bytes at the same key; the
         // module's content-addressed key should prevent this, but the
         // check is cheap and the alert is loud.
         if let Some(meta) = store.head(&key).await? {

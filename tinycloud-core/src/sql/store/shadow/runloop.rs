@@ -4,9 +4,8 @@
 //! One run loop per node. It owns:
 //!
 //! - A `DashMap<(space, db_id), Mutex<DbState>>` of per-database state.
-//!   The `Mutex` is the `in_flight` primitive from 1b-design §2: at most
-//!   one cycle per database runs at a time, and a duplicate cycle in
-//!   the same process is impossible.
+//!   The `Mutex` enforces at most one cycle per database at a time, so
+//!   a duplicate cycle in the same process is impossible.
 //! - A node-wide semaphore bounding the number of cycles in flight
 //!   across all databases (default 8).
 //! - A node-wide PG semaphore bounding the manifest's Postgres

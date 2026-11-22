@@ -178,7 +178,7 @@ async fn second_boot_keeps_the_same_owner_and_writes_the_marker_no_more() {
 
 #[tokio::test]
 async fn scratch_dir_lives_under_the_configured_sql_data_dir() {
-    // Bobbie 2026-11-22 00:50Z integration pin: the handle's scratch
+    // Integration pin: the handle's scratch
     // directory MUST live under the node's SQL data directory so the
     // bootstrap's temp SQLite file and VACUUM INTO copy count against
     // the 1a DiskBudget and the configured minimum free headroom.
