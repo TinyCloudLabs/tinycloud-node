@@ -84,6 +84,11 @@ services:
       # verification; only the final, explicitly reviewed redeploy sets false.
       TINYCLOUD_DATABASE__WRITE_FENCE: "${SQL_IDENTITY_FENCE:?set true during cutover, false after verification}"
       TINYCLOUD_CORS: "true"
+      # TC-287: the retention sweeper prunes delivered hook deliveries after
+      # 7 days, dead-letter ones after 30 days and signed KV tickets 7 days
+      # after they expire, in batches of 5000, at boot and every 5 minutes.
+      # Deleted rows do not come back; remove this line to stop it.
+      TINYCLOUD_RETENTION__ENABLED: "true"
       # --- addressed sharing (TC-397) ------------------------------------
       #
       # The public trust document shared with Share and OpenCredentials,
