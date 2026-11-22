@@ -25,8 +25,8 @@ pub const SHADOW_EPOCH: i64 = 0;
 const MAX_ID_CHARS: usize = 255;
 
 /// The `format` each object kind must be recorded with.
-const SNAPSHOT_FORMAT: &str = "sqlite-v1";
-const SEGMENT_FORMAT: &str = "wal-cum-v1";
+pub(crate) const SNAPSHOT_FORMAT: &str = "sqlite-v1";
+pub(crate) const SEGMENT_FORMAT: &str = "wal-cum-v1";
 
 fn required_format(kind: ObjectKind) -> &'static str {
     match kind {
@@ -271,7 +271,10 @@ fn to_i64(v: u64) -> Result<i64, SqlStoreError> {
 }
 
 /// The primary key filter of one object row.
-fn object_pk(db: &DbRef<'_>, key: &ObjectKey) -> Result<sea_orm::Condition, SqlStoreError> {
+pub(crate) fn object_pk(
+    db: &DbRef<'_>,
+    key: &ObjectKey,
+) -> Result<sea_orm::Condition, SqlStoreError> {
     use object::Column as C;
     Ok(sea_orm::Condition::all()
         .add(C::Space.eq(db.space))

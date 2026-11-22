@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use tinycloud_core::{
     sql::store::{
         key::KEY_ROOT,
-        object::{check_body_file, sha256},
+        object::{check_body_file, discard_download, private_file_options, sha256},
         ObjectKey, ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError,
     },
     storage::ByteRangeSpec,
@@ -498,6 +498,7 @@ impl SqlObjectStore for S3SqlObjectStore {
         &self,
         key: &ObjectKey,
         path: &Path,
+        max_bytes: u64,
     ) -> Result<Option<ObjectMeta>, SqlStoreError> {
         let output = match self
             .client
@@ -515,31 +516,51 @@ impl SqlObjectStore for S3SqlObjectStore {
                 return Err(backend("get", &error));
             }
         };
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .map_err(|e| SqlStoreError::file("create", &e))?;
-        let mut body = output.body;
-        let mut hasher = Sha256::new();
-        let mut bytes = 0u64;
-        while let Some(chunk) = body
-            .try_next()
-            .await
-            .map_err(|_| SqlStoreError::Backend("s3 get body failed".into()))?
+        // A larger announced length is refused before a byte is streamed.
+        if output
+            .content_length
+            .is_some_and(|len| u64::try_from(len).map_or(true, |len| len > max_bytes))
         {
-            hasher.update(&chunk);
-            bytes += chunk.len() as u64;
-            file.write_all(&chunk)
+            discard_download(path);
+            return Err(SqlStoreError::Oversize);
+        }
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::from(private_file_options())
+                .open(path)
+                .await
+                .map_err(|e| SqlStoreError::file("create", &e))?;
+            let mut body = output.body;
+            let mut hasher = Sha256::new();
+            let mut bytes = 0u64;
+            while let Some(chunk) = body
+                .try_next()
+                .await
+                .map_err(|_| SqlStoreError::Backend("s3 get body failed".into()))?
+            {
+                bytes += chunk.len() as u64;
+                // The body may run past its announced length; stop at the cap.
+                if bytes > max_bytes {
+                    return Err(SqlStoreError::Oversize);
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| SqlStoreError::file("write", &e))?;
+            }
+            file.flush()
                 .await
                 .map_err(|e| SqlStoreError::file("write", &e))?;
+            let sha: [u8; 32] = hasher.finalize().into();
+            if &sha != key.sha256() {
+                return Err(SqlStoreError::BodyMismatch);
+            }
+            Ok(Some(ObjectMeta { bytes, sha256: sha }))
         }
-        file.flush()
-            .await
-            .map_err(|e| SqlStoreError::file("write", &e))?;
-        let sha: [u8; 32] = hasher.finalize().into();
-        if &sha != key.sha256() {
-            return Err(SqlStoreError::BodyMismatch);
+        .await;
+        if result.is_err() {
+            discard_download(path);
         }
-        Ok(Some(ObjectMeta { bytes, sha256: sha }))
+        result
     }
 
     async fn get_range(
@@ -803,11 +824,14 @@ fn fs_head(path: &Path) -> Result<Option<ObjectMeta>, SqlStoreError> {
 type IoErr = fn(&str, &std::io::Error) -> SqlStoreError;
 
 /// Copy `source` into `target` in bounded chunks; the length and SHA-256 of
-/// what was copied. `read` and `write` name whose side failed: the caller's
-/// file ([`SqlStoreError::file`]) or the store's ([`io_error`]).
+/// what was copied. More than `limit` bytes is [`SqlStoreError::Oversize`],
+/// stopped before the excess is written. `read` and `write` name whose side
+/// failed: the caller's file ([`SqlStoreError::file`]) or the store's
+/// ([`io_error`]).
 fn copy_hashed(
     source: &mut File,
     target: &mut File,
+    limit: u64,
     read: IoErr,
     write: IoErr,
 ) -> Result<ObjectMeta, SqlStoreError> {
@@ -822,11 +846,14 @@ fn copy_hashed(
                 sha256: hasher.finalize().into(),
             });
         }
+        bytes += n as u64;
+        if bytes > limit {
+            return Err(SqlStoreError::Oversize);
+        }
         hasher.update(&chunk[..n]);
         target
             .write_all(&chunk[..n])
             .map_err(|e| write("write", &e))?;
-        bytes += n as u64;
     }
 }
 
@@ -855,7 +882,13 @@ fn fs_put(
             .create_new(true)
             .open(&temp.0)
             .map_err(|e| io_error("create temp file", &e))?;
-        let copied = copy_hashed(&mut source, &mut file, SqlStoreError::file, io_error)?;
+        let copied = copy_hashed(
+            &mut source,
+            &mut file,
+            u64::MAX,
+            SqlStoreError::file,
+            io_error,
+        )?;
         if copied.bytes != size {
             return Err(SqlStoreError::Invalid("body file size does not match"));
         }
@@ -886,28 +919,48 @@ fn fs_put(
     }
 }
 
-/// Copy the object at `path` into `target`, checked against `sha`.
+/// Copy the object at `path` into `target`, checked against `sha` and capped
+/// at `max_bytes`. On any error `target` is emptied.
 fn fs_get_to_file(
     path: &Path,
     target: &Path,
     sha: &[u8; 32],
+    max_bytes: u64,
 ) -> Result<Option<ObjectMeta>, SqlStoreError> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_error("open", &e)),
     };
-    if !file.metadata().map_err(|e| io_error("stat", &e))?.is_file() {
-        return Err(SqlStoreError::Backend(
-            "filesystem entry is not a file".into(),
-        ));
+    let result = (|| {
+        let metadata = file.metadata().map_err(|e| io_error("stat", &e))?;
+        if !metadata.is_file() {
+            return Err(SqlStoreError::Backend(
+                "filesystem entry is not a file".into(),
+            ));
+        }
+        if metadata.len() > max_bytes {
+            return Err(SqlStoreError::Oversize);
+        }
+        let mut out = private_file_options()
+            .open(target)
+            .map_err(|e| SqlStoreError::file("create", &e))?;
+        let meta = copy_hashed(
+            &mut file,
+            &mut out,
+            max_bytes,
+            io_error,
+            SqlStoreError::file,
+        )?;
+        if &meta.sha256 != sha {
+            return Err(SqlStoreError::BodyMismatch);
+        }
+        Ok(Some(meta))
+    })();
+    if result.is_err() {
+        discard_download(target);
     }
-    let mut out = File::create(target).map_err(|e| SqlStoreError::file("create", &e))?;
-    let meta = copy_hashed(&mut file, &mut out, io_error, SqlStoreError::file)?;
-    if &meta.sha256 != sha {
-        return Err(SqlStoreError::BodyMismatch);
-    }
-    Ok(Some(meta))
+    result
 }
 
 fn fs_get_range(path: &Path, range: ByteRangeSpec) -> Result<Option<ObjectRange>, SqlStoreError> {
@@ -992,11 +1045,12 @@ impl SqlObjectStore for FsSqlObjectStore {
         &self,
         key: &ObjectKey,
         path: &Path,
+        max_bytes: u64,
     ) -> Result<Option<ObjectMeta>, SqlStoreError> {
         let source = self.path_for(key)?;
         let target = path.to_path_buf();
         let sha = *key.sha256();
-        blocking(move || fs_get_to_file(&source, &target, &sha)).await
+        blocking(move || fs_get_to_file(&source, &target, &sha, max_bytes)).await
     }
 
     async fn get_range(
