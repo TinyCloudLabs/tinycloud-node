@@ -189,5 +189,6 @@ pub mod drain;
 pub mod failpoints;
 pub mod reconciler;
 pub mod restore;
+pub mod runloop;
 pub mod sweep;
 pub mod uploader;
