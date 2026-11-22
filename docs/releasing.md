@@ -563,6 +563,17 @@ malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
+In `authority=billing`, when the deploy mutated nothing quota-related and only
+the verification did not run (for example a transient read failed earlier in
+the job), clear it without redeploying: on the operator's GO, dispatch
+
+```sh
+gh workflow run quota-verify.yml -R TinyCloudLabs/tinycloud-node --ref main
+```
+
+It runs only `scripts/ci/reconcile-quota.py` (GET-only in billing mode) and
+refuses under any other authority or ref. A green run is the verification; a
+red one stays OVERRIDES UNVERIFIED (TC-3881).
 
 If a job that names the environment ever runs before the environment exists,
 GitHub creates `production` with no branch policy. Create the environment and
