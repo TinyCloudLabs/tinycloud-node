@@ -3274,12 +3274,65 @@ async fn postgres_secret_keys_are_seeded_and_stray_rows_stop_the_start() {
     assert_startup_check_finds_stray_secret_rows(&db).await;
 }
 
-// `path_starts_with` selects the keys under a segment. A prefix without the
-// trailing `/` would also select a sibling that shares its leading characters
-// (`apps/a` and `apps/ab/…`), so debug builds refuse it.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "path_starts_with needs a prefix ending in '/'")]
-fn path_starts_with_refuses_a_prefix_without_a_trailing_slash() {
-    let _ = crate::encryption_network::keys::path_starts_with("apps/a");
+// `path_starts_with` treats its prefix as a directory, so a sibling that only
+// shares leading characters is never selected, whether or not the caller
+// wrote the trailing `/`. Runs in release builds too.
+async fn assert_path_starts_with_matches_directories(db: &DatabaseConnection) {
+    use crate::encryption_network::keys::path_starts_with;
+    use sea_orm::QueryFilter;
+
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    for path in ["apps/ab/x", "apps/abc/x", "secrets/s", "secretsx/y"] {
+        svc.create_key(
+            &key_loc(path),
+            path.starts_with("apps/") || path.starts_with("secrets/"),
+        )
+        .await
+        .unwrap();
+    }
+    let select = |prefix: &'static str| {
+        let db = db.clone();
+        async move {
+            let mut paths: Vec<String> = encryption_network_key::Entity::find()
+                .filter(path_starts_with(prefix))
+                .all(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.key_path)
+                .collect();
+            paths.sort();
+            paths
+        }
+    };
+    for prefix in ["apps/ab", "apps/ab/"] {
+        assert_eq!(select(prefix).await, ["apps/ab/x"], "{prefix}");
+    }
+    for prefix in ["apps/abc", "apps/abc/"] {
+        assert_eq!(select(prefix).await, ["apps/abc/x"], "{prefix}");
+    }
+    for prefix in ["secrets", "secrets/"] {
+        assert_eq!(select(prefix).await, ["secrets/s"], "{prefix}");
+    }
+    assert!(select("apps/a").await.is_empty());
+}
+
+#[tokio::test]
+async fn path_starts_with_matches_directories_not_siblings() {
+    assert_path_starts_with_matches_directories(&fresh_db().await).await;
+}
+
+// PostgreSQL-backed; CI-only.
+#[tokio::test]
+async fn postgres_path_starts_with_matches_directories_not_siblings() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_path_starts_with_matches_directories_not_siblings",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_path_starts_with_matches_directories(&fixture.connect(4).await).await;
 }

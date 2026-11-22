@@ -690,21 +690,23 @@ pub async fn ensure_no_deterministic_app_keys<C: ConnectionTrait>(
 /// `_` and `%` as wildcards, and SQLite's ignores case) and never a range
 /// (collation dependent). Key paths are ASCII, so characters are bytes.
 ///
-/// `prefix` must end in `/`, so it selects the keys *under* a segment and never
-/// a sibling that merely shares its leading characters (`apps/a` would select
-/// `apps/ab/…`). The caller adds the `/`; a prefix without one is a bug, and
-/// debug builds assert it.
+/// `prefix` is a directory: the keys *under* it, never a sibling that merely
+/// shares its leading characters. A prefix without a trailing `/` gets one
+/// before matching, so `apps/ab` selects `apps/ab/x` and not `apps/abc/x`,
+/// and `secrets` behaves like `secrets/`. The `/` is added before the length
+/// is taken, so the substring and the compared text always agree.
 pub(super) fn path_starts_with(prefix: &str) -> SimpleExpr {
-    debug_assert!(
-        prefix.ends_with('/'),
-        "path_starts_with needs a prefix ending in '/', got {prefix:?}"
-    );
+    let directory = if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    };
     Expr::expr(Func::cust(Alias::new("substr")).args([
         Expr::col(encryption_network_key::Column::KeyPath).into(),
         SimpleExpr::from(1i32),
-        SimpleExpr::from(prefix.len() as i32),
+        SimpleExpr::from(directory.len() as i32),
     ]))
-    .eq(prefix.to_string())
+    .eq(directory)
 }
 
 /// Rows at the path `segment` or under `segment/` whose kind is not
