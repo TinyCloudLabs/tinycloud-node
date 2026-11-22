@@ -32,7 +32,8 @@
 
 use crate::sql::store::key::ObjectKey;
 use crate::sql::store::manifest::{
-    CasToken, Frontier, ObjectRecord, Publish, PublishOutcome as ManifestOutcome, SqlManifest,
+    CasToken, Frontier, ObjectRecord, ObjectState, Publish, PublishOutcome as ManifestOutcome,
+    SqlManifest,
 };
 use crate::sql::store::object::{PutOutcome, SqlObjectStore, SqlStoreError};
 use crate::sql::store::DbRef;
@@ -58,6 +59,17 @@ pub enum CycleOutcome {
 pub enum CycleError {
     #[error("sql object store error: {0}")]
     Store(#[from] SqlStoreError),
+    /// The caller handed inconsistent keys across the cycle inputs.
+    /// `record.key`, `cycle.key` and `publish.object` must all be the
+    /// same. This is a programming error in the caller; publish is
+    /// refused before any I/O.
+    #[error("cycle keys do not agree")]
+    Invalid,
+    /// The object was uploaded but a HEAD afterwards returned no
+    /// object. That is an infrastructure failure (deleted out from
+    /// under us, backend lost the write), not a benign race.
+    #[error("object vanished between put and head")]
+    ObjectVanished,
 }
 
 /// What the uploader hands this function per cycle. The body is passed
@@ -87,25 +99,63 @@ pub async fn publish_cycle<'a, S: SqlObjectStore, M: SqlManifest>(
         publish,
     } = cycle;
 
+    // Preflight: every input that names the object must name the same
+    // one. A mismatch is a caller bug; publish is refused before any
+    // I/O so a stale `publish.object` cannot race ahead of its body.
+    if record.key != key || publish.object != key {
+        return Err(CycleError::Invalid);
+    }
+
     let put = store.put_if_absent(&key, body.clone()).await?;
     #[cfg(feature = "sql-store-failpoints")]
     super::failpoints::hit(super::failpoints::Point::AfterPut);
 
     if matches!(put, PutOutcome::Created | PutOutcome::AlreadyPresent) {
-        // Verify the stored object's length and hash. A mismatch means
-        // someone else wrote different bytes at the same key; the
-        // module's content-addressed key should prevent this, but the
-        // check is cheap and the alert is loud.
-        if let Some(meta) = store.head(&key).await? {
-            if meta.bytes != record.bytes || meta.sha256 != *key.sha256() {
-                return Ok(CycleOutcome::Blocked);
+        // Verify the stored object's length and hash. A HEAD that
+        // returns `None` right after a successful PUT is an
+        // infrastructure failure, not a benign race: the backend lost
+        // the write, or something else deleted it out from under us.
+        match store.head(&key).await? {
+            Some(meta) => {
+                if meta.bytes != record.bytes || meta.sha256 != *key.sha256() {
+                    // Same key, different bytes. The content-addressed
+                    // key should prevent this, but the check is cheap
+                    // and the alert is loud.
+                    return Ok(CycleOutcome::Blocked);
+                }
             }
+            None => return Err(CycleError::ObjectVanished),
         }
     }
 
-    manifest.record_object(&db, &record).await?;
+    let state = manifest.record_object(&db, &record).await?;
     #[cfg(feature = "sql-store-failpoints")]
     super::failpoints::hit(super::failpoints::Point::AfterRecord);
+
+    // Observed state matters:
+    //
+    // - Uploaded: the normal path. Proceed to the CAS.
+    // - Orphan: the reconciler marked an earlier row orphan after a
+    //   crash between put and the previous CAS. Revive it before the
+    //   CAS, otherwise `publish_cas` fails with `ObjectNotUploaded`
+    //   forever and the database's backup freezes silently.
+    // - Published: someone else won the CAS with this exact object
+    //   (same content-addressed key). Nothing to publish; return
+    //   `Lost(current)` so the caller re-plans from the new frontier.
+    match state {
+        ObjectState::Uploaded => {}
+        ObjectState::Orphan => {
+            let revived = manifest.revive_object(&db, &key).await?;
+            if !revived {
+                // Someone raced us between the record and the revive;
+                // re-read the current frontier and try again.
+                return Ok(CycleOutcome::Lost(manifest.current(&db).await?));
+            }
+        }
+        ObjectState::Published => {
+            return Ok(CycleOutcome::Lost(manifest.current(&db).await?));
+        }
+    }
 
     #[cfg(feature = "sql-store-failpoints")]
     super::failpoints::hit(super::failpoints::Point::BeforeCas);
@@ -260,5 +310,93 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, CycleOutcome::Blocked);
+    }
+
+    fn cycle_for(key: &ObjectKey, body: &[u8], publish_object: &ObjectKey) -> Cycle<'static> {
+        use crate::sql::store::manifest::PublishKind;
+        Cycle {
+            db: DbRef {
+                space: "s",
+                db_id: "d",
+            },
+            key: key.clone(),
+            body: body.to_vec(),
+            record: ObjectRecord {
+                key: key.clone(),
+                format: "sqlite-v1".into(),
+                bytes: body.len() as u64,
+                created_at: "2026-11-22T00:00:00.000000Z".into(),
+            },
+            expected: None,
+            publish: Publish {
+                kind: PublishKind::Snapshot,
+                object: publish_object.clone(),
+                base_checkpoint_cid: "cid".into(),
+                frontier_bytes: body.len() as u64,
+                publish_id: PublishId::random(),
+                now: "2026-11-22T00:00:00.000000Z".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_keys_across_inputs_are_refused_before_any_io() {
+        let (store, manifest) = harness().await;
+        let key_a = snapshot_key();
+        let key_b = snapshot_key();
+        let cycle = cycle_for(&key_a, b"body", &key_b);
+        let err = publish_cycle(&store, &manifest, cycle)
+            .await
+            .expect_err("mismatched keys must be refused");
+        assert!(matches!(err, CycleError::Invalid), "{err:?}");
+        // And no object was put: the preflight runs before the PUT.
+        assert!(store.head(&key_a).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn orphaned_record_is_revived_so_the_cas_can_succeed_on_retry() {
+        // Simulate the crash-matrix case Bobbie flagged: a cycle lands
+        // put_if_absent + record_object (state=uploaded), the process
+        // dies before publish_cas, then the reconciler marks the row
+        // orphan before the retry. The retry's record_object is a no-op
+        // on the same content-addressed row, so observed state is
+        // Orphan; without the revive, publish_cas returns
+        // ObjectNotUploaded forever.
+        use crate::sql::store::manifest::SqlManifest;
+        let (store, manifest) = harness().await;
+        let key = snapshot_key();
+        let body = b"body".to_vec();
+        let cycle_1 = cycle_for(&key, &body, &key);
+        // First call lands the row in `uploaded`.
+        let _ = store.put_if_absent(&key, body.clone()).await.unwrap();
+        let state_before = manifest
+            .record_object(
+                &DbRef {
+                    space: "s",
+                    db_id: "d",
+                },
+                &cycle_1.record,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_before, ObjectState::Uploaded);
+        // Reconciler marks it orphan.
+        manifest
+            .mark_orphans(
+                &DbRef {
+                    space: "s",
+                    db_id: "d",
+                },
+                "9999",
+            )
+            .await
+            .unwrap();
+        // Retry.
+        let cycle_2 = cycle_for(&key, &body, &key);
+        let outcome = publish_cycle(&store, &manifest, cycle_2).await.unwrap();
+        assert!(
+            matches!(outcome, CycleOutcome::Published(_)),
+            "the retry must revive the orphan and publish: {outcome:?}"
+        );
     }
 }

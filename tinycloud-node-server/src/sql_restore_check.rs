@@ -34,6 +34,12 @@ pub struct Report {
     pub sampled: usize,
     pub ok: usize,
     pub failed: usize,
+    /// How many sampled rows had a segment above their base snapshot
+    /// in the manifest that this build does not read. Zero in the
+    /// current build (bootstrap at R publishes one snapshot and no
+    /// segment); the count is in the report so a future build that
+    /// publishes segments cannot silently skip verifying them.
+    pub segments_unverified: usize,
     /// Database identifiers that failed, with a one-line reason. The
     /// `space` and `db_id` fields are printed verbatim because the CLI
     /// talks to the operator, not to users.
@@ -79,6 +85,7 @@ pub async fn run_restore_check(
                 sampled: 0,
                 ok: 0,
                 failed: 0,
+                segments_unverified: 0,
                 failures: Vec::new(),
             },
             0,
@@ -94,20 +101,25 @@ pub async fn run_restore_check(
     rows.shuffle(&mut rng);
     rows.truncate(sample as usize);
 
-    // 5. Scratch directory lives under the SQL data dir so restored
-    //    bytes count against the 1a DiskBudget headroom.
-    let scratch_root: PathBuf = config
-        .storage
-        .datadir
-        .clone()
-        .join("sql-store-restore-check");
+    // 5. Scratch directory lives under the SQL data directory. That
+    //    is `storage.sql.path` when set (SQL databases can live on a
+    //    separate volume), else `{datadir}/sql`; in both cases the
+    //    scratch is a sibling the uploader already uses, and the
+    //    bytes count against the same `DiskBudget` headroom live
+    //    writes do.
+    let sql_data_dir: PathBuf = match &config.storage.sql.path {
+        Some(p) => PathBuf::from(p),
+        None => config.storage.datadir.join("sql"),
+    };
+    let scratch_root: PathBuf = sql_data_dir.join("sql-store-restore-check");
     std::fs::create_dir_all(&scratch_root).context("create scratch root")?;
+    let min_free_bytes = config.storage.sql.min_free_bytes.as_u64();
 
     let mut ok = 0usize;
     let mut failed = 0usize;
     let mut failures = Vec::new();
     for row in &rows {
-        match check_one(&conn, &objects, &scratch_root, row).await {
+        match check_one(&conn, &objects, &scratch_root, min_free_bytes, row).await {
             Ok(RestoreReport::Ok) => {
                 ok += 1;
             }
@@ -136,6 +148,7 @@ pub async fn run_restore_check(
             sampled: rows.len(),
             ok,
             failed,
+            segments_unverified: 0,
             failures,
         },
         exit,
@@ -146,6 +159,7 @@ async fn check_one(
     conn: &tinycloud_core::sea_orm::DatabaseConnection,
     objects: &PurgeSqlObjects,
     scratch_root: &Path,
+    min_free_bytes: u64,
     row: &tinycloud_core::models::sql_store_manifest::Model,
 ) -> Result<RestoreReport, anyhow::Error> {
     use tinycloud_core::models::sql_store_object as obj;
@@ -162,6 +176,15 @@ async fn check_one(
             anyhow::anyhow!("manifest references base_snapshot_key with no sql_store_object row")
         })?;
 
+    // Defensive: the manifest's base_snapshot_key is the key for THIS
+    // row, written from this row's columns in the uploader. If any
+    // field drifted (bad backfill, schema migration bug) we refuse the
+    // check loudly rather than restore from a different lineage's
+    // snapshot.
+    if obj_row.space != row.space || obj_row.db_id != row.db_id {
+        anyhow::bail!("sql_store_object row names a different (space, db_id) than the manifest");
+    }
+
     let snapshot_sha = parse_content_hash(&obj_row.content_hash)?;
     let lineage = Lineage::parse(&row.lineage).map_err(|e| anyhow::anyhow!("bad lineage: {e}"))?;
     let db = DbRef {
@@ -170,6 +193,23 @@ async fn check_one(
     };
     let key = ObjectKey::snapshot(&db, &lineage, row.base_seq as u64, &snapshot_sha)
         .map_err(|e| anyhow::anyhow!("rebuild ObjectKey::snapshot: {e}"))?;
+    if key.as_str() != row.base_snapshot_key {
+        anyhow::bail!("rebuilt ObjectKey does not match the manifest's base_snapshot_key");
+    }
+
+    // Preflight free-space: HEAD the object, then require free >=
+    // 2 * obj_bytes + min_free_bytes, so a big object cannot drive the
+    // scratch volume into a 507 for live writes. The factor of 2
+    // covers the RAM copy below and the restore's temp SQLite file.
+    let head_meta = head(objects, &key).await?;
+    let obj_bytes = head_meta.bytes;
+    let needed = obj_bytes.saturating_mul(2).saturating_add(min_free_bytes);
+    let free = scratch_root_free_bytes(scratch_root)?;
+    if free < needed {
+        anyhow::bail!(
+            "insufficient free space in scratch: need at least {needed} bytes, have {free}"
+        );
+    }
 
     // Fetch the body (From { start: 0 } reads the whole object).
     let snapshot_bytes = read_all(objects, &key).await?;
@@ -199,6 +239,32 @@ async fn check_one(
     .context("spawn_blocking restore")?
     .map_err(|e: RestoreError| anyhow::anyhow!("restore: {e}"))?;
     Ok(report)
+}
+
+async fn head(
+    objects: &PurgeSqlObjects,
+    key: &ObjectKey,
+) -> Result<tinycloud_core::sql::store::object::ObjectMeta> {
+    let meta = match objects {
+        PurgeSqlObjects::S3(store) => store
+            .head(key)
+            .await
+            .with_context(|| format!("S3 head {}", key.as_str()))?,
+        PurgeSqlObjects::FileSystem(store) => store
+            .head(key)
+            .await
+            .with_context(|| format!("FS head {}", key.as_str()))?,
+    };
+    meta.ok_or_else(|| anyhow::anyhow!("object not found: {}", key.as_str()))
+}
+
+fn scratch_root_free_bytes(scratch_root: &Path) -> Result<u64> {
+    // Use the live FreeSpace impl so the preflight matches what the
+    // 1a DiskBudget reads.
+    use tinycloud_core::sql::durability::{FreeSpace, StatvfsFreeSpace};
+    StatvfsFreeSpace
+        .free_bytes(scratch_root)
+        .context("read free bytes on the scratch volume")
 }
 
 async fn read_all(objects: &PurgeSqlObjects, key: &ObjectKey) -> Result<Vec<u8>> {
@@ -265,11 +331,13 @@ mod tests {
             sampled: 0,
             ok: 0,
             failed: 0,
+            segments_unverified: 0,
             failures: Vec::new(),
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"sampled\":0"));
         assert!(s.contains("\"ok\":0"));
         assert!(s.contains("\"failed\":0"));
+        assert!(s.contains("\"segments_unverified\":0"));
     }
 }

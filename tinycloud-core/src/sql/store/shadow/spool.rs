@@ -27,8 +27,14 @@ use std::sync::Arc;
 use crate::sql::durability::{DiskBudget, FreeSpace, ReservationRefused};
 
 /// Reservation key prefix the spool uses, so it never collides with a
-/// live actor's reservation (`sql:<space>:<db_id>`).
+/// live actor's reservation (`{space}/{db_id}`).
 pub const SPOOL_KEY_PREFIX: &str = "sql-spool";
+
+/// Process-wide counter that makes each spool reservation key unique
+/// so two in-flight reservations for the same DB do not alias each
+/// other on the DiskBudget (the budget stores one entry per key, and
+/// an aliased key's Drop would forget both).
+static RESERVATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A spool reservation tied to the SQL disk budget. Drop releases the
 /// bytes.
@@ -43,6 +49,18 @@ impl Reservation {
     /// success; on refusal the caller MUST shed the capture before any
     /// copy. The reserved bytes are inflight (not pending) because the
     /// spool file lives only until its upload completes.
+    ///
+    /// `spool_margin_bytes` is added on top of the actors'
+    /// `min_free_bytes` headroom, so a big bootstrap cannot push the
+    /// live-write headroom to zero and force user writes into
+    /// `sql_disk_headroom` 507s. 32 MiB is a reasonable default for
+    /// the live set; the node fairing supplies it.
+    ///
+    /// The reservation key carries a process-wide counter so two
+    /// in-flight reservations on the same `(space, db_id)` do not
+    /// alias on the budget's map (where a Drop on the second one
+    /// would forget both).
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         budget: Arc<DiskBudget>,
         space: &str,
@@ -51,9 +69,17 @@ impl Reservation {
         free_space: &dyn FreeSpace,
         dir: &Path,
         min_free_bytes: u64,
+        spool_margin_bytes: u64,
     ) -> Result<Self, ReservationRefused> {
         let key = reservation_key(space, db_id);
-        budget.reserve(&key, bytes, 0, free_space, dir, min_free_bytes)?;
+        budget.reserve(
+            &key,
+            bytes,
+            0,
+            free_space,
+            dir,
+            min_free_bytes.saturating_add(spool_margin_bytes),
+        )?;
         Ok(Self { budget, key })
     }
 
@@ -68,9 +94,12 @@ impl Drop for Reservation {
     }
 }
 
-/// Build the reservation key for a database's spool entry.
+/// Build the reservation key for a database's spool entry. The
+/// process-wide counter guarantees uniqueness across in-flight
+/// reservations on the same `(space, db_id)`.
 pub fn reservation_key(space: &str, db_id: &str) -> String {
-    format!("{SPOOL_KEY_PREFIX}:{space}:{db_id}")
+    let n = RESERVATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{SPOOL_KEY_PREFIX}:{space}:{db_id}:{n}")
 }
 
 #[cfg(test)]
@@ -107,9 +136,10 @@ mod tests {
             &free,
             &dir,
             1024 * 1024,
+            0,
         )
         .unwrap();
-        assert_eq!(r.key(), "sql-spool:space-a:main");
+        assert!(r.key().starts_with("sql-spool:space-a:main:"));
     }
 
     #[test]
@@ -127,6 +157,7 @@ mod tests {
             &free,
             &dir,
             1024 * 1024,
+            0,
         )
         .unwrap_err();
         assert!(matches!(err, ReservationRefused::Headroom));
@@ -148,6 +179,7 @@ mod tests {
             &free,
             &dir,
             0,
+            0,
         )
         .unwrap();
         // While `first` holds, a second one of the same size would
@@ -160,29 +192,116 @@ mod tests {
             &free,
             &dir,
             0,
+            0,
         )
         .unwrap_err();
         assert!(matches!(err, ReservationRefused::Headroom));
         drop(first);
         // After drop, the second reservation succeeds.
         let _second =
-            Reservation::try_new(budget, "b", "e", 4 * 1024 * 1024 + 2, &free, &dir, 0).unwrap();
+            Reservation::try_new(budget, "b", "e", 4 * 1024 * 1024 + 2, &free, &dir, 0, 0).unwrap();
     }
 
     #[test]
     fn two_spool_keys_for_two_databases_do_not_collide() {
-        assert_eq!(reservation_key("s1", "d1"), "sql-spool:s1:d1");
-        assert_ne!(reservation_key("s1", "d1"), reservation_key("s1", "d2"));
-        assert_ne!(reservation_key("s1", "d1"), reservation_key("s2", "d1"));
+        assert!(reservation_key("s1", "d1").starts_with("sql-spool:s1:d1:"));
+        // Two different DBs must not share a prefix either.
+        assert_ne!(
+            reservation_key("s1", "d1")[..17],
+            reservation_key("s1", "d2")[..17]
+        );
+        // Two reservations on the same DB get unique counter suffixes.
+        assert_ne!(reservation_key("s1", "d1"), reservation_key("s1", "d1"));
     }
 
     #[test]
     fn spool_key_never_collides_with_actor_key_prefix() {
         let k = reservation_key("s", "d");
         assert!(k.starts_with("sql-spool:"));
-        // The actor's reservation key starts with "sql:"; the spool's
-        // "sql-spool:" prefix shares the "sql" letters but the colon
-        // position differs.
-        assert!(!k.starts_with("sql:"));
+        // The actor's reservation key has the shape "{space}/{db_id}";
+        // the spool's "sql-spool:..." prefix never starts with that.
+        assert!(!k.contains('/'));
+    }
+
+    #[test]
+    fn two_reservations_for_the_same_db_coexist_and_are_forgotten_independently() {
+        let budget = Arc::new(DiskBudget::default());
+        let free = FakeFreeSpace(Mutex::new(HashMap::new()));
+        let dir = PathBuf::from("/data/sql");
+        free.set(&dir, 32 * 1024 * 1024);
+        let a = Reservation::try_new(
+            budget.clone(),
+            "space-a",
+            "main",
+            4 * 1024 * 1024,
+            &free,
+            &dir,
+            0,
+            0,
+        )
+        .unwrap();
+        let b = Reservation::try_new(
+            budget.clone(),
+            "space-a",
+            "main",
+            4 * 1024 * 1024,
+            &free,
+            &dir,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_ne!(a.key(), b.key(), "unique keys per reservation");
+        drop(a);
+        // After dropping `a`, `b` still holds its 4 MiB. 25 MiB ask
+        // against 32 MiB free with 4 MiB held = 29 MiB used: still
+        // fits. Push to 29 MiB to force a refusal (29 + 4 = 33 > 32).
+        let err = Reservation::try_new(
+            budget,
+            "space-a",
+            "main",
+            29 * 1024 * 1024,
+            &free,
+            &dir,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReservationRefused::Headroom));
+        drop(b);
+    }
+
+    #[test]
+    fn spool_margin_is_added_above_min_free_bytes() {
+        let budget = Arc::new(DiskBudget::default());
+        let free = FakeFreeSpace(Mutex::new(HashMap::new()));
+        let dir = PathBuf::from("/data/sql");
+        // 10 MiB free, 1 MiB min_free, 8 MiB spool margin, 3 MiB ask:
+        // 3 + 1 + 8 = 12 > 10, refused.
+        free.set(&dir, 10 * 1024 * 1024);
+        let err = Reservation::try_new(
+            budget.clone(),
+            "space-a",
+            "main",
+            3 * 1024 * 1024,
+            &free,
+            &dir,
+            1024 * 1024,
+            8 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReservationRefused::Headroom));
+        // Without the margin the same ask succeeds.
+        Reservation::try_new(
+            budget,
+            "space-a",
+            "main",
+            3 * 1024 * 1024,
+            &free,
+            &dir,
+            1024 * 1024,
+            0,
+        )
+        .unwrap();
     }
 }

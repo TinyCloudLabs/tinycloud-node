@@ -60,7 +60,7 @@ impl<F: Fn(&DbState, Instant) -> bool + Send + Sync> IsDue for F {
 /// The run loop's shared state: the per-DB map, the node-wide and
 /// Postgres semaphores, and the allowlist.
 pub struct RunState {
-    pub states: DashMap<DbKey, Mutex<DbState>>,
+    pub states: DashMap<DbKey, Arc<Mutex<DbState>>>,
     pub node_concurrency: Semaphore,
     pub pg_concurrency: Semaphore,
     pub allowlist: BTreeSet<String>,
@@ -87,11 +87,19 @@ impl RunState {
     where
         F: FnOnce(&mut DbState),
     {
-        let entry = self
-            .states
-            .entry(key)
-            .or_insert_with(|| Mutex::new(DbState::default()));
-        let mut st = entry.lock().await;
+        // Clone the Arc<Mutex> out of the DashMap before awaiting so the
+        // DashMap's RefMut does not live across the `.await`. A RefMut
+        // is `!Send`, so holding it across `.await` makes the future
+        // non-Send and can deadlock when another task tries to acquire
+        // the same bucket's shard.
+        let arc = {
+            let entry = self
+                .states
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(DbState::default())));
+            Arc::clone(entry.value())
+        };
+        let mut st = arc.lock().await;
         apply(&mut st);
     }
 }

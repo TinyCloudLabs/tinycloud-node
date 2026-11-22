@@ -102,10 +102,11 @@ struct SqlStoreArgs {
 
 #[derive(Debug, Subcommand)]
 enum SqlStoreCommand {
-    /// Sample N published databases, fetch each one's snapshot (and the
-    /// highest published segment, when the frontier names one), run the
+    /// Sample N published databases, fetch each one's snapshot, run the
     /// restore module on the materialised bytes, and report the result.
-    /// Exits nonzero on any mismatch.
+    /// Segments are not read in this build (bootstrap at R publishes
+    /// one snapshot and no segment; capture-driven segment publishing
+    /// lands later). Exits nonzero on any mismatch.
     RestoreCheck(RestoreCheckArgs),
 }
 
