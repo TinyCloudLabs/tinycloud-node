@@ -694,8 +694,9 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`**
-  (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized). Before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
+  **`c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46`**
+  (raw `46287bc31dc09649b0679bacfe611ee24ad5ced5c51cd7909821dee895c1f6d2` normalized). Before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` / `MIN_FREE_BYTES` env lines the template was `e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`
+  (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized); before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
   (raw `f4f51e75076f21c7bd05e93e24d08ffe7290e2f9567fe1ed4daca7ec0e9ad7a5` normalized); before the TC-287 `TINYCLOUD_RETENTION__ENABLED` env line the template was `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`
   (raw `272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468` normalized). With the TC-3554 key-recovery sidecar (1.26.14), before the node opened its root from `root_wrap`, the template was `70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`
   (raw `8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9` normalized); before the TC-3554 key-recovery sidecar and `DstackKmsEpoch` epoch-0 pins the template was `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da`
@@ -721,11 +722,13 @@ Before any CVM mutation the workflow requires:
   refused;
 - the release revision to be a **strict descendant** of the revision running
   in production (read from the CVM's pinned image by the ancestry guard).
-  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
-  or an unknown running revision is refused. The same ancestry rule makes
-  the 12c same-image command refuse an image older than the running
-  revision once 1.21.0 is live, so it cannot downgrade across migrations.
-  The captured pre-N0 rollback is the only intentional downgrade route.
+  A downgrade (for example 1.20.5 or 1.0.0) or an unknown running revision is
+  refused. The same revision as running is accepted only for the exact image
+  digest Phala's current compose runs: a config-only deployment (TC-3765, see
+  [A compose-only change on the running image](#a-compose-only-change-on-the-running-image)).
+  The same ancestry rule makes the 12c same-image command refuse an image older
+  than the running revision once 1.21.0 is live, so it cannot downgrade across
+  migrations. The captured pre-N0 rollback is the only intentional downgrade route.
 
 Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
 `allowed_envs` sync, and the general quota reconciliation run as on every
@@ -755,32 +758,37 @@ The downstream watcher cannot skip quota restoration.
 For column encryption cutovers, use the backup-based rollback in
 [Column encryption cutover](#column-encryption-cutover-tc-2682).
 
-### A compose-only change ships as a release
+### A compose-only change on the running image
 
 The production compose is the reviewed N0 template (locked by the template
 hash in `docker.yml`), and the compose on `main` is the one that gets
 deployed. For any image digest other than the reviewed 1.20.6 image, the
-N0-template path requires a released image (`require_release`): the tag commit
-must be a strict descendant of the revision running in production. So a change
-to the production compose (for example the database pool in TC-950) reaches
-production with a release, which means a version bump even when the node code
-is unchanged. A digest promotion of the revision that is already running, with
-a changed compose, is refused by the ancestry guard ("Released image must be a
-strict descendant of the running production revision").
+N0-template path requires a released image (`require_release`): its tag commit
+must descend from the revision running in production. A compose change (for
+example a flag turn-on) can ship without a new release by promoting the image
+that is already running: the release revision may equal the running revision
+only when the selected digest equals the digest pinned in Phala's current
+compose (TC-3765). The same revision under any other digest, or a running image
+the ancestry guard cannot read, is refused ("…or the exact running image digest
+for a config-only deployment"). `allow_non_descendant` does not help here: it
+skips the ancestry guard, so the running image is unknown and the pin step
+refuses.
 
 1. Merge the compose change (the compose, its byte-identical fixture
    `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
    `docker.yml` and the hashes in this file move together).
-2. Cut the release PR (version bump in `Cargo.toml` and the three lockfiles,
-   `[Unreleased]` moved under the new version) and let the tag build finish.
-3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
-   promotion command above with that digest, version and revision.
+2. Use the promotion command above with the **running** image's digest,
+   version and revision (from the `Deployment image:` line of the run that
+   deployed it).
 
-A rollback of a compose-only change still follows the same path: revert plus a
-new release. To restore an earlier node image while retaining the current N0
-compose, use the explicit audited rollback below. The same-image recovery
-command below is for the reviewed 1.20.6 image only and is refused once a later
-release is running.
+Rolling back a compose-only change is the same path in reverse: revert the
+compose change on `main` (compose, fixture, template hash), then promote the
+running digest again. A change that needs new node code still ships as a
+release (version bump in `Cargo.toml` and the three lockfiles, `[Unreleased]`
+moved under the new version). To restore an earlier node image while retaining
+the current N0 compose, use the explicit audited rollback below. The same-image
+recovery command below is for the reviewed 1.20.6 image only and is refused
+once a later release is running.
 
 ### Audited rollback to a prior N0 release
 
@@ -852,8 +860,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line and the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line), whatever digest
+`46287bc31dc09649b0679bacfe611ee24ad5ced5c51cd7909821dee895c1f6d2`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**
 1.26.14 needs the sidecar this compose lacks,

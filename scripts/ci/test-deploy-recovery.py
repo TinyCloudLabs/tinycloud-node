@@ -232,6 +232,7 @@ class RecoveryTests(unittest.TestCase):
     def run_deploy(self, compose=CURRENT, changes=None, *, fail_at="", artifact_error="", authority="node-override",
                    missing_billing=False, missing_authorization=False, approved_privacy="", event="workflow_dispatch", stats_token=None,
                    allowed_stats=False, migration_diff=False,
+                   running_image="",  # test-ruling: TC-3765 scripts/ci/test-deploy-recovery.py additive running_image kwarg + new test only (2026-11-22)
                    ref="refs/heads/main", oci_label=None, oci_revision=None, build_digest="", releases=RELEASED, running=REVISION, order=None):
         inputs = {"deploy_phala": "true", "authorize_quota_values": "true", "image_version": "1.20.6",
                   "deploy_image_digest": DIGEST, "rollback_image_version": "1.20.6", "rollback_image_revision": REVISION,
@@ -296,6 +297,7 @@ class RecoveryTests(unittest.TestCase):
                         "TEST_ORDER": json.dumps(order or ORDER),
                         "TEST_MIGRATION_DIFF": str(migration_diff).lower()})
             if running: env["RUNNING_REVISION"] = running
+            if running_image: env["RUNNING_IMAGE"] = running_image
             if allowed_stats: env["TEST_ALLOWED_ENVS"] = "NODE_STATS_READ_TOKEN"
             if stats_token == ADMIN_VALUE: stats_token = canary
             if stats_token is not None:
@@ -468,6 +470,26 @@ class RecoveryTests(unittest.TestCase):
                 result = self.run_deploy(N0, changes, releases=releases, running=running)
                 self.assertEqual(result["success"], ok)
                 if not ok:
+                    self.assertNotIn("cvm-deploy", result["events"])
+                    self.assertEqual(result["compose"], N0)
+
+    def test_config_only_deploy_needs_the_exact_running_image_digest(self):
+        changes = {"deploy_image_digest": RELEASE_DIGEST, "image_version": "1.21.0", "rollback_image_version": "1.21.0",
+                   "rollback_image_revision": RELEASE_REVISION}
+        releases = {"1.21.0": (RELEASE_REVISION, "1.21.0")}
+        native = "ghcr.io/tinycloudlabs/tinycloud-node@"
+        for name, running, running_image, ok in (
+                ("running image, new N0 compose", RELEASE_REVISION, native + RELEASE_DIGEST, True),
+                ("same revision, other digest", RELEASE_REVISION, native + "sha256:" + "a" * 64, False),
+                ("same revision, running image unreadable", RELEASE_REVISION, "", False),
+                ("running revision unreadable", "", native + RELEASE_DIGEST, False)):
+            with self.subTest(name):
+                result = self.run_deploy(N0, changes, releases=releases, running=running, running_image=running_image)
+                self.assertEqual(result["success"], ok)
+                if ok:
+                    self.assertIn("cvm-deploy", result["events"])
+                    self.assertIn(RELEASE_DIGEST.encode(), result["compose"])
+                else:
                     self.assertNotIn("cvm-deploy", result["events"])
                     self.assertEqual(result["compose"], N0)
 

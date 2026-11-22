@@ -694,8 +694,10 @@ jobs:
             exit 1
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
-          # Later steps refuse a deployment older than what is running.
+          # Later steps refuse a deployment older than what is running, and
+          # accept the running revision only for its own image digest (TC-3765).
           echo "RUNNING_REVISION=${RUNNING_REVISION}" >> "$GITHUB_ENV"
+          echo "RUNNING_IMAGE=${RUNNING_IMAGE}" >> "$GITHUB_ENV"
 
       - name: Preflight quota authority
         env:
@@ -774,12 +776,13 @@ jobs:
           # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes, the TC-2917
           # storage-headroom event in the Vector config, the TC-1491 artifact read limit env line, the TC-3554
           # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar, the TC-287 retention
-          # sweeper env line and the TC-1791 delegated SQL caveats env line (raw d1d2ef49…;
+          # sweeper env line, the TC-1791 delegated SQL caveats env line and the TC-1491 SQL size-cap and
+          # free-disk env lines (raw 46287bc3…; e5f1c356… / d1d2ef49… before the TC-1491 caps,
           # e1cf031b… / f4f51e75… before TC-1791, 6a577c6d… / 272f43b8… before TC-287,
           # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
           # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = 'e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea'
+          n0_template_hash = 'c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -834,8 +837,12 @@ jobs:
                   raise SystemExit('::error::Refusing to deploy an image older than the running production revision; use the captured pre-N0 rollback for an intentional rollback')
 
           def require_release_descends(revision):
-              if not re.fullmatch(r'[0-9a-f]{40}', running) or running == revision or not is_ancestor(running, revision):
+              if not re.fullmatch(r'[0-9a-f]{40}', running) or not is_ancestor(running, revision):
                   raise SystemExit('::error::Released image must be a strict descendant of the running production revision; deployment not attempted')
+              if running == revision and os.environ.get('RUNNING_IMAGE') != os.environ['RESOLVED_IMAGE']:
+                  # TC-3765: the running revision is accepted only as a config-only
+                  # deployment of the exact image Phala's current compose runs.
+                  raise SystemExit('::error::Released image must be a strict descendant of the running production revision, or the exact running image digest for a config-only deployment; deployment not attempted')
           pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
           rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
