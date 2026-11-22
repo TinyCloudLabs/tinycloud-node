@@ -654,6 +654,23 @@ its branch policy before any workflow that names it runs.
      that profile's space. This exercises `/delegate`, `/invoke` KV and SQL.
      Run it with stderr visible (no `2>/dev/null`), so a failing request shows
      its error rather than an empty result.
+   - Delegated SQL caveats (TC-1791): after a deploy that changes caveat
+     handling (the `sql.delegated_caveats_enforced` setting, its N0, or code
+     in `models/delegation.rs` or the SQL caveat checks), run the caveat
+     probe against the live node. It signs with throwaway keys kept in a
+     state file you name, outside any repository; the first run creates the
+     file (mode 0600), and later runs reuse its one `caveatprobe` space. Do
+     not commit or paste the file:
+
+     ```sh
+     cargo build --manifest-path test/caveat-probe/Cargo.toml
+     test/caveat-probe/target/debug/tinycloud-caveat-probe https://tee.node.tinycloud.xyz ~/.cache/tc1791-probe.json
+     ```
+
+     It prints one `step status= expected= code= PASS|FAIL` line per step and
+     exits 0 only on `result PASS`. With the setting off, only `e-delegate`
+     fails (401 `unsupported-caveat`); any other failure is a regression.
+     Details: `test/caveat-probe/src/main.rs`.
 4. **Watch.** The `promote-watch` job then dispatches the Write Probe's dense
    promote watch (TC-1176): signed-in KV and SQL reads every 30 s for 5 min,
    then every 5 min for 60 min, paging team@ through Better Stack on 2 reads
