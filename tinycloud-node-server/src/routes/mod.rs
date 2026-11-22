@@ -13788,6 +13788,112 @@ mod tests {
         config
     }
 
+    // test-ruling: TC-1791 tinycloud-node-server/src/routes/mod.rs new test only (2026-11-22)
+    /// TC-1791: with the setting on, a SQL grant whose caveat list is `[{}]`
+    /// or empty, the form nearly every client sends, is admitted by the real
+    /// `/delegate` and restricts nothing: reads of any column, schema reads,
+    /// writes and batches all run under it. A constrained-statements profile
+    /// (the SDK's `readSql` form) is admitted too; its named statement runs
+    /// with `params: []` and the pinned `fixedParams` injected, and a raw
+    /// query under it is refused.
+    #[tokio::test]
+    async fn empty_and_profile_sql_grants_through_delegate_under_enforcement() -> Result<()> {
+        use rocket::http::Status;
+        use serde_json::json;
+        let fixture = KvSyncFixture::new_configured(tc1791_on(), |rocket| rocket).await?;
+        tc1791_seed(&fixture).await?;
+        for (label, list) in [("one-empty", json!([{}])), ("no-entry", json!([]))] {
+            let reply = fixture
+                .delegate_sql(
+                    &fixture.owner,
+                    &fixture.owner_vm,
+                    &fixture.device_did(),
+                    "tinycloud.sql/write",
+                    list,
+                    &[],
+                    label,
+                )
+                .await?;
+            assert_eq!(reply.status, Status::Ok, "{label}: {}", reply.body);
+            let id = KvSyncFixture::delegation_id(&reply)?;
+            for request in [
+                tc1791_query("SELECT secret FROM Notes"),
+                tc1791_query("SELECT name FROM sqlite_master"),
+                tc1791_execute("INSERT INTO plain (a) VALUES (5)"),
+                tc1791_batch(&[
+                    "INSERT INTO t2 (x) VALUES ('y')",
+                    "DELETE FROM plain WHERE a = 5",
+                ]),
+            ] {
+                let ran = fixture.sql_device(id, request).await?;
+                assert_eq!(ran.status, Status::Ok, "{label}: {}", ran.body);
+            }
+        }
+        // Each grant's batch wrote one row.
+        assert_eq!(tc1791_count(&fixture, "t2").await?, 2);
+
+        // The SDK's `readSql` form: the delegation carries the profile, the
+        // invocation attaches the same caveat and sends `params: []`, and the
+        // node binds the pinned value (row 2 of Notes).
+        let entry: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(json!({"mode": "constrained-statements", "readOnly": true,
+                "statements": [{"name": "get", "sql": "SELECT body FROM Notes WHERE id = ?",
+                                "fixedParams": [{"index": 0, "value": 2}]}]}))?;
+        let reply = fixture
+            .delegate_sql(
+                &fixture.owner,
+                &fixture.owner_vm,
+                &fixture.device_did(),
+                "tinycloud.sql/read",
+                json!([entry.clone()]),
+                &[],
+                "profile",
+            )
+            .await?;
+        assert_eq!(reply.status, Status::Ok, "profile: {}", reply.body);
+        let id = KvSyncFixture::delegation_id(&reply)?;
+        let invoke = |request: SqlRequest| {
+            let entry = entry.clone();
+            let fixture = &fixture;
+            async move {
+                use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+                use tinycloud_auth::ucan_capabilities_object::Capabilities;
+                let mut capabilities = Capabilities::new();
+                capabilities.with_action(
+                    fixture.resource_in(&fixture.space, "sql", "db")?.as_uri(),
+                    "tinycloud.sql/read".parse::<UcanAbility>()?,
+                    [entry],
+                );
+                let header = Payload {
+                    issuer: fixture.device_vm.parse::<DIDURLBuf>()?,
+                    audience: KvSyncFixture::did_of(&fixture.device_vm).parse::<DIDBuf>()?,
+                    not_before: None,
+                    expiration: test_invocation_expiration(),
+                    nonce: Some(fixture.next_nonce()),
+                    facts: Some(Vec::<serde_json::Value>::new()),
+                    proof: vec![id.to_cid(0x55)],
+                    attenuation: capabilities,
+                }
+                .sign(
+                    fixture.device.get_algorithm().unwrap_or_default(),
+                    &fixture.device,
+                )?
+                .encode()?;
+                fixture.invoke_json(header, &request).await
+            }
+        };
+        let named = invoke(SqlRequest::ExecuteStatement {
+            name: "get".into(),
+            params: Vec::new(),
+        })
+        .await?;
+        assert_eq!(named.status, Status::Ok, "{}", named.body);
+        assert_eq!(named.json["rows"], json!([["b"]]), "{}", named.body);
+        let raw = invoke(tc1791_query("SELECT body FROM Notes")).await?;
+        assert_eq!(raw.status, Status::Forbidden, "{}", raw.body);
+        Ok(())
+    }
+
     impl KvSyncFixture {
         async fn ensure_actor(&self, did: &str) -> Result<()> {
             use tinycloud_core::models::actor;
