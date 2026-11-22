@@ -843,7 +843,8 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::Backend(_)
         | EncryptionServiceError::Signing(_)
         | EncryptionServiceError::CorruptKeyRow
-        | EncryptionServiceError::StrayAppKeyRows(_) => {
+        | EncryptionServiceError::StrayAppKeyRows(_)
+        | EncryptionServiceError::StraySecretKeyRows(_) => {
             super::note_error_code(ErrorCode::Encryption);
             Status::InternalServerError
         }
