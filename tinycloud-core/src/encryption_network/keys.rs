@@ -689,7 +689,16 @@ pub async fn ensure_no_deterministic_app_keys<C: ConnectionTrait>(
 /// characters, the same SQL on SQLite and PostgreSQL. Never `LIKE` (it treats
 /// `_` and `%` as wildcards, and SQLite's ignores case) and never a range
 /// (collation dependent). Key paths are ASCII, so characters are bytes.
+///
+/// `prefix` must end in `/`, so it selects the keys *under* a segment and never
+/// a sibling that merely shares its leading characters (`apps/a` would select
+/// `apps/ab/…`). The caller adds the `/`; a prefix without one is a bug, and
+/// debug builds assert it.
 pub(super) fn path_starts_with(prefix: &str) -> SimpleExpr {
+    debug_assert!(
+        prefix.ends_with('/'),
+        "path_starts_with needs a prefix ending in '/', got {prefix:?}"
+    );
     Expr::expr(Func::cust(Alias::new("substr")).args([
         Expr::col(encryption_network_key::Column::KeyPath).into(),
         SimpleExpr::from(1i32),

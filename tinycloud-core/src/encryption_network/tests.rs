@@ -3273,3 +3273,13 @@ async fn postgres_secret_keys_are_seeded_and_stray_rows_stop_the_start() {
     assert_secret_keys_are_seeded(&db, &svc).await;
     assert_startup_check_finds_stray_secret_rows(&db).await;
 }
+
+// `path_starts_with` selects the keys under a segment. A prefix without the
+// trailing `/` would also select a sibling that shares its leading characters
+// (`apps/a` and `apps/ab/…`), so debug builds refuse it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "path_starts_with needs a prefix ending in '/'")]
+fn path_starts_with_refuses_a_prefix_without_a_trailing_slash() {
+    let _ = crate::encryption_network::keys::path_starts_with("apps/a");
+}
