@@ -99,7 +99,7 @@ pub(crate) fn decode(
         return Err(unavailable());
     }
     let signed = TinyCloudDelegation::from_bytes(&bytes).map_err(|_| unavailable())?;
-    let info = DelegationInfo::try_from(signed).map_err(|_| unavailable())?;
+    let info = DelegationInfo::try_from_stored(signed).map_err(|_| unavailable())?;
     if !did_principal_matches(&info.delegator, &row.delegator)
         || !did_principal_matches(&info.delegate, &row.delegatee)
     {

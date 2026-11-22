@@ -289,10 +289,8 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
         .clone()
         .to_resource("kv".parse()?, Some("secrets/beta".parse()?), None, None)
         .to_string();
-    let secret_key_res = format!(
-        "urn:tinycloud:encryption:{}:default/secrets/alpha",
-        wallet.did
-    );
+    let network_res = format!("urn:tinycloud:encryption:{}:default", wallet.did);
+    let secret_key_res = format!("{network_res}/secrets/alpha");
 
     let app_key = JWK::generate_ed25519()?;
     let (app_did, _) = verification_method(&app_key);
@@ -341,6 +339,7 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
         &[
             (&kv_res, "tinycloud.kv/get"),
             (&kv_put_res, "tinycloud.kv/put"),
+            (&network_res, "tinycloud.encryption/decrypt"),
             (&secret_key_res, "tinycloud.encryption/decrypt"),
         ],
         &[],
@@ -369,6 +368,7 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
         &[
             (&kv_res, "tinycloud.kv/get"),
             (&kv_put_res, "tinycloud.kv/put"),
+            (&network_res, "tinycloud.encryption/decrypt"),
             (&secret_key_res, "tinycloud.encryption/decrypt"),
         ],
         &[t_cid],
@@ -450,6 +450,7 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
     for (res, ab) in [
         (&kv_res, "tinycloud.kv/get"),
         (&kv_put_res, "tinycloud.kv/put"),
+        (&network_res, "tinycloud.encryption/decrypt"),
         (&secret_key_res, "tinycloud.encryption/decrypt"),
     ] {
         abilities::ActiveModel {
@@ -561,6 +562,37 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
         invocation_replay::Entity::find().count(&db).await?,
         replay_before,
         "decrypt refusal must not spend a replay row"
+    );
+
+    // Dedicated /encryption/networks/<network_id>/decrypt route via legacy
+    // child of terminal CACAO -> 401 terminal-parent-cannot-redelegate, zero
+    // replay spend.
+    let inv_net_decrypt = signed_invocation(
+        &sub_key,
+        &node_did(),
+        &[(&network_res, "tinycloud.encryption/decrypt")],
+        &[ucan_child_cid],
+        None,
+    )?;
+    let net_decrypt_body = json!({ "networkId": network_res }).to_string();
+    let (status, body) = post_auth(
+        &client,
+        &format!("/encryption/networks/{network_res}/decrypt"),
+        &inv_net_decrypt,
+        Some(&net_decrypt_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "dedicated encryption decrypt via legacy child: {body}"
+    );
+    assert_eq!(body, "terminal-parent-cannot-redelegate");
+    assert_eq!(
+        invocation_replay::Entity::find().count(&db).await?,
+        replay_before,
+        "dedicated encryption decrypt refusal must not spend a replay row"
     );
 
     // 6. Confirm kv_put_res was never written (owner read -> 404).

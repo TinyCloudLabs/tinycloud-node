@@ -1312,8 +1312,10 @@ async fn verify_owner_delegation(
     let delegation = TinyCloudDelegation::from_bytes(&bytes).map_err(|_| ())?;
     verify_delegation_signature(&delegation).await?;
     let info = DelegationInfo::try_from(delegation).map_err(|_| ())?;
-    if info.delegation_mode == DelegationMode::Terminal
-        || !did_principal_matches(&info.delegator, &policy.owner_did)
+    if matches!(
+        info.delegation_mode,
+        DelegationMode::Terminal | DelegationMode::Invalid
+    ) || !did_principal_matches(&info.delegator, &policy.owner_did)
         || !did_principal_matches(&info.delegate, &policy.share_key_did)
         || row
             .expiry

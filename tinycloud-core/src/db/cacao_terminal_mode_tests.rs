@@ -1317,7 +1317,25 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         ))
     ));
 
-    // 3. Normal attenuable row & its child are unaffected.
+    // 3. Normal attenuable row & its child are marked explicitly "attenuable",
+    // never treated as terminal (including by older-node rollback checks), and
+    // remain unaffected.
+    let ok_row = delegation::Entity::find_by_id(Hash::from(ok_cid))
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!delegation::parent_is_terminal(&ok_row));
+    assert!(!delegation::delegation_mode_is_invalid(&ok_row));
+    assert_eq!(
+        ok_row
+            .facts
+            .as_ref()
+            .and_then(|crate::types::Facts(m)| m.get(crate::util::DelegationMode::FACT_KEY))
+            .and_then(|v| v.as_str()),
+        Some("attenuable"),
+        "scanned legacy row must be marked explicitly attenuable so future boots skip it"
+    );
     let ok_inv = signed_invocation(
         &k_ok_child,
         &[(&f.kv_res, "tinycloud.kv/get")],
@@ -1328,13 +1346,101 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         .await
         .unwrap();
 
-    // 4. Re-running reindex is idempotent (0 updates, no downgrades).
+    // 4. F2 stored-row readers tolerate the malformed-mode row without failing
+    // listing or purge, while keeping it unusable for authorization/renewal.
+    let listed = must_ok(
+        get_valid_delegations::<_, MemoryStore, StaticSecret>(
+            &reopened.conn,
+            &f.space,
+            Some(&encryption),
+        )
+        .await,
+    );
+    assert!(
+        listed.contains_key(&bad_hash),
+        "listing a space with a malformed stored row must succeed and remain listable"
+    );
+    assert_eq!(
+        listed[&bad_hash].0.delegation_mode,
+        crate::util::DelegationMode::Invalid
+    );
+    assert!(listed.contains_key(&Hash::from(ok_cid)));
+
+    let (_, loaded_bad) = reopened
+        .load_signed_delegation(bad_cid)
+        .await
+        .expect("load_signed_delegation must tolerate malformed stored row")
+        .expect("malformed row must exist");
+    assert_eq!(
+        loaded_bad.0.delegation_mode,
+        crate::util::DelegationMode::Invalid
+    );
+
+    let (_, collector_bad) =
+        crate::resource_purge_dependencies::collector::decode(&bad_row, Some(&encryption))
+            .expect("resource_purge collector must tolerate malformed stored row");
+    assert_eq!(
+        collector_bad.delegation_mode,
+        crate::util::DelegationMode::Invalid
+    );
+
+    let purge_targets =
+        crate::space_purge_records::policy::inventory_authorization_targets(&bad_bytes)
+            .expect("space_purge policy must tolerate malformed stored row");
+    assert_eq!(
+        purge_targets,
+        vec![crate::space_purge_records::policy::PolicyTarget::Space(
+            f.space.to_string()
+        )]
+    );
+
+    // Renewal registration must refuse a malformed stored original.
+    let renew_res = format!("urn:cid:{bad_cid}");
+    let (renew_lease_tok, _, _) = signed_cacao_token(
+        &f.wallet,
+        &reopened.secrets.node_did(),
+        &[(&renew_res, "tinycloud.delegation/renew")],
+        &[],
+        None,
+        "renewbad001",
+    );
+    let renew_lease = parse_delegation(&renew_lease_tok);
+    assert!(matches!(
+        crate::renewal::preverify_lease_original(&reopened.conn, &renew_lease, Some(&encryption))
+            .await,
+        Err(crate::renewal::RenewalStoreError::InvalidInput)
+    ));
+
+    // 5. F1: Second boot scans 0 rows (both previously indexed rows and newly
+    // saved rows already carry `delegationMode` in `facts`).
     let stats = delegation::reindex_cacao_modes(&reopened.conn, Some(&encryption))
         .await
         .unwrap();
     assert!(stats.completed);
+    assert_eq!(stats.scanned, 0, "second boot must scan 0 rows");
     assert_eq!(stats.reindexed_terminal, 0);
+    assert_eq!(stats.marked_attenuable, 0);
     assert_eq!(stats.marked_invalid, 0);
+
+    let fresh_key = JWK::generate_ed25519().unwrap();
+    let (fresh_did, _) = verification_method(&fresh_key);
+    let (fresh_tok, _, _) = signed_cacao_token(
+        &f.wallet,
+        &fresh_did,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+        "freshsave01",
+    );
+    must_ok(reopened.delegate(parse_delegation(&fresh_tok)).await);
+    let stats_after_save = delegation::reindex_cacao_modes(&reopened.conn, Some(&encryption))
+        .await
+        .unwrap();
+    assert!(stats_after_save.completed);
+    assert_eq!(
+        stats_after_save.scanned, 0,
+        "newly saved rows must already be indexed and skipped on next boot"
+    );
 
     // Part B: Plaintext multi-page interrupted reindex + restart completes
     // remaining pages before SpaceDatabase::new returns.
@@ -1373,6 +1479,7 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         .await
         .unwrap();
     assert!(!partial.completed, "1-page bounded run must stop early");
+    assert_eq!(partial.scanned, 128);
     assert_eq!(partial.reindexed_terminal, 128);
 
     // Confirm 12 rows on page 2 are not yet marked.
@@ -1404,6 +1511,11 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         unmarked_after, 0,
         "all 140 rows must be reindexed on restart"
     );
+    let second_boot = delegation::reindex_cacao_modes(&restarted.conn, None)
+        .await
+        .unwrap();
+    assert!(second_boot.completed);
+    assert_eq!(second_boot.scanned, 0);
 
     // Pick a row from both ends of sorted ID order and confirm children are refused.
     inserted_terminals.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));

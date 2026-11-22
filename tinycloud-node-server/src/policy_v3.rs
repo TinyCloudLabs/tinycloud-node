@@ -5941,6 +5941,9 @@ async fn authenticate_account_owner(
             authorization_failure(policy_refusal(error, "account-authorization-invalid"))
         })?
         .ok_or((Status::Forbidden, "account-authorization-missing".into()))?;
+    if event.0.delegation_mode == tinycloud_core::util::DelegationMode::Invalid {
+        return Err((Status::Forbidden, "account-authorization-invalid".into()));
+    }
     if !holder_did.starts_with("did:key:") {
         return Err((Status::Forbidden, "account-holder-invalid".into()));
     }

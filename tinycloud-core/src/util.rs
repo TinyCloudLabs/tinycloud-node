@@ -160,12 +160,18 @@ pub struct DelegationInfo {
     pub delegation_mode: DelegationMode,
 }
 
-/// W1 delegation mode marker. Carried in the signed UCAN delegation's
-/// `facts` array under the key `xyz.tinycloud.policy/delegationMode`.
+/// W1 + TC-3810 delegation mode marker. Carried in UCAN `facts` and top-level
+/// SIWE ReCap JSON under `xyz.tinycloud.policy/delegationMode`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DelegationMode {
     Attenuable,
     Terminal,
+    /// Pre-upgrade stored CACAO whose signed ReCap carried a malformed, null,
+    /// unknown, or duplicate `xyz.tinycloud.policy/delegationMode`. Produced
+    /// only by [`DelegationInfo::try_from_stored`]; live ingress rejects it
+    /// with [`DelegationError::InvalidDelegationMode`], and authorization paths
+    /// treat it as terminal and refused.
+    Invalid,
 }
 
 impl DelegationMode {
@@ -175,6 +181,7 @@ impl DelegationMode {
         match self {
             Self::Attenuable => "attenuable",
             Self::Terminal => "terminal",
+            Self::Invalid => "invalid",
         }
     }
 }
@@ -280,6 +287,47 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                 }
             }
         })
+    }
+}
+
+impl DelegationInfo {
+    /// Decode a previously persisted delegation tolerating a pre-upgrade CACAO
+    /// whose top-level `xyz.tinycloud.policy/delegationMode` is malformed, null,
+    /// unknown, or duplicated (mapping it to [`DelegationMode::Invalid`]).
+    ///
+    /// Intended ONLY for stored-row inspection, listing, and purge readers so a
+    /// pre-upgrade malformed row cannot break listing or purge. Live admission
+    /// must always use [`TryFrom<TinyCloudDelegation>`], and callers must never
+    /// authorize a grant whose mode is [`DelegationMode::Invalid`].
+    pub fn try_from_stored(d: TinyCloudDelegation) -> Result<Self, DelegationError> {
+        match Self::try_from(d.clone()) {
+            Ok(info) => Ok(info),
+            Err(DelegationError::InvalidDelegationMode) => {
+                let TinyCloudDelegation::Cacao(ref c) = d else {
+                    return Err(DelegationError::InvalidDelegationMode);
+                };
+                let m: Message = c.payload().clone().try_into()?;
+                let maybe_siwe_cap =
+                    SiweCap::<SiweCaveatValue>::extract_and_verify_ignoring_mode(&m)
+                        .map_err(siwe_decode_error)?;
+                let (capabilities, parents) = match maybe_siwe_cap {
+                    Some(siwe_cap) => extract_siwe_cap(siwe_cap),
+                    None => (vec![], vec![]),
+                };
+                Ok(Self {
+                    capabilities,
+                    delegator: strip_fragment(c.payload().iss.as_ref()),
+                    delegate: strip_fragment(c.payload().aud.as_ref()),
+                    parents,
+                    expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
+                    not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
+                    issued_at: Some(*c.payload().iat.as_ref()),
+                    delegation_mode: DelegationMode::Invalid,
+                    delegation: d,
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -749,9 +797,12 @@ mod tests {
     /// TC-3810 mixed-fleet compatibility: an unrelated unknown top-level ReCap
     /// field is still ignored, and a pinned legacy parser (reading only `att`
     /// and `prf`) decodes a terminal ReCap cleanly with identical capabilities,
-    /// statement, and raw CACAO CID.
+    /// statement, and raw CACAO bytes/CID.
     #[test]
     fn cacao_unknown_top_level_field_and_old_node_simulation() {
+        use sha3::Digest;
+        use tinycloud_auth::authorization::HeaderEncode;
+
         #[derive(serde::Deserialize)]
         struct LegacyRecap {
             att: ucan_capabilities_object::Capabilities<SiweCaveatValue>,
@@ -767,19 +818,103 @@ mod tests {
             DelegationInfo::try_from(siwe_with_verified_raw_recap(&with_other, &stmt)).unwrap();
         assert_eq!(info.delegation_mode, DelegationMode::Attenuable);
 
-        // Legacy parser decodes a terminal ReCap without error and keeps
-        // identical att/prf/statement and raw CACAO serialization CID.
+        // Build a real wallet-signed terminal CACAO and compare canonical
+        // DAG-CBOR bytes and CID across the legacy parser (ignoring unknown
+        // keys) and new parser.
         let terminal_json =
             format!(r#"{{"att":{att},"prf":[],"xyz.tinycloud.policy/delegationMode":"terminal"}}"#);
-        let legacy: LegacyRecap = serde_json::from_str(&terminal_json).unwrap();
+        let signing_key = k256::ecdsa::SigningKey::from_bytes(&[0x42u8; 32].into()).unwrap();
+        let pub_uncompressed = signing_key.verifying_key().to_encoded_point(false);
+        let addr_hash = sha3::Keccak256::digest(&pub_uncompressed.as_bytes()[1..]);
+        let mut signed_msg = base_message();
+        signed_msg.address = addr_hash[12..].try_into().unwrap();
+        signed_msg.statement = Some(stmt.clone());
+        let encoded_terminal = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &terminal_json,
+        );
+        signed_msg.resources.push(
+            format!(
+                "{}{encoded_terminal}",
+                tinycloud_auth::siwe_recap::RESOURCE_PREFIX
+            )
+            .parse()
+            .unwrap(),
+        );
+        let (sig, rec) = signing_key
+            .sign_prehash_recoverable(&signed_msg.eip191_hash().unwrap())
+            .unwrap();
+        let mut sig_bytes = [0u8; 65];
+        sig_bytes[..64].copy_from_slice(&sig.to_bytes());
+        sig_bytes[64] = u8::from(rec) + 27;
+        let signed_cacao = tinycloud_auth::cacaos::siwe_cacao::Payload::from(signed_msg)
+            .sign::<tinycloud_auth::cacaos::siwe_cacao::Eip191>(
+            tinycloud_auth::cacaos::siwe_cacao::Signature::from(sig_bytes),
+        );
+        let terminal_del = TinyCloudDelegation::Cacao(Box::new(signed_cacao));
+        let wire_token = terminal_del.encode().unwrap();
+        let (decoded_old_del, old_bytes) = TinyCloudDelegation::decode(&wire_token).unwrap();
+        let (decoded_new_del, new_bytes) = TinyCloudDelegation::decode(&wire_token).unwrap();
+        let old_cid = crate::hash::hash(&old_bytes).to_cid(0x55);
+        let new_cid = crate::hash::hash(&new_bytes).to_cid(0x55);
+        assert_eq!(old_bytes, new_bytes, "canonical CACAO bytes must match");
+        assert_eq!(old_cid, new_cid, "raw CACAO CID must match");
+
+        let TinyCloudDelegation::Cacao(old_cacao) = decoded_old_del else {
+            panic!("expected CACAO");
+        };
+        let old_msg: tinycloud_auth::cacaos::siwe::Message =
+            old_cacao.payload().clone().try_into().unwrap();
+        let encoded_recap = old_msg
+            .resources
+            .last()
+            .unwrap()
+            .as_str()
+            .strip_prefix(tinycloud_auth::siwe_recap::RESOURCE_PREFIX)
+            .unwrap();
+        let raw_recap = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            encoded_recap,
+        )
+        .unwrap();
+
+        let legacy: LegacyRecap = serde_json::from_slice(&raw_recap).unwrap();
         assert_eq!(legacy.att.abilities().len(), 1);
         assert!(legacy.prf.is_empty());
 
-        let new_cap: SiweCap<SiweCaveatValue> = serde_json::from_str(&terminal_json).unwrap();
+        let new_cap: SiweCap<SiweCaveatValue> = serde_json::from_slice(&raw_recap).unwrap();
         assert_eq!(new_cap.to_statement(), stmt);
+        assert_eq!(old_msg.statement.as_deref(), Some(stmt.as_str()));
         assert_eq!(
             new_cap.delegation_mode(),
             Some(DelegationModeFact::Terminal)
         );
+        let new_info = DelegationInfo::try_from(decoded_new_del).unwrap();
+        assert_eq!(new_info.delegation_mode, DelegationMode::Terminal);
+        assert_eq!(new_info.capabilities.len(), 1);
+        let reencoded = TinyCloudDelegation::Cacao(old_cacao).encode().unwrap();
+        let (_, redecoded_bytes) = TinyCloudDelegation::decode(&reencoded).unwrap();
+        assert_eq!(
+            redecoded_bytes, new_bytes,
+            "re-encoded legacy CACAO must remain byte-identical"
+        );
+        assert_eq!(
+            crate::hash::hash(&redecoded_bytes).to_cid(0x55),
+            new_cid,
+            "re-encoded legacy CACAO CID must match"
+        );
+
+        // Tolerant stored-row decoder preserves malformed-mode rows as Invalid
+        // while live TryFrom still refuses them.
+        let malformed_json =
+            format!(r#"{{"att":{att},"prf":[],"xyz.tinycloud.policy/delegationMode":"bogus"}}"#);
+        let malformed_del = siwe_with_verified_raw_recap(&malformed_json, &stmt);
+        assert!(matches!(
+            DelegationInfo::try_from(malformed_del.clone()),
+            Err(DelegationError::InvalidDelegationMode)
+        ));
+        let stored_info = DelegationInfo::try_from_stored(malformed_del).unwrap();
+        assert_eq!(stored_info.delegation_mode, DelegationMode::Invalid);
+        assert_eq!(stored_info.capabilities.len(), 1);
     }
 }

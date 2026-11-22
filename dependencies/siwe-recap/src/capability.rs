@@ -377,6 +377,52 @@ where
         }
     }
 
+    /// Extract and verify the encoded capabilities while ignoring any
+    /// `xyz.tinycloud.policy/delegationMode` value. Intended only for tolerant
+    /// stored-row inspection/listing/purge paths when a pre-upgrade row carries
+    /// a malformed mode; live admission must always call [`Self::extract_and_verify`].
+    pub fn extract_and_verify_ignoring_mode(
+        message: &Message,
+    ) -> Result<Option<Self>, VerificationError> {
+        #[serde_as]
+        #[derive(Deserialize)]
+        struct LegacyCapability<NB> {
+            #[serde(rename = "att")]
+            attenuations: Capabilities<NB>,
+            #[serde(rename = "prf")]
+            #[serde_as(as = "Vec<B58Cid>")]
+            proof: Vec<Cid>,
+        }
+
+        let Some(uri) = message
+            .resources
+            .iter()
+            .last()
+            .filter(|u| u.as_str().starts_with(RESOURCE_PREFIX))
+        else {
+            return Ok(None);
+        };
+        let encoded = uri
+            .as_str()
+            .strip_prefix(RESOURCE_PREFIX)
+            .ok_or_else(|| DecodingError::InvalidResourcePrefix(uri.to_string()))?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(DecodingError::Base64Decode)?;
+        let legacy: LegacyCapability<NB> =
+            serde_json::from_slice(&decoded).map_err(DecodingError::De)?;
+        let cap = Self {
+            attenuations: legacy.attenuations,
+            proof: legacy.proof,
+            delegation_mode: None,
+        };
+        let expected = cap.to_statement();
+        match &message.statement {
+            Some(s) if s.ends_with(&expected) => Ok(Some(cap)),
+            _ => Err(VerificationError::IncorrectStatement(expected)),
+        }
+    }
+
     fn extract(message: &Message) -> Result<Option<Self>, DecodingError> {
         message
             .resources

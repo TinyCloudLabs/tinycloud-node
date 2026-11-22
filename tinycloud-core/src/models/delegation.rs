@@ -1483,15 +1483,18 @@ pub(crate) fn check_no_terminal_in_parent_closure(
 /// Outcome of boot-time CACAO delegation-mode reindexing (TC-3810).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacaoReindexStats {
+    pub scanned: usize,
     pub reindexed_terminal: usize,
+    pub marked_attenuable: usize,
     pub marked_invalid: usize,
+    pub elapsed_ms: u64,
     pub completed: bool,
 }
 
 enum StoredCacaoMode {
     Terminal,
     Invalid,
-    Unchanged,
+    Attenuable,
 }
 
 fn classify_stored_cacao_mode(
@@ -1501,25 +1504,44 @@ fn classify_stored_cacao_mode(
     use tinycloud_auth::siwe_recap::{Capability as SiweCap, DelegationModeFact};
 
     let Ok(message) = TryInto::<Message>::try_into(cacao.payload().clone()) else {
-        return StoredCacaoMode::Unchanged;
+        return StoredCacaoMode::Attenuable;
     };
     match SiweCap::<serde_json::Value>::extract_and_verify(&message) {
         Ok(Some(cap)) => match cap.delegation_mode() {
             Some(DelegationModeFact::Terminal) => StoredCacaoMode::Terminal,
-            Some(DelegationModeFact::Attenuable) | None => StoredCacaoMode::Unchanged,
+            Some(DelegationModeFact::Attenuable) | None => StoredCacaoMode::Attenuable,
         },
-        Ok(None) => StoredCacaoMode::Unchanged,
+        Ok(None) => StoredCacaoMode::Attenuable,
         Err(err) if util::is_invalid_delegation_mode_error(&err) => StoredCacaoMode::Invalid,
-        Err(_) => StoredCacaoMode::Unchanged,
+        Err(_) => StoredCacaoMode::Attenuable,
     }
 }
 
-/// Reindex stored pre-upgrade CACAO rows from their signed serialization
-/// before serving traffic (TC-3810). Runs in bounded keyset pages, commits
-/// each page so an interruption is safe and idempotent on restart, decrypts
-/// encrypted serializations when configured, never downgrades already-marked
-/// rows, and marks malformed-mode rows unusable (`"invalid"`) without failing
-/// startup (logging counts only).
+/// SQL predicate matching only delegation rows that do not yet carry
+/// `xyz.tinycloud.policy/delegationMode` in `facts`. Once a row is marked
+/// (`"terminal"`, `"attenuable"`, or `"invalid"`), subsequent boots skip it in
+/// SQL so steady-state startup scans 0 rows.
+fn unindexed_delegation_mode_filter(backend: DbBackend) -> sea_orm::sea_query::SimpleExpr {
+    match backend {
+        DbBackend::Postgres => Expr::cust(
+            r#"(facts IS NULL OR facts::jsonb ->> 'xyz.tinycloud.policy/delegationMode' IS NULL)"#,
+        ),
+        DbBackend::Sqlite => Expr::cust(
+            r#"(facts IS NULL OR json_extract(facts, '$."xyz.tinycloud.policy/delegationMode"') IS NULL)"#,
+        ),
+        DbBackend::MySql => Expr::cust(
+            r#"(facts IS NULL OR JSON_EXTRACT(facts, '$."xyz.tinycloud.policy/delegationMode"') IS NULL)"#,
+        ),
+    }
+}
+
+/// Reindex stored pre-upgrade rows from their signed serialization before
+/// serving traffic (TC-3810). Runs in bounded keyset pages, commits each page
+/// so an interruption is safe and idempotent on restart, decrypts encrypted
+/// serializations when configured, never downgrades already-marked rows, marks
+/// malformed-mode rows unusable (`"invalid"`) without failing startup, marks
+/// unchanged legacy rows `"attenuable"` so subsequent boots scan 0 rows, and
+/// logs counts + elapsed time only.
 pub(crate) async fn reindex_cacao_modes<C>(
     pool: &C,
     encryption: Option<&ColumnEncryption>,
@@ -1539,12 +1561,15 @@ where
     C: ConnectionTrait + sea_orm::TransactionTrait,
 {
     const PAGE_SIZE: u64 = 128;
+    let started = std::time::Instant::now();
+    let backend = pool.get_database_backend();
     let mut after: Option<Hash> = None;
     let mut pages = 0usize;
     let mut stats = CacaoReindexStats::default();
 
     loop {
         if max_pages.is_some_and(|limit| pages >= limit) {
+            stats.elapsed_ms = started.elapsed().as_millis() as u64;
             return Ok(stats);
         }
         let mut query = Entity::find()
@@ -1553,6 +1578,7 @@ where
             .column(Column::Facts)
             .column(Column::Serialization)
             .column(Column::SerializationFormat)
+            .filter(unindexed_delegation_mode_filter(backend))
             .order_by_asc(Column::Id)
             .limit(PAGE_SIZE);
         if let Some(id) = after {
@@ -1564,13 +1590,15 @@ where
             .await?;
         if rows.is_empty() {
             stats.completed = true;
-            if stats.reindexed_terminal > 0 || stats.marked_invalid > 0 {
-                tracing::info!(
-                    reindexed_terminal = stats.reindexed_terminal,
-                    marked_invalid = stats.marked_invalid,
-                    "reindexed stored CACAO delegation modes"
-                );
-            }
+            stats.elapsed_ms = started.elapsed().as_millis() as u64;
+            tracing::info!(
+                scanned = stats.scanned,
+                reindexed_terminal = stats.reindexed_terminal,
+                marked_attenuable = stats.marked_attenuable,
+                marked_invalid = stats.marked_invalid,
+                elapsed_ms = stats.elapsed_ms,
+                "delegation mode boot reindex complete"
+            );
             return Ok(stats);
         }
 
@@ -1581,29 +1609,35 @@ where
                 .as_ref()
                 .and_then(|Facts(map)| map.get(DelegationMode::FACT_KEY))
                 .and_then(|v| v.as_str())
-                .is_some_and(|s| {
-                    s == DelegationMode::Terminal.as_str() || s == INVALID_DELEGATION_MODE_FACT
-                });
+                .is_some();
             if already_marked {
                 continue;
             }
+            stats.scanned += 1;
             let plaintext =
                 delegation_cid_alias::stored_plaintext(encryption, id, &stored, format)?;
-            let Ok(TinyCloudDelegation::Cacao(cacao)) =
-                TinyCloudDelegation::from_bytes(plaintext.as_ref())
-            else {
-                continue;
-            };
-            let new_value = match classify_stored_cacao_mode(&cacao) {
-                StoredCacaoMode::Terminal => {
-                    stats.reindexed_terminal += 1;
-                    DelegationMode::Terminal.as_str()
+            let new_value = match TinyCloudDelegation::from_bytes(plaintext.as_ref()) {
+                Ok(TinyCloudDelegation::Cacao(cacao)) => match classify_stored_cacao_mode(&cacao) {
+                    StoredCacaoMode::Terminal => {
+                        stats.reindexed_terminal += 1;
+                        DelegationMode::Terminal.as_str()
+                    }
+                    StoredCacaoMode::Invalid => {
+                        stats.marked_invalid += 1;
+                        INVALID_DELEGATION_MODE_FACT
+                    }
+                    StoredCacaoMode::Attenuable => {
+                        stats.marked_attenuable += 1;
+                        DelegationMode::Attenuable.as_str()
+                    }
+                },
+                // Non-CACAO (UCAN) rows already indexed any terminal marker at
+                // save time; mark remaining rows attenuable so future boots
+                // skip them in SQL.
+                Ok(TinyCloudDelegation::Ucan(_)) | Err(_) => {
+                    stats.marked_attenuable += 1;
+                    DelegationMode::Attenuable.as_str()
                 }
-                StoredCacaoMode::Invalid => {
-                    stats.marked_invalid += 1;
-                    INVALID_DELEGATION_MODE_FACT
-                }
-                StoredCacaoMode::Unchanged => continue,
             };
             let mut map = existing_facts.map(|Facts(m)| m).unwrap_or_default();
             map.insert(
@@ -1615,7 +1649,7 @@ where
 
         if !updates.is_empty() {
             let tx = crate::db::begin_write_transaction(pool, None).await?;
-            if pool.get_database_backend() == DbBackend::Postgres {
+            if backend == DbBackend::Postgres {
                 tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
                     .await?;
             }
@@ -1693,17 +1727,17 @@ async fn save<C: ConnectionTrait>(
         ),
     );
 
-    // Persist the signed-in `delegationMode` marker. We store ONLY the
-    // marker we recognize natively (not the full UCAN facts), keeping the
-    // serialization column as the source of truth for the bytes the holder
-    // actually signed and the `facts` column as a fast-path lookup index.
+    // Persist the signed-in `delegationMode` marker (`terminal` or
+    // `attenuable`). Recording `attenuable` explicitly as well ensures newly
+    // saved rows are already indexed and skipped in SQL by future boot
+    // reindexes; older nodes only check `== "terminal"` so this is
+    // rollback-safe. We store ONLY markers we recognize natively (not the full
+    // UCAN facts), keeping `serialization` as the source of truth.
     let mut fact_index = BTreeMap::new();
-    if matches!(delegation.delegation_mode, DelegationMode::Terminal) {
-        fact_index.insert(
-            DelegationMode::FACT_KEY.to_string(),
-            serde_json::Value::String(DelegationMode::Terminal.as_str().to_string()),
-        );
-    }
+    fact_index.insert(
+        DelegationMode::FACT_KEY.to_string(),
+        serde_json::Value::String(delegation.delegation_mode.as_str().to_string()),
+    );
     if let Some((key, value)) = signed_policy_fact(&delegation.delegation) {
         fact_index.insert(key.to_string(), value);
     }

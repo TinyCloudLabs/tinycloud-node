@@ -1455,7 +1455,7 @@ where
             row.serialization_format,
         )?;
         let delegation = TinyCloudDelegation::from_bytes(&bytes)?;
-        let info = DelegationInfo::try_from(delegation)?;
+        let info = DelegationInfo::try_from_stored(delegation)?;
         let event = SerializedEvent(info, bytes);
         if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
             return Err("delegation-signed-bytes-mismatch".into());
@@ -6788,7 +6788,7 @@ fn delegations_touching_space(backend: DbBackend, space_id: &SpaceId) -> SimpleE
 fn decode_stored_delegation(serialization: Vec<u8>) -> Result<Delegation, DbErr> {
     let delegation = TinyCloudDelegation::from_bytes(&serialization)
         .map_err(|_| DbErr::Custom("delegation-signed-bytes-invalid".into()))?;
-    let info = DelegationInfo::try_from(delegation)
+    let info = DelegationInfo::try_from_stored(delegation)
         .map_err(|_| DbErr::Custom("delegation-signed-info-invalid".into()))?;
     Ok(SerializedEvent(info, serialization))
 }
