@@ -747,12 +747,15 @@ cmd_logs() {
   done
 }
 
-case ${1:-} in
-  bins) shift; cmd_bins "$@" ;;
-  up) shift; cmd_up "$@" ;;
-  down) shift; cmd_down "$@" ;;
-  test) shift; cmd_test "$@" ;;
-  status) shift; cmd_status "$@" ;;
-  logs) shift; cmd_logs "$@" ;;
-  *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect EXPECT] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
-esac
+# Dispatch only when executed: test-stop.sh sources this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case ${1:-} in
+    bins) shift; cmd_bins "$@" ;;
+    up) shift; cmd_up "$@" ;;
+    down) shift; cmd_down "$@" ;;
+    test) shift; cmd_test "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect EXPECT] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
+  esac
+fi
