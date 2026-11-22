@@ -39,8 +39,6 @@ ignore = [
     { id = "RUSTSEC-2026-0251", reason = "unmaintained, no fix: sized-chunks via im (ssi linked-data)" },
     { id = "RUSTSEC-2026-0283", reason = "unmaintained, no fix: clear_on_drop via ssi-jws" },
     { id = "RUSTSEC-2026-0346", reason = "unreachable: rustls Debug of client session values only leaks via a custom ClientSessionStore that logs them; the workspace has none" },
-    { id = "RUSTSEC-2026-0347", reason = "unreachable: rustls ECH rejection path; the node never configures Encrypted Client Hello" },
-    { id = "RUSTSEC-2026-0348", reason = "unreachable: rustls brotli certificate decompression; the brotli feature is not enabled" },
     { id = "RUSTSEC-2026-0367", reason = "build-time only: zip 6 in the libduckdb-sys build script (not in the shipped node graph)" },
     { id = "RUSTSEC-2026-0368", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
     { id = "RUSTSEC-2026-0369", reason = "build-time only: zip 6 in the libduckdb-sys build script" },
