@@ -1,7 +1,5 @@
 # Dev dstack OS images a production deploy may target, one sha256 hash per line.
 # Changed only by a reviewed PR. Every entry is also re-verified against
 # download.dstack.org on each deploy (see phala-os-guard.sh).
-# dstack-dev-0.5.12
-e866e987221db357129ebc3f066b6706ef955889ea95e5510acbdf3d3055186b
-# dstack-dev-0.5.15 (TC-3554: the node CVM runs it since Phala's KMS move)
-432b8a1e82ec8a90b3d30bb201e5d20a8bc5c05b69f1d8ba13687232dda5aebd
+# Empty (TC-3838): production runs only the pinned production image; a dev
+# image runs sshd and lets an SSH key holder in as root inside the TEE.

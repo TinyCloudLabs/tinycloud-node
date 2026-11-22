@@ -138,8 +138,11 @@ expect "a failed download is refused" 1 "Cannot download"; no_leftovers "failed 
 run "$(os_json true "dstack-dev-0.5.12" "${GOOD_HASH}")" STUB_TARBALL="${root}/fixtures/garbage.tar.gz"
 expect "an archive that does not extract is refused" 1 "Cannot extract"; no_leftovers "bad archive"
 
-run "$(os_json true "dstack-dev-0.5.12" "${REAL_DEV_HASH}")" DEV_OS_ALLOWLIST="${here}/phala-dev-os-allowlist.txt"
-expect "the repo allowlist pins the dev image, then the pre-check refuses a mismatch" 1 "hashes to [0-9a-f]{64}, not ${REAL_DEV_HASH}"
+# TC-3838: the repo allowlist is empty, so both dev images the node ran are refused before any fetch.
+for dev in "dstack-dev-0.5.12 ${REAL_DEV_HASH}" "dstack-dev-0.5.15 432b8a1e82ec8a90b3d30bb201e5d20a8bc5c05b69f1d8ba13687232dda5aebd"; do
+  run "$(os_json true "${dev% *}" "${dev#* }")" DEV_OS_ALLOWLIST="${here}/phala-dev-os-allowlist.txt"
+  expect "the repo allowlist refuses ${dev% *}" 1 "not in the pinned allowlist"; no_curl "repo allowlist ${dev% *}"
+done
 
 run "$(os_json true "dstack-dev-0.5.12" "${GOOD_HASH}")" DEV_OS_ALLOWLIST="${root}/missing.txt"
 expect "a missing allowlist is refused" 1 "allowlist .* is missing"; no_curl "missing allowlist"

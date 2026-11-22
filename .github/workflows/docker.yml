@@ -600,8 +600,8 @@ jobs:
         # Install before any sealed values enter the step environment.
         run: npm install --prefix "$RUNNER_TEMP/phala-env-sync" --no-save --ignore-scripts @phala/cloud@0.2.9
 
-      # Fail closed before any production change unless the CVM runs the pinned production OS, or the one pinned dev OS
-      # in scripts/ci/phala-dev-os-allowlist.txt after a fresh integrity check (scripts/ci/phala-os-guard.sh).
+      # Fail closed before any production change unless the CVM runs the pinned production OS, or a dev OS pinned
+      # in scripts/ci/phala-dev-os-allowlist.txt (empty since TC-3838) after a fresh integrity check (scripts/ci/phala-os-guard.sh).
       # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15`.
       - name: Require a permitted OS image on the CVM
         env:
@@ -777,13 +777,14 @@ jobs:
           # storage-headroom event in the Vector config, the TC-1491 artifact read limit env line, the TC-3554
           # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar, the TC-287 retention
           # sweeper env line, the TC-1791 delegated SQL caveats env line, the TC-1491 SQL size-cap and
-          # free-disk env lines and the TC-3739 node_request DB timing fields in the Vector config
-          # (raw 02d90755…; c6d05e1e… / 46287bc3… before TC-3739, e5f1c356… / d1d2ef49… before the TC-1491 caps,
+          # free-disk env lines, the TC-3739 node_request DB timing fields in the Vector config and no TC-3838
+          # ssh-gateway (raw a0f27043…; cc219eb5… / 02d90755… before TC-3838, c6d05e1e… / 46287bc3… before TC-3739,
+          # e5f1c356… / d1d2ef49… before the TC-1491 caps,
           # e1cf031b… / f4f51e75… before TC-1791, 6a577c6d… / 272f43b8… before TC-287,
           # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
           # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = 'cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249'
+          n0_template_hash = 'cbd46ff56f20b7c987fef9694931d63788e453f70609a6e4d74f10f3742d5abf'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -1016,6 +1017,9 @@ jobs:
             requireCondition(new Set(names).size === names.length);
             return names;
           };
+          // Names a reviewed PR removed from the sealed file. They are the only allowed_envs
+          // entries the file may lack, and sync removes them (TC-3838: no SSH keys on the CVM).
+          const RETIRED = ["DSTACK_AUTHORIZED_KEYS"];
 
           try {
             const {
@@ -1050,13 +1054,17 @@ jobs:
             const ref = { id: "tinycloud-node" };
             phase = "complete whitelist validation";
             const allowed = namesFrom(await getCvmComposeFile(client, ref));
-            // Retaining a name cannot recover a value absent from this file.
+            // Retaining a name cannot recover a value absent from this file;
+            // only a retired name may be absent, and it never comes back.
             // Check before deploy AND again immediately before any env PATCH.
-            requireCondition(allowed.every((key) => keys.has(key)));
+            requireCondition(allowed.every((key) => keys.has(key) || RETIRED.includes(key)));
+            requireCondition(RETIRED.every((key) => !keys.has(key)));
+            const retired = allowed.filter((key) => RETIRED.includes(key));
+            const kept = allowed.filter((key) => !RETIRED.includes(key));
             const missing = [...keys].filter((key) => !allowed.includes(key));
             if (process.argv.includes("--check")) {
               console.log(`Validated complete sealed set: ${keys.size} env names.`);
-            } else if (missing.length === 0) {
+            } else if (missing.length === 0 && retired.length === 0) {
               console.log(`allowed_envs verified: ${keys.size} env names; no PATCH needed.`);
             } else {
               phase = "public encryption key validation";
@@ -1066,12 +1074,12 @@ jobs:
               const encrypted = await encryptEnvVars(envs, pubkey);
               phase = "env whitelist update";
               const result = await updateCvmEnvs(client, {
-                ...ref, encrypted_env: encrypted, env_keys: [...allowed, ...missing],
+                ...ref, encrypted_env: encrypted, env_keys: [...kept, ...missing],
               });
               // An on-chain precondition needs a separately reviewed
               // addComposeHash transaction. Never assume hash-only approval.
               requireCondition(result.status === "in_progress" && typeof result.correlation_id === "string" && result.correlation_id.length > 0);
-              console.log(`allowed_envs update accepted: ${missing.length} added names.`);
+              console.log(`allowed_envs update accepted: ${missing.length} added names, ${retired.length} retired names removed.`);
               phase = "env whitelist convergence";
               const deadline = Date.now() + 600000;
               let completed = false;
@@ -1092,7 +1100,8 @@ jobs:
                 const settled = progress == null || (
                   progress && !progress.target && !progress.started_at && !progress.correlation_id
                 );
-                if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))) {
+                if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))
+                    && !after.some((key) => RETIRED.includes(key))) {
                   completed = true;
                   break;
                 }
@@ -1224,11 +1233,6 @@ jobs:
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
               printf 'NODE_STATS_READ_TOKEN=%s\n' "$PHALA_ENV_NODE_STATS_READ_TOKEN"
             fi
-            # SSH public keys authorized on the CVM (checked into the repo,
-            # see dstack-authorized-keys). The Phala Cloud pre-launch script
-            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
-            # at boot, enabling `phala ssh tinycloud-node`.
-            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
           } > .phala-prod.env
 
           # Validate complete env names/whitelist before any CVM mutation.

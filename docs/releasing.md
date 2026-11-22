@@ -60,16 +60,16 @@ built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
 ## The CVM must run a permitted OS image
 
 The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
-deploy, unless the `tinycloud-node` CVM reports one of:
+deploy, unless the `tinycloud-node` CVM reports the production image:
+`.os.is_dev == false` with the name and hash pinned in `PHALA_OS_IMAGE` /
+`PHALA_OS_IMAGE_HASH` (`dstack-0.5.15`).
 
-- the production image: `.os.is_dev == false` with the name and hash pinned in
-  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.15`); or
-- a dev image whose `.os.os_image_hash` is listed in
-  `scripts/ci/phala-dev-os-allowlist.txt` (`dstack-dev-0.5.12`, and
-  `dstack-dev-0.5.15`, which the node CVM runs since the TC-3554 KMS move), and
-  that passes a fresh check in the same job: `download.dstack.org` serves
-  `mr_<hash>.tar.gz`, and `sha256sum sha256sum.txt` of the extracted archive
-  equals `<hash>`, and every file it lists matches (`sha256sum -c`).
+`scripts/ci/phala-dev-os-allowlist.txt` is empty (TC-3838): no dev image is
+permitted, because a dev image runs sshd and lets an SSH key holder in as root
+inside the TEE. The guard still supports a listed dev hash, which
+must pass a fresh check in the same job: `download.dstack.org` serves
+`mr_<hash>.tar.gz`, and `sha256sum sha256sum.txt` of the extracted archive
+equals `<hash>`, and every file it lists matches (`sha256sum -c`).
 
 Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
 or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is
@@ -711,7 +711,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249`**
+  **`cbd46ff56f20b7c987fef9694931d63788e453f70609a6e4d74f10f3742d5abf`**
+  (raw `a0f270435e230315b08b0d3b5ef13da21f616e42f61c18091505d54ab854bb48` normalized). Before the TC-3838 removal of the `ssh-gateway` service the template was `cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249`
   (raw `02d907552b74066b0d49f1088cc0b7ba9ca3e842eb9c1444b3cd778474498eb9` normalized). Before the TC-3739 `node_request` DB timing fields (`pool_wait_ms`, `query_time_ms`, `query_count`) in the Vector config the template was `c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46`
   (raw `46287bc31dc09649b0679bacfe611ee24ad5ced5c51cd7909821dee895c1f6d2` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` / `MIN_FREE_BYTES` env lines the template was `e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`
   (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized); before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
@@ -878,8 +879,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`02d907552b74066b0d49f1088cc0b7ba9ca3e842eb9c1444b3cd778474498eb9`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom` and TC-3739 `node_request` DB timing Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
+`a0f270435e230315b08b0d3b5ef13da21f616e42f61c18091505d54ab854bb48`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom` and TC-3739 `node_request` DB timing Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines, and without the TC-3838 `ssh-gateway` service), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**
 1.26.14 needs the sidecar this compose lacks,
