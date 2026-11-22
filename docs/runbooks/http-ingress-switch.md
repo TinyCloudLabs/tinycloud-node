@@ -9,9 +9,10 @@ execution. No release, application default, DNS record or production policy is
 changed by merging these files.
 
 The intended operation is: keep `https://node.tinycloud.xyz` serving through
-Cloudflare while withdrawing the Phala gateway's node HTTP ports. Management
-port **10022 remains direct and key-authenticated** if the prior policy allowed
-it. This is not a switch that removes all CVM ingress or guarantees upstream
+Cloudflare while withdrawing the Phala gateway's node HTTP ports. Port **10022**
+keeps whatever the prior policy gave it. It was the SSH management relay; since
+TC-3838 the compose publishes nothing there, so an allowed 10022 reaches no
+service. This is not a switch that removes all CVM ingress or guarantees upstream
 DDoS protection.
 
 **The current recorded Worker fetches the public Phala `-8000` origin. Closing
@@ -28,7 +29,7 @@ Read-only Phala metadata on 2026-11-19 identified app
 | --- | --- |
 | `node.tinycloud.xyz` | Cloudflare edge → `tinycloud-tee-proxy` Worker → app `-8000.dstack-pha-prod5.phala.network` in the recorded Worker source |
 | `tee.node.tinycloud.xyz` | Gateway custom-domain TLS passthrough → in-CVM ingress `443` → `tinycloud:8000` |
-| App **and instance** gateway URLs | Published guest ports `443`, `8000`, `10022`; also inspect passthrough (`s`) and HTTP/2 (`g`) variants |
+| App **and instance** gateway URLs | Published guest ports `443`, `8000`; `10022` only under a pre-TC-3838 compose (the SSH relay); also inspect passthrough (`s`) and HTTP/2 (`g`) variants |
 | Direct host port mappings | `/network` and `/network-config` returned empty mappings at inspection; inventory again before operating |
 | Gateway policy | `gateway_enabled=true`, `port_policy=null` at inspection |
 | Host firewall API | `/firewall-status` reported `available=true`, `capabilities.acl=true`; this describes host port mappings, not gateway visitor filtering |
@@ -178,9 +179,10 @@ python3 scripts/ingress-switch.py \
 Inspect `plan.json`: it contains only before/after policy and the provider PATCH,
 not the compose's environment or credential contents. No files are changed by
 the default or explicit dry-run. The desired policy is `restrict_mode=true`,
-allowing only `10022` (retaining its recorded PROXY-protocol attributes). If a
-previous restrictive policy already denied management, it stays denied. Unknown
-additional policy ports are refused, not silently removed.
+allowing only `10022` (retaining its recorded PROXY-protocol attributes); no
+service listens there since TC-3838. If a previous restrictive policy already
+denied 10022, it stays denied. Unknown additional policy ports are refused, not
+silently removed.
 
 Stage it with the **same arguments**, replacing `--dry-run` with `--apply` and
 redirecting output to `staged.json`. This writes only local `app-compose.json`
@@ -236,8 +238,9 @@ From independent external IPv4 **and** IPv6 networks where available:
   Distinguish a local resolver error from actual gateway refusal.
 - Check every provider host mapping and public NIC path, including IPv6; a
   nonempty new mapping invalidates this runbook's gateway-only assumption.
-- Management `10022` retains its previous key-gated behavior; it is deliberately
-  **not** counted as node HTTP. Verify separately without printing credentials.
+- `10022` keeps its previous policy and is deliberately **not** counted as node
+  HTTP. Since TC-3838 it should refuse connections; an answer there means a
+  pre-TC-3838 compose (the SSH relay) is running. Verify without printing credentials.
 - Check existing long-lived connections as well as fresh ones. Do not declare
   withdrawal complete while an old direct stream can still deliver node data.
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -251,7 +252,6 @@ class RecoveryTests(unittest.TestCase):
             (root / "sitecustomize.py").write_text(HTTP)
             (root / "tinycloud-node-server").mkdir()
             (root / "tinycloud-node-server/Cargo.toml").write_text('version = "1.20.7"\n')
-            (root / "dstack-authorized-keys").write_text("synthetic-public-key\n")
             (root / "phala-env-sync").mkdir()
             (root / "scripts/ci").mkdir(parents=True)
             (root / "scripts/ci/reconcile-quota.py").write_bytes((ROOT / "scripts/ci/reconcile-quota.py").read_bytes())
@@ -711,15 +711,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn("cvm-deploy", result["events"])
         self.assertEqual(result["compose"], N0)
 
-    def test_named_keys_gate_is_sealed_as_a_literal_flag_beside_the_ssh_keys(self):
+    def test_named_keys_gate_is_sealed_as_a_literal_flag_without_ssh_keys(self):
         # TC-1777: the flip is a workflow input, so the sealed file (the only CVM env source)
-        # carries the flag and keeps DSTACK_AUTHORIZED_KEYS on every dispatch.
+        # carries the flag on every dispatch. TC-3838: it never carries DSTACK_AUTHORIZED_KEYS.
         for value in ("false", "true"):
             with self.subTest(value=value):
                 result = self.run_deploy(changes={"named_keys_v1": value})
                 self.assertTrue(result["success"])
                 self.assertEqual(result["env_names"].count("NAMED_KEYS_V1"), 1)
-                self.assertEqual(result["env_names"].count("DSTACK_AUTHORIZED_KEYS"), 1)
+                self.assertNotIn("DSTACK_AUTHORIZED_KEYS", result["env_names"])
                 sealed = {event for event in result["events"] if event.startswith("sealed-named-keys-v1=")}
                 self.assertEqual(sealed, {"sealed-named-keys-v1=" + value})
 
@@ -854,6 +854,81 @@ class RecoveryTests(unittest.TestCase):
                                          approved_privacy=mode, **rollback_args)
                 self.assertFalse(denied["success"])
                 self.assertEqual(denied["events"], [])
+
+
+# The real sync.mjs from the workflow, run by node against a fake @phala/cloud whose CVM state is a JSON file.
+SYNC_JS = textwrap.dedent(SOURCE.split("cat > \"$RUNNER_TEMP/phala-env-sync/sync.mjs\" <<'JS'\n", 1)[1]
+                          .split("\n          JS\n", 1)[0])
+FAKE_PHALA = r'''
+import { readFileSync, writeFileSync } from "node:fs";
+const load = () => JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+const save = (state) => writeFileSync(process.env.FAKE_STATE, JSON.stringify(state));
+export const createClient = () => ({});
+export const parseEnvVars = (source) => source.split("\n").filter(Boolean)
+  .map((line) => ({ key: line.slice(0, line.indexOf("=")), value: line.slice(line.indexOf("=") + 1) }));
+export const encryptEnvVars = async () => "ciphertext";
+export const getCvmComposeFile = async () => ({ allowed_envs: load().allowed });
+export const getCvmInfo = async () => {
+  const state = load(); const status = state.cycle.shift() ?? "running"; save(state);
+  return { status, progress: null, encrypted_env_pubkey: "ab".repeat(32) };
+};
+export const updateCvmEnvs = async (_client, body) => {
+  const state = load(); state.patches.push(body.env_keys); state.allowed = body.env_keys; state.cycle = ["restarting"];
+  save(state); return { status: "in_progress", correlation_id: "synthetic" };
+};
+'''
+
+
+class EnvSyncTests(unittest.TestCase):
+    SEALED = ["DATABASE_URL", "BETTERSTACK_SOURCE_TOKEN", "NAMED_KEYS_V1"]
+
+    def sync(self, allowed, sealed=SEALED, check=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "node_modules/@phala/cloud"; module.mkdir(parents=True)
+            (module / "package.json").write_text('{"name": "@phala/cloud", "type": "module", "main": "index.js"}')
+            (module / "index.js").write_text(FAKE_PHALA)
+            (root / "sync.mjs").write_text(SYNC_JS)
+            (root / ".phala-prod.env").write_text("".join(f"{name}=value-{name}\n" for name in sealed))
+            state = root / "state.json"; state.write_text(json.dumps({"allowed": allowed, "patches": [], "cycle": []}))
+            result = subprocess.run(["node", "sync.mjs"] + (["--check"] if check else []), cwd=root, capture_output=True, text=True,
+                                    env={"PATH": "/usr/bin:/bin:" + str(Path(shutil.which("node")).parent),
+                                         "PHALA_CLOUD_API_KEY": "synthetic", "FAKE_STATE": str(state)})
+            return result.returncode, result.stdout + result.stderr, json.loads(state.read_text())
+
+    def test_retired_ssh_keys_name_may_be_absent_before_deploy_but_is_never_patched_away(self):
+        # TC-3838: the live CVM still allows DSTACK_AUTHORIZED_KEYS, which the sealed file no longer has.
+        live = self.SEALED + ["DSTACK_AUTHORIZED_KEYS"]
+        code, logs, state = self.sync(live, check=True)
+        self.assertEqual(code, 0, logs)
+        self.assertEqual(state["patches"], [])
+        # After deploy, `phala deploy -e` should have dropped it under the compose-hash and KMS
+        # checks. If it is still allowed, sync stops for a human; it never PATCHes it away.
+        code, logs, state = self.sync(live)
+        self.assertEqual(code, 1, logs)
+        self.assertIn("::error::allowed_envs synchronization failed during post-deploy check: a retired name is still allowed;", logs)
+        self.assertEqual(state["patches"], [])
+        self.assertIn("DSTACK_AUTHORIZED_KEYS", state["allowed"])
+        # Once the deploy dropped it, sync needs no PATCH.
+        code, logs, state = self.sync(self.SEALED)
+        self.assertEqual((code, state["patches"]), (0, []), logs)
+
+    def test_a_missing_non_retired_name_is_still_patched_in(self):
+        # TC-959 behaviour unchanged: a sealed name the deploy did not register is added by PATCH.
+        code, logs, state = self.sync(self.SEALED[:-1])
+        self.assertEqual(code, 0, logs)
+        self.assertEqual(state["patches"], [self.SEALED])
+        self.assertEqual(sorted(state["allowed"]), sorted(self.SEALED))
+
+    def test_any_other_missing_name_or_a_retired_name_in_the_file_fails_closed(self):
+        for allowed, sealed in ((self.SEALED + ["NODE_STATS_READ_TOKEN"], self.SEALED),
+                                (self.SEALED + ["DSTACK_AUTHORIZED_KEYS"], self.SEALED + ["DSTACK_AUTHORIZED_KEYS"])):
+            for check in (True, False):
+                with self.subTest(allowed=allowed, sealed=sealed, check=check):
+                    code, logs, state = self.sync(allowed, sealed, check)
+                    self.assertEqual(code, 1)
+                    self.assertIn(GUARD_MESSAGE, logs)
+                    self.assertEqual(state["patches"], [])
 
 
 if __name__ == "__main__":

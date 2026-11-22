@@ -600,8 +600,8 @@ jobs:
         # Install before any sealed values enter the step environment.
         run: npm install --prefix "$RUNNER_TEMP/phala-env-sync" --no-save --ignore-scripts @phala/cloud@0.2.9
 
-      # Fail closed before any production change unless the CVM runs the pinned production OS, or the one pinned dev OS
-      # in scripts/ci/phala-dev-os-allowlist.txt after a fresh integrity check (scripts/ci/phala-os-guard.sh).
+      # Fail closed before any production change unless the CVM runs the pinned production OS, or a dev OS pinned
+      # in scripts/ci/phala-dev-os-allowlist.txt (empty since TC-3838) after a fresh integrity check (scripts/ci/phala-os-guard.sh).
       # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15`.
       - name: Require a permitted OS image on the CVM
         env:
@@ -778,14 +778,15 @@ jobs:
           # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar, the TC-287 retention
           # sweeper env line, the TC-1791 delegated SQL caveats env line, the TC-1491 SQL size-cap and
           # free-disk env lines, the TC-3739 node_request DB timing fields, the TC-3834 node_request
-          # error_code and the TC-3284 deletion ledger error events in the Vector config
-          # (raw bced82d3…; db348152… / 27287a38… before TC-3284, cc219eb5… / 02d90755… before TC-3834, c6d05e1e… / 46287bc3… before TC-3739,
+          # error_code and the TC-3284 deletion ledger error events in the Vector config and no TC-3838
+          # ssh-gateway (raw 4982f4fd…; 97a180a4… / bced82d3… before TC-3838, db348152… / 27287a38… before TC-3284,
+          # cc219eb5… / 02d90755… before TC-3834, c6d05e1e… / 46287bc3… before TC-3739,
           # e5f1c356… / d1d2ef49… before the TC-1491 caps,
           # e1cf031b… / f4f51e75… before TC-1791, 6a577c6d… / 272f43b8… before TC-287,
           # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
           # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = '97a180a43ec70c7950e717417c5455b13ede1a3adab5a196f65b5aa21dcc5271'
+          n0_template_hash = 'dff38c1ea38e67ae94aeb235bd1e50f5f73c3b5a286e3dc1ec69ec7fd6896630'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -1018,6 +1019,9 @@ jobs:
             requireCondition(new Set(names).size === names.length);
             return names;
           };
+          // Names a reviewed PR removed from the sealed file. They are the only allowed_envs
+          // entries the file may lack before deploy (TC-3838: no SSH keys on the CVM).
+          const RETIRED = ["DSTACK_AUTHORIZED_KEYS"];
 
           try {
             const {
@@ -1052,12 +1056,22 @@ jobs:
             const ref = { id: "tinycloud-node" };
             phase = "complete whitelist validation";
             const allowed = namesFrom(await getCvmComposeFile(client, ref));
-            // Retaining a name cannot recover a value absent from this file.
+            // Retaining a name cannot recover a value absent from this file;
+            // only a retired name may be absent, and it never comes back.
             // Check before deploy AND again immediately before any env PATCH.
-            requireCondition(allowed.every((key) => keys.has(key)));
+            requireCondition(allowed.every((key) => keys.has(key) || RETIRED.includes(key)));
+            requireCondition(RETIRED.every((key) => !keys.has(key)));
+            const retired = allowed.filter((key) => RETIRED.includes(key));
             const missing = [...keys].filter((key) => !allowed.includes(key));
             if (process.argv.includes("--check")) {
               console.log(`Validated complete sealed set: ${keys.size} env names.`);
+            } else if (retired.length > 0) {
+              // The deploy's own compose update (`phala deploy -e`) sets allowed_envs to
+              // the sealed names, under its compose-hash and KMS checks. A retired name
+              // still allowed means it did not; removing it by PATCH would change
+              // allowed_envs after those checks, so stop for a human instead (TC-3838).
+              phase = "post-deploy check: a retired name is still allowed";
+              requireCondition(false);
             } else if (missing.length === 0) {
               console.log(`allowed_envs verified: ${keys.size} env names; no PATCH needed.`);
             } else {
@@ -1226,11 +1240,6 @@ jobs:
             if [ -n "${PHALA_ENV_NODE_STATS_READ_TOKEN:-}" ]; then
               printf 'NODE_STATS_READ_TOKEN=%s\n' "$PHALA_ENV_NODE_STATS_READ_TOKEN"
             fi
-            # SSH public keys authorized on the CVM (checked into the repo,
-            # see dstack-authorized-keys). The Phala Cloud pre-launch script
-            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
-            # at boot, enabling `phala ssh tinycloud-node`.
-            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
           } > .phala-prod.env
 
           # Validate complete env names/whitelist before any CVM mutation.
@@ -1248,8 +1257,8 @@ jobs:
           # The CLI/SDK can include request details in errors. Never forward
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
-          # No --image/--no-dev-os: the CVM keeps its OS class (TC-3554: it runs
-          # dstack-dev-0.5.15); the guards before and after check the OS.
+          # No --image/--no-dev-os: the deploy never changes the OS; the guards
+          # before and after require the production image (TC-3838).
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
           if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"
