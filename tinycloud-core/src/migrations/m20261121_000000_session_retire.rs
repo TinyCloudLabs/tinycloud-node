@@ -72,7 +72,10 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        if manager.has_index("session_retire", EXPIRES_AT_INDEX).await? {
+        if manager
+            .has_index("session_retire", EXPIRES_AT_INDEX)
+            .await?
+        {
             return Ok(());
         }
         manager
