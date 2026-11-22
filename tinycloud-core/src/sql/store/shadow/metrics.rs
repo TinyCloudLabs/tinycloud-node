@@ -115,7 +115,12 @@ pub enum RestoreResult {
 }
 
 impl RestoreResult {
-    pub const ALL: [Self; 4] = [Self::Ok, Self::Mismatch, Self::NotComparable, Self::Unreadable];
+    pub const ALL: [Self; 4] = [
+        Self::Ok,
+        Self::Mismatch,
+        Self::NotComparable,
+        Self::Unreadable,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {

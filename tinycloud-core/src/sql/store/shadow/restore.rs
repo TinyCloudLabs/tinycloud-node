@@ -495,8 +495,8 @@ fn link(prefix: &str, key: &ObjectKey, row: &object::Model, format: &str) -> Res
     if row.format != format {
         return Err(unreadable(format!("the {kind}'s format is not {format}")));
     }
-    let bytes =
-        u64::try_from(row.bytes).map_err(|_| unreadable(format!("the {kind}'s size is negative")))?;
+    let bytes = u64::try_from(row.bytes)
+        .map_err(|_| unreadable(format!("the {kind}'s size is negative")))?;
     Ok(Link {
         key: key.clone(),
         bytes,
@@ -618,7 +618,9 @@ pub enum MaterialiseError {
     #[error("refused before open: {0}")]
     Refused(String),
     /// The guard against RUSTSEC-2026-0459; also refused before open.
-    #[error("refused before open: the WAL page size {wal} differs from the database page size {db}")]
+    #[error(
+        "refused before open: the WAL page size {wal} differs from the database page size {db}"
+    )]
     PageSizeMismatch { db: u32, wal: u32 },
     #[error("sqlite {op} failed ({code})")]
     Sqlite { op: &'static str, code: String },
@@ -726,9 +728,7 @@ pub fn materialise(
             checkpointed,
         });
     }
-    if frames.is_some_and(|f| f > 0)
-        && std::fs::metadata(&wal).map_err(io_error)?.len() != 0
-    {
+    if frames.is_some_and(|f| f > 0) && std::fs::metadata(&wal).map_err(io_error)?.len() != 0 {
         return Err(MaterialiseError::WalLeft);
     }
     if integrity {
@@ -925,7 +925,9 @@ mod tests {
         ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
     };
     use crate::sql::store::key::{Lineage, PublishId};
-    use crate::sql::store::manifest::{now_timestamp, ObjectRecord, Publish, PublishChain, PublishKind};
+    use crate::sql::store::manifest::{
+        now_timestamp, ObjectRecord, Publish, PublishChain, PublishKind,
+    };
     use crate::sql::store::memory::MemorySqlObjectStore;
     use crate::sql::store::object::sha256;
     use crate::sql::store::policy::SpaceAllowlist;
@@ -987,7 +989,9 @@ mod tests {
         /// The checkpoint bytes, as the node saves them.
         fn checkpoint(&self) -> Vec<u8> {
             self.conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    r.get::<_, i64>(0)
+                })
                 .unwrap();
             std::fs::read(&self.path).unwrap()
         }
@@ -1163,7 +1167,12 @@ mod tests {
         // WAL deltas on the same checkpoint: a segment appended on base 1.
         live.write(4);
         let revision = rig
-            .save_delta("main", &live.wal(), meta.revision, &meta.checkpoint_content_hash)
+            .save_delta(
+                "main",
+                &live.wal(),
+                meta.revision,
+                &meta.checkpoint_content_hash,
+            )
             .await;
         let f = rig.upload("main", revision as u64).await;
         assert_eq!((f.base_seq, f.last_seq), (1, 2));
@@ -1342,7 +1351,12 @@ mod tests {
         rig.upload("main", 2).await;
         live.write(1);
         let revision = rig
-            .save_delta("main", &live.wal(), meta.revision, &meta.checkpoint_content_hash)
+            .save_delta(
+                "main",
+                &live.wal(),
+                meta.revision,
+                &meta.checkpoint_content_hash,
+            )
             .await;
         let report = rig.check("main").await;
         assert_result(&report, RestoreResult::NotComparable);
@@ -1350,7 +1364,10 @@ mod tests {
             report.reason.as_deref(),
             Some("not comparable at this revision: postgres is at revision 3, the frontier at 2")
         );
-        assert_eq!((report.last_seq, report.pg_revision), (Some(2), Some(revision)));
+        assert_eq!(
+            (report.last_seq, report.pg_revision),
+            (Some(2), Some(revision))
+        );
         // Nothing was read, so the frontier's segment is unverified.
         assert_eq!(
             (report.segments_required, report.segments_unverified),
@@ -1538,7 +1555,10 @@ mod tests {
         let frames = walk(&wal).unwrap();
         assert!(frames >= 3, "{frames}");
         assert_eq!(walk(b""), Ok(0));
-        assert!(matches!(walk(&wal[..20]), Err(MaterialiseError::Refused(_))));
+        assert!(matches!(
+            walk(&wal[..20]),
+            Err(MaterialiseError::Refused(_))
+        ));
         // A header checksum that fails.
         let mut bad = wal.clone();
         bad[27] ^= 1;
@@ -1619,7 +1639,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(picked.len(), 4);
-        assert!(picked.iter().all(|(s, _)| allowed.contains(s)), "{picked:?}");
+        assert!(
+            picked.iter().all(|(s, _)| allowed.contains(s)),
+            "{picked:?}"
+        );
         let mut unique = picked.clone();
         unique.dedup();
         assert_eq!(unique, picked, "sorted and distinct");
@@ -1648,7 +1671,12 @@ mod tests {
         )
         .await;
         assert_eq!(
-            (report.sampled, report.ok, report.unreadable, report.passed()),
+            (
+                report.sampled,
+                report.ok,
+                report.unreadable,
+                report.passed()
+            ),
             (2, 1, 1, false)
         );
         assert_eq!(

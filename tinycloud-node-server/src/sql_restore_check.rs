@@ -136,8 +136,11 @@ impl PrometheusRestoreMetrics {
             "Segments a checked frontier needs that the restore check did not verify.",
         )?;
         let seconds = Histogram::with_opts(
-            HistogramOpts::new(RESTORE_CHECK_SECONDS, "Seconds one database's restore check took.")
-                .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0]),
+            HistogramOpts::new(
+                RESTORE_CHECK_SECONDS,
+                "Seconds one database's restore check took.",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0]),
         )?;
         let registry = Registry::new();
         registry.register(Box::new(checks.clone()))?;
@@ -166,8 +169,7 @@ impl PrometheusRestoreMetrics {
         let temp = PathBuf::from(temp);
         std::fs::write(&temp, self.encode()?)
             .with_context(|| format!("metrics file {}", temp.display()))?;
-        std::fs::rename(&temp, path)
-            .with_context(|| format!("metrics file {}", path.display()))?;
+        std::fs::rename(&temp, path).with_context(|| format!("metrics file {}", path.display()))?;
         Ok(())
     }
 }
@@ -213,8 +215,10 @@ mod tests {
              INSERT INTO t (v) VALUES ('one');",
         )
         .unwrap();
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
-            .unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
         let checkpoint = std::fs::read(&path).unwrap();
         for v in ["two", "three"] {
             conn.execute("INSERT INTO t (v) VALUES (?1)", [v]).unwrap();
@@ -409,14 +413,9 @@ mod tests {
         rig.shadowed("b").await;
         rig.shadowed("c").await;
         let metrics = Arc::new(PrometheusRestoreMetrics::new().unwrap());
-        let report = check_sample(
-            &rig.deps(metrics),
-            &[SPACE.to_string()],
-            2,
-            Some(9),
-        )
-        .await
-        .unwrap();
+        let report = check_sample(&rig.deps(metrics), &[SPACE.to_string()], 2, Some(9))
+            .await
+            .unwrap();
         assert_eq!((report.sampled, report.ok), (2, 2), "{report:?}");
     }
 }
