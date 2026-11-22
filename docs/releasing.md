@@ -148,6 +148,33 @@ must show that step's validity query output (the `SELECT` in its section), or
 the release waits. An out-of-band prerequisite listed only in a ticket or a
 note is not a gate.
 
+### Rollback plans: who owns the tables a release creates (TC-3755)
+
+A table created by a migration at boot is owned by the role the node connects
+as (in production, its own PlanetScale API role, `pscale_api_…`). The older
+tables, such as `delegation` and `seaql_migrations`, are owned by `postgres`,
+and `postgres` is not a member of the node's role. An operator role that
+inherits `postgres` can therefore alter the old tables but **cannot `DROP` a
+table the release creates**. Only the node's own sealed credential can, or a
+PlanetScale `roles/{id}/reassign`, which changes ownership in production and
+needs its own GO. This bit 1.26.18: the pre-deploy ownership read of the
+existing tables passed, but `session_retire` and `sql_store_owner` were then
+created under the node's role, and the staged down-migration could not run.
+
+So, for any release whose migrations create tables:
+
+1. A pre-deploy ownership check of existing tables **does not prove** that a
+   down-migration is runnable. The release plan states the rollback as
+   fix-forward only, unless its down path drops nothing the release creates.
+2. Re-read the owners of the new tables on the replica after the deploy
+   (`SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public'
+   AND tablename IN (...)`) and record them in the release record.
+3. Deleting a migration's `seaql_migrations` row needs only `postgres`. After
+   that, the previous image boots with the release's additive tables and
+   columns left in place. Going forward again then needs that migration's `up`
+   to be idempotent (`IF NOT EXISTS`); otherwise the boot fails with "already
+   exists".
+
 ### Verify out-of-band indexes after every node deploy (TC-2062)
 
 Because these indexes are performance-only, a missing one raises no error: the
