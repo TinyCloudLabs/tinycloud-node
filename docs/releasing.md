@@ -386,7 +386,6 @@ only inside the deploy job.
 | --- | --- | --- |
 | `docker.yml` | `deploy-phala` | `PHALA_CLOUD_API_KEY` and the `PROD_TINYCLOUD_*` sealed config |
 | `docker.yml` | `rollback-audit` | `PROD_TINYCLOUD_DATABASE_URL` |
-| `export-share-invitation-descriptor.yml` | `export` | `PROD_TINYCLOUD_KEYS_SECRET` |
 
 Environment settings (Settings → Environments → `production`):
 

@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- CI: the manual `export-share-invitation-descriptor.yml` workflow is removed. It derived the Share invitation key from the static `PROD_TINYCLOUD_KEYS_SECRET`, which is not the production node's key (the node uses dstack-derived keys), so its output never matched the live node and nothing consumed it. Operators read the live key from `GET /.well-known/tinycloud/node-keys` as `deploy/share-email/production-trust-bundle-contract.md` describes. The `export-share-invitation-descriptor` binary stays for static-key deployments and the Share native-stack e2e. The secret itself is not touched here. Details: TC-971.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;

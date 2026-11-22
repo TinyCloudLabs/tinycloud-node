@@ -190,9 +190,9 @@ then set `nodeInvitationKid` to
 `<nodeAudience>#invitation-key-<nodeKeyVersion>` in the bundle. Verify the
 node's startup configuration; startup refuses a descriptor/key mismatch.
 Never put a secret in the bundle. The
-`export-share-invitation-descriptor` binary reads `TINYCLOUD_KEYS_SECRET`
-(the workflow supplies `PROD_TINYCLOUD_KEYS_SECRET`) and is for static-key
-deployments only; it hard-codes `<nodeAudience>#invitation-key-1` and version
+`export-share-invitation-descriptor` binary reads `TINYCLOUD_KEYS_SECRET` and
+is for static-key deployments only; it hard-codes
+`<nodeAudience>#invitation-key-1` and version
 `1`, so changing those values for a static-key node requires updating and
 reviewing the exporter. Recheck `nodeAudience` and `nodeEnabled` in the
 separately signed authority material. An issuer-key overlap alone does not
