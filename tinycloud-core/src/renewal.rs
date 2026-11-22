@@ -1547,14 +1547,9 @@ async fn status_authorized<C: ConnectionTrait>(
         {
             ControlProofDecision::DirectSigner(principal) => {
                 ControlAction::Status.party_may_act(&target, &principal)
-                    || abilities.iter().any(|ability| {
-                        ability.resource.space().is_some_and(|space| {
-                            tinycloud_auth::identity::did_principal_matches(
-                                space.did().as_str(),
-                                &principal,
-                            )
-                        })
-                    })
+                    || abilities
+                        .iter()
+                        .any(|ability| ability.resource.owned_by(&principal))
             }
             ControlProofDecision::Scoped(control) => {
                 control.authorizes_target(&target_id, &target, &abilities)

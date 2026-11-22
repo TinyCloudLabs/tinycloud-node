@@ -3012,3 +3012,128 @@ async fn native_decrypt_checks_wrap_context_and_outer_algorithm() {
         }
     }
 }
+
+// Secret keys (paths under `secrets/`) are seeded deletable keys (TC-3798).
+
+/// Create, read and open a secret key on `db`, and check that the public GET
+/// never derives one.
+async fn assert_secret_keys_are_seeded(db: &DatabaseConnection, svc: &EncryptionService) {
+    let loc = key_loc("secrets/x");
+    let err = svc.create_key(&loc, false).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyPathInvalid(_)),
+        "{err:?}"
+    );
+    let created = svc.create_key(&loc, true).await.unwrap();
+    assert_eq!(created.kind, "deletable");
+    assert_eq!(created.state, KeyState::Active);
+    assert_eq!(created.key_version, 1);
+    assert!(key_row(db, "secrets/x").await.sealed_seed.is_some());
+    assert_eq!(svc.describe_key(&loc).await.unwrap(), created);
+
+    let wrapped = wrap_to_public_key(&created.public_encryption_key, &[9u8; 32]).unwrap();
+    let (version, opened) = svc.unwrap_named_key(&loc, &wrapped, 1).await.unwrap();
+    assert_eq!((version, opened), (1, vec![9u8; 32]));
+
+    // Two secrets never share a seed.
+    svc.create_key(&key_loc("secrets/y"), true).await.unwrap();
+    assert_ne!(
+        key_row(db, "secrets/y").await.sealed_seed,
+        key_row(db, "secrets/x").await.sealed_seed
+    );
+
+    for path in [
+        "secrets/x",
+        "secrets/missing",
+        "secrets/scoped/acme/token",
+        "secrets",
+    ] {
+        let err = svc.public_key(&key_loc(path)).await.unwrap_err();
+        assert!(
+            matches!(err, EncryptionServiceError::KeyNotFound),
+            "{path}: {err:?}"
+        );
+    }
+    // A first segment that only starts with `secrets` is deterministic.
+    let other = svc.create_key(&key_loc("secretsx/y"), false).await.unwrap();
+    assert_eq!(other.kind, "deterministic");
+    assert!(svc.public_key(&key_loc("secretsx/y")).await.is_ok());
+}
+
+/// The startup check on `db`: rows under `secrets/` (or at `secrets`) that
+/// are not deletable are counted; other rows are not.
+async fn assert_startup_check_finds_stray_secret_rows(db: &DatabaseConnection) {
+    ensure_no_deterministic_app_keys(db).await.unwrap();
+    insert_raw_row(db, "secretsx/z", "deterministic", None).await;
+    ensure_no_deterministic_app_keys(db).await.unwrap();
+
+    insert_raw_row(db, "secrets/old", "deterministic", None).await;
+    insert_raw_row(db, "secrets", "deterministic", None).await;
+    let err = ensure_no_deterministic_app_keys(db).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::StraySecretKeyRows(2)),
+        "{err:?}"
+    );
+    assert!(err
+        .to_string()
+        .starts_with("2 key rows under secrets/ are not deletable keys"));
+    assert!(err.to_string().contains("SELECT network_id, key_path"));
+}
+
+#[tokio::test]
+async fn secret_key_is_deletable_seeded_and_never_derived_by_the_public_get() {
+    let (db, svc) = service_with_network().await;
+    assert_secret_keys_are_seeded(&db, &svc).await;
+}
+
+#[tokio::test]
+async fn startup_check_finds_rows_under_secrets_that_are_not_deletable() {
+    let (db, svc) = service_with_network().await;
+    svc.create_key(&key_loc("secrets/x"), true).await.unwrap();
+    assert_startup_check_finds_stray_secret_rows(&db).await;
+}
+
+#[tokio::test]
+async fn startup_check_reports_rows_under_apps_before_rows_under_secrets() {
+    let (db, _) = service_with_network().await;
+    insert_raw_row(&db, "secrets/old", "deterministic", None).await;
+    insert_raw_row(&db, "apps/foo/old", "deterministic", None).await;
+    let err = ensure_no_deterministic_app_keys(&db).await.unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::StrayAppKeyRows(1)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleted_secret_key_refuses_old_ciphertext_and_is_reinstalled_by_create() {
+    let (db, svc) = service_with_network().await;
+    let loc = key_loc("secrets/x");
+    let first = svc.create_key(&loc, true).await.unwrap();
+    force_row(&db, "secrets/x", "deleted", None).await;
+    let wrapped = wrap_to_public_key(&first.public_encryption_key, &[1u8; 32]).unwrap();
+    let err = svc.unwrap_named_key(&loc, &wrapped, 1).await.unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::KeyDeleted), "{err:?}");
+    let again = svc.create_key(&loc, true).await.unwrap();
+    assert_eq!((again.key_version, again.state), (2, KeyState::Active));
+    assert_ne!(again.public_encryption_key, first.public_encryption_key);
+}
+
+// PostgreSQL-backed; CI-only. Secret keys are seeded and the startup check
+// finds stray rows under `secrets/`, as on SQLite.
+#[tokio::test]
+async fn postgres_secret_keys_are_seeded_and_stray_rows_stop_the_start() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_secret_keys_are_seeded_and_stray_rows_stop_the_start",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let db = fixture.connect(4).await;
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    assert_secret_keys_are_seeded(&db, &svc).await;
+    assert_startup_check_finds_stray_secret_rows(&db).await;
+}

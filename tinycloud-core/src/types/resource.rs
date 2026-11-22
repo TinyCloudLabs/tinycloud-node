@@ -2,12 +2,15 @@ use crate::encryption_network::key_id;
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
-use tinycloud_auth::resource::{
-    iri_string::{
-        types::{UriStr, UriString},
-        validate::Error as UriError,
+use tinycloud_auth::{
+    identity::did_principal_matches,
+    resource::{
+        iri_string::{
+            types::{UriStr, UriString},
+            validate::Error as UriError,
+        },
+        KRIParseError, ResourceId, SpaceId,
     },
-    KRIParseError, ResourceId, SpaceId,
 };
 
 const ENCRYPTION_NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
@@ -38,6 +41,19 @@ impl Resource {
     /// network; a bare network is not one.
     pub fn is_named_key(&self) -> bool {
         matches!(self, Resource::Other(uri) if key_id::is_named_key(uri.as_str()))
+    }
+
+    /// Whether `principal` owns this resource: the owner of a space
+    /// resource's space, or the owner DID an encryption network, key or key
+    /// prefix URN names (TC-3858). Both sides compare as principal DIDs, so
+    /// EIP-55 and lowercase spellings of one address match and another chain
+    /// id does not. Any other resource has no owner.
+    pub fn owned_by(&self, principal: &str) -> bool {
+        match self {
+            Resource::TinyCloud(id) => did_principal_matches(id.space().did().as_str(), principal),
+            Resource::Other(uri) => key_id::parse(uri.as_str())
+                .is_ok_and(|resource| did_principal_matches(resource.owner_did(), principal)),
+        }
     }
 
     /// `child.extends(&parent)` is true when `parent` covers `child`.

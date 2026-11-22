@@ -106,6 +106,11 @@ async fn part<S: SqlObjectStore>(
         .map(|r| (r.start, r.total_size, r.data))
 }
 
+/// Nothing readable is left at `path`: it is gone or empty.
+fn emptied(path: &Path) -> bool {
+    std::fs::metadata(path).map_or(true, |m| m.len() == 0)
+}
+
 // ---------------------------------------------------------------------------
 // The conformance set
 // ---------------------------------------------------------------------------
@@ -141,7 +146,7 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
     // The whole object streams back into a file.
     let out = tempfile::NamedTempFile::new().unwrap();
     assert_eq!(
-        s.get_to_file(&k, out.path()).await.unwrap(),
+        s.get_to_file(&k, out.path(), 300).await.unwrap(),
         Some(ObjectMeta {
             bytes: 300,
             sha256: sha256(&b)
@@ -149,11 +154,18 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
     );
     assert_eq!(std::fs::read(out.path()).unwrap(), b);
     assert_eq!(
-        s.get_to_file(&key_for(b"absent"), out.path())
+        s.get_to_file(&key_for(b"absent"), out.path(), 300)
             .await
             .unwrap(),
         None
     );
+    // A cap below the object's size: refused, and the target holds nothing.
+    std::fs::write(out.path(), b"stale bytes").unwrap();
+    assert!(matches!(
+        s.get_to_file(&k, out.path(), 299).await,
+        Err(SqlStoreError::Oversize)
+    ));
+    assert!(emptied(out.path()));
     // A file of another size than declared is refused.
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), &b).unwrap();
@@ -289,6 +301,31 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
                 assert_eq!(whole(s, &key).await.unwrap(), other);
             }
         }
+        // A planted body is never handed out: a wrong body of the right
+        // length or a short one is refused, one longer than the cap is cut
+        // off, and each time the target is left empty.
+        for (len, planted) in [(48usize, None), (48, Some(7usize))] {
+            let wanted = body(len);
+            let key = key_for(&wanted);
+            let other = planted.map_or_else(|| differing(&wanted), body);
+            planter.plant(&key, other).await;
+            let out = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(out.path(), b"stale bytes").unwrap();
+            assert!(matches!(
+                s.get_to_file(&key, out.path(), len as u64).await,
+                Err(SqlStoreError::BodyMismatch)
+            ));
+            assert!(emptied(out.path()));
+        }
+        let wanted = body(32);
+        let key = key_for(&wanted);
+        planter.plant(&key, body(100)).await;
+        let out = tempfile::NamedTempFile::new().unwrap();
+        assert!(matches!(
+            s.get_to_file(&key, out.path(), 32).await,
+            Err(SqlStoreError::Oversize)
+        ));
+        assert!(emptied(out.path()));
     }
 
     concurrent_creators(store, 40).await;
@@ -324,7 +361,18 @@ async fn concurrent_creators<S: SqlObjectStore + 'static>(store: Arc<S>, rounds:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_conformance() {
-    conformance(Arc::new(MemorySqlObjectStore::default()), None).await;
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let planter = MemoryPlanter(store.clone());
+    conformance(store, Some(&planter)).await;
+}
+
+struct MemoryPlanter(Arc<MemorySqlObjectStore>);
+
+#[async_trait]
+impl Planter for MemoryPlanter {
+    async fn plant(&self, key: &ObjectKey, bytes: Vec<u8>) {
+        self.0.plant(key.as_str(), bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -731,8 +779,9 @@ impl<S: SqlObjectStore> SqlObjectStore for Timed<S> {
         &self,
         key: &ObjectKey,
         path: &Path,
+        max_bytes: u64,
     ) -> Result<Option<ObjectMeta>, SqlStoreError> {
-        limited("get_to_file", self.0.get_to_file(key, path)).await
+        limited("get_to_file", self.0.get_to_file(key, path, max_bytes)).await
     }
     async fn get_range(
         &self,
@@ -804,8 +853,9 @@ async fn s3_conformance(config: &S3BlockConfig, mode: WriteMode) {
             &self,
             key: &ObjectKey,
             path: &Path,
+            max_bytes: u64,
         ) -> Result<Option<ObjectMeta>, SqlStoreError> {
-            self.0.get_to_file(key, path).await
+            self.0.get_to_file(key, path, max_bytes).await
         }
         async fn get_range(
             &self,

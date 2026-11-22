@@ -7,10 +7,11 @@
 //! Paths are `/`-separated segments of `[a-z0-9][a-z0-9._-]*`.
 //! Key and prefix networks are `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; bare networks follow [`NetworkId`].
 //!
-//! The first path segment `apps` is reserved for deletable keys. A key under
-//! it is `apps/<app id>/<name>[/<more>]` (at least three segments) and a prefix
-//! is `apps/<app id>/[<more>/]` (at least two segments before the trailing
-//! `/`). Every other path is a deterministic key.
+//! The first path segments `apps` and `secrets` are reserved for deletable
+//! keys. A key under `apps` is `apps/<app id>/<name>[/<more>]` (at least three
+//! segments) and a prefix is `apps/<app id>/[<more>/]` (at least two segments
+//! before the trailing `/`). A key under `secrets` is `secrets/<name>[/<more>]`.
+//! Every other path is a deterministic key.
 
 use super::network_id::{NetworkId, NetworkIdError};
 use std::fmt;
@@ -22,8 +23,13 @@ const PREFIX: &str = "urn:tinycloud:encryption:";
 const MAX_PATH_BYTES: usize = 255;
 const MAX_SEGMENTS: usize = 8;
 const MAX_SEGMENT_BYTES: usize = 64;
-/// First path segment reserved for deletable keys.
+/// First path segment reserved for app keys, which are deletable.
 const APPS_SEGMENT: &str = "apps";
+/// First path segment reserved for secret keys, which are deletable.
+const SECRETS_SEGMENT: &str = "secrets";
+/// First path segments whose keys are deletable. Every other key is
+/// deterministic.
+const DELETABLE_SEGMENTS: [&str; 2] = [APPS_SEGMENT, SECRETS_SEGMENT];
 const MIN_APPS_KEY_SEGMENTS: usize = 3;
 const MIN_APPS_PREFIX_SEGMENTS: usize = 2;
 
@@ -74,8 +80,8 @@ impl KeyLocation {
         &self.path
     }
 
-    /// The kind a key at this path has: a path under `apps/` is deletable,
-    /// every other path is deterministic.
+    /// The kind a key at this path has: a path under `apps/` or `secrets/` is
+    /// deletable, every other path is deterministic.
     pub fn kind(&self) -> KeyKind {
         KeyKind::for_path(&self.path)
     }
@@ -193,7 +199,8 @@ pub fn is_named_key(uri: &str) -> bool {
     )
 }
 
-/// Whether keys at `path` are deletable (first segment exactly `apps`).
+/// Whether `path` is under the reserved `apps` segment (first segment exactly
+/// `apps`).
 pub fn is_apps_path(path: &str) -> bool {
     path.split('/').next() == Some(APPS_SEGMENT)
 }
@@ -217,8 +224,11 @@ pub enum KeyKind {
 }
 
 impl KeyKind {
+    /// Deletable when the first path segment is one of
+    /// [`DELETABLE_SEGMENTS`] (`apps`, `secrets`), deterministic otherwise.
     pub fn for_path(path: &str) -> Self {
-        if is_apps_path(path) {
+        let first = path.split('/').next().unwrap_or_default();
+        if DELETABLE_SEGMENTS.contains(&first) {
             Self::Deletable
         } else {
             Self::Deterministic

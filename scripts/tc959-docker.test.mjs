@@ -61,6 +61,18 @@ test('capture accepts well-formed N2 correlation fields on node_request only', (
   }
 });
 
+// test-ruling: TC-3834 scripts/tc959-docker.test.mjs new test only (2026-11-24)
+test('capture accepts a declared error_code on a 5xx node_request only (TC-3834)', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const failed = { ...request, method: 'POST', route: '/invoke', status: 503, error_code: 'db_timeout' };
+  assert.doesNotThrow(() => assertCapture([failed], fields));
+  assert.doesNotThrow(() => assertCapture([{ ...failed, status: 500, error_code: 'internal' }], fields));
+  for (const bad of [{ error_code: 'database timed out' }, { error_code: 'DB_TIMEOUT' }, { error_code: 7 }, { status: 404 }, { status: 200 }]) {
+    assert.throws(() => assertCapture([{ ...failed, ...bad }], fields), JSON.stringify(bad));
+  }
+  assert.throws(() => assertCapture([{ ...ingress, status: 503, error_code: 'db_timeout' }], fields), 'ingress error_code');
+});
+
 test('capture accepts the individual 5xx diagnostic with exactly its eight typed fields (TC-1840)', () => {
   const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
   const dbFailure = { ts: request.ts, level: 'warn', event: 'node_warning', svc: 'api', event_code: 'db_failure_5xx', status: 503, code: 'sql_busy', service: 'sql', route: '/invoke', elapsed_ms: 30001, failure_kind: 'lock_wait', write_may_have_applied: false, db_hash: 'a'.repeat(64) };
