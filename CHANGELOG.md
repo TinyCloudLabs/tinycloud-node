@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Deploy workflow: the `named_keys_v1` input of `docker.yml` defaults to `true`, the value production has run since 1.26.16. A dispatch that leaves it out no longer turns named keys off, which would stop Share v3 decrypt, `apps/` keys and per-secret keys. Passing `false` still turns them off. A new step, `Verify named-keys gate`, fails the deploy unless both node.tinycloud.xyz and tee.node.tinycloud.xyz list `encryption-named-keys-v1` in `/info` exactly when the input is `true`. A deletion ledger that could not be opened or replayed leaves the node serving with the gate off, and this step catches it. Images built before the feature, and the captured pre-N0 rollback, are not checked. Details: TC-3284.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
