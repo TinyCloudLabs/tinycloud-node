@@ -74,6 +74,14 @@ services:
       # slice. The 64 MiB save limit (max_artifact_write_bytes) is unchanged:
       # a write that needs a whole checkpoint over it still answers 507.
       TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"
+      # TC-1491: cap each stored SQL database at 320 MiB, the same as the read
+      # limit above, so a database can always be loaded again. A write that
+      # would grow a database past it answers 507 sql_database_size_limit; a
+      # database already over it still takes writes that do not grow it. Keep
+      # 1 GiB of the data volume free: a write that would eat into it answers
+      # 507 sql_disk_headroom.
+      TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"
+      TINYCLOUD_STORAGE__SQL__MIN_FREE_BYTES: "1 GiB"
       # TC-1791: enforce the tables / columns / readOnly caveats of delegated
       # SQL grants. Off, such a grant is refused at /delegate, so no stored
       # chain carries them and un-caveated SQL is unchanged.
