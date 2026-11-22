@@ -160,11 +160,15 @@ stop_recorded() {
   if kill -0 "$pid" 2>/dev/null; then
     local actual
     actual=$(proc_start "$pid" || true)
-    if [[ -z "$start" || "$actual" != "$start" ]]; then
-      log "pid $pid is not the recorded $what (start time ${actual:-?} != ${start:-unrecorded}); leaving it alone"
+    # An unreadable start time (/proc/$pid/stat gone) means the process has
+    # exited or is exiting, not that the pid was reused: fall through to the
+    # group check. Refuse only when a start time is read and does not match.
+    if [[ -n "$actual" && ( -z "$start" || "$actual" != "$start" ) ]]; then
+      log "pid $pid is not the recorded $what (start time $actual != ${start:-unrecorded}); leaving it alone"
       return 1
     fi
-  elif ! group_alive "$pid"; then
+  fi
+  if ! group_alive "$pid"; then
     log "$what (pid $pid) is not running"
     return 0
   fi
