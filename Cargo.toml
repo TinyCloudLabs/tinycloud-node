@@ -13,6 +13,7 @@ members = [
     "dependencies/siwe-recap",
     "dependencies/cacao",
     "test/n4-mounted-e2e",
+    "test/caveat-probe",
 ]
 
 default-members = ["tinycloud-node-server"]
