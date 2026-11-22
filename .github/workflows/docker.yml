@@ -491,7 +491,8 @@ jobs:
           cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=dstack' || '' }}
 
       # TC-3839: SLSA build provenance, signed with this workflow's OIDC identity and
-      # pushed next to the image. Check: gh attestation verify oci://<image>@<digest> -R TinyCloudLabs/tinycloud-node
+      # pushed next to the image. Check with the pinned command in docs/releasing.md
+      # (signer workflow, source ref, no self-hosted runners), never with -R alone.
       - name: Attest dstack image build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -579,10 +580,12 @@ jobs:
       version: ${{ steps.pin.outputs.version }}
       revision: ${{ steps.pin.outputs.revision }}
       image_label: ${{ steps.pin.outputs.image_label }}
-      compose_hash: ${{ steps.compose.outputs.compose_hash }}
     permissions:
       contents: read
       packages: read
+      # TC-3839: sign provenance for the deployed app-compose.json only.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -1442,6 +1445,10 @@ jobs:
             ALLOWED="sealed sealed-new"
           fi
           ROOT="$(curl -fsS --max-time 15 https://tee.node.tinycloud.xyz/info | jq -r '.identityRoot // "absent"')"
+          if ! [[ "${ROOT}" =~ ^[a-z-]{1,32}$ ]]; then
+            echo "::error::/info identityRoot is not a plain word; expected one of: ${ALLOWED}."
+            exit 1
+          fi
           case " ${ALLOWED} " in
             *" ${ROOT} "*)
               echo "identityRoot: ${ROOT}"
@@ -1454,13 +1461,14 @@ jobs:
           esac
 
       # TC-3839: capture the exact app-compose.json dstack measured (compose file
-      # plus runner settings; the attested compose hash is its SHA-256). It is
-      # published on the release by publish-compose, so anyone can compare the
-      # attestation's compose hash with a reviewable manifest. Phala serves the
-      # manifest as JSON; its compact, key-sorted form is the measured bytes
-      # (checked 2026-11-22 on 1.26.19: 1dc2fe4a…, while the pretty-printed
-      # output does not match). Fails unless that form hashes to the compose
-      # hash the running node attests.
+      # plus runner settings; the compose hash is its SHA-256) and sign build
+      # provenance for it, so anyone holding the file can check it came from
+      # this workflow on main and compare its hash with an attestation. Phala
+      # serves the manifest as JSON; its compact, key-sorted form is the
+      # measured bytes (checked 2026-11-22 on 1.26.19: 1dc2fe4a…, while the
+      # pretty-printed output does not match). Fails unless that form hashes to
+      # the compose hash the running node reports. CI does not verify the quote
+      # here; the endpoint just requires a nonce.
       - name: Capture the deployed app-compose.json
         id: compose
         env:
@@ -1473,30 +1481,44 @@ jobs:
             echo "::error::Cannot read the compose file of tinycloud-node from Phala"
             exit 1
           fi
+          # The compose file never carries sealed values; refuse if it ever does.
+          if [ "$(jq '(type == "object") and (has("encrypted_env") | not)' <<<"${SERVED}")" != "true" ]; then
+            echo "::error::The Phala compose file is not an object without encrypted_env; not publishing it."
+            exit 1
+          fi
           jq -cjS . <<<"${SERVED}" > "${MANIFEST}"
           HASH="$(sha256sum "${MANIFEST}" | cut -d' ' -f1)"
-          ATTESTED=""
+          REPORTED=""
           for _ in 1 2 3; do
             NONCE="$(openssl rand -hex 16)"
-            ATTESTED="$(curl -fsS --max-time 30 "https://tee.node.tinycloud.xyz/attestation?nonce=${NONCE}" | jq -r '.compose_hash // empty' || true)"
-            [ -n "${ATTESTED}" ] && break
+            REPORTED="$(curl -fsS --max-time 30 "https://tee.node.tinycloud.xyz/attestation?nonce=${NONCE}" | jq -r '.compose_hash // empty' || true)"
+            [ -n "${REPORTED}" ] && break
             sleep 10
           done
-          if [ "${ATTESTED}" != "${HASH}" ]; then
-            echo "::error::The node attests compose hash '${ATTESTED}', but the Phala compose file hashes to ${HASH}; not publishing it."
+          if ! [[ "${REPORTED}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The node reported no well-formed compose hash; not publishing the Phala compose file (${HASH})."
+            exit 1
+          fi
+          if [ "${REPORTED}" != "${HASH}" ]; then
+            echo "::error::The node reports compose hash ${REPORTED}, but the Phala compose file hashes to ${HASH}; not publishing it."
             exit 1
           fi
           mv "${MANIFEST}" "$RUNNER_TEMP/app-compose/app-compose-${HASH}.json"
           echo "compose_hash=${HASH}" >> "$GITHUB_OUTPUT"
-          echo "Attested compose hash: \`${HASH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Node-reported compose hash (matches app-compose-${HASH}.json): \`${HASH}\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the deployed app-compose.json for the release
+      - name: Sign provenance for the deployed app-compose.json
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/app-compose/app-compose-${{ steps.compose.outputs.compose_hash }}.json
+
+      - name: Keep the deployed app-compose.json
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: app-compose
+          name: app-compose-${{ steps.compose.outputs.compose_hash }}
           path: ${{ runner.temp }}/app-compose/app-compose-${{ steps.compose.outputs.compose_hash }}.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
 
       - name: Report unverified storage overrides
         if: >-
@@ -1537,47 +1559,3 @@ jobs:
             echo "Promote watch after deployment attempt; image validation did not complete."
           fi
           gh workflow run write-probe.yml -R "${GITHUB_REPOSITORY}" --ref main -f mode=dense
-
-  # TC-3839: attach the measured app-compose.json to the deployed version's
-  # GitHub release as app-compose-<compose hash>.json. A separate job so the
-  # production-secret deploy job never holds `contents: write`. A rollback or
-  # promotion that runs an older version under a new compose adds a second file;
-  # nothing is replaced.
-  publish-compose:
-    runs-on: ubuntu-latest
-    needs: [deploy-phala]
-    if: ${{ needs.deploy-phala.result == 'success' && needs.deploy-phala.outputs.compose_hash != '' }}
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: app-compose
-          path: app-compose
-
-      - name: Attach app-compose.json to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.deploy-phala.outputs.version }}
-          COMPOSE_HASH: ${{ needs.deploy-phala.outputs.compose_hash }}
-        run: |
-          set -euo pipefail
-          NAME="app-compose-${COMPOSE_HASH}.json"
-          FILE="app-compose/${NAME}"
-          if [ "$(sha256sum "${FILE}" | cut -d' ' -f1)" != "${COMPOSE_HASH}" ]; then
-            echo "::error::${NAME} does not hash to ${COMPOSE_HASH}"
-            exit 1
-          fi
-          TAG="v${VERSION}"
-          if ! ASSETS="$(gh release view "${TAG}" -R "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"; then
-            echo "::error::No GitHub release ${TAG} to attach ${NAME} to"
-            exit 1
-          fi
-          if grep -qxF "${NAME}" <<<"${ASSETS}"; then
-            echo "${TAG} already has ${NAME}"
-          else
-            gh release upload "${TAG}" "${FILE}" -R "${GITHUB_REPOSITORY}"
-          fi
-          echo "Published \`${NAME}\` on ${TAG}" >> "$GITHUB_STEP_SUMMARY"
-
