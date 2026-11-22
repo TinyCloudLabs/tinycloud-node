@@ -16,6 +16,10 @@
 //! memory in the database count. The caller supplies the page size and
 //! paces the calls.
 //!
+//! The LEFT JOIN relies on `sql_store_manifest` having at most one row
+//! per `(space, db_id)`: the primary key is exactly that pair, so no row
+//! is multiplied and no stale lineage row can mask lag.
+//!
 //! TC-1491.
 
 use std::collections::BTreeSet;
