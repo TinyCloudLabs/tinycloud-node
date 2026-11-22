@@ -22,6 +22,10 @@ verification-count-test-hook = []
 # are inert without a test that uses them. Never part of a production build;
 # downstream crates enable it only on their `tinycloud-core` dev-dependency.
 test-util = []
+# TC-1491 kill -9 harness for the shadow uploader: deterministic failpoints
+# at the four cycle points (after_put, after_record, before_cas, after_cas).
+# Off by default; never part of a production build.
+sql-store-failpoints = []
 
 tokio = [
     "sea-orm/runtime-tokio-rustls",

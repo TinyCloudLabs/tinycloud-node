@@ -185,6 +185,8 @@ mod tests {
 
 pub mod bootstrap;
 pub mod drain;
+#[cfg(feature = "sql-store-failpoints")]
+pub mod failpoints;
 pub mod reconciler;
 pub mod restore;
 pub mod sweep;
