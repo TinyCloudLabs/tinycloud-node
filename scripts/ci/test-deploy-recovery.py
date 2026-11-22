@@ -896,19 +896,29 @@ class EnvSyncTests(unittest.TestCase):
                                          "PHALA_CLOUD_API_KEY": "synthetic", "FAKE_STATE": str(state)})
             return result.returncode, result.stdout + result.stderr, json.loads(state.read_text())
 
-    def test_retired_ssh_keys_name_may_be_absent_and_is_removed_from_allowed_envs(self):
+    def test_retired_ssh_keys_name_may_be_absent_before_deploy_but_is_never_patched_away(self):
         # TC-3838: the live CVM still allows DSTACK_AUTHORIZED_KEYS, which the sealed file no longer has.
         live = self.SEALED + ["DSTACK_AUTHORIZED_KEYS"]
         code, logs, state = self.sync(live, check=True)
         self.assertEqual(code, 0, logs)
         self.assertEqual(state["patches"], [])
+        # After deploy, `phala deploy -e` should have dropped it under the compose-hash and KMS
+        # checks. If it is still allowed, sync stops for a human; it never PATCHes it away.
         code, logs, state = self.sync(live)
-        self.assertEqual(code, 0, logs)
-        self.assertEqual(state["patches"], [self.SEALED])
-        self.assertNotIn("DSTACK_AUTHORIZED_KEYS", state["allowed"])
-        # Once removed, a deploy needs no PATCH.
+        self.assertEqual(code, 1, logs)
+        self.assertIn("::error::allowed_envs synchronization failed during post-deploy check: a retired name is still allowed;", logs)
+        self.assertEqual(state["patches"], [])
+        self.assertIn("DSTACK_AUTHORIZED_KEYS", state["allowed"])
+        # Once the deploy dropped it, sync needs no PATCH.
         code, logs, state = self.sync(self.SEALED)
         self.assertEqual((code, state["patches"]), (0, []), logs)
+
+    def test_a_missing_non_retired_name_is_still_patched_in(self):
+        # TC-959 behaviour unchanged: a sealed name the deploy did not register is added by PATCH.
+        code, logs, state = self.sync(self.SEALED[:-1])
+        self.assertEqual(code, 0, logs)
+        self.assertEqual(state["patches"], [self.SEALED])
+        self.assertEqual(sorted(state["allowed"]), sorted(self.SEALED))
 
     def test_any_other_missing_name_or_a_retired_name_in_the_file_fails_closed(self):
         for allowed, sealed in ((self.SEALED + ["NODE_STATS_READ_TOKEN"], self.SEALED),

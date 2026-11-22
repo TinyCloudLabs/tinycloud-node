@@ -1018,7 +1018,7 @@ jobs:
             return names;
           };
           // Names a reviewed PR removed from the sealed file. They are the only allowed_envs
-          // entries the file may lack, and sync removes them (TC-3838: no SSH keys on the CVM).
+          // entries the file may lack before deploy (TC-3838: no SSH keys on the CVM).
           const RETIRED = ["DSTACK_AUTHORIZED_KEYS"];
 
           try {
@@ -1060,11 +1060,17 @@ jobs:
             requireCondition(allowed.every((key) => keys.has(key) || RETIRED.includes(key)));
             requireCondition(RETIRED.every((key) => !keys.has(key)));
             const retired = allowed.filter((key) => RETIRED.includes(key));
-            const kept = allowed.filter((key) => !RETIRED.includes(key));
             const missing = [...keys].filter((key) => !allowed.includes(key));
             if (process.argv.includes("--check")) {
               console.log(`Validated complete sealed set: ${keys.size} env names.`);
-            } else if (missing.length === 0 && retired.length === 0) {
+            } else if (retired.length > 0) {
+              // The deploy's own compose update (`phala deploy -e`) sets allowed_envs to
+              // the sealed names, under its compose-hash and KMS checks. A retired name
+              // still allowed means it did not; removing it by PATCH would change
+              // allowed_envs after those checks, so stop for a human instead (TC-3838).
+              phase = "post-deploy check: a retired name is still allowed";
+              requireCondition(false);
+            } else if (missing.length === 0) {
               console.log(`allowed_envs verified: ${keys.size} env names; no PATCH needed.`);
             } else {
               phase = "public encryption key validation";
@@ -1074,12 +1080,12 @@ jobs:
               const encrypted = await encryptEnvVars(envs, pubkey);
               phase = "env whitelist update";
               const result = await updateCvmEnvs(client, {
-                ...ref, encrypted_env: encrypted, env_keys: [...kept, ...missing],
+                ...ref, encrypted_env: encrypted, env_keys: [...allowed, ...missing],
               });
               // An on-chain precondition needs a separately reviewed
               // addComposeHash transaction. Never assume hash-only approval.
               requireCondition(result.status === "in_progress" && typeof result.correlation_id === "string" && result.correlation_id.length > 0);
-              console.log(`allowed_envs update accepted: ${missing.length} added names, ${retired.length} retired names removed.`);
+              console.log(`allowed_envs update accepted: ${missing.length} added names.`);
               phase = "env whitelist convergence";
               const deadline = Date.now() + 600000;
               let completed = false;
@@ -1100,8 +1106,7 @@ jobs:
                 const settled = progress == null || (
                   progress && !progress.target && !progress.started_at && !progress.correlation_id
                 );
-                if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))
-                    && !after.some((key) => RETIRED.includes(key))) {
+                if (observedOperation && current.status === "running" && settled && [...keys].every((key) => after.includes(key))) {
                   completed = true;
                   break;
                 }
