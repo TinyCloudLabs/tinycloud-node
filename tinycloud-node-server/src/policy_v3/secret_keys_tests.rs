@@ -20,10 +20,13 @@ use tinycloud_auth::{
     ucan_capabilities_object::Capabilities,
 };
 use tinycloud_core::encryption_network::{
-    backend::wrap_to_public_key,
+    backend::{
+        wrap_to_public_key, wrap_to_public_key_with_context, KeyWrapContext, KeyWrapPurpose,
+        KeyWrapVersion,
+    },
     canonical::canonical_hash,
     protocol::{DECRYPT_ACTION, DECRYPT_REQUEST_TYPE, KEY_ADMIN_TYPE, KEY_DESCRIBE_TYPE},
-    types::ALG_X25519_AES256GCM,
+    types::{ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM},
     CreateNetworkRequest, Threshold, KEY_CREATE_ACTION,
 };
 
@@ -219,16 +222,44 @@ async fn describe(
 /// node's answer.
 struct Wrapped {
     receiver: x25519_dalek::StaticSecret,
+    alg: &'static str,
     wrapped: Vec<u8>,
     symmetric: Vec<u8>,
 }
 
 impl Wrapped {
+    /// A v1 wrap to `public`.
     fn to(public: &[u8]) -> Self {
         let symmetric = vec![0x5Cu8; 32];
         Self {
             receiver: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+            alg: ALG_X25519_AES256GCM,
             wrapped: wrap_to_public_key(public, &symmetric).expect("wrap to the key"),
+            symmetric,
+        }
+    }
+
+    /// A v2 wrap to `public` whose header names `network` and `key_path` at
+    /// version 1.
+    fn v2_to(public: &[u8], network: &str, key_path: &str) -> Self {
+        let symmetric = vec![0x5Cu8; 32];
+        let context = KeyWrapContext {
+            purpose: KeyWrapPurpose::NetworkKey,
+            network_id: network,
+            key_path,
+            key_version: 1,
+            metadata: None,
+        };
+        Self {
+            receiver: x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+            alg: ALG_X25519_HKDF_AES256GCM,
+            wrapped: wrap_to_public_key_with_context(
+                public,
+                &symmetric,
+                &context,
+                KeyWrapVersion::V2,
+            )
+            .expect("v2 wrap to the key"),
             symmetric,
         }
     }
@@ -249,6 +280,13 @@ impl Wrapped {
     }
 }
 
+/// The two decrypt routes.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    Invoke,
+    Direct,
+}
+
 /// Decrypt over `/invoke`. `path` names the key, `None` the network's root
 /// key; the capability names the same target.
 async fn decrypt(
@@ -256,6 +294,20 @@ async fn decrypt(
     signer: &Signer,
     proof: Option<&str>,
     path: Option<&str>,
+    case: &Wrapped,
+) -> anyhow::Result<(Status, String)> {
+    decrypt_at(h, Route::Invoke, signer, proof, path, path, case).await
+}
+
+/// Decrypt over `route` under a `decrypt` capability on `cap_path` (`None`:
+/// the bare network), with `body_path` as the body's and facts' `keyPath`.
+async fn decrypt_at(
+    h: &Harness,
+    route: Route,
+    signer: &Signer,
+    proof: Option<&str>,
+    cap_path: Option<&str>,
+    body_path: Option<&str>,
     case: &Wrapped,
 ) -> anyhow::Result<(Status, String)> {
     let encrypted = base64::encode(&case.wrapped);
@@ -266,14 +318,14 @@ async fn decrypt(
         "type": DECRYPT_REQUEST_TYPE,
         "targetNode": h.node_did(),
         "networkId": h.network,
-        "alg": ALG_X25519_AES256GCM,
+        "alg": case.alg,
         "keyVersion": 1,
         "encryptedSymmetricKey": encrypted,
         "encryptedSymmetricKeyHash": encrypted_hash,
         "receiverPublicKey": receiver,
         "receiverPublicKeyHash": receiver_hash,
     });
-    if let Some(path) = path {
+    if let Some(path) = body_path {
         body["keyPath"] = json!(path);
     }
     let mut facts = json!({
@@ -283,18 +335,22 @@ async fn decrypt(
         "bodyHash": canonical_hash(&body),
         "encryptedSymmetricKeyHash": encrypted_hash,
         "receiverPublicKeyHash": receiver_hash,
-        "alg": ALG_X25519_AES256GCM,
+        "alg": case.alg,
         "keyVersion": 1,
     });
-    let resource = match path {
-        Some(path) => {
-            facts["keyPath"] = json!(path);
-            key(h, path)
-        }
+    if let Some(path) = body_path {
+        facts["keyPath"] = json!(path);
+    }
+    let resource = match cap_path {
+        Some(path) => key(h, path),
         None => h.network.clone(),
     };
     let auth = invocation(h, signer, &[(resource, DECRYPT_ACTION)], vec![facts], proof)?;
-    Ok(post(h, "/invoke", &auth, &body).await)
+    let uri = match route {
+        Route::Invoke => "/invoke".to_string(),
+        Route::Direct => format!("/encryption/networks/{}/decrypt", h.network),
+    };
+    Ok(post(h, &uri, &auth, &body).await)
 }
 
 /// The root network public key.
@@ -663,3 +719,73 @@ async fn a_re_delegated_secret_grant_attenuates_and_cannot_widen(
     Ok(())
 }
 on_both_backends!(a_re_delegated_secret_grant_attenuates_and_cannot_widen);
+
+/// A grant of `decrypt` on the bare network opens the network's root key and
+/// nothing wrapped to a secret's key: neither the secret key's v1 wrap, its
+/// v2 wrap, nor a v2 wrap to it whose header is shaped like a root wrap, on
+/// `/invoke` or on the direct route; a `keyPath` under a network capability
+/// is refused.
+async fn a_bare_network_grant_opens_no_secret_key_wrap(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = secrets_harness(backend, "a_bare_network_grant_opens_no_secret_key_wrap").await?
+    else {
+        return Ok(());
+    };
+    let x_public = owner_created(&h, "secrets/x").await?;
+    let root = root_public_key(&h).await?;
+    let holder = Signer::key();
+    let proof = grant(&h, &holder, &[(h.network.clone(), DECRYPT_ACTION)]).await?;
+
+    for route in [Route::Invoke, Route::Direct] {
+        // The grant is live: it opens a wrap to the root key.
+        let case = Wrapped::to(&root);
+        let (status, text) =
+            decrypt_at(&h, route, &holder, Some(&proof), None, None, &case).await?;
+        assert_eq!(status, Status::Ok, "{route:?} root: {text}");
+        assert_eq!(case.open(&text)?, case.symmetric, "{route:?}");
+
+        for (what, case) in [
+            ("v1 wrap", Wrapped::to(&x_public)),
+            (
+                "v2 wrap",
+                Wrapped::v2_to(&x_public, &h.network, "secrets/x"),
+            ),
+            (
+                "v2 wrap with a root header",
+                Wrapped::v2_to(&x_public, &h.network, ""),
+            ),
+        ] {
+            let (status, text) =
+                decrypt_at(&h, route, &holder, Some(&proof), None, None, &case).await?;
+            assert_eq!(status, Status::Forbidden, "{route:?} {what}: {text}");
+            assert!(
+                text.starts_with("key_unwrap_failed"),
+                "{route:?} {what}: {text}"
+            );
+            assert!(!text.contains("wrappedKey"), "{route:?} {what}: {text}");
+
+            // Naming the secret's key under the network capability: `/invoke`
+            // answers its refusals 403, the direct route 400.
+            let (status, text) = decrypt_at(
+                &h,
+                route,
+                &holder,
+                Some(&proof),
+                None,
+                Some("secrets/x"),
+                &case,
+            )
+            .await?;
+            let refused = match route {
+                Route::Invoke => Status::Forbidden,
+                Route::Direct => Status::BadRequest,
+            };
+            assert_eq!(status, refused, "{route:?} {what} keyPath: {text}");
+            assert!(
+                text.starts_with("key_path_invalid"),
+                "{route:?} {what} keyPath: {text}"
+            );
+        }
+    }
+    Ok(())
+}
+on_both_backends!(a_bare_network_grant_opens_no_secret_key_wrap);
