@@ -52,7 +52,7 @@
 
 ## [1.26.18] - 2026-11-22
 
-Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443). Database artifact saves now take their payload as shared bytes instead of a copy (#681, TC-1491); stored data and responses are unchanged. The SQL shadow store to the block store is built but refused at boot (#683, TC-1491). The production compose turns on the retention sweeper (#685, TC-287); that is config only and deploys with the 1.26.17 image. The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
+Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443). Database artifact saves now take their payload as shared bytes instead of a copy (#681, TC-1491); stored data and responses are unchanged. Copying SQL databases to the block store is built, and this build refuses to start with it turned on (#683, TC-1491). The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
 
 ### Upgrade notes
 
@@ -79,7 +79,6 @@ Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443).
     - The node stores only its own retires: **a host that starts hosting the space after the sign-out never gets the marker** and accepts the key until its session root expires (follow-up TC-3673).
   - **Schema:** adds the `session_retire` table and a nullable `delegation.first_seen_at` column, set when this node first stores a delegation; existing rows stay NULL and count as stored before any retire. Details: TC-3443.
 - The node can shadow-copy SQL databases to the block store, but this build refuses to start with `[sql_store] enabled = true`, so nothing changes at runtime. Adds the `sql_store_owner` table (see the upgrade notes). Details: TC-1491.
-- Production compose: the retention sweeper is on (`TINYCLOUD_RETENTION__ENABLED: "true"`, default windows). At boot and every 5 minutes it deletes delivered hook deliveries older than 7 days, dead-letter hook deliveries older than 30 days and signed KV tickets that expired more than 7 days ago, in batches of 5000. On 2026-11-21 that matched 485 rows (9 delivered, 4 dead-letter, 472 tickets). Deleted rows do not come back. Details: TC-287.
 
 ## [1.26.17] - 2026-11-21
 
