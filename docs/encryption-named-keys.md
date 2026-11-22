@@ -173,6 +173,8 @@ delegation and `key.delete` is refused in every delegation.
   `key_not_deletable`.
 - A deleted key keeps its row with state `deleted` and no seed. `keyVersion` is
   unchanged until the path is created again.
+- Deleting a secret's key does not end grants on its path; a key re-created
+  under the same path while a grant is live is readable by that grant.
 - The response is `{ keyPath, state: "deleted", deleted, alreadyDeleted,
   count }`; `deleted` lists the keys this call deleted (in path order),
   `alreadyDeleted` those that already were, and `count` is the length of
