@@ -1545,6 +1545,47 @@ async fn postgres_concurrent_creates_respect_the_key_cap() {
     assert_eq!(rows.len() as u64, CAP, "cap is never exceeded");
 }
 
+// PostgreSQL-backed; CI-only. The cap counts are SQL (`state <> 'deleted'`,
+// `substr`): the same budgets on PostgreSQL as on SQLite.
+#[tokio::test]
+async fn postgres_key_caps_count_live_rows_per_budget() {
+    let Some(fixture) =
+        PostgresTestSchema::migrated_through("postgres_key_caps_count_live_rows_per_budget", None)
+            .await
+    else {
+        return;
+    };
+    let db = fixture.connect(2).await;
+    let svc = make_service(db.clone())
+        .with_key_cap_per_network(2)
+        .with_key_cap_per_app_prefix(1)
+        .with_key_cap_secrets(1);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("secrets/a"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/secrets/x"), true)
+        .await
+        .unwrap();
+    svc.create_key(&key_loc("secretsx/a"), false).await.unwrap();
+    for (path, deletable) in [("secrets/b", true), ("apps/a/y", true), ("docs/a", false)] {
+        let err = svc.create_key(&key_loc(path), deletable).await.unwrap_err();
+        assert!(
+            matches!(err, EncryptionServiceError::KeyLimitExceeded),
+            "{path}: {err:?}"
+        );
+    }
+    force_row(&db, "secrets/a", "deleted", None).await;
+    force_row(&db, "apps/a/secrets/x", "deleted", None).await;
+    svc.create_key(&key_loc("secrets/b"), true).await.unwrap();
+    svc.create_key(&key_loc("apps/a/y"), true).await.unwrap();
+    for path in ["secrets/a", "apps/a/secrets/x"] {
+        let err = svc.create_key(&key_loc(path), true).await.unwrap_err();
+        assert!(
+            matches!(err, EncryptionServiceError::KeyLimitExceeded),
+            "reinstall {path}: {err:?}"
+        );
+    }
+}
+
 // PostgreSQL-backed; CI-only. `create_key` must end its transaction before it
 // returns. A dropped transaction is rolled back by a task sqlx spawns, which
 // cannot run while `execute_blocking` holds this runtime's only thread, so a
@@ -2294,7 +2335,7 @@ async fn public_get_under_apps_never_answers_with_a_key() {
 }
 
 #[tokio::test]
-async fn per_app_prefix_cap_counts_deleted_rows_until_they_are_reused() {
+async fn per_app_prefix_cap_stops_counting_deleted_rows_and_a_reinstall_rechecks() {
     let db = fresh_db().await;
     let svc = make_service(db.clone()).with_key_cap_per_app_prefix(2);
     create_network(&svc).await;
@@ -2315,33 +2356,128 @@ async fn per_app_prefix_cap_counts_deleted_rows_until_they_are_reused() {
     svc.create_key(&key_loc("apps/b/x"), true).await.unwrap();
     svc.create_key(&key_loc("docs/a"), false).await.unwrap();
 
-    // A deleted row still counts; reusing it adds no row.
+    // A deleted row stops counting.
     force_row(&db, "apps/a/x", "deleted", None).await;
+    svc.create_key(&key_loc("apps/a/z"), true).await.unwrap();
+    // Reinstalling it is checked like a new row: refused while the prefix is full.
     let err = svc
-        .create_key(&key_loc("apps/a/z"), true)
+        .create_key(&key_loc("apps/a/x"), true)
         .await
         .unwrap_err();
     assert!(
         matches!(err, EncryptionServiceError::KeyLimitExceeded),
         "{err:?}"
     );
+    force_row(&db, "apps/a/z", "deleted", None).await;
     let reused = svc.create_key(&key_loc("apps/a/x"), true).await.unwrap();
     assert_eq!(reused.key_version, 2);
 }
 
 #[tokio::test]
-async fn per_network_cap_counts_deleted_rows() {
+async fn per_network_cap_stops_counting_deleted_rows_and_a_reinstall_rechecks() {
     let db = fresh_db().await;
     let svc = make_service(db.clone()).with_key_cap_per_network(1);
     create_network(&svc).await;
     svc.create_key(&key_loc("apps/a/x"), true).await.unwrap();
     force_row(&db, "apps/a/x", "deleted", None).await;
+    svc.create_key(&key_loc("docs/a"), false).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/a/x"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn secrets_keys_have_their_own_cap_and_do_not_count_per_network() {
+    let db = fresh_db().await;
+    let svc = make_service(db.clone())
+        .with_key_cap_per_network(1)
+        .with_key_cap_secrets(2);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("docs/a"), false).await.unwrap();
+    // The per-network cap is full; keys at or under `secrets` still fit.
+    svc.create_key(&key_loc("secrets/a"), true).await.unwrap();
+    svc.create_key(&key_loc("secrets/b/deep"), true)
+        .await
+        .unwrap();
+    for (path, deletable) in [("secrets", true), ("secrets/c", true), ("docs/b", false)] {
+        let err = svc.create_key(&key_loc(path), deletable).await.unwrap_err();
+        assert!(
+            matches!(err, EncryptionServiceError::KeyLimitExceeded),
+            "{path}: {err:?}"
+        );
+    }
+    // A deleted secrets key stops counting; its reinstall is checked again.
+    force_row(&db, "secrets/a", "deleted", None).await;
+    svc.create_key(&key_loc("secrets/c"), true).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("secrets/a"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_secrets_cap_matches_the_segment_byte_for_byte() {
+    let svc = make_service(fresh_db().await)
+        .with_key_cap_per_network(2)
+        .with_key_cap_secrets(1);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("secrets"), true).await.unwrap();
+    // Paths that only share leading bytes with `secrets` count per network.
+    svc.create_key(&key_loc("secretsx/a"), false).await.unwrap();
+    svc.create_key(&key_loc("secrets_/a"), false).await.unwrap();
     let err = svc.create_key(&key_loc("docs/a"), false).await.unwrap_err();
     assert!(
         matches!(err, EncryptionServiceError::KeyLimitExceeded),
         "{err:?}"
     );
-    svc.create_key(&key_loc("apps/a/x"), true).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("secrets/a"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_secrets_count_against_the_app_prefix_and_the_network_not_the_secrets_cap() {
+    let svc = make_service(fresh_db().await)
+        .with_key_cap_per_network(2)
+        .with_key_cap_per_app_prefix(1)
+        .with_key_cap_secrets(1);
+    create_network(&svc).await;
+    svc.create_key(&key_loc("secrets/x"), true).await.unwrap();
+    // The secrets cap is full; an app's own `secrets/` keys do not use it.
+    svc.create_key(&key_loc("apps/a/secrets/x"), true)
+        .await
+        .unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/a/secrets/y"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "app prefix: {err:?}"
+    );
+    svc.create_key(&key_loc("docs/a"), false).await.unwrap();
+    let err = svc
+        .create_key(&key_loc("apps/b/secrets/x"), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EncryptionServiceError::KeyLimitExceeded),
+        "per network: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -3136,4 +3272,67 @@ async fn postgres_secret_keys_are_seeded_and_stray_rows_stop_the_start() {
     create_network(&svc).await;
     assert_secret_keys_are_seeded(&db, &svc).await;
     assert_startup_check_finds_stray_secret_rows(&db).await;
+}
+
+// `path_starts_with` treats its prefix as a directory, so a sibling that only
+// shares leading characters is never selected, whether or not the caller
+// wrote the trailing `/`. Runs in release builds too.
+async fn assert_path_starts_with_matches_directories(db: &DatabaseConnection) {
+    use crate::encryption_network::keys::path_starts_with;
+    use sea_orm::QueryFilter;
+
+    let svc = make_service(db.clone());
+    create_network(&svc).await;
+    for path in ["apps/ab/x", "apps/abc/x", "secrets/s", "secretsx/y"] {
+        svc.create_key(
+            &key_loc(path),
+            path.starts_with("apps/") || path.starts_with("secrets/"),
+        )
+        .await
+        .unwrap();
+    }
+    let select = |prefix: &'static str| {
+        let db = db.clone();
+        async move {
+            let mut paths: Vec<String> = encryption_network_key::Entity::find()
+                .filter(path_starts_with(prefix))
+                .all(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.key_path)
+                .collect();
+            paths.sort();
+            paths
+        }
+    };
+    for prefix in ["apps/ab", "apps/ab/"] {
+        assert_eq!(select(prefix).await, ["apps/ab/x"], "{prefix}");
+    }
+    for prefix in ["apps/abc", "apps/abc/"] {
+        assert_eq!(select(prefix).await, ["apps/abc/x"], "{prefix}");
+    }
+    for prefix in ["secrets", "secrets/"] {
+        assert_eq!(select(prefix).await, ["secrets/s"], "{prefix}");
+    }
+    assert!(select("apps/a").await.is_empty());
+}
+
+#[tokio::test]
+async fn path_starts_with_matches_directories_not_siblings() {
+    assert_path_starts_with_matches_directories(&fresh_db().await).await;
+}
+
+// PostgreSQL-backed; CI-only.
+#[tokio::test]
+async fn postgres_path_starts_with_matches_directories_not_siblings() {
+    let Some(fixture) = PostgresTestSchema::migrated_through(
+        "postgres_path_starts_with_matches_directories_not_siblings",
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_path_starts_with_matches_directories(&fixture.connect(4).await).await;
 }

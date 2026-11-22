@@ -41,6 +41,7 @@ use super::deletion_ledger::DeletionLedger;
 use super::key_id::{self, EncryptionResource, KeyLocation};
 use super::keys::{
     canonical_key_urn, network_of, DEFAULT_KEY_CAP_PER_APP_PREFIX, DEFAULT_KEY_CAP_PER_NETWORK,
+    DEFAULT_KEY_CAP_SECRETS,
 };
 use super::network_id::NetworkId;
 use super::protocol::{
@@ -282,6 +283,7 @@ pub struct EncryptionService {
     pub(super) key_cap_per_network: u64,
     pub(super) deletion_ledger: Option<Arc<DeletionLedger>>,
     pub(super) key_cap_per_app_prefix: u64,
+    pub(super) key_cap_secrets: u64,
     /// Makes the next key delete fail around its commit.
     #[cfg(test)]
     pub(super) delete_faults: super::key_delete::DeleteFaults,
@@ -332,6 +334,7 @@ impl EncryptionService {
             #[cfg(test)]
             create_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
+            key_cap_secrets: DEFAULT_KEY_CAP_SECRETS,
         }
     }
 
@@ -357,6 +360,7 @@ impl EncryptionService {
             #[cfg(test)]
             create_faults: Default::default(),
             key_cap_per_app_prefix: DEFAULT_KEY_CAP_PER_APP_PREFIX,
+            key_cap_secrets: DEFAULT_KEY_CAP_SECRETS,
         }
     }
 
@@ -404,6 +408,11 @@ impl EncryptionService {
 
     pub fn with_key_cap_per_app_prefix(mut self, cap: u64) -> Self {
         self.key_cap_per_app_prefix = cap;
+        self
+    }
+
+    pub fn with_key_cap_secrets(mut self, cap: u64) -> Self {
+        self.key_cap_secrets = cap;
         self
     }
 
