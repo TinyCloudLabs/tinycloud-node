@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { buildConfig, nodeImage, ingressImage, vectorImage } from './tc959-logship.mjs';
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
+import { LEDGER_EVENTS, LEDGER_ERROR_KINDS } from '../log-shipper/ledger.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
 import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
@@ -101,6 +102,12 @@ export function assertCapture(events, fields) {
         assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
         allowed = [...base, 'event_code', 'event_count'];
       }
+    } else if (LEDGER_EVENTS.includes(event.event)) {
+      // TC-3284: a deletion ledger error event; exactly its fixed error_kind beyond the common fields.
+      assert.equal(event.svc, 'api');
+      assert.equal(event.level, 'error');
+      assert.ok(LEDGER_ERROR_KINDS.includes(event.error_kind));
+      allowed = [...base, 'error_kind'];
     } else {
       assert.equal(event.event, 'logship_gate_summary_total');
       assert.equal(event.svc, 'logship');

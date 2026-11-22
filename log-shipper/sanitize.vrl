@@ -59,6 +59,20 @@ if label == "tinycloud-node" {
       }
     }
   }
+  # TC-3284: the deletion ledger's three error events (open and replay at start from target `tinycloud`, an unrepaired
+  # append from the ledger module) ship individually as their event name and `error_kind`. The input must be an error
+  # from that event's own target with exactly the message, `event` and `error_kind` keys, and `error_kind` exactly one
+  # of the ledger's fixed kinds. The message is never copied. Anything else leaves ledger null and the line falls back
+  # to the unclassified count below.
+  ledger = null
+  l_event = string(f.event) ?? ""
+  if level == "error" && includes(__LEDGER_EVENTS__, l_event) && exists(f.message) && length(f) == 3 {
+    l_target = get(__LEDGER_TARGETS__, [l_event]) ?? ""
+    l_kind = string(f.error_kind) ?? ""
+    if target == l_target && includes(__LEDGER_ERROR_KINDS__, l_kind) {
+      ledger = {"event": l_event, "svc": "api", "level": "error", "error_kind": l_kind}
+    }
+  }
   if target == "tinycloud::request" && level == "info" && msg == "request" {
     method = string!(f.method)
     if includes(["TRACE", "CONNECT"], method) { method = "<other>" }
@@ -113,6 +127,8 @@ if label == "tinycloud-node" {
     out = db_event
   } else if is_object(headroom) {
     out = headroom
+  } else if is_object(ledger) {
+    out = ledger
   } else {
     if !includes(["warn", "error"], level) { abort }
     code = "unclassified"

@@ -10,6 +10,8 @@ on:
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
+      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
+      - 'tinycloud-node-server/src/lib.rs'
   push:
     branches: [main]
     paths:
@@ -18,6 +20,8 @@ on:
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
+      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
+      - 'tinycloud-node-server/src/lib.rs'
 
 permissions:
   contents: read
@@ -39,7 +43,7 @@ jobs:
         with:
           node-version: 22
       - name: Verify request budgets and hosted acceptance guards
-        run: node --test log-shipper/budget.test.mjs log-shipper/profile.test.mjs scripts/tc959-docker.test.mjs scripts/tc959-readiness.test.mjs
+        run: node --test log-shipper/budget.test.mjs log-shipper/profile.test.mjs log-shipper/ledger.test.mjs scripts/tc959-docker.test.mjs scripts/tc959-readiness.test.mjs
       - name: Check schema provenance and compose boundary without env interpolation
         run: node scripts/tc959-check.mjs
       - name: Install checksum-pinned native Vector

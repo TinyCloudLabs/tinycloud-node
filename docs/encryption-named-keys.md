@@ -221,6 +221,14 @@ opened or replayed, the node logs the event `deletion_ledger_open_failed` or
   off;
 - with `named_keys_v1` off, the rest of the node starts and serves.
 
+The log shipper sends `deletion_ledger_open_failed`, `deletion_ledger_replay_failed`
+and `deletion_ledger_unrepaired` to Better Stack as individual events with only
+their `error_kind` (`io`, `path`, `encode`, `moved`, `lock_held`, `malformed`,
+`refused` or `db`), never the message or the path. Each fires at most once per
+process, so they bypass the caps and the count reducer. A line with any other
+`error_kind`, an extra field, or from another level or target ships only as an
+`unclassified` `node_error` count.
+
 **When restoring the node DB from a PlanetScale backup, keep the node's existing disk (and its ledger) in place and boot normally, so the ledger replay re-shreds keys deleted after the backup. Never restore the DB onto a fresh disk without the ledger unless you accept that later deletions are undone.**
 
 Before restoring a database, stop the node and disable its automatic restart.
