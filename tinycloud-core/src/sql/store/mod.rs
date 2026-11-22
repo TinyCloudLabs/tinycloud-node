@@ -13,10 +13,10 @@ pub mod shadow;
 
 pub use key::{DbRef, KeyError, Lineage, ObjectKey, ObjectKind, PublishId};
 pub use manifest::{
-    CasToken, DbSqlManifest, Frontier, ObjectRecord, ObjectState, Publish, PublishKind,
-    PublishOutcome, SqlManifest,
+    now_timestamp, CasToken, DbSqlManifest, Frontier, ObjectRecord, ObjectState, Publish,
+    PublishChain, PublishKind, PublishOutcome, SqlManifest,
 };
 pub use memory::MemorySqlObjectStore;
 pub use object::{ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError};
 pub use policy::{PendingState, RetentionPolicy, SpaceAllowlist, UploadPolicy};
-pub use shadow::{Capture, CaptureKind, NoopSink, ShadowSink};
+pub use shadow::{NoopSink, Notice, ShadowSink};
