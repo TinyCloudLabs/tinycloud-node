@@ -75,6 +75,17 @@ fn tag() -> String {
     hex::encode(rand::random::<[u8; 6]>())
 }
 
+/// `put_file` of `bytes`, through a temporary file of exactly those bytes.
+async fn put<S: SqlObjectStore + ?Sized>(
+    store: &S,
+    key: &ObjectKey,
+    bytes: &[u8],
+) -> Result<PutOutcome, SqlStoreError> {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    store.put_file(key, file.path(), bytes.len() as u64).await
+}
+
 async fn whole<S: SqlObjectStore>(store: &S, key: &ObjectKey) -> Option<Vec<u8>> {
     store
         .get_range(key, ByteRangeSpec::From { start: 0 })
@@ -93,6 +104,11 @@ async fn part<S: SqlObjectStore>(
         .await
         .unwrap()
         .map(|r| (r.start, r.total_size, r.data))
+}
+
+/// Nothing readable is left at `path`: it is gone or empty.
+fn emptied(path: &Path) -> bool {
+    std::fs::metadata(path).map_or(true, |m| m.len() == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,14 +133,8 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
         .await
         .unwrap()
         .is_none());
-    assert_eq!(
-        s.put_if_absent(&k, b.clone()).await.unwrap(),
-        PutOutcome::Created
-    );
-    assert_eq!(
-        s.put_if_absent(&k, b.clone()).await.unwrap(),
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(s, &k, &b).await.unwrap(), PutOutcome::Created);
+    assert_eq!(put(s, &k, &b).await.unwrap(), PutOutcome::AlreadyPresent);
     assert_eq!(whole(s, &k).await.unwrap(), b);
     assert_eq!(
         s.head(&k).await.unwrap(),
@@ -133,18 +143,48 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
             sha256: sha256(&b)
         })
     );
+    // The whole object streams back into a file.
+    let out = tempfile::NamedTempFile::new().unwrap();
+    assert_eq!(
+        s.get_to_file(&k, out.path(), 300).await.unwrap(),
+        Some(ObjectMeta {
+            bytes: 300,
+            sha256: sha256(&b)
+        })
+    );
+    assert_eq!(std::fs::read(out.path()).unwrap(), b);
+    assert_eq!(
+        s.get_to_file(&key_for(b"absent"), out.path(), 300)
+            .await
+            .unwrap(),
+        None
+    );
+    // A cap below the object's size: refused, and the target holds nothing.
+    std::fs::write(out.path(), b"stale bytes").unwrap();
+    assert!(matches!(
+        s.get_to_file(&k, out.path(), 299).await,
+        Err(SqlStoreError::Oversize)
+    ));
+    assert!(emptied(out.path()));
+    // A file of another size than declared is refused.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &b).unwrap();
+    assert!(matches!(
+        s.put_file(&key_for(&b), file.path(), 299).await,
+        Err(SqlStoreError::Invalid(_))
+    ));
 
     // A body that does not hash to the key is refused and stores nothing.
     let mut wrong = b.clone();
     wrong[0] ^= 1;
     assert!(matches!(
-        s.put_if_absent(&k, wrong.clone()).await,
+        put(s, &k, &wrong).await,
         Err(SqlStoreError::BodyMismatch)
     ));
     assert_eq!(whole(s, &k).await.unwrap(), b);
     let k_unmade = key_for(&wrong);
     assert!(matches!(
-        s.put_if_absent(&k_unmade, b.clone()).await,
+        put(s, &k_unmade, &b).await,
         Err(SqlStoreError::BodyMismatch)
     ));
     assert_eq!(s.head(&k_unmade).await.unwrap(), None);
@@ -225,12 +265,9 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
 
     // The empty object: it exists, and no range of it selects anything.
     let empty = key_for(b"");
+    assert_eq!(put(s, &empty, b"").await.unwrap(), PutOutcome::Created);
     assert_eq!(
-        s.put_if_absent(&empty, Vec::new()).await.unwrap(),
-        PutOutcome::Created
-    );
-    assert_eq!(
-        s.put_if_absent(&empty, Vec::new()).await.unwrap(),
+        put(s, &empty, b"").await.unwrap(),
         PutOutcome::AlreadyPresent
     );
     assert_eq!(
@@ -258,12 +295,37 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
             planter.plant(&key, other.clone()).await;
             for _ in 0..2 {
                 assert!(matches!(
-                    s.put_if_absent(&key, wanted.clone()).await,
+                    put(s, &key, &wanted).await,
                     Err(SqlStoreError::Conflict)
                 ));
                 assert_eq!(whole(s, &key).await.unwrap(), other);
             }
         }
+        // A planted body is never handed out: a wrong body of the right
+        // length or a short one is refused, one longer than the cap is cut
+        // off, and each time the target is left empty.
+        for (len, planted) in [(48usize, None), (48, Some(7usize))] {
+            let wanted = body(len);
+            let key = key_for(&wanted);
+            let other = planted.map_or_else(|| differing(&wanted), body);
+            planter.plant(&key, other).await;
+            let out = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(out.path(), b"stale bytes").unwrap();
+            assert!(matches!(
+                s.get_to_file(&key, out.path(), len as u64).await,
+                Err(SqlStoreError::BodyMismatch)
+            ));
+            assert!(emptied(out.path()));
+        }
+        let wanted = body(32);
+        let key = key_for(&wanted);
+        planter.plant(&key, body(100)).await;
+        let out = tempfile::NamedTempFile::new().unwrap();
+        assert!(matches!(
+            s.get_to_file(&key, out.path(), 32).await,
+            Err(SqlStoreError::Oversize)
+        ));
+        assert!(emptied(out.path()));
     }
 
     concurrent_creators(store, 40).await;
@@ -277,7 +339,7 @@ async fn concurrent_creators<S: SqlObjectStore + 'static>(store: Arc<S>, rounds:
         let tasks: Vec<_> = (0..8)
             .map(|_| {
                 let (store, k, b) = (store.clone(), k.clone(), b.clone());
-                tokio::spawn(async move { store.put_if_absent(&k, b).await })
+                tokio::spawn(async move { put(&*store, &k, &b).await })
             })
             .collect();
         let mut created = 0;
@@ -299,7 +361,18 @@ async fn concurrent_creators<S: SqlObjectStore + 'static>(store: Arc<S>, rounds:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_conformance() {
-    conformance(Arc::new(MemorySqlObjectStore::default()), None).await;
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let planter = MemoryPlanter(store.clone());
+    conformance(store, Some(&planter)).await;
+}
+
+struct MemoryPlanter(Arc<MemorySqlObjectStore>);
+
+#[async_trait]
+impl Planter for MemoryPlanter {
+    async fn plant(&self, key: &ObjectKey, bytes: Vec<u8>) {
+        self.0.plant(key.as_str(), bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,10 +442,7 @@ async fn fs_leftover_temp_files_never_block_a_create() {
     let leftovers = names_in(parent);
     assert_eq!(leftovers.len(), 2);
 
-    assert_eq!(
-        store.put_if_absent(&k, b.clone()).await.unwrap(),
-        PutOutcome::Created
-    );
+    assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
     assert_eq!(std::fs::read(&path).unwrap(), b);
     // The stray files are untouched; the create left none of its own.
     let mut expected = leftovers.clone();
@@ -382,7 +452,7 @@ async fn fs_leftover_temp_files_never_block_a_create() {
 
     // Every outcome removes its temp file.
     assert_eq!(
-        store.put_if_absent(&k, b.clone()).await.unwrap(),
+        put(&*store, &k, &b).await.unwrap(),
         PutOutcome::AlreadyPresent
     );
     assert_eq!(names_in(parent), expected);
@@ -392,7 +462,7 @@ async fn fs_leftover_temp_files_never_block_a_create() {
     std::fs::create_dir_all(conflicted_path.parent().unwrap()).unwrap();
     std::fs::write(&conflicted_path, &planted).unwrap();
     assert!(matches!(
-        store.put_if_absent(&conflicted, b.clone()).await,
+        put(&*store, &conflicted, &b).await,
         Err(SqlStoreError::Conflict)
     ));
     assert_eq!(names_in(conflicted_path.parent().unwrap()).len(), 1);
@@ -414,10 +484,7 @@ async fn fs_keys_never_resolve_outside_the_root() {
         let k = key_in(space, db, &b);
         let path = store.path_for(&k).unwrap();
         assert!(path.starts_with(store.root()), "{path:?}");
-        assert_eq!(
-            store.put_if_absent(&k, b.clone()).await.unwrap(),
-            PutOutcome::Created
-        );
+        assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
         assert_eq!(std::fs::read(&path).unwrap(), b);
     }
     // Nothing was created beside the root.
@@ -429,12 +496,9 @@ async fn fs_large_objects_are_hashed_in_chunks_and_ranged() {
     let (_dir, store) = fs_store();
     let b: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 253) as u8).collect();
     let k = key_for(&b);
+    assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
     assert_eq!(
-        store.put_if_absent(&k, b.clone()).await.unwrap(),
-        PutOutcome::Created
-    );
-    assert_eq!(
-        store.put_if_absent(&k, b.clone()).await.unwrap(),
+        put(&*store, &k, &b).await.unwrap(),
         PutOutcome::AlreadyPresent
     );
     assert_eq!(
@@ -703,12 +767,21 @@ struct Timed<S>(S);
 
 #[async_trait]
 impl<S: SqlObjectStore> SqlObjectStore for Timed<S> {
-    async fn put_if_absent(
+    async fn put_file(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        size: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
-        limited("put_if_absent", self.0.put_if_absent(key, body)).await
+        limited("put_file", self.0.put_file(key, path, size)).await
+    }
+    async fn get_to_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        limited("get_to_file", self.0.get_to_file(key, path, max_bytes)).await
     }
     async fn get_range(
         &self,
@@ -768,12 +841,21 @@ async fn s3_conformance(config: &S3BlockConfig, mode: WriteMode) {
     struct Shared(Arc<S3SqlObjectStore>);
     #[async_trait]
     impl SqlObjectStore for Shared {
-        async fn put_if_absent(
+        async fn put_file(
             &self,
             key: &ObjectKey,
-            body: Vec<u8>,
+            path: &Path,
+            size: u64,
         ) -> Result<PutOutcome, SqlStoreError> {
-            self.0.put_if_absent(key, body).await
+            self.0.put_file(key, path, size).await
+        }
+        async fn get_to_file(
+            &self,
+            key: &ObjectKey,
+            path: &Path,
+            max_bytes: u64,
+        ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+            self.0.get_to_file(key, path, max_bytes).await
         }
         async fn get_range(
             &self,
@@ -805,7 +887,7 @@ async fn s3_object_without_hash_metadata_is_an_error(config: &S3BlockConfig, mod
         Err(SqlStoreError::Backend(_))
     ));
     assert!(matches!(
-        store.put_if_absent(&k, b.clone()).await,
+        put(&*store, &k, &b).await,
         Err(SqlStoreError::Backend(_))
     ));
     assert_eq!(whole(&*store, &k).await.unwrap(), b);
@@ -865,9 +947,7 @@ async fn kv_scan_ignores_sql_objects(config: &S3BlockConfig) {
         let b = body(len);
         let k = key_in(&space, "v2n", &b);
         assert!(k.as_str().starts_with("sql/v1/"));
-        limited("sql put", store.put_if_absent(&k, b))
-            .await
-            .unwrap();
+        limited("sql put", put(&*store, &k, &b)).await.unwrap();
     }
     put_raw(format!("sql/v1/{space}/db/lineage/snap/x"), 1000).await;
     put_raw(format!("sql/v1/{sql_only}/db/x"), 2000).await;
@@ -930,7 +1010,7 @@ async fn mock_s3_body_mismatch_sends_no_request() -> Result<()> {
         let store = S3SqlObjectStore::open_with_mode(&config, mode).await;
         let k = key_for(b"abc");
         assert!(matches!(
-            store.put_if_absent(&k, b"abd".to_vec()).await,
+            put(&store, &k, b"abd").await,
             Err(SqlStoreError::BodyMismatch)
         ));
         assert!(s3.requests.lock().is_empty());
@@ -944,17 +1024,11 @@ async fn mock_s3_conditional_create_is_one_request_and_a_412_is_checked() -> Res
     let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::Conditional).await;
     let b = body(40);
     let k = key_for(&b);
-    assert_eq!(
-        store.put_if_absent(&k, b.clone()).await?,
-        PutOutcome::Created
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::Created);
     assert_eq!(s3.requests.lock().len(), 1);
     assert!(s3.requests.lock()[0].ends_with("conditional=true"));
     s3.requests.lock().clear();
-    assert_eq!(
-        store.put_if_absent(&k, b).await?,
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::AlreadyPresent);
     // The refused PUT, then the check of the stored object.
     let log = s3.requests.lock().clone();
     assert_eq!(log.len(), 2, "{log:?}");
@@ -969,15 +1043,9 @@ async fn mock_s3_check_then_write_never_sends_an_unconditional_put_for_an_existi
     let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::CheckThenWrite).await;
     let b = body(40);
     let k = key_for(&b);
-    assert_eq!(
-        store.put_if_absent(&k, b.clone()).await?,
-        PutOutcome::Created
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::Created);
     s3.requests.lock().clear();
-    assert_eq!(
-        store.put_if_absent(&k, b).await?,
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::AlreadyPresent);
     let log = s3.requests.lock().clone();
     assert_eq!(log.len(), 1, "{log:?}");
     assert!(log[0].starts_with("HEAD "));
@@ -1045,7 +1113,7 @@ async fn mock_s3_a_rejected_conditional_create_is_an_error_with_its_status_and_c
         let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::Conditional).await;
         let b = body(40);
         let k = key_for(&b);
-        let Err(SqlStoreError::Backend(message)) = store.put_if_absent(&k, b).await else {
+        let Err(SqlStoreError::Backend(message)) = put(&store, &k, &b).await else {
             panic!("{status} {code}: expected a backend error");
         };
         assert!(

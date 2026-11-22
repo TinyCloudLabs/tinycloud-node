@@ -123,6 +123,20 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
             .await
     }
 
+    async fn read_part_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        part: crate::database_artifacts::ArtifactPart,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        self.inner
+            .read_part_chunks(service, space, name, meta, part, sink)
+            .await
+    }
+
     fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
         self.inner.chunked_checkpoints(service, space, name)
     }
