@@ -24,6 +24,7 @@ exclude = [
     "vendor/sqlx-postgres",
     "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
+    "test/caveat-probe",
 ]
 
 [workspace.dependencies]
