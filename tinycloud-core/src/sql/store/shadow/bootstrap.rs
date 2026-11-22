@@ -60,18 +60,15 @@ pub struct BootstrapPlan {
     pub snapshot_body: Bytes,
 }
 
-/// Why bootstrap would refuse to produce a plan. `CidMoved` is retryable
-/// once by the caller; any other error is terminal for this cycle.
+/// Why bootstrap would refuse to produce a plan. Every variant is
+/// terminal for this cycle; the caller retries from scratch on the next
+/// sweep hit.
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
     #[error("database artifact not found")]
     NotFound,
     #[error("artifact repository error: {0}")]
     Artifact(DatabaseArtifactError),
-    #[error(
-        "the artifact's checkpoint hash changed between the meta read and the body read; retry"
-    )]
-    CidMoved,
     #[error("the checkpoint body did not hash to its recorded content hash")]
     HashMismatch,
     #[error("replaying the WAL into a temp SQLite failed: {0}")]
@@ -84,38 +81,38 @@ impl From<DatabaseArtifactError> for BootstrapError {
     }
 }
 
-/// Drive a bootstrap for a single database. Takes the live artifact
-/// repository and nothing else: no store client, no manifest, no uploader
-/// state. Returns a plan the uploader then acts on.
+/// Drive a bootstrap for a single database.
 ///
-/// Sequence:
-/// 1. `load_meta` once, outside any lock.
-/// 2. `read_chunks` the stored checkpoint and (when present) the WAL into
-///    an in-memory sink. A concurrent commit mid-read surfaces as
-///    `DatabaseArtifactError::ArtifactChanged`; the module retries the
-///    streaming read up to `BOOTSTRAP_READ_RETRIES` times (the repository
-///    itself resets the sink between attempts).
-/// 3. Re-check `load_meta` and compare `checkpoint_content_hash`: a
-///    checkpoint change between the first meta and the completed body
-///    read returns `CidMoved`, which the caller retries once and then
-///    backs off.
-/// 4. Verify the checkpoint whole-object hash against the repository's
-///    `checkpoint_content_hash`; the per-chunk verify inside the
-///    repository already gates partial reads, this is a surface
-///    invariant.
-/// 5. When the artifact carries a WAL delta, write the checkpoint to a
-///    temp file plus the WAL as its `-wal` sidecar, open the file, run
-///    `PRAGMA wal_checkpoint(TRUNCATE)` to apply the WAL, and `VACUUM
-///    INTO` a second temp file that holds the materialised state at
-///    revision `R`. Read that file back as the snapshot body.
-/// 6. Otherwise the snapshot body is the stored checkpoint unchanged.
+/// The uploader supplies the artifact repository and a scratch directory
+/// under the node's SQL data directory. Bootstrap does not allocate any
+/// state beyond the plan it returns.
 ///
-/// Memory: peak is bounded by the stored checkpoint size plus (if a WAL
-/// is present) the materialised snapshot. The caller MUST serialise
-/// bootstraps (typically one per node at a time via the uploader's
-/// `pg_concurrency` semaphore) so this bound holds.
+/// Flow:
+/// 1. `read_artifact` streams the checkpoint, and the WAL when present,
+///    into an in-memory sink. Metadata is refreshed between retries and
+///    the read restarts on `ArtifactChanged`, up to the repository's own
+///    retry bound. The returned meta pins both bytes to one consistent
+///    artifact row.
+/// 2. The checkpoint's whole-object hash is asserted against
+///    `meta.checkpoint_content_hash`.
+/// 3. When the row has a WAL delta, the checkpoint and WAL are written
+///    to a temp directory UNDER `scratch_dir` (not the system temp dir),
+///    SQLite's WAL recovery runs on open, `wal_checkpoint(TRUNCATE)`
+///    merges the WAL into the main file, and `VACUUM INTO` produces a
+///    clean materialised copy at revision R. The snapshot body is that
+///    file; otherwise it's the stored checkpoint unchanged.
+///
+/// Scratch: `scratch_dir` must live under the node's SQL data directory
+/// so the bytes count against the 1a `DiskBudget` and the node's
+/// configured minimum free headroom. The returned plan owns the bytes;
+/// the scratch directory is removed before this function returns.
+///
+/// Blocking work: the SQLite open, checkpoint and VACUUM are
+/// synchronous and run inside a `tokio::task::spawn_blocking` so the
+/// async executor stays free during a large bootstrap.
 pub async fn bootstrap(
     repo: &dyn DatabaseArtifactRepository,
+    scratch_dir: &std::path::Path,
     space: &str,
     name: &str,
 ) -> Result<BootstrapPlan, BootstrapError> {
@@ -141,7 +138,15 @@ pub async fn bootstrap(
 
     let snapshot_body = match sink.wal {
         None => Bytes::from(checkpoint_bytes),
-        Some(wal) => Bytes::from(materialise_with_wal(&checkpoint_bytes, &wal)?),
+        Some(wal) => {
+            let scratch = scratch_dir.to_path_buf();
+            let bytes = tokio::task::spawn_blocking(move || {
+                materialise_with_wal(&scratch, &checkpoint_bytes, &wal)
+            })
+            .await
+            .map_err(|e| BootstrapError::Replay(format!("spawn_blocking: {e}")))??;
+            Bytes::from(bytes)
+        }
     };
 
     Ok(BootstrapPlan {
@@ -158,9 +163,16 @@ pub async fn bootstrap(
 /// checkpoint to merge the WAL into the main file and VACUUM INTO a
 /// clean copy. The result is byte-identical to what a snapshot cut at
 /// revision R by the live actor would be.
-fn materialise_with_wal(checkpoint: &[u8], wal: &[u8]) -> Result<Vec<u8>, BootstrapError> {
-    let dir =
-        tempfile::TempDir::new().map_err(|e| BootstrapError::Replay(format!("tempdir: {e}")))?;
+fn materialise_with_wal(
+    scratch_dir: &std::path::Path,
+    checkpoint: &[u8],
+    wal: &[u8],
+) -> Result<Vec<u8>, BootstrapError> {
+    // Scratch sits UNDER the node's SQL data directory so a large
+    // bootstrap counts against the configured disk budget and headroom.
+    // The TempDir is 0700 and removed on drop.
+    let dir = tempfile::TempDir::new_in(scratch_dir)
+        .map_err(|e| BootstrapError::Replay(format!("tempdir: {e}")))?;
     let db_path = dir.path().join("bootstrap.sqlite");
     let wal_path = dir.path().join("bootstrap.sqlite-wal");
     let snap_path = dir.path().join("snapshot.sqlite");
@@ -192,8 +204,13 @@ fn materialise_with_wal(checkpoint: &[u8], wal: &[u8]) -> Result<Vec<u8>, Bootst
         .map_err(|e| BootstrapError::Replay(format!("wal_checkpoint: {e}")))?;
     // VACUUM INTO materialises a clean, defragmented copy with no WAL
     // sidecar at the given path.
-    conn.execute(&format!("VACUUM INTO '{}'", snap_path.display()), [])
-        .map_err(|e| BootstrapError::Replay(format!("vacuum into: {e}")))?;
+    // VACUUM INTO path is bound as a parameter so an unexpected
+    // scratch directory name cannot inject SQL.
+    conn.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![snap_path.to_string_lossy()],
+    )
+    .map_err(|e| BootstrapError::Replay(format!("vacuum into: {e}")))?;
     drop(conn);
 
     let bytes = std::fs::read(&snap_path)
@@ -257,7 +274,10 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = bootstrap(&*repo, "space", "main").await.unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let plan = bootstrap(&*repo, scratch.path(), "space", "main")
+            .await
+            .unwrap();
         assert_eq!(plan.snapshot_revision, saved.revision);
         assert_eq!(plan.base_checkpoint_cid, saved.checkpoint_content_hash);
         assert_eq!(plan.snapshot_body.as_ref(), payload.as_slice());
@@ -266,7 +286,10 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_of_an_absent_artifact_is_not_found() {
         let repo = repo_and_db().await;
-        let err = bootstrap(&*repo, "space", "main").await.unwrap_err();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let err = bootstrap(&*repo, scratch.path(), "space", "main")
+            .await
+            .unwrap_err();
         assert!(matches!(err, BootstrapError::NotFound));
     }
 
@@ -334,7 +357,10 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = bootstrap(&*repo, "space", "main").await.unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let plan = bootstrap(&*repo, scratch.path(), "space", "main")
+            .await
+            .unwrap();
         assert_eq!(
             plan.snapshot_revision, delta.revision,
             "snapshot is labelled at the artifact's current revision, not R-1"
