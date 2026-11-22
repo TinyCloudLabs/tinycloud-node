@@ -10,8 +10,6 @@ on:
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
-      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
-      - 'tinycloud-node-server/src/lib.rs'
   push:
     branches: [main]
     paths:
@@ -20,8 +18,6 @@ on:
       - 'docker-compose.dstack-postgres.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
-      - 'tinycloud-core/src/encryption_network/deletion_ledger.rs'
-      - 'tinycloud-node-server/src/lib.rs'
 
 permissions:
   contents: read
