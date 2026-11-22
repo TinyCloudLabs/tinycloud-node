@@ -36,7 +36,7 @@ fn required_format(kind: ObjectKind) -> &'static str {
 }
 
 /// Current time in the canonical `created_at` form.
-fn now_timestamp() -> String {
+pub fn now_timestamp() -> String {
     canonical_format(OffsetDateTime::now_utc())
 }
 
@@ -67,11 +67,13 @@ fn canonical_timestamp(text: &str) -> Result<String, SqlStoreError> {
     Ok(canonical_format(utc))
 }
 
+/// An inventory row's state. There is no `orphan` state: an `uploaded` row
+/// that no frontier reaches is an orphan, and GC derives that by query
+/// (contract 3.3, slice 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectState {
     Uploaded,
     Published,
-    Orphan,
 }
 
 impl ObjectState {
@@ -79,14 +81,12 @@ impl ObjectState {
         match self {
             Self::Uploaded => "uploaded",
             Self::Published => "published",
-            Self::Orphan => "orphan",
         }
     }
     fn parse(text: &str) -> Result<Self, SqlStoreError> {
         match text {
             "uploaded" => Ok(Self::Uploaded),
             "published" => Ok(Self::Published),
-            "orphan" => Ok(Self::Orphan),
             _ => Err(SqlStoreError::Invalid("unknown object state")),
         }
     }
@@ -127,7 +127,7 @@ impl Frontier {
         }
     }
 
-    fn from_model(m: manifest::Model) -> Result<Self, SqlStoreError> {
+    pub(crate) fn from_model(m: manifest::Model) -> Result<Self, SqlStoreError> {
         let nonneg = |v: i64| u64::try_from(v).map_err(|_| SqlStoreError::Invalid("negative seq"));
         Ok(Self {
             lineage: Lineage::parse(&m.lineage)?,
@@ -185,6 +185,19 @@ pub enum PublishOutcome {
     Lost(Option<Frontier>),
 }
 
+/// Objects to record and publish in one control-database transaction
+/// ([`SqlManifest::publish_chain`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishChain {
+    /// Either a snapshot followed by zero or more segments on it, or one or
+    /// more segments on the expected frontier's base snapshot.
+    pub objects: Vec<ObjectRecord>,
+    /// The artifact's `checkpoint_content_hash` the chain is cut from.
+    pub base_checkpoint_cid: String,
+    pub publish_id: PublishId,
+    pub now: String,
+}
+
 #[async_trait]
 pub trait SqlManifest: Send + Sync {
     async fn current(&self, db: &DbRef<'_>) -> Result<Option<Frontier>, SqlStoreError>;
@@ -213,13 +226,24 @@ pub trait SqlManifest: Send + Sync {
         state: Option<ObjectState>,
     ) -> Result<Vec<ObjectRecord>, SqlStoreError>;
 
-    /// `uploaded -> orphan` for rows created before `older_than`, conditional
-    /// on the row still being `uploaded`. Returns rows changed.
-    async fn mark_orphans(&self, db: &DbRef<'_>, older_than: &str) -> Result<u64, SqlStoreError>;
-
-    /// Explicit `orphan -> uploaded` before an object is reused. False if the
-    /// row is not an orphan.
-    async fn revive_object(&self, db: &DbRef<'_>, key: &ObjectKey) -> Result<bool, SqlStoreError>;
+    /// Record every object of `chain` as `uploaded` and CAS-publish them in
+    /// order, in one transaction (contract 4.1). `expected` is the frontier
+    /// the caller planned against (`None` for a first publication). A
+    /// leading snapshot publishes as `Snapshot` in `expected`'s lineage,
+    /// `LineageSwitch` in another, or as the first row; every segment chains
+    /// on the previous step. The chain must end at or above
+    /// `expected.last_seq`.
+    ///
+    /// A CAS lost on the first object commits the inventory rows (they stay
+    /// `uploaded`) and returns `Lost` with the current row. A CAS lost on a
+    /// later object rolls everything back and is an error: in one
+    /// transaction the earlier steps fixed the row it checks against.
+    async fn publish_chain(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: PublishChain,
+    ) -> Result<PublishOutcome, SqlStoreError>;
 }
 
 /// [`SqlManifest`] on the control database (Postgres, MySQL or SQLite).
@@ -413,73 +437,13 @@ impl DbSqlManifest {
         }
         Ok(PublishStep::Won(Self::read(txn, db).await?))
     }
-}
 
-#[async_trait]
-impl SqlManifest for DbSqlManifest {
-    async fn current(&self, db: &DbRef<'_>) -> Result<Option<Frontier>, SqlStoreError> {
-        check_db(db)?;
-        Self::read(&self.db, db).await
-    }
-
-    async fn publish_cas(
-        &self,
-        db: &DbRef<'_>,
-        expected: Option<&CasToken>,
-        publish: Publish,
-    ) -> Result<PublishOutcome, SqlStoreError> {
-        check_db(db)?;
-        let obj = &publish.object;
-        match (&publish.kind, expected) {
-            (PublishKind::Snapshot, None) if obj.kind() == ObjectKind::Snapshot => {}
-            (PublishKind::Snapshot, Some(t))
-                if obj.kind() == ObjectKind::Snapshot && obj.lineage() == &t.lineage => {}
-            (PublishKind::LineageSwitch, Some(t))
-                if obj.kind() == ObjectKind::Snapshot && obj.lineage() != &t.lineage => {}
-            (PublishKind::Segment { .. }, Some(t))
-                if obj.kind() == ObjectKind::Segment && obj.lineage() == &t.lineage => {}
-            _ => {
-                return Err(SqlStoreError::Invalid(
-                    "publish kind does not match its inputs",
-                ))
-            }
-        }
-        if matches!(publish.kind, PublishKind::Segment { .. })
-            && obj.from_seq() != obj.base_seq() + 1
-        {
-            return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
-        }
-        let txn = self.db.begin().await?;
-        let step = match Self::publish_in(&txn, db, expected, &publish).await {
-            Ok(step) => step,
-            Err(err) => {
-                let _ = txn.rollback().await;
-                return Err(err);
-            }
-        };
-        match step {
-            PublishStep::Lost => {
-                txn.rollback().await?;
-                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
-            }
-            PublishStep::Won(published) => {
-                txn.commit().await?;
-                match published {
-                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
-                    None => Err(SqlStoreError::Invalid(
-                        "manifest row vanished after publish",
-                    )),
-                }
-            }
-        }
-    }
-
-    async fn record_object(
-        &self,
+    /// Insert one inventory row as `uploaded`, or report the existing row's state.
+    async fn record_in<C: ConnectionTrait>(
+        conn: &C,
         db: &DbRef<'_>,
         record: &ObjectRecord,
     ) -> Result<ObjectState, SqlStoreError> {
-        check_db(db)?;
         let key = &record.key;
         if record.format != required_format(key.kind()) {
             return Err(SqlStoreError::Invalid(
@@ -518,20 +482,223 @@ impl SqlManifest for DbSqlManifest {
                 .do_nothing()
                 .to_owned(),
             )
-            .exec_without_returning(&self.db)
+            .exec_without_returning(conn)
             .await?;
         if inserted == 1 {
             return Ok(ObjectState::Uploaded);
         }
         let existing = object::Entity::find()
             .filter(object_pk(db, key)?)
-            .one(&self.db)
+            .one(conn)
             .await?
             .ok_or(SqlStoreError::Invalid("object row vanished"))?;
         if existing.bytes != to_i64(record.bytes)? {
             return Err(SqlStoreError::Conflict);
         }
         ObjectState::parse(&existing.state)
+    }
+
+    /// The recorded size of the object stored under `key`.
+    async fn object_bytes<C: ConnectionTrait>(
+        conn: &C,
+        db: &DbRef<'_>,
+        key: &str,
+    ) -> Result<u64, SqlStoreError> {
+        let row = object::Entity::find()
+            .filter(object::Column::Space.eq(db.space))
+            .filter(object::Column::DbId.eq(db.db_id))
+            .filter(object::Column::Key.eq(key))
+            .one(conn)
+            .await?
+            .ok_or(SqlStoreError::Invalid("base snapshot is not recorded"))?;
+        u64::try_from(row.bytes).map_err(|_| SqlStoreError::Invalid("negative size"))
+    }
+
+    /// The transactional part of [`SqlManifest::publish_chain`]. Returns with
+    /// `txn` open; the caller commits after `Won` or `Lost` and rolls back on
+    /// an error.
+    async fn chain_in(
+        txn: &DatabaseTransaction,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: &PublishChain,
+    ) -> Result<ChainStep, SqlStoreError> {
+        for record in &chain.objects {
+            Self::record_in(txn, db, record).await?;
+        }
+        let mut current = expected.cloned();
+        let mut base_bytes = None;
+        for (i, record) in chain.objects.iter().enumerate() {
+            let obj = &record.key;
+            let kind = match (obj.kind(), &current) {
+                (ObjectKind::Snapshot, _) if i > 0 => {
+                    return Err(SqlStoreError::Invalid(
+                        "only the first object of a chain can be a snapshot",
+                    ))
+                }
+                (ObjectKind::Snapshot, Some(f)) if &f.lineage != obj.lineage() => {
+                    PublishKind::LineageSwitch
+                }
+                (ObjectKind::Snapshot, _) => PublishKind::Snapshot,
+                (ObjectKind::Segment, Some(f)) => PublishKind::Segment {
+                    base_snapshot_key: f.base_snapshot_key.clone(),
+                },
+                (ObjectKind::Segment, None) => {
+                    return Err(SqlStoreError::Invalid("a segment needs a published base"))
+                }
+            };
+            let frontier_bytes = match (&kind, base_bytes) {
+                (PublishKind::Segment { .. }, Some(base)) => base + record.bytes,
+                (PublishKind::Segment { base_snapshot_key }, None) => {
+                    let base = Self::object_bytes(txn, db, base_snapshot_key).await?;
+                    base_bytes = Some(base);
+                    base + record.bytes
+                }
+                _ => {
+                    base_bytes = Some(record.bytes);
+                    record.bytes
+                }
+            };
+            let token = current.as_ref().map(Frontier::token);
+            let publish = Publish {
+                kind,
+                object: obj.clone(),
+                base_checkpoint_cid: chain.base_checkpoint_cid.clone(),
+                frontier_bytes,
+                publish_id: chain.publish_id.clone(),
+                now: chain.now.clone(),
+            };
+            check_publish(&publish, token.as_ref())?;
+            match Self::publish_in(txn, db, token.as_ref(), &publish).await? {
+                PublishStep::Lost if i == 0 => return Ok(ChainStep::Lost),
+                PublishStep::Lost => {
+                    return Err(SqlStoreError::Invalid(
+                        "publish chain lost its CAS after the first object",
+                    ))
+                }
+                PublishStep::Won(Some(frontier)) => current = Some(frontier),
+                PublishStep::Won(None) => {
+                    return Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    ))
+                }
+            }
+        }
+        current
+            .map(ChainStep::Won)
+            .ok_or(SqlStoreError::Invalid("empty publish chain"))
+    }
+}
+
+/// What the transactional part of a chain publish decided.
+enum ChainStep {
+    Won(Frontier),
+    /// The first CAS lost; the inventory rows are kept.
+    Lost,
+}
+
+/// A publish's kind must match its object and the token it replaces.
+fn check_publish(publish: &Publish, expected: Option<&CasToken>) -> Result<(), SqlStoreError> {
+    let obj = &publish.object;
+    match (&publish.kind, expected) {
+        (PublishKind::Snapshot, None) if obj.kind() == ObjectKind::Snapshot => {}
+        (PublishKind::Snapshot, Some(t))
+            if obj.kind() == ObjectKind::Snapshot && obj.lineage() == &t.lineage => {}
+        (PublishKind::LineageSwitch, Some(t))
+            if obj.kind() == ObjectKind::Snapshot && obj.lineage() != &t.lineage => {}
+        (PublishKind::Segment { .. }, Some(t))
+            if obj.kind() == ObjectKind::Segment && obj.lineage() == &t.lineage => {}
+        _ => {
+            return Err(SqlStoreError::Invalid(
+                "publish kind does not match its inputs",
+            ))
+        }
+    }
+    if matches!(publish.kind, PublishKind::Segment { .. }) && obj.from_seq() != obj.base_seq() + 1 {
+        return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl SqlManifest for DbSqlManifest {
+    async fn current(&self, db: &DbRef<'_>) -> Result<Option<Frontier>, SqlStoreError> {
+        check_db(db)?;
+        Self::read(&self.db, db).await
+    }
+
+    async fn publish_cas(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&CasToken>,
+        publish: Publish,
+    ) -> Result<PublishOutcome, SqlStoreError> {
+        check_db(db)?;
+        check_publish(&publish, expected)?;
+        let txn = self.db.begin().await?;
+        let step = match Self::publish_in(&txn, db, expected, &publish).await {
+            Ok(step) => step,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err);
+            }
+        };
+        match step {
+            PublishStep::Lost => {
+                txn.rollback().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            PublishStep::Won(published) => {
+                txn.commit().await?;
+                match published {
+                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
+                    None => Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn record_object(
+        &self,
+        db: &DbRef<'_>,
+        record: &ObjectRecord,
+    ) -> Result<ObjectState, SqlStoreError> {
+        check_db(db)?;
+        Self::record_in(&self.db, db, record).await
+    }
+
+    async fn publish_chain(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: PublishChain,
+    ) -> Result<PublishOutcome, SqlStoreError> {
+        check_db(db)?;
+        let Some(last) = chain.objects.last() else {
+            return Err(SqlStoreError::Invalid("empty publish chain"));
+        };
+        if expected.is_some_and(|f| last.key.to_seq() < f.last_seq) {
+            return Err(SqlStoreError::Invalid(
+                "publish chain would regress last_seq",
+            ));
+        }
+        let txn = self.db.begin().await?;
+        match Self::chain_in(&txn, db, expected, &chain).await {
+            Ok(ChainStep::Won(frontier)) => {
+                txn.commit().await?;
+                Ok(PublishOutcome::Published(frontier))
+            }
+            Ok(ChainStep::Lost) => {
+                txn.commit().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     async fn list_objects(
@@ -589,38 +756,6 @@ impl SqlManifest for DbSqlManifest {
                 })
             })
             .collect()
-    }
-
-    async fn mark_orphans(&self, db: &DbRef<'_>, older_than: &str) -> Result<u64, SqlStoreError> {
-        check_db(db)?;
-        Ok(object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Orphan.as_str()),
-            )
-            .filter(object::Column::Space.eq(db.space))
-            .filter(object::Column::DbId.eq(db.db_id))
-            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
-            .filter(object::Column::CreatedAt.lt(older_than))
-            .exec(&self.db)
-            .await?
-            .rows_affected)
-    }
-
-    async fn revive_object(&self, db: &DbRef<'_>, key: &ObjectKey) -> Result<bool, SqlStoreError> {
-        check_db(db)?;
-        Ok(object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Uploaded.as_str()),
-            )
-            .col_expr(object::Column::CreatedAt, Expr::value(now_timestamp()))
-            .filter(object_pk(db, key)?)
-            .filter(object::Column::State.eq(ObjectState::Orphan.as_str()))
-            .exec(&self.db)
-            .await?
-            .rows_affected
-            == 1)
     }
 }
 
@@ -1034,34 +1169,20 @@ mod tests {
         let f = first(&m, &Lineage::random(), 5).await;
         let key = seg(&f.lineage, 5, 6, 7, "o");
         record(&m, &key).await;
-        // The reconciler marks it; a publisher that read it as `uploaded` now
-        // finds it orphaned and its CAS rolls back.
-        assert_eq!(m.mark_orphans(&DB, "9999").await.unwrap(), 1);
         let kind = PublishKind::Segment {
             base_snapshot_key: f.base_snapshot_key.clone(),
         };
-        assert!(matches!(
-            m.publish_cas(&DB, Some(&f.token()), publish(kind.clone(), &key, CID))
-                .await,
-            Err(SqlStoreError::ObjectNotUploaded)
-        ));
-        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
-        // Reuse needs an explicit revive; recording alone reports `orphan`.
-        assert_eq!(state_of(&m, &key).await, ObjectState::Orphan);
-        assert!(m.revive_object(&DB, &key).await.unwrap());
-        assert!(!m.revive_object(&DB, &key).await.unwrap());
         let PublishOutcome::Published(f2) = m
             .publish_cas(&DB, Some(&f.token()), publish(kind, &key, CID))
             .await
             .unwrap()
         else {
-            panic!("publish after revive lost");
+            panic!("publish lost");
         };
         assert_eq!(f2.last_seq, 7);
-        // The reconciler never touches a published row.
-        assert_eq!(m.mark_orphans(&DB, "9999").await.unwrap(), 0);
+        // Recording again is idempotent and reports the flipped state.
         assert_eq!(state_of(&m, &key).await, ObjectState::Published);
-        // An object that was never recorded cannot be published either.
+        // An object that was never recorded cannot be published.
         let ghost = seg(&f2.lineage, 5, 6, 20, "ghost");
         assert!(matches!(
             m.publish_cas(
@@ -1078,7 +1199,11 @@ mod tests {
             .await,
             Err(SqlStoreError::ObjectNotUploaded)
         ));
-        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+        assert_eq!(
+            m.current(&DB).await.unwrap().unwrap(),
+            f2,
+            "CAS rolled back"
+        );
     }
 
     /// A publish whose read-back fails in Rust after the manifest row UPDATE
@@ -1306,26 +1431,100 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         }
     }
 
-    async fn revive_restarts_the_orphan_clock(m: DbSqlManifest) {
-        let l = Lineage::random();
-        let a = snap(&l, 1, "revive");
-        let rec = ObjectRecord {
-            key: a.clone(),
-            format: "sqlite-v1".into(),
+    fn rec(key: &ObjectKey) -> ObjectRecord {
+        ObjectRecord {
+            key: key.clone(),
+            format: required_format(key.kind()).into(),
             bytes: 10,
-            created_at: "2020-01-01T00:00:00Z".into(),
+            created_at: "2026-10-21T00:00:00Z".into(),
+        }
+    }
+
+    fn chain(keys: &[&ObjectKey]) -> PublishChain {
+        PublishChain {
+            objects: keys.iter().map(|k| rec(k)).collect(),
+            base_checkpoint_cid: CID.into(),
+            publish_id: PublishId::random(),
+            now: "2026-10-21T00:01:00Z".into(),
+        }
+    }
+
+    async fn chain_bootstrap_publishes_snapshot_and_segment_atomically(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let (s, g) = (snap(&l, 0, "boot"), seg(&l, 0, 1, 7, "wal"));
+        let PublishOutcome::Published(f) =
+            m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap()
+        else {
+            panic!("bootstrap chain lost");
         };
-        m.record_object(&DB, &rec).await.unwrap();
-        let cutoff = "2021-01-01T00:00:00.000000Z";
-        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 1);
-        assert!(m.revive_object(&DB, &a).await.unwrap());
-        let listed = m
-            .list_objects(&DB, Some(ObjectState::Uploaded))
+        assert_eq!(
+            (
+                f.base_seq,
+                f.last_seq,
+                f.frontier_bytes,
+                f.base_snapshot_key.as_str()
+            ),
+            (0, 7, 20, s.as_str())
+        );
+        assert_eq!(f.base_checkpoint_cid, CID);
+        assert_eq!(state_of(&m, &s).await, ObjectState::Published);
+        assert_eq!(state_of(&m, &g).await, ObjectState::Published);
+    }
+
+    async fn chain_lost_first_cas_keeps_the_inventory(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l = Lineage::random();
+        let (s, g) = (snap(&l, 0, "late"), seg(&l, 0, 1, 9, "late-wal"));
+        let current = lost(m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap());
+        assert_eq!(current.unwrap(), f);
+        assert_eq!(state_of(&m, &s).await, ObjectState::Uploaded);
+        assert_eq!(state_of(&m, &g).await, ObjectState::Uploaded);
+    }
+
+    async fn chain_switches_lineage_then_appends_on_the_recorded_base(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l2 = Lineage::random();
+        let (s, g) = (snap(&l2, 0, "switch"), seg(&l2, 0, 1, 9, "switch-wal"));
+        let PublishOutcome::Published(f2) = m
+            .publish_chain(&DB, Some(&f), chain(&[&s, &g]))
             .await
-            .unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(listed[0].created_at.as_str() > cutoff);
-        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 0);
+            .unwrap()
+        else {
+            panic!("switch chain lost");
+        };
+        assert_eq!((f2.lineage.clone(), f2.last_seq), (l2.clone(), 9));
+        assert!(f2.revision > f.revision, "revision stays monotonic");
+        // A segment-only chain sizes its frontier from the recorded base.
+        let g2 = seg(&l2, 0, 1, 12, "more-wal");
+        let PublishOutcome::Published(f3) = m
+            .publish_chain(&DB, Some(&f2), chain(&[&g2]))
+            .await
+            .unwrap()
+        else {
+            panic!("segment chain lost");
+        };
+        assert_eq!((f3.last_seq, f3.frontier_bytes), (12, 20));
+        assert_eq!(f3.base_snapshot_key, s.as_str());
+    }
+
+    async fn chain_loss_after_the_first_step_rolls_everything_back(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l = f.lineage.clone();
+        // The segment names a base the snapshot step does not leave behind.
+        let (s, g) = (snap(&l, 9, "mid"), seg(&l, 3, 4, 12, "mid-wal"));
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), chain(&[&s, &g])).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+        assert_eq!(m.list_objects(&DB, None).await.unwrap().len(), 1);
+        // A chain ending below the frontier is refused before any write.
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), chain(&[&snap(&l, 3, "old")]))
+                .await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.list_objects(&DB, None).await.unwrap().len(), 1);
     }
 
     macro_rules! on_both {
@@ -1360,11 +1559,14 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         lineage_switch_keeps_revision_monotonic,
         lost_response_is_reconciled_by_publish_id,
         state_flips_are_conditional,
+        chain_bootstrap_publishes_snapshot_and_segment_atomically,
+        chain_lost_first_cas_keeps_the_inventory,
+        chain_switches_lineage_then_appends_on_the_recorded_base,
+        chain_loss_after_the_first_step_rolls_everything_back,
         inventory_listing_and_conflicts,
         concurrent_publishers_have_one_winner,
         object_format_must_match_its_kind,
         created_at_is_stored_canonically,
-        revive_restarts_the_orphan_clock,
         segment_from_must_follow_base_seq,
         object_state_flip_checks_the_format,
     );
