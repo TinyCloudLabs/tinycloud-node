@@ -80,15 +80,15 @@ Each sidecar instance (one per CVM) caps five classes per 60-second window: the 
 | Class | Cap per minute | Worst-valid bytes (NDJSON) | Cap x bytes x 43,200 minutes, per sidecar instance |
 | --- | ---: | ---: | ---: |
 | `db_failure_5xx` | 10 | 402 | 173,664,000 |
-| `node_request_5xx` | 10 | 439 | 189,648,000 |
+| `node_request_5xx` (with `error_code`, TC-3834) | 10 | 468 | 202,176,000 |
 | `ingress_request_5xx` | 10 | 223 | 96,336,000 |
 | `node_request_4xx` | 3 | 439 | 56,894,400 |
 | `ingress_request_4xx` | 3 | 223 | 28,900,800 |
-| Capped events | 36 | | **545,443,200** |
+| Capped events | 36 | | **557,971,200** |
 | `errors_dropped`: at most one per class per minute | 5 | 185 | 5 x 185 x 43,200 = 39,960,000 |
-| **Capped worst case** | | | **585,403,200** |
+| **Capped worst case** | | | **597,931,200** |
 
-The reserve for these classes is at most **600,000,000 bytes per 30 days**, 20% of the shared 3 GB: 600,000,000 / 43,200 minutes = 13,888 bytes/minute. The 5xx classes at 10 per minute cost 10 x (402 + 439 + 223) = 10,640 bytes/minute (459,648,000 bytes per 30 days) and the five dropped-count events 5 x 185 = 925 bytes/minute (39,960,000 bytes), which leaves 100,392,000 bytes of headroom, of which 3 x 662 x 43,200 = 85,795,200 is the 4xx events. One 4xx event of each class per minute costs (439 + 223) x 43,200 = 28,598,400 bytes, so the largest whole 4xx cap is 3 (a cap of 4 gives 614,001,600 bytes in total). The worst case is 585,403,200 bytes per 30 days, 19.5% of 3 GB, **per sidecar instance**: with one sidecar per CVM, multiply it by the number of CVMs shipping to the shared plan. `node log-shipper/budget.mjs` reports these as `cappedClasses`, `cappedReserveBytes30Days` and `withinCappedAllocation`; `totalWithCappedBytes30Days` adds the reserve to the request and diagnostic totals. The sizes are exact serialized worst-valid records (a three-digit status is as wide for 4xx as for 5xx), not a provider billing formula.
+The reserve for these classes is at most **600,000,000 bytes per 30 days**, 20% of the shared 3 GB: 600,000,000 / 43,200 minutes = 13,888 bytes/minute. The 5xx classes at 10 per minute cost 10 x (402 + 468 + 223) = 10,930 bytes/minute (472,176,000 bytes per 30 days) and the five dropped-count events 5 x 185 = 925 bytes/minute (39,960,000 bytes), which leaves 87,864,000 bytes of headroom, of which 3 x 662 x 43,200 = 85,795,200 is the 4xx events. One 4xx event of each class per minute costs (439 + 223) x 43,200 = 28,598,400 bytes, so the largest whole 4xx cap is 3 (a cap of 4 gives 626,529,600 bytes in total). The worst case is 597,931,200 bytes per 30 days, 19.9% of 3 GB, **per sidecar instance**: with one sidecar per CVM, multiply it by the number of CVMs shipping to the shared plan. A `node_request_5xx` line is sized with its longest `error_code` (TC-3834, 13 bytes). The json-array framing charges one more byte per event and is the binding case: 599,702,400 bytes, so no `error_code` may be longer than 13 bytes (`MAX_ERROR_CODE_LEN`; one byte more is 600,134,400). `node log-shipper/budget.mjs` reports these as `cappedClasses`, `cappedReserveBytes30Days` and `withinCappedAllocation`; `totalWithCappedBytes30Days` adds the reserve to the request and diagnostic totals. The sizes are exact serialized worst-valid records (a three-digit status is as wide for 4xx as for 5xx), not a provider billing formula.
 
 The `errors_dropped` event is a `node_warning` with `svc=api`, `level=warn`, `event_code=errors_dropped` and exactly three further fields: `class` (`db_failure_5xx`, `node_request_5xx`, `ingress_request_5xx`, `node_request_4xx` or `ingress_request_4xx`), `dropped` (integer, 1 or more: the events of that class held back in the window) and `window_s` (60). It carries no content, ids, SQL, paths or messages, and no node log line can produce it: the sidecar builds it from literals and a counter. `dropped` counts events held back by the cap, not events lost in transport.
 

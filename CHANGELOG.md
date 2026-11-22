@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Telemetry: every `node_request` event with status 500 or above now carries `error_code`, a stable code for the 5xx's origin, from a closed set of 18 snake_case codes of at most 13 bytes: `db_error`, `db_timeout`, `db_busy`, `req_timeout`, `read_audit`, `storage_io`, `caveat_db`, `read_tx_error`, `key_ledger`, `lifecycle`, `registry_down`, `cutover_fence`, `kv_candidate`, `engine_error`, `encryption`, `size_limit`, `disk_headroom` and `internal`. A 5xx that no origin classified carries `internal`. The code never holds message text, payloads, keys, DIDs, SQL or paths. Events below 500 are unchanged. The production compose's log shipper keeps `error_code` on 5xx `node_request` events only when it is one of these codes. The capped 5xx reserve stays within 600 MB, with the caps unchanged. The N0 compose template hash is `1c073d0b…` (raw `d5958a66…`). Details: TC-3834
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
