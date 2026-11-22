@@ -130,14 +130,22 @@ fn authorization(headers: impl serde::Serialize) -> Result<String> {
         .ok_or_else(|| anyhow!("headers carry no Authorization"))
 }
 
+/// Creates the state file with mode 0600 in one step (`create_new`, so two
+/// concurrent first runs cannot both write it), or loads the existing one,
+/// refusing it when group or others can read it.
 fn load_or_create_state(path: &Path) -> Result<(SigningKey, JWK)> {
-    if path.exists() {
-        let state: Value = serde_json::from_slice(&fs::read(path)?)?;
-        let key = hex::decode(state["wallet"].as_str().context("state: wallet")?)?;
-        let wallet = SigningKey::from_slice(&key)?;
-        let delegatee: JWK = serde_json::from_value(state["delegatee"].clone())?;
-        return Ok((wallet, delegatee));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return load_state(path),
+        Err(e) => return Err(e).context("create state file"),
+    };
     let mut seed = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut seed);
     let wallet = SigningKey::from_slice(&seed)?;
@@ -147,12 +155,26 @@ fn load_or_create_state(path: &Path) -> Result<(SigningKey, JWK)> {
         "wallet": hex::encode(wallet.to_bytes()),
         "delegatee": delegatee,
     });
-    fs::write(path, serde_json::to_vec_pretty(&state)?)?;
+    std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&state)?)?;
+    Ok((wallet, delegatee))
+}
+
+fn load_state(path: &Path) -> Result<(SigningKey, JWK)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "state file mode {:o} lets others read it; chmod 600 it",
+                mode & 0o777
+            );
+        }
     }
+    let state: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let key = hex::decode(state["wallet"].as_str().context("state: wallet")?)?;
+    let wallet = SigningKey::from_slice(&key)?;
+    let delegatee: JWK = serde_json::from_value(state["delegatee"].clone())?;
     Ok((wallet, delegatee))
 }
 
