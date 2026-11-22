@@ -46,13 +46,19 @@ refused in delegations and invocations. `appsx/...` and `apps.x/...` are
 ordinary paths. An app id matches `^[a-z0-9][a-z0-9._-]{0,63}$` as a whole
 string; it is validated, never changed.
 
+The first segment `secrets` is reserved for secret keys, one per secret:
+`secrets/<name>` for a global secret and `secrets/scoped/<scope>/<name>` for a
+scoped one (the names are lowercase, as every segment is). It has no extra
+depth rule. The exact key `secrets/scoped` and the prefix `secrets/scoped/`
+never cover each other. `secretsx/...` is an ordinary path.
+
 ## Key kinds
 
 The kind follows from the path.
 
 | Path | Kind | Secret |
 | --- | --- | --- |
-| first segment `apps` | `deletable` | HKDF-SHA256(ikm = HKDF-Extract(salt = seed, ikm = network secret), salt = `tinycloud.encryption.named-key/v1`, info = `seeded\n` + key URN) |
+| first segment `apps` or `secrets` | `deletable` | HKDF-SHA256(ikm = HKDF-Extract(salt = seed, ikm = network secret), salt = `tinycloud.encryption.named-key/v1`, info = `seeded\n` + key URN) |
 | any other | `deterministic` | HKDF-SHA256(ikm = network secret, salt = `tinycloud.encryption.named-key/v1`, info = `deterministic\n` + key URN) |
 
 The seed of a deletable key is 32 bytes from the operating system's random
@@ -64,7 +70,7 @@ seed, and a row whose kind the path does not imply, is a corrupt row (500).
 ## Create
 
 `POST /encryption/networks/<network>/keys` with `{ "keyPath": "...", "deletable": bool }`.
-`deletable` must equal the kind the path implies (`true` under `apps/`, `false`
+`deletable` must equal the kind the path implies (`true` under `apps/` and `secrets/`, `false`
 elsewhere), otherwise 400 `key_path_invalid`. Unknown fields are refused with
 400. Per network at most 1000 key rows, and per `apps/<app id>/` prefix at most
 100, count towards `key_limit_exceeded`; `deleted` rows count until they are
@@ -107,7 +113,8 @@ they answer 403 `key_deleted` and change nothing.
 
 `GET /encryption/networks/<network>/keys/<path>` without `Authorization`:
 
-- Under `apps/` every path answers 404 `key_not_found`, with the same body and
+- Under `apps/` and `secrets/` (deletable keys) every path answers 404
+  `key_not_found`, with the same body and
   headers whether the key exists, is blocked or deleted, is missing, or
   belongs to another owner or network.
 - Elsewhere it answers the derived public key for every valid path on an active
@@ -115,7 +122,22 @@ they answer 403 `key_deleted` and change nothing.
 
 The authenticated GET (a `key-describe/v1` invocation) returns the full
 descriptor, including `kind` (`deterministic` or `deletable`) and `state`
-(`active`, `blocked` or `deleted`).
+(`active`, `blocked` or `deleted`). It, or the `key.create` answer, is the only
+source of a deletable key's public key; a writer checks that `state` is
+`active` before it encrypts to the key.
+
+## Grants on secret keys
+
+A key or key prefix in a delegation covers an invocation on an exact key below
+it, so no grant shape is special to `secrets/`:
+
+- `decrypt` (or `key.create`) on the exact key `secrets/<name>` covers only that
+  key: not a sibling, not a key below it, not the bare network.
+- `key.create` (or `decrypt`) on the prefix `secrets/` covers every key below
+  it. The invocation still names the exact key; a prefix is never invoked.
+- The holder of an exact-key grant can re-delegate it, attenuated, unless the
+  grant is a UCAN with the `delegationMode` fact `terminal`. A re-delegation to
+  a sibling key, the prefix, the network or another ability is refused.
 
 ## Decrypt
 
@@ -141,7 +163,7 @@ not checked. A refusal answers `app_id_not_bound`.
 delegation and `key.delete` is refused in every delegation.
 
 - `keyPath` without a trailing `/` deletes one key. A deterministic key (a path
-  outside `apps/`) answers 409 `key_not_deletable`; a missing key answers 404
+  outside `apps/` and `secrets/`) answers 409 `key_not_deletable`; a missing key answers 404
   `key_not_found`.
 - `keyPath` `apps/<app id>/` (exactly two segments and one trailing `/`) deletes
   every key under it. Any other path ending in `/` answers 400
@@ -151,6 +173,8 @@ delegation and `key.delete` is refused in every delegation.
   `key_not_deletable`.
 - A deleted key keeps its row with state `deleted` and no seed. `keyVersion` is
   unchanged until the path is created again.
+- Deleting a secret's key does not end grants on its path; a key re-created
+  under the same path while a grant is live is readable by that grant.
 - The response is `{ keyPath, state: "deleted", deleted, alreadyDeleted,
   count }`; `deleted` lists the keys this call deleted (in path order),
   `alreadyDeleted` those that already were, and `count` is the length of
@@ -236,11 +260,14 @@ line anywhere else stops the replay. Replay is idempotent.
 ## Startup check
 
 The node does not start while a row in `encryption_network_key` under `apps/`
-(or at the path `apps`) has a kind other than `deletable`. List such rows with:
+or `secrets/` (or at the path `apps` or `secrets`) has a kind other than
+`deletable`. The error names the segment and the count. List such rows with:
 
 ```sql
 SELECT network_id, key_path, kind FROM encryption_network_key
-WHERE (key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/') AND kind <> 'deletable';
+WHERE (key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/'
+    OR key_path = 'secrets' OR substr(key_path, 1, 8) = 'secrets/')
+  AND kind <> 'deletable';
 ```
 
 The node deletes no data; remove or move the rows, then start the node.

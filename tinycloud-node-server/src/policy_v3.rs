@@ -12337,6 +12337,10 @@ mod test_harness;
 mod named_keys_gate_tests;
 
 #[cfg(test)]
+#[path = "policy_v3/secret_keys_tests.rs"]
+mod secret_keys_tests;
+
+#[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
 
