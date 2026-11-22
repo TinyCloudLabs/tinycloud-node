@@ -53,6 +53,8 @@ assert.equal(vector.ports[0].published, '12201');
 assert.equal(vector.ports[0].protocol, 'udp');
 assert.equal(vector.logging.driver, 'json-file');
 assert.equal(vector.environment.TINYCLOUD_LOGSHIP_PROFILE, '${TINYCLOUD_LOGSHIP_PROFILE:-errors_slow}');
+// Compose interpolates a bare `${…}` at deploy time; Vector must receive the literal, so every one is written `$${…}`.
+assert.doesNotMatch(vector.environment.VECTOR_CONFIG_JSON, /(^|[^$])\$\{/, 'embedded Vector config has an unescaped ${…} that Compose would interpolate');
 const embedded = vector.environment.VECTOR_CONFIG_JSON.replaceAll('$${TINYCLOUD_LOGSHIP_PROFILE}', '${TINYCLOUD_LOGSHIP_PROFILE}');
 assert.ok(isDeepStrictEqual(JSON.parse(embedded), buildConfig({ runtimeProfile: true })), 'embedded Vector config differs from schema/compiler sources');
 const schema = JSON.parse(bytes).services['tinycloud-node'];
