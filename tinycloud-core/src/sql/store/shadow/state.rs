@@ -53,8 +53,14 @@ pub enum Action {
 /// What the uploader knows about one database between cycles.
 #[derive(Debug, Clone)]
 pub struct DbState {
-    /// The last capture seen for this DB (if any).
-    pub pending: Option<CapturePlan>,
+    /// A pending `Checkpoint` capture waiting to be published as a
+    /// snapshot. Invariant: if `Some`, `kind == Checkpoint`.
+    pub pending_base: Option<CapturePlan>,
+    /// A pending `Wal` capture waiting to be published as a segment.
+    /// Invariant: if `Some`, `kind == Wal`; if `pending_base` is also
+    /// `Some`, `pending_delta.revision > pending_base.revision` (the
+    /// delta rides on top of the newer base).
+    pub pending_delta: Option<CapturePlan>,
     /// When the oldest un-uploaded commit happened; `None` when idle.
     pub first_dirty_at: Option<Instant>,
     /// Bytes pending since the published frontier.
@@ -74,7 +80,8 @@ pub struct DbState {
 impl Default for DbState {
     fn default() -> Self {
         Self {
-            pending: None,
+            pending_base: None,
+            pending_delta: None,
             first_dirty_at: None,
             pending_bytes: 0,
             needs_bootstrap: false,
@@ -104,55 +111,124 @@ pub enum CaptureKindTag {
 }
 
 impl DbState {
-    /// A fresh dirty mark from a capture. Updates pending slot, first-dirty
-    /// time and pending-bytes counter. A checkpoint capture supersedes a
-    /// pending WAL (the new base makes the old delta meaningless).
+    /// A fresh dirty mark from a capture. Supersedes the pending slot
+    /// only when the incoming capture advances the revision, whatever
+    /// the kind.
     ///
     /// The capture-hook ingress spawns a detached task per capture, so
     /// two captures can race through the per-DB upsert lock out of
-    /// commit order. To guarantee the pending slot is the newest
-    /// commit's bytes, `mark_capture` keeps the maximum revision for
-    /// same-kind captures, and a Checkpoint always supersedes a Wal
-    /// (even one at a later revision, because the new base invalidates
-    /// the delta chain the WAL rides on).
+    /// commit order. The data shape allows one pending `Checkpoint` AND
+    /// one newer `Wal` to coexist: the cycle publishes the snapshot
+    /// first and the segment second, so a `Checkpoint 5 -> Wal 6`
+    /// sequence keeps both, and a `Wal 7` followed by a stale
+    /// `Checkpoint 5` keeps the newer `Wal 7` and drops the older base.
+    ///
+    /// Rules, where `c` is the incoming capture:
+    ///
+    /// For a `Checkpoint c`:
+    /// - If `pending_base` is `None` or `c.revision > pending_base.revision`,
+    ///   install `c` as `pending_base`.
+    /// - Then drop `pending_delta` if its revision is <= the installed
+    ///   base's revision, because that delta is stale on the new base.
+    /// - Else, ignore the incoming (older or equal checkpoint).
+    ///
+    /// For a `Wal c`:
+    /// - If `pending_base` is `Some` and `c.revision <= pending_base.revision`,
+    ///   ignore (stale delta on the newer base).
+    /// - Else, install `c` as `pending_delta` if the slot is empty or
+    ///   `c.revision > pending_delta.revision`; otherwise ignore.
     pub fn mark_capture(&mut self, c: CapturePlan, now: Instant) {
         if self.first_dirty_at.is_none() {
             self.first_dirty_at = Some(now);
         }
-        let is_checkpoint = matches!(c.kind, CaptureKindTag::Checkpoint);
-        // Decide whether the new capture supersedes the pending one.
-        let supersedes = match (&self.pending, c.kind) {
-            (None, _) => true,
-            // Checkpoint always wins over a pending Wal: the new base
-            // makes the delta chain meaningless.
-            (Some(p), CaptureKindTag::Checkpoint) if matches!(p.kind, CaptureKindTag::Wal) => true,
-            // Same kind: newer revision wins; equal revisions keep the
-            // pending one (the first task to install it sets the pin).
-            (Some(p), _) if p.kind == c.kind => c.revision > p.revision,
-            // Wal arriving after a Checkpoint in-flight is ignored: the
-            // Checkpoint is the new base, and a Wal from before it is a
-            // stale delta.
-            (Some(_), CaptureKindTag::Wal) => false,
-            _ => false,
-        };
-        if is_checkpoint {
-            // The new checkpoint is the new base: the pending-bytes counter
-            // resets to this snapshot's size (the segment's base is gone).
-            self.pending_bytes = c.bytes;
-        } else {
-            self.pending_bytes = self.pending_bytes.saturating_add(c.bytes);
+        match c.kind {
+            CaptureKindTag::Checkpoint => {
+                // A newer Checkpoint supersedes the pending base; a
+                // stale Checkpoint arriving after a newer WAL or newer
+                // Checkpoint is dropped. Compare against both slots:
+                // the incoming revision must be greater than every
+                // pending revision to install.
+                let max_pending = self.max_pending_revision().unwrap_or(i64::MIN);
+                if c.revision > max_pending {
+                    // The new base makes an older or equal-revision
+                    // delta stale (its from_seq would be <= the new
+                    // base's base_seq).
+                    if let Some(delta) = self.pending_delta.as_ref() {
+                        if delta.revision <= c.revision {
+                            self.pending_delta = None;
+                        }
+                    }
+                    self.pending_base = Some(c);
+                }
+            }
+            CaptureKindTag::Wal => {
+                // A WAL at or before the pending base's revision is a
+                // stale delta on an older base; drop it.
+                if let Some(base) = self.pending_base.as_ref() {
+                    if c.revision <= base.revision {
+                        return;
+                    }
+                }
+                let install = self
+                    .pending_delta
+                    .as_ref()
+                    .is_none_or(|d| c.revision > d.revision);
+                if install {
+                    self.pending_delta = Some(c);
+                }
+            }
         }
-        if supersedes {
-            self.pending = Some(c);
+        self.pending_bytes = self.recompute_pending_bytes();
+    }
+
+    /// Pending-bytes counter reflects the bytes the uploader must
+    /// ship next (base + delta, when both are present).
+    fn recompute_pending_bytes(&self) -> u64 {
+        let base = self.pending_base.as_ref().map_or(0, |c| c.bytes);
+        let delta = self.pending_delta.as_ref().map_or(0, |c| c.bytes);
+        base.saturating_add(delta)
+    }
+
+    /// The capture the planner should act on next: `pending_base`
+    /// first (the snapshot that publishes first), else `pending_delta`.
+    pub fn next_to_publish(&self) -> Option<&CapturePlan> {
+        self.pending_base.as_ref().or(self.pending_delta.as_ref())
+    }
+
+    /// The newest revision anything in the pending slots refers to.
+    /// Used by the uploader to decide whether a publish is still fresh.
+    pub fn max_pending_revision(&self) -> Option<i64> {
+        let b = self.pending_base.as_ref().map(|c| c.revision);
+        let d = self.pending_delta.as_ref().map(|c| c.revision);
+        match (b, d) {
+            (Some(a), Some(c)) => Some(a.max(c)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
         }
     }
 
-    /// Clear state after a successful publish. Called by the uploader.
-    pub fn clear_after_publish(&mut self) {
-        self.pending = None;
-        self.first_dirty_at = None;
-        self.pending_bytes = 0;
-        self.needs_bootstrap = false;
+    /// Clear state after a successful publish of `published_revision`.
+    ///
+    /// Clears only the pending slots whose revision is at or below
+    /// `published_revision`, so a capture that arrived during the
+    /// upload survives. The uploader passes the frontier's `last_seq`
+    /// as `published_revision`.
+    pub fn clear_after_publish(&mut self, published_revision: i64) {
+        if let Some(base) = self.pending_base.as_ref() {
+            if base.revision <= published_revision {
+                self.pending_base = None;
+            }
+        }
+        if let Some(delta) = self.pending_delta.as_ref() {
+            if delta.revision <= published_revision {
+                self.pending_delta = None;
+            }
+        }
+        self.pending_bytes = self.recompute_pending_bytes();
+        if self.pending_base.is_none() && self.pending_delta.is_none() {
+            self.first_dirty_at = None;
+            self.needs_bootstrap = false;
+        }
     }
 }
 
@@ -179,7 +255,7 @@ pub fn plan(
     if !allowed {
         return Action::Idle;
     }
-    let Some(capture) = st.pending.as_ref() else {
+    let Some(capture) = st.next_to_publish() else {
         return match frontier {
             Some(_) => Action::Idle,
             None => {
@@ -441,7 +517,10 @@ mod tests {
         let t1 = t0 + Duration::from_secs(5);
         st.mark_capture(capture(2, "cid", CaptureKindTag::Wal, 20), t1);
         assert_eq!(st.first_dirty_at, Some(t0));
-        assert_eq!(st.pending_bytes, 30);
+        // Cumulative WAL: the newest capture carries all the frames
+        // from base_seq+1 to its revision, so pending_bytes is its
+        // bytes, not the sum of all captures.
+        assert_eq!(st.pending_bytes, 20);
     }
 
     #[test]
@@ -454,44 +533,97 @@ mod tests {
     }
 
     #[test]
-    fn clear_after_publish_resets_state() {
+    fn clear_after_publish_resets_state_when_the_pending_was_published() {
         let t0 = Instant::now();
         let mut st = DbState::default();
         st.mark_capture(capture(1, "cid", CaptureKindTag::Wal, 10), t0);
         st.needs_bootstrap = true;
-        st.clear_after_publish();
-        assert!(st.pending.is_none());
+        st.clear_after_publish(1);
+        assert!(st.next_to_publish().is_none());
         assert!(st.first_dirty_at.is_none());
         assert_eq!(st.pending_bytes, 0);
         assert!(!st.needs_bootstrap);
     }
 
     #[test]
-    fn out_of_order_captures_keep_the_newest_revision_in_the_pending_slot() {
+    fn clear_after_publish_keeps_captures_that_arrived_during_the_upload() {
+        // Uploader starts publishing R=5; a WAL at R=7 arrives before
+        // the CAS succeeds. clear_after_publish(5) must keep R=7 in
+        // pending, and must NOT clear first_dirty_at, so the uploader
+        // runs again on the next tick.
+        let t0 = Instant::now();
+        let mut st = DbState::default();
+        st.mark_capture(capture(5, "cid", CaptureKindTag::Wal, 10), t0);
+        st.mark_capture(capture(7, "cid", CaptureKindTag::Wal, 20), t0);
+        st.clear_after_publish(5);
+        assert_eq!(
+            st.next_to_publish().map(|c| c.revision),
+            Some(7),
+            "a later capture must survive clear_after_publish of the older revision"
+        );
+        assert!(st.first_dirty_at.is_some());
+    }
+
+    #[test]
+    fn out_of_order_wal_captures_keep_the_newest_revision_in_the_delta_slot() {
         // The ingress spawns a detached task per capture, so two wal
         // captures at revisions 5 and 7 can hit mark_capture in either
         // order. The newest revision must win so a clear_after_publish
-        // against R=7 does not clear the state against the older R=5
-        // and lose commits 6-7.
+        // against R=5 does not drop the state for R=7 and lose
+        // commits 6-7.
         let t0 = Instant::now();
         let mut st = DbState::default();
         st.mark_capture(capture(7, "cid", CaptureKindTag::Wal, 20), t0);
         st.mark_capture(capture(5, "cid", CaptureKindTag::Wal, 10), t0);
-        assert_eq!(st.pending.as_ref().map(|p| p.revision), Some(7));
+        assert_eq!(st.next_to_publish().map(|c| c.revision), Some(7));
+        assert!(st.pending_base.is_none());
     }
 
     #[test]
-    fn a_wal_arriving_after_a_checkpoint_is_ignored() {
-        // A later-dated Wal is a stale delta once the base is the new
-        // checkpoint. The Checkpoint wins; the Wal is dropped.
+    fn checkpoint_5_then_wal_6_publishes_through_revision_6() {
+        // A newer WAL on a pending (unpublished) checkpoint must NOT
+        // be dropped: the cycle publishes the snapshot first and the
+        // segment second. Without this, revision 6's commits are lost
+        // on restore until the next write.
         let t0 = Instant::now();
         let mut st = DbState::default();
         st.mark_capture(capture(5, "cid-a", CaptureKindTag::Checkpoint, 100), t0);
         st.mark_capture(capture(6, "cid-a", CaptureKindTag::Wal, 20), t0);
         assert_eq!(
-            st.pending.as_ref().map(|p| (p.revision, p.kind)),
-            Some((5, CaptureKindTag::Checkpoint))
+            st.pending_base.as_ref().map(|c| c.revision),
+            Some(5),
+            "the pending checkpoint survives"
         );
+        assert_eq!(
+            st.pending_delta.as_ref().map(|c| c.revision),
+            Some(6),
+            "the newer WAL rides on top of the base"
+        );
+        assert_eq!(st.max_pending_revision(), Some(6));
+        // After the base publishes (R=5), the delta remains.
+        st.clear_after_publish(5);
+        assert_eq!(
+            st.next_to_publish().map(|c| c.revision),
+            Some(6),
+            "the delta is the next to publish after the base lands"
+        );
+    }
+
+    #[test]
+    fn wal_7_then_stale_checkpoint_5_keeps_wal_7() {
+        // The capture-hook ingress spawns a detached task per capture,
+        // so a late-arriving stale Checkpoint 5 must NOT replace a
+        // pending WAL 7. Keep the WAL; drop the stale checkpoint.
+        let t0 = Instant::now();
+        let mut st = DbState::default();
+        st.mark_capture(capture(7, "cid-a", CaptureKindTag::Wal, 20), t0);
+        st.mark_capture(capture(5, "cid-a", CaptureKindTag::Checkpoint, 100), t0);
+        assert!(
+            st.pending_base.is_none(),
+            "the stale older checkpoint is dropped"
+        );
+        assert_eq!(st.pending_delta.as_ref().map(|c| c.revision), Some(7));
+        assert_eq!(st.max_pending_revision(), Some(7));
     }
 
     #[test]

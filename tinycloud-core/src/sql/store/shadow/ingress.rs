@@ -138,7 +138,7 @@ mod tests {
             "capture must set first_dirty_at"
         );
         assert_eq!(
-            st.pending.as_ref().map(|p| p.revision),
+            st.next_to_publish().map(|c| c.revision),
             Some(7),
             "pending capture must carry the captured revision"
         );
