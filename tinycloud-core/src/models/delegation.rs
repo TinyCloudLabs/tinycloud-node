@@ -10,7 +10,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
-    ConnectionTrait, DbBackend, QuerySelect, QueryTrait, Statement,
+    ConnectionTrait, DbBackend, QueryOrder, QuerySelect, QueryTrait, Statement,
 };
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -568,9 +568,29 @@ async fn validate_with<C: ConnectionTrait>(
     let dependant_caps = dependant_capabilities(delegation);
 
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
-        // no dependant caps, so no parent's authority is needed; any cited
-        // parent must still be stored (TC-3663)
-        (true, _) => refuse_unstored_parents(db, delegation).await,
+        // no dependant caps, no parents cited: root authority alone
+        (true, true) => Ok(()),
+        // no dependant caps, but parents are cited: every cited parent must be
+        // stored (TC-3663), and no cited parent or ancestor may be terminal
+        // (TC-3810), even when the signer holds root authority.
+        (true, false) => {
+            let parent_ids: Vec<Hash> =
+                delegation.parents.iter().copied().map(Hash::from).collect();
+            let graph = crate::auth_graph::AuthGraphSnapshot::load(db, &parent_ids)
+                .await
+                .map_err(|error| match error {
+                    crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                    crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                        Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+                    }
+                })?;
+            check_no_terminal_in_parent_closure(&graph, &parent_ids)?;
+            if parent_ids.iter().all(|id| graph.delegation(id).is_some()) {
+                Ok(())
+            } else {
+                Err(DelegationError::MissingParents.into())
+            }
+        }
         // Policy roots are owner-signed control-plane roots.  They are
         // admitted into the ordinary graph during policy registration, but
         // they are never a usable grant on their own: the route gate rejects
@@ -729,15 +749,12 @@ async fn validate_with<C: ConnectionTrait>(
                 }
             }
 
-            // W1 (B): reject any chain that cites a terminal parent. The
-            // marker is persisted on the parent row's `facts` column at
-            // save time and is signed-into the parent's UCAN payload, so a
-            // cooperating holder cannot strip it after the fact.
-            for p in &all_parents {
-                if parent_is_terminal(p) {
-                    return Err(DelegationError::TerminalParentCannotRedelegate.into());
-                }
-            }
+            // W1 (B) + TC-3810: reject any chain that cites a terminal parent
+            // or descends from a terminal ancestor (or a pre-upgrade stored
+            // malformed-mode CACAO). The marker is persisted on the row's
+            // `facts` column at save/reindex time and is signed into the
+            // parent's UCAN/ReCap payload, so a holder cannot strip it.
+            check_no_terminal_in_parent_closure(graph, &parent_ids)?;
 
             // Check time constraints and track failures
             let mut expiry_failed = false;
@@ -948,33 +965,6 @@ fn dependant_capabilities(delegation: &util::DelegationInfo) -> Vec<&util::Capab
         .collect()
 }
 
-/// TC-3663: a delegation is stored with an edge to each parent it cites,
-/// even when none of its capabilities needs a parent's authority, so every
-/// cited parent must already be stored. A missing one is refused as
-/// [`DelegationError::MissingParents`], as for any other delegation, instead
-/// of failing the edge insert on its foreign key with a database error.
-async fn refuse_unstored_parents<C: ConnectionTrait>(
-    db: &C,
-    delegation: &util::DelegationInfo,
-) -> Result<(), Error> {
-    if delegation.parents.is_empty() {
-        return Ok(());
-    }
-    let parent_ids: Vec<Hash> = delegation.parents.iter().copied().map(Hash::from).collect();
-    let stored: Vec<Hash> = Entity::find()
-        .select_only()
-        .column(Column::Id)
-        .filter(Column::Id.is_in(parent_ids.iter().copied()))
-        .into_tuple::<Hash>()
-        .all(db)
-        .await?;
-    if parent_ids.iter().all(|id| stored.contains(id)) {
-        Ok(())
-    } else {
-        Err(DelegationError::MissingParents.into())
-    }
-}
-
 /// The checks of [`process_with`] that need no lock, run on the pool before
 /// a delegation takes any chain guard, space write order or transaction
 /// (TC-3000): its signed time window, and the issuer's standing. A stranger
@@ -983,10 +973,10 @@ async fn refuse_unstored_parents<C: ConnectionTrait>(
 ///
 /// The issuer has standing when it is the root authority for every
 /// capability, or holds an owner revoke grant on each other capability, or
-/// each cited parent is stored and was granted to it. Every check runs again
-/// inside the transaction, which stays the authority. In error order this
-/// follows [`process_with`], except that a cited parent is read directly
-/// instead of through the transaction's graph snapshot.
+/// each cited parent is stored and was granted to it, and no cited parent or
+/// ancestor is terminal (TC-3810). Every check runs again inside the
+/// transaction, which stays the authority. In error order this follows
+/// [`process_with`].
 pub(crate) async fn precheck<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
@@ -1023,10 +1013,10 @@ pub(crate) async fn precheck_standing<C: ConnectionTrait>(
     refuse_renewal_lease_parents(db, delegation).await?;
     check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
     let dependant_caps = dependant_capabilities(delegation);
-    if dependant_caps.is_empty() {
-        return refuse_unstored_parents(db, delegation).await;
-    }
     if delegation.parents.is_empty() {
+        if dependant_caps.is_empty() {
+            return Ok(());
+        }
         if is_policy_root(&delegation.delegation)
             || revocation::delegator_hands_back_revoke(db, delegation).await?
         {
@@ -1040,19 +1030,20 @@ pub(crate) async fn precheck_standing<C: ConnectionTrait>(
         return Ok(());
     }
     let parent_ids: Vec<Hash> = delegation.parents.iter().copied().map(Hash::from).collect();
-    let delegatees: std::collections::HashMap<Hash, String> = Entity::find()
-        .select_only()
-        .column(Column::Id)
-        .column(Column::Delegatee)
-        .filter(Column::Id.is_in(parent_ids.iter().copied()))
-        .into_tuple::<(Hash, String)>()
-        .all(db)
-        .await?
-        .into_iter()
-        .collect();
+    // TC-3810: refuse any cited terminal parent or ancestor before the
+    // root-authority early return and before taking any chain/space/writer lock,
+    // using pure read-only SQL so `track_writes` never treats precheck as a write.
+    let rows = check_parent_closure_not_terminal_readonly(db, &parent_ids).await?;
+    if dependant_caps.is_empty() {
+        return if parent_ids.iter().all(|id| rows.contains_key(id)) {
+            Ok(())
+        } else {
+            Err(DelegationError::MissingParents.into())
+        };
+    }
     let policy_session = is_policy_session(&delegation.delegation);
     for id in &parent_ids {
-        let Some(delegatee) = delegatees.get(id) else {
+        let Some(delegatee) = rows.get(id) else {
             return Err(DelegationError::MissingParents.into());
         };
         if !policy_session && *delegatee != delegation.delegator {
@@ -1396,17 +1387,251 @@ fn extract_sql_caveat(
     None
 }
 
-/// True if the persisted parent row is marked terminal via the
-/// `xyz.tinycloud.policy/delegationMode` fact. The marker is stored in the
-/// `facts` JSON column at save time; absence is treated as attenuable.
-fn parent_is_terminal(p: &Model) -> bool {
-    let Some(Facts(map)) = &p.facts else {
+/// Fact value written by boot reindexing when a pre-upgrade stored CACAO
+/// carried a malformed or duplicate `xyz.tinycloud.policy/delegationMode`.
+/// Treated as both terminal (cannot parent children) and refused (cannot
+/// authorize direct invocation), without failing node startup.
+pub(crate) const INVALID_DELEGATION_MODE_FACT: &str = "invalid";
+
+pub(crate) fn facts_is_terminal(facts: Option<&Facts>) -> bool {
+    let Some(Facts(map)) = facts else {
         return false;
     };
     map.get(DelegationMode::FACT_KEY)
         .and_then(|v| v.as_str())
-        .map(|s| s == "terminal")
-        .unwrap_or(false)
+        .is_some_and(|s| {
+            s == DelegationMode::Terminal.as_str() || s == INVALID_DELEGATION_MODE_FACT
+        })
+}
+
+pub(crate) fn facts_mode_is_invalid(facts: Option<&Facts>) -> bool {
+    let Some(Facts(map)) = facts else {
+        return false;
+    };
+    map.get(DelegationMode::FACT_KEY)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == INVALID_DELEGATION_MODE_FACT)
+}
+
+/// True if the persisted row is marked terminal (or was marked unusable due to
+/// a malformed stored delegation mode, which is terminal and refused).
+pub(crate) fn parent_is_terminal(p: &Model) -> bool {
+    facts_is_terminal(p.facts.as_ref())
+}
+
+/// True if the persisted row was marked unusable during boot reindexing because
+/// its signed bytes carried a malformed or duplicate delegation mode.
+pub(crate) fn delegation_mode_is_invalid(p: &Model) -> bool {
+    facts_mode_is_invalid(p.facts.as_ref())
+}
+
+/// Pure read-only closure check for pre-lock registration preflight (TC-3810):
+/// loads only parent edges and `(id, delegatee, facts)` rows (no string
+/// literals in SQL, so `db_pool::is_read_only_statement` stays true), refuses
+/// if any cited parent or ancestor is terminal/invalid, and returns the
+/// `delegatee` map of all loaded rows in the closure.
+pub(crate) async fn check_parent_closure_not_terminal_readonly<C: ConnectionTrait>(
+    db: &C,
+    parent_ids: &[Hash],
+) -> Result<std::collections::HashMap<Hash, String>, Error> {
+    if parent_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let (nodes, _) = crate::auth_graph::load_closure_edges(db, parent_ids)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    let rows: Vec<(Hash, String, Option<Facts>)> = Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .column(Column::Delegatee)
+        .column(Column::Facts)
+        .filter(Column::Id.is_in(nodes))
+        .into_tuple::<(Hash, String, Option<Facts>)>()
+        .all(db)
+        .await?;
+    let mut delegatees = std::collections::HashMap::with_capacity(rows.len());
+    for (id, delegatee, facts) in rows {
+        if facts_is_terminal(facts.as_ref()) {
+            return Err(DelegationError::TerminalParentCannotRedelegate.into());
+        }
+        delegatees.insert(id, delegatee);
+    }
+    Ok(delegatees)
+}
+
+/// Refuse if any directly cited parent or any transitive ancestor in `graph`
+/// is terminal (or carries a malformed stored delegation mode).
+pub(crate) fn check_no_terminal_in_parent_closure(
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    parent_ids: &[Hash],
+) -> Result<(), DelegationError> {
+    for parent_id in parent_ids {
+        for chain_id in graph.chain_ids_from(parent_id) {
+            if graph.delegation(&chain_id).is_some_and(parent_is_terminal) {
+                return Err(DelegationError::TerminalParentCannotRedelegate);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of boot-time CACAO delegation-mode reindexing (TC-3810).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacaoReindexStats {
+    pub reindexed_terminal: usize,
+    pub marked_invalid: usize,
+    pub completed: bool,
+}
+
+enum StoredCacaoMode {
+    Terminal,
+    Invalid,
+    Unchanged,
+}
+
+fn classify_stored_cacao_mode(
+    cacao: &tinycloud_auth::cacaos::siwe_cacao::SiweCacao,
+) -> StoredCacaoMode {
+    use tinycloud_auth::cacaos::siwe::Message;
+    use tinycloud_auth::siwe_recap::{Capability as SiweCap, DelegationModeFact};
+
+    let Ok(message) = TryInto::<Message>::try_into(cacao.payload().clone()) else {
+        return StoredCacaoMode::Unchanged;
+    };
+    match SiweCap::<serde_json::Value>::extract_and_verify(&message) {
+        Ok(Some(cap)) => match cap.delegation_mode() {
+            Some(DelegationModeFact::Terminal) => StoredCacaoMode::Terminal,
+            Some(DelegationModeFact::Attenuable) | None => StoredCacaoMode::Unchanged,
+        },
+        Ok(None) => StoredCacaoMode::Unchanged,
+        Err(err) if util::is_invalid_delegation_mode_error(&err) => StoredCacaoMode::Invalid,
+        Err(_) => StoredCacaoMode::Unchanged,
+    }
+}
+
+/// Reindex stored pre-upgrade CACAO rows from their signed serialization
+/// before serving traffic (TC-3810). Runs in bounded keyset pages, commits
+/// each page so an interruption is safe and idempotent on restart, decrypts
+/// encrypted serializations when configured, never downgrades already-marked
+/// rows, and marks malformed-mode rows unusable (`"invalid"`) without failing
+/// startup (logging counts only).
+pub(crate) async fn reindex_cacao_modes<C>(
+    pool: &C,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<CacaoReindexStats, DbErr>
+where
+    C: ConnectionTrait + sea_orm::TransactionTrait,
+{
+    reindex_cacao_modes_bounded(pool, encryption, None).await
+}
+
+pub(crate) async fn reindex_cacao_modes_bounded<C>(
+    pool: &C,
+    encryption: Option<&ColumnEncryption>,
+    max_pages: Option<usize>,
+) -> Result<CacaoReindexStats, DbErr>
+where
+    C: ConnectionTrait + sea_orm::TransactionTrait,
+{
+    const PAGE_SIZE: u64 = 128;
+    let mut after: Option<Hash> = None;
+    let mut pages = 0usize;
+    let mut stats = CacaoReindexStats::default();
+
+    loop {
+        if max_pages.is_some_and(|limit| pages >= limit) {
+            return Ok(stats);
+        }
+        let mut query = Entity::find()
+            .select_only()
+            .column(Column::Id)
+            .column(Column::Facts)
+            .column(Column::Serialization)
+            .column(Column::SerializationFormat)
+            .order_by_asc(Column::Id)
+            .limit(PAGE_SIZE);
+        if let Some(id) = after {
+            query = query.filter(Column::Id.gt(id));
+        }
+        let rows = query
+            .into_tuple::<(Hash, Option<Facts>, Vec<u8>, i16)>()
+            .all(pool)
+            .await?;
+        if rows.is_empty() {
+            stats.completed = true;
+            if stats.reindexed_terminal > 0 || stats.marked_invalid > 0 {
+                tracing::info!(
+                    reindexed_terminal = stats.reindexed_terminal,
+                    marked_invalid = stats.marked_invalid,
+                    "reindexed stored CACAO delegation modes"
+                );
+            }
+            return Ok(stats);
+        }
+
+        let mut updates: Vec<(Hash, Facts)> = Vec::new();
+        for (id, existing_facts, stored, format) in rows {
+            after = Some(id);
+            let already_marked = existing_facts
+                .as_ref()
+                .and_then(|Facts(map)| map.get(DelegationMode::FACT_KEY))
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| {
+                    s == DelegationMode::Terminal.as_str() || s == INVALID_DELEGATION_MODE_FACT
+                });
+            if already_marked {
+                continue;
+            }
+            let plaintext =
+                delegation_cid_alias::stored_plaintext(encryption, id, &stored, format)?;
+            let Ok(TinyCloudDelegation::Cacao(cacao)) =
+                TinyCloudDelegation::from_bytes(plaintext.as_ref())
+            else {
+                continue;
+            };
+            let new_value = match classify_stored_cacao_mode(&cacao) {
+                StoredCacaoMode::Terminal => {
+                    stats.reindexed_terminal += 1;
+                    DelegationMode::Terminal.as_str()
+                }
+                StoredCacaoMode::Invalid => {
+                    stats.marked_invalid += 1;
+                    INVALID_DELEGATION_MODE_FACT
+                }
+                StoredCacaoMode::Unchanged => continue,
+            };
+            let mut map = existing_facts.map(|Facts(m)| m).unwrap_or_default();
+            map.insert(
+                DelegationMode::FACT_KEY.to_string(),
+                serde_json::Value::String(new_value.to_string()),
+            );
+            updates.push((id, Facts(map)));
+        }
+
+        if !updates.is_empty() {
+            let tx = crate::db::begin_write_transaction(pool, None).await?;
+            if pool.get_database_backend() == DbBackend::Postgres {
+                tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
+                    .await?;
+            }
+            for (id, facts) in updates {
+                ActiveModel {
+                    id: sea_orm::ActiveValue::Unchanged(id),
+                    facts: Set(Some(facts)),
+                    ..Default::default()
+                }
+                .update(&tx)
+                .await?;
+            }
+            tx.commit().await?;
+        }
+        pages += 1;
+    }
 }
 
 #[cfg(test)]

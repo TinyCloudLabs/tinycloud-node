@@ -2293,6 +2293,22 @@ pub async fn register_policy(
         .iter()
         .flat_map(|delegation| delegation.0.spaces().cloned())
         .collect::<Vec<_>>();
+    let verified = tinycloud
+        .precheck_delegation_batch_verified(&root_delegations, &verified)
+        .await
+        .map_err(|error| {
+            let status = if matches!(
+                error,
+                tinycloud_core::db::TxError::InvalidDelegation(
+                    tinycloud_core::models::delegation::DelegationError::TerminalParentCannotRedelegate
+                )
+            ) {
+                Status::Unauthorized
+            } else {
+                Status::Forbidden
+            };
+            (status, error.to_string())
+        })?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;
@@ -2914,11 +2930,28 @@ pub async fn mint(
     // TC-732: per-space sequence locks before the row locks below; see
     // `register_policy`.
     let sequence_spaces = event.0.spaces().cloned().collect::<Vec<_>>();
-    // TC-2986: the node-signed session is verified before the locks below.
+    // TC-2986 + TC-3810: verify signature and preflight terminal ancestors
+    // before acquiring space/writer locks or opening the transaction.
     let verified = tinycloud
         .preverify_delegation(&event)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
+    let verified = tinycloud
+        .precheck_delegation_batch_verified(std::slice::from_ref(&event), &verified)
+        .await
+        .map_err(|error| {
+            let status = if matches!(
+                error,
+                tinycloud_core::db::TxError::InvalidDelegation(
+                    tinycloud_core::models::delegation::DelegationError::TerminalParentCannotRedelegate
+                )
+            ) {
+                Status::Unauthorized
+            } else {
+                Status::Forbidden
+            };
+            (status, error.to_string())
+        })?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;

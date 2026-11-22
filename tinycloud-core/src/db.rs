@@ -1,4 +1,7 @@
 #[cfg(test)]
+#[path = "db/cacao_terminal_mode_tests.rs"]
+mod cacao_terminal_mode_tests;
+#[cfg(test)]
 #[path = "db/session_retire_tests.rs"]
 mod session_retire_tests;
 #[cfg(test)]
@@ -790,6 +793,10 @@ where
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
+        // TC-3810: reindex stored pre-upgrade CACAO delegation modes from their
+        // signed bytes before returning so no authorization traffic runs until
+        // terminal and malformed-mode markers are indexed.
+        delegation::reindex_cacao_modes(&pool, encryption.as_ref()).await?;
         let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
             (Some(seed), Some(stable_node_did)) => {
                 let (renewer_did, epoch, _) =
@@ -1288,6 +1295,17 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
+    /// TC-3810: lock-free preflight rejecting invocations whose cited chains
+    /// descend from a terminal ancestor or directly cite a boot-marked
+    /// malformed-mode leaf. Must run after signature verification and before
+    /// replay spend, upload staging, chain/space/writer guards, or data access.
+    pub async fn preflight_invocation_terminal_ancestors(
+        &self,
+        invocation: &crate::util::InvocationInfo,
+    ) -> Result<(), crate::models::invocation::Error> {
+        invocation::preflight_terminal_ancestors(&self.conn, &invocation.parents).await
+    }
+
     /// Run the ordinary invocation authorization kernel without recording an
     /// invocation or performing a data-plane operation.  Specialized routes
     /// (notably encryption decrypt) must call this before dispatch so they
@@ -2445,6 +2463,7 @@ where
         guards
     }
 
+    #[cfg(test)]
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
         self.transact_verified(events, &PreVerified::default())
             .await
@@ -2727,7 +2746,16 @@ where
             }
             // A delegation already stored answers as before, even once it
             // has expired: these exact signed bytes are already registered.
+            // TC-3810: a terminal-parent refusal must never be turned into
+            // already-registered success (e.g. a legacy child reposted after
+            // reindexing its terminal CACAO parent).
             if !renewal_lease
+                && !matches!(
+                    refused,
+                    TxError::InvalidDelegation(
+                        delegation::DelegationError::TerminalParentCannotRedelegate
+                    )
+                )
                 && delegation::Entity::find_by_id(retained_hash)
                     .one(&self.conn)
                     .await
@@ -2791,6 +2819,61 @@ where
         }
     }
 
+    /// TC-3810: lock-free preflight for a batch of delegations before taking
+    /// chain/space/writer locks or opening a caller-owned transaction. Tracks
+    /// earlier in-memory batch parents as well as already-stored parent
+    /// closures, so `[T, child_of_T]` and `[child_of_stored_T]` both fail
+    /// closed with `TerminalParentCannotRedelegate` before any lock or `BEGIN`.
+    pub async fn precheck_delegation_batch_verified(
+        &self,
+        delegations: &[Delegation],
+        verified: &PreVerified,
+    ) -> Result<PreVerified, TxError<B, K>> {
+        let mut all_verified = verified.clone();
+        let mut in_batch_terminal: HashMap<Hash, bool> = HashMap::new();
+        for delegation in delegations {
+            if self.secrets.renewal_seed().is_some_and(|seed| {
+                crate::renewal::renewal_identity_from_seed(seed).0 == delegation.0.delegator
+            }) {
+                return Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(
+                        delegation.0.delegator.clone(),
+                    ),
+                ));
+            }
+            if !all_verified.contains(&delegation.content_hash()) {
+                let checked = self.preverify_delegation(delegation).await?;
+                all_verified = all_verified.union(checked);
+            }
+            delegation::verify_time(&delegation.0.delegation).map_err(TxError::from)?;
+            let mut db_parent_ids = Vec::new();
+            for parent_cid in &delegation.0.parents {
+                let parent_id = Hash::from(*parent_cid);
+                if let Some(&is_terminal) = in_batch_terminal.get(&parent_id) {
+                    if is_terminal {
+                        return Err(TxError::InvalidDelegation(
+                            delegation::DelegationError::TerminalParentCannotRedelegate,
+                        ));
+                    }
+                } else {
+                    db_parent_ids.push(parent_id);
+                }
+            }
+            if !db_parent_ids.is_empty() {
+                delegation::check_parent_closure_not_terminal_readonly(&self.conn, &db_parent_ids)
+                    .await?;
+            }
+            in_batch_terminal.insert(
+                delegation.content_hash(),
+                matches!(
+                    delegation.0.delegation_mode,
+                    crate::util::DelegationMode::Terminal
+                ),
+            );
+        }
+        Ok(all_verified)
+    }
+
     /// Atomically register control-plane roots in the ordinary delegation
     /// graph.  The policy v3 tables remain indexes; the graph rows are needed
     /// so an S0 can be admitted through the same proof resolver as every
@@ -2799,24 +2882,15 @@ where
         &self,
         delegations: Vec<Delegation>,
     ) -> Result<TransactResult, TxError<B, K>> {
-        if let Some(seed) = self.secrets.renewal_seed() {
-            let renewer_did = crate::renewal::renewal_identity_from_seed(seed).0;
-            if let Some(delegation) = delegations
-                .iter()
-                .find(|item| item.0.delegator == renewer_did)
-            {
-                return Err(TxError::InvalidDelegation(
-                    delegation::DelegationError::UnauthorizedDelegator(
-                        delegation.0.delegator.clone(),
-                    ),
-                ));
-            }
-        }
-        self.transact(
+        let verified = self
+            .precheck_delegation_batch_verified(&delegations, &PreVerified::default())
+            .await?;
+        self.transact_verified(
             delegations
                 .into_iter()
                 .map(|delegation| Event::Delegation(Box::new(delegation)))
                 .collect(),
+            &verified,
         )
         .await
     }
@@ -3486,6 +3560,22 @@ where
                     }
                 }
             }
+        }
+        // TC-3810: verify public invocation signatures once and refuse
+        // terminal strict ancestors (or boot-marked malformed-mode leaves)
+        // before taking chain, KV-object, space-sequence, or writer locks.
+        let mode = if mode == InvokeMode::Public {
+            invocation::verify_invocation(&invocation.0.invocation)
+                .await
+                .map_err(TxError::<B, K>::from)?;
+            InvokeMode::Admitted
+        } else {
+            mode
+        };
+        if mode == InvokeMode::Admitted {
+            invocation::preflight_terminal_ancestors(&self.conn, &invocation.0.parents)
+                .await
+                .map_err(TxError::<B, K>::from)?;
         }
         let roots: Vec<Hash> = invocation
             .0
@@ -5166,7 +5256,7 @@ async fn stored_revocation_target<C: ConnectionTrait>(db: &C, target: Hash) -> R
 /// [`transact_verified`] checks only their time window, so a slow or forged
 /// signature never runs under a space lock. A hash names exact signed bytes,
 /// so a check cannot carry over to other bytes.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PreVerified(HashSet<Hash>);
 
 impl PreVerified {

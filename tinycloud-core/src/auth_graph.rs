@@ -26,9 +26,8 @@ use crate::models::revocation::MAX_CHAIN_TRAVERSAL_NODES;
 /// Batched ancestor-closure load over `parent_delegations`. A recursive CTE
 /// fetches all reachable edges in one query rather than walking one node at a
 /// time. The in-memory pass enforces the same fail-closed node budget as the
-/// per-node traversal used by the delegate/revoke paths. Production locks use
-/// `load_chain_lock_ids`; tests keep this as the sequential edge oracle.
-#[cfg(test)]
+/// per-node traversal used by the delegate/revoke paths. Pure read-only SQL
+/// (no string literals), safe under `track_writes`.
 pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],

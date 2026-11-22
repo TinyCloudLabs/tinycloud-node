@@ -14,6 +14,72 @@ use ucan_capabilities_object::{
     ConvertResult,
 };
 
+/// Error prefix produced when `xyz.tinycloud.policy/delegationMode` carries a
+/// malformed, null, or unknown value.
+pub const INVALID_DELEGATION_MODE_ERROR: &str = "invalid-delegation-mode";
+
+/// Delegation mode carried in the top-level ReCap object under
+/// `xyz.tinycloud.policy/delegationMode`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DelegationModeFact {
+    Terminal,
+    Attenuable,
+}
+
+impl DelegationModeFact {
+    pub const FIELD_NAME: &'static str = "xyz.tinycloud.policy/delegationMode";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Attenuable => "attenuable",
+        }
+    }
+}
+
+impl Serialize for DelegationModeFact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+fn deserialize_present_mode<'de, D>(deserializer: D) -> Result<Option<DelegationModeFact>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ModeVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ModeVisitor {
+        type Value = DelegationModeFact;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("the exact string \"terminal\" or \"attenuable\"")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match value {
+                "terminal" => Ok(DelegationModeFact::Terminal),
+                "attenuable" => Ok(DelegationModeFact::Attenuable),
+                _ => Err(E::custom(INVALID_DELEGATION_MODE_ERROR)),
+            }
+        }
+    }
+
+    // Reject null, numbers, booleans, arrays, objects, and unknown strings with
+    // the stable `INVALID_DELEGATION_MODE_ERROR` prefix so callers can map it
+    // deterministically without leaking untrusted values.
+    deserializer
+        .deserialize_str(ModeVisitor)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom(INVALID_DELEGATION_MODE_ERROR))
+}
+
 /// Representation of a set of delegated Capabilities.
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +92,16 @@ pub struct Capability<NB> {
     #[serde(rename = "prf")]
     #[serde_as(as = "Vec<B58Cid>")]
     proof: Vec<Cid>,
+
+    /// Optional top-level delegation mode fact (`terminal` | `attenuable`).
+    /// Omitted on serialization when unset so legacy ReCaps are byte-identical.
+    #[serde(
+        default,
+        rename = "xyz.tinycloud.policy/delegationMode",
+        deserialize_with = "deserialize_present_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    delegation_mode: Option<DelegationModeFact>,
 }
 
 impl<NB> Capability<NB> {
@@ -34,6 +110,7 @@ impl<NB> Capability<NB> {
         Self {
             attenuations: Capabilities::new(),
             proof: Default::default(),
+            delegation_mode: None,
         }
     }
 
@@ -60,6 +137,12 @@ impl<NB> Capability<NB> {
     where
         NB2: From<NB> + From<NB1>,
     {
+        let mode = match (self.delegation_mode, other.delegation_mode) {
+            (Some(DelegationModeFact::Terminal), _) | (_, Some(DelegationModeFact::Terminal)) => {
+                Some(DelegationModeFact::Terminal)
+            }
+            (left, right) => left.or(right),
+        };
         let (caps, mut proofs) = self.into_inner();
         for proof in &other.proof {
             if proofs.contains(proof) {
@@ -71,7 +154,19 @@ impl<NB> Capability<NB> {
         Capability {
             attenuations: caps.merge(other.attenuations),
             proof: proofs,
+            delegation_mode: mode,
         }
+    }
+
+    /// Read the optional top-level delegation mode fact (`terminal` | `attenuable`).
+    pub fn delegation_mode(&self) -> Option<DelegationModeFact> {
+        self.delegation_mode
+    }
+
+    /// Set the top-level delegation mode fact (`terminal` | `attenuable`).
+    pub fn with_delegation_mode(mut self, mode: DelegationModeFact) -> Self {
+        self.delegation_mode = Some(mode);
+        self
     }
 
     /// Add an allowed action for the given target, with a set of note-benes

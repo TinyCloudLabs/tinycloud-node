@@ -9,7 +9,8 @@ use tinycloud_auth::{
     ipld_core::cid::Cid,
     resource::SpaceId,
     siwe_recap::{
-        Capability as SiweCap, DecodingError as SiweDecodingError, VerificationError as SiweError,
+        Capability as SiweCap, DecodingError as SiweDecodingError, DelegationModeFact,
+        VerificationError as SiweError, INVALID_DELEGATION_MODE_ERROR,
     },
 };
 use ucan_capabilities_object::Capabilities as UcanCapabilities;
@@ -93,23 +94,37 @@ impl<'de> Deserialize<'de> for SiweCaveatValue {
     }
 }
 
-/// Maps a SIWE ReCap decode failure. Only a refused caveat value becomes
-/// `UnsupportedCaveat`; every other failure keeps `SiweCapError`.
+/// Whether a SIWE ReCap verification/decode error was caused by a malformed,
+/// null, unknown, or duplicate `xyz.tinycloud.policy/delegationMode` field.
+pub(crate) fn is_invalid_delegation_mode_error(e: &SiweError) -> bool {
+    let SiweError::Decoding(SiweDecodingError::De(de)) = e else {
+        return false;
+    };
+    let message = de.to_string();
+    message.starts_with(INVALID_DELEGATION_MODE_ERROR)
+        || message.starts_with(&format!(
+            "duplicate field `{}`",
+            DelegationModeFact::FIELD_NAME
+        ))
+}
+
+/// Maps a SIWE ReCap decode failure. Refused caveat values become
+/// `UnsupportedCaveat`, malformed or duplicate delegation mode facts become
+/// `InvalidDelegationMode`, and every other failure keeps `SiweCapError`.
 ///
-/// The refusal is recognized by the start of the serde message. A parser error
-/// could match only if its text begins with this exact sentence; the result is
-/// still a refusal, so no caveat is accepted by such a match.
+/// Refusals are recognized by the start of the serde message. A parser error
+/// could match only if its text begins with one of these exact prefixes; the
+/// result is still a refusal, so no caveat or mode is accepted by such a match.
 fn siwe_decode_error(e: SiweError) -> DelegationError {
-    let refused = matches!(
-        &e,
-        SiweError::Decoding(SiweDecodingError::De(de))
-            if de.to_string().starts_with(SIWE_CAVEAT_REFUSED)
-    );
-    if refused {
-        DelegationError::UnsupportedCaveat(SIWE_CAVEAT_REFUSED.to_string())
-    } else {
-        DelegationError::SiweCapError(e)
+    if is_invalid_delegation_mode_error(&e) {
+        return DelegationError::InvalidDelegationMode;
     }
+    if let SiweError::Decoding(SiweDecodingError::De(de)) = &e {
+        if de.to_string().starts_with(SIWE_CAVEAT_REFUSED) {
+            return DelegationError::UnsupportedCaveat(SIWE_CAVEAT_REFUSED.to_string());
+        }
+    }
+    DelegationError::SiweCapError(e)
 }
 
 fn extract_siwe_cap(c: SiweCap<SiweCaveatValue>) -> (Vec<Capability>, Vec<Cid>) {
@@ -205,6 +220,8 @@ pub enum DelegationError {
     InvalidStatement,
     #[error("unsupported-caveat: {0}")]
     UnsupportedCaveat(String),
+    #[error("invalid-delegation-mode")]
+    InvalidDelegationMode,
 }
 
 impl TryFrom<TinyCloudDelegation> for DelegationInfo {
@@ -236,9 +253,18 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                 let maybe_siwe_cap = SiweCap::<SiweCaveatValue>::extract_and_verify(&m)
                     .map_err(siwe_decode_error)?;
 
-                let (capabilities, parents) = match maybe_siwe_cap {
-                    Some(siwe_cap) => extract_siwe_cap(siwe_cap),
-                    None => (vec![], vec![]),
+                let (capabilities, parents, delegation_mode) = match maybe_siwe_cap {
+                    Some(siwe_cap) => {
+                        let mode = match siwe_cap.delegation_mode() {
+                            Some(DelegationModeFact::Terminal) => DelegationMode::Terminal,
+                            Some(DelegationModeFact::Attenuable) | None => {
+                                DelegationMode::Attenuable
+                            }
+                        };
+                        let (capabilities, parents) = extract_siwe_cap(siwe_cap);
+                        (capabilities, parents, mode)
+                    }
+                    None => (vec![], vec![], DelegationMode::Attenuable),
                 };
 
                 Self {
@@ -249,9 +275,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
                     not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
                     issued_at: Some(*c.payload().iat.as_ref()),
-                    // CACAO delegations do not currently carry the terminal
-                    // marker; only policy-engine-issued UCAN delegations do.
-                    delegation_mode: DelegationMode::Attenuable,
+                    delegation_mode,
                     delegation: d,
                 }
             }
@@ -562,5 +586,200 @@ mod tests {
         let err = DelegationInfo::try_from(siwe_with_raw_recap(r#"{"att":5,"prf":[]}"#))
             .expect_err("a non-object attenuation must not decode");
         assert!(matches!(err, DelegationError::SiweCapError(_)), "got {err}");
+    }
+
+    /// A SIWE CACAO with a valid statement matching `att`, whose ReCap JSON is
+    /// `recap_json` verbatim.
+    fn siwe_with_verified_raw_recap(recap_json: &str, statement: &str) -> TinyCloudDelegation {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(recap_json);
+        let mut message = base_message();
+        message.statement = Some(statement.to_string());
+        message.resources.push(
+            format!("{}{encoded}", tinycloud_auth::siwe_recap::RESOURCE_PREFIX)
+                .parse()
+                .unwrap(),
+        );
+        cacao(message)
+    }
+
+    fn expected_statement(grants: &[(&str, &str)]) -> String {
+        let mut recap = tinycloud_auth::siwe_recap::Capability::<serde_json::Value>::new();
+        for (resource, ability) in grants {
+            recap.with_action(resource.parse().unwrap(), ability.parse().unwrap(), []);
+        }
+        recap.to_statement()
+    }
+
+    /// TC-3810: top-level `xyz.tinycloud.policy/delegationMode` parses
+    /// `terminal`, explicit `attenuable`, and legacy absence accurately across
+    /// single- and multi-resource CACAOs.
+    #[test]
+    fn cacao_delegation_mode_parses_terminal_attenuable_and_absent() {
+        let kv =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/kv/main";
+        let stmt =
+            expected_statement(&[(RESOURCE, "tinycloud.sql/read"), (kv, "tinycloud.kv/get")]);
+        let att = format!(
+            r#"{{"{RESOURCE}":{{"tinycloud.sql/read":[{{}}]}},"{kv}":{{"tinycloud.kv/get":[{{}}]}}}}"#
+        );
+
+        // Terminal
+        let terminal_json =
+            format!(r#"{{"att":{att},"prf":[],"xyz.tinycloud.policy/delegationMode":"terminal"}}"#);
+        let info =
+            DelegationInfo::try_from(siwe_with_verified_raw_recap(&terminal_json, &stmt)).unwrap();
+        assert_eq!(info.delegation_mode, DelegationMode::Terminal);
+        assert_eq!(info.capabilities.len(), 2);
+
+        // Explicit attenuable
+        let attenuable_json = format!(
+            r#"{{"att":{att},"prf":[],"xyz.tinycloud.policy/delegationMode":"attenuable"}}"#
+        );
+        let info = DelegationInfo::try_from(siwe_with_verified_raw_recap(&attenuable_json, &stmt))
+            .unwrap();
+        assert_eq!(info.delegation_mode, DelegationMode::Attenuable);
+        assert_eq!(info.capabilities.len(), 2);
+
+        // Absent (legacy)
+        let absent_json = format!(r#"{{"att":{att},"prf":[]}}"#);
+        let info =
+            DelegationInfo::try_from(siwe_with_verified_raw_recap(&absent_json, &stmt)).unwrap();
+        assert_eq!(info.delegation_mode, DelegationMode::Attenuable);
+        assert_eq!(info.capabilities.len(), 2);
+
+        // Builder omits field when unset (byte-identical legacy) and emits when set.
+        let mut legacy_cap = tinycloud_auth::siwe_recap::Capability::<serde_json::Value>::new();
+        legacy_cap.with_action(
+            RESOURCE.parse().unwrap(),
+            "tinycloud.sql/read".parse().unwrap(),
+            [],
+        );
+        let legacy_msg = legacy_cap.build_message(base_message()).unwrap();
+        let legacy_info = DelegationInfo::try_from(cacao(legacy_msg.clone())).unwrap();
+        assert_eq!(legacy_info.delegation_mode, DelegationMode::Attenuable);
+        let legacy_uri = legacy_msg.resources.last().unwrap().as_str();
+        let legacy_decoded = String::from_utf8(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                legacy_uri
+                    .strip_prefix(tinycloud_auth::siwe_recap::RESOURCE_PREFIX)
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!legacy_decoded.contains("delegationMode"));
+
+        let terminal_msg = legacy_cap
+            .clone()
+            .with_delegation_mode(DelegationModeFact::Terminal)
+            .build_message(base_message())
+            .unwrap();
+        assert_eq!(terminal_msg.statement, legacy_msg.statement);
+        let terminal_info = DelegationInfo::try_from(cacao(terminal_msg)).unwrap();
+        assert_eq!(terminal_info.delegation_mode, DelegationMode::Terminal);
+    }
+
+    /// TC-3810: malformed, null, unknown, and duplicate delegationMode values
+    /// (including escaped-key equivalents) refuse the CACAO with
+    /// `InvalidDelegationMode`, with no last-key-wins or partial acceptance.
+    #[test]
+    fn cacao_malformed_or_duplicate_delegation_mode_is_refused() {
+        let stmt = expected_statement(&[(RESOURCE, "tinycloud.sql/read")]);
+        let att = format!(r#"{{"{RESOURCE}":{{"tinycloud.sql/read":[{{}}]}}}}"#);
+        let bad_tails = [
+            r#""xyz.tinycloud.policy/delegationMode":null"#,
+            r#""xyz.tinycloud.policy/delegationMode":true"#,
+            r#""xyz.tinycloud.policy/delegationMode":false"#,
+            r#""xyz.tinycloud.policy/delegationMode":0"#,
+            r#""xyz.tinycloud.policy/delegationMode":1"#,
+            r#""xyz.tinycloud.policy/delegationMode":[]"#,
+            r#""xyz.tinycloud.policy/delegationMode":["terminal"]"#,
+            r#""xyz.tinycloud.policy/delegationMode":{}"#,
+            r#""xyz.tinycloud.policy/delegationMode":{"mode":"terminal"}"#,
+            r#""xyz.tinycloud.policy/delegationMode":"""#,
+            r#""xyz.tinycloud.policy/delegationMode":"Terminal""#,
+            r#""xyz.tinycloud.policy/delegationMode":"TERMINAL""#,
+            r#""xyz.tinycloud.policy/delegationMode":"bogus""#,
+            r#""xyz.tinycloud.policy/delegationMode":"terminal ""#,
+            // Duplicate keys in every order, identical or conflicting, raw or JSON-escaped.
+            r#""xyz.tinycloud.policy/delegationMode":"terminal","xyz.tinycloud.policy/delegationMode":"attenuable""#,
+            r#""xyz.tinycloud.policy/delegationMode":"attenuable","xyz.tinycloud.policy/delegationMode":"terminal""#,
+            r#""xyz.tinycloud.policy/delegationMode":"terminal","xyz.tinycloud.policy/delegationMode":"terminal""#,
+            r#""xyz.tinycloud.policy/delegationMode":"attenuable","xyz.tinycloud.policy/delegationMode":"attenuable""#,
+            r#""xyz.tinycloud.policy/delegationMode":"bogus","xyz.tinycloud.policy/delegationMode":"terminal""#,
+            r#""xyz.tinycloud.policy/delegationMode":"terminal","xyz.tinycloud.policy/delegationMode":"bogus""#,
+            r#""xyz.tinycloud.policy/delegationMode":"terminal","xyz.tinycloud.policy\u002fdelegationMode":"attenuable""#,
+            r#""xyz.tinycloud.policy\u002fdelegationMode":"attenuable","xyz.tinycloud.policy/delegationMode":"terminal""#,
+            r#""xyz.tinycloud.policy/delegationMode":"terminal","xyz.tinycloud.policy\u002fdelegationMode":"terminal""#,
+        ];
+
+        for tail in bad_tails {
+            let json = format!(r#"{{"att":{att},"prf":[],{tail}}}"#);
+            let err = DelegationInfo::try_from(siwe_with_verified_raw_recap(&json, &stmt))
+                .expect_err(tail);
+            assert!(
+                matches!(err, DelegationError::InvalidDelegationMode),
+                "expected InvalidDelegationMode for {tail}, got {err}"
+            );
+            assert_eq!(err.to_string(), "invalid-delegation-mode");
+        }
+    }
+
+    /// TC-3810: placing delegationMode as an `nb` caveat on one ability is
+    /// refused by the existing non-null SIWE caveat rule (no partial mode).
+    #[test]
+    fn cacao_mode_as_nb_caveat_is_refused_by_existing_caveat_rule() {
+        let kv =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/kv/main";
+        let stmt =
+            expected_statement(&[(RESOURCE, "tinycloud.sql/read"), (kv, "tinycloud.kv/get")]);
+        let json = format!(
+            r#"{{"att":{{"{RESOURCE}":{{"tinycloud.sql/read":[{{"xyz.tinycloud.policy/delegationMode":"terminal"}}]}},"{kv}":{{"tinycloud.kv/get":[{{}}]}}}},"prf":[]}}"#
+        );
+        let err =
+            DelegationInfo::try_from(siwe_with_verified_raw_recap(&json, &stmt)).expect_err("nb");
+        assert!(
+            matches!(err, DelegationError::UnsupportedCaveat(_)),
+            "got {err}"
+        );
+    }
+
+    /// TC-3810 mixed-fleet compatibility: an unrelated unknown top-level ReCap
+    /// field is still ignored, and a pinned legacy parser (reading only `att`
+    /// and `prf`) decodes a terminal ReCap cleanly with identical capabilities,
+    /// statement, and raw CACAO CID.
+    #[test]
+    fn cacao_unknown_top_level_field_and_old_node_simulation() {
+        #[derive(serde::Deserialize)]
+        struct LegacyRecap {
+            att: ucan_capabilities_object::Capabilities<SiweCaveatValue>,
+            prf: Vec<String>,
+        }
+
+        let stmt = expected_statement(&[(RESOURCE, "tinycloud.sql/read")]);
+        let att = format!(r#"{{"{RESOURCE}":{{"tinycloud.sql/read":[{{}}]}}}}"#);
+
+        // Unrelated unknown top-level field is preserved/ignored.
+        let with_other = format!(r#"{{"att":{att},"prf":[],"other.vendor/flag":true}}"#);
+        let info =
+            DelegationInfo::try_from(siwe_with_verified_raw_recap(&with_other, &stmt)).unwrap();
+        assert_eq!(info.delegation_mode, DelegationMode::Attenuable);
+
+        // Legacy parser decodes a terminal ReCap without error and keeps
+        // identical att/prf/statement and raw CACAO serialization CID.
+        let terminal_json =
+            format!(r#"{{"att":{att},"prf":[],"xyz.tinycloud.policy/delegationMode":"terminal"}}"#);
+        let legacy: LegacyRecap = serde_json::from_str(&terminal_json).unwrap();
+        assert_eq!(legacy.att.abilities().len(), 1);
+        assert!(legacy.prf.is_empty());
+
+        let new_cap: SiweCap<SiweCaveatValue> = serde_json::from_str(&terminal_json).unwrap();
+        assert_eq!(new_cap.to_statement(), stmt);
+        assert_eq!(
+            new_cap.delegation_mode(),
+            Some(DelegationModeFact::Terminal)
+        );
     }
 }

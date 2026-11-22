@@ -91,7 +91,7 @@ async fn validate_encryption<C: ConnectionTrait>(
     Ok(())
 }
 
-fn stored_plaintext<'a>(
+pub(crate) fn stored_plaintext<'a>(
     encryption: Option<&ColumnEncryption>,
     id: Hash,
     stored: &'a [u8],

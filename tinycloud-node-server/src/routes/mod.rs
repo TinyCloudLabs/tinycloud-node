@@ -2167,6 +2167,20 @@ async fn invoke_impl(
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
         }
+        // TC-3810: refuse invocations descending from a terminal ancestor (or
+        // directly citing a boot-marked malformed-mode leaf) after signature
+        // admission and before any replay spend, upload staging, lock, or data
+        // access across every /invoke handler.
+        tinycloud
+            .preflight_invocation_terminal_ancestors(&admitted.invocation().0)
+            .await
+            .map_err(|error| {
+                authorization_refusal(
+                    "server.invoke.auth",
+                    &TxStoreError::Tx(error.into()),
+                    false,
+                )
+            })?;
 
         // Named keys are served only while `named_keys_v1` is on: with it
         // off, an invocation on a key or key prefix is refused before any
@@ -2242,6 +2256,10 @@ async fn invoke_impl(
                     invocation_model::Error::InvalidInvocation(
                         invocation_model::InvocationError::Registry(error),
                     ) => registry_failure(error),
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::TerminalParentCannotRedelegate
+                        | invocation_model::InvocationError::InvalidDelegationMode,
+                    ) => (Status::Unauthorized, error.to_string()),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Other, &db, false, db.to_string(),
                     ),
@@ -2597,6 +2615,10 @@ async fn invoke_impl(
                     invocation_model::Error::InvalidInvocation(
                         invocation_model::InvocationError::Registry(error),
                     ) => registry_failure(error),
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::TerminalParentCannotRedelegate
+                        | invocation_model::InvocationError::InvalidDelegationMode,
+                    ) => (Status::Unauthorized, error.to_string()),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Kv, &db, false, db.to_string(),
                     ),
