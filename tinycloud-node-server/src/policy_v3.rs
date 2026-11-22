@@ -12341,6 +12341,10 @@ mod named_keys_gate_tests;
 mod root_revocation_tests;
 
 #[cfg(test)]
+#[path = "policy_v3/encryption_owner_revocation_tests.rs"]
+mod encryption_owner_revocation_tests;
+
+#[cfg(test)]
 #[path = "policy_v3/registration_probe_tests.rs"]
 mod registration_probe_tests;
 
