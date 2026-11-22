@@ -183,6 +183,7 @@ mod tests {
     }
 }
 
+pub mod backoff;
 pub mod bootstrap;
 pub mod drain;
 #[cfg(feature = "sql-store-failpoints")]
