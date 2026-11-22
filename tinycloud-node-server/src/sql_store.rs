@@ -4,14 +4,11 @@
 //! (lives in `tinycloud-core::sql::store::shadow`) and the node's runtime.
 //! It builds a [`ShadowHandle`] only when `[sql_store] enabled` is true and
 //! at least one space is in the allowlist; otherwise it returns `None` and
-//! the node pays nothing.
+//! the node pays nothing: no owner-marker IO, no object store, no task.
 //!
-//! Ships off. The shutdown drain and catch-up path are not implemented yet,
-//! which is a known break for any database the uploader has not already
-//! captured. Uploading databases unencrypted is not cleared yet, so the
-//! build-level gate refuses to enable the store until a later change lifts
-//! both.
-//!
+//! Ships off. Uploading databases unencrypted is not cleared yet, and the
+//! restore check (TC-1491 P2, `tinycloud node sql-store restore-check`, in
+//! `sql_restore_check`) has not passed on any space yet, so
 //! `SqlStoreConfig::validate_for_database` keeps its terminating
 //! `"sql_store is not available in this build"` refusal in this build. The
 //! acceptance tests exercise this module directly, bypassing that gate.
@@ -26,35 +23,45 @@
 //!   mismatch is a `ConfigError::OwnerMarkerMismatch` and refuses the
 //!   start: once written, every future enable of this bucket and prefix
 //!   must present the same `store_id`.
-//! - The shadow sink itself is `NoopSink` until the uploader run loop
-//!   lands. That lets the node wiring exist and be tested on its own
-//!   merits without coupling the integration gate to uploader iteration.
+//! - The sink is a [`NoticeBoard`]: the save hook's metadata-only notices
+//!   land there, and the scheduler task (`shadow::scheduler`) drains them,
+//!   runs the startup lag scan (which bootstraps every allowlisted database
+//!   without a frontier) and uploads from Postgres through
+//!   [`PgArtifactSource`].
+//! - [`ShadowHandle::drain`] stops scheduling at shutdown, waits for
+//!   in-flight uploads up to a deadline, and reports each database's
+//!   frontier against the newest revision the uploader learned of.
 //!
 //! TC-1491.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::future::Future;
 use std::pin::Pin;
 
+use tinycloud_core::database_artifacts::DatabaseArtifactRepository;
 use tinycloud_core::sql::store::{
     shadow::{
+        budget::DiskBudget,
+        metrics::ShadowMetrics,
         owner::{self, BootOutcome, OwnerMarkerError, StoreId, OWNER_OBJECT_KEY},
-        NoopSink,
+        scheduler::{self, DrainReport, SchedulerConfig, SchedulerHandle, ShadowDeps},
+        source::PgArtifactSource,
+        NoticeBoard,
     },
-    ShadowSink,
+    DbSqlManifest, ShadowSink, SpaceAllowlist, SqlObjectStore,
 };
 
 /// Everything the runtime holds to keep the shadow uploader alive for the
-/// process's lifetime. The handle's `Drop` releases every background task.
-///
-/// The uploader core is not built in this session; the handle currently
-/// bundles the [`ShadowSink`] wired into `SqlService` and the resolved
-/// owner-marker identity. The uploader run loop + bootstrap / sweep /
-/// drain join at the same handle in later milestones.
+/// process's lifetime: the [`ShadowSink`] wired into `SqlService`, the
+/// resolved owner-marker identity, and the scheduler task. Dropping the
+/// handle without [`Self::drain`] aborts the task.
 pub struct ShadowHandle {
     pub sink: Arc<dyn ShadowSink>,
     pub owner: StoreId,
+    scheduler: SchedulerHandle,
 }
 
 impl ShadowHandle {
@@ -62,6 +69,28 @@ impl ShadowHandle {
     pub fn sink(&self) -> Arc<dyn ShadowSink> {
         Arc::clone(&self.sink)
     }
+
+    /// Stop scheduling, give in-flight uploads up to `deadline`
+    /// (`[sql_store] drain_secs`), and report each database's `last_seq`
+    /// against its target revision.
+    pub async fn drain(self, deadline: Duration) -> DrainReport {
+        self.scheduler.drain(deadline).await
+    }
+}
+
+/// What the uploader runs on. Built only after the gate passed and the
+/// owner marker paired (`maybe_build` awaits it then, never before).
+pub struct ShadowRuntime {
+    pub store: Arc<dyn SqlObjectStore>,
+    /// The repository `SqlService` saves through; the upload jobs read the
+    /// checkpoint and WAL from it.
+    pub artifacts: Arc<dyn DatabaseArtifactRepository>,
+    /// Scratch files for streamed uploads (created if missing).
+    pub scratch_dir: PathBuf,
+    /// Bytes the scratch files may hold at once (`[sql_store] spool_cap`).
+    pub scratch_bytes: u64,
+    pub scheduler: SchedulerConfig,
+    pub metrics: Arc<dyn ShadowMetrics>,
 }
 
 /// Reasons the shadow handle refused to start. Mapped onto the node's
@@ -114,8 +143,8 @@ pub trait OwnerMarkerIo {
     /// Return the marker object's body if it exists; `None` if absent.
     fn load_marker_body<'a>(&'a self) -> LoadMarkerFut<'a>;
 
-    /// Write `body` to the marker object exactly once, using `put_if_absent`
-    /// semantics. If the object exists with a different body the
+    /// Write `body` to the marker object exactly once, with a create-once
+    /// (`If-None-Match: *`) write. If the object exists with a different body the
     /// implementation must return `ShadowBuildError::OwnerMarkerMismatch`;
     /// if it exists with the same body it may return `Ok(())` (the pairing
     /// still holds). An unconditional PUT would silently overwrite a
@@ -138,10 +167,10 @@ pub trait OwnerMarkerIo {
 ///    (`RowMissingMarkerPresent`): the control DB was wiped and the bucket
 ///    is still owned by a (possibly different) node.
 /// 4. If both are absent, mint a fresh candidate, insert the row, then
-///    `put_if_absent` the marker with that body.
+///    create the marker once with that body.
 /// 5. If both are present, compare: match returns `Ok`, mismatch refuses.
 /// 6. If the row is present and the marker is absent (fresh bucket,
-///    retained control DB), `put_if_absent` the marker with the row's ID.
+///    retained control DB), create the marker once with the row's ID.
 ///
 /// This function does not log the store ID or the marker body. The caller
 /// obtains a `StoreId` on success; the metric `sql_store_owner_marker_total`
@@ -188,24 +217,53 @@ pub async fn pair_owner_marker<I: OwnerMarkerIo>(
 /// module directly.
 pub const OWNER_MARKER_KEY: &str = OWNER_OBJECT_KEY;
 
-/// Build a shadow sink + owner handle if the flag and the allowlist permit;
-/// return `None` otherwise. Used by `resolve_runtime`.
+/// Build the shadow handle if the flag and the allowlist permit; return
+/// `None` otherwise. Used by `resolve_runtime`.
 ///
-/// This stub returns `NoopSink` as the sink for now (the uploader core is
-/// built in a later milestone); it still runs the full owner-marker
-/// pairing so a mismatch refuses the start.
-pub async fn maybe_build<I: OwnerMarkerIo>(
+/// Off (`enabled` false or an empty allowlist) touches nothing: no marker
+/// IO, and `runtime` is dropped unpolled, so whatever it would open (the S3
+/// probe, the scratch directory) is never opened. On, it pairs the owner
+/// marker (a mismatch refuses the start), then awaits `runtime`, wires a
+/// [`NoticeBoard`] as the sink and spawns the scheduler on the current
+/// tokio runtime. `conn` is the control database: the manifest, and the
+/// artifact rows the lag scan joins it with, live there.
+pub async fn maybe_build<I, R>(
     enabled: bool,
-    allowlist_empty: bool,
+    allowlist: SpaceAllowlist,
     conn: &tinycloud_core::sea_orm::DatabaseConnection,
     io: &I,
-) -> Result<Option<ShadowHandle>, ShadowBuildError> {
-    if !enabled || allowlist_empty {
+    runtime: R,
+) -> Result<Option<ShadowHandle>, ShadowBuildError>
+where
+    I: OwnerMarkerIo,
+    R: Future<Output = Result<ShadowRuntime, ShadowBuildError>>,
+{
+    if !enabled || allowlist.is_empty() {
         return Ok(None);
     }
     let owner = pair_owner_marker(conn, io).await?;
-    let sink: Arc<dyn ShadowSink> = Arc::new(NoopSink);
-    Ok(Some(ShadowHandle { sink, owner }))
+    let runtime = runtime.await?;
+    std::fs::create_dir_all(&runtime.scratch_dir).map_err(|e| {
+        ShadowBuildError::System(format!("sql_store scratch directory: {:?}", e.kind()))
+    })?;
+    let board = Arc::new(NoticeBoard::new(allowlist, runtime.metrics.clone()));
+    let scheduler = scheduler::spawn(
+        ShadowDeps {
+            control: conn.clone(),
+            manifest: Arc::new(DbSqlManifest::new(conn.clone())),
+            store: runtime.store,
+            source: Arc::new(PgArtifactSource::new(runtime.artifacts)),
+            disk: DiskBudget::new(runtime.scratch_dir, runtime.scratch_bytes),
+            board: board.clone(),
+            metrics: runtime.metrics,
+        },
+        runtime.scheduler,
+    );
+    Ok(Some(ShadowHandle {
+        sink: board,
+        owner,
+        scheduler,
+    }))
 }
 
 #[cfg(test)]
@@ -256,7 +314,7 @@ mod tests {
                 let mut current = marker.lock().unwrap();
                 if let Some(existing) = current.as_ref() {
                     if existing == &body {
-                        // Same body: idempotent under put_if_absent.
+                        // Same body: idempotent under a create-once write.
                         return Ok(());
                     }
                     return Err(ShadowBuildError::OwnerMarkerMismatch);
@@ -329,11 +387,22 @@ mod tests {
         ));
     }
 
+    /// The runtime future of an off gate: never polled.
+    async fn never() -> Result<ShadowRuntime, ShadowBuildError> {
+        panic!("the runtime is built only when the gate is on")
+    }
+
+    fn allow(spaces: &[&str]) -> SpaceAllowlist {
+        SpaceAllowlist::new(spaces.iter().map(|s| s.to_string()))
+    }
+
     #[tokio::test]
     async fn disabled_flag_builds_no_handle_and_touches_no_io() {
         let conn = fresh_conn().await;
         let io = FakeIo::new();
-        let handle = maybe_build(false, true, &conn, &io).await.unwrap();
+        let handle = maybe_build(false, allow(&["tinycloud:x"]), &conn, &io, never())
+            .await
+            .unwrap();
         assert!(handle.is_none());
         assert_eq!(io.puts(), 0);
     }
@@ -342,21 +411,91 @@ mod tests {
     async fn empty_allowlist_builds_no_handle_and_touches_no_io() {
         let conn = fresh_conn().await;
         let io = FakeIo::new();
-        let handle = maybe_build(true, true, &conn, &io).await.unwrap();
+        let handle = maybe_build(true, allow(&[]), &conn, &io, never())
+            .await
+            .unwrap();
         assert!(handle.is_none());
         assert_eq!(io.puts(), 0);
     }
 
+    const SPACE: &str = "tinycloud:pkh:eip155:1:0xAb://default";
+
     #[tokio::test]
-    async fn enabled_with_non_empty_allowlist_builds_a_handle_and_writes_marker() {
-        let conn = fresh_conn().await;
+    async fn enabled_with_non_empty_allowlist_bootstraps_and_drains_caught_up() {
+        use tinycloud_core::database_artifacts::{
+            ArtifactExpectation, SeaOrmDatabaseArtifactRepository,
+        };
+        use tinycloud_core::sql::store::shadow::metrics::NoopMetrics;
+        use tinycloud_core::sql::store::{DbRef, MemorySqlObjectStore, SqlManifest};
+
+        // One connection: every user sees the same in-memory database.
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1).sqlx_logging(false);
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let artifacts = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        let saved = artifacts
+            .save(
+                "sql",
+                SPACE,
+                "main",
+                bytes::Bytes::from_static(b"checkpoint"),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let store = Arc::new(MemorySqlObjectStore::default());
+        let scratch = tempfile::tempdir().unwrap();
         let io = FakeIo::new();
-        let handle = maybe_build(true, false, &conn, &io).await.unwrap().unwrap();
+        let runtime = ShadowRuntime {
+            store: store.clone(),
+            artifacts,
+            scratch_dir: scratch.path().join("shadow"),
+            scratch_bytes: 1 << 20,
+            scheduler: SchedulerConfig {
+                policy: tinycloud_core::sql::store::shadow::machine::Policy {
+                    interval: Duration::ZERO,
+                    ..Default::default()
+                },
+                tick: Duration::from_millis(5),
+                ..SchedulerConfig::default()
+            },
+            metrics: Arc::new(NoopMetrics),
+        };
+        let handle = maybe_build(true, allow(&[SPACE]), &conn, &io, async { Ok(runtime) })
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(io.puts(), 1);
         assert_eq!(
             io.marker.lock().unwrap().as_deref(),
             Some(handle.owner.as_str().as_bytes())
         );
+        // The startup lag scan bootstraps the database with no notice.
+        let manifest = DbSqlManifest::new(conn.clone());
+        let db = DbRef {
+            space: SPACE,
+            db_id: "main",
+        };
+        let frontier = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(f) = manifest.current(&db).await.unwrap() {
+                    return f;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the startup scan bootstraps the database");
+        assert_eq!(frontier.last_seq, saved.revision as u64);
+        assert_eq!(frontier.base_checkpoint_cid, saved.checkpoint_content_hash);
+        assert_eq!(
+            store.bytes(&frontier.base_snapshot_key).unwrap(),
+            b"checkpoint"
+        );
+        let report = handle.drain(Duration::from_secs(5)).await;
+        assert_eq!(report.abandoned_jobs, 0);
+        assert!(report.databases.iter().all(|d| d.caught_up()), "{report:?}");
     }
 
     #[tokio::test]
