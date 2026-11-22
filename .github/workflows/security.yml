@@ -22,7 +22,10 @@ concurrency:
 jobs:
   # Secret scan. A PR scans only its own commits (base..head); main scans the
   # whole history against the reviewed baseline in .gitleaksignore. The
-  # did:key allowlist lives in .gitleaks.toml.
+  # did:key allowlist lives in .gitleaks.toml. A PR is scanned with the
+  # baseline and config of its base commit, so it cannot allowlist its own
+  # finding; a baseline change lands in its own PR first. Inline
+  # `gitleaks:allow` comments are not honoured.
   gitleaks:
     name: gitleaks
     runs-on: ubuntu-latest
@@ -51,14 +54,27 @@ jobs:
       run: |
         set -euo pipefail
         gitleaks version
-        args=(git --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner --exit-code 1)
+        args=(git --redact --no-banner --exit-code 1 --ignore-gitleaks-allow)
         if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
           [[ "${BASE_SHA}" =~ ^[0-9a-f]{40}$ && "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::PR base/head SHA missing"; exit 1; }
           git cat-file -e "${HEAD_SHA}^{commit}"
           git cat-file -e "${BASE_SHA}^{commit}"
+          # gitleaks also loads .gitleaksignore and .gitleaks.toml from the
+          # scanned directory, so remove the PR's copies from the worktree.
+          # The scan reads commits from git, not from the worktree.
+          rm -f .gitleaksignore .gitleaks.toml
+          ignore="${RUNNER_TEMP}/base.gitleaksignore"
+          git show "${BASE_SHA}:.gitleaksignore" > "${ignore}" 2>/dev/null || : > "${ignore}"
+          args+=(--gitleaks-ignore-path "${ignore}")
+          config="${RUNNER_TEMP}/base.gitleaks.toml"
+          if git show "${BASE_SHA}:.gitleaks.toml" > "${config}" 2>/dev/null; then
+            args+=(--config "${config}")
+          else
+            echo "Base has no .gitleaks.toml; using the gitleaks default rules."
+          fi
           gitleaks "${args[@]}" --log-opts="${BASE_SHA}..${HEAD_SHA}" .
         else
-          gitleaks "${args[@]}" .
+          gitleaks "${args[@]}" --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore .
         fi
 
   # Whole-workspace dependency policy (deny.toml): RustSec advisories, bans and

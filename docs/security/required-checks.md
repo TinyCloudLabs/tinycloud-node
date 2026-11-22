@@ -36,10 +36,13 @@ build` would let an image scanner see them; that is a possible later item.
 - `.gitleaksignore`: fingerprints of the findings in full history at
   `ccc14ec4`, each file under a comment saying why it is not a live secret.
   `.gitleaks.toml` allowlists `did:key` identifiers, which are public keys.
-  For a new finding in a PR: if it is a live credential, rotate it first and
-  never baseline it. If it is a fixture or a public value, add its fingerprint
-  (`gitleaks git --report-format json` prints it) under a comment with the
-  reason, in a PR reviewed by security.
+  A PR is scanned with the `.gitleaksignore` and `.gitleaks.toml` of its base
+  commit, and inline `gitleaks:allow` comments are not honoured, so a PR
+  cannot allowlist its own finding. For a new finding: if it is a live
+  credential, rotate it first and never baseline it. If it is a fixture or a
+  public value, add its fingerprint (`gitleaks git --report-format json`
+  prints it) under a comment with the reason, in a separate PR reviewed by
+  security that merges first; then rerun the blocked PR's check.
 - `deny.toml`: every RustSec advisory open at `ccc14ec4`, each with a reason.
   An advisory not listed fails the job. Delete an entry when the upgrade that
   clears it lands; `cargo deny` warns `advisory-not-detected` for stale ones.
