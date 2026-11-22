@@ -885,6 +885,15 @@ fn open_deletion_ledger(
     DeletionLedger::open(path)
 }
 
+/// What a failing deletion ledger means for this start, for its alert line.
+fn ledger_failure_consequence(named_keys_v1: bool) -> &'static str {
+    if named_keys_v1 {
+        "named_keys_v1 is on, so the node does not start"
+    } else {
+        "named keys are off; the node serves"
+    }
+}
+
 /// Settings the node no longer reads that a deployment may still set, in
 /// its file or environment. Configuration extraction ignores unknown keys,
 /// so each is named once at startup instead of being dropped silently.
@@ -1153,7 +1162,8 @@ pub async fn app_with_control(
             ::tracing::error!(
                 event = "deletion_ledger_open_failed",
                 error_kind = error.kind(),
-                "deletion ledger could not be opened: the named-key routes are off"
+                "deletion ledger could not be opened: {}",
+                ledger_failure_consequence(named_keys_enabled)
             );
             if named_keys_enabled {
                 anyhow::bail!(
@@ -1195,7 +1205,8 @@ pub async fn app_with_control(
                 ::tracing::error!(
                     event = "deletion_ledger_replay_failed",
                     error_kind = error.kind(),
-                    "deletion ledger replay failed: the named-key routes are off"
+                    "deletion ledger replay failed: {}",
+                    ledger_failure_consequence(named_keys_enabled)
                 );
                 if named_keys_enabled {
                     anyhow::bail!(
