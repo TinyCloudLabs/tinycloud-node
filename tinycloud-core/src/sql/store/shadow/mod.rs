@@ -182,3 +182,5 @@ mod tests {
         assert_eq!(sink.wants_calls.load(Ordering::Relaxed), 2);
     }
 }
+
+pub mod bootstrap;
