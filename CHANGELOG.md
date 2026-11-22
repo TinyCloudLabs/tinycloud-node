@@ -11,7 +11,6 @@
 - SQL databases over the checkpoint save size limit remain readable and reject mutations before execution. Details: TC-1491.
 - Ops: added a reversible local-config HTTP ingress switch and operator runbook for a separately verified independent Cloudflare origin. Dry-run is the default; production routing and policy execution remain separate. Details: TC-1387.
 - Production compose: stored SQL databases up to 320 MiB load again; saves still stop at 64 MiB (`TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES: "320 MiB"`). Config only, no migration. Details: TC-1491.
-- Production compose: the retention sweeper is on (`TINYCLOUD_RETENTION__ENABLED: "true"`, default windows). At boot and every 5 minutes it deletes delivered hook deliveries older than 7 days, dead-letter hook deliveries older than 30 days and signed KV tickets that expired more than 7 days ago, in batches of 5000. On 2026-11-21 that matched 485 rows (9 delivered, 4 dead-letter, 472 tickets). Deleted rows do not come back. Details: TC-287.
 - DuckDB: the node opens and ends every transaction itself; client requests that send transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, savepoints) are refused at every tier, and the SDK's `transactional` batches are unchanged. `nextval` and `setval` count as writes, so a read-tier or `readOnly` request is refused them. Line comments are parsed more strictly. Details: TC-3430.
 - DuckDB: a request marked `readOnly` allows only queries and `EXPLAIN`, whatever its ability tier. Transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`) counts as a write, so the read tier and `readOnly` requests are refused it. Details: TC-3035.
 - The 503 body of a request that reached its deadline before its write began reads "request_timeout: no change was applied; retry the request with a new signature". Details: TC-1997.
@@ -51,14 +50,17 @@
   Values are sealed like the webhook secret (v2, bound to the subscription row and column) and are never returned or logged; create and list return `headerNames` only. Change headers by deleting and re-registering. One migration, `m20261117_000000_hook_subscription_headers`, adds `header_names_json`, `encrypted_headers` and `encrypted_headers_format` (`NOT NULL DEFAULT 0`) to `hook_subscription`. Existing subscriptions have no headers and deliver unchanged. Details: TC-3123.
 - SQL write events (SSE and webhook bodies) carry `rowId`, the SQLite rowid of the row a statement inserted, when that statement is a single-table INSERT that inserted exactly one row. A woken agent can then read the row (for example the Home feed's `feed_responses.sequence`) without scanning. Updates, deletes, multi-row inserts, upserts that updated, ignored inserts, `WITHOUT ROWID` tables and DuckDB writes omit it. The body stays ids-only. Details: TC-3123.
 
-## [1.26.18] - 2026-11-21
+## [1.26.18] - 2026-11-22
 
-Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443). Database artifact saves now take their payload as shared bytes instead of a copy (#681, TC-1491); stored data and responses are unchanged. The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
+Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443). Database artifact saves now take their payload as shared bytes instead of a copy (#681, TC-1491); stored data and responses are unchanged. The SQL shadow store to the block store is built but refused at boot (#683, TC-1491). The production compose turns on the retention sweeper (#685, TC-287); that is config only and deploys with the 1.26.17 image. The node keeps its identity (`did:key:z6MkjHi79SMX4doJyo2w7jDTM6Fa7iX6EVZWXNbJ6RzBm3Wi`).
 
 ### Upgrade notes
 
-- **One database migration, and it is one-way.** `m20261121_000000_session_retire` adds the `session_retire` table and a nullable `delegation.first_seen_at`. A 1.26.17 or older binary refuses to start on the migrated database ("Migration file of version 'm20261121_000000_session_retire' is missing"). Rolling back takes a reviewed down-migration plus deleting the `seaql_migrations` row, or a restore; fixing forward is preferred.
+- **Two database migrations; the first is one-way.**
+  - `m20261121_000000_session_retire` adds the `session_retire` table and a nullable `delegation.first_seen_at`. A 1.26.17 or older binary refuses to start on the migrated database ("Migration file of version 'm20261121_000000_session_retire' is missing"). Rolling back takes a reviewed down-migration plus deleting the `seaql_migrations` row, or a restore; fixing forward is preferred.
+  - `m20261122_000000_sql_store_owner` adds the empty singleton table `sql_store_owner` (one row at most, `id = 1`). Nothing writes it in this release. Its down migration drops the table while it is empty and refuses once a row exists.
 - New config `[session_retire]`: `ttl_secs` (default 30 days; `0` refuses to start) and `rate_limit_per_minute` (default 10). The production compose needs no change.
+- New config `[sql_store]`: `enabled` defaults to `false`, and `enabled = true` refuses to start ("sql_store is not available in this build"). The production compose needs no change.
 
 ### Changes
 - Sign-out can retire the session key with `POST /session/retire`.
@@ -76,6 +78,8 @@ Sign-out can retire a session key on the node (`POST /session/retire`, TC-3443).
     - **Sign-out covers only the grants this node holds or was given in the request: a root the client does not send and this node does not hold is not covered**, and posting it later makes the key usable here again until it expires.
     - The node stores only its own retires: **a host that starts hosting the space after the sign-out never gets the marker** and accepts the key until its session root expires (follow-up TC-3673).
   - **Schema:** adds the `session_retire` table and a nullable `delegation.first_seen_at` column, set when this node first stores a delegation; existing rows stay NULL and count as stored before any retire. Details: TC-3443.
+- The node can shadow-copy SQL databases to the block store, but this build refuses to start with `[sql_store] enabled = true`, so nothing changes at runtime. Adds the `sql_store_owner` table (see the upgrade notes). Details: TC-1491.
+- Production compose: the retention sweeper is on (`TINYCLOUD_RETENTION__ENABLED: "true"`, default windows). At boot and every 5 minutes it deletes delivered hook deliveries older than 7 days, dead-letter hook deliveries older than 30 days and signed KV tickets that expired more than 7 days ago, in batches of 5000. On 2026-11-21 that matched 485 rows (9 delivered, 4 dead-letter, 472 tickets). Deleted rows do not come back. Details: TC-287.
 
 ## [1.26.17] - 2026-11-21
 
