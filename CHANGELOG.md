@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Ops: `docs/releasing.md` explains that tables a release creates at boot are owned by the node's own database role, so an operator role cannot drop them, and that a pre-deploy ownership check of existing tables does not prove a down-migration can run. Details: TC-3755.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
