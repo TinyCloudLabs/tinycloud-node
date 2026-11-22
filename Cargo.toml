@@ -13,7 +13,6 @@ members = [
     "dependencies/siwe-recap",
     "dependencies/cacao",
     "test/n4-mounted-e2e",
-    "test/caveat-probe",
 ]
 
 default-members = ["tinycloud-node-server"]
@@ -25,6 +24,7 @@ exclude = [
     "vendor/sqlx-postgres",
     "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
+    "test/caveat-probe",
 ]
 
 [workspace.dependencies]

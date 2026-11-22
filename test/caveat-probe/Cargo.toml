@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-hex.workspace = true
+hex = "0.4"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 rand = "0.8"
 reqwest = { version = "0.11", features = ["blocking", "json"] }
@@ -17,3 +17,8 @@ tinycloud-auth = { path = "../../tinycloud-auth" }
 tinycloud-sdk-rs = { path = "../../tinycloud-sdk-rs" }
 tinycloud-sdk-wasm = { path = "../../tinycloud-sdk-wasm" }
 uuid = { version = "1", features = ["v4"] }
+
+# Outside the node workspace (root `exclude`), so the release image's
+# `cargo chef` recipe never needs this crate. Same security patch as the root.
+[patch.crates-io]
+slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }

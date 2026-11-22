@@ -663,8 +663,8 @@ its branch policy before any workflow that names it runs.
      not commit or paste the file:
 
      ```sh
-     cargo build -p tinycloud-caveat-probe
-     target/debug/tinycloud-caveat-probe https://tee.node.tinycloud.xyz ~/.cache/tc1791-probe.json
+     cargo build --manifest-path test/caveat-probe/Cargo.toml
+     test/caveat-probe/target/debug/tinycloud-caveat-probe https://tee.node.tinycloud.xyz ~/.cache/tc1791-probe.json
      ```
 
      It prints one `step status= expected= code= PASS|FAIL` line per step and
