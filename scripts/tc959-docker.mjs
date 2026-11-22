@@ -73,6 +73,8 @@ export function assertCapture(events, fields) {
           if (key in event) { assert.equal(typeof event[key], 'string'); assert.match(event[key], new RegExp(pattern)); allowed.push(key); }
         }
         if ('request_id_replaced' in event) { assert.equal(typeof event.request_id_replaced, 'boolean'); allowed.push('request_id_replaced'); }
+        // TC-3834: the 5xx origin code; optional, status 500 and above only, one of the declared codes.
+        if ('error_code' in event) { assert.ok(event.status >= 500); assert.ok(fields?.error_code?.values.includes(event.error_code)); allowed.push('error_code'); }
       }
     } else if (event.event === 'node_warning' || event.event === 'node_error') {
       assert.equal(event.svc, 'api');

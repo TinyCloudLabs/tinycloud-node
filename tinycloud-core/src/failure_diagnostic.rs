@@ -102,6 +102,139 @@ impl FailureNote {
     }
 }
 
+/// The longest [`ErrorCode::as_str`], in bytes. The log shipper's capped
+/// 5xx reserve (TC-1843) fits a code of at most this length under either
+/// sink framing (`log-shipper/budget.mjs`).
+pub const MAX_ERROR_CODE_LEN: usize = 13;
+
+/// The stable code a request answered with a 5xx carries on its
+/// `node_request` event as `error_code` (TC-3834): one per origin of a 5xx,
+/// so two failures that read alike in the client's body stay apart in the
+/// logs. The set is closed; a value is only ever one of [`ErrorCode::ALL`]'s
+/// strings (snake_case ASCII, at most [`MAX_ERROR_CODE_LEN`] bytes), never
+/// text taken from the error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorCode {
+    /// A database error other than a timeout (SeaORM/sqlx: a lost
+    /// connection, a refused or failed statement, a serialization failure).
+    DbError,
+    /// A database timeout: the pool gave no connection in time (or was
+    /// closed), or the server cancelled the statement at its timeout.
+    DbTimeout,
+    /// The SQL/DuckDB database stayed busy past a wait bound (`sql_busy`).
+    DbBusy,
+    /// The `/invoke` deadline was reached before any write began.
+    ReqTimeout,
+    /// A read's audit record was not confirmed (busy, unavailable, failed
+    /// or stopped).
+    ReadAudit,
+    /// The block store failed to stage, write or read a blob.
+    StorageIo,
+    /// The database read of a delegation chain's SQL caveats failed
+    /// (`ChainCaveatError::Db`).
+    CaveatDb,
+    /// No read transaction could be opened (`TinyCloud::readable`).
+    ReadTxError,
+    /// The encryption-key deletion ledger is missing or its append failed.
+    KeyLedger,
+    /// The space lifecycle state could not be read.
+    Lifecycle,
+    /// The delegation registry could not be consulted.
+    RegistryDown,
+    /// An SQL/DuckDB identity cutover fence is active.
+    CutoverFence,
+    /// A KV blob candidate could not be committed.
+    KvCandidate,
+    /// The SQL or DuckDB engine failed for a reason other than its database
+    /// connection (an internal, ingest, import or export error).
+    EngineError,
+    /// The encryption backend or signer failed, or a key row is corrupt.
+    Encryption,
+    /// A database refused to grow past, or load beyond, its size limit
+    /// (`507`).
+    SizeLimit,
+    /// The node's disk is below its free-space headroom (`507`).
+    DiskHeadroom,
+    /// Any other 5xx, including one no origin classified.
+    Internal,
+}
+
+impl ErrorCode {
+    /// Every code, for consumers that hold the closed set (the log
+    /// shipper's schema, tests).
+    pub const ALL: [ErrorCode; 18] = [
+        Self::DbError,
+        Self::DbTimeout,
+        Self::DbBusy,
+        Self::ReqTimeout,
+        Self::ReadAudit,
+        Self::StorageIo,
+        Self::CaveatDb,
+        Self::ReadTxError,
+        Self::KeyLedger,
+        Self::Lifecycle,
+        Self::RegistryDown,
+        Self::CutoverFence,
+        Self::KvCandidate,
+        Self::EngineError,
+        Self::Encryption,
+        Self::SizeLimit,
+        Self::DiskHeadroom,
+        Self::Internal,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DbError => "db_error",
+            Self::DbTimeout => "db_timeout",
+            Self::DbBusy => "db_busy",
+            Self::ReqTimeout => "req_timeout",
+            Self::ReadAudit => "read_audit",
+            Self::StorageIo => "storage_io",
+            Self::CaveatDb => "caveat_db",
+            Self::ReadTxError => "read_tx_error",
+            Self::KeyLedger => "key_ledger",
+            Self::Lifecycle => "lifecycle",
+            Self::RegistryDown => "registry_down",
+            Self::CutoverFence => "cutover_fence",
+            Self::KvCandidate => "kv_candidate",
+            Self::EngineError => "engine_error",
+            Self::Encryption => "encryption",
+            Self::SizeLimit => "size_limit",
+            Self::DiskHeadroom => "disk_headroom",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The class of a database error: [`ErrorCode::DbTimeout`] for a pool
+    /// that gave no connection or a statement the server timed out,
+    /// [`ErrorCode::DbError`] otherwise.
+    pub fn for_db(error: &DbErr) -> Self {
+        Self::for_kind(failure_kind(error))
+    }
+
+    /// The code of a recorded [`FailureNote`].
+    pub fn for_note(note: &FailureNote) -> Self {
+        match (note.code, note.kind) {
+            (_, KIND_REQUEST_TIMEOUT) => Self::ReqTimeout,
+            (FailureCode::Busy, KIND_READ_AUDIT_BUSY) => Self::ReadAudit,
+            (FailureCode::Busy, _) => Self::DbBusy,
+            // `FailureNote::internal`: not a database error.
+            (FailureCode::Internal, _) => Self::Internal,
+            (FailureCode::UnavailableRetryable | FailureCode::OutcomeUnknown, kind) => {
+                Self::for_kind(kind)
+            }
+        }
+    }
+
+    fn for_kind(kind: &str) -> Self {
+        match kind {
+            "pool_timeout" | "pool_closed" | "statement_timeout" => Self::DbTimeout,
+            _ => Self::DbError,
+        }
+    }
+}
+
 /// A fixed class of a database failure, from the error's variant and, for a
 /// server error, its SQLSTATE. Never any text of the error.
 pub fn failure_kind(error: &DbErr) -> &'static str {
@@ -318,5 +451,79 @@ mod tests {
         // The last failure recorded is the one reported.
         request.note_failure(FailureNote::internal(Service::Kv));
         assert_eq!(request.failure(), Some(FailureNote::internal(Service::Kv)));
+    }
+
+    #[test]
+    fn error_codes_are_a_closed_set_of_distinct_snake_case_strings() {
+        let codes: Vec<&str> = ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
+        for code in &codes {
+            assert!(
+                !code.is_empty()
+                    && code.len() <= MAX_ERROR_CODE_LEN
+                    && code.starts_with(|c: char| c.is_ascii_lowercase())
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{code}"
+            );
+        }
+        let mut distinct = codes.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), codes.len(), "{codes:?}");
+        assert!(codes.contains(&"internal"));
+    }
+
+    #[test]
+    fn error_codes_classify_database_failures_and_notes() {
+        assert_eq!(
+            ErrorCode::for_db(&DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)),
+            ErrorCode::DbTimeout
+        );
+        assert_eq!(
+            ErrorCode::for_db(&DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed)),
+            ErrorCode::DbTimeout
+        );
+        assert_eq!(
+            ErrorCode::for_db(&server_error("57014")),
+            ErrorCode::DbTimeout
+        );
+        assert_eq!(
+            ErrorCode::for_db(&server_error("40001")),
+            ErrorCode::DbError
+        );
+        assert_eq!(
+            ErrorCode::for_db(&DbErr::Custom("secret".into())),
+            ErrorCode::DbError
+        );
+        let busy = |kind| FailureNote::busy(Service::Sql, kind, None);
+        assert_eq!(
+            ErrorCode::for_note(&busy(KIND_REQUEST_TIMEOUT)),
+            ErrorCode::ReqTimeout
+        );
+        assert_eq!(
+            ErrorCode::for_note(&busy(KIND_READ_AUDIT_BUSY)),
+            ErrorCode::ReadAudit
+        );
+        assert_eq!(ErrorCode::for_note(&busy("lock_wait")), ErrorCode::DbBusy);
+        assert_eq!(
+            ErrorCode::for_note(&FailureNote::internal(Service::Sql)),
+            ErrorCode::Internal
+        );
+
+        // The request keeps the code of its last recorded failure.
+        let request = crate::request_telemetry::RequestContext::new(
+            uuid::Uuid::nil(),
+            std::sync::Arc::new(crate::telemetry::Pseudonymizer::new(
+                &crate::keys::StaticSecret::new(vec![0x42; 32]).unwrap(),
+            )),
+        );
+        assert_eq!(request.error_code(), None);
+        request.note_failure(busy("lock_wait"));
+        assert_eq!(request.error_code(), Some(ErrorCode::DbBusy));
+        request.note_outcome_unknown(Service::Sql, None);
+        assert_eq!(request.error_code(), Some(ErrorCode::DbError));
+        request.note_error_code(ErrorCode::CaveatDb);
+        assert_eq!(request.error_code(), Some(ErrorCode::CaveatDb));
     }
 }

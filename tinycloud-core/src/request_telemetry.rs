@@ -14,7 +14,7 @@ use pin_project::pin_project;
 use tinycloud_auth::resource::SpaceId;
 use uuid::Uuid;
 
-use crate::failure_diagnostic::{FailureCode, FailureNote, Service};
+use crate::failure_diagnostic::{ErrorCode, FailureCode, FailureNote, Service};
 use crate::telemetry::{Pseudonym, Pseudonymizer};
 
 pub use sqlx_core::request_telemetry::{Metrics, PoolTimer, QueryTimer, Snapshot};
@@ -73,6 +73,7 @@ pub struct RequestContext {
     pseudonymizer: Arc<Pseudonymizer>,
     identities: Mutex<IdentityState>,
     failure: Mutex<Option<FailureNote>>,
+    error_code: Mutex<Option<ErrorCode>>,
 }
 
 impl RequestContext {
@@ -84,6 +85,7 @@ impl RequestContext {
             pseudonymizer,
             identities: Mutex::new(IdentityState::default()),
             failure: Mutex::new(None),
+            error_code: Mutex::new(None),
         })
     }
 
@@ -136,12 +138,15 @@ impl RequestContext {
         }
     }
 
-    /// Record the request's database failure, replacing an earlier one.
+    /// Record the request's database failure, replacing an earlier one; its
+    /// [`ErrorCode::for_note`] becomes the request's error code.
     pub fn note_failure(&self, note: FailureNote) {
+        let code = ErrorCode::for_note(&note);
         *self
             .failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+        self.note_error_code(code);
     }
 
     /// The recorded failure becomes one after which a write may have been
@@ -161,6 +166,9 @@ impl RequestContext {
         });
         note.code = FailureCode::OutcomeUnknown;
         note.write_may_have_applied = true;
+        let code = ErrorCode::for_note(note);
+        drop(failure);
+        self.note_error_code(code);
     }
 
     /// The request's recorded database failure, if any.
@@ -169,6 +177,23 @@ impl RequestContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record the origin of the 5xx the request is about to answer,
+    /// replacing an earlier one (TC-3834).
+    pub fn note_error_code(&self, code: ErrorCode) {
+        *self
+            .error_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
+    }
+
+    /// The request's recorded 5xx origin, if any.
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        *self
+            .error_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -212,6 +237,15 @@ pub fn note_failure(note: FailureNote) {
 pub fn note_outcome_unknown(service: Service, db_hash: Option<String>) {
     if let Some(context) = current() {
         context.note_outcome_unknown(service, db_hash);
+    }
+}
+
+/// Record the origin of the 5xx the current request is about to answer
+/// (TC-3834); a later code replaces an earlier one. A no-op outside an HTTP
+/// request.
+pub fn note_error_code(code: ErrorCode) {
+    if let Some(context) = current() {
+        context.note_error_code(code);
     }
 }
 
