@@ -39,8 +39,9 @@ use std::pin::Pin;
 
 use tinycloud_core::sql::store::{
     shadow::{
+        ingress::IngressSink,
         owner::{self, BootOutcome, OwnerMarkerError, StoreId, OWNER_OBJECT_KEY},
-        NoopSink,
+        runloop::RunState,
     },
     ShadowSink,
 };
@@ -48,13 +49,17 @@ use tinycloud_core::sql::store::{
 /// Everything the runtime holds to keep the shadow uploader alive for the
 /// process's lifetime. The handle's `Drop` releases every background task.
 ///
-/// The uploader core is not built in this session; the handle currently
-/// bundles the [`ShadowSink`] wired into `SqlService` and the resolved
-/// owner-marker identity. The uploader run loop + bootstrap / sweep /
-/// drain join at the same handle in later milestones.
+/// Carries the [`ShadowSink`] wired into `SqlService`, the resolved
+/// owner-marker identity, the [`RunState`] the uploader keeps, and the
+/// scratch directory the bootstrap writes its temp SQLite file under.
+/// The scratch directory MUST live under the node's SQL data
+/// directory so a bootstrap of a large database counts against the
+/// 1a `DiskBudget` and the node's configured minimum free headroom.
 pub struct ShadowHandle {
     pub sink: Arc<dyn ShadowSink>,
     pub owner: StoreId,
+    pub run_state: Arc<RunState>,
+    pub scratch_dir: std::path::PathBuf,
 }
 
 impl ShadowHandle {
@@ -188,24 +193,63 @@ pub async fn pair_owner_marker<I: OwnerMarkerIo>(
 /// module directly.
 pub const OWNER_MARKER_KEY: &str = OWNER_OBJECT_KEY;
 
-/// Build a shadow sink + owner handle if the flag and the allowlist permit;
-/// return `None` otherwise. Used by `resolve_runtime`.
+/// Build the shadow uploader handle if the flag and the allowlist
+/// permit; return `None` otherwise. Used by `resolve_runtime`.
 ///
-/// This stub returns `NoopSink` as the sink for now (the uploader core is
-/// built in a later milestone); it still runs the full owner-marker
-/// pairing so a mismatch refuses the start.
+/// On a non-empty allowlist this function does three things:
+///
+/// 1. Pairs the owner marker. A mismatch refuses the start.
+/// 2. Allocates a [`RunState`] carrying the per-DB state map, the
+///    node-wide publish-cycle semaphore, the Postgres-concurrency
+///    semaphore and the allowlist. The capture hook writes into this
+///    through the returned [`IngressSink`].
+/// 3. Creates the scratch directory under the node's SQL data
+///    directory so bootstrap, catch-up and restore operations charge
+///    their disk bytes to the 1a `DiskBudget`.
+///
+/// The returned handle is wired into `SqlService::with_shadow` at the
+/// caller's `resolve_runtime` seam. The timer loop that drives the
+/// uploader off `run_state` arrives in a sibling commit.
 pub async fn maybe_build<I: OwnerMarkerIo>(
     enabled: bool,
     allowlist_empty: bool,
     conn: &tinycloud_core::sea_orm::DatabaseConnection,
     io: &I,
+    config: MaybeBuildConfig<'_>,
 ) -> Result<Option<ShadowHandle>, ShadowBuildError> {
     if !enabled || allowlist_empty {
         return Ok(None);
     }
     let owner = pair_owner_marker(conn, io).await?;
-    let sink: Arc<dyn ShadowSink> = Arc::new(NoopSink);
-    Ok(Some(ShadowHandle { sink, owner }))
+    let scratch_dir = config.sql_data_dir.join("sql-store-scratch");
+    std::fs::create_dir_all(&scratch_dir)
+        .map_err(|e| ShadowBuildError::System(format!("create scratch dir: {e}")))?;
+    let allowlist: std::collections::BTreeSet<String> =
+        config.allowlist.iter().map(|s| s.to_string()).collect();
+    let run_state = Arc::new(RunState::new(
+        config.node_concurrency,
+        config.pg_concurrency,
+        allowlist,
+    ));
+    let sink: Arc<dyn ShadowSink> = Arc::new(IngressSink::new(Arc::clone(&run_state)));
+    Ok(Some(ShadowHandle {
+        sink,
+        owner,
+        run_state,
+        scratch_dir,
+    }))
+}
+
+/// Inputs to [`maybe_build`] besides the flag and the IO. The node's
+/// `resolve_runtime` fills these from `[sql_store]` and the resolved
+/// storage configuration.
+pub struct MaybeBuildConfig<'a> {
+    /// `{datadir}/sql` typically. Scratch lives at
+    /// `{sql_data_dir}/sql-store-scratch`.
+    pub sql_data_dir: &'a std::path::Path,
+    pub allowlist: &'a [String],
+    pub node_concurrency: usize,
+    pub pg_concurrency: usize,
 }
 
 #[cfg(test)]
@@ -265,6 +309,22 @@ mod tests {
                 puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             })
+        }
+    }
+
+    fn test_config() -> MaybeBuildConfig<'static> {
+        use std::path::Path;
+        use std::sync::OnceLock;
+        // Keep the TempDir alive for the process so the path stays valid.
+        static SCRATCH: OnceLock<tempfile::TempDir> = OnceLock::new();
+        static ALLOWLIST: OnceLock<Vec<String>> = OnceLock::new();
+        let scratch = SCRATCH.get_or_init(|| tempfile::TempDir::new().unwrap());
+        let allowlist = ALLOWLIST.get_or_init(|| vec!["tc:test".into()]);
+        MaybeBuildConfig {
+            sql_data_dir: scratch.path() as &Path,
+            allowlist: allowlist.as_slice(),
+            node_concurrency: 8,
+            pg_concurrency: 2,
         }
     }
 
@@ -333,7 +393,9 @@ mod tests {
     async fn disabled_flag_builds_no_handle_and_touches_no_io() {
         let conn = fresh_conn().await;
         let io = FakeIo::new();
-        let handle = maybe_build(false, true, &conn, &io).await.unwrap();
+        let handle = maybe_build(false, true, &conn, &io, test_config())
+            .await
+            .unwrap();
         assert!(handle.is_none());
         assert_eq!(io.puts(), 0);
     }
@@ -342,7 +404,9 @@ mod tests {
     async fn empty_allowlist_builds_no_handle_and_touches_no_io() {
         let conn = fresh_conn().await;
         let io = FakeIo::new();
-        let handle = maybe_build(true, true, &conn, &io).await.unwrap();
+        let handle = maybe_build(true, true, &conn, &io, test_config())
+            .await
+            .unwrap();
         assert!(handle.is_none());
         assert_eq!(io.puts(), 0);
     }
@@ -351,7 +415,10 @@ mod tests {
     async fn enabled_with_non_empty_allowlist_builds_a_handle_and_writes_marker() {
         let conn = fresh_conn().await;
         let io = FakeIo::new();
-        let handle = maybe_build(true, false, &conn, &io).await.unwrap().unwrap();
+        let handle = maybe_build(true, false, &conn, &io, test_config())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(io.puts(), 1);
         assert_eq!(
             io.marker.lock().unwrap().as_deref(),
