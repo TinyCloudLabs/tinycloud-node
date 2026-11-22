@@ -287,11 +287,11 @@ pub struct SqlService {
     checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
     /// The first back-off and its cap.
     checkpoint_backoff_bounds: (Duration, Duration),
-    /// The shadow uploader's capture seam (TC-1491).
+    /// The shadow uploader's save hook (TC-1491).
     ///
-    /// Defaults to [`NoopSink`] on construction, so flag-off builds (the
-    /// production default) pay a single branchless `wants()` returning false
-    /// in `persist_write` and nothing else. The node runtime replaces it via
+    /// Defaults to [`NoopSink`](crate::sql::store::NoopSink). After a save
+    /// succeeds, `persist_write` hands it the revision and checkpoint cid:
+    /// metadata only, no bytes, never fails. The node runtime replaces it via
     /// [`SqlService::with_shadow`] only when `[sql_store] enabled` and the
     /// space allowlist is non-empty.
     shadow: Arc<dyn crate::sql::store::ShadowSink>,
@@ -347,13 +347,24 @@ impl SqlService {
         self.bounds = bounds;
         self
     }
-    /// Wire the shadow uploader's capture sink (TC-1491). The default
-    /// is [`NoopSink`]; the node runtime calls this after
-    /// [`SqlService::new`] when `[sql_store]` is enabled with a non-empty
-    /// allowlist.
+    /// Wire the shadow uploader's save hook (TC-1491). The default is
+    /// [`NoopSink`](crate::sql::store::NoopSink); the node runtime calls this
+    /// after [`SqlService::new`] when `[sql_store]` is enabled with a
+    /// non-empty allowlist.
     pub fn with_shadow(mut self, shadow: Arc<dyn crate::sql::store::ShadowSink>) -> Self {
         self.shadow = shadow;
         self
+    }
+
+    /// Tell the shadow uploader a save landed. Synchronous and infallible:
+    /// the sink only records the head.
+    fn notify_shadow(&self, space: &SpaceId, db_name: &str, revision: i64, cid: &str) {
+        self.shadow.notify(crate::sql::store::Notice {
+            space: space.to_string(),
+            db_id: db_name.to_string(),
+            revision,
+            cid: cid.to_string(),
+        });
     }
 
     /// The checkpoint back-off (TC-2961): `first` after a failed or refused
@@ -1204,22 +1215,6 @@ impl SqlService {
             .chunked_checkpoints("sql", &key.0, db_name)
         {
             let snapshot = handle.snapshot().await?;
-            // Capture reads the snapshot file into memory only when
-            // `shadow.wants(space)` returns true. Zero-cost for the flag-off
-            // path (the default). TC-2917 chunked artifacts means a very
-            // large checkpoint is possible here; the capture payload is the
-            // same whole-file bytes the follow-up uploader would need, so
-            // memory doubling is a known cost for allowlisted chunked
-            // databases until the capture Bytes can be backed by a file
-            // handle.
-            let space_str_ck = space.to_string();
-            let capture_snapshot_bytes = if self.shadow.wants(&space_str_ck) {
-                Some(std::fs::read(snapshot.path()).map_err(|e| {
-                    SqlError::Internal(format!("read snapshot for shadow capture: {e}"))
-                })?)
-            } else {
-                None
-            };
             let bytes = snapshot
                 .as_file()
                 .metadata()
@@ -1271,20 +1266,13 @@ impl SqlService {
                     },
                 },
             );
-            // Capture hook runs on the Ok arm only. Err returns above never
-            // emit; a stale-lineage conflict does not reach here. The anchor
-            // is the fresh `saved.checkpoint_content_hash`.
-            if let Some(payload_vec) = capture_snapshot_bytes {
-                self.shadow.captured(crate::sql::store::Capture {
-                    space: space_str_ck,
-                    db_id: db_name.to_string(),
-                    revision: saved.revision,
-                    cid: saved.checkpoint_content_hash,
-                    kind: crate::sql::store::CaptureKind::Checkpoint(bytes::Bytes::from(
-                        payload_vec,
-                    )),
-                });
-            }
+            // Shadow hook (TC-1491): metadata only, on the Ok arm only.
+            self.notify_shadow(
+                space,
+                db_name,
+                saved.revision,
+                &saved.checkpoint_content_hash,
+            );
             return Ok(());
         }
 
@@ -1298,12 +1286,6 @@ impl SqlService {
             None
         };
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
-            // Consult the sink before cloning any bytes. `wants` returns
-            // false under flag-off, empty allowlist, breaker-open or
-            // disallowed-space, so the hot path pays only a branchless
-            // virtual call. (TC-1491.)
-            let space_str = space.to_string();
-            let capture_bytes = self.shadow.wants(&space_str).then(|| wal.clone());
             match self
                 .bounded(
                     (space, db_name),
@@ -1325,24 +1307,14 @@ impl SqlService {
                     if let Some(mut lineage) = self.lineage.get_mut(&key) {
                         lineage.expectation = expected.advanced_to(saved.revision);
                     }
-                    // Capture hook, delta branch. Only reachable on the
-                    // success arm: an Err return above never emits, and
-                    // `discard_local_state` is not touched.
-                    if let (
-                        Some(wal_vec),
-                        ArtifactExpectation::Derived {
-                            checkpoint_content_hash,
-                            ..
-                        },
-                    ) = (capture_bytes, &expected)
+                    // Shadow hook (TC-1491), delta branch: the WAL rides on
+                    // the checkpoint this actor derives from.
+                    if let ArtifactExpectation::Derived {
+                        checkpoint_content_hash,
+                        ..
+                    } = &expected
                     {
-                        self.shadow.captured(crate::sql::store::Capture {
-                            space: space_str,
-                            db_id: db_name.to_string(),
-                            revision: saved.revision,
-                            cid: checkpoint_content_hash.clone(),
-                            kind: crate::sql::store::CaptureKind::Wal(bytes::Bytes::from(wal_vec)),
-                        });
+                        self.notify_shadow(space, db_name, saved.revision, checkpoint_content_hash);
                     }
                     tracing::info!(
                         service = "sql",
@@ -1379,12 +1351,6 @@ impl SqlService {
                 return Err(SqlError::StorageWouldGrow);
             }
         }
-        // Consult the sink before cloning any bytes; the clone only
-        // happens when the sink will actually consume it. The anchor cid
-        // for a checkpoint capture is `saved.checkpoint_content_hash`
-        // (below), not the old `expected`.
-        let space_str_ck = space.to_string();
-        let capture_payload = self.shadow.wants(&space_str_ck).then(|| payload.clone());
         let (saved, transfer_started) =
             crate::database_artifacts::track_transfer_start(self.bounded(
                 (space, db_name),
@@ -1431,19 +1397,13 @@ impl SqlService {
                 },
             },
         );
-        // Capture hook, non-chunked checkpoint branch. Only the success
-        // path reaches here: a `StaleLineage` or save error returns above
-        // and never emits. The anchor is the fresh
-        // `saved.checkpoint_content_hash`: no extra PG read, no stale cid.
-        if let Some(payload_vec) = capture_payload {
-            self.shadow.captured(crate::sql::store::Capture {
-                space: space_str_ck,
-                db_id: db_name.to_string(),
-                revision: saved.revision,
-                cid: saved.checkpoint_content_hash.clone(),
-                kind: crate::sql::store::CaptureKind::Checkpoint(bytes::Bytes::from(payload_vec)),
-            });
-        }
+        // Shadow hook (TC-1491): metadata only, on the Ok arm only.
+        self.notify_shadow(
+            space,
+            db_name,
+            saved.revision,
+            &saved.checkpoint_content_hash,
+        );
         tracing::info!(
             service = "sql",
             mode = "checkpoint",
@@ -1972,41 +1932,22 @@ mod tests {
             .unwrap();
     }
 
-    /// A counting `ShadowSink` for the capture-hook tests below. Records
-    /// every `wants` call and every captured payload. (TC-1491.)
+    /// A recording `ShadowSink` for the save-hook tests below. (TC-1491.)
     #[derive(Debug, Default)]
     struct ProbeSink {
-        allow: Vec<String>,
-        wants_calls: AtomicU64,
-        captured: std::sync::Mutex<Vec<crate::sql::store::Capture>>,
+        notices: std::sync::Mutex<Vec<crate::sql::store::Notice>>,
     }
 
     impl ProbeSink {
-        fn allowing<I: IntoIterator<Item = String>>(spaces: I) -> Arc<Self> {
-            Arc::new(Self {
-                allow: spaces.into_iter().collect(),
-                ..Self::default()
-            })
-        }
-        fn captures(&self) -> Vec<crate::sql::store::Capture> {
-            self.captured.lock().unwrap().clone()
-        }
-        fn wants_calls(&self) -> u64 {
-            self.wants_calls.load(std::sync::atomic::Ordering::Relaxed)
+        fn notices(&self) -> Vec<crate::sql::store::Notice> {
+            self.notices.lock().unwrap().clone()
         }
     }
 
     impl crate::sql::store::ShadowSink for ProbeSink {
-        fn wants(&self, space: &str) -> bool {
-            self.wants_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.allow.iter().any(|s| s == space)
-        }
-        fn captured(&self, capture: crate::sql::store::Capture) {
-            // Called from the capture hook inside the per-DB operation lock;
-            // a std::sync::Mutex is correct: `captured` is a sync trait fn
-            // and must not block on `.await` or on the tokio runtime.
-            self.captured.lock().unwrap().push(capture);
+        fn notify(&self, notice: crate::sql::store::Notice) {
+            // Runs inside the per-DB operation lock: sync, never awaits.
+            self.notices.lock().unwrap().push(notice);
         }
     }
 
@@ -2028,86 +1969,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tc1491_capture_hook_checkpoint_path_emits_one_capture_with_anchor() {
+    async fn tc1491_save_hook_checkpoint_path_notifies_revision_and_cid() {
         let cache = TempDir::new().unwrap();
-        let space = test_space_id("tc1491-capture-checkpoint");
-        let sink = ProbeSink::allowing([space.to_string()]);
-        let service = SqlService::new(
-            cache.path().to_string_lossy().into_owned(),
-            0,
-            artifact_repository().await,
-        )
-        .with_ddl_policy(DdlPolicy::Log)
-        .with_shadow(sink.clone());
+        let space = test_space_id("tc1491-notice-checkpoint");
+        let sink = Arc::new(ProbeSink::default());
+        let repo = artifact_repository().await;
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
         execute_insert(&service, &space, "first").await;
-        let caps = sink.captures();
-        assert_eq!(caps.len(), 1, "exactly one capture for the first write");
-        let cap = &caps[0];
-        assert_eq!(cap.space, space.to_string());
-        assert_eq!(cap.db_id, "main");
-        assert_eq!(cap.revision, 1);
-        assert!(
-            !cap.cid.is_empty(),
-            "checkpoint cid is set from saved.checkpoint_content_hash"
+        let meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!meta.has_delta(), "the first save is a checkpoint");
+        assert_eq!(
+            sink.notices(),
+            vec![crate::sql::store::Notice {
+                space: space.to_string(),
+                db_id: "main".into(),
+                revision: 1,
+                cid: meta.checkpoint_content_hash,
+            }]
         );
-        assert!(matches!(
-            cap.kind,
-            crate::sql::store::CaptureKind::Checkpoint(_)
-        ));
-        // A2: `wants` was consulted at least once before the copy.
-        assert!(sink.wants_calls() >= 1);
     }
 
     #[tokio::test]
-    async fn tc1491_capture_hook_delta_path_emits_one_wal_capture_with_anchor() {
+    async fn tc1491_save_hook_delta_path_notifies_the_checkpoint_the_wal_rides_on() {
         let cache = TempDir::new().unwrap();
-        let space = test_space_id("tc1491-capture-delta");
-        let sink = ProbeSink::allowing([space.to_string()]);
-        let service = SqlService::new(
-            cache.path().to_string_lossy().into_owned(),
-            0,
-            artifact_repository().await,
-        )
-        .with_ddl_policy(DdlPolicy::Log)
-        .with_shadow(sink.clone());
+        let space = test_space_id("tc1491-notice-delta");
+        let sink = Arc::new(ProbeSink::default());
+        let repo = artifact_repository().await;
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
         execute_insert(&service, &space, "first").await;
         execute_insert(&service, &space, "second").await;
-        let caps = sink.captures();
-        assert_eq!(caps.len(), 2, "one capture per persist");
-        let first_cid = match &caps[0].kind {
-            crate::sql::store::CaptureKind::Checkpoint(_) => caps[0].cid.clone(),
-            other => panic!("first persist should be a checkpoint capture: {other:?}"),
-        };
-        assert!(matches!(
-            caps[1].kind,
-            crate::sql::store::CaptureKind::Wal(_)
-        ));
-        assert_eq!(caps[1].revision, 2);
-        // A3: the delta rides on the previous checkpoint; its cid matches.
-        assert_eq!(caps[1].cid, first_cid);
+        let meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(meta.has_delta(), "the second save is a WAL delta");
+        let notices = sink.notices();
+        assert_eq!(notices.len(), 2, "one notice per save");
+        assert_eq!(
+            notices.iter().map(|n| n.revision).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // Both name the checkpoint the artifact still rides on.
+        assert!(notices
+            .iter()
+            .all(|n| n.cid == meta.checkpoint_content_hash && n.db_id == "main"));
     }
 
     #[tokio::test]
-    async fn tc1491_capture_hook_disallowed_space_never_captures() {
+    async fn tc1491_notice_board_drops_notices_for_spaces_outside_the_allowlist() {
         let cache = TempDir::new().unwrap();
-        let space = test_space_id("tc1491-capture-disallowed");
-        // Empty allowlist: `wants` returns false for every space.
-        let sink = ProbeSink::allowing(std::iter::empty::<String>());
+        let space = test_space_id("tc1491-notice-disallowed");
+        let board = Arc::new(crate::sql::store::shadow::NoticeBoard::new(
+            crate::sql::store::SpaceAllowlist::default(),
+            Arc::new(crate::sql::store::shadow::metrics::NoopMetrics),
+        ));
         let service = SqlService::new(
             cache.path().to_string_lossy().into_owned(),
             0,
             artifact_repository().await,
         )
         .with_ddl_policy(DdlPolicy::Log)
-        .with_shadow(sink.clone());
+        .with_shadow(board.clone());
         execute_insert(&service, &space, "x").await;
         assert!(
-            sink.captures().is_empty(),
-            "wants=false must not emit any capture (A2)"
-        );
-        assert!(
-            sink.wants_calls() >= 1,
-            "wants must have been consulted before any byte was cloned"
+            board.take().is_empty(),
+            "an empty allowlist records nothing"
         );
     }
 
@@ -2123,7 +2058,7 @@ mod tests {
         )
         .with_ddl_policy(DdlPolicy::Log);
         execute_insert(&service, &space, "x").await;
-        // Trivially, no panic; the hot path is a single virtual `wants` returning false.
+        // Trivially, no panic; the hook is one call into `NoopSink::notify`.
     }
 
     #[tokio::test]
