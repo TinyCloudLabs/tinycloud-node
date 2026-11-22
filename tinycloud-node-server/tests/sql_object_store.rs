@@ -128,14 +128,8 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
         .await
         .unwrap()
         .is_none());
-    assert_eq!(
-        put(s, &k, &b).await.unwrap(),
-        PutOutcome::Created
-    );
-    assert_eq!(
-        put(s, &k, &b).await.unwrap(),
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(s, &k, &b).await.unwrap(), PutOutcome::Created);
+    assert_eq!(put(s, &k, &b).await.unwrap(), PutOutcome::AlreadyPresent);
     assert_eq!(whole(s, &k).await.unwrap(), b);
     assert_eq!(
         s.head(&k).await.unwrap(),
@@ -154,7 +148,12 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
         })
     );
     assert_eq!(std::fs::read(out.path()).unwrap(), b);
-    assert_eq!(s.get_to_file(&key_for(b"absent"), out.path()).await.unwrap(), None);
+    assert_eq!(
+        s.get_to_file(&key_for(b"absent"), out.path())
+            .await
+            .unwrap(),
+        None
+    );
     // A file of another size than declared is refused.
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), &b).unwrap();
@@ -254,10 +253,7 @@ async fn conformance<S: SqlObjectStore + 'static>(store: Arc<S>, planter: Option
 
     // The empty object: it exists, and no range of it selects anything.
     let empty = key_for(b"");
-    assert_eq!(
-        put(s, &empty, b"").await.unwrap(),
-        PutOutcome::Created
-    );
+    assert_eq!(put(s, &empty, b"").await.unwrap(), PutOutcome::Created);
     assert_eq!(
         put(s, &empty, b"").await.unwrap(),
         PutOutcome::AlreadyPresent
@@ -398,10 +394,7 @@ async fn fs_leftover_temp_files_never_block_a_create() {
     let leftovers = names_in(parent);
     assert_eq!(leftovers.len(), 2);
 
-    assert_eq!(
-        put(&*store, &k, &b).await.unwrap(),
-        PutOutcome::Created
-    );
+    assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
     assert_eq!(std::fs::read(&path).unwrap(), b);
     // The stray files are untouched; the create left none of its own.
     let mut expected = leftovers.clone();
@@ -443,10 +436,7 @@ async fn fs_keys_never_resolve_outside_the_root() {
         let k = key_in(space, db, &b);
         let path = store.path_for(&k).unwrap();
         assert!(path.starts_with(store.root()), "{path:?}");
-        assert_eq!(
-            put(&*store, &k, &b).await.unwrap(),
-            PutOutcome::Created
-        );
+        assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
         assert_eq!(std::fs::read(&path).unwrap(), b);
     }
     // Nothing was created beside the root.
@@ -458,10 +448,7 @@ async fn fs_large_objects_are_hashed_in_chunks_and_ranged() {
     let (_dir, store) = fs_store();
     let b: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 253) as u8).collect();
     let k = key_for(&b);
-    assert_eq!(
-        put(&*store, &k, &b).await.unwrap(),
-        PutOutcome::Created
-    );
+    assert_eq!(put(&*store, &k, &b).await.unwrap(), PutOutcome::Created);
     assert_eq!(
         put(&*store, &k, &b).await.unwrap(),
         PutOutcome::AlreadyPresent
@@ -910,9 +897,7 @@ async fn kv_scan_ignores_sql_objects(config: &S3BlockConfig) {
         let b = body(len);
         let k = key_in(&space, "v2n", &b);
         assert!(k.as_str().starts_with("sql/v1/"));
-        limited("sql put", put(&*store, &k, &b))
-            .await
-            .unwrap();
+        limited("sql put", put(&*store, &k, &b)).await.unwrap();
     }
     put_raw(format!("sql/v1/{space}/db/lineage/snap/x"), 1000).await;
     put_raw(format!("sql/v1/{sql_only}/db/x"), 2000).await;
@@ -989,17 +974,11 @@ async fn mock_s3_conditional_create_is_one_request_and_a_412_is_checked() -> Res
     let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::Conditional).await;
     let b = body(40);
     let k = key_for(&b);
-    assert_eq!(
-        put(&store, &k, &b).await?,
-        PutOutcome::Created
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::Created);
     assert_eq!(s3.requests.lock().len(), 1);
     assert!(s3.requests.lock()[0].ends_with("conditional=true"));
     s3.requests.lock().clear();
-    assert_eq!(
-        put(&store, &k, &b).await?,
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::AlreadyPresent);
     // The refused PUT, then the check of the stored object.
     let log = s3.requests.lock().clone();
     assert_eq!(log.len(), 2, "{log:?}");
@@ -1014,15 +993,9 @@ async fn mock_s3_check_then_write_never_sends_an_unconditional_put_for_an_existi
     let store = S3SqlObjectStore::open_with_mode(&config, WriteMode::CheckThenWrite).await;
     let b = body(40);
     let k = key_for(&b);
-    assert_eq!(
-        put(&store, &k, &b).await?,
-        PutOutcome::Created
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::Created);
     s3.requests.lock().clear();
-    assert_eq!(
-        put(&store, &k, &b).await?,
-        PutOutcome::AlreadyPresent
-    );
+    assert_eq!(put(&store, &k, &b).await?, PutOutcome::AlreadyPresent);
     let log = s3.requests.lock().clone();
     assert_eq!(log.len(), 1, "{log:?}");
     assert!(log[0].starts_with("HEAD "));

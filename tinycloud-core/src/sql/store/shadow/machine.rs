@@ -170,7 +170,9 @@ pub enum Event {
     /// The durable lag scan (also fed with the head an upload job observed).
     Scanned(Head),
     /// `permit` is the shell's capacity: breaker closed and upload slots free.
-    Tick { permit: bool },
+    Tick {
+        permit: bool,
+    },
     Published(Frontier),
     /// The CAS lost; carries the manifest row as reloaded.
     Lost(Option<Frontier>),
@@ -218,7 +220,9 @@ impl Policy {
         let factor = 1_u32
             .checked_shl(attempt.saturating_sub(1))
             .unwrap_or(u32::MAX);
-        self.backoff_base.saturating_mul(factor).min(self.backoff_max)
+        self.backoff_base
+            .saturating_mul(factor)
+            .min(self.backoff_max)
     }
 
     fn due(&self, since: Instant, now: Instant) -> bool {
@@ -929,10 +933,7 @@ mod tests {
     #[test]
     fn cell_inflight_failed_policy() {
         let mut c = in_flight(1);
-        let out = c.step(
-            Event::Failed(Failure::Policy(PolicyReason::DailyBudget)),
-            4,
-        );
+        let out = c.step(Event::Failed(Failure::Policy(PolicyReason::DailyBudget)), 4);
         let reason = BlockReason::Policy(PolicyReason::DailyBudget);
         assert_eq!(out, vec![Command::Blocked(reason)]);
         assert_eq!(c.m.phase, blocked(reason));
@@ -1386,17 +1387,15 @@ mod tests {
             let active = script.noise.len() as u64;
             let mut scanned_after_quiet = false;
 
-            let check = |m: &DbMachine,
-                         job: &Option<Job>,
-                         last: &mut u64|
-             -> Result<(), TestCaseError> {
-                prop_assert_eq!(m.in_flight(), job.is_some(), "one upload per InFlight");
-                if let Some(seq) = m.last_seq() {
-                    prop_assert!(seq >= *last, "last_seq regressed");
-                    *last = seq;
-                }
-                Ok(())
-            };
+            let check =
+                |m: &DbMachine, job: &Option<Job>, last: &mut u64| -> Result<(), TestCaseError> {
+                    prop_assert_eq!(m.in_flight(), job.is_some(), "one upload per InFlight");
+                    if let Some(seq) = m.last_seq() {
+                        prop_assert!(seq >= *last, "last_seq regressed");
+                        *last = seq;
+                    }
+                    Ok(())
+                };
 
             for tick in 0..(active + 400) {
                 let now = t0 + S * tick as u32;
@@ -1434,7 +1433,10 @@ mod tests {
                 due.reverse();
                 for h in due {
                     let out = step(&mut m, Event::Notified(h), now, &policy);
-                    let uploads = out.iter().filter(|c| matches!(c, Command::Upload { .. })).count();
+                    let uploads = out
+                        .iter()
+                        .filter(|c| matches!(c, Command::Upload { .. }))
+                        .count();
                     prop_assert_eq!(uploads, 0, "an upload only starts from a tick");
                     check(&m, &job, &mut last_seq_seen)?;
                 }
@@ -1475,7 +1477,10 @@ mod tests {
                         }
                     };
                     let out = step(&mut m, event, now, &policy);
-                    let uploads = out.iter().filter(|c| matches!(c, Command::Upload { .. })).count();
+                    let uploads = out
+                        .iter()
+                        .filter(|c| matches!(c, Command::Upload { .. }))
+                        .count();
                     prop_assert_eq!(uploads, 0, "an upload only starts from a tick");
                     check(&m, &job, &mut last_seq_seen)?;
                 }

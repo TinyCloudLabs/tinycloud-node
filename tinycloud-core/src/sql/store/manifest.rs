@@ -614,9 +614,7 @@ fn check_publish(publish: &Publish, expected: Option<&CasToken>) -> Result<(), S
             ))
         }
     }
-    if matches!(publish.kind, PublishKind::Segment { .. })
-        && obj.from_seq() != obj.base_seq() + 1
-    {
+    if matches!(publish.kind, PublishKind::Segment { .. }) && obj.from_seq() != obj.base_seq() + 1 {
         return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
     }
     Ok(())
@@ -682,7 +680,9 @@ impl SqlManifest for DbSqlManifest {
             return Err(SqlStoreError::Invalid("empty publish chain"));
         };
         if expected.is_some_and(|f| last.key.to_seq() < f.last_seq) {
-            return Err(SqlStoreError::Invalid("publish chain would regress last_seq"));
+            return Err(SqlStoreError::Invalid(
+                "publish chain would regress last_seq",
+            ));
         }
         let txn = self.db.begin().await?;
         match Self::chain_in(&txn, db, expected, &chain).await {
@@ -1199,7 +1199,11 @@ mod tests {
             .await,
             Err(SqlStoreError::ObjectNotUploaded)
         ));
-        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2, "CAS rolled back");
+        assert_eq!(
+            m.current(&DB).await.unwrap().unwrap(),
+            f2,
+            "CAS rolled back"
+        );
     }
 
     /// A publish whose read-back fails in Rust after the manifest row UPDATE
@@ -1448,15 +1452,18 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
     async fn chain_bootstrap_publishes_snapshot_and_segment_atomically(m: DbSqlManifest) {
         let l = Lineage::random();
         let (s, g) = (snap(&l, 0, "boot"), seg(&l, 0, 1, 7, "wal"));
-        let PublishOutcome::Published(f) = m
-            .publish_chain(&DB, None, chain(&[&s, &g]))
-            .await
-            .unwrap()
+        let PublishOutcome::Published(f) =
+            m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap()
         else {
             panic!("bootstrap chain lost");
         };
         assert_eq!(
-            (f.base_seq, f.last_seq, f.frontier_bytes, f.base_snapshot_key.as_str()),
+            (
+                f.base_seq,
+                f.last_seq,
+                f.frontier_bytes,
+                f.base_snapshot_key.as_str()
+            ),
             (0, 7, 20, s.as_str())
         );
         assert_eq!(f.base_checkpoint_cid, CID);
@@ -1468,11 +1475,7 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         let f = first(&m, &Lineage::random(), 5).await;
         let l = Lineage::random();
         let (s, g) = (snap(&l, 0, "late"), seg(&l, 0, 1, 9, "late-wal"));
-        let current = lost(
-            m.publish_chain(&DB, None, chain(&[&s, &g]))
-                .await
-                .unwrap(),
-        );
+        let current = lost(m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap());
         assert_eq!(current.unwrap(), f);
         assert_eq!(state_of(&m, &s).await, ObjectState::Uploaded);
         assert_eq!(state_of(&m, &g).await, ObjectState::Uploaded);

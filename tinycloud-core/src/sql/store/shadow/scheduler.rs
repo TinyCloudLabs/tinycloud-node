@@ -471,12 +471,7 @@ impl Scheduler {
     /// The lag scan over every allowlisted space.
     async fn scan(&mut self) {
         let started = Instant::now();
-        let spaces: Vec<String> = self
-            .board
-            .allowlist()
-            .spaces()
-            .map(str::to_owned)
-            .collect();
+        let spaces: Vec<String> = self.board.allowlist().spaces().map(str::to_owned).collect();
         for space in spaces {
             let drift = {
                 let _pg = self.deps.pg.acquire().await;
@@ -569,7 +564,11 @@ impl Scheduler {
             }
         })
         .await;
-        let abandoned_jobs = if finished.is_err() { self.jobs.len() } else { 0 };
+        let abandoned_jobs = if finished.is_err() {
+            self.jobs.len()
+        } else {
+            0
+        };
         self.jobs.abort_all();
         let mut databases: Vec<DbDrain> = self
             .machines
@@ -644,7 +643,9 @@ fn scratch_failure(_: std::io::Error) -> JobError {
 }
 
 /// A scratch file and the async handle the source writes through.
-async fn scratch(reservation: &Reservation) -> Result<(tempfile::TempPath, tokio::fs::File), JobError> {
+async fn scratch(
+    reservation: &Reservation,
+) -> Result<(tempfile::TempPath, tokio::fs::File), JobError> {
     let named = reservation.scratch().map_err(scratch_failure)?;
     let file = named.as_file().try_clone().map_err(scratch_failure)?;
     Ok((named.into_temp_path(), tokio::fs::File::from_std(file)))
@@ -705,13 +706,10 @@ async fn upload(
     if bytes > deps.disk.capacity() {
         return Err(JobError::Policy(PolicyReason::TooLarge));
     }
-    let reservation = deps
-        .disk
-        .try_reserve(bytes)
-        .ok_or(JobError::Transient {
-            infra: false,
-            observed: None,
-        })?;
+    let reservation = deps.disk.try_reserve(bytes).ok_or(JobError::Transient {
+        infra: false,
+        observed: None,
+    })?;
     let _streaming = deps
         .bytes
         .acquire_many(deps.charge(bytes))
@@ -792,9 +790,17 @@ async fn upload(
                 Err(error) => return Err(source_failure(error)),
             }
         };
-        let to_seq = u64::try_from(head.revision).map_err(|_| JobError::Policy(PolicyReason::Refused))?;
-        let key = ObjectKey::segment(&db, &lineage, base_seq, base_seq + 1, to_seq, &copied.sha256)
-            .map_err(|e| store_failure(e.into()))?;
+        let to_seq =
+            u64::try_from(head.revision).map_err(|_| JobError::Policy(PolicyReason::Refused))?;
+        let key = ObjectKey::segment(
+            &db,
+            &lineage,
+            base_seq,
+            base_seq + 1,
+            to_seq,
+            &copied.sha256,
+        )
+        .map_err(|e| store_failure(e.into()))?;
         objects.push((
             ObjectRecord {
                 key,

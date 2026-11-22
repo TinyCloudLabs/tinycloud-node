@@ -138,11 +138,7 @@ pub async fn sha256_file(path: &Path) -> Result<ObjectMeta, SqlStoreError> {
 }
 
 /// Check a body file against the key and the declared size before any write.
-pub async fn check_body_file(
-    key: &ObjectKey,
-    path: &Path,
-    size: u64,
-) -> Result<(), SqlStoreError> {
+pub async fn check_body_file(key: &ObjectKey, path: &Path, size: u64) -> Result<(), SqlStoreError> {
     let meta = sha256_file(path).await?;
     if meta.bytes != size {
         return Err(SqlStoreError::Invalid("body file size does not match"));
