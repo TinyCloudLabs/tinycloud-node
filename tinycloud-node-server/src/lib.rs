@@ -1179,8 +1179,8 @@ pub async fn app_with_control(
     let encryption_service = encryption_service
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
         .with_deletion_ledger(deletion_ledger.clone());
-    // Runs after the migrations: a key row under `apps/` that is not a
-    // deletable key stops the node from starting.
+    // Runs after the migrations: a key row under `apps/` or `secrets/` that
+    // is not a deletable key stops the node from starting.
     tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
     // The deletion ledger is replayed onto the database before any route is
     // served, so a delete that a restore or a crash left out is applied

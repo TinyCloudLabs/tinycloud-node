@@ -262,10 +262,12 @@ pub enum EncryptionServiceError {
     OwnerOnly(String),
     #[error("deletion_ledger_unavailable: {0}")]
     DeletionLedger(String),
-    #[error("key_not_deletable: only keys under apps/ can be deleted")]
+    #[error("key_not_deletable: only keys under apps/ or secrets/ can be deleted")]
     KeyNotDeletable,
     #[error("{0} key rows under apps/ are not deletable keys; list them with: SELECT network_id, key_path, kind FROM encryption_network_key WHERE (key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/') AND kind <> 'deletable'")]
     StrayAppKeyRows(u64),
+    #[error("{0} key rows under secrets/ are not deletable keys; list them with: SELECT network_id, key_path, kind FROM encryption_network_key WHERE (key_path = 'secrets' OR substr(key_path, 1, 8) = 'secrets/') AND kind <> 'deletable'")]
+    StraySecretKeyRows(u64),
 }
 
 pub struct EncryptionService {

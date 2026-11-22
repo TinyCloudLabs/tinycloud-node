@@ -81,10 +81,14 @@
         "node_warning",
         "node_error",
         "logship_gate_summary_total",
-        "node_storage_headroom"
+        "node_storage_headroom",
+        "deletion_ledger_open_failed",
+        "deletion_ledger_replay_failed",
+        "deletion_ledger_unrepaired"
       ],
       "fields": {
         "svc": { "type": "enum", "values": ["api", "ingress", "logship"] },
+        "error_kind": { "type": "enum", "values": ["io", "path", "encode", "moved", "lock_held", "malformed", "refused", "db"] },
         "method": { "type": "enum", "values": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "<other>"] },
         "route": { "type": "enum", "values": ["/healthz", "/info", "/version", "/invoke", "/delegate", "/revoke", "/attestation", "/signed/kv", "/signed/kv/<ticket_id>", "/admin/quota", "/admin/quota/<space_id>", "/admin/usage", "/admin/stats", "/hooks/events", "/hooks/tickets", "/hooks/webhooks", "/hooks/webhooks/<subscription_id>", "/delegation/query", "/delegation/status", "/encryption/networks", "/encryption/networks/<network_id>", "/encryption/networks/<network_id>/revoke", "/encryption/networks/<network_id>/decrypt", "/policy/v3/status", "/policy/v3/status/<root_cid>", "/policy/v3/policies", "/policy/v3/challenges", "/policy/v3/delegations", "/policy/v3/enforcer-bindings", "/policy/v3/deliveries/authorize", "/.well-known/tinycloud/node-keys", "/.well-known/encryption/network/<name>", "/public/<space_id>/kv", "/public/<space_id>/kv/<key..>", "/peer/generate/<space>", "/evidences/<file>", "/share/v2/readiness", "/share/v2/policies", "/share/v2/policy/challenges", "/share/v2/policy/session", "/share/v2/invoke", "/share/v2/deliveries/authorize", "/<_s..>", "/public/<_space_id>/kv/<_key..>", "<unmatched>"] },
         "status": { "type": "integer", "min": 100, "max": 599 },
@@ -93,6 +97,7 @@
         "pool_wait_ms": { "type": "number", "min": 0, "max": 86400000 },
         "query_time_ms": { "type": "number", "min": 0, "max": 86400000 },
         "query_count": { "type": "integer", "min": 0, "max": 9007199254740991 },
+        "error_code": { "type": "enum", "values": ["db_error", "db_timeout", "db_busy", "req_timeout", "read_audit", "storage_io", "caveat_db", "read_tx_error", "key_ledger", "lifecycle", "registry_down", "cutover_fence", "kv_candidate", "engine_error", "encryption", "size_limit", "disk_headroom", "internal"] },
         "event_code": { "type": "enum", "values": ["invocation_replay_insert_failed", "invocation_replay_cleanup_failed", "dstack_get_info_failed", "share_local_tee_identity", "retention_hook_delivery_prune_failed", "retention_dead_letter_prune_failed", "retention_signed_ticket_prune_failed", "quota_invalid_body", "quota_fallback", "tunnel_state_load_failed", "tunnel_address_invalid", "link_state_load_failed", "link_bind_invalid", "link_address_invalid", "link_bind_failed", "link_bind_state_write_failed", "link_tls_config_failed", "link_listener_error", "link_listener_state_write_failed", "link_auto_renew_config_failed", "link_auto_renew_failed", "link_cert_reload_failed", "link_cert_state_missing", "link_listener_cert_reload_failed", "link_disable_failed", "link_connection_error", "link_listener_accept_failed", "webhook_delivery_failed", "webhook_dispatcher_failed", "share_authorization_failed", "share_native_authorization_denied", "share_native_kv_put_failed", "share_v2_readiness_failed", "share_invitation_key_missing", "share_invitation_key_mismatch", "share_policy_denied", "attestation_quote_failed", "hook_events_read_failed", "hook_rows_load_failed", "missing_committed_hook_row", "webhook_enqueue_failed", "tunnel_connection_prepare_failed", "tunnel_idle_timeout", "tunnel_read_failed", "tunnel_malformed_frame", "tunnel_relay_error", "tunnel_write_failed", "tunnel_state_record_failed", "tunnel_state_clear_failed", "tunnel_auth_rejected", "network_did_resolution_enabled", "unclassified", "sql_busy_lock_wait", "sql_busy_hydration", "sql_busy_artifact_transfer", "request_timeout", "deadline_overrun", "sql_hydration_timeout", "read_audit_busy", "read_audit_batch_slow", "read_audit_batch_failed", "read_audit_drain_stalled", "current_kv_c_index_missing", "current_kv_c_index_invalid", "current_kv_c_index_wrong_shape", "db_operation_retried", "db_operation_retry_skipped_slow", "db_failure_5xx", "errors_dropped", "http_5xx", "chain_guard_slow_wait", "db_pool_closed_in_transaction", "sql_database_too_large_to_load", "sql_checkpoint_save_backoff", "kv_head_size_probe_failed", "invoke_rate_limited", "account_limited", "node_top_talkers"] },
         "event_count": { "type": "integer", "min": 1, "max": 9007199254740991 },
         "reason": { "type": "enum", "values": ["malformed_envelope", "unexpected_label", "unlabelled", "non_json", "oversized", "partial", "invalid_fields", "unknown_target", "filtered_level"] },
@@ -153,7 +158,9 @@
         "assemblyai_worker_heartbeat",
         "retention_sweep_stalled",
         "retention_sweep_recovered",
-        "tinychat_request"
+        "tinychat_request",
+        "agent_chat_budget_preflight",
+        "agent_turn_settled"
       ],
       "fields": {
         "svc": { "type": "enum", "values": ["backend"] },
@@ -196,6 +203,20 @@
         "failure_cause": { "type": "enum", "values": ["model", "ours"] },
         "credits": { "type": "enum", "values": ["0", "1-9", "10-99", "100-999", "1000+"] },
         "account_hash": { "type": "string", "regex": "^[0-9a-f]{64}$", "max_len": 64 },
+        "mode": { "type": "enum", "values": ["log", "enforce", "off"] },
+        "would_block": { "type": "boolean" },
+        "blocked": { "type": "boolean" },
+        "remaining_known": { "type": "boolean" },
+        "remaining_bucket": { "type": "enum", "values": ["lt0", "0-99", "100-319", "320-999", "1000+", "unknown"] },
+        "minimum": { "type": "integer", "min": 0, "max": 1000000 },
+        "tier": { "type": "enum", "values": ["free", "plus", "pro"] },
+        "source": { "type": "enum", "values": ["ledger", "local", "outage"] },
+        "unpriced": { "type": "boolean" },
+        "raw_credits": { "type": "integer", "min": 0, "max": 10000000 },
+        "charged": { "type": "integer", "min": 0, "max": 1000000 },
+        "window_kind": { "type": "enum", "values": ["day", "week"] },
+        "outcome": { "type": "enum", "values": ["success", "limit_stop", "failed", "timed_out", "cancelled"] },
+        "started_attempts": { "type": "integer", "min": 0, "max": 1000 },
         "route_template": { "type": "enum", "values": ["/api/agent/chat", "/api/agent/session", "/api/attestation/self", "/api/auth/nonce", "/api/auth/verify", "/api/billing/checkout", "/api/billing/config", "/api/billing/portal", "/api/billing/rates", "/api/billing/status", "/api/billing/webhook", "/api/bots/history/grant", "/api/bots/history/notice", "/api/bots/history/notice/ack", "/api/bots/history/status", "/api/bots/main/messages", "/api/bots/status", "/api/chat", "/api/chat/model-selection", "/api/chat/models", "/api/connectors/credentials/:source", "/api/connectors/credentials/:source/oauth/callback", "/api/connectors/credentials/:source/oauth/start", "/api/connectors/google/autojoin/begin", "/api/connectors/google/autojoin/disable", "/api/connectors/google/autojoin/disconnect", "/api/connectors/google/autojoin/enable", "/api/connectors/google/autojoin/exchange", "/api/connectors/google/autojoin/status", "/api/connectors/google/oauth/callback", "/api/connectors/google/oauth/desktop/start", "/api/connectors/google/oauth/exchange", "/api/connectors/google/oauth/refresh", "/api/connectors/google/oauth/revoke", "/api/connectors/google/oauth/start", "/api/connectors/meetings", "/api/connectors/meetings/:source/:sourceId", "/api/connectors/meetings/:source/:sourceId/reconciled", "/api/connectors/webhooks/:source/:token", "/api/connectors/webhooks/ack", "/api/connectors/webhooks/config", "/api/connectors/webhooks/drain", "/api/connectors/webhooks/pending", "/api/connectors/webhooks/purged", "/api/delegations", "/api/delegations/status", "/api/exo/v1/grant", "/api/exo/v1/requests", "/api/internal/assemblyai-status", "/api/internal/credential-row-count", "/api/manifest", "/api/nras-proxy", "/api/nras-proxy/jwks", "/api/openapi.json", "/api/ops/content-continuity", "/api/phala-verify", "/api/server-info", "/api/signature/:id", "/api/transcriber/assemblyai/capabilities", "/api/transcriber/assemblyai/hosted/admin/reconcile", "/api/transcriber/assemblyai/hosted/jobs/:source_id", "/api/transcriber/assemblyai/hosted/transcripts", "/api/transcriber/assemblyai/hosted/transcripts/:handle", "/api/transcriber/assemblyai/hosted/transcripts/:handle/sentences", "/api/transcriber/assemblyai/hosted/uploads", "/api/transcriber/assemblyai/hosted/uploads/:upload_id", "/api/transcriber/assemblyai/hosted/uploads/:upload_id/parts/:index", "/api/transcriber/assemblyai/transcripts/:id", "/api/transcriber/meetings", "/api/transcriber/meetings/:id", "/api/transcriber/meetings/:id/stop", "/api/transcriber/meetings/:id/transcript", "/api/transcriber/private-cloud/capabilities", "/api/transcriber/private-cloud/transcriptions", "/api/transcriber/private-cloud/transcriptions/:id", "/api/transcriber/private-cloud/transcriptions/:id/cancel", "/api/transcriber/private-cloud/transcriptions/:id/result", "/api/transcriber/webhooks/ptx", "/health", "unmatched"] }
       }
     },
