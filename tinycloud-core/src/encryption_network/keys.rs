@@ -1,10 +1,10 @@
 //! Named-key rows: create, block/unblock, public-key derivation, and the
 //! state-checked unwrap used by the decrypt release guard.
 //!
-//! A key's kind follows from its path: a path under `apps/` is a deletable
-//! key (derived from the network secret, the path and a per-key random seed),
-//! every other path is a deterministic key (no seed). The create, block and
-//! unblock writes all run under the network row lock.
+//! A key's kind follows from its path: a path under `apps/` or `secrets/` is
+//! a deletable key (derived from the network secret, the path and a per-key
+//! random seed), every other path is a deterministic key (no seed). The
+//! create, block and unblock writes all run under the network row lock.
 
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
@@ -15,7 +15,7 @@ use crate::db::begin_write_transaction;
 use crate::models::{encryption_network, encryption_network_key, encryption_network_member};
 
 use super::backend::{KeyBackendError, KeySeed, KeyWrapContext, KeyWrapPurpose};
-use super::key_id::{app_id_of, is_apps_path, EncryptionResource, KeyKind, KeyLocation};
+use super::key_id::{app_id_of, EncryptionResource, KeyKind, KeyLocation};
 use super::network_id::NetworkId;
 use super::service::{is_unique_violation, now_rfc3339, EncryptionService, EncryptionServiceError};
 use super::types::{NetworkState, ALG_X25519_AES256GCM};
@@ -217,8 +217,8 @@ enum CreateStep {
 
 impl EncryptionService {
     /// `key.create`. `deletable` must equal what the path implies (true under
-    /// `apps/`, false elsewhere). Idempotent for an identical ACTIVE
-    /// deterministic key (returns the existing descriptor). A `deleted`
+    /// `apps/` and `secrets/`, false elsewhere). Idempotent for an identical
+    /// ACTIVE deterministic key (returns the existing descriptor). A `deleted`
     /// deletable row is reused with a fresh seed, state `active` and the next
     /// key version; any other existing row is `key_exists`, and a deleted
     /// deterministic row is `key_deleted`. The existence check and the write
@@ -230,7 +230,8 @@ impl EncryptionService {
     ) -> Result<KeyDescriptor, EncryptionServiceError> {
         if deletable != (loc.kind() == KeyKind::Deletable) {
             return Err(EncryptionServiceError::KeyPathInvalid(
-                "deletable must be true for key paths under apps/ and false elsewhere".to_string(),
+                "deletable must be true for key paths under apps/ or secrets/ and false elsewhere"
+                    .to_string(),
             ));
         }
         let _writer = match &self.sqlite_writer_lock {
@@ -543,14 +544,15 @@ impl EncryptionService {
         descriptor(row)
     }
 
-    /// Unauthenticated public GET. Under `apps/` every path answers
-    /// `key_not_found` without reading anything. Elsewhere it requires an
-    /// ACTIVE network and always derives from the network secret, never from
-    /// the stored row, so missing, blocked and active keys return identical
-    /// output. Writes nothing and never reports key state or absence outside
-    /// `apps/`.
+    /// Unauthenticated public GET. A deletable key (under `apps/` or
+    /// `secrets/`) always answers `key_not_found` without reading anything:
+    /// its public key comes only from the authenticated descriptor. Elsewhere
+    /// it requires an ACTIVE network and always derives from the network
+    /// secret, never from the stored row, so missing, blocked and active keys
+    /// return identical output. Writes nothing and never reports key state or
+    /// absence of a deterministic key.
     pub async fn public_key(&self, loc: &KeyLocation) -> Result<KeyPublic, EncryptionServiceError> {
-        if is_apps_path(loc.path()) {
+        if loc.kind() == KeyKind::Deletable {
             return Err(EncryptionServiceError::KeyNotFound);
         }
         let network = network_of(loc)?;
@@ -640,21 +642,41 @@ impl EncryptionService {
     }
 }
 
-/// Startup check: no key row under `apps/` (or at the path `apps`) may be
-/// anything other than a deletable key. Such a row cannot be read as a key,
-/// and a path under `apps/` is only ever deletable.
+/// Startup check: no key row under a deletable segment (`apps/` or
+/// `secrets/`, or at the bare path `apps` or `secrets`) may be anything other
+/// than a deletable key. Such a row cannot be read as a key, and a path under
+/// those segments is only ever deletable. Rows under `apps/` are reported as
+/// [`EncryptionServiceError::StrayAppKeyRows`], rows under `secrets/` as
+/// [`EncryptionServiceError::StraySecretKeyRows`].
 pub async fn ensure_no_deterministic_app_keys<C: ConnectionTrait>(
     db: &C,
 ) -> Result<(), EncryptionServiceError> {
-    let stray = encryption_network_key::Entity::find()
+    let apps = non_deletable_rows_under(db, "apps").await?;
+    if apps > 0 {
+        return Err(EncryptionServiceError::StrayAppKeyRows(apps));
+    }
+    let secrets = non_deletable_rows_under(db, "secrets").await?;
+    if secrets > 0 {
+        return Err(EncryptionServiceError::StraySecretKeyRows(secrets));
+    }
+    Ok(())
+}
+
+/// Rows at the path `segment` or under `segment/` whose kind is not
+/// deletable. `segment` is a fixed literal, never input.
+async fn non_deletable_rows_under<C: ConnectionTrait>(
+    db: &C,
+    segment: &'static str,
+) -> Result<u64, DbErr> {
+    let under = format!(
+        "(key_path = '{segment}' OR substr(key_path, 1, {}) = '{segment}/')",
+        segment.len() + 1
+    );
+    encryption_network_key::Entity::find()
         .filter(
-            Expr::cust("(key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/')")
+            Expr::cust(under)
                 .and(encryption_network_key::Column::Kind.ne(KeyKind::Deletable.as_str())),
         )
         .count(db)
-        .await?;
-    if stray == 0 {
-        return Ok(());
-    }
-    Err(EncryptionServiceError::StrayAppKeyRows(stray))
+        .await
 }

@@ -343,12 +343,12 @@
   {
    "keyPath": "secrets/x",
    "deletable": true,
-   "accepted": false
+   "accepted": true
   },
   {
    "keyPath": "secrets/x",
    "deletable": false,
-   "accepted": true
+   "accepted": false
   }
  ],
  "deletePrefix": [
