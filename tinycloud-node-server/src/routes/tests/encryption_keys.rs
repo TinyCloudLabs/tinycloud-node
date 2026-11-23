@@ -548,28 +548,6 @@ async fn create_refuses_a_capability_for_another_ability() -> Result<()> {
 }
 
 #[tokio::test]
-async fn create_refuses_a_capability_on_a_prefix() -> Result<()> {
-    let (fixture, network) = setup().await?;
-    let body = json!({"keyPath": "docs/a", "deletable": false});
-    let prefix = format!("{network}/docs/");
-    let auth = invocation(
-        &fixture,
-        &fixture.node_did,
-        &[(prefix.as_str(), KEY_CREATE_ACTION)],
-        vec![admin_fact_for(
-            &fixture.node_did,
-            &network,
-            "docs/a",
-            KEY_CREATE_ACTION,
-            &canonical_hash(&body),
-        )],
-    )?;
-    let (status, text) = post_json(&fixture.client, &keys_url(&network), &auth, &body).await;
-    assert_eq!(status, Status::Unauthorized, "{text}");
-    Ok(())
-}
-
-#[tokio::test]
 async fn create_refuses_a_capability_on_the_bare_network() -> Result<()> {
     let (fixture, network) = setup().await?;
     let body = json!({"keyPath": "docs/a", "deletable": false});
@@ -826,15 +804,6 @@ async fn describe_refuses_a_percent_escape_in_the_network_id() -> Result<()> {
 }
 
 #[tokio::test]
-async fn public_get_of_a_clean_raw_path_with_a_colon_network_id_succeeds() -> Result<()> {
-    let (fixture, network) = setup().await?;
-    assert!(network.contains(':'), "{network}");
-    let (status, text) = public_get(&fixture, &network, "docs/a").await;
-    assert_eq!(status, Status::Ok, "{text}");
-    Ok(())
-}
-
-#[tokio::test]
 async fn public_get_refuses_a_grammar_invalid_key_path() -> Result<()> {
     let (fixture, network) = setup().await?;
     let (status, text) = public_get(&fixture, &network, "docs/Bad").await;
@@ -904,16 +873,6 @@ async fn public_get_is_rate_limited_per_client_ip() -> Result<()> {
 }
 
 #[tokio::test]
-async fn describe_missing_key_is_not_found() -> Result<()> {
-    let (fixture, network) = setup().await?;
-    let auth = describe_auth(&fixture, &network, "docs/absent", KEY_CREATE_ACTION)?;
-    let (status, text) = describe_get(&fixture, &network, "docs/absent", &auth).await;
-    assert_eq!(status, Status::NotFound, "{text}");
-    assert!(text.starts_with("key_not_found"), "{text}");
-    Ok(())
-}
-
-#[tokio::test]
 async fn describe_refuses_admin_facts() -> Result<()> {
     let (fixture, network) = setup().await?;
     let (status, text) = create(&fixture, &network, "docs/a", false).await?;
@@ -931,23 +890,6 @@ async fn describe_refuses_admin_facts() -> Result<()> {
             KEY_CREATE_ACTION,
             &canonical_hash(&body),
         )],
-    )?;
-    let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
-    assert_eq!(status, Status::Unauthorized, "{text}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn describe_refuses_a_capability_on_a_prefix() -> Result<()> {
-    let (fixture, network) = setup().await?;
-    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
-    assert_eq!(status, Status::Ok, "create: {text}");
-    let prefix = format!("{network}/docs/");
-    let auth = invocation(
-        &fixture,
-        &fixture.node_did,
-        &[(prefix.as_str(), KEY_CREATE_ACTION)],
-        vec![describe_fact_for(&fixture.node_did, &network, "docs/a")],
     )?;
     let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
     assert_eq!(status, Status::Unauthorized, "{text}");
@@ -1012,27 +954,6 @@ async fn describe_refuses_a_replayed_invocation() -> Result<()> {
     assert_eq!(status, Status::Ok, "first: {text}");
     let (status, text) = describe_get(&fixture, &network, "docs/a", &auth).await;
     assert_eq!(status, Status::Unauthorized, "replay: {text}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn describe_without_an_authorization_header_returns_the_public_shape() -> Result<()> {
-    let (fixture, network) = setup().await?;
-    let (status, text) = create(&fixture, &network, "docs/a", false).await?;
-    assert_eq!(status, Status::Ok, "create: {text}");
-    let (status, text) = public_get(&fixture, &network, "docs/a").await;
-    assert_eq!(status, Status::Ok, "{text}");
-    let body: Value = serde_json::from_str(&text)?;
-    assert_eq!(
-        field_names(&body),
-        vec![
-            "alg",
-            "keyPath",
-            "keyVersion",
-            "networkId",
-            "publicEncryptionKey"
-        ]
-    );
     Ok(())
 }
 

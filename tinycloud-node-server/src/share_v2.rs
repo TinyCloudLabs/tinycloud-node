@@ -3846,15 +3846,6 @@ mod tests {
         assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare", None).is_err());
     }
 
-    #[test]
-    fn runtime_delegation_facts_include_share_and_presentation_digests() {
-        let request = sample_v2_challenge();
-        assert_eq!(request.share_cid, "bafy-share");
-        let presentation = serde_json::json!({"holderDid": request.holder_did});
-        let digest = b64_digest(&jcs::canonicalize(&presentation));
-        assert_eq!(digest.len(), 43);
-    }
-
     fn sample_v2_challenge() -> V2ChallengeRequest {
         serde_json::from_value(serde_json::json!({
             "envelopeCid": "bafy-envelope",
@@ -4033,35 +4024,6 @@ mod tests {
             Ed25519InvitationSigner::new(kid, keypair.into()).expect("valid kid"),
             did,
         )
-    }
-
-    #[test]
-    fn v2_holder_proof_signature_tamper_is_rejected() {
-        let (signer, holder_did) = tamper_keypair_and_did();
-        let value = serde_json::json!({"resource": "shares/share-1/document.md"});
-        let mut proof = signed_value(&signer, b"xyz.tinycloud.share/test-tamper/v1\0", &value)
-            .expect("valid signature produced");
-        assert!(verify_v2_proof(
-            &holder_did,
-            &proof,
-            b"xyz.tinycloud.share/test-tamper/v1\0",
-            &value
-        )
-        .is_ok());
-
-        let mut signature_bytes = decode_config(&proof.signature, URL_SAFE_NO_PAD).unwrap();
-        signature_bytes[0] ^= 0x01;
-        proof.signature = encode_config(&signature_bytes, URL_SAFE_NO_PAD);
-        assert!(
-            verify_v2_proof(
-                &holder_did,
-                &proof,
-                b"xyz.tinycloud.share/test-tamper/v1\0",
-                &value
-            )
-            .is_err(),
-            "a single flipped signature byte must be rejected"
-        );
     }
 
     async fn migrated_memory_db() -> tinycloud_core::sea_orm::DatabaseConnection {

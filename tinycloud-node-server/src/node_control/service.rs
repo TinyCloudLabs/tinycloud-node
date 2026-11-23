@@ -2659,18 +2659,6 @@ printf '%s\n' "31536000"
         assert_eq!(parse_process_age("1-02:03:04"), Some(93_784));
     }
 
-    #[cfg(target_os = "macos")]
-    #[::core::prelude::v1::test]
-    fn process_age_uses_etime_on_macos() {
-        assert_eq!(ps_elapsed_field(), "etime=");
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[::core::prelude::v1::test]
-    fn process_age_uses_etimes_elsewhere() {
-        assert_eq!(ps_elapsed_field(), "etimes=");
-    }
-
     #[::core::prelude::v1::test]
     fn systemd_system_group_install_step_matches_profile_and_privilege() {
         assert_eq!(

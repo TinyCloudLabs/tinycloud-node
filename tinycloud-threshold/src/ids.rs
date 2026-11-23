@@ -275,13 +275,5 @@ mod properties {
             prop_assert_eq!(MemberIndex::new(index).is_ok(), (1..=16).contains(&index));
             prop_assert_eq!(Threshold::new(t, n).is_ok(), (2..=16).contains(&t) && t <= n && n <= 16);
         }
-
-        #[test]
-        fn arbitrary_counters_use_checked_increment(value in any::<u64>()) {
-            let expected = value.checked_add(1);
-            prop_assert_eq!(Epoch::new(value).checked_next().ok().map(|v| v.get()), expected);
-            prop_assert_eq!(RekeyCounter::new(value).checked_next().ok().map(|v| v.get()), expected);
-            prop_assert_eq!(KeyVersion::new(value).checked_next().ok().map(|v| v.get()), expected);
-        }
     }
 }

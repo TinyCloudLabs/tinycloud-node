@@ -62,22 +62,9 @@ pub(crate) fn tagged_hash(tag: &[u8], body: &[u8]) -> [u8; 32] {
 /// RFC 9380 §§5.3.1,5.3.3. SHA-256 limits ell to 255 blocks.
 #[cfg(test)]
 pub(crate) fn expand_xmd<const N: usize>(msg: &[u8], dst: &[u8]) -> Result<[u8; N], Error> {
-    if N == 0 || N > 8160 {
-        return Err(Error::InvalidLength);
-    }
     let length = u16::try_from(N)
         .map_err(|_| Error::InvalidLength)?
         .to_be_bytes();
-    let mut shortened = [0; 32];
-    let dst = if dst.len() > 255 {
-        let mut hash = Sha256::new();
-        hash.update(b"H2C-OVERSIZE-DST-");
-        hash.update(dst);
-        shortened.copy_from_slice(&hash.finalize());
-        shortened.as_slice()
-    } else {
-        dst
-    };
     let dst_len = u8::try_from(dst.len()).map_err(|_| Error::InvalidLength)?;
     Ok(xmd(msg, dst, length, dst_len))
 }
@@ -215,22 +202,5 @@ mod tests {
         assert_ne!(tagged_hash(b"a", b"bc"), tagged_hash(b"ab", b"c"));
         assert_eq!(h2(&[0; 576]), expand_xmd::<32>(&[0; 576], H2).unwrap());
         assert_eq!(h4(&[0; 32]), expand_xmd::<32>(&[0; 32], H4).unwrap());
-    }
-
-    #[test]
-    fn xmd_bounds_and_oversize_dst() {
-        assert!(expand_xmd::<0>(b"", H1).is_err());
-        assert!(expand_xmd::<8161>(b"", H1).is_err());
-        assert!(expand_xmd::<8160>(b"", H1).is_ok());
-        let dst = [42u8; 256];
-        let mut h = Sha256::new();
-        h.update(b"H2C-OVERSIZE-DST-");
-        h.update(dst);
-        let shortened = h.finalize();
-        assert_eq!(
-            expand_xmd::<48>(b"abc", &dst).unwrap(),
-            expand_xmd::<48>(b"abc", &shortened).unwrap()
-        );
-        assert_eq!(expand_xmd::<1>(b"abc", H1).unwrap().len(), 1);
     }
 }

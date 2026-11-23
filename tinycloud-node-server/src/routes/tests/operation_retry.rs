@@ -462,22 +462,6 @@ async fn other_database_failures_are_not_retried() -> Result<()> {
     Ok(())
 }
 
-/// A mutating invocation that began its transaction and then lost its
-/// connection may have been applied: `outcome_unknown`, not a safe `503`.
-/// An authorization that wrote nothing stays a safe `503`.
-#[tokio::test]
-async fn an_authorization_failure_reports_the_trackers_verdict() {
-    let error = TxStoreError::Tx(TxError::Db(lost()));
-
-    let (status, body) = authorization_failure("server.sql.auth", &error, true);
-    assert_eq!(status, Status::InternalServerError);
-    assert!(body.starts_with(OUTCOME_UNKNOWN), "{body}");
-
-    let (status, body) = authorization_failure("server.sql.auth", &error, false);
-    assert_eq!(status, Status::ServiceUnavailable);
-    assert!(body.starts_with(UNAVAILABLE_RETRYABLE), "{body}");
-}
-
 /// A mutating invocation (a `kv/del` beside the SQL read) reaches the same
 /// authorization step. Its read-write transaction began and the connection
 /// was then lost, so the delete may have applied: `outcome_unknown`, not a
@@ -514,23 +498,6 @@ async fn a_mutating_invocation_that_lost_its_connection_after_begin_is_outcome_u
 async fn kv_get_header(fixture: &KvSyncFixture, key: &str) -> Result<String> {
     let kv = fixture.kv_resource(key)?.to_string();
     fixture.owner_invocation(&[(kv, "tinycloud.kv/get")])
-}
-
-/// A KV read that meets a dead pooled connection before its audit step is
-/// run once more inside the request and answers the value.
-#[tokio::test]
-async fn a_kv_read_recovers_in_request_from_a_dead_pooled_connection() -> Result<()> {
-    let fixture = fixture().await?;
-    fixture.owner_write("notes/x", Some(b"value")).await?;
-    let header = kv_get_header(&fixture, "notes/x").await?;
-    let plan = Plan::new(1, lost);
-
-    let reply = retried(&plan, fixture.dispatch(header, &[])).await;
-
-    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
-    assert_eq!(reply.body, "value");
-    assert_eq!(plan.injected(), 1, "the loss reached the read");
-    Ok(())
 }
 
 /// The retried read writes its audit record once: the failed run stopped

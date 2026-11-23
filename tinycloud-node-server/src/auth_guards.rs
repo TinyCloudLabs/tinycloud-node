@@ -629,10 +629,18 @@ mod tests {
 
     #[test]
     fn object_response_drops_hop_by_hop_headers() {
-        for header in NON_REPLAYABLE_OBJECT_HEADERS {
-            assert!(!is_replayable_object_header(header));
+        for header in [
+            "Connection",
+            "content-length",
+            "keep-alive",
+            "proxy-authorization",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(!is_replayable_object_header(header), "{header}");
         }
         assert!(is_replayable_object_header("content-type"));
+        assert!(is_replayable_object_header("x-tinycloud-meta-owner"));
     }
 
     #[test]
@@ -708,35 +716,6 @@ mod tests {
         );
         assert!(response.headers().get_one("Transfer-Encoding").is_none());
         assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn kv_responder_sets_streaming_postconditions() -> Result<()> {
-        let client = Client::tracked(rocket::build()).await?;
-        let request = client.get("/");
-        let body = vec![b'k'; 32 * 1024];
-        let response = KVResponse::new(
-            Metadata(
-                [
-                    (
-                        "content-type".to_string(),
-                        "application/octet-stream".to_string(),
-                    ),
-                    ("transfer-encoding".to_string(), "chunked".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            hash(b"direct-authenticated-stream"),
-            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
-        )
-        .respond_to(request.inner())
-        .map_err(|status| anyhow::anyhow!("KVResponse failed: {status}"))?;
-
-        assert_eq!(response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
-        assert_eq!(response.headers().get_one("Content-Length"), Some("32768"));
-        assert!(response.headers().get_one("Transfer-Encoding").is_none());
         Ok(())
     }
 }

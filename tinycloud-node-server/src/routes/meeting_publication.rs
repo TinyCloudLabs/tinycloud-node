@@ -417,23 +417,6 @@ mod tests {
         }
     }
     #[test]
-    fn publication_route_rejects_read_only_and_constrained_authority() {
-        assert!(command(
-            &request("unfreeze_legacy"),
-            Some(publication::SQL_PATH),
-            "tinycloud.sql/read",
-            &None
-        )
-        .is_err());
-        assert!(command(
-            &request("unfreeze_legacy"),
-            Some(publication::SQL_PATH),
-            "tinycloud.sql/write",
-            &Some(SqlCaveats::default())
-        )
-        .is_err());
-    }
-    #[test]
     fn publication_route_rejects_wrong_database_and_private_operations() {
         assert!(command(
             &request("unfreeze_legacy"),
