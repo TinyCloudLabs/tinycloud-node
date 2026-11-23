@@ -854,6 +854,29 @@ fn renewal_rows_query() -> SelectStatement {
     renewal_rows
 }
 
+/// Push down only predicates that `renewal_candidate` already ignores.
+/// Keep predecessor history and unverifiable chains for fail-closed resolution.
+fn account_renewal_rows_query(
+    identity: &crate::renewal::RenewalNodeIdentity,
+    now: time::PrimitiveDateTime,
+) -> SelectStatement {
+    Query::select()
+        .column(sea_orm::sea_query::Asterisk)
+        .from_subquery(
+            renewal_rows_query(),
+            Alias::new("account_renewal_candidates"),
+        )
+        .and_where(Expr::col(Alias::new("lease_state")).is_in(["active", "stopped"]))
+        .and_where(Expr::col(Alias::new("lease_expiry")).gt(now))
+        .and_where(Expr::col(Alias::new("lease_revoked")).eq(false))
+        .and_where(Expr::col(Alias::new("renewer_did")).eq(identity.renewer_did.as_str()))
+        .and_where(Expr::col(Alias::new("renewer_epoch")).eq(identity.epoch as i64))
+        .and_where(Expr::col(Alias::new("stamp_epoch")).eq(identity.epoch as i64))
+        .and_where(Expr::col(Alias::new("stamp_generation")).gte(0))
+        .and_where(Expr::col(Alias::new("lease_period")).gt(0))
+        .to_owned()
+}
+
 // The old metadata query had no ORDER BY. Authorization accepts any matching
 // ability, but the last rejected caveat supplies a diagnostic reason. Use the
 // typed `(resource, ability)` order on every backend; only that diagnostic can
@@ -990,14 +1013,10 @@ pub(crate) async fn account_effective_ends<C: ConnectionTrait>(
 ) -> Result<HashMap<Hash, i64>, DbErr> {
     let mut candidates = Vec::new();
     if let Some(identity) = identity.filter(|_| !delegations.is_empty()) {
-        let mut query = renewal_rows_query();
-        query.and_where(
-            Expr::col((
-                Alias::new("renewal_original_alias"),
-                delegation_cid_alias::Column::Id,
-            ))
-            .is_in(delegations.keys().copied()),
-        );
+        let now = time::OffsetDateTime::from_unix_timestamp(verifier_now)
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+        let mut query = account_renewal_rows_query(identity, now.date().with_time(now.time()));
+        query.and_where(Expr::col(Alias::new("node")).is_in(delegations.keys().copied()));
         for row in db
             .query_all(db.get_database_backend().build(&query))
             .await?
@@ -1061,26 +1080,25 @@ fn resolve_effective_end(
         }
         let mut renewed_end = None;
         if let Some(rows) = candidates.get(&id) {
-            let mut expected_previous = rows.first()?.lease.clone();
-            let mut used = HashSet::new();
-            loop {
-                let matching = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.previous == expected_previous)
-                    .collect::<Vec<_>>();
-                if matching.is_empty() {
-                    break;
-                }
-                if matching.len() != 1 {
+            let mut by_previous = HashMap::with_capacity(rows.len());
+            for candidate in rows {
+                if by_previous
+                    .insert(candidate.previous.as_str(), candidate)
+                    .is_some()
+                {
                     return None;
                 }
-                let (index, candidate) = matching[0];
+            }
+            let mut expected_previous = rows.first()?.lease.as_str();
+            let mut used = 0;
+            while let Some(candidate) = by_previous.get(expected_previous) {
+                if used == rows.len() {
+                    return None;
+                }
                 let latest_allowed = candidate.now.checked_add(candidate.period)?;
                 let stamp_verifier_now = candidate.end.checked_sub(1)?;
                 if candidate.original_expiry != signed_end
                     || candidate.end > latest_allowed
-                    || used.contains(&index)
                     || crate::renewal::verify_snapshot_stamp(
                         crate::renewal::SnapshotStampVerification {
                             signed_bytes: &candidate.signed_bytes,
@@ -1104,12 +1122,12 @@ fn resolve_effective_end(
                 {
                     return None;
                 }
-                used.insert(index);
-                expected_previous = candidate.stamp.clone();
+                used += 1;
+                expected_previous = candidate.stamp.as_str();
                 renewed_end =
                     Some(renewed_end.map_or(candidate.end, |end: i64| end.max(candidate.end)));
             }
-            if used.len() != rows.len() {
+            if used != rows.len() {
                 return None;
             }
         }
@@ -1711,6 +1729,120 @@ mod tests {
         }
         (stable_node_did, renewer_did, epoch)
     }
+    #[tokio::test]
+    async fn account_candidate_sql_keeps_history_and_excludes_ineligible_leases() {
+        let (db, _) = counted_database().await;
+        let mut roots = Vec::new();
+        let mut identity = None;
+        for case in [
+            "valid",
+            "stopped",
+            "generation",
+            "expired",
+            "renewer",
+            "epoch",
+            "parent",
+            "signature",
+        ] {
+            let original = hash(format!("tc4046-{case}-original").as_bytes());
+            let lease = hash(format!("tc4046-{case}-lease").as_bytes());
+            let ancestor = hash(format!("tc4046-{case}-parent").as_bytes());
+            let (stable_node_did, renewer_did, epoch) =
+                insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
+                    .await;
+            identity = Some(crate::renewal::RenewalNodeIdentity {
+                stable_node_did,
+                renewer_did,
+                epoch,
+            });
+            roots.push(original);
+            let change = match case {
+                "stopped" => Some("state = 'stopped'"),
+                "generation" => Some("generation = 2"),
+                "expired" => Some("lease_expiry = '1970-01-01 00:35:50'"),
+                "renewer" => Some("renewer_did = 'did:key:old-renewer'"),
+                "epoch" => Some("renewer_epoch = 2"),
+                _ => None,
+            };
+            if let Some(change) = change {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE renewal_lease SET {change} WHERE lease_cid = $1"),
+                    [Value::Bytes(Some(Box::new(Vec::<u8>::from(lease))))],
+                ))
+                .await
+                .unwrap();
+            }
+            if case == "parent" {
+                revocation::ActiveModel {
+                    id: Set(hash(b"tc4046-revoked-lease-parent")),
+                    revoker: Set("did:key:actor".to_owned()),
+                    revoked: Set(ancestor),
+                    serialization: Set(vec![1]),
+                    revoked_at: Set(None),
+                }
+                .insert(&db)
+                .await
+                .unwrap();
+            }
+            if case == "signature" {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE renewal_stamp SET signature = $1 WHERE lease_cid = $2",
+                    [
+                        Value::Bytes(Some(Box::new(vec![0; 64]))),
+                        Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                    ],
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        let identity = identity.unwrap();
+        let rows = db
+            .query_all(
+                DbBackend::Sqlite.build(&account_renewal_rows_query(&identity, db_datetime(2_150))),
+            )
+            .await
+            .unwrap();
+        // Includes the expired predecessor of every eligible lease, stopped
+        // leases, old generations, and invalid signatures (fail closed later).
+        assert_eq!(rows.len(), 8);
+        let snapshot = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &roots,
+            &identity.stable_node_did,
+            &identity.renewer_did,
+            identity.epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        let ends = account_effective_ends(
+            &db,
+            &snapshot.parents,
+            &snapshot.delegations,
+            &snapshot.revoked,
+            Some(&identity),
+            2_150,
+        )
+        .await
+        .unwrap();
+        for root in &roots {
+            assert_eq!(
+                ends.get(root).copied(),
+                snapshot.effective_expiry(root),
+                "{root:?}"
+            );
+        }
+        assert_eq!(ends.get(&roots[0]), Some(&2_200));
+        assert_eq!(
+            ends.get(&roots[7]),
+            None,
+            "invalid signature must not fall back to signed expiry"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_verifies_stamp_history_caps_expiry_and_fails_closed() {
         let (db, counter) = counted_database().await;

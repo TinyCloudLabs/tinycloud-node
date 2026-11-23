@@ -1150,3 +1150,76 @@ async fn delegation_query_json_key_sets_unchanged_for_renewed_grant() -> Result<
     )
     .await
 }
+
+#[tokio::test]
+async fn delegation_query_full_hundred_row_page_with_renewal_enabled() -> Result<()> {
+    let h = Harness::start(None).await?;
+    let (owner, first, resource) = new_renewable(&h).await?;
+    let mut renewed = vec![first];
+    for _ in 0..4 {
+        renewed.push(h.renewable(&owner, &resource, false).await?);
+    }
+    let mut unrenewed = Vec::new();
+    for _ in 0..90 {
+        unrenewed.push(
+            h.register(token(
+                &owner,
+                &key_did(&renewed[0].holder)?,
+                &resource,
+                "tinycloud.kv/get",
+                h.now - 1,
+                h.now + 120,
+            )?)
+            .await?,
+        );
+    }
+    for target in &renewed {
+        await_stamps(&h, target, h.now + 75, 1).await?;
+    }
+    for target in &renewed {
+        await_stamps(&h, target, h.now + 150, 2).await?;
+    }
+    let issuer = key_did(&owner)?;
+    let authorization = token(
+        &owner,
+        &h.secret.node_did(),
+        &format!(
+            "tinycloud:{}:agent/delegation",
+            issuer.strip_prefix("did:").unwrap()
+        ),
+        "tinycloud.delegation/list",
+        h.now - 1,
+        h.now + 3600,
+    )?;
+    let response = h
+        .client
+        .post(format!("{}/delegation/query", h.base))
+        .header("Authorization", authorization)
+        .json(&json!({"direction": "issued", "limit": 100}))
+        .send()
+        .await?;
+    let code = response.status();
+    let body = response.text().await?;
+    ensure!(code.is_success(), "query {code}: {body}");
+    let page: Value = serde_json::from_str(&body)?;
+    ensure!(
+        page["items"].as_array().context("items")?.len() == 100,
+        "{page}"
+    );
+    ensure!(
+        page.get("nextCursor").is_none(),
+        "unexpected pagination: {page}"
+    );
+    for target in &renewed {
+        let status = h.status(target).await?;
+        ensure!(status["status"] == "active", "{status}");
+        ensure!(
+            query_record(&page, &target.cid)?["status"] == status["status"],
+            "{page}"
+        );
+    }
+    for cid in &unrenewed {
+        ensure!(query_record(&page, cid)?["status"] == "expired", "{page}");
+    }
+    Ok(())
+}

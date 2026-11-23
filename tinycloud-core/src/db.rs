@@ -7130,6 +7130,7 @@ struct AccountAncestorState {
     parents: HashMap<Hash, Vec<Hash>>,
     delegations: HashMap<Hash, delegation::Model>,
     revocations: HashMap<Hash, Vec<revocation::Model>>,
+    policy_revocations: HashSet<Hash>,
     /// Ancestor-capped ends from the same resolver as `/delegation/status`.
     effective_ends: HashMap<Hash, i64>,
 }
@@ -7154,6 +7155,13 @@ impl AccountAncestorState {
                 revoked_ancestor_cid: None,
             });
         }
+        if self.policy_revocations.contains(&root) {
+            return Ok(AccountLifecycle {
+                status: "revoked",
+                direct_revocation: None,
+                revoked_ancestor_cid: None,
+            });
+        }
 
         let mut frontier = self.parents.get(&root).cloned().unwrap_or_default();
         frontier.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
@@ -7164,6 +7172,13 @@ impl AccountAncestorState {
             for current in current_level {
                 if !visited.insert(current) {
                     continue;
+                }
+                if self.policy_revocations.contains(&current) {
+                    return Ok(AccountLifecycle {
+                        status: "revoked",
+                        direct_revocation: None,
+                        revoked_ancestor_cid: Some(current.to_cid(0x55).to_string()),
+                    });
                 }
                 if self
                     .revocations
@@ -7466,6 +7481,27 @@ async fn load_account_ancestor_state_with_renewal<C: ConnectionTrait>(
         .all(db)
         .await?;
     let revocation_rows = revocation::effective_rows(db, &ids).await?;
+    let policy_revocations = policy_v3_root::Entity::find()
+        .select_only()
+        .column(policy_v3_root::Column::RootCid)
+        .filter(
+            policy_v3_root::Column::RootCid.is_in(ids.iter().map(|id| id.to_cid(0x55).to_string())),
+        )
+        .filter(
+            Condition::any()
+                .add(policy_v3_root::Column::RevokedAt.is_not_null())
+                .add(policy_v3_root::Column::RevocationBytes.is_not_null()),
+        )
+        .into_tuple::<String>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|cid| {
+            cid.parse::<tinycloud_auth::authorization::Cid>()
+                .map(Hash::from)
+                .map_err(|error| DbErr::Custom(error.to_string()))
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
     let delegations = delegation_rows
         .into_iter()
         .map(|row| (row.id, row))
@@ -7481,7 +7517,11 @@ async fn load_account_ancestor_state_with_renewal<C: ConnectionTrait>(
         db,
         &parents,
         &delegations,
-        &revocations.keys().copied().collect(),
+        &revocations
+            .keys()
+            .copied()
+            .chain(policy_revocations.iter().copied())
+            .collect(),
         renewal_identity,
         verifier_now,
     )
@@ -7490,6 +7530,7 @@ async fn load_account_ancestor_state_with_renewal<C: ConnectionTrait>(
         parents,
         delegations,
         revocations,
+        policy_revocations,
         effective_ends,
     })
 }
