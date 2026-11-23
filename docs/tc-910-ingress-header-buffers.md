@@ -29,12 +29,18 @@ CI runs it in the `build-ingress` job before the image is pushed. Locally: `DOCK
 
 ## Temporary upstream failures (TC-3972)
 
-While ingress is running, a locally generated proxy 502 (including connection
-refusal or a response lost before headers) or 504 (upstream timeout) becomes
-503 with `Content-Type: text/plain`, `Retry-After: 5`, and the body
-`Service temporarily unavailable.` followed by a newline. Five seconds is a
-short suggested pause to reduce immediate reconnect pressure, not an estimate
-of when startup will finish.
+While ingress is running, a locally generated proxy 502 becomes 503 only when
+`$upstream_connect_time` is exactly `-`: nginx did not reach the request-send
+stage. The response has `Content-Type: text/plain`, `Retry-After: 5`, and the
+body `Service temporarily unavailable.` followed by a newline. Five seconds
+is a short suggested pause to reduce immediate reconnect pressure, not an
+estimate of when startup will finish.
+
+Numeric, empty or multiple-attempt connection timings retain the original
+502 without Retry-After. In particular, losing a response after receiving a
+POST body remains 502; upstream timeouts remain 504 without Retry-After.
+The exact `-` match is conservative: nginx sets the timing before sending,
+so even some connection failures may retain 502 rather than be misclassified.
 
 The Dockerfile patches the pinned entrypoint's proxy location and fails the
 build if its anchors or relevant error/retry directives change. A named error
@@ -51,10 +57,11 @@ make a generic failure safe to retry. A lost response after a write remains
 ambiguous; `Retry-After` alone is not the node's typed retry contract.
 
 CI runs `python3 deploy/ingress/test-upstream-unavailable.py` against the built
-wrapper and its generated TLS server block: refused upstream and timeout →
-503 plus header/body; healthy and node-error responses unchanged; loss after
-receiving a POST body → one received body, no replay; unbuffered streaming;
-upstream shutdown; and original redacted route/status logging. The existing
+wrapper and its generated TLS server block: refused upstream → 503 plus
+header/plain body; timeout → unchanged 504; loss after receiving a POST body →
+unchanged 502 with one received body, no replay, and no Retry-After; healthy
+and node-error responses unchanged; unbuffered streaming; upstream shutdown;
+and original redacted route/status/connection-timing logging. The existing
 redacted-logging test remains unchanged (its injected `/public/` proxy location
 is outside the production proxy location's error mapping).
 

@@ -30,7 +30,7 @@ RUN test "$(grep -cF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh)" = 1 \
     && test "$(grep -cF 'ssl_ecdh_curve X25519:prime256v1:secp384r1;' /scripts/entrypoint.sh)" = 1 \
     && ! grep -qF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh
 
-# TC-3972: only locally generated proxy failures become temporary 503s.
+# TC-3972: only a locally generated 502 with no upstream connect becomes 503.
 # Keep proxy_intercept_errors off: node responses, especially typed 503s, pass
 # through untouched. Scope error_page to the generated proxy location; the
 # named location preserves the original URI for redacted route classification.
@@ -39,6 +39,6 @@ RUN test "$(grep -cFx '    location / {' /scripts/entrypoint.sh)" = 1 \
     && test "$(grep -cFx '        ${PROXY_CMD}_pass ${TARGET_ENDPOINT};' /scripts/entrypoint.sh)" = 1 \
     && ! grep -Eq 'proxy_intercept_errors|proxy_next_upstream|error_page' /scripts/entrypoint.sh \
     && sed -i '/^    location \/ {$/i\    include /etc/nginx/tinycloud-upstream-unavailable.conf;\n' /scripts/entrypoint.sh \
-    && sed -i '/^    location \/ {$/a\        error_page 502 504 =503 @tc_upstream_unavailable;' /scripts/entrypoint.sh \
+    && sed -i '/^    location \/ {$/a\        error_page 502 = @tc_upstream_unavailable;' /scripts/entrypoint.sh \
     && test "$(grep -cFx '    include /etc/nginx/tinycloud-upstream-unavailable.conf;' /scripts/entrypoint.sh)" = 1 \
-    && test "$(grep -cFx '        error_page 502 504 =503 @tc_upstream_unavailable;' /scripts/entrypoint.sh)" = 1
+    && test "$(grep -cFx '        error_page 502 = @tc_upstream_unavailable;' /scripts/entrypoint.sh)" = 1

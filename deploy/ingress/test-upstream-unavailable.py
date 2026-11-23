@@ -174,10 +174,10 @@ http {{
                       and (("retry-after: 17\n" in headers) if code == 503 else "retry-after:" not in headers))
             status, headers, body = request("/timeout")
             print(f"upstream_timeout_status={status}")
-            check("upstream_timeout", status == 503 and "retry-after: 5\n" in headers and body == BODY)
+            check("upstream_timeout", status == 504 and "retry-after:" not in headers and body != BODY)
             status, headers, body = request("/invoke", "--data-binary", marker)
             print(f"response_lost_status={status}\nreceived_bodies={len(received_bodies)}")
-            check("response_lost", status == 503 and body == BODY and "retry-after: 5\n" in headers
+            check("response_lost", status == 502 and body != BODY and "retry-after:" not in headers
                   and received_bodies == [marker.encode()])
 
             stream = subprocess.Popen(["curl", "-skN", "--max-time", "5",
@@ -203,8 +203,10 @@ http {{
                 ["docker", "logs", name], stderr=subprocess.STDOUT).decode())
             records = [json.loads(line) for line in logs.splitlines() if line.startswith("{")]
             check("redacted_proxy_errors", marker not in logs and any(
-                r["route"] == "/invoke" and r["status"] == 503 and r["upstream_status"] == "502"
-                for r in records))
+                r["route"] == "/invoke" and r["status"] == 502 and r["upstream_status"] == "502"
+                and r["upstream_connect_time"] != "-" for r in records) and any(
+                r["route"] == "/info" and r["status"] == 503 and r["upstream_status"] == "502"
+                and r["upstream_connect_time"] == "-" for r in records))
         finally:
             stream_release.set()
             if upstream:
