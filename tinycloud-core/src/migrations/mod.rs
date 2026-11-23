@@ -57,6 +57,7 @@ pub mod m20261121_000000_session_retire;
 pub mod m20261122_000000_sql_store_owner;
 pub mod m20261123_000000_delegation_mode;
 pub mod m20261124_000000_sql_wal_mark;
+pub mod m20261125_000000_revocation_tombstone;
 pub mod m20261125_000000_sql_store_mode;
 
 pub struct Migrator;
@@ -120,6 +121,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261122_000000_sql_store_owner::Migration),
             Box::new(m20261123_000000_delegation_mode::Migration),
             Box::new(m20261124_000000_sql_wal_mark::Migration),
+            Box::new(m20261125_000000_revocation_tombstone::Migration),
             Box::new(m20261125_000000_sql_store_mode::Migration),
         ]
     }

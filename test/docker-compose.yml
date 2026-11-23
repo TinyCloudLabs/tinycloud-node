@@ -1,5 +1,3 @@
-version: "3"
-
 services:
   tinycloud:
     build: ..
@@ -28,18 +26,19 @@ services:
       - "postgres"
 
   localstack:
-    image: localstack/localstack
+    # LocalStack 4.14.0, multi-arch index digest.
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
     ports:
-      - "4566:4566"
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health && awslocal s3api head-bucket --bucket tinycloud-blocks"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
     environment:
-      LOCALSTACK_SERVICES: "s3"
+      SERVICES: "s3"
     volumes:
-      - "./setup.sh:/docker-entrypoint-initaws.d/setup.sh:z"
+      - "./setup.sh:/etc/localstack/init/ready.d/setup.sh:ro,z"
 
   postgres:
     image: postgres

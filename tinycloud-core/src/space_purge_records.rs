@@ -727,6 +727,145 @@ async fn accounting(
     Ok(Accounting { retained, counts })
 }
 
+/// TC-4092: remember every revocation this page is about to delete. The
+/// `revocation` row names the revoker and carries the signed bytes, so it goes
+/// with the delegation; without a trace, posting the same signed bytes again
+/// would register a revoked delegation as new. Keyed by canonical hash (read
+/// from the alias row, so before the alias delete). A revocation of a target
+/// outside `page` is included: the foreign key forbids deleting a target that
+/// still has one, so that set is empty unless the key changes.
+async fn write_tombstones(
+    tx: &DatabaseTransaction,
+    page: &[Hash],
+    refs: &HashSet<Hash>,
+) -> Result<(), DbErr> {
+    let rows = revocation::Entity::find()
+        .filter(
+            Condition::any()
+                .add(revocation::Column::Id.is_in(page.iter().copied()))
+                .add(revocation::Column::Revoked.is_in(refs.iter().copied())),
+        )
+        .all(tx)
+        .await?;
+    insert_tombstones(
+        tx,
+        rows.into_iter()
+            .map(|row| (row.revoked, row.revoked_at))
+            .collect(),
+    )
+    .await
+}
+
+/// One tombstone per revoked delegation, keyed by canonical hash; `revoked`
+/// holds the stored id and, when known, the revocation time. Shared by the
+/// `revocation` rows and the Policy/v3 revocation stores (`policy::remove`'s
+/// caller). Must run while the delegation and alias rows still exist.
+pub(super) async fn insert_tombstones(
+    tx: &DatabaseTransaction,
+    revoked: Vec<(Hash, Option<OffsetDateTime>)>,
+) -> Result<(), DbErr> {
+    if revoked.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<Hash> = revoked.iter().map(|(id, _)| *id).collect();
+    let canonical: HashMap<Hash, Hash> = delegation_cid_alias::Entity::find()
+        .filter(delegation_cid_alias::Column::Id.is_in(targets.iter().copied()))
+        .all(tx)
+        .await?
+        .into_iter()
+        .map(|alias| (alias.id, alias.canonical))
+        .collect();
+    let expiry: HashMap<Hash, Option<OffsetDateTime>> = delegation::Entity::find()
+        .select_only()
+        .columns([delegation::Column::Id, delegation::Column::Expiry])
+        .filter(delegation::Column::Id.is_in(targets.iter().copied()))
+        .into_tuple::<(Hash, Option<OffsetDateTime>)>()
+        .all(tx)
+        .await?
+        .into_iter()
+        .collect();
+    let recorded_at = OffsetDateTime::now_utc();
+    let mut tombstones = HashMap::new();
+    for (target, revoked_at) in revoked {
+        let key = canonical.get(&target).copied().unwrap_or(target);
+        tombstones
+            .entry(key)
+            .or_insert_with(|| models::revocation_tombstone::ActiveModel {
+                delegation_canonical: Set(key),
+                delegation_expiry: Set(expiry.get(&target).copied().flatten()),
+                revoked_at: Set(revoked_at),
+                recorded_at: Set(recorded_at),
+            });
+    }
+    match models::revocation_tombstone::Entity::insert_many(tombstones.into_values())
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(
+                models::revocation_tombstone::Column::DelegationCanonical,
+            )
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(tx)
+        .await
+    {
+        Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// TC-4092: a deleted delegation takes its renewal rows with it. A lease row
+/// is keyed by the lease delegation's id and the original's canonical hash; a
+/// revocation left it `active`, so after the revocation row went a surviving
+/// row would be a live lease for revoked or deleted records. Stamps first:
+/// `renewal_stamp.lease_cid` has a foreign key to `renewal_lease`.
+async fn remove_renewal_rows(
+    tx: &DatabaseTransaction,
+    page: &[Hash],
+    refs: &HashSet<Hash>,
+) -> Result<(), DbErr> {
+    let mut keys: HashSet<Hash> = refs.iter().copied().chain(page.iter().copied()).collect();
+    keys.extend(
+        delegation_cid_alias::Entity::find()
+            .filter(delegation_cid_alias::Column::Id.is_in(page.iter().copied()))
+            .all(tx)
+            .await?
+            .into_iter()
+            .map(|alias| alias.canonical),
+    );
+    let values: Vec<sea_orm::Value> = keys
+        .into_iter()
+        .map(|key| Vec::<u8>::from(key).into())
+        .collect();
+    let placeholders = (1..=values.len())
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for table in ["renewal_stamp", "renewal_lease"] {
+        tx.execute(Statement::from_sql_and_values(
+            tx.get_database_backend(),
+            format!(
+                "DELETE FROM {table} WHERE lease_cid IN ({placeholders}) OR original_canonical IN ({placeholders})"
+            ),
+            values.clone(),
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ids of `page` and every alias of them.
+fn alias_family(graph: &Graph, page: &[Hash]) -> HashSet<Hash> {
+    page.iter()
+        .flat_map(|id| {
+            graph
+                .aliases
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| HashSet::from([*id]))
+        })
+        .collect()
+}
+
 async fn remove_records(
     tx: &DatabaseTransaction,
     graph: &Graph,
@@ -736,6 +875,19 @@ async fn remove_records(
     let ids: Vec<_> = deleted.iter().copied().collect();
     let mut affected = HashSet::new();
     let mut actors = HashSet::new();
+    // TC-4092, before anything is deleted: a tombstone for every revocation
+    // about to go, and the renewal rows of every delegation about to go. Both
+    // read alias rows, which the pass below deletes.
+    // Policy/v3 roots keep their revocation in their own rows
+    // (`policy_v3_root.revoked_at`), which `policy::remove` deletes: tombstone
+    // those too.
+    policy::tombstone_revoked(tx, deleted, lease).await?;
+    for page in ids.chunks(PAGE) {
+        lease.keep(tx).await?;
+        let refs = alias_family(graph, page);
+        write_tombstones(tx, page, &refs).await?;
+        remove_renewal_rows(tx, page, &refs).await?;
+    }
     for page in ids.chunks(PAGE) {
         lease.keep(tx).await?;
         affected.extend(
@@ -877,8 +1029,12 @@ async fn remove_records(
     Ok(affected)
 }
 
-#[cfg(test)]
-pub(crate) async fn remove_records_for_test(
+/// Test seam: run the real `remove_records` on `deleted` (what `complete_space`
+/// and the sweep do after they choose the records). Under `test-util` so a
+/// route test in `tinycloud-node` can purge; never in a production build.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub async fn remove_records_for_test(
     tx: &DatabaseTransaction,
     deleted: &HashSet<Hash>,
 ) -> Result<HashSet<String>, DbErr> {
@@ -888,6 +1044,38 @@ pub(crate) async fn remove_records_for_test(
         last: std::time::Instant::now(),
     };
     remove_records(tx, &graph, deleted, &mut lease).await
+}
+
+/// TC-4092, fence time: mark terminal (`revoked`) every renewal lease whose
+/// original delegation names `space` and nothing else, so no stamp is issued
+/// between the fence and the terminal transaction that deletes the rows.
+/// Run in the SAME transaction that writes the space fence. An original that
+/// also names another space or a non-space resource keeps its lease: whether
+/// that original stays live is decided at `complete_space`. Stamp rows stay
+/// until `remove_records` deletes them with the lease.
+pub async fn terminate_space_leases<C: ConnectionTrait>(db: &C, space: &str) -> Result<u64, DbErr> {
+    let backend = db.get_database_backend();
+    // `substr`/`length` instead of `split_part`/`LIKE`: portable, and a `_` or
+    // `%` in a space name is not a wildcard.
+    let names = |column: &str| {
+        format!(
+            "({column} = CAST($1 AS TEXT) OR substr({column}, 1, length(CAST($1 AS TEXT)) + 1) = CAST($1 AS TEXT) || '/')"
+        )
+    };
+    let sql = format!(
+        "UPDATE renewal_lease SET state = 'revoked' WHERE state <> 'revoked' AND EXISTS (
+            SELECT 1 FROM ability a
+            WHERE COALESCE((SELECT x.canonical FROM delegation_cid_alias x WHERE x.id = a.delegation), a.delegation)
+                  = renewal_lease.original_canonical
+              AND {named}
+              AND NOT EXISTS (SELECT 1 FROM ability b WHERE b.delegation = a.delegation AND NOT {other}))",
+        named = names("a.resource"),
+        other = names("b.resource"),
+    );
+    Ok(db
+        .execute(Statement::from_sql_and_values(backend, sql, [space.into()]))
+        .await?
+        .rows_affected())
 }
 
 /// Called inside the lease-checked terminal transaction, before its tombstone.
