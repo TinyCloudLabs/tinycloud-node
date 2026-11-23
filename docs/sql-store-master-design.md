@@ -9,6 +9,7 @@ Items marked [INFERENCE] are not verified against code or production.
 - **Why it matters to you:** it is a one-way door. Once a database is store-master, going back to PostgreSQL master is a copy job with its own size limit (section 8), and a mistake can lose acknowledged writes.
 - **What this document is:** the plan we recommend, what it does to the 64 MiB limit (section 9) and to the Inbox per-source databases (section 10), and the decisions we need from Sam (section 13).
 - **What it is not:** an estimate-backed schedule. Section 12 gives slice order and relative size only.
+- **Terminology (read this first).** The **durable master** of a store-master database is the object store (the same S3 block store that backs KV blocks): a checkpoint plus WAL segments with a manifest. The node's local disk is the **working copy** the SQL engine runs on, and it can be up to about 60 s / 8 MiB **ahead of** the store because of Sam's 10-19 ruling (no wait-for-store on commit). Where this document says the local file is "the master" or "must never be overwritten", it means "the freshest copy of the newest acknowledged writes", not a permanent authority. SQL still runs on a SQLite file; this design does not turn rows into KV entries.
 
 ## 1. Where we are today (verified in code, node main cae89736)
 
@@ -269,6 +270,7 @@ P4.1-P4.3 can be built and merged with no database cut over (no user-visible cha
 | 5 | `owner_lost` | Manual operator claim in v1; automatic with TC-1471 later. (Proposed, not yet ruled.) |
 | 6 | Supported maximum size after the pilot | Open. A number from disk and hydration measurements (P4.3), not "unlimited". Lifting the pilot cap needs a copy-back path: the opt-in PG parts store (section 8) with capacities set, or TC-3764. |
 | 7 | Pilot order | **Owned spaces, then Inbox per-source, then opt-in users.** |
+| 8 | Write-through instead of the 60 s window | Not offered in v1 (it reverses the 10-19 ruling). If Sam wants the node's disk to be a pure cache, the node would acknowledge a write only after the object store has it; the lease, epoch fence, never-overwrite and loss-bound machinery then mostly disappear, at the cost of an object-store PUT on every commit. Asked of Sam on the card (Holden 14:13Z). |
 
 ## 14. What was unknown, and how each was resolved
 
