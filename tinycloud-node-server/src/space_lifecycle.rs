@@ -1040,6 +1040,11 @@ pub async fn purge_space(
         .fence_hmac(&tx, "space", &record.key_id, &digest)
         .await
         .map_err(unavailable)?;
+    // TC-4092: in the same transaction as the fence, stop the space's
+    // renewal leases; `complete_space` deletes their rows later.
+    tinycloud_core::space_purge_records::terminate_space_leases(&tx, &canonical)
+        .await
+        .map_err(unavailable)?;
     let now = runtime.now();
     let job = space_purge_job::ActiveModel {
         purge_id: Set(record.operation_id.clone()),

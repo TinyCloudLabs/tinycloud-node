@@ -88,7 +88,7 @@ enum State {
 
 async fn count(db: &sea_orm::DatabaseConnection, table: &str) -> i64 {
     db.query_one(Statement::from_string(
-        DbBackend::Sqlite,
+        db.get_database_backend(),
         format!("SELECT COUNT(*) AS n FROM {table}"),
     ))
     .await
@@ -105,22 +105,13 @@ fn outcome<T>(result: &Result<T, TxError<MemoryStore, StaticSecret>>) -> String 
     }
 }
 
-async fn scenario(state: State) -> Vec<String> {
+async fn scenario(state: State, conn: sea_orm::DatabaseConnection) -> Vec<String> {
     let mut report = Vec::new();
-    let directory = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("tc4092.sqlite").display()
-    );
     let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
-    let mut db = SpaceDatabase::new(
-        sea_orm::Database::connect(url).await.unwrap(),
-        MemoryStore::default(),
-        secret.clone(),
-    )
-    .await
-    .map_err(|error| error.to_string())
-    .unwrap();
+    let mut db = SpaceDatabase::new(conn, MemoryStore::default(), secret.clone())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
     let identity = db.renewal_identity().unwrap().clone();
     let (_, owner_did, _) = key(0x11);
     let (_, holder1, _) = key(0x21);
@@ -262,6 +253,46 @@ async fn scenario(state: State) -> Vec<String> {
         report.push("VIOLATION: revoked lease re-post is Ok before any purge".to_owned());
     }
 
+    let keys = std::sync::Arc::new(
+        crate::space_purge_ledger::LedgerKeys::new(
+            "test".into(),
+            BTreeMap::from([("test".into(), vec![7; 32])]),
+        )
+        .unwrap(),
+    );
+    let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
+    fence.set_serving_ready(true);
+    if state == State::Fenced {
+        // Fence time, as in the purge accept transaction: the space fence and
+        // the terminal mark of its leases in ONE transaction, before any
+        // record is deleted.
+        assert_eq!(lease_states(&db.conn).await, ["active"]);
+        let tx = db.conn.begin().await.unwrap();
+        fence
+            .fence_hmac(
+                &tx,
+                "space",
+                "test",
+                &keys
+                    .target_hmac("test", "space", &space.to_string())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stopped = crate::space_purge_records::terminate_space_leases(&tx, &space.to_string())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let states = lease_states(&db.conn).await;
+        report.push(format!(
+            "fence time: {stopped} lease row(s) terminal, renewal_lease={states:?}, renewal_stamp={}",
+            count(&db.conn, "renewal_stamp").await
+        ));
+        if stopped != 1 || states != ["revoked"] {
+            report.push("VIOLATION: the lease is not terminal at fence time".to_owned());
+        }
+    }
+
     // Purge the records of the space.
     let mut deleted: std::collections::HashSet<Hash> = [&root, &child, &original, &lease]
         .iter()
@@ -271,7 +302,7 @@ async fn scenario(state: State) -> Vec<String> {
     for row in db
         .conn
         .query_all(Statement::from_string(
-            DbBackend::Sqlite,
+            db.conn.get_database_backend(),
             "SELECT id FROM revocation".to_owned(),
         ))
         .await
@@ -287,7 +318,7 @@ async fn scenario(state: State) -> Vec<String> {
         // The space-keyed rows complete_space deletes before the space row.
         for table in ["event_order", "epoch_order", "epoch_head", "epoch", "space"] {
             tx.execute(Statement::from_string(
-                DbBackend::Sqlite,
+                db.conn.get_database_backend(),
                 format!("DELETE FROM {table}"),
             ))
             .await
@@ -297,15 +328,6 @@ async fn scenario(state: State) -> Vec<String> {
     tx.commit().await.unwrap();
     // The node's purge fence is attached for every state, as in production;
     // only (c) and the non-space case write fence rows.
-    let keys = std::sync::Arc::new(
-        crate::space_purge_ledger::LedgerKeys::new(
-            "test".into(),
-            BTreeMap::from([("test".into(), vec![7; 32])]),
-        )
-        .unwrap(),
-    );
-    let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
-    fence.set_serving_ready(true);
     let fenced_kinds: &[(&str, String)] = match state {
         State::Hosted | State::Rehosted => &[],
         State::Fenced => &[("space", space.to_string())],
@@ -405,7 +427,7 @@ async fn scenario(state: State) -> Vec<String> {
 
 async fn lease_states(db: &sea_orm::DatabaseConnection) -> Vec<String> {
     db.query_all(Statement::from_string(
-        DbBackend::Sqlite,
+        db.get_database_backend(),
         "SELECT state FROM renewal_lease".to_owned(),
     ))
     .await
@@ -417,7 +439,7 @@ async fn lease_states(db: &sea_orm::DatabaseConnection) -> Vec<String> {
 
 async fn count_where(db: &sea_orm::DatabaseConnection, table: &str, id: &Hash) -> i64 {
     db.query_one(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        db.get_database_backend(),
         format!("SELECT COUNT(*) AS n FROM {table} WHERE id = $1"),
         [Vec::<u8>::from(*id).into()],
     ))
@@ -429,25 +451,110 @@ async fn count_where(db: &sea_orm::DatabaseConnection, table: &str, id: &Hash) -
 }
 
 /// The safe outcome in every state: the revoked child and the revoked lease
-/// are not admitted again, the old lease never stamps, and no lease row
-/// stays 'active' once its records are purged. Fails today in `Hosted` and
-/// `Rehosted`: nothing remembers a revocation once purge deletes its row.
-#[tokio::test]
-async fn tc4092_real_admission_after_revoke_and_purge() {
+/// are not admitted again, the old lease never stamps, and no lease or stamp
+/// row stays once its records are purged. Each state has its own test, on
+/// SQLite and on PostgreSQL. Failed on main in all four states (a re-admitted
+/// revocation in `Hosted`, `Rehosted` and `NonSpace`; an 'active' lease row in
+/// `Fenced`): nothing remembers a revocation once purge deletes its row.
+async fn run_state(state: State, conn: sea_orm::DatabaseConnection) {
     let mut violations = Vec::new();
-    for state in [
-        State::Hosted,
-        State::Rehosted,
-        State::Fenced,
-        State::NonSpace,
-    ] {
-        eprintln!("=== TC-4092 {state:?} ===");
-        for line in scenario(state).await {
-            eprintln!("{line}");
-            if line.starts_with("VIOLATION") {
-                violations.push(format!("{state:?}: {line}"));
-            }
+    eprintln!("=== TC-4092 {state:?} ===");
+    for line in scenario(state, conn).await {
+        eprintln!("{line}");
+        if line.starts_with("VIOLATION") {
+            violations.push(line);
         }
     }
-    assert!(violations.is_empty(), "{violations:#?}");
+    assert!(violations.is_empty(), "{state:?}: {violations:#?}");
+}
+
+async fn run_sqlite(state: State) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("tc4092.sqlite").display()
+    );
+    run_state(state, sea_orm::Database::connect(url).await.unwrap()).await;
+}
+
+/// PostgreSQL leg: a private schema on the test server, dropped afterwards.
+/// Runs only on GitHub Actions or with `TINYCLOUD_TEST_POSTGRES_URL` and
+/// `TINYCLOUD_ALLOW_LOCAL_PG=1` (see `test_support`).
+async fn run_postgres(test: &str, state: State) {
+    let Some(url) = crate::test_support::postgres_test_url(test) else {
+        return;
+    };
+    let admin = sea_orm::Database::connect(sea_orm::ConnectOptions::new(url.clone()))
+        .await
+        .unwrap();
+    let schema = format!(
+        "tc4092s_{}_{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options
+        .max_connections(4)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
+    let conn = sea_orm::Database::connect(options).await.unwrap();
+    let ran = tokio::spawn(run_state(state, conn)).await;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    ran.unwrap();
+}
+
+#[tokio::test]
+async fn tc4092_hosted_unfenced_a_revoked_purged_chain_is_not_readmitted_on_sqlite() {
+    run_sqlite(State::Hosted).await;
+}
+#[tokio::test]
+async fn tc4092_rehosted_b_revoked_purged_chain_is_not_readmitted_on_sqlite() {
+    run_sqlite(State::Rehosted).await;
+}
+#[tokio::test]
+async fn tc4092_fenced_c_revoked_purged_chain_leaves_no_lease_or_stamp_on_sqlite() {
+    run_sqlite(State::Fenced).await;
+}
+#[tokio::test]
+async fn tc4092_non_space_d_revoked_purged_chain_is_not_readmitted_on_sqlite() {
+    run_sqlite(State::NonSpace).await;
+}
+#[tokio::test]
+async fn postgres_tc4092_hosted_unfenced_a_revoked_purged_chain_is_not_readmitted() {
+    run_postgres(
+        "postgres_tc4092_hosted_unfenced_a_revoked_purged_chain_is_not_readmitted",
+        State::Hosted,
+    )
+    .await;
+}
+#[tokio::test]
+async fn postgres_tc4092_rehosted_b_revoked_purged_chain_is_not_readmitted() {
+    run_postgres(
+        "postgres_tc4092_rehosted_b_revoked_purged_chain_is_not_readmitted",
+        State::Rehosted,
+    )
+    .await;
+}
+#[tokio::test]
+async fn postgres_tc4092_fenced_c_revoked_purged_chain_leaves_no_lease_or_stamp() {
+    run_postgres(
+        "postgres_tc4092_fenced_c_revoked_purged_chain_leaves_no_lease_or_stamp",
+        State::Fenced,
+    )
+    .await;
+}
+#[tokio::test]
+async fn postgres_tc4092_non_space_d_revoked_purged_chain_is_not_readmitted() {
+    run_postgres(
+        "postgres_tc4092_non_space_d_revoked_purged_chain_is_not_readmitted",
+        State::NonSpace,
+    )
+    .await;
 }

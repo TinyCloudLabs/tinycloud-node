@@ -1021,6 +1021,38 @@ pub(crate) async fn remove_records_for_test(
     remove_records(tx, &graph, deleted, &mut lease).await
 }
 
+/// TC-4092, fence time: mark terminal (`revoked`) every renewal lease whose
+/// original delegation names `space` and nothing else, so no stamp is issued
+/// between the fence and the terminal transaction that deletes the rows.
+/// Run in the SAME transaction that writes the space fence. An original that
+/// also names another space or a non-space resource keeps its lease: whether
+/// that original stays live is decided at `complete_space`. Stamp rows stay
+/// until `remove_records` deletes them with the lease.
+pub async fn terminate_space_leases<C: ConnectionTrait>(db: &C, space: &str) -> Result<u64, DbErr> {
+    let backend = db.get_database_backend();
+    // `substr`/`length` instead of `split_part`/`LIKE`: portable, and a `_` or
+    // `%` in a space name is not a wildcard.
+    let names = |column: &str| {
+        format!(
+            "({column} = CAST($1 AS TEXT) OR substr({column}, 1, length(CAST($1 AS TEXT)) + 1) = CAST($1 AS TEXT) || '/')"
+        )
+    };
+    let sql = format!(
+        "UPDATE renewal_lease SET state = 'revoked' WHERE state <> 'revoked' AND EXISTS (
+            SELECT 1 FROM ability a
+            WHERE COALESCE((SELECT x.canonical FROM delegation_cid_alias x WHERE x.id = a.delegation), a.delegation)
+                  = renewal_lease.original_canonical
+              AND {named}
+              AND NOT EXISTS (SELECT 1 FROM ability b WHERE b.delegation = a.delegation AND NOT {other}))",
+        named = names("a.resource"),
+        other = names("b.resource"),
+    );
+    Ok(db
+        .execute(Statement::from_sql_and_values(backend, sql, [space.into()]))
+        .await?
+        .rows_affected())
+}
+
 /// Called inside the lease-checked terminal transaction, before its tombstone.
 /// All target links disappear atomically with completion; other live proofs stay unchanged.
 pub(crate) async fn complete_space(

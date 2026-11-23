@@ -706,7 +706,28 @@ async fn multi_space_ancestor(conn: sea_orm::DatabaseConnection) {
         "child-1",
         now + 3000,
     );
-    for t in [&host1, &host2, &parent, &original, &lease, &child, &child1] {
+    // A second original that names only S1, with its own lease.
+    let original3 = token_for(
+        0x11,
+        &holder3,
+        &[&kv1],
+        ability,
+        &[],
+        "original-3",
+        now + 3600,
+    );
+    let lease3 = token(
+        0x11,
+        &identity.renewer_did,
+        &format!("urn:cid:{}", cid_of(&original3).to_cid(0x55)),
+        "tinycloud.delegation/renew",
+        &[],
+        "lease-3",
+        now + 7200,
+    );
+    for t in [
+        &host1, &host2, &parent, &original, &lease, &original3, &lease3, &child, &child1,
+    ] {
         db.delegate(deleg(t))
             .await
             .map_err(|error| error.to_string())
@@ -724,13 +745,14 @@ async fn multi_space_ancestor(conn: sea_orm::DatabaseConnection) {
         );
         Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap()
     };
-    let stamp_request = |label: &str| {
+    let stamp_request_for = |original: &str, lease: &str, label: &str| {
+        let original_cid = cid_of(original).to_cid(0x55).to_string();
         let invocation =
-            tinycloud_auth::authorization::TinyCloudInvocation::decode(&original).unwrap();
+            tinycloud_auth::authorization::TinyCloudInvocation::decode(original).unwrap();
         let mut request = crate::renewal::StampIssue {
             invocation: crate::util::InvocationInfo::try_from(invocation).unwrap(),
             original_cid: original_cid.clone(),
-            lease_cid: cid_of(&lease).to_cid(0x55).to_string(),
+            lease_cid: cid_of(lease).to_cid(0x55).to_string(),
             replay_hash: crate::hash::hash(label.as_bytes()),
             replay_expires_at: now + 600,
         };
@@ -743,9 +765,50 @@ async fn multi_space_ancestor(conn: sea_orm::DatabaseConnection) {
         }];
         request
     };
+    let stamp_request = |label: &str| stamp_request_for(&original, &lease, label);
     db.issue_renewal_stamp(stamp_request("control"))
         .await
         .expect("control: the live lease stamps");
+    db.issue_renewal_stamp(stamp_request_for(&original3, &lease3, "control-3"))
+        .await
+        .expect("control: the S1-only lease stamps");
+
+    // Fence time (the purge accept transaction writes the space fence and
+    // calls this in the same transaction): the lease of the original that
+    // names only S1 goes terminal; the lease of the two-space original stays.
+    let tx = conn.begin().await.unwrap();
+    let stopped = crate::space_purge_records::terminate_space_leases(&tx, &s1.to_string())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(stopped, 1, "only the S1-only lease is stopped");
+    let state_of = |lease: String| {
+        let conn = conn.clone();
+        async move {
+            conn.query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT state FROM renewal_lease WHERE lease_cid = $1",
+                [Vec::<u8>::from(cid_of(&lease)).into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "state")
+            .unwrap()
+        }
+    };
+    assert_eq!(state_of(lease3.clone()).await, "revoked");
+    assert_eq!(state_of(lease.clone()).await, "active");
+    let stamp = db
+        .issue_renewal_stamp(stamp_request_for(&original3, &lease3, "drain-3"))
+        .await;
+    assert!(
+        matches!(
+            stamp,
+            Err(crate::renewal::RenewalStoreError::LeaseUnavailable)
+        ),
+        "no stamp for a lease stopped at fence time: {stamp:?}"
+    );
 
     // The owner revokes C1 (S1 only) before the purge.
     db.revoke(revoke(&child1, "revoke-child-1"))
