@@ -396,6 +396,8 @@ pub(super) struct Registered {
     pub policy_root_cid: String,
     pub enforcement_root_cid: String,
     pub requested_capabilities: Vec<Value>,
+    /// The request body `register_with` sent (`Null` from `register_source_for`).
+    pub registration: Value,
 }
 
 /// Which principal owns the content space, and who owns the policy.
@@ -823,6 +825,7 @@ impl Harness {
         // new registration. The tests that register one are about what a
         // stored registration does, so it is stored as one; path-bound
         // sources still go through the route.
+        let posted = registration.clone();
         let (status, body) = if registration["policy"]["contentSource"]
             .get("encryptionKeyPath")
             .is_none()
@@ -839,6 +842,7 @@ impl Harness {
                 policy_cid,
                 policy_root_cid,
                 enforcement_root_cid,
+                registration: posted,
                 requested_capabilities,
             },
         ))
@@ -1489,6 +1493,7 @@ impl Harness {
                 policy_cid,
                 policy_root_cid,
                 enforcement_root_cid,
+                registration: Value::Null,
                 requested_capabilities: {
                     let mut requested = self.requested();
                     requested[1]["resource"] = json!(decrypt_resource);

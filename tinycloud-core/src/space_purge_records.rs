@@ -878,8 +878,9 @@ async fn remove_records(
     // TC-4092, before anything is deleted: a tombstone for every revocation
     // about to go, and the renewal rows of every delegation about to go. Both
     // read alias rows, which the pass below deletes.
-    // Policy/v3 roots and policy delegations keep their revocation in their
-    // own rows, which `policy::remove` deletes: tombstone those too.
+    // Policy/v3 roots keep their revocation in their own rows
+    // (`policy_v3_root.revoked_at`), which `policy::remove` deletes: tombstone
+    // those too.
     policy::tombstone_revoked(tx, deleted, lease).await?;
     for page in ids.chunks(PAGE) {
         lease.keep(tx).await?;
@@ -1028,8 +1029,12 @@ async fn remove_records(
     Ok(affected)
 }
 
-#[cfg(test)]
-pub(crate) async fn remove_records_for_test(
+/// Test seam: run the real `remove_records` on `deleted` (what `complete_space`
+/// and the sweep do after they choose the records). Under `test-util` so a
+/// route test in `tinycloud-node` can purge; never in a production build.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub async fn remove_records_for_test(
     tx: &DatabaseTransaction,
     deleted: &HashSet<Hash>,
 ) -> Result<HashSet<String>, DbErr> {

@@ -1040,6 +1040,17 @@ async fn policy_root_revoked_purge_repost(conn: sea_orm::DatabaseConnection) {
     assert_eq!(tombstones.len(), 1, "only the revoked root is tombstoned");
     assert_eq!(tombstones[0].delegation_canonical, cid_of(&child));
     assert!(tombstones[0].delegation_expiry.is_some());
+    assert_eq!(
+        tombstones[0].revoked_at,
+        Some(
+            OffsetDateTime::parse(
+                "2026-01-01T00:00:00Z",
+                &time::format_description::well_known::Rfc3339
+            )
+            .unwrap()
+        ),
+        "the revocation time of the row, nothing else"
+    );
 
     let process = |t: &str| {
         let conn = conn.clone();
