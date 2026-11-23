@@ -491,3 +491,37 @@ async fn tc4092_alternate_encoding_of_a_revoked_purged_cacao_is_refused() {
     }
     assert_eq!(count(&conn, "delegation").await, 0);
 }
+
+/// The runbook's audit queries run, and return counts only.
+#[tokio::test]
+async fn tc4092_runbook_audit_queries_execute_and_return_counts_only() {
+    let runbook = include_str!("../../../docs/runbooks/revocation-tombstone-audit.md");
+    let queries: Vec<&str> = runbook
+        .split("```sql\n")
+        .skip(1)
+        .map(|block| block.split("```").next().unwrap())
+        .filter(|sql| sql.trim_start().starts_with("SELECT\n"))
+        .collect();
+    assert_eq!(queries.len(), 2, "the two audit queries");
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("audit.sqlite").display()
+    );
+    let conn = sea_orm::Database::connect(url).await.unwrap();
+    let _db = open(conn.clone()).await;
+    for sql in queries {
+        let row = conn
+            .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        for column in row.column_names() {
+            assert_eq!(
+                row.try_get::<i64>("", &column).unwrap(),
+                0,
+                "{column}: an empty node counts zero"
+            );
+        }
+    }
+}

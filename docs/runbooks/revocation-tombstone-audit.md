@@ -28,10 +28,24 @@ SELECT
 Reading it:
 
 - `lease_delegation_gone` and `original_delegation_gone` count leases whose delegation a purge deleted. Each such row is a lease the node could still treat as stored. They are the only trace a purge that ran before 1.26.24 left of a revoked lease; the revocation row itself is gone.
-- A revoked plain delegation (not a lease) that a past purge deleted leaves no row, so no query counts it. `completed_space_purges` is the upper bound on how many purges could have deleted revocations. A completed purge fences its space permanently, so a re-post naming the purged space is refused by the fence; the remaining exposure is a delegation that names no purged space.
+- A revoked plain delegation (not a lease) that a past purge deleted leaves no row, so no query counts it. A completed purge fences its own space permanently, so a re-post naming the purged space is refused by the fence. The exposure is a revoked record that names **another, still hosted space** (it shared an ancestor with the purged space; the purge deletes it with its revocation) or **no space** (an encryption-network resource). The second query bounds that population.
 - `tombstones` is 0 on the first day. It grows only with purges run by 1.26.24 or later.
 
 No action follows from a non-zero count in this runbook. Report the counts to the incident owner. Do not delete the leftover `renewal_lease` rows by hand: the next purge of the same delegation deletes them.
+
+### Purges that shared records with another space
+
+The schema records no deleted revocation, so past exposure cannot be counted exactly. A purge can have deleted a revoked record that names another live space only if its space shared signed records with that other space. This read-only, counts-only query bounds how many purges and owners were in that situation; it names no DID, space or resource:
+
+```sql
+SELECT
+  (SELECT count(*) FROM space_purge_job WHERE phase = 'complete')              AS completed_space_purges,
+  (SELECT count(DISTINCT purge_id) FROM space_purge_shared_residue)            AS purges_still_holding_shared_records,
+  (SELECT count(*) FROM space_purge_shared_residue)                            AS shared_records_retained,
+  (SELECT count(*) FROM space_retirement)                                      AS owner_retirements;
+```
+
+`purges_still_holding_shared_records` is a lower bound for purges that met the situation: residue rows go once the last live record that needed them is gone, so a purge that shared records and has since finished sweeping shows no row. `completed_space_purges` is the upper bound. A purge with no shared records cannot have exposed another space's revoked record. `owner_retirements` counts owners whose non-space records the sweep may have deleted. Report the four counts; do not run this in production before Bobbie OKs the text.
 
 ## Rollback
 
