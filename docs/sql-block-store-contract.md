@@ -505,14 +505,27 @@ table. Every pair not in it, a mode to itself included, is refused:
 | store_master | owner_lost | +1 | keep |
 | owner_lost | store_master | +1 | set to the claimant |
 
-`sql::store::mode::transition_row` applies one transition as one statement:
-`INSERT … ON CONFLICT DO NOTHING` from no row, otherwise `UPDATE … WHERE mode
-= :from AND epoch = :e`. Either must change exactly one row. If it changes
-none (`Stale`), nothing changed and the caller rereads; it never retries
-blindly. A stored mode this binary does not know is refused (`Unknown`),
-never guessed. The design's guards (preconditions, restore check, size guard,
+`sql::store::mode::transition_row` applies one transition as one statement.
+From no row it is an insert at epoch 0 that changes nothing if a row exists:
+`INSERT … ON CONFLICT DO NOTHING` on Postgres and SQLite. On MySQL it is a
+plain `INSERT` whose key violation means "exists", because sea-query renders
+`DO NOTHING` there as `ON DUPLICATE KEY UPDATE`, and with `CLIENT_FOUND_ROWS`
+a duplicate counts as one row. Otherwise it is `UPDATE … WHERE mode = :from
+AND epoch = :e`. Either must change exactly one row. If it changes none
+(`Stale`), nothing changed and the caller rereads; it never retries blindly.
+A stored mode this binary does not know is refused (`Unknown`), never
+guessed. The design's guards (preconditions, restore check, size guard,
 lease expiry) belong to the callers in P4.2-P4.4. A space purge deletes the
 rows with the manifest (objects phase).
+
+- **The epoch alone is not a fence.** `owner_lost → store_master` claims
+  with epoch + 1, and a node holding an older epoch is fenced by the
+  mismatch. P4.2c's lease and write fence must still check `mode =
+  store_master` and `owner_node` = this node, not only the epoch.
+- **Rollback leftovers.** After a rollback that leaves the table in place
+  (section 7), a 1.26.22 space purge does not delete this table's rows. The
+  orphans are harmless while every row is `pg_master` or `shadow`, and the
+  next purge by a binary that ships this migration removes them.
 
 ## 5. Upload and retention policy
 
@@ -754,9 +767,17 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   The `DELETE` needs only `postgres` and is enough for the older image to
   boot. The `DROP` needs the table owner, the node's own role
   (`docs/releasing.md`, TC-3755). A table left behind is harmless: `up` is
-  `IF NOT EXISTS`, and P4.1 writes no rows. Dropping it is safe only while
-  every row is `pg_master` or `shadow`, which holds until a cutover exists
-  (P4.4). The migration's own `down` refuses once any row is in another mode.
+  `IF NOT EXISTS`, and P4.1 writes no rows. The `DROP` is safe only while
+  every row is `pg_master` or `shadow` **at epoch 0**. The migration's own
+  `down` refuses otherwise. A row past `shadow` may be the only record that
+  the store holds the newest data. A row whose epoch moved (a `pg_master`
+  after a copy-back) would restart at epoch 0 on its next insert, and the
+  epoch must never be reset. **Dropping the table by hand on a database where
+  any row has `epoch > 0` or a mode past `shadow` is a data-loss decision,
+  not a rollback step.** Check first with
+  `SELECT count(*) FROM sql_store_mode WHERE epoch > 0 OR mode NOT IN
+  ('pg_master','shadow')`, which must be 0. If it isn't, leave the table and
+  delete only the `seaql_migrations` row.
 - Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
   SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
   above; `migrations/mod.rs` versions list extended.

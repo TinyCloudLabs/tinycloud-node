@@ -8,11 +8,14 @@
 //! two `varchar(255)` are 2,040 bytes under utf8mb4, under MySQL's
 //! 3,072-byte InnoDB key cap.
 //!
-//! `down` drops the table while every row is `pg_master` or `shadow` (both
-//! advisory: Postgres is master). It refuses while any row is in another
-//! mode, because then the row is the only record that the store, not
-//! Postgres, holds the newest data (contract section 7). Rolling back past
-//! this migration also needs `DELETE FROM seaql_migrations WHERE version =
+//! `down` drops the table only while every row is `pg_master` or `shadow`
+//! (both advisory: Postgres is master) at epoch 0. It refuses while any row
+//! is in another mode, because then the row is the only record that the
+//! store, not Postgres, holds the newest data (contract section 7). It also
+//! refuses while any row has an epoch above 0, even a `pg_master` one after
+//! a copy-back: dropping it would let the next insert restart that database
+//! at epoch 0, and the epoch must never be reset. Rolling back past this
+//! migration also needs `DELETE FROM seaql_migrations WHERE version =
 //! 'm20261125_000000_sql_store_mode'`: older binaries refuse to start with
 //! an applied migration they do not ship.
 //!
@@ -35,15 +38,19 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
         if manager.has_table("sql_store_mode").await? {
-            let authoritative = mode::Entity::find()
-                .filter(mode::Column::Mode.is_not_in(ADVISORY_MODES))
+            let kept = mode::Entity::find()
+                .filter(
+                    Condition::any()
+                        .add(mode::Column::Mode.is_not_in(ADVISORY_MODES))
+                        .add(mode::Column::Epoch.gt(0)),
+                )
                 .one(manager.get_connection())
                 .await?;
-            if authoritative.is_some() {
+            if kept.is_some() {
                 return Err(DbErr::Custom(
-                    "sql_store_mode down is refused while a database is not pg_master or shadow: see the runbook".into(),
+                    "sql_store_mode down is refused while a database is past shadow or has an epoch above 0: see the runbook".into(),
                 ));
             }
         }
@@ -158,6 +165,48 @@ mod tests {
         transition_row(&conn, &DB, Some(shadow), StoreMode::CuttingOver, None)
             .await
             .unwrap();
+        let err = Migration
+            .down(&SchemaManager::new(&conn))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("sql_store_mode down is refused"),
+            "{err}"
+        );
+        assert!(table_exists(&conn).await);
+    }
+
+    /// After a cutover and a copy-back the row is `pg_master` again but at
+    /// epoch 1. Dropping it would restart the database at epoch 0.
+    #[tokio::test]
+    async fn down_refuses_a_pg_master_row_whose_epoch_moved() {
+        use StoreMode::*;
+        let conn = sqlite().await;
+        Migrator::up(&conn, None).await.unwrap();
+        let mut at = Expected {
+            mode: Shadow,
+            epoch: transition_row(&conn, &DB, None, Shadow, None)
+                .await
+                .unwrap(),
+        };
+        for (to, owner) in [
+            (CuttingOver, None),
+            (StoreMaster, Some("node-a")),
+            (CopyingBack, None),
+            (PgMaster, None),
+        ] {
+            let epoch = transition_row(&conn, &DB, Some(at), to, owner)
+                .await
+                .unwrap();
+            at = Expected { mode: to, epoch };
+        }
+        assert_eq!(
+            at,
+            Expected {
+                mode: PgMaster,
+                epoch: 1
+            }
+        );
         let err = Migration
             .down(&SchemaManager::new(&conn))
             .await

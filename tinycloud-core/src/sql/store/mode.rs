@@ -30,7 +30,7 @@
 use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, SqlErr,
 };
 
 use super::key::DbRef;
@@ -203,9 +203,10 @@ pub async fn read_mode<C: ConnectionTrait>(
 /// Moves `db` from `expected` to `to` and returns the row's new epoch.
 ///
 /// `expected = None` means "no row": the only legal move is to `shadow`, an
-/// `INSERT … ON CONFLICT DO NOTHING` at epoch 0. Otherwise one `UPDATE …
-/// WHERE mode = :from AND epoch = :e`. Either must change exactly one row,
-/// else [`ModeError::Stale`] and nothing changed. `owner` names the claiming
+/// insert at epoch 0 that changes nothing if any row exists
+/// ([`insert_absent`]). Otherwise one `UPDATE … WHERE mode = :from AND
+/// epoch = :e` that must change exactly one row. Either way a miss is
+/// [`ModeError::Stale`] and nothing changed. `owner` names the claiming
 /// node, required exactly when the transition sets `owner_node`.
 pub async fn transition_row<C: ConnectionTrait>(
     conn: &C,
@@ -235,7 +236,7 @@ pub async fn transition_row<C: ConnectionTrait>(
     }
     let now = now_timestamp();
     let Some(expected) = expected else {
-        let inserted = row::Entity::insert(row::ActiveModel {
+        let first = row::ActiveModel {
             space: Set(db.space.to_owned()),
             db_id: Set(db.db_id.to_owned()),
             mode: Set(to.as_str().to_owned()),
@@ -245,15 +246,9 @@ pub async fn transition_row<C: ConnectionTrait>(
             lease_expires_at: Set(None),
             mode_changed_at: Set(now),
             cutover_revision: Set(None),
-        })
-        .on_conflict(
-            OnConflict::columns([row::Column::Space, row::Column::DbId])
-                .do_nothing()
-                .to_owned(),
-        )
-        .exec_without_returning(conn)
-        .await?;
-        return if inserted == 1 {
+        };
+        let plain = conn.get_database_backend() == DbBackend::MySql;
+        return if insert_absent(conn, first, plain).await? {
             Ok(0)
         } else {
             Err(ModeError::Stale)
@@ -290,6 +285,42 @@ pub async fn transition_row<C: ConnectionTrait>(
     } else {
         Err(ModeError::Stale)
     }
+}
+
+/// Inserts `first` if the database has no row; `false` if one exists.
+///
+/// Postgres and SQLite: `INSERT … ON CONFLICT DO NOTHING`, decided by the row
+/// count (a raw key violation would abort an enclosing Postgres
+/// transaction). MySQL (`plain`): sea-query renders `DO NOTHING` as `ON
+/// DUPLICATE KEY UPDATE`, and sqlx's `CLIENT_FOUND_ROWS` counts a duplicate
+/// as one row, so the count cannot tell an insert from an existing row. There
+/// a plain `INSERT` runs instead, and its key violation means the row exists
+/// (as `database_artifacts` does for an absent artifact, TC-2214). A failed
+/// statement does not abort a MySQL transaction.
+async fn insert_absent<C: ConnectionTrait>(
+    conn: &C,
+    first: row::ActiveModel,
+    plain: bool,
+) -> Result<bool, ModeError> {
+    let insert = row::Entity::insert(first);
+    if plain {
+        return match insert.exec_without_returning(conn).await {
+            Ok(_) => Ok(true),
+            Err(error) if matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        };
+    }
+    let inserted = insert
+        .on_conflict(
+            OnConflict::columns([row::Column::Space, row::Column::DbId])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(conn)
+        .await?;
+    Ok(inserted == 1)
 }
 
 #[cfg(test)]
@@ -446,6 +477,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read_mode(&conn, &DB).await, Err(ModeError::Unknown));
+    }
+
+    /// Drives `DB` from no row to `store_master` at epoch 1.
+    async fn to_store_master(conn: &DatabaseConnection) -> ModeRow {
+        let e = transition_row(conn, &DB, None, Shadow, None).await.unwrap();
+        let e = transition_row(
+            conn,
+            &DB,
+            Some(Expected {
+                mode: Shadow,
+                epoch: e,
+            }),
+            CuttingOver,
+            None,
+        )
+        .await
+        .unwrap();
+        let cutting = Expected {
+            mode: CuttingOver,
+            epoch: e,
+        };
+        transition_row(conn, &DB, Some(cutting), StoreMaster, Some(NODE))
+            .await
+            .unwrap();
+        read_mode(conn, &DB).await.unwrap().unwrap()
+    }
+
+    fn first_row() -> row::ActiveModel {
+        row::ActiveModel {
+            space: Set(DB.space.to_owned()),
+            db_id: Set(DB.db_id.to_owned()),
+            mode: Set(Shadow.as_str().to_owned()),
+            epoch: Set(0),
+            owner_node: Set(None),
+            lease_holder: Set(None),
+            lease_expires_at: Set(None),
+            mode_changed_at: Set(now_timestamp()),
+            cutover_revision: Set(None),
+        }
+    }
+
+    /// Both insert forms, the ON CONFLICT one and MySQL's plain one (run here
+    /// on SQLite, whose key violation maps to the same `SqlErr`), insert into
+    /// an empty table and report an existing `store_master` row as present
+    /// without touching it. MySQL itself is not in this repo's test harness.
+    #[tokio::test]
+    async fn insert_absent_never_reports_an_existing_row_as_inserted() {
+        for plain in [false, true] {
+            let conn = sqlite().await;
+            assert_eq!(insert_absent(&conn, first_row(), plain).await, Ok(true));
+            conn.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "DELETE FROM sql_store_mode".to_string(),
+            ))
+            .await
+            .unwrap();
+            let before = to_store_master(&conn).await;
+            assert_eq!(
+                insert_absent(&conn, first_row(), plain).await,
+                Ok(false),
+                "plain={plain}"
+            );
+            assert_eq!(read_mode(&conn, &DB).await.unwrap(), Some(before));
+        }
     }
 
     /// One attempted transition of the random walk.
