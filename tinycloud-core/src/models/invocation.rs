@@ -772,15 +772,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
             let registered_policy_roots = if terminal_cids.is_empty() {
                 std::collections::HashSet::new()
             } else {
-                policy_v3_root::Entity::find()
-                    .filter(policy_v3_root::Column::RootCid.is_in(terminal_cids))
-                    .filter(policy_v3_root::Column::RevokedAt.is_null())
-                    .filter(policy_v3_root::Column::RevocationBytes.is_null())
-                    .all(db)
-                    .await?
-                    .into_iter()
-                    .map(|row| row.root_cid)
-                    .collect::<std::collections::HashSet<_>>()
+                Box::pin(live_policy_roots(db, terminal_cids)).await?
             };
             for c in &dependant_caps {
                 // TC-119: ability containment is registry-aware. A parent
@@ -882,6 +874,25 @@ async fn validate_capabilities<C: ConnectionTrait>(
             Ok(())
         }
     }
+}
+
+/// The live registered policy roots among `root_cids`. Its own function and
+/// boxed at the call site: the sea-orm select held across this await is 1.7 KB
+/// that every `validate_capabilities` caller's future (and, unoptimized, every
+/// poll frame up to the request handler) would otherwise carry.
+async fn live_policy_roots<C: ConnectionTrait>(
+    db: &C,
+    root_cids: std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>, DbErr> {
+    Ok(policy_v3_root::Entity::find()
+        .filter(policy_v3_root::Column::RootCid.is_in(root_cids))
+        .filter(policy_v3_root::Column::RevokedAt.is_null())
+        .filter(policy_v3_root::Column::RevocationBytes.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.root_cid)
+        .collect())
 }
 
 /// W1 (audit P0 finding 1): same containment helper as the delegation path,
