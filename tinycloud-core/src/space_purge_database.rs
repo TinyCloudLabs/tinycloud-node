@@ -48,6 +48,7 @@ pub const PURGED_BY_SPACE: &[(&str, PurgePhase)] = &[
     ("kv_blob_generation", PurgePhase::Objects),
     ("sql_store_object", PurgePhase::Objects),
     ("sql_store_manifest", PurgePhase::Objects),
+    ("sql_store_mode", PurgePhase::Objects),
     ("artifact_chunk", PurgePhase::Objects),
     ("artifact_part", PurgePhase::Objects),
     ("artifact_space_owner", PurgePhase::Objects),
@@ -505,6 +506,7 @@ pub(crate) async fn delete_verified_empty_inventory(
         "DELETE FROM kv_blob_generation WHERE space=$1",
         "DELETE FROM sql_store_object WHERE space=$1",
         "DELETE FROM sql_store_manifest WHERE space=$1",
+        "DELETE FROM sql_store_mode WHERE space=$1",
         "DELETE FROM artifact_space_owner WHERE space=$1",
         // artifact_owner() is the owner key artifact_reserve enforces. The
         // foreign keys from artifact_space_owner and artifact_part make a
