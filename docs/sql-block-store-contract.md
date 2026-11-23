@@ -769,6 +769,8 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   `DELETE FROM seaql_migrations WHERE version IN
   ('m20261125_000000_revocation_tombstone','m20261125_000000_sql_store_mode');`.
   An optional `DROP TABLE IF EXISTS sql_store_mode;` may follow.
+  Both rollbacks are proposed only: the postgres-role `DELETE` has not been
+  exercised against the production provider, and the default is fix-forward.
   The `DELETE` needs only `postgres` and is enough for the older image to
   boot. The `DROP` needs the table owner, the node's own role
   (`docs/releasing.md`, TC-3755). A table left behind is harmless: `up` is
