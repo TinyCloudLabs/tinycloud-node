@@ -1123,3 +1123,268 @@ async fn postgres_tc4092_policy_v3_root_revoked_in_its_own_store_stays_refused_a
         .unwrap();
     ran.unwrap();
 }
+
+/// TC-4092: the tombstones, the `revocation` delete and `policy::remove` are
+/// one transaction. A database error after the tombstones were written (here a
+/// trigger that aborts the delete of `fail_table`, which comes after the
+/// tombstone pre-pass, after the `revocation` delete and, for `delegation`,
+/// after `policy::remove`) leaves NEITHER done once the caller's transaction
+/// rolls back: no tombstone, every revocation, policy and delegation row intact.
+/// Without the fault, the same input tombstones both revocations.
+async fn purge_is_all_or_nothing(conn: sea_orm::DatabaseConnection, fail_table: &str) {
+    let db = open(conn.clone()).await;
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder1, _) = key(0x21);
+    let (_, holder2, _) = key(0x22);
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = token(
+        0x11,
+        &owner_did,
+        &host,
+        "tinycloud.space/host",
+        &[],
+        "host",
+        now + 3600,
+    );
+    let root = token(
+        0x11,
+        &holder1,
+        &kv,
+        "tinycloud.kv/get",
+        &[],
+        "root",
+        now + 3600,
+    );
+    let child = token(
+        0x21,
+        &holder2,
+        &kv,
+        "tinycloud.kv/get",
+        &[cid_of(&root)],
+        "child",
+        now + 3000,
+    );
+    for t in [&host_token, &root, &child] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    // One revocation in each store: `child` in `revocation`, `root` in
+    // `policy_v3_root.revoked_at`.
+    let revocation = token(
+        0x11,
+        &owner_did,
+        &format!("urn:cid:{}", cid_of(&child).to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        &[],
+        "revoke-child",
+        now + 600,
+    );
+    db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    crate::models::policy_v3_root::Entity::insert(crate::models::policy_v3_root::ActiveModel {
+        root_cid: Set(cid_of(&root).to_cid(0x55).to_string()),
+        policy_cid: Set("policy".to_string()),
+        role: Set("policy".to_string()),
+        authorization_bytes: Set(vec![1]),
+        status_checkpoint_bytes: Set(None),
+        previous_checkpoint_digest_hex: Set(None),
+        status_sequence: Set(0),
+        admission_epoch: Set(0),
+        status_checked_at: Set(None),
+        status_fresh_until: Set(None),
+        revoked_at: Set(Some("2026-01-01T00:00:00Z".to_string())),
+        revocation_bytes: Set(Some(vec![2])),
+    })
+    .exec(&conn)
+    .await
+    .unwrap();
+    let rows = |conn: &sea_orm::DatabaseConnection| {
+        let conn = conn.clone();
+        async move {
+            (
+                count(&conn, "revocation").await,
+                count(&conn, "delegation").await,
+                count(&conn, "policy_v3_root").await,
+                count(&conn, "revocation_tombstone").await,
+            )
+        }
+    };
+    assert_eq!(rows(&conn).await, (1, 3, 1, 0));
+
+    let mut deleted: HashSet<Hash> = [&host_token, &root, &child]
+        .map(|t| cid_of(t))
+        .into_iter()
+        .collect();
+    deleted.extend(
+        crate::models::revocation::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id),
+    );
+
+    // The fault: the delete of `fail_table` rows aborts.
+    let backend = conn.get_database_backend();
+    let (install, remove): (Vec<String>, Vec<String>) = match backend {
+        sea_orm::DatabaseBackend::Postgres => (
+            vec![
+                "CREATE FUNCTION tc4092_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'tc4092 injected'; END $$".to_string(),
+                format!("CREATE TRIGGER tc4092_fail BEFORE DELETE ON {fail_table} FOR EACH ROW EXECUTE FUNCTION tc4092_fail()"),
+            ],
+            vec![
+                format!("DROP TRIGGER tc4092_fail ON {fail_table}"),
+                "DROP FUNCTION tc4092_fail()".to_string(),
+            ],
+        ),
+        _ => (
+            vec![format!(
+                "CREATE TRIGGER tc4092_fail BEFORE DELETE ON {fail_table} BEGIN SELECT RAISE(ABORT, 'tc4092 injected'); END"
+            )],
+            vec!["DROP TRIGGER tc4092_fail".to_string()],
+        ),
+    };
+    for sql in &install {
+        conn.execute_unprepared(sql).await.unwrap();
+    }
+    let tx = conn.begin().await.unwrap();
+    let error = crate::space_purge_records::remove_records_for_test(&tx, &deleted)
+        .await
+        .expect_err("the injected fault must fail the purge");
+    assert!(error.to_string().contains("tc4092 injected"), "{error}");
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        rows(&conn).await,
+        (1, 3, 1, 0),
+        "a failed purge leaves no tombstone and every row in place ({fail_table})"
+    );
+
+    // Control: the same purge without the fault does both.
+    for sql in &remove {
+        conn.execute_unprepared(sql).await.unwrap();
+    }
+    let tx = conn.begin().await.unwrap();
+    crate::space_purge_records::remove_records_for_test(&tx, &deleted)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        rows(&conn).await,
+        (0, 0, 0, 2),
+        "both revocations remembered"
+    );
+    // The ticket check (signed URLs, hook tickets) must not forget either
+    // revocation: the delegations are gone, the tombstones remain. The purged
+    // host delegation was never revoked and has no tombstone.
+    let cited = |t: &String| [cid_of(t).to_cid(0x55)];
+    for revoked in [&child, &root] {
+        assert_eq!(
+            db.delegation_chains_revocation(&cited(revoked))
+                .await
+                .unwrap(),
+            Some(RevocationCode::DelegationRevoked),
+            "ticket authority stays revoked after the purge"
+        );
+    }
+    assert_eq!(
+        db.delegation_chains_revocation(&cited(&host_token))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn tc4092_failed_delegation_delete_rolls_back_tombstones_and_leaves_rows_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("atomic-delegation.sqlite").display()
+    );
+    purge_is_all_or_nothing(sea_orm::Database::connect(url).await.unwrap(), "delegation").await;
+}
+
+#[tokio::test]
+async fn tc4092_failed_policy_root_delete_rolls_back_tombstones_and_leaves_rows_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("atomic-policy.sqlite").display()
+    );
+    purge_is_all_or_nothing(
+        sea_orm::Database::connect(url).await.unwrap(),
+        "policy_v3_root",
+    )
+    .await;
+}
+
+async fn postgres_all_or_nothing(fail_table: &'static str, name: &'static str) {
+    let Some(url) = crate::test_support::postgres_test_url(name) else {
+        return;
+    };
+    let admin = sea_orm::Database::connect(sea_orm::ConnectOptions::new(url.clone()))
+        .await
+        .unwrap();
+    let schema = format!(
+        "tc4092a_{}_{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options
+        .max_connections(4)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
+    let conn = sea_orm::Database::connect(options).await.unwrap();
+    let ran = tokio::spawn(purge_is_all_or_nothing(conn, fail_table)).await;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    ran.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_tc4092_failed_delegation_delete_rolls_back_tombstones_and_leaves_rows() {
+    postgres_all_or_nothing(
+        "delegation",
+        "postgres_tc4092_failed_delegation_delete_rolls_back_tombstones_and_leaves_rows",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_tc4092_failed_policy_root_delete_rolls_back_tombstones_and_leaves_rows() {
+    postgres_all_or_nothing(
+        "policy_v3_root",
+        "postgres_tc4092_failed_policy_root_delete_rolls_back_tombstones_and_leaves_rows",
+    )
+    .await;
+}

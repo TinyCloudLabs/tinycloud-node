@@ -1417,6 +1417,13 @@ where
         if roots.is_empty() {
             return Ok(None);
         }
+        // TC-4092: a cited delegation whose revocation a purge deleted (the
+        // delegation is gone with it, so the walk below finds nothing) is
+        // still revoked: signed-URL and hook tickets minted from it before the
+        // revocation must not work again.
+        if crate::models::revocation_tombstone::is_tombstoned(&self.conn, &roots).await? {
+            return Ok(Some(RevocationCode::DelegationRevoked));
+        }
         // The shared traversal budget covers every cited root together.
         let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
             .await
