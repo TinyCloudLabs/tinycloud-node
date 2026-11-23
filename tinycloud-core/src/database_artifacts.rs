@@ -3930,6 +3930,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_delta_cte_wal_marks_round_trip() {
+        let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("postgres_delta_cte_wal_marks_round_trip")
+                .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        let base = repo
+            .save(
+                "sql",
+                "cte-space",
+                "cte-db",
+                b"checkpoint".to_vec().into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let wal = b"wal-mark-cte-readback";
+        let saved = repo
+            .save_delta(
+                "sql",
+                "cte-space",
+                "cte-db",
+                wal.to_vec().into(),
+                ArtifactExpectation::Derived {
+                    revision: base.revision,
+                    checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.revision, base.revision + 1);
+        assert_eq!(
+            sql_wal_mark::Entity::find()
+                .all(&fixture.conn)
+                .await
+                .unwrap(),
+            vec![sql_wal_mark::Model {
+                service: "sql".into(),
+                space: "cte-space".into(),
+                name: "cte-db".into(),
+                revision: saved.revision,
+                checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+                wal_end_bytes: wal.len() as i64,
+                wal_prefix_sha256: hex::encode(wal_sha256(wal)),
+            }]
+        );
+        assert_eq!(
+            repo.load_wal_marks(
+                "sql",
+                "cte-space",
+                "cte-db",
+                &[base.revision, saved.revision, saved.revision + 1],
+            )
+            .await
+            .unwrap(),
+            vec![WalMark {
+                revision: saved.revision,
+                checkpoint_content_hash: base.checkpoint_content_hash,
+                wal_end_bytes: wal.len() as u64,
+                wal_prefix_sha256: wal_sha256(wal),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_cas_lost_delta_cte_writes_no_wal_marks() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+        use std::time::Duration;
+
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_cas_lost_delta_cte_writes_no_wal_marks",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        for (name, change) in [
+            ("revision", "revision = revision + 1"),
+            ("checkpoint", "checkpoint_content_hash = 'other-checkpoint'"),
+        ] {
+            let base = repo
+                .save(
+                    "sql",
+                    "space",
+                    name,
+                    b"checkpoint".to_vec().into(),
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+            let competitor = fixture.connect(1).await;
+            let holder = competitor.begin().await.unwrap();
+            let pid: i32 = holder
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT pg_backend_pid()",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            holder
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    format!("UPDATE database_artifact SET {change} WHERE name = $1"),
+                    [name.into()],
+                ))
+                .await
+                .unwrap();
+            let winner = database_artifact::Entity::find_by_id((
+                "sql".to_string(),
+                "space".to_string(),
+                name.to_string(),
+            ))
+            .one(&holder)
+            .await
+            .unwrap()
+            .unwrap();
+
+            // The metadata read sees the committed base; only the CTE waits
+            // on the competing update, then rechecks its CAS after commit.
+            let saver = repo.clone();
+            let mut save = tokio::spawn(async move {
+                saver
+                    .save_delta(
+                        "sql",
+                        "space",
+                        name,
+                        b"losing-wal".to_vec().into(),
+                        ArtifactExpectation::Derived {
+                            revision: base.revision,
+                            checkpoint_content_hash: base.checkpoint_content_hash,
+                        },
+                    )
+                    .await
+            });
+            let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if fixture
+                        .conn
+                        .query_one(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                            [pid.into()],
+                        ))
+                        .await?
+                        .is_some()
+                    {
+                        return Ok::<_, DbErr>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            // Release the lock even if observing the blocked CTE timed out.
+            let committed = holder.commit().await;
+            let result = match tokio::time::timeout(Duration::from_secs(10), &mut save).await {
+                Ok(result) => result.unwrap(),
+                Err(error) => {
+                    save.abort();
+                    let _ = save.await;
+                    panic!("{name}: delta save did not finish after competitor release: {error}");
+                }
+            };
+            committed.unwrap();
+            blocked
+                .expect("delta CTE must wait for the competing update")
+                .unwrap();
+            assert!(
+                matches!(&result, Err(DatabaseArtifactError::Backend(message))
+                    if message == "concurrent database artifact update"),
+                "{name}: {result:?}"
+            );
+            assert_eq!(
+                database_artifact::Entity::find_by_id((
+                    "sql".to_string(),
+                    "space".to_string(),
+                    name.to_string(),
+                ))
+                .one(&fixture.conn)
+                .await
+                .unwrap()
+                .unwrap(),
+                winner,
+                "{name}: the competing row must stand"
+            );
+            assert!(marks_of(&repo, name).await.is_empty(), "{name}");
+            assert!(
+                sql_wal_mark::Entity::find()
+                    .all(&fixture.conn)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{name}: a CAS-lost CTE must insert no mark"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_checkpoint_save_drops_the_marks_of_the_artifact_it_replaces() {
         let (_conn, repo) = marks_repo().await;
         for name in ["main", "other"] {
