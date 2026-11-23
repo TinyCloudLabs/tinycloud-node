@@ -1462,7 +1462,8 @@ jobs:
           if grep -q '^  key-recovery:$' docker-compose.dstack-postgres.yaml; then
             ALLOWED="sealed sealed-new"
           fi
-          ROOT="$(curl -fsS --max-time 15 https://tee.node.tinycloud.xyz/info | jq -r '.identityRoot // "absent"')"
+          # TC-3881: a read-only /info; one transient failure is retried once, a second still fails the step.
+          ROOT="$(bash scripts/ci/retry-read.sh curl -fsS --max-time 15 https://tee.node.tinycloud.xyz/info | jq -r '.identityRoot // "absent"')"
           if ! [[ "${ROOT}" =~ ^[a-z-]{1,32}$ ]]; then
             echo "::error::/info identityRoot is not a plain word; expected one of: ${ALLOWED}."
             exit 1
@@ -1536,8 +1537,9 @@ jobs:
           MANIFEST="$RUNNER_TEMP/app-compose/app-compose.json"
           # Written to a file, not read through $(...): phala 1.1.19 stdout through a pipe is cut at
           # 64 KiB (TC-3928), and this runs after the deploy mutated the CVM.
+          # TC-3881: the GET is retried once (retry-read.sh writes to a file, then copies it to this one).
           SERVED="$RUNNER_TEMP/app-compose/served.json"
-          if ! phala api /cvms/tinycloud-node/compose_file >"${SERVED}" 2>/dev/null; then
+          if ! bash scripts/ci/retry-read.sh phala api /cvms/tinycloud-node/compose_file >"${SERVED}"; then
             echo "::error::Cannot read the compose file of tinycloud-node from Phala"
             exit 1
           fi
