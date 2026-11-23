@@ -138,8 +138,7 @@ async fn load_closure<C: ConnectionTrait>(
     let mut closure_query = base;
     let seed_rows = canonical_locks || include_modes;
     if canonical_locks {
-        // Parentless stored roots otherwise produce no edge row. Seed them
-        // only for locking; roots without a persisted alias retain their ID.
+        // Parentless roots with aliases need a row to resolve their lock IDs.
         let seed = Query::select()
             .expr_as(Expr::col(delegation_cid_alias::Column::Id), child.clone())
             .expr_as(Expr::val(Option::<Hash>::None), parent.clone())
@@ -147,7 +146,8 @@ async fn load_closure<C: ConnectionTrait>(
             .and_where(Expr::col(delegation_cid_alias::Column::Id).is_in(nodes.iter().copied()))
             .to_owned();
         closure_query.union(UnionType::Distinct, seed);
-    } else if include_modes {
+    }
+    if include_modes {
         // Parentless roots have no `parent_delegation` row; seed them from
         // `delegation_mode` so one query fetches both edges and root modes.
         let seed = Query::select()
@@ -2466,6 +2466,107 @@ mod tests {
             insert_edge(db, pair[0], pair[1]).await;
         }
         ids
+    }
+
+    #[tokio::test]
+    async fn tc3952_parentless_mode_row_seeds_lock_closure_without_alias() {
+        let (db, _) = counted_database().await;
+        assert_parentless_mode_row_seeds_lock_closure(&db).await;
+        if let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("tc3952_parentless_mode_row").await
+        {
+            actor::ActiveModel {
+                id: Set("did:key:actor".to_owned()),
+            }
+            .insert(&fixture.conn)
+            .await
+            .unwrap();
+            assert_parentless_mode_row_seeds_lock_closure(&fixture.conn).await;
+        }
+    }
+
+    async fn assert_parentless_mode_row_seeds_lock_closure(db: &DatabaseConnection) {
+        let root = hash(b"mode-only parentless delegation");
+        insert_delegation(db, root).await;
+        delegation_mode::ActiveModel {
+            delegation_id: Set(root),
+            mode: Set("invalid".to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        let closure = load_chain_lock_ids_and_modes(db, &[root]).await.unwrap();
+        assert_eq!(closure.nodes, vec![root]);
+        assert!(closure.edges.is_empty());
+        assert_eq!(
+            closure.modes.get(&root),
+            Some(&delegation_mode::StoredDelegationMode::Invalid),
+        );
+    }
+
+    #[tokio::test]
+    async fn tc3952_retention_grant_requires_attenuable_ancestors() {
+        use crate::kv_sync::{retention_until, KvSyncRetentionError, KV_RETAIN_ACTION};
+        use sea_orm::IntoActiveModel;
+
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "kv-retention-mode", 1).await;
+        let (grant, ancestor) = (ids[0], ids[1]);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let expiry = now + time::Duration::hours(1);
+        let mut leaf = delegation::Entity::find_by_id(grant)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        leaf.expiry = Set(Some(expiry));
+        leaf.update(&db).await.unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(grant),
+            mode: Set("attenuable".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let resource: crate::types::Resource =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/kv/docs"
+                .parse()
+                .unwrap();
+        abilities::ActiveModel {
+            delegation: Set(grant),
+            resource: Set(resource.clone()),
+            ability: Set(KV_RETAIN_ACTION.to_owned().try_into().unwrap()),
+            caveats: Set(Caveats::default()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for (mode, expected) in [
+            ("attenuable", Ok(Some(expiry))),
+            ("terminal", Err(KvSyncRetentionError::InvalidMode)),
+            ("invalid", Err(KvSyncRetentionError::InvalidMode)),
+        ] {
+            delegation_mode::Entity::delete_by_id(ancestor)
+                .exec(&db)
+                .await
+                .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(ancestor),
+                mode: Set(mode.to_owned()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let graph = AuthGraphSnapshot::load(&db, &[grant]).await.unwrap();
+            assert_eq!(
+                retention_until(&graph, &grant, "did:key:actor", &resource, now),
+                expected,
+                "ancestor mode {mode}",
+            );
+        }
     }
 
     #[tokio::test]

@@ -829,14 +829,14 @@ jobs:
           # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar, the TC-287 retention
           # sweeper env line, the TC-1791 delegated SQL caveats env line, the TC-1491 SQL size-cap and
           # free-disk env lines, the TC-3739 node_request DB timing fields, the TC-3834 node_request
-          # error_code, the TC-3284 deletion ledger error events and the TC-3284 named node diagnostics in the Vector config
-          # (raw a8fb25f7…; 97a180a4… / bced82d3… before the named diagnostics, db348152… / 27287a38… before TC-3284, cc219eb5… / 02d90755… before TC-3834, c6d05e1e… / 46287bc3… before TC-3739,
+          # error_code, the TC-3284 deletion ledger error events and the TC-3284 named node diagnostics and the TC-3973 startup events in the Vector config
+          # (raw 7cc95bde…; e0f99bcc… / a8fb25f7… before TC-3973; 97a180a4… / bced82d3… before the named diagnostics, db348152… / 27287a38… before TC-3284, cc219eb5… / 02d90755… before TC-3834, c6d05e1e… / 46287bc3… before TC-3739,
           # e5f1c356… / d1d2ef49… before the TC-1491 caps,
           # e1cf031b… / f4f51e75… before TC-1791, 6a577c6d… / 272f43b8… before TC-287,
           # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
           # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = 'e0f99bcca6f220c65d81cad15504790099d634243ea701350a509e995b672aa0'
+          n0_template_hash = '8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))

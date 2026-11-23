@@ -576,18 +576,7 @@ pub(crate) async fn control_proof_decision_with_encryption<C: ConnectionTrait>(
     .await
 }
 
-pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
-    db: &C,
-    signer: &str,
-    proofs: &[Cid],
-    action: ControlAction,
-    target: &Hash,
-    now: OffsetDateTime,
-) -> Result<ControlProofDecision, DbErr> {
-    control_proof_decision_at_with_encryption(db, signer, proofs, action, target, now, None).await
-}
-
-async fn control_proof_decision_at_with_encryption<C: ConnectionTrait>(
+pub(crate) async fn control_proof_decision_at_with_encryption<C: ConnectionTrait>(
     db: &C,
     signer: &str,
     proofs: &[Cid],
@@ -629,7 +618,7 @@ async fn control_proof_decision_at_with_encryption<C: ConnectionTrait>(
         return Ok(ControlProofDecision::Denied);
     }
 
-    if action == ControlAction::Status {
+    if matches!(action, ControlAction::Status | ControlAction::Renew) {
         match crate::models::invocation::preflight_terminal_ancestors(db, &[proofs[0]], encryption)
             .await
         {
@@ -1497,6 +1486,72 @@ mod tests {
             .await
             .unwrap();
             assert!(matches!(decision, ControlProofDecision::Denied));
+        }
+    }
+
+    #[tokio::test]
+    async fn tc3952_renew_checks_ancestor_modes_and_revoke_remains_available() {
+        use crate::models::delegation_mode;
+
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let ancestor = hash(b"control proof ancestor");
+        let proof = hash(b"control proof leaf");
+        let target = hash(b"control target");
+        insert_delegation_between(&db, ancestor, "did:key:owner", "did:key:owner").await;
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:owner", "did:key:recipient").await;
+        insert_link(&db, proof, ancestor).await;
+        for action in [ControlAction::Renew, ControlAction::Revoke] {
+            insert_ability(
+                &db,
+                proof,
+                &format!("urn:cid:{}", target.to_cid(0x55)),
+                action.ability(),
+            )
+            .await;
+        }
+        delegation_mode::ActiveModel {
+            delegation_id: Set(proof),
+            mode: Set("attenuable".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let target_row = target_for_cid(&db, target).await.unwrap().unwrap();
+
+        for mode in ["attenuable", "terminal", "invalid"] {
+            delegation_mode::Entity::delete_by_id(ancestor)
+                .exec(&db)
+                .await
+                .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(ancestor),
+                mode: Set(mode.to_owned()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let decision = control_proof_decision(
+                &db,
+                "did:key:session",
+                &[proof.to_cid(0x55)],
+                ControlAction::Renew,
+                &target,
+            )
+            .await
+            .unwrap();
+            match mode {
+                "attenuable" => assert!(matches!(
+                    decision,
+                    ControlProofDecision::Scoped(control)
+                        if control.directly_authorizes_cid(&target, &target_row)
+                )),
+                _ => assert!(matches!(decision, ControlProofDecision::Denied)),
+            }
+            assert!(revoker_may_revoke(&db, target, "did:key:session", proof).await);
         }
     }
 

@@ -25,9 +25,9 @@ test('the real sink receives the uncapped requests, the five cap transforms, the
   for (const profile of ['errors_slow', 'all_requests']) {
     const { sinks, transforms } = buildConfig({ profile });
     // test-ruling: TC-3284 log-shipper/profile.test.mjs sink inputs and route keys gain deletion_ledger (2026-11-22)
-    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'event_route.storage_headroom', 'event_route.deletion_ledger', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_node_request_4xx', 'cap_ingress_request_4xx', 'diagnostic_output', 'gate_output']);
+    assert.deepEqual(sinks.betterstack.inputs, ['event_route.request', 'event_route.storage_headroom', 'event_route.delegation_mode_boot_reindex', 'event_route.deletion_ledger', 'cap_db_failure_5xx', 'cap_node_request_5xx', 'cap_ingress_request_5xx', 'cap_node_request_4xx', 'cap_ingress_request_4xx', 'diagnostic_output', 'gate_output']);
     assert.deepEqual(transforms.diagnostic_reduce.inputs, ['event_route.diagnostic']);
-    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx', 'db_failure_5xx', 'storage_headroom', 'deletion_ledger', 'diagnostic']);
+    assert.deepEqual(Object.keys(transforms.event_route.route), ['request', 'node_request_5xx', 'ingress_request_5xx', 'node_request_4xx', 'ingress_request_4xx', 'db_failure_5xx', 'storage_headroom', 'delegation_mode_boot_reindex', 'deletion_ledger', 'diagnostic']);
     assert.match(transforms.event_route.route.diagnostic, /event_code != "db_failure_5xx"/);
   }
 });

@@ -22,6 +22,7 @@ pub fn verifier_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
 }
 
+use crate::encryption::ColumnEncryption;
 use crate::hash::Hash;
 use crate::keys::StaticSecret;
 use sea_orm::sea_query::Value;
@@ -638,6 +639,7 @@ pub async fn authorize_renewal_invocation<C: ConnectionTrait>(
         original_cid,
         identity,
         verifier_now().unix_timestamp(),
+        None,
     )
     .await
 }
@@ -648,6 +650,7 @@ async fn authorize_renewal_invocation_at<C: ConnectionTrait>(
     original_cid: &str,
     identity: &RenewalNodeIdentity,
     verifier_now: i64,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<(), RenewalStoreError> {
     use crate::models::revocation::{ControlAction, ControlProofDecision};
     if invocation.capabilities.len() != 1
@@ -679,13 +682,14 @@ async fn authorize_renewal_invocation_at<C: ConnectionTrait>(
         .await?
         .ok_or(RenewalStoreError::Unauthorized)?;
 
-    match crate::models::revocation::control_proof_decision_at(
+    match crate::models::revocation::control_proof_decision_at_with_encryption(
         db,
         &invocation.invoker,
         &invocation.parents,
         ControlAction::Renew,
         &target,
         unix_time(verifier_now)?,
+        encryption,
     )
     .await?
     {
@@ -1222,6 +1226,7 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
     request: StampIssue,
     secret: &StaticSecret,
     identity: &RenewalNodeIdentity,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<StampRecord, RenewalStoreError> {
     issue_stamp_at(
         conn,
@@ -1229,6 +1234,7 @@ pub(crate) async fn issue_stamp<C: TransactionTrait + ConnectionTrait>(
         secret,
         identity,
         verifier_now().unix_timestamp(),
+        encryption,
     )
     .await
 }
@@ -1239,6 +1245,7 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
     secret: &StaticSecret,
     identity: &RenewalNodeIdentity,
     now: i64,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<StampRecord, RenewalStoreError> {
     let (_, original) = canonical_cid(&request.original_cid)?;
     let tx = crate::db::begin_write_transaction(conn, None).await?;
@@ -1274,6 +1281,7 @@ async fn issue_stamp_at<C: TransactionTrait + ConnectionTrait>(
             &request.original_cid,
             identity,
             now,
+            encryption,
         )
         .await?;
         issue_stamp_in_transaction(&tx, request, secret, identity, now).await
@@ -2104,18 +2112,27 @@ mod tests {
         let mut wrong_caller = request.invocation.clone();
         wrong_caller.invoker = "did:key:attacker".to_owned();
         assert!(matches!(
-            authorize_renewal_invocation_at(&db, &wrong_caller, original_cid, &identity, now).await,
+            authorize_renewal_invocation_at(&db, &wrong_caller, original_cid, &identity, now, None)
+                .await,
             Err(RenewalStoreError::Unauthorized)
         ));
         let mut extra_parent = request.invocation.clone();
         extra_parent.parents.push(original_cid.parse().unwrap());
         assert!(matches!(
-            authorize_renewal_invocation_at(&db, &extra_parent, original_cid, &identity, now).await,
+            authorize_renewal_invocation_at(&db, &extra_parent, original_cid, &identity, now, None)
+                .await,
             Err(RenewalStoreError::Unauthorized)
         ));
-        authorize_renewal_invocation_at(&db, &request.invocation, original_cid, &identity, now)
-            .await
-            .unwrap();
+        authorize_renewal_invocation_at(
+            &db,
+            &request.invocation,
+            original_cid,
+            &identity,
+            now,
+            None,
+        )
+        .await
+        .unwrap();
         // TC-3443 (C2): while the original's holder is a retired session key
         // no stamp is issued and the request spends no replay; once the
         // retire is gone the same request is stamped below. The retire has a
@@ -2131,7 +2148,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let declined = issue_stamp_at(&db, request.clone(), &secret, &identity, now).await;
+        let declined = issue_stamp_at(&db, request.clone(), &secret, &identity, now, None).await;
         assert!(
             matches!(&declined, Err(RenewalStoreError::SessionRetired(_))),
             "{declined:?}"
@@ -2151,7 +2168,7 @@ mod tests {
         // either the stamp is declined, or the retire counts its end.
         let holder = original_info.delegate.clone();
         let (stamped, raced) = tokio::join!(
-            issue_stamp_at(&db, request.clone(), &secret, &identity, now),
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now, None),
             crate::models::session_retire::retire(
                 &db,
                 &holder,
@@ -2179,7 +2196,7 @@ mod tests {
                 issued
             }
             Err(RenewalStoreError::SessionRetired(_)) => {
-                issue_stamp_at(&db, request.clone(), &secret, &identity, now)
+                issue_stamp_at(&db, request.clone(), &secret, &identity, now, None)
                     .await
                     .unwrap()
             }
@@ -2230,7 +2247,7 @@ mod tests {
         assert_eq!(retire_expiry(&db).await, unix_time(issued.new_end).unwrap());
         set_lease_state("active").await.unwrap();
         assert!(matches!(
-            issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now, None).await,
             Err(RenewalStoreError::Replay)
         ));
 
@@ -2252,7 +2269,15 @@ mod tests {
         stale_process_request.replay_hash = hash(b"stale process identity");
         stale_process_request.replay_expires_at = now + 120;
         assert!(matches!(
-            issue_stamp_at(&db, stale_process_request, &secret, &identity, now + 60,).await,
+            issue_stamp_at(
+                &db,
+                stale_process_request,
+                &secret,
+                &identity,
+                now + 60,
+                None
+            )
+            .await,
             Err(RenewalStoreError::IdentityEpoch)
         ));
         let next_snapshot = load_renewal_snapshot(
@@ -2281,9 +2306,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(issue_stamp_at(&db, request, &secret, &next_identity, now)
-            .await
-            .is_err());
+        assert!(
+            issue_stamp_at(&db, request, &secret, &next_identity, now, None)
+                .await
+                .is_err()
+        );
 
         let next_not_before = now - 100;
         let next_expiry = next_not_before + MAX_LEASE_SECONDS;
@@ -2647,7 +2674,7 @@ mod tests {
             "a repeated pause keeps the original change time"
         );
         assert!(matches!(
-            issue_stamp_at(&db, request.clone(), &secret, &identity, now).await,
+            issue_stamp_at(&db, request.clone(), &secret, &identity, now, None).await,
             Err(RenewalStoreError::Paused)
         ));
         assert_eq!(replay_rows().await, 0, "a paused refusal spends no replay");
@@ -2659,7 +2686,7 @@ mod tests {
                 changed_at: Some(700)
             }
         );
-        let resumed = issue_stamp_at(&db, request, &secret, &identity, now).await;
+        let resumed = issue_stamp_at(&db, request, &secret, &identity, now, None).await;
         assert!(
             !matches!(resumed, Err(RenewalStoreError::Paused)),
             "resume lets the request through the switch: {resumed:?}"
@@ -2719,7 +2746,7 @@ mod tests {
             .unwrap();
         let stamp = tokio::spawn({
             let db = db.clone();
-            async move { issue_stamp_at(&db, request, &secret, &identity, now).await }
+            async move { issue_stamp_at(&db, request, &secret, &identity, now, None).await }
         });
         tokio::time::sleep(waits).await;
         assert!(

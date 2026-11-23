@@ -84,3 +84,12 @@ mod tests {
     { level: 'warn', message: null, dynamic: true, event: null, target: null },
   ]);
 });
+
+test('boot-scoped diagnostics and reindex summaries use closed schema codes (TC-3973)', () => {
+  const codes = [
+    ...diagnostics.scoped.map(entry => entry.code),
+    ...Object.values(diagnostics.boot_reindex),
+  ];
+  for (const code of codes) assert.ok(schema.fields.event_code.values.includes(code), code);
+  assert.ok(schema.events.includes('delegation_mode_boot_reindex'));
+});

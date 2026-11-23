@@ -38,6 +38,20 @@ const reject = (name, input, insertAt = 'logship_gate') => ({ name, inputs: [{ i
 // `free_bytes`; any deviation drops it.
 export const storageHeadroom = (fields = {}, extra = {}) => ({ timestamp, level: 'INFO', target: 'tinycloud::disk_headroom', ...extra, fields: { message: 'storage headroom', store: 'sql', free_bytes: 7516192768, ...fields } });
 const headroomShipped = ['event', 'free_bytes', 'level', 'store', 'svc', 'ts'];
+const bootReindexMessages = {
+  complete: 'delegation mode boot reindex complete',
+  incomplete: 'delegation mode boot reindex incomplete; skipped rows remain unmarked and derive on read',
+  lock_timeout: 'delegation mode boot reindex incomplete (lock timeout); remaining rows derive on read',
+};
+const bootCounts = {
+  scanned: 123, reindexed_terminal: 4, marked_attenuable: 116, marked_invalid: 1,
+  skipped_locked_pages: 0, skipped_decrypt_failed: 2, elapsed_ms: 50,
+};
+const bootSummary = (result, fields = {}, extra = {}) => ({
+  timestamp, level: 'INFO', target: 'tinycloud_core::models::delegation_mode', ...extra,
+  fields: { message: bootReindexMessages[result], ...bootCounts, ...fields },
+});
+const bootSummaryKeys = ['event', 'event_code', 'level', 'svc', 'ts', ...Object.keys(bootCounts)].sort();
 // TC-3284: the deletion ledger's error lines as tinycloud-node emits them (target, level and fields). The message is
 // the canary so a case fails if it is ever copied.
 export const ledgerError = (event, fields = {}, extra = {}) => ({ timestamp, level: 'ERROR', target: LEDGER_TARGETS[event], ...extra, fields: { message: `deletion ledger failed ${canary}`, event, error_kind: 'io', ...fields } });
@@ -138,6 +152,23 @@ export const vectorTests = [
   ...[200, 399, 400, 404, 499].map(status => check(`error_code is dropped on status ${status}`, envelope(nodeRequest({ status, error_code: 'db_error' })), `.event == "node_request" && .status == ${status} && !exists(.error_code)`)),
   check('free-text or unknown error_code is dropped but the 5xx request ships', envelope(nodeRequest({ status: 500, error_code: `SELECT secret FROM t ${canary}` })), '.event == "node_request" && .status == 500 && .route == "/invoke" && !exists(.error_code)'),
   ...['DB_ERROR', 'db_error ', 'unknown_code', 7].map(value => check(`error_code ${JSON.stringify(value)} outside the closed set is dropped`, envelope(nodeRequest({ status: 503, error_code: value })), '.event == "node_request" && .status == 503 && !exists(.error_code)')),
+  ...[
+    ['rocket::config::config', 'found value for deprecated config key `log`', 'rocket_deprecated_log_config'],
+    ['rocket::launch', `Rocket has launched from http://127.0.0.1:8000/${canary}`, 'rocket_launched'],
+    ['rocket::server', 'Rocket has launched from http://127.0.0.1:8000', 'unclassified'],
+    ['tinycloud_core::db', 'delegation mode boot backfill failed; unmarked rows derive on read', 'delegation_mode_boot_backfill_failed'],
+    ['tinycloud_core::models::delegation_mode', 'delegation mode boot reindex skipped rows that failed decryption; leaving unmarked for read-time fail-closed handling', 'delegation_mode_boot_reindex_decrypt_failed'],
+  ].map(([target, message, code]) => check(`boot warning on ${target} maps to ${code}`, envelope({ timestamp, target, level: 'WARN', fields: { message, error: canary } }), `.event == "node_warning" && .event_code == "${code}" && .event_count == 1 && ${keysAre(['event', 'event_code', 'event_count', 'level', 'svc', 'ts'])}`)),
+  ...[
+    ['a negative count', { scanned: -1 }],
+    ['a string count', { scanned: '123' }],
+    ['a fractional count', { marked_invalid: 0.5 }],
+    ['an oversized count', { scanned: 9007199254740992 }],
+    ['a missing count', { marked_invalid: undefined }],
+    ['an unexpected DID field', { did: canary }],
+    ['an unlisted message', { message: canary }],
+  ].map(([label, fields]) => rejectFor(`boot reindex with ${label} is dropped`, envelope(bootSummary('complete', fields)), 'invalid_fields')),
+  rejectFor('boot reindex from a different node target is dropped', envelope(bootSummary('complete', {}, { target: 'tinycloud_core::db' })), 'filtered_level'),
   check('known warning strips all free text', envelope({ timestamp, level: 'WARN', target: 'tinycloud::runtime', fields: { message: 'invalid link bind address; LAN listener not started', err: canary, bind: canary } }), '.event == "node_warning" && .event_code == "link_bind_invalid" && .event_count == 1'),
   check('unmatched warning becomes typed unclassified', envelope({ timestamp, level: 'WARN', target: 'tinycloud::tunnel::connection', fields: { message: canary, remote: canary } }), '.event == "node_warning" && .event_code == "unclassified" && .event_count == 1'),
   check('application error remains typed without error value', envelope({ timestamp, level: 'ERROR', target: 'tinycloud::share_email', fields: { message: 'native share KV put failed', failure: canary } }), '.event == "node_error" && .event_code == "share_native_kv_put_failed" && .event_count == 1'),
@@ -306,6 +337,12 @@ export function requestProfileTests(profile) {
       no_outputs_from: ['event_route.diagnostic', 'event_route.request', ...capNames.map(name => `event_route.${name}`)],
       outputs: [{ extract_from: 'event_route.storage_headroom', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "node_storage_headroom" && .store == "duckdb" && .free_bytes == 7516192768)\nassert!(${keysAre(headroomShipped)})\nassert!(${safe})` }] }],
     },
+    ...Object.keys(bootReindexMessages).map(result => ({
+      name: `${profile}: delegation mode boot reindex ${result} reaches the sink with its seven counters`,
+      inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(bootSummary(result))) }],
+      no_outputs_from: ['event_route.diagnostic', 'event_route.request'],
+      outputs: [{ extract_from: 'event_route.delegation_mode_boot_reindex', expected_event_count: 1, conditions: [{ type: 'vrl', source: `assert!(.event == "delegation_mode_boot_reindex" && .event_code == "delegation_mode_boot_reindex_${result}" && .level == "info" && .svc == "api" && ${Object.entries(bootCounts).map(([key, value]) => `.${key} == ${value}`).join(' && ')} && ${keysAre(bootSummaryKeys)})\nassert!(${safe})` }] }],
+    })),
     ...LEDGER_EVENTS.map(event => ({
       name: `${profile}: ${event} routes as an individual event, never into the count reducer or a cap`,
       inputs: [{ insert_at: 'logship_gate', type: 'log', log_fields: logFields(envelope(ledgerError(event, { error_kind: 'lock_held' }))) }],
