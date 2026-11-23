@@ -39,6 +39,17 @@ Space lifecycle (the `/space/list`, `/space/retire-owner`, `/space/purge` and `/
 
 Setting only one of them is a configuration error. On also needs PostgreSQL and a `[storage.purge_ledger]` (section 1).
 
+**Do not set TINYCLOUD_HOST_ID / TINYCLOUD_PURGE_LEDGER_KEYS (do not enable space purge) before TC-4092 is deployed.**
+
+**Hard precondition (TC-4092): the release that contains `revocation_tombstone` (1.26.24) must be deployed first.** With lifecycle on, a purge or the automatic residue sweep deletes a revoked delegation and its `revocation` row even when the delegation names a space that is still hosted, an encryption network or a lease target (for example, a delegation that covers a purged space and a live space, whose revoked child is deleted when the owner revokes it). Without the tombstone the owner can then re-post that delegation and it is admitted again. Before setting `TINYCLOUD_HOST_ID` and `TINYCLOUD_PURGE_LEDGER_KEYS`, check on the replica that the table exists and is owned by the node role: `SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'revocation_tombstone'` (docs/runbooks/revocation-tombstone-audit.md). Rolling back below 1.26.24 while lifecycle is on reopens the gap.
+
+**Lifecycle-enable preconditions (TC-4136, child of TC-4092).** The tombstone release closes the re-post gap for revoked delegations and leases. Four related gaps remain; none blocks the merge, all four must be closed or explicitly accepted before `TINYCLOUD_HOST_ID` and `TINYCLOUD_PURGE_LEDGER_KEYS` are set. Not started:
+
+1. **An owner's `stopped` renewal lease must survive a purge.** A purge deletes the lease row, so a re-posted lease for an un-revoked purged original registers as a fresh `active` lease and renewal resumes. A stop is an owner pause, not a revocation, so it needs its own durable record, not `revocation_tombstone`.
+2. **Alias-CID ticket match.** The signed-URL and hook-ticket check reads the tombstone by the CID the ticket cites; a ticket citing a non-canonical alias CID of a purged, revoked delegation is not matched, because the alias rows are deleted with it.
+3. **Stamp `SELECT ... FOR UPDATE`.** The renewal stamp path reads the lease state with a plain SELECT (no lock), so one in-flight stamp can still commit after the purge-accept transaction has terminated the lease.
+4. **Multi-space lease termination.** At purge accept only leases whose original names that space and nothing else are marked terminal; a lease of an original that also names another space or a non-space resource is not terminated until the terminal transaction.
+
 With both unset, the node starts as before and the lifecycle routes answer 404. If the database or the configured ledger already holds lifecycle state (records, fences, retirements or purge jobs), startup refuses: removing the settings cannot bypass the ledger. With lifecycle off and an S3 ledger configured, startup lists the ledger bucket, so the IAM grant in section 1 must be in place first.
 
 When on, the node does this before it serves anything:
@@ -84,6 +95,8 @@ A crash between steps leaves the record in place; the worker's next pass and thi
 A failure exits non-zero and changes nothing that a later run cannot finish. Fix the cause and run it again. Only `deletions.jsonl` is locked (the command waits up to 60 seconds for it, then fails); nothing else stops it running beside a serving node, so never run it while the node is serving.
 
 ## 6. Ledger HMAC key: custody, rotation and loss
+
+**Do not set TINYCLOUD_HOST_ID / TINYCLOUD_PURGE_LEDGER_KEYS (do not enable space purge) before TC-4092 is deployed.** The values below are for the day it is.
 
 **Production values (Amos, 11-19):**
 - `TINYCLOUD_PURGE_LEDGER_KEYS` comes from the production secret `PROD_TINYCLOUD_NODE_PURGE_LEDGER_KEYS`, sealed into the node's environment like the other `PROD_TINYCLOUD_NODE_*` secrets. JSON form only (section 4); key IDs are `plk-YYYYMMDD`.

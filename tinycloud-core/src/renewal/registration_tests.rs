@@ -258,3 +258,233 @@ async fn identity_without_renewal_seed_refuses_before_saving_any_lease_graph() {
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
     }
 }
+
+/// TC-4092: a lease the owner revoked, then the space purged. Purge removes
+/// the revocation rows (and the delegations they name) but keeps
+/// `renewal_lease` / `renewal_stamp`, which are keyed by delegation CID. The
+/// old lease must not stamp again, neither straight after the purge nor after
+/// the identical original + lease are posted again.
+#[tokio::test]
+async fn revoked_lease_issues_no_stamp_after_space_purge_or_identical_repost() {
+    let (db, tx, fixture, seed, epoch, lease_event) = frozen_lease_graph().await;
+    let node_did = fixture["nodeIdentityDid"].as_str().unwrap().to_owned();
+    let original_cid = fixture["originalCid"].as_str().unwrap().to_owned();
+    let lease_cid = fixture["leaseCid"].as_str().unwrap().to_owned();
+    let original = canonical_cid(&original_cid).unwrap().1;
+    let lease = canonical_cid(&lease_cid).unwrap().1;
+    let issued_at = fixture["issuedAt"].as_i64().unwrap();
+    let period = fixture["renewalPeriodSeconds"].as_i64().unwrap();
+    let t1 = issued_at + 1;
+    let t2 = t1 + 1_000_000;
+    let t3 = t2 + 1_000_000;
+    assert!(t3 < fixture["leaseExpiration"].as_i64().unwrap());
+    assert!(t3 < t2 + period, "t3 is inside the second stamp's window");
+
+    register_lease_at(&tx, &lease_event, seed, epoch, &node_did, None, t1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+    let (renewer_did, stored_epoch, _) =
+        current_renewal_identity_from_seed(&db, seed).await.unwrap();
+    assert_eq!(stored_epoch, epoch);
+    let identity = RenewalNodeIdentity {
+        stable_node_did: node_did.clone(),
+        renewer_did: renewer_did.clone(),
+        epoch,
+    };
+    let request = |label: &str, now: i64| {
+        let token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
+            fixture["originalToken"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut request = StampIssue {
+            invocation: crate::util::InvocationInfo::try_from(token).unwrap(),
+            original_cid: original_cid.clone(),
+            lease_cid: lease_cid.clone(),
+            replay_hash: crate::hash::hash(label.as_bytes()),
+            replay_expires_at: now + 60,
+        };
+        request.invocation.invoker = renewer_did.clone();
+        request.invocation.parents = vec![lease_cid.parse().unwrap()];
+        request.invocation.capabilities = vec![crate::util::Capability {
+            resource: format!("urn:cid:{original_cid}").parse().unwrap(),
+            ability: "tinycloud.delegation/renew".to_owned().try_into().unwrap(),
+            caveats: Default::default(),
+        }];
+        request
+    };
+    let count = |table: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT COUNT(*) AS n FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap()
+        }
+    };
+    let lease_state = || {
+        let db = db.clone();
+        async move {
+            db.query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT state FROM renewal_lease",
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "state").unwrap())
+            .collect::<Vec<_>>()
+        }
+    };
+
+    // Control: the unrevoked lease renews twice, so the refusals below are
+    // not an artefact of timing (the second stamp is inside the first's window).
+    issue_stamp_at(&db, request("control 1", t1), &secret, &identity, t1, None)
+        .await
+        .expect("control: the live lease stamps");
+    issue_stamp_at(&db, request("control 2", t2), &secret, &identity, t2, None)
+        .await
+        .expect("control: the live lease stamps again later");
+    assert_eq!(count("renewal_stamp").await, 2);
+
+    // The owner revokes the lease. Revocation is a `revocation` row only:
+    // `renewal_lease.state` is not touched by it.
+    let revocation = crate::hash::hash(b"TC-4092 revocation of the lease");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO revocation (id, revoker, revoked, serialization, revoked_at) VALUES ($1,$2,$3,$4,NULL)",
+        [
+            Vec::<u8>::from(revocation).into(),
+            fixture["ownerDid"].as_str().unwrap().into(),
+            Vec::<u8>::from(lease).into(),
+            vec![1_u8].into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    let revoked = issue_stamp_at(
+        &db,
+        request("after revoke", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            revoked,
+            Err(RenewalStoreError::Revoked) | Err(RenewalStoreError::LeaseUnavailable)
+        ),
+        "before the purge a revoked lease must not stamp: {revoked:?}"
+    );
+    let state_after_revoke = lease_state().await;
+    assert_eq!(count("revocation").await, 1);
+
+    // The space purge's record deletion: the original, the lease and the
+    // revocation are all records of the purged space.
+    let deleted: std::collections::HashSet<Hash> =
+        [original, lease, revocation].into_iter().collect();
+    let purge = db.begin().await.unwrap();
+    crate::space_purge_records::remove_records_for_test(&purge, &deleted)
+        .await
+        .unwrap();
+    purge.commit().await.unwrap();
+    let state_after_purge = lease_state().await;
+    let revocations_after_purge = count("revocation").await;
+    let delegations_after_purge = count("delegation").await;
+    let stamps_after_purge = count("renewal_stamp").await;
+    eprintln!(
+        "TC-4092 after purge: renewal_lease.state={state_after_purge:?} (after revoke, before purge: {state_after_revoke:?}), \
+         revocation rows={revocations_after_purge}, delegation rows={delegations_after_purge}, \
+         renewal_lease rows={}, renewal_stamp rows={stamps_after_purge}",
+        count("renewal_lease").await,
+    );
+
+    // (a) the scheduler's path for the old lease, original and lease gone.
+    let after_purge = issue_stamp_at(
+        &db,
+        request("after purge", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
+    eprintln!("TC-4092 (a) stamp after purge: {after_purge:?}");
+    assert!(
+        after_purge.is_err(),
+        "(a) a revoked, purged lease issued a stamp: {after_purge:?}"
+    );
+    assert_eq!(count("renewal_stamp").await, stamps_after_purge, "(a)");
+
+    // (b) the identical original + lease are posted again: the same rows the
+    // first post stored, with no revocation among them.
+    let repost = db.begin().await.unwrap();
+    for name in ["ownerDid", "holderDid", "renewerDid"] {
+        repost
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO actor (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+                [fixture[name].as_str().unwrap().into()],
+            ))
+            .await
+            .unwrap();
+    }
+    for field in ["originalToken", "leaseToken"] {
+        let bytes = fixture[field].as_str().unwrap().as_bytes();
+        let info = signed_delegation_info(bytes).unwrap();
+        let id = crate::hash::hash(bytes);
+        repost.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO delegation (id,delegator,delegatee,expiry,issued_at,not_before,facts,serialization,serialization_format) VALUES ($1,$2,$3,$4,NULL,NULL,NULL,$5,0)",
+            [Vec::<u8>::from(id).into(), info.delegator.into(), info.delegate.into(),
+             Value::TimeDateTime(Some(Box::new(db_datetime(info.expiry.unwrap().unix_timestamp()).unwrap()))), bytes.to_vec().into()])).await.unwrap();
+        repost
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO delegation_cid_alias (id,canonical,encrypted) VALUES ($1,$1,FALSE)",
+                [Vec::<u8>::from(id).into()],
+            ))
+            .await
+            .unwrap();
+    }
+    repost.execute(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO ability (delegation,resource,ability,caveats) VALUES ($1,$2,'tinycloud.delegation/renew',$3)",
+        [Vec::<u8>::from(lease).into(), fixture["renewResource"].as_str().unwrap().into(),
+         Value::Json(Some(Box::new(serde_json::json!({}))))])).await.unwrap();
+    let admitted = register_lease_at(&repost, &lease_event, seed, epoch, &node_did, None, t3).await;
+    eprintln!("TC-4092 (b) re-admission of the identical lease: {admitted:?}");
+    repost.commit().await.unwrap();
+    eprintln!(
+        "TC-4092 after re-post: renewal_lease.state={:?}, revocation rows={}, renewal_lease rows={}",
+        lease_state().await,
+        count("revocation").await,
+        count("renewal_lease").await,
+    );
+    let after_repost = issue_stamp_at(
+        &db,
+        request("after repost", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
+    eprintln!("TC-4092 (b) stamp after re-post: {after_repost:?}");
+    eprintln!(
+        "TC-4092 (b) effective_end after re-post: {:?}",
+        effective_end(&db, &original_cid, &lease_cid, t3, &identity).await
+    );
+    assert!(
+        after_repost.is_err(),
+        "(b) a revoked, purged, re-posted lease issued a stamp: {after_repost:?}"
+    );
+    assert_eq!(count("renewal_stamp").await, stamps_after_purge, "(b)");
+}

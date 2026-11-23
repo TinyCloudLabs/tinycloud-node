@@ -22,7 +22,9 @@ use tinycloud_auth::{
 /// this instead of matching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationCode {
-    /// The delegation the invocation cites is itself revoked.
+    /// The delegation the invocation cites is itself revoked, or a delegation
+    /// posted to `/delegate` was revoked and its revocation row since purged
+    /// (a `revocation_tombstone` remembers it, TC-4092).
     DelegationRevoked,
     /// A direct parent of the delegation being invoked or registered is
     /// revoked.
