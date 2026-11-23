@@ -458,6 +458,7 @@ pub enum KvSyncRetentionError {
     HolderMismatch,
     Revoked,
     AncestorRevoked,
+    InvalidMode,
     NotYetValid,
     Expired,
     NotCovering,
@@ -470,6 +471,7 @@ impl KvSyncRetentionError {
             Self::HolderMismatch => "retention-grant-holder-mismatch",
             Self::Revoked => "retention-grant-revoked",
             Self::AncestorRevoked => "retention-grant-ancestor-revoked",
+            Self::InvalidMode => "retention-grant-invalid-mode",
             Self::NotYetValid => "retention-grant-not-yet-valid",
             Self::Expired => "retention-grant-expired",
             Self::NotCovering => "retention-grant-not-covering",
@@ -532,6 +534,8 @@ pub(crate) fn retention_until(
     if graph.first_revoked_ancestor(grant).is_some() {
         return Err(KvSyncRetentionError::AncestorRevoked);
     }
+    crate::models::invocation::check_no_terminal_strict_ancestor(graph, &[*grant])
+        .map_err(|_| KvSyncRetentionError::InvalidMode)?;
     let mut retain_until = None;
     for id in graph.chain_ids_from(grant) {
         let ancestor = graph

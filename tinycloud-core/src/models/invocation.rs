@@ -520,7 +520,7 @@ pub(crate) async fn check_closure_modes<C: ConnectionTrait>(
 
 /// Lock-free, single-query preflight check for terminal strict ancestors and
 /// quarantined `invalid` leaves (used by `/delegation/status` and
-/// `revocation::control_proof_decision_at`). Pure read-only SQL, never reads
+/// proof-bearing Renew). Pure read-only SQL, never reads
 /// `delegation.facts`.
 pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
     db: &C,

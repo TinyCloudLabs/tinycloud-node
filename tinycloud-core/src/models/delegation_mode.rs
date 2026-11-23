@@ -331,7 +331,7 @@ where
             stats.completed = stats.skipped_locked_pages == 0 && stats.skipped_decrypt_failed == 0;
             stats.elapsed_ms = started.elapsed().as_millis() as u64;
             if stats.skipped_decrypt_failed > 0 {
-                tracing::info!(
+                tracing::warn!(
                     skipped_decrypt_failed = stats.skipped_decrypt_failed,
                     "delegation mode boot reindex skipped rows that failed decryption; leaving unmarked for read-time fail-closed handling"
                 );

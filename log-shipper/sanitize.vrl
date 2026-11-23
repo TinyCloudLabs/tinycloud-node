@@ -59,6 +59,23 @@ if label == "tinycloud-node" {
       }
     }
   }
+  # TC-3973: ship the boot summary with exactly the seven bounded counters.
+  backfill = null
+  if target == "tinycloud_core::models::delegation_mode" && level == "info" && length(f) == 8 {
+    backfill_code = get(__BOOT_REINDEX_CODES__, [msg]) ?? null
+    if is_string(backfill_code) {
+      counters = {}
+      for_each(["scanned", "reindexed_terminal", "marked_attenuable", "marked_invalid", "skipped_locked_pages", "skipped_decrypt_failed", "elapsed_ms"]) -> |_index, field| {
+        value = int(get(f, [field]) ?? null) ?? -1
+        if value >= 0 && value <= 9007199254740991 {
+          counters = set!(counters, [field], value)
+        }
+      }
+      if length(counters) == 7 {
+        backfill = merge(counters, {"event": "delegation_mode_boot_reindex", "svc": "api", "level": "info", "event_code": backfill_code})
+      }
+    }
+  }
   # TC-3284: the deletion ledger's three error events (open and replay at start from target `tinycloud`, an unrepaired
   # append from the ledger module) ship individually as their event name and `error_kind`. The input must be an error
   # from that event's own target with exactly the message, `event` and `error_kind` keys, and `error_kind` exactly one
@@ -127,6 +144,8 @@ if label == "tinycloud-node" {
     out = db_event
   } else if is_object(headroom) {
     out = headroom
+  } else if is_object(backfill) {
+    out = backfill
   } else if is_object(ledger) {
     out = ledger
   } else {
@@ -144,6 +163,7 @@ if label == "tinycloud-node" {
         if is_string(named) { code = named }
       }
     }
+    __SCOPED_DIAGNOSTICS__
     event = if level == "warn" { "node_warning" } else { "node_error" }
     out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
   }

@@ -77,6 +77,11 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
     .replaceAll('__LEDGER_ERROR_KINDS__', JSON.stringify(LEDGER_ERROR_KINDS))
     .replaceAll('__LEDGER_TARGETS__', JSON.stringify(LEDGER_TARGETS))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
+    .replace('__BOOT_REINDEX_CODES__', JSON.stringify(diagnostics.boot_reindex))
+    .replace('__SCOPED_DIAGNOSTICS__', diagnostics.scoped.map(({ target, message, prefix, code }) => {
+      const match = message === undefined ? `starts_with(msg, ${JSON.stringify(prefix)})` : `msg == ${JSON.stringify(message)}`;
+      return `if level == "warn" && target == ${JSON.stringify(target)} && ${match} { code = ${JSON.stringify(code)} }`;
+    }).join('\n'))
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
     .replace('__EVENT_DIAGNOSTICS__', JSON.stringify(diagnostics.event))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
@@ -124,7 +129,7 @@ if reason != "" {
     level = downcase(string(parsed.level) ?? "")
     if label == "tinycloud-node" && !includes(["warn", "error"], level) && target != "tinycloud" && !starts_with(target, "tinycloud::") && target != "tinycloud_core" && !starts_with(target, "tinycloud_core::") {
       . = {"reason": "unknown_target"}
-    } else if label == "tinycloud-node" && !includes(["warn", "error"], level) && !((target == "tinycloud::request" || target == "tinycloud::disk_headroom") && level == "info") {
+    } else if label == "tinycloud-node" && !includes(["warn", "error"], level) && !((target == "tinycloud::request" || target == "tinycloud::disk_headroom" || target == "tinycloud_core::models::delegation_mode") && level == "info") {
       . = {"reason": "filtered_level"}
     } else { . = {"label": label, "parsed": parsed} }
   }
@@ -137,7 +142,7 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
 . = {"reason": reason, "count": 1}`),
       gate_reduce: { type: 'reduce', inputs: ['gate_counts'], group_by: ['reason'], end_every_period_ms: 60000, expire_after_ms: 75000, flush_period_ms: 1000, merge_strategies: { count: 'sum' } },
       gate_output: remap(['gate_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": "warn", "event": "logship_gate_summary_total", "svc": "logship", "reason": .reason, "count": .count}`),
-      request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(${JSON.stringify(['node_warning', 'node_error', 'node_storage_headroom', ...LEDGER_EVENTS])}, .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
+      request_profile: { type: 'filter', inputs: ['allowlist'], condition: `${profileExpression} == "all_requests" || includes(${JSON.stringify(['node_warning', 'node_error', 'node_storage_headroom', 'delegation_mode_boot_reindex', ...LEDGER_EVENTS])}, .event) || (int(.status) ?? 0) >= 400 || (.event == "node_request" && (int(.latency_us) ?? 0) > ${slowThresholdUs}) || (.event == "ingress_request" && (to_float(.request_time_seconds) ?? 0.0) > ${(slowThresholdUs / 1000000).toFixed(6)})` },
       // The 5xx diagnostic (TC-1840) is an individual event: it bypasses the count reducer, which would drop its fields.
       // The five capped classes (TC-1843) each have their own route; request events below status 400 (slow 1xx-3xx
       // requests, and every request under all_requests) stay on `request`, unsampled.
@@ -150,6 +155,7 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
         db_failure_5xx: '.event == "node_warning" && .event_code == "db_failure_5xx"',
         // TC-2917: the disk headroom event ships as is: two per 5 minutes, no cap or reducer.
         storage_headroom: '.event == "node_storage_headroom"',
+        delegation_mode_boot_reindex: '.event == "delegation_mode_boot_reindex"',
         // TC-3284: the deletion ledger's error events ship as is: at most one of each per process, no cap or reducer.
         deletion_ledger: `includes(${JSON.stringify(LEDGER_EVENTS)}, .event)`,
         diagnostic: '(.event == "node_warning" && .event_code != "db_failure_5xx") || .event == "node_error"',
@@ -159,7 +165,7 @@ if !includes(${JSON.stringify(schema.fields.reason.values)}, reason) { reason = 
       diagnostic_output: remap(['diagnostic_reduce'], `. = {"ts": format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S%.3fZ"), "level": .level, "event": .event, "svc": "api", "event_code": .event_code, "event_count": .event_count}`),
     },
     sinks: { betterstack: {
-      type: 'http', inputs: ['event_route.request', 'event_route.storage_headroom', 'event_route.deletion_ledger', ...Object.keys(CAPPED_CLASSES).map(capName), 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
+      type: 'http', inputs: ['event_route.request', 'event_route.storage_headroom', 'event_route.delegation_mode_boot_reindex', 'event_route.deletion_ledger', ...Object.keys(CAPPED_CLASSES).map(capName), 'diagnostic_output', 'gate_output'], method: 'post', uri: sinkUri,
       encoding: { codec: 'json' }, framing: { method: 'newline_delimited' }, compression: 'gzip',
       auth: { strategy: 'bearer', token: token ?? 'SECRET[bs.bs_token]' },
       batch: { max_bytes: 262144, timeout_secs: 1 },

@@ -1,5 +1,16 @@
 {
+  "scoped": [
+    {"target": "rocket::config::config", "message": "found value for deprecated config key `log`", "code": "rocket_deprecated_log_config"},
+    {"target": "rocket::launch", "prefix": "Rocket has launched from ", "code": "rocket_launched"}
+  ],
+  "boot_reindex": {
+    "delegation mode boot reindex complete": "delegation_mode_boot_reindex_complete",
+    "delegation mode boot reindex incomplete; skipped rows remain unmarked and derive on read": "delegation_mode_boot_reindex_incomplete",
+    "delegation mode boot reindex incomplete (lock timeout); remaining rows derive on read": "delegation_mode_boot_reindex_lock_timeout"
+  },
   "exact": {
+    "delegation mode boot backfill failed; unmarked rows derive on read": "delegation_mode_boot_backfill_failed",
+    "delegation mode boot reindex skipped rows that failed decryption; leaving unmarked for read-time fail-closed handling": "delegation_mode_boot_reindex_decrypt_failed",
     "invocation replay insert failed": "invocation_replay_insert_failed",
     "invocation replay cleanup failed": "invocation_replay_cleanup_failed",
     "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material": "share_local_tee_identity",

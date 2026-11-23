@@ -808,7 +808,7 @@ where
         // on PostgreSQL and never fails boot: any skipped/unmarked row derives
         // the identical mode on read via `delegation_mode::derive_when_unmarked`.
         if let Err(error) = delegation_mode::backfill(&pool, encryption.as_ref()).await {
-            tracing::info!(
+            tracing::warn!(
                 error = %error,
                 "delegation mode boot backfill failed; unmarked rows derive on read"
             );
@@ -995,7 +995,14 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
             .renewal_identity
             .as_ref()
             .ok_or(crate::renewal::RenewalStoreError::IdentityEpoch)?;
-        crate::renewal::issue_stamp(&self.conn, request, &self.secrets, identity).await
+        crate::renewal::issue_stamp(
+            &self.conn,
+            request,
+            &self.secrets,
+            identity,
+            self.encryption.as_ref(),
+        )
+        .await
     }
 }
 impl<C, B, K> SpaceDatabase<C, B, K> {
