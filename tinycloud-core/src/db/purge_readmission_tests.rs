@@ -344,6 +344,15 @@ async fn scenario(state: State) -> Vec<String> {
     {
         report.push("VIOLATION: a lease row is 'active' after its records were purged".to_owned());
     }
+    // TC-4092 (lead, 17:47Z): in EVERY state, the fenced one included, the
+    // purge deletes the lease row and its stamp history; none is left behind
+    // to be 'active' or 'terminal'.
+    if !lease_states(&db.conn).await.is_empty() || count(&db.conn, "renewal_stamp").await != 0 {
+        report.push(
+            "VIOLATION: a renewal_lease or renewal_stamp row survives the purge of its records"
+                .to_owned(),
+        );
+    }
 
     if state != State::Hosted {
         let rehost = db.delegate(deleg(&host_token("host-2"))).await;
