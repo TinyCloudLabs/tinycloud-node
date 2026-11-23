@@ -74,13 +74,16 @@ fn cid_of(token: &str) -> Hash {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// (a) records gone, the space row still hosted, no purge fence.
+    /// (a) records gone, the space row still hosted; fence attached, nothing fenced.
     Hosted,
-    /// (b) records gone, the space row gone too, no fence; the owner posts a
-    /// fresh `tinycloud.space/host` delegation first.
+    /// (b) records gone, the space row gone too; fence attached, nothing fenced;
+    /// the owner posts a host delegation again first.
     Rehosted,
     /// (c) records gone, space row gone, permanent purge fence on the space.
     Fenced,
+    /// Originals and leases that name NO space (an encryption-network
+    /// resource): records gone, the owner and the space fenced.
+    NonSpace,
 }
 
 async fn count(db: &sea_orm::DatabaseConnection, table: &str) -> i64 {
@@ -126,15 +129,25 @@ async fn scenario(state: State) -> Vec<String> {
     let space: SpaceId = format!("tinycloud:{}:default", owner_did.strip_prefix("did:").unwrap())
         .parse()
         .unwrap();
-    let kv = space
-        .clone()
-        .to_resource(
-            "kv".parse().unwrap(),
-            Some("docs".parse().unwrap()),
-            None,
-            None,
+    let (kv, ability) = if state == State::NonSpace {
+        (
+            format!("urn:tinycloud:encryption:{owner_did}:default"),
+            "tinycloud.encryption/decrypt",
         )
-        .to_string();
+    } else {
+        (
+            space
+                .clone()
+                .to_resource(
+                    "kv".parse().unwrap(),
+                    Some("docs".parse().unwrap()),
+                    None,
+                    None,
+                )
+                .to_string(),
+            "tinycloud.kv/get",
+        )
+    };
     let host = space
         .clone()
         .to_resource("space".parse().unwrap(), None, None, None)
@@ -159,18 +172,18 @@ async fn scenario(state: State) -> Vec<String> {
     assert_eq!(count(&db.conn, "space").await, 1);
 
     // Plain chain: root -> child, signed by the owner then by holder 1.
-    let root = token(0x11, &holder1, &kv, "tinycloud.kv/get", &[], "root", now + 3600);
+    let root = token(0x11, &holder1, &kv, ability, &[], "root", now + 3600);
     let child = token(
         0x21,
         &holder2,
         &kv,
-        "tinycloud.kv/get",
+        ability,
         &[cid_of(&root)],
         "child",
         now + 3000,
     );
     // Lease chain: original (holder 3) and its owner-signed lease.
-    let original = token(0x11, &holder3, &kv, "tinycloud.kv/get", &[], "original", now + 3600);
+    let original = token(0x11, &holder3, &kv, ability, &[], "original", now + 3600);
     let original_cid = cid_of(&original).to_cid(0x55).to_string();
     let lease = token(
         0x11,
@@ -235,6 +248,13 @@ async fn scenario(state: State) -> Vec<String> {
             .unwrap();
     }
     assert_eq!(count(&db.conn, "revocation").await, 2);
+    // Before any purge: the revoked lease's identical bytes re-posted. The
+    // existing-row branch of register_lease_checked must not answer Ok.
+    let before = db.delegate(deleg(&lease)).await;
+    report.push(format!("pre-purge re-post lease (revoked): {}", outcome(&before)));
+    if before.is_ok() {
+        report.push("VIOLATION: revoked lease re-post is Ok before any purge".to_owned());
+    }
 
     // Purge the records of the space.
     let mut deleted: std::collections::HashSet<Hash> =
@@ -267,33 +287,42 @@ async fn scenario(state: State) -> Vec<String> {
         }
     }
     tx.commit().await.unwrap();
-    if state == State::Fenced {
-        let keys = std::sync::Arc::new(
-            crate::space_purge_ledger::LedgerKeys::new(
-                "test".into(),
-                BTreeMap::from([("test".into(), vec![7; 32])]),
-            )
-            .unwrap(),
-        );
-        let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
-            keys.clone(),
-        ));
-        fence.set_serving_ready(true);
+    // The node's purge fence is attached for every state, as in production;
+    // only (c) and the non-space case write fence rows.
+    let keys = std::sync::Arc::new(
+        crate::space_purge_ledger::LedgerKeys::new(
+            "test".into(),
+            BTreeMap::from([("test".into(), vec![7; 32])]),
+        )
+        .unwrap(),
+    );
+    let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
+        keys.clone(),
+    ));
+    fence.set_serving_ready(true);
+    let fenced_kinds: &[(&str, String)] = match state {
+        State::Hosted | State::Rehosted => &[],
+        State::Fenced => &[("space", space.to_string())],
+        // The owner was erased after the space purge: owner and space fenced.
+        State::NonSpace => &[
+            ("space", space.to_string()),
+            ("owner", space.did().as_str().to_owned()),
+        ],
+    };
+    for (kind, target) in fenced_kinds {
         let tx = db.conn.begin().await.unwrap();
         fence
             .fence_hmac(
                 &tx,
-                "space",
+                kind,
                 "test",
-                &keys
-                    .target_hmac("test", "space", &space.to_string())
-                    .unwrap(),
+                &keys.target_hmac("test", kind, target).unwrap(),
             )
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        db = db.with_space_purge_fence(fence);
     }
+    db = db.with_space_purge_fence(fence);
     report.push(format!(
         "after purge: delegation={}, revocation={}, renewal_lease={:?}, renewal_stamp={}, space={}",
         count(&db.conn, "delegation").await,
@@ -381,7 +410,12 @@ async fn count_where(db: &sea_orm::DatabaseConnection, table: &str, id: &Hash) -
 #[tokio::test]
 async fn tc4092_real_admission_after_revoke_and_purge() {
     let mut violations = Vec::new();
-    for state in [State::Hosted, State::Rehosted, State::Fenced] {
+    for state in [
+        State::Hosted,
+        State::Rehosted,
+        State::Fenced,
+        State::NonSpace,
+    ] {
         eprintln!("=== TC-4092 {state:?} ===");
         for line in scenario(state).await {
             eprintln!("{line}");
