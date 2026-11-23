@@ -683,6 +683,11 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   'm20261021_000000_sql_store_manifest'`; deleting the row alone would let a
   later re-upgrade inherit stale rows (which `base_checkpoint_cid` also
   guards against). The release note says so.
+  The same holds for `m20261124_000000_sql_wal_mark` (P3): rolling back past
+  it means `DROP TABLE IF EXISTS sql_wal_mark` as the table owner and
+  `DELETE FROM seaql_migrations WHERE version =
+  'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
+  matter to an older restore-check, and only if shadow was ever enabled.
 - Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
   SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
   above; `migrations/mod.rs` versions list extended.
