@@ -1,0 +1,50 @@
+name: TC-971 one-off static identity print
+
+# Run once from main, then deleted (with src/bin/tc971-static-identity.rs) by
+# the PR that retires export-share-invitation-descriptor. Prints only the
+# public identities derived from PROD_TINYCLOUD_KEYS_SECRET.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  print:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # PROD_TINYCLOUD_KEYS_SECRET lives in the production environment.
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
+
+      - name: Build and test the identity printer (no secret)
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tinycloud-node --bin tc971-static-identity
+          cargo build --locked --quiet -p tinycloud-node --bin tc971-static-identity
+
+      - name: Print public identities
+        env:
+          TINYCLOUD_KEYS_SECRET: ${{ secrets.PROD_TINYCLOUD_KEYS_SECRET }}
+        run: |
+          set -euo pipefail
+          out="$(target/debug/tc971-static-identity)"
+          if ! printf '%s\n' "$out" | grep -Eqx 'node_did=did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}' \
+            || ! printf '%s\n' "$out" | grep -Eqx 'renewer_did=did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}' \
+            || ! printf '%s\n' "$out" | grep -Eqx 'invitation_key_prefix=[A-Za-z0-9_-]{8}' \
+            || [ "$(printf '%s\n' "$out" | wc -l)" -ne 3 ]; then
+            echo "::error::identity output did not match the three expected public lines"
+            exit 1
+          fi
+          printf '%s\n' "$out"
+          {
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

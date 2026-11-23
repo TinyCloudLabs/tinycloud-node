@@ -205,6 +205,12 @@ pub fn is_apps_path(path: &str) -> bool {
     path.split('/').next() == Some(APPS_SEGMENT)
 }
 
+/// Whether `path` is under the reserved `secrets` segment (first segment
+/// exactly `secrets`). `apps/<id>/secrets/...` is not.
+pub fn is_secrets_path(path: &str) -> bool {
+    path.split('/').next() == Some(SECRETS_SEGMENT)
+}
+
 /// The app id of a path under `apps/`: its second segment.
 pub fn app_id_of(path: &str) -> Option<&str> {
     if !is_apps_path(path) {

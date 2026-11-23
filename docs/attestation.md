@@ -77,3 +77,33 @@ or TCB status, so a 200 response proves nothing on its own.
 The digest only binds what the verifier recomputes in steps 2 and 3, so
 always derive the preimage from your own nonce and expected DID rather than
 trusting the returned string.
+
+## Where the trusted values come from
+
+Both checks below use `gh attestation verify` with the signer pinned. Without
+the flags, any workflow on any branch of this repository can produce provenance
+the command accepts:
+
+```sh
+gh attestation verify <subject> -R TinyCloudLabs/tinycloud-node \
+  --signer-workflow TinyCloudLabs/tinycloud-node/.github/workflows/docker.yml \
+  --source-ref refs/heads/main \
+  --deny-self-hosted-runners
+```
+
+An image built by a release-tag push is checked with
+`--source-ref refs/tags/v<version>` instead.
+
+- **Manifest:** each production deploy signs provenance for the manifest it
+  ran, `app-compose-<compose hash>.json`, and keeps the file as a run artifact
+  for 90 days (TC-3839). CI signs it only when its SHA-256 equals the compose
+  hash the running node reports. CI does not verify the quote itself. Check the
+  file with the command above, hash it yourself, and compare that with the
+  replayed `compose-hash`. Its `docker_compose_file` pins each image by digest.
+- **Images:** each digest built since TC-3839 has signed build provenance. Its
+  subject is `oci://ghcr.io/tinycloudlabs/tinycloud-node@<digest>` (likewise
+  `tinycloud-node-ingress`), and it names the commit and the workflow run that
+  built the image. Images built earlier have none.
+- `tinycloud-tee-verify <url>` (`@tinycloud/tee-verify`, js-sdk) runs steps
+  1-6 against published lists of production OS measurements and released
+  compose hashes.

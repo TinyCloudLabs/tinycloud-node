@@ -74,6 +74,10 @@ deploy, unless the `tinycloud-node` CVM reports one of:
 Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
 or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is
 `scripts/ci/phala-os-guard.sh`, tested by `scripts/ci/test-phala-os-guard.sh`.
+The CVM is read through `scripts/ci/phala-cvm-json.sh` (tested by
+`scripts/ci/test-phala-cvm-json.sh`), which retries an empty or non-JSON Phala
+read up to 4 times. The check after the deploy runs last, after the quota
+restore, so a failed read there fails the run without skipping the restore.
 CI never changes the OS. If the check fails, set it by hand, then re-run:
 
 ```sh
@@ -776,6 +780,50 @@ git show main:docker-compose.dstack-postgres.yaml \
 Rolling this release back means a database snapshot restore (a separate
 decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
 to 1.20.6 with Sam's explicit privacy mode.
+
+## What each deploy publishes (TC-3839)
+
+Provenance is checked with `gh attestation verify`, and every check pins who
+signed it. Without these flags, any workflow on any branch of this repository
+can produce provenance the command accepts:
+
+```sh
+gh attestation verify <subject> -R TinyCloudLabs/tinycloud-node \
+  --signer-workflow TinyCloudLabs/tinycloud-node/.github/workflows/docker.yml \
+  --source-ref refs/heads/main \
+  --deny-self-hosted-runners
+```
+
+For an image built by a release-tag push, use `--source-ref refs/tags/v<version>`
+instead. Accept no other ref.
+
+- **Build provenance.** `build-dstack` and `build-ingress` sign SLSA provenance
+  for every pushed image with `actions/attest-build-provenance`, which needs
+  `id-token: write` and `attestations: write` on those two jobs. The provenance
+  is pushed to GHCR next to the image. The subject is
+  `oci://ghcr.io/tinycloudlabs/tinycloud-node@<digest>` (or
+  `tinycloud-node-ingress`). PR builds of the ingress image are not pushed, so
+  they are not attested. Images built before TC-3839 have no provenance, so a
+  rollback to one of them deploys an image that cannot be checked this way.
+- **The measured manifest.** After every check of a successful `deploy-phala`:
+  1. *Capture the deployed app-compose.json* reads the CVM's compose file
+     (`phala api /cvms/tinycloud-node/compose_file`). It refuses one that is
+     not a JSON object or that carries `encrypted_env`. It writes the file as
+     compact, key-sorted JSON (`jq -cjS .`). Those are the bytes dstack
+     hashes: on 1.26.19 they hashed to the attested `1dc2fe4a…`, while the
+     pretty-printed response does not.
+  2. It requires that their SHA-256 equals the `compose_hash` the live node
+     reports from `/attestation`. CI does not verify that quote; a verifier
+     does, by replaying RTMR3 to the same hash.
+  3. *Sign provenance for the deployed app-compose.json* (`actions/attest`)
+     signs `app-compose-<hash>.json`. This is the deploy job's only use of
+     `id-token: write` and `attestations: write`. Nothing needs
+     `contents: write`: releases are immutable, so no asset is uploaded.
+  4. The file is kept as the run artifact `app-compose-<hash>` for 90 days.
+     Check it with the command above, with `app-compose-<hash>.json` as the
+     subject, then compare its SHA-256 with the replayed compose hash.
+  A mismatch fails the deploy run after the deploy: production already runs
+  the new compose, and nothing is signed until the cause is understood.
 
 ## Rolling back
 
