@@ -581,10 +581,17 @@ export async function main(args = process.argv.slice(2)) {
     // request events with status >= 400 (TC-1843), so the burst still measures transport loss.
     const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: '__MARKER__', authorization: canary, uri: canary }));
     const [prefix, suffix] = payload.split('"__MARKER__"');
-    // One exec; 500 distinct slow-success lines, no sleeps, no pacing, no emission reduction.
-    const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
+    // TC-3948: paced at >= 720 lines/s, 10x production's observed ~72 host UDP datagrams/s (Amos, node CVM, 6.5 h to 2026-11-23 03:1xZ).
+    // Unpaced, docker-proxy's host socket (rmem_default 212992, as in production) drops lines; that burst is TC-3949's done-when.
+    // One exec; 500 distinct slow-success lines in 50 batches of 10, 5 ms apart (at most 2000 lines/s); no emission reduction.
+    const burstStart = Date.now();
+    const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); [ $((i % 10)) -ne 0 ] || sleep 0.005; done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
+    const burstRate = burstSize / ((Date.now() - burstStart) / 1000);
     assert.match(emitted, /^500$/);
     burstSent = Number(emitted);
+    report.healthy_burst_lines_per_second = Math.floor(burstRate);
+    // Wall time includes docker exec overhead, so the measured rate is a lower bound on the true rate.
+    assert.ok(burstRate >= 720, 'healthy_burst_below_10x_production_rate');
     // Fixed bounded sampling persists the exact subset even if loss is static; never retry the burst.
     for (const offset of [0, 1000, 3000, 6000, 10000, 15000]) {
       const delay = offset - (Date.now() - startedAt);
