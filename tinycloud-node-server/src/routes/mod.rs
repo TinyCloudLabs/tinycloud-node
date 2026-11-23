@@ -824,6 +824,23 @@ pub async fn delegation_status(
                 "Invalid status invocation".to_string(),
             )
         })?;
+    // TC-3810: enforce the same delegation-mode rules as `/invoke` on
+    // proof-bearing status requests (leaf must not be `invalid`; strict
+    // ancestors must not be `terminal` or `invalid`). Proofless party access
+    // (`auth.parents.is_empty()`) is unaffected.
+    if !auth.parents.is_empty() {
+        tinycloud
+            .preflight_proof_modes(&auth.parents)
+            .await
+            .map_err(|error| match error {
+                invocation_model::Error::Db(_) => {
+                    (Status::ServiceUnavailable, "Status unavailable".to_string())
+                }
+                invocation_model::Error::InvalidInvocation(_) => {
+                    (Status::Unauthorized, error.to_string())
+                }
+            })?;
+    }
 
     let expected_resource = format!("urn:cid:{}", request.cid);
     let bound = auth.capabilities.len() == 1
@@ -2293,6 +2310,10 @@ async fn invoke_impl(
                     invocation_model::Error::InvalidInvocation(
                         invocation_model::InvocationError::Registry(error),
                     ) => registry_failure(error),
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::TerminalParentCannotRedelegate
+                        | invocation_model::InvocationError::InvalidDelegationMode,
+                    ) => (Status::Unauthorized, error.to_string()),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Other, &db, false, db.to_string(),
                     ),
@@ -2650,6 +2671,10 @@ async fn invoke_impl(
                     invocation_model::Error::InvalidInvocation(
                         invocation_model::InvocationError::Registry(error),
                     ) => registry_failure(error),
+                    invocation_model::Error::InvalidInvocation(
+                        invocation_model::InvocationError::TerminalParentCannotRedelegate
+                        | invocation_model::InvocationError::InvalidDelegationMode,
+                    ) => (Status::Unauthorized, error.to_string()),
                     invocation_model::Error::Db(db) => database_failure(
                         Service::Kv, &db, false, db.to_string(),
                     ),
@@ -6708,6 +6733,12 @@ mod tests {
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&conn)
+            .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&conn)
             .await?;
@@ -12839,6 +12870,12 @@ mod tests {
             }
             .insert(&self.conn)
             .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
+            }
+            .insert(&self.conn)
+            .await?;
             for (space, path, action) in abilities {
                 let service = action
                     .split_once('.')
@@ -14011,6 +14048,12 @@ mod tests {
                 serialization: Set(label.as_bytes().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&self.conn)
+            .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&self.conn)
             .await?;

@@ -55,7 +55,7 @@ pub fn inventory_authorization_targets(bytes: &[u8]) -> Result<Vec<PolicyTarget>
         std::str::from_utf8(bytes)
             .map_err(|_| failure("invalid persisted authorization encoding"))?;
     }
-    let info = crate::util::DelegationInfo::try_from(delegation)
+    let info = crate::util::DelegationInfo::try_from_stored(delegation)
         .map_err(|_| failure("invalid persisted authorization capabilities"))?;
     info.capabilities
         .into_iter()

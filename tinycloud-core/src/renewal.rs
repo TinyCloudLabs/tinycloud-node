@@ -724,6 +724,9 @@ pub(crate) fn lease_original_from_signed(
     lease: &crate::events::Delegation,
 ) -> Result<Option<String>, RenewalStoreError> {
     let info = signed_delegation_info(lease.serialized_bytes())?;
+    if info.delegation_mode == crate::util::DelegationMode::Invalid {
+        return Err(RenewalStoreError::InvalidInput);
+    }
     let renew_capabilities = info
         .capabilities
         .iter()
@@ -755,7 +758,8 @@ pub(crate) fn lease_original_from_signed(
 fn signed_delegation_info(bytes: &[u8]) -> Result<crate::util::DelegationInfo, RenewalStoreError> {
     let signed = tinycloud_auth::authorization::TinyCloudDelegation::from_bytes(bytes)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
-    crate::util::DelegationInfo::try_from(signed).map_err(|_| RenewalStoreError::InvalidInput)
+    crate::util::DelegationInfo::try_from_stored(signed)
+        .map_err(|_| RenewalStoreError::InvalidInput)
 }
 
 async fn verify_signed_signature(
@@ -923,6 +927,9 @@ pub(crate) async fn preverify_lease_original<C: ConnectionTrait>(
         .await?
         .ok_or(RenewalStoreError::InvalidInput)?;
     let original_info = signed_delegation_info(&original_bytes)?;
+    if original_info.delegation_mode == crate::util::DelegationMode::Invalid {
+        return Err(RenewalStoreError::InvalidInput);
+    }
     verify_signed_signature(&original_info).await?;
     if lease_event.0.delegator != original_info.delegator {
         return Err(RenewalStoreError::Unauthorized);
@@ -973,6 +980,9 @@ async fn register_lease_checked<C: ConnectionTrait>(
 ) -> Result<(), RenewalStoreError> {
     let lease_bytes = lease_event.serialized_bytes();
     let lease = signed_delegation_info(lease_bytes)?;
+    if lease.delegation_mode == crate::util::DelegationMode::Invalid {
+        return Err(RenewalStoreError::InvalidInput);
+    }
     let lease_hash = crate::hash::hash(lease_bytes);
     if !verified.contains(&lease_hash) {
         verify_signed_signature(&lease).await?;
@@ -987,6 +997,9 @@ async fn register_lease_checked<C: ConnectionTrait>(
         .await?
         .ok_or(RenewalStoreError::InvalidInput)?;
     let original_info = signed_delegation_info(&original_bytes)?;
+    if original_info.delegation_mode == crate::util::DelegationMode::Invalid {
+        return Err(RenewalStoreError::InvalidInput);
+    }
     if !verified.contains(&original) {
         verify_signed_signature(&original_info).await?;
     }
@@ -1525,6 +1538,7 @@ async fn status_authorized<C: ConnectionTrait>(
     invoker: &str,
     proofs: &[Cid],
     target_id: Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<bool, RenewalStoreError> {
     use crate::models::revocation::{ControlAction, ControlProofDecision};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -1536,12 +1550,13 @@ async fn status_authorized<C: ConnectionTrait>(
         .all(db)
         .await?;
     Ok(
-        match crate::models::revocation::control_proof_decision(
+        match crate::models::revocation::control_proof_decision_with_encryption(
             db,
             invoker,
             proofs,
             ControlAction::Status,
             &target_id,
+            encryption,
         )
         .await?
         {
@@ -1567,11 +1582,12 @@ pub(crate) async fn renewal_history<C: ConnectionTrait>(
     original_cid: &str,
     invoker: &str,
     proofs: &[Cid],
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<Vec<StampRecord>, RenewalStoreError> {
     let original_id = Cid::from_str(original_cid)
         .map(Hash::from)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
-    if !status_authorized(db, invoker, proofs, original_id).await? {
+    if !status_authorized(db, invoker, proofs, original_id, encryption).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
     let canonical_original_cid = original_id.to_cid(0x55).to_string();

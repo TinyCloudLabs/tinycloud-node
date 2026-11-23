@@ -7,6 +7,7 @@ pub mod database_identity_fence;
 pub mod database_legacy_artifact;
 pub mod delegation;
 pub mod delegation_cid_alias;
+pub mod delegation_mode;
 pub(crate) use crate::did_resolution;
 pub mod encryption_audit;
 pub mod encryption_ceremony;

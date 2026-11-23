@@ -306,6 +306,13 @@ mod tests {
                 .insert(db)
                 .await
                 .unwrap();
+                crate::models::delegation_mode::ActiveModel {
+                    delegation_id: Set(parent_id),
+                    mode: Set("attenuable".to_string()),
+                }
+                .insert(db)
+                .await
+                .unwrap();
                 abilities::ActiveModel {
                     delegation: Set(parent_id),
                     resource: Set(Resource::TinyCloud(space.clone().to_resource(

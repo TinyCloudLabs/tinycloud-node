@@ -1,6 +1,9 @@
 mod capability;
 
-pub use capability::{Capability, DecodingError, EncodingError, VerificationError};
+pub use capability::{
+    Capability, DecodingError, DelegationModeFact, EncodingError, VerificationError,
+    INVALID_DELEGATION_MODE_ERROR,
+};
 pub use ucan_capabilities_object::{
     Ability, AbilityName, AbilityNameRef, AbilityNamespace, AbilityNamespaceRef, AbilityRef,
     CapsInner, Caveats, ConvertError,

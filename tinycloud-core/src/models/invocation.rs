@@ -136,6 +136,16 @@ pub enum InvocationError {
     /// retire.
     #[error("session_retired: {0}")]
     SessionRetired(String),
+    /// TC-3810: a strict ancestor of a cited delegation is terminal (or carries
+    /// a malformed stored delegation mode) and cannot authorize descendant
+    /// delegations.
+    #[error("terminal-parent-cannot-redelegate")]
+    TerminalParentCannotRedelegate,
+    /// TC-3810: a cited delegation row was marked unusable during boot
+    /// reindexing because its signed bytes carried a malformed or duplicate
+    /// delegation mode.
+    #[error("invalid-delegation-mode")]
+    InvalidDelegationMode,
     #[error(transparent)]
     Registry(#[from] crate::registry_admission::RegistryError),
 }
@@ -409,6 +419,129 @@ pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     .await
 }
 
+/// TC-3810: refuse an invocation if any cited delegation leaf is marked
+/// `invalid` (or fails closed when unmarked), or if any strict ancestor of a
+/// cited leaf is `terminal` or `invalid`. Reads `graph.delegation_mode(...)`
+/// (from the joined `delegation_mode` side table, never `delegation.facts`).
+/// Direct use of a valid terminal leaf is allowed: invocation is not
+/// redelegation.
+pub(crate) fn check_no_terminal_strict_ancestor(
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    leaf_ids: &[Hash],
+) -> Result<(), InvocationError> {
+    for leaf_id in leaf_ids {
+        if graph
+            .delegation_mode(leaf_id)
+            .is_some_and(delegation_mode::StoredDelegationMode::is_invalid)
+        {
+            return Err(InvocationError::InvalidDelegationMode);
+        }
+        for ancestor_id in graph.chain_ids_from(leaf_id).into_iter().skip(1) {
+            if graph
+                .delegation_mode(&ancestor_id)
+                .is_some_and(delegation_mode::StoredDelegationMode::is_terminal_or_invalid)
+            {
+                return Err(InvocationError::TerminalParentCannotRedelegate);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate leaf (`invalid`) and strict-ancestor (`terminal`/`invalid`) modes
+/// against an already-loaded [`crate::auth_graph::ClosureWithModes`] with zero
+/// extra queries when every node has a `delegation_mode` row. Any unmarked
+/// node falls back to fail-closed derivation from its stored signed bytes.
+pub(crate) async fn check_closure_modes<C: ConnectionTrait>(
+    db: &C,
+    root_ids: &[Hash],
+    closure: &crate::auth_graph::ClosureWithModes,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    if root_ids.is_empty() {
+        return Ok(());
+    }
+    let mut strict_ancestors: Vec<Hash> = Vec::new();
+    let mut unmarked: Vec<Hash> = Vec::new();
+    for leaf_id in root_ids {
+        match closure.modes.get(leaf_id) {
+            Some(mode) if mode.is_invalid() => {
+                return Err(InvocationError::InvalidDelegationMode.into());
+            }
+            Some(_) => {}
+            None => unmarked.push(*leaf_id),
+        }
+        let mut visited = std::collections::HashSet::from([*leaf_id]);
+        let mut frontier: Vec<Hash> = closure.edges.get(leaf_id).cloned().unwrap_or_default();
+        while let Some(ancestor_id) = frontier.pop() {
+            if !visited.insert(ancestor_id) {
+                continue;
+            }
+            match closure.modes.get(&ancestor_id) {
+                Some(mode) if mode.is_terminal_or_invalid() => {
+                    return Err(InvocationError::TerminalParentCannotRedelegate.into());
+                }
+                Some(_) => {}
+                None => {
+                    strict_ancestors.push(ancestor_id);
+                    unmarked.push(ancestor_id);
+                }
+            }
+            if let Some(next_parents) = closure.edges.get(&ancestor_id) {
+                for parent in next_parents {
+                    if !visited.contains(parent) {
+                        frontier.push(*parent);
+                    }
+                }
+            }
+        }
+    }
+    if unmarked.is_empty() {
+        return Ok(());
+    }
+    unmarked.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    unmarked.dedup();
+    let derived = delegation_mode::resolve_unmarked_modes(db, &unmarked, encryption).await?;
+    for leaf_id in root_ids {
+        if derived.get(leaf_id).is_some_and(|mode| mode.is_invalid()) {
+            return Err(InvocationError::InvalidDelegationMode.into());
+        }
+    }
+    for ancestor_id in &strict_ancestors {
+        if derived
+            .get(ancestor_id)
+            .is_some_and(|mode| mode.is_terminal_or_invalid())
+        {
+            return Err(InvocationError::TerminalParentCannotRedelegate.into());
+        }
+    }
+    Ok(())
+}
+
+/// Lock-free, single-query preflight check for terminal strict ancestors and
+/// quarantined `invalid` leaves (used by `/delegation/status` and
+/// `revocation::control_proof_decision_at`). Pure read-only SQL, never reads
+/// `delegation.facts`.
+pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
+    db: &C,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
+    let closure = crate::auth_graph::load_closure_with_modes(db, &root_ids)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    check_closure_modes(db, &root_ids, &closure, encryption).await
+}
+
 async fn validate_capabilities<C: ConnectionTrait>(
     db: &C,
     capabilities: &[util::Capability],
@@ -438,8 +571,33 @@ async fn validate_capabilities<C: ConnectionTrait>(
         .collect();
 
     match (dependant_caps.is_empty(), parents.is_empty()) {
-        // no dependant caps, no parents needed, must be valid
-        (true, _) => Ok(()),
+        // no dependant caps, no parents cited: root authority alone
+        (true, true) => Ok(()),
+        // no dependant caps, but parents are cited: refuse any cited invalid
+        // graph (terminal strict ancestor or malformed leaf) before the
+        // root-authority shortcut (TC-3810).
+        (true, false) => {
+            let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
+            let loaded_graph;
+            let graph = match auth_graph {
+                Some(graph) => graph,
+                None => {
+                    loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &root_ids)
+                        .await
+                        .map_err(|error| match error {
+                            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                                Error::InvalidInvocation(
+                                    InvocationError::ChainTraversalLimitExceeded,
+                                )
+                            }
+                        })?;
+                    &loaded_graph
+                }
+            };
+            check_no_terminal_strict_ancestor(graph, &root_ids)?;
+            Ok(())
+        }
         // dependant caps, no parents, invalid
         (false, true) => Err(InvocationError::MissingParents.into()),
         // dependant caps, parents, check parents
@@ -467,6 +625,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     &loaded_graph
                 }
             };
+
+            // TC-3810: refuse any cited chain descending from a terminal
+            // ancestor or citing a boot-marked malformed-mode leaf. Direct use
+            // of a valid terminal leaf is allowed.
+            check_no_terminal_strict_ancestor(graph, &root_ids)?;
 
             // every cited CID must name a delegation row that is already persisted.
             // Rows are written only by the delegation registration path
@@ -2172,6 +2335,13 @@ mod tests {
             .insert(&db)
             .await
             .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
             abilities::ActiveModel {
                 delegation: Set(id),
                 resource: Set(resource.parse().unwrap()),
@@ -2337,6 +2507,13 @@ mod tests {
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&db)
             .await
