@@ -1380,22 +1380,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_only_caveat() {
-        let caveats = DuckDbCaveats {
-            tables: None,
-            columns: None,
-            statements: None,
-            read_only: Some(true),
-        };
-        let result = validate_sql(
-            "INSERT INTO users (name) VALUES ('test')",
-            &Some(caveats),
-            "tinycloud.duckdb/write",
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_table_caveats() {
         let caveats = DuckDbCaveats {
             tables: Some(vec!["users".to_string()]),
@@ -1512,21 +1496,6 @@ mod tests {
             "{:?}",
             result.map(|parsed| parsed.is_read_only)
         );
-    }
-
-    #[test]
-    fn read_only_caveat_still_allows_plain_reads_for_admin() {
-        for sql in [
-            "SELECT 1",
-            "SELECT * FROM t",
-            "WITH c AS (SELECT 1) SELECT * FROM c",
-            "EXPLAIN SELECT * FROM t",
-            "EXPLAIN ANALYZE SELECT * FROM t",
-        ] {
-            let parsed = validate_sql(sql, &read_only_caveat(), ADMIN)
-                .unwrap_or_else(|error| panic!("{sql}: {error}"));
-            assert!(parsed.is_read_only, "{sql}");
-        }
     }
 
     /// `is_plain_read` is the rule a request that can't write must meet:

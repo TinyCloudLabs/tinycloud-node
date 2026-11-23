@@ -951,37 +951,6 @@ fn the_unspilled_wal_bound_covers_what_commit_appends() {
     );
 }
 
-/// Indicative only (not a benchmark gate): p50/p99 of a small committed write
-/// with `synchronous` NORMAL and FULL. Run with
-/// `TC1491_LATENCY_DIR=<dir on the disk to measure> cargo test -p tinycloud-core
-/// --test sql_local_durability latency -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn synchronous_latency_indicative() {
-    let base = std::env::var("TC1491_LATENCY_DIR").expect("TC1491_LATENCY_DIR");
-    for round in 0..2 {
-        for setting in [Synchronous::Normal, Synchronous::Full] {
-            let dir = tempfile::tempdir_in(&base).unwrap();
-            let conn =
-                open_connection(&StorageMode::File(dir.path().join("lat.db")), setting).unwrap();
-            conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-                .unwrap();
-            let mut micros = Vec::with_capacity(1000);
-            for i in 0..1000 {
-                let start = std::time::Instant::now();
-                conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("value-{i}")])
-                    .unwrap();
-                micros.push(start.elapsed().as_micros() as u64);
-            }
-            micros.sort_unstable();
-            println!(
-                "round {round} {setting:?}: p50 {} us, p99 {} us, max {} us",
-                micros[499], micros[989], micros[999]
-            );
-        }
-    }
-}
-
 // ---- kill -9 ---------------------------------------------------------------
 
 /// Where the child process dies.

@@ -636,14 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn metrics_are_not_keyed_by_private_evidence() {
-        let metrics = VerificationMetrics::default();
-        metrics.rejected.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(metrics.rejected(), 1);
-        assert_eq!(metrics.accepted(), 0);
-    }
-
-    #[test]
     fn caller_selected_credential_digest_cannot_replace_verified_evidence() {
         let evidence = CredentialVerificationEvidence {
             issuer_did: Did::parse("did:web:issuer.example").unwrap(),

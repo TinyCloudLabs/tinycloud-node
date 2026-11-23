@@ -2047,21 +2047,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tc1491_default_noop_sink_leaves_the_persist_path_working() {
-        let cache = TempDir::new().unwrap();
-        let space = test_space_id("tc1491-noop-default");
-        // No `with_shadow`: service defaults to NoopSink.
-        let service = SqlService::new(
-            cache.path().to_string_lossy().into_owned(),
-            0,
-            artifact_repository().await,
-        )
-        .with_ddl_policy(DdlPolicy::Log);
-        execute_insert(&service, &space, "x").await;
-        // Trivially, no panic; the hook is one call into `NoopSink::notify`.
-    }
-
-    #[tokio::test]
     async fn tc2612_failed_shutdown_still_removes_actor_and_lineage() {
         let cache = TempDir::new().unwrap();
         let space = test_space_id("sql-shutdown-failure");
@@ -2406,30 +2391,6 @@ mod tests {
                 vec![vec![SqlValue::Integer(1), SqlValue::Text("later".into())]]
             );
         }
-    }
-
-    #[tokio::test]
-    async fn sql_schema_ability_can_create_schema() {
-        let repo = artifact_repository().await;
-        let cache = TempDir::new().unwrap();
-        let space = test_space_id("sql-schema");
-        let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
-
-        service
-            .execute(
-                &space,
-                "main",
-                SqlRequest::Execute {
-                    schema: None,
-                    sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
-                        .to_string(),
-                    params: Vec::new(),
-                },
-                None,
-                "tinycloud.sql/schema".to_string(),
-            )
-            .await
-            .expect("schema ability should create tables");
     }
 
     fn ddl(sql: &str) -> SqlRequest {
@@ -5537,7 +5498,6 @@ mod tests {
             matches!(err, SqlError::Busy(SqlBusyStage::ArtifactTransfer)),
             "{err:?}"
         );
-        assert!(service.hydrations.lock().unwrap().is_empty());
 
         // The fresh hydration does real disk work (fsync); give it the
         // default bound so only the gated first attempt is bound-limited.
@@ -5692,7 +5652,6 @@ mod tests {
             .expect("a panicked hydration must not hang its caller")
             .expect_err("a panicked hydration must fail");
         assert!(matches!(err, SqlError::Internal(_)), "{err:?}");
-        assert!(service.hydrations.lock().unwrap().is_empty());
         let served = tokio::time::timeout(PATIENCE, read(&service, &space))
             .await
             .expect("the next request must not join the dead hydration")

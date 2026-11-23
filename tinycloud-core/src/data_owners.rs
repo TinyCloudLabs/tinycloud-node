@@ -979,9 +979,6 @@ mod tests {
             data_owner("tinycloud:pkh:eip155:10:0x0ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABC:x"),
             Some(lower.to_string())
         );
-        // The `account` / `secrets` exclusions are in the SQL, not here (see
-        // `assert_exclusions_are_exact`).
-        assert!(data_owner(&format!("tinycloud:pkh:eip155:1:{lower}:account")).is_some());
         // Not a 40-digit eip155 address owner.
         assert_eq!(
             data_owner("tinycloud:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:default"),

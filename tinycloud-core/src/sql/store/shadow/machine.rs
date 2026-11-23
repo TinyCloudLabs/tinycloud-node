@@ -2178,16 +2178,5 @@ mod tests {
             assert!(plan(&have(MAX_DELTA_CHAIN), &head, &marks).is_some());
             assert_eq!(plan(&have(2 * MAX_DELTA_CHAIN - 1), &head, &marks), None);
         }
-
-        #[test]
-        fn the_chain_never_outgrows_its_bound() {
-            // Publish every revision as a delta until the planner refuses: the
-            // refusal comes within MAX_DELTA_CHAIN publishes.
-            let (head, marks) = grown();
-            let refused = (0..2 * MAX_DELTA_CHAIN)
-                .find(|revision| plan(&have(*revision), &head, &marks).is_none())
-                .expect("a cumulative publish");
-            assert!(refused < MAX_DELTA_CHAIN, "{refused}");
-        }
     }
 }

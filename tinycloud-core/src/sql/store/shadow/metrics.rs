@@ -230,20 +230,4 @@ mod tests {
         assert_eq!(RestoreResult::ALL.len(), 4);
         RestoreMetrics::restore_check(&NoopMetrics, RestoreResult::Ok, 0, 0.1);
     }
-
-    #[test]
-    fn noop_metrics_never_panic_on_any_entrypoint() {
-        let m = NoopMetrics;
-        m.notice(NoticeResult::Accepted);
-        m.upload("segment", UploadResult::Ok, 100);
-        m.publish(PublishResult::Published);
-        m.blocked("regressed");
-        m.regressed();
-        m.owner_marker("ok");
-        m.dirty_databases(1);
-        m.oldest_dirty_age_seconds(1.0);
-        m.inflight_bytes(1);
-        m.breaker_open(true);
-        m.record_cycle_seconds("put", 0.1);
-    }
 }

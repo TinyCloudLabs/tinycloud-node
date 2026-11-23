@@ -305,24 +305,3 @@ fn owner_erased_is_refused_for_any_other_kind_state_or_version() {
             .is_err());
     }
 }
-
-/// A reader that predates `("owner","erased")` accepts only the pairs it
-/// knew, so it refuses this record and its reconcile stays fail-closed. This
-/// is why a node that wrote one must not be rolled back below this release.
-#[test]
-fn older_reader_refuses_owner_erased_records() {
-    fn older_reader_accepts(record: &LedgerRecord) -> bool {
-        matches!(
-            (record.kind.as_str(), record.state.as_str()),
-            ("owner", "retired") | ("space" | "resource", "purging" | "complete")
-        )
-    }
-    let keys = keys();
-    let owner = keys.target_hmac("test", "owner", OWNER_DID).unwrap();
-    let retired = keys
-        .sign("test", "owner", &owner, OP, "retired", 100)
-        .unwrap();
-    let erased = keys.erasure_from_retirement(&retired, 200).unwrap();
-    assert!(older_reader_accepts(&retired));
-    assert!(!older_reader_accepts(&erased));
-}

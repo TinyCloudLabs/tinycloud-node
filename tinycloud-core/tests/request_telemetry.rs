@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::request_telemetry::{current, scope, RequestContext};
@@ -22,33 +20,23 @@ fn request(pseudonymizer: Arc<Pseudonymizer>) -> Arc<RequestContext> {
 
 #[test]
 fn hashes_match_exact_canonical_domain_separated_hmac() {
-    let secret = StaticSecret::new(vec![17; 32]).unwrap();
-    let context = request(Arc::new(Pseudonymizer::new(&secret)));
-    let space: SpaceId =
-        "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890:private"
-            .parse()
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/telemetry-pseudonyms.json")).unwrap();
+    let secret =
+        StaticSecret::new(hex::decode(fixtures["synthetic_secret_hex"].as_str().unwrap()).unwrap())
             .unwrap();
+    let context = request(Arc::new(Pseudonymizer::new(&secret)));
+    let case = &fixtures["identities"][0];
+    let space: SpaceId = case["space"].as_str().unwrap().parse().unwrap();
     context.observe_space(&space);
-    let key = secret.derive_key(b"tinycloud/telemetry/pseudonyms/v1");
-    let mut account = Hmac::<Sha256>::new_from_slice(&key).unwrap();
-    account.update(b"account\0");
-    account.update(space.did().as_str().as_bytes());
-    let mut canonical_space = Hmac::<Sha256>::new_from_slice(&key).unwrap();
-    canonical_space.update(b"space\0");
-    canonical_space.update(space.to_string().as_bytes());
     let hashes = context.hashes();
     assert_eq!(
-        hashes.account_hash,
-        Some(account.finalize().into_bytes().into())
+        hashes.account_hash.map(hex::encode).as_deref(),
+        case["account_hash"].as_str()
     );
     assert_eq!(
-        hashes.space_hash,
-        Some(canonical_space.finalize().into_bytes().into())
-    );
-    assert_ne!(hashes.account_hash, hashes.space_hash);
-    assert_eq!(
-        context.request_id().to_string(),
-        "12345678-1234-4234-8234-123456789abc"
+        hashes.space_hash.map(hex::encode).as_deref(),
+        case["space_hash"].as_str()
     );
     context.observe_space(&space);
     assert_eq!(context.hashes(), hashes);

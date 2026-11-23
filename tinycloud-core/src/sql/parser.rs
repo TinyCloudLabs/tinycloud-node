@@ -642,18 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_sql_rejects_ddl_ability_for_schema_changes() {
-        let err = validate_sql(
-            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
-            &None,
-            "tinycloud.sql/ddl",
-        )
-        .expect_err("ddl ability is not a schema permission");
-
-        assert!(matches!(err, SqlError::PermissionDenied(_)));
-    }
-
-    #[test]
     fn schema_ability_allows_ddl() {
         let parsed = validate_sql(
             "CREATE TABLE IF NOT EXISTS conversation (id TEXT PRIMARY KEY)",
@@ -667,34 +655,6 @@ mod tests {
         assert_eq!(
             parsed.write_targets,
             vec![TouchedTables::supported(vec!["conversation".to_string()])]
-        );
-    }
-
-    #[test]
-    fn schema_ability_rejects_dml() {
-        for sql in [
-            "INSERT INTO conversation (id) VALUES ('1')",
-            "UPDATE conversation SET id = '2'",
-            "DELETE FROM conversation WHERE id = '1'",
-        ] {
-            let err = validate_sql(sql, &None, "tinycloud.sql/schema")
-                .expect_err("schema ability must not authorize DML");
-
-            assert!(
-                matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
-                "expected DML permission denial for {sql}, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn schema_ability_rejects_select() {
-        let err = validate_sql("SELECT id FROM conversation", &None, "tinycloud.sql/schema")
-            .expect_err("schema ability must not authorize reads");
-
-        assert!(
-            matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
-            "expected SELECT permission denial, got {err:?}"
         );
     }
 

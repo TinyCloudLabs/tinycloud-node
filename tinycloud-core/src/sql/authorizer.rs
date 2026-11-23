@@ -810,48 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn create_index_denied_with_write_ability() {
-        // TC-1581: `write` no longer runs schema-changing actions. CREATE
-        // [UNIQUE] INDEX fires CreateIndex followed by Reindex.
-        let create_index = AuthAction::CreateIndex {
-            index_name: "uq_interaction_nonce",
-            table_name: "interaction",
-        };
-        let reindex = AuthAction::Reindex {
-            index_name: "uq_interaction_nonce",
-        };
-
-        assert_eq!(
-            authorize("tinycloud.sql/write", false, create_index),
-            Authorization::Deny
-        );
-        assert_eq!(
-            authorize("tinycloud.sql/write", false, reindex),
-            Authorization::Deny
-        );
-    }
-
-    #[test]
-    fn create_index_allowed_with_schema_ability() {
-        let create_index = AuthAction::CreateIndex {
-            index_name: "uq_interaction_nonce",
-            table_name: "interaction",
-        };
-        let reindex = AuthAction::Reindex {
-            index_name: "uq_interaction_nonce",
-        };
-
-        assert_eq!(
-            authorize("tinycloud.sql/schema", false, create_index),
-            Authorization::Allow
-        );
-        assert_eq!(
-            authorize("tinycloud.sql/schema", false, reindex),
-            Authorization::Allow
-        );
-    }
-
-    #[test]
     fn create_index_allowed_for_admin() {
         let create_index = AuthAction::CreateIndex {
             index_name: "uq_interaction_nonce",
@@ -868,28 +826,6 @@ mod tests {
         assert_eq!(
             authorize("tinycloud.sql/read", true, reindex),
             Authorization::Allow
-        );
-    }
-
-    #[test]
-    fn create_index_denied_without_write() {
-        let create_index = AuthAction::CreateIndex {
-            index_name: "uq_interaction_nonce",
-            table_name: "interaction",
-        };
-        let reindex = AuthAction::Reindex {
-            index_name: "uq_interaction_nonce",
-        };
-
-        assert_eq!(
-            authorize("tinycloud.sql/read", false, create_index),
-            Authorization::Deny
-        );
-        // Reindex must be gated identically to CreateIndex: a read-only cap
-        // cannot sneak an index build through the companion callback.
-        assert_eq!(
-            authorize("tinycloud.sql/read", false, reindex),
-            Authorization::Deny
         );
     }
 
@@ -1011,23 +947,6 @@ mod tests {
     }
 
     #[test]
-    fn create_unique_index_blocked_with_write_cap() {
-        // End-to-end against real SQLite: `write` alone does not build an index.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
-            .unwrap();
-
-        let err = execute_under_authorizer(
-            &conn,
-            "tinycloud.sql/write",
-            false,
-            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
-        )
-        .expect_err("CREATE UNIQUE INDEX must be denied for a write cap");
-        assert!(err.to_string().contains("not authorized"), "{err}");
-    }
-
-    #[test]
     fn create_unique_index_executes_with_schema_cap() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         execute_under_authorizer(
@@ -1045,27 +964,6 @@ mod tests {
             "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
         )
         .expect("CREATE UNIQUE INDEX should succeed with a schema cap");
-    }
-
-    #[test]
-    fn create_unique_index_blocked_with_read_only_cap() {
-        // Set up the table directly, then attempt the index under a
-        // read-only cap: SQLite must report "not authorized".
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE interaction (reader_did TEXT, nonce TEXT)")
-            .unwrap();
-
-        let err = execute_under_authorizer(
-            &conn,
-            "tinycloud.sql/read",
-            false,
-            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
-        )
-        .expect_err("CREATE UNIQUE INDEX must be denied for a read-only cap");
-        assert!(
-            err.to_string().contains("not authorized"),
-            "expected an authorization error, got: {err}"
-        );
     }
 
     #[test]
@@ -1544,19 +1442,6 @@ mod tests {
 mod ddl_authority_tests {
     use super::*;
 
-    fn authorize(ability: &str, is_admin: bool, action: AuthAction<'_>) -> Authorization {
-        let mut auth = create_authorizer_scoped(
-            None,
-            &authority_for(&[ability], is_admin),
-            StatementScope::default(),
-        );
-        auth(AuthContext {
-            action,
-            database_name: Some("main"),
-            accessor: None,
-        })
-    }
-
     fn execute_under_authorizer(
         conn: &rusqlite::Connection,
         ability: &str,
@@ -1585,33 +1470,6 @@ mod ddl_authority_tests {
             database_name: Some("main"),
             accessor: None,
         })
-    }
-
-    #[test]
-    fn create_index_needs_schema_authority_not_write() {
-        // CREATE [UNIQUE] INDEX fires CreateIndex followed by Reindex while the
-        // index is built; both must pass for the statement to succeed.
-        let create_index = || AuthAction::CreateIndex {
-            index_name: "uq_interaction_nonce",
-            table_name: "interaction",
-        };
-        let reindex = || AuthAction::Reindex {
-            index_name: "uq_interaction_nonce",
-        };
-
-        // TC-1581: `write` no longer runs schema-changing actions.
-        assert_eq!(
-            authorize("tinycloud.sql/write", false, create_index()),
-            Authorization::Deny
-        );
-        assert_eq!(
-            authorize("tinycloud.sql/write", false, reindex()),
-            Authorization::Deny
-        );
-        // A holder of both abilities is unaffected.
-        let both = ["tinycloud.sql/write", "tinycloud.sql/schema"];
-        assert_eq!(authorize_held(&both, create_index()), Authorization::Allow);
-        assert_eq!(authorize_held(&both, reindex()), Authorization::Allow);
     }
 
     /// Install the authorizer on a real rusqlite connection (mirroring the

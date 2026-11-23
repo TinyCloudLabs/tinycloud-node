@@ -1508,29 +1508,6 @@ pub(crate) fn check_no_terminal_in_parent_closure(
     Ok(())
 }
 
-#[cfg(test)]
-async fn ensure_parent_active<C: ConnectionTrait>(db: &C, parent_id: &Hash) -> Result<(), Error> {
-    if revocation::is_revoked(db, parent_id).await? {
-        return Err(DelegationError::ParentRevoked(parent_id.to_cid(0x55).to_string()).into());
-    }
-    let revoked_ancestor = revocation::first_revoked_ancestor(db, parent_id)
-        .await
-        .map_err(|error| match error {
-            revocation::ChainTraversalError::Db(error) => Error::Db(error),
-            revocation::ChainTraversalError::LimitExceeded => {
-                Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
-            }
-        })?;
-    if let Some(ancestor_cid) = revoked_ancestor {
-        return Err(DelegationError::AncestorRevoked {
-            ancestor_cid,
-            parent_cid: parent_id.to_cid(0x55).to_string(),
-        }
-        .into());
-    }
-    Ok(())
-}
-
 fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     if cap
         .resource
@@ -1967,159 +1944,69 @@ mod tests {
 
     // ── DelegationRegistration New/Existing outcome tests ───────────────────
 
-    /// Tests the DB-level ON CONFLICT behaviour that backs DelegationRegistration:
-    /// first insert succeeds (→ New), second with same PK gets RecordNotInserted
-    /// (→ Existing), both operations produce the same content hash, and the
-    /// second insert does not duplicate the ability row.
+    /// Saving the same signed delegation twice registers it once: the first
+    /// save is `New`, the resubmission is `Existing` with the same hash, and
+    /// neither the delegation row nor its ability row is duplicated.
     #[tokio::test]
     async fn delegation_row_first_insert_new_second_existing() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::{
+            authorization::TinyCloudDelegation,
+            resolver::DID_METHODS,
+            ssi::jwk::{Algorithm, JWK},
+        };
         let db = database().await;
-
-        let ser_a = b"delegation-new-existing-bytes-A".to_vec();
-        let hash_a = crate::hash::hash(&ser_a);
-
-        for actor in ["did:key:ne-delegator", "did:key:ne-delegatee"] {
-            actor::ActiveModel {
-                id: Set(actor.to_string()),
-            }
-            .insert(&db)
-            .await
-            .ok();
-        }
-
-        let model = || ActiveModel {
-            id: Set(hash_a),
-            delegator: Set("did:key:ne-delegator".to_string()),
-            delegatee: Set("did:key:ne-delegatee".to_string()),
-            expiry: Set(None),
-            issued_at: Set(None),
-            not_before: Set(None),
-            facts: Set(None),
-            serialization: Set(ser_a.clone()),
-            serialization_format: Set(0),
-            first_seen_at: Default::default(),
-        };
-
-        // First insert → row is new.
-        let first = Entity::insert(model())
-            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
-            .exec(&db)
-            .await;
-        let first_reg = match first {
-            Ok(_) => DelegationRegistration::New(hash_a),
-            Err(DbErr::RecordNotInserted) => DelegationRegistration::Existing(hash_a),
-            Err(e) => panic!("unexpected error: {e}"),
-        };
-
-        // Ability row for the first insert.
-        abilities::Entity::insert(abilities::ActiveModel {
-            delegation: Set(hash_a),
-            resource: Set("tinycloud:did:key:ne-delegator:files/kv/doc"
+        let key = JWK::generate_ed25519().unwrap();
+        let issuer = DID_METHODS.generate(&key, "key").unwrap().to_string();
+        let token = signed_ucan_to(&issuer, HOLDER, &key, Algorithm::EdDSA, false)
+            .encode()
+            .unwrap();
+        let mut event =
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap();
+        let principal = issuer.trim_start_matches("did:");
+        event.0.capabilities.push(util::Capability {
+            resource: format!("tinycloud:{principal}:files/kv/doc")
                 .parse()
-                .unwrap()),
-            ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
-            caveats: Set(Default::default()),
-        })
-        .exec(&db)
-        .await
-        .unwrap();
+                .unwrap(),
+            ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
+            caveats: crate::types::Caveats::default(),
+        });
 
-        // Second insert → Existing (RecordNotInserted).
-        let second = Entity::insert(model())
-            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
-            .exec(&db)
-            .await;
-        let second_reg = match second {
-            Ok(_) => DelegationRegistration::New(hash_a),
-            Err(DbErr::RecordNotInserted) => DelegationRegistration::Existing(hash_a),
-            Err(e) => panic!("unexpected error: {e}"),
-        };
+        let first = save(&db, event.0.clone(), event.1.clone(), None)
+            .await
+            .unwrap();
+        let second = save(&db, event.0.clone(), event.1.clone(), None)
+            .await
+            .unwrap();
 
-        assert!(first_reg.is_new(), "first insert must be New");
-        assert!(
-            matches!(second_reg, DelegationRegistration::Existing(_)),
-            "second insert must be Existing"
-        );
-        assert_eq!(
-            first_reg.hash(),
-            second_reg.hash(),
-            "both registrations must report the same hash"
-        );
-
-        // Exactly one ability row — second save must not duplicate.
+        assert_eq!(first, DelegationRegistration::New(first.hash()));
+        assert_eq!(second, DelegationRegistration::Existing(first.hash()));
+        assert_eq!(Entity::find().count(&db).await.unwrap(), 1);
         let count = abilities::Entity::find()
-            .filter(abilities::Column::Delegation.eq(hash_a))
+            .filter(abilities::Column::Delegation.eq(first.hash()))
             .count(&db)
             .await
             .unwrap();
         assert_eq!(count, 1, "Existing must not insert duplicate ability rows");
     }
 
-    /// Two delegations with distinct serialization bytes produce distinct hashes
-    /// and neither satisfies the other's exact-hash idempotency predicate.
-    #[tokio::test]
-    async fn distinct_delegations_yield_distinct_hashes() {
-        let db = database().await;
-
-        let ser_a = b"delegation-distinct-alpha".to_vec();
-        let ser_b = b"delegation-distinct-beta".to_vec();
-        let hash_a = crate::hash::hash(&ser_a);
-        let hash_b = crate::hash::hash(&ser_b);
-
-        assert_ne!(
-            hash_a, hash_b,
-            "distinct serialization bytes must produce distinct hashes"
-        );
-
-        for actor in ["did:key:dist-a", "did:key:dist-b"] {
-            actor::ActiveModel {
-                id: Set(actor.to_string()),
-            }
-            .insert(&db)
-            .await
-            .ok();
-        }
-
-        for (hash, ser) in [(hash_a, ser_a), (hash_b, ser_b)] {
-            Entity::insert(ActiveModel {
-                id: Set(hash),
-                delegator: Set("did:key:dist-a".to_string()),
-                delegatee: Set("did:key:dist-b".to_string()),
-                expiry: Set(None),
-                issued_at: Set(None),
-                not_before: Set(None),
-                facts: Set(None),
-                serialization: Set(ser),
-                serialization_format: Set(0),
-                first_seen_at: Default::default(),
-            })
-            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
-            .exec(&db)
-            .await
-            .unwrap();
-        }
-
-        // hash_a row exists but hash_b lookup returns it — must not.
-        let row_for_a = Entity::find_by_id(hash_a).one(&db).await.unwrap();
-        let row_for_b = Entity::find_by_id(hash_b).one(&db).await.unwrap();
-        assert!(row_for_a.is_some());
-        assert!(row_for_b.is_some());
-        // Neither hash satisfies the other delegation's exact-byte predicate.
-        assert_ne!(
-            row_for_a.unwrap().id,
-            row_for_b.unwrap().id,
-            "distinct delegations must not share a primary key"
-        );
-    }
-
+    /// A revoked parent cannot authorize a new child.
     #[tokio::test]
     async fn new_child_from_revoked_parent_is_rejected() {
         let db = database().await;
         let parent_id = crate::hash::hash(b"revoked-parent");
-        insert_delegation(&db, parent_id, "did:key:owner", "did:key:holder").await;
+        insert_parent_grant(
+            &db,
+            parent_id,
+            "did:key:other",
+            "did:key:actor",
+            "tinycloud:did:key:other:files/kv",
+            "tinycloud.kv/get",
+        )
+        .await;
         revocation::ActiveModel {
             id: Set(crate::hash::hash(b"parent-revocation")),
-            revoker: Set("did:key:owner".to_string()),
+            revoker: Set("did:key:other".to_string()),
             revoked: Set(parent_id),
             serialization: Set(b"parent-revocation".to_vec()),
             revoked_at: Set(Some(OffsetDateTime::now_utc())),
@@ -2128,13 +2015,22 @@ mod tests {
         .await
         .unwrap();
 
-        let error = ensure_parent_active(&db, &parent_id)
+        let child = key_grant_info(
+            "did:key:actor",
+            "tinycloud:did:key:other:files/kv/doc",
+            "tinycloud.kv/get",
+            &[parent_id],
+        );
+        let error = validate(&db, &child)
             .await
             .expect_err("a revoked parent must not authorize a new child");
-        assert!(matches!(
-            error,
-            Error::InvalidDelegation(DelegationError::ParentRevoked(_))
-        ));
+        assert!(
+            matches!(
+                error,
+                Error::InvalidDelegation(DelegationError::ParentRevoked(_))
+            ),
+            "{error:?}"
+        );
     }
 
     /// TC-1791: an SQL grant with a caveat outside the

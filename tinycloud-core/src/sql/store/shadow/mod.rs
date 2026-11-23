@@ -145,11 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn noop_sink_accepts_anything() {
-        NoopSink.notify(notice("x", 1, "c"));
-    }
-
-    #[test]
     fn notice_board_max_merges_allowlisted_spaces_only() {
         let board = NoticeBoard::new(
             super::super::policy::SpaceAllowlist::new(["a".to_string()]),

@@ -112,9 +112,9 @@ mod tests {
 
     #[test]
     fn hash_hex_stable() {
-        let h1 = hash_hex(b"hello");
-        let h2 = hash_hex(b"hello");
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64);
+        assert_eq!(
+            hash_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }

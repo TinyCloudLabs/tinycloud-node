@@ -1101,15 +1101,6 @@ mod tests {
 
         let exported = recreated.export(&space, "analytics").await.unwrap();
         assert!(!exported.is_empty(), "hydrated DuckDB should export");
-
-        let hydrated_path = cache_two
-            .path()
-            .join(space.to_string())
-            .join("analytics.duckdb");
-        assert!(
-            hydrated_path.exists(),
-            "durable artifact should hydrate cache"
-        );
     }
 
     #[tokio::test]

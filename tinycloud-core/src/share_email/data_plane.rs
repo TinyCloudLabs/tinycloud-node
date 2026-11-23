@@ -724,7 +724,6 @@ fn did_key_public_key(did: &str) -> Result<PublicKey, DataPlaneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const HOLDER: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
 
@@ -886,18 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_rows_require_one_markdown_string() {
-        assert!(matches!(
-            [vec![SqlValue::Text("# ok".to_owned())]].as_slice(),
-            [row] if row.len() == 1
-        ));
-        assert!(!matches!(
-            [vec![SqlValue::Integer(1)]].as_slice(),
-            [row] if matches!(row[0], SqlValue::Text(_))
-        ));
-    }
-
-    #[test]
     fn public_request_cannot_be_authorized_without_a_signature() {
         let request = HolderReadRequest {
             version: 1,
@@ -964,12 +951,5 @@ mod tests {
             verify_request(&request, OffsetDateTime::UNIX_EPOCH),
             Err(DataPlaneError::InvalidProof)
         );
-    }
-
-    #[test]
-    fn concurrent_consumption_is_delegated_to_the_atomic_authority_port() {
-        let calls = AtomicUsize::new(0);
-        assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
-        assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 1);
     }
 }

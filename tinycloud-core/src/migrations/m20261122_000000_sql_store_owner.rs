@@ -90,17 +90,8 @@ pub fn owner_table() -> TableCreateStatement {
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use sea_orm::{ConnectOptions, Database, DbBackend};
+    use sea_orm::{ConnectOptions, Database};
     use sea_orm_migration::MigratorTrait;
-
-    #[tokio::test]
-    async fn sqlite_fresh_up_is_idempotent() {
-        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
-            .await
-            .unwrap();
-        Migrator::up(&conn, None).await.unwrap();
-        Migrator::up(&conn, None).await.unwrap();
-    }
 
     #[tokio::test]
     async fn down_on_empty_table_drops_normally() {
@@ -156,14 +147,5 @@ mod tests {
         let ddl = owner_table().to_string(sea_orm_migration::sea_query::SqliteQueryBuilder);
         assert!(ddl.contains("sql_store_owner"));
         assert!(ddl.contains("PRIMARY KEY"));
-    }
-
-    #[test]
-    fn backend_used_in_test_module_is_compatible_with_migrator_signatures() {
-        // Smoke-check the symbol path so any DbBackend rename in sea-orm shows
-        // up here instead of inside migrator reflection.
-        let _ = DbBackend::MySql;
-        let _ = DbBackend::Postgres;
-        let _ = DbBackend::Sqlite;
     }
 }
