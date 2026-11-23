@@ -88,6 +88,11 @@ phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15
 The deploy does not pass `--image`/`--no-dev-os` (they are ignored for an
 existing CVM anyway); the PATCH is what changes the OS.
 
+Other post-deploy reads (the `/info` identity-root check and the compose-file GET)
+go through `scripts/ci/retry-read.sh`, which reruns a read that exits non-zero once
+after 5 s and logs only the attempt number and exit code. A second failure fails
+the step. Deploys, quota writes and restores are never wrapped in it.
+
 ## Operator steps before a node deploy
 
 A migration that indexes a large PostgreSQL table cannot be built by the boot:

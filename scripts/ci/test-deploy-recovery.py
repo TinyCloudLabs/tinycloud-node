@@ -796,6 +796,68 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(result["events"].count("quota-put"), 2)
         self.assertNotIn("OVERRIDES UNVERIFIED", result["summary"])
 
+    # TC-3881: post-deploy read-only verification retries one transient read; mutations are never retried.
+    READ_STUB = textwrap.dedent(r"""\
+        #!/usr/bin/env bash
+        n=$(( $(cat "$READ_COUNT") + 1 )); echo "$n" >"$READ_COUNT"
+        case "$(sed -n "${n}p" "$READ_SCRIPT")" in
+          ok) printf '%s\n' "$READ_BODY" ;;
+          fail) echo "SECRET-BODY-MUST-NOT-LOG"; echo "SECRET-BODY-MUST-NOT-LOG" >&2; exit 22 ;;
+          *) echo "stub called too often" >&2; exit 9 ;;
+        esac
+        """)
+
+    def run_read_retry(self, tool, responses, *, script, env_extra=None):
+        """Run workflow/helper bash with a stubbed `tool` that plays `responses` (ok|fail per call)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); binaries = root / "bin"; binaries.mkdir()
+            stub = binaries / tool; stub.write_text(self.READ_STUB); stub.chmod(0o700)
+            git = binaries / "git"; git.write_text("#!/usr/bin/env bash\nexit 0\n"); git.chmod(0o700)
+            (root / "scripts/ci").mkdir(parents=True)
+            (root / "scripts/ci/retry-read.sh").write_bytes((ROOT / "scripts/ci/retry-read.sh").read_bytes())
+            (root / "docker-compose.dstack-postgres.yaml").write_bytes(CURRENT)
+            (root / "read_script").write_text("\n".join(responses) + "\n")
+            (root / "read_count").write_text("0")
+            env = {"PATH": str(binaries) + ":/usr/bin:/bin", "READ_SCRIPT": str(root / "read_script"), "READ_COUNT": str(root / "read_count"),
+                   "READ_RETRY_PAUSE": "0", "GITHUB_STEP_SUMMARY": str(root / "summary"), "IMAGE_REVISION": REVISION, "TMPDIR": directory,
+                   "READ_BODY": '{"identityRoot":"sealed"}'}
+            env.update(env_extra or {})
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+            logs = result.stdout + result.stderr
+            self.assertNotIn("SECRET-BODY-MUST-NOT-LOG", logs, "A response body was logged")
+            return result, int((root / "read_count").read_text()), (root / "summary").read_text() if (root / "summary").exists() else ""
+
+    def test_identity_root_read_retries_one_transient_failure(self):
+        step = shell_for_step("Verify the identity root opened from root_wrap")
+        result, calls, summary = self.run_read_retry("curl", ["ok"], script=step)
+        self.assertEqual((result.returncode, calls), (0, 1), result.stderr)
+        result, calls, summary = self.run_read_retry("curl", ["fail", "ok"], script=step)
+        self.assertEqual((result.returncode, calls), (0, 2), result.stderr)
+        self.assertIn("read attempt 1/2 failed with exit code 22", result.stderr)
+        self.assertIn("Identity root: `sealed`", summary)
+
+    def test_identity_root_read_fails_closed_after_a_second_failure(self):
+        step = shell_for_step("Verify the identity root opened from root_wrap")
+        result, calls, summary = self.run_read_retry("curl", ["fail", "fail", "ok"], script=step)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, 2, "Exactly one retry, never a third read")
+        self.assertIn("read failed after 2 attempts (last exit code 22)", result.stderr)
+        self.assertEqual(summary, "")
+
+    def test_read_retry_helper_passes_stdout_whole_and_keeps_the_exit_code(self):
+        big = "x" * 100000  # over a 64 KiB pipe (TC-3928)
+        result, calls, _ = self.run_read_retry("phala", ["fail", "ok"], env_extra={"READ_BODY": big},
+            script='bash scripts/ci/retry-read.sh phala api /cvms/tinycloud-node/compose_file >out; wc -c <out')
+        self.assertEqual((result.returncode, calls, result.stdout.strip()), (0, 2, str(len(big) + 1)))
+        result, calls, _ = self.run_read_retry("phala", ["fail", "fail"],
+            script='rc=0; bash scripts/ci/retry-read.sh phala api /x >out || rc=$?; echo "rc=${rc}"; wc -c <out')
+        self.assertEqual((calls, result.stdout.split()), (2, ["rc=22", "0"]), "A failed attempt prints nothing")
+
+    def test_mutating_steps_never_use_the_read_retry(self):
+        for name in ("Deploy to Phala Cloud", "Restore storage quota overrides"):
+            self.assertNotIn("retry-read.sh", shell_for_step(name), name)
+        self.assertNotIn("retry-read.sh", (ROOT / "scripts/ci/reconcile-quota.py").read_text())
+
     def test_three_shell_blocks_keep_strict_runtime_options(self):
         probe = """
         require_strict() {
