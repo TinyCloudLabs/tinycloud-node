@@ -286,9 +286,8 @@ async fn revoked_lease_issues_no_stamp_after_space_purge_or_identical_repost() {
     tx.commit().await.unwrap();
 
     let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
-    let (renewer_did, stored_epoch, _) = current_renewal_identity_from_seed(&db, seed)
-        .await
-        .unwrap();
+    let (renewer_did, stored_epoch, _) =
+        current_renewal_identity_from_seed(&db, seed).await.unwrap();
     assert_eq!(stored_epoch, epoch);
     let identity = RenewalNodeIdentity {
         stable_node_did: node_did.clone(),
@@ -370,7 +369,15 @@ async fn revoked_lease_issues_no_stamp_after_space_purge_or_identical_repost() {
     ))
     .await
     .unwrap();
-    let revoked = issue_stamp_at(&db, request("after revoke", t3), &secret, &identity, t3, None).await;
+    let revoked = issue_stamp_at(
+        &db,
+        request("after revoke", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
     assert!(
         matches!(
             revoked,
@@ -402,8 +409,15 @@ async fn revoked_lease_issues_no_stamp_after_space_purge_or_identical_repost() {
     );
 
     // (a) the scheduler's path for the old lease, original and lease gone.
-    let after_purge =
-        issue_stamp_at(&db, request("after purge", t3), &secret, &identity, t3, None).await;
+    let after_purge = issue_stamp_at(
+        &db,
+        request("after purge", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
     eprintln!("TC-4092 (a) stamp after purge: {after_purge:?}");
     assert!(
         after_purge.is_err(),
@@ -454,8 +468,15 @@ async fn revoked_lease_issues_no_stamp_after_space_purge_or_identical_repost() {
         count("revocation").await,
         count("renewal_lease").await,
     );
-    let after_repost =
-        issue_stamp_at(&db, request("after repost", t3), &secret, &identity, t3, None).await;
+    let after_repost = issue_stamp_at(
+        &db,
+        request("after repost", t3),
+        &secret,
+        &identity,
+        t3,
+        None,
+    )
+    .await;
     eprintln!("TC-4092 (b) stamp after re-post: {after_repost:?}");
     eprintln!(
         "TC-4092 (b) effective_end after re-post: {:?}",

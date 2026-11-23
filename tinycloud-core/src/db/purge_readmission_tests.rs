@@ -16,7 +16,7 @@ use tinycloud_auth::{
     ucan_capabilities_object::Capabilities,
 };
 
-fn key(seed: u8) -> (JWK, String, String) {
+pub(super) fn key(seed: u8) -> (JWK, String, String) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let secret = [seed; 32];
     let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
@@ -31,7 +31,7 @@ fn key(seed: u8) -> (JWK, String, String) {
     (jwk, did, method)
 }
 
-fn token(
+pub(super) fn token(
     issuer_seed: u8,
     audience: &str,
     resource: &str,
@@ -64,11 +64,11 @@ fn token(
     .unwrap()
 }
 
-fn deleg(token: &str) -> Delegation {
+pub(super) fn deleg(token: &str) -> Delegation {
     Delegation::from_header_ser::<TinyCloudDelegation>(token).unwrap()
 }
 
-fn cid_of(token: &str) -> Hash {
+pub(super) fn cid_of(token: &str) -> Hash {
     crate::hash::hash(token.as_bytes())
 }
 
@@ -126,9 +126,12 @@ async fn scenario(state: State) -> Vec<String> {
     let (_, holder1, _) = key(0x21);
     let (_, holder2, _) = key(0x22);
     let (_, holder3, _) = key(0x23);
-    let space: SpaceId = format!("tinycloud:{}:default", owner_did.strip_prefix("did:").unwrap())
-        .parse()
-        .unwrap();
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
     let (kv, ability) = if state == State::NonSpace {
         (
             format!("urn:tinycloud:encryption:{owner_did}:default"),
@@ -204,8 +207,8 @@ async fn scenario(state: State) -> Vec<String> {
 
     // Control: the live lease stamps.
     let request = |label: &str| {
-        let invocation = tinycloud_auth::authorization::TinyCloudInvocation::decode(&original)
-            .unwrap();
+        let invocation =
+            tinycloud_auth::authorization::TinyCloudInvocation::decode(&original).unwrap();
         let mut request = crate::renewal::StampIssue {
             invocation: crate::util::InvocationInfo::try_from(invocation).unwrap(),
             original_cid: original_cid.clone(),
@@ -251,14 +254,19 @@ async fn scenario(state: State) -> Vec<String> {
     // Before any purge: the revoked lease's identical bytes re-posted. The
     // existing-row branch of register_lease_checked must not answer Ok.
     let before = db.delegate(deleg(&lease)).await;
-    report.push(format!("pre-purge re-post lease (revoked): {}", outcome(&before)));
+    report.push(format!(
+        "pre-purge re-post lease (revoked): {}",
+        outcome(&before)
+    ));
     if before.is_ok() {
         report.push("VIOLATION: revoked lease re-post is Ok before any purge".to_owned());
     }
 
     // Purge the records of the space.
-    let mut deleted: std::collections::HashSet<Hash> =
-        [&root, &child, &original, &lease].iter().map(|t| cid_of(t)).collect();
+    let mut deleted: std::collections::HashSet<Hash> = [&root, &child, &original, &lease]
+        .iter()
+        .map(|t| cid_of(t))
+        .collect();
     deleted.insert(cid_of(&host_token("host-1")));
     for row in db
         .conn
@@ -296,9 +304,7 @@ async fn scenario(state: State) -> Vec<String> {
         )
         .unwrap(),
     );
-    let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
-        keys.clone(),
-    ));
+    let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
     fence.set_serving_ready(true);
     let fenced_kinds: &[(&str, String)] = match state {
         State::Hosted | State::Rehosted => &[],
@@ -331,16 +337,26 @@ async fn scenario(state: State) -> Vec<String> {
         count(&db.conn, "renewal_stamp").await,
         count(&db.conn, "space").await,
     ));
-    if lease_states(&db.conn).await.iter().any(|state| state == "active") {
+    if lease_states(&db.conn)
+        .await
+        .iter()
+        .any(|state| state == "active")
+    {
         report.push("VIOLATION: a lease row is 'active' after its records were purged".to_owned());
     }
 
     if state != State::Hosted {
         let rehost = db.delegate(deleg(&host_token("host-2"))).await;
-        report.push(format!("re-host (fresh host delegation): {}", outcome(&rehost)));
+        report.push(format!(
+            "re-host (fresh host delegation): {}",
+            outcome(&rehost)
+        ));
         // The same host delegation, byte for byte.
         let same = db.delegate(deleg(&host_token("host-1"))).await;
-        report.push(format!("re-host (identical host delegation): {}", outcome(&same)));
+        report.push(format!(
+            "re-host (identical host delegation): {}",
+            outcome(&same)
+        ));
     }
     for (label, t, revoked) in [
         ("root", &root, false),

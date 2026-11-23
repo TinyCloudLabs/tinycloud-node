@@ -1221,3 +1221,76 @@ async fn postgres_policy_artifact_without_legacy_row_is_discovered_and_collected
         .is_empty());
     f.dispose().await;
 }
+
+// TC-4092: a revocation the sweep deletes leaves a tombstone (canonical hash,
+// the delegation's expiry, the revocation time, no DID), and the renewal lease
+// the revoked delegation carried goes with it.
+#[tokio::test]
+async fn postgres_tc4092_sweep_tombstones_a_deleted_revocation_and_deletes_its_lease_row() {
+    let Some(f) = Fixture::new(false).await else {
+        return;
+    };
+    let parent = f.stored("delegation", &scopes(&[A, B]), -60, &[]).await;
+    let child = f
+        .stored("delegation", &scopes(&[B]), 3600, &[parent.id])
+        .await;
+    let a = f.accept(A).await;
+    assert!(f.finish(&a).await);
+    assert_eq!(
+        records::sweep(&f.db, &a.job.purge_id, &f.keys, None)
+            .await
+            .unwrap(),
+        1
+    );
+    let tx = f.db.begin().await.unwrap();
+    records::operation(&tx).await.unwrap();
+    let signed_revocation = f.revocation_bytes(child.id);
+    models::revocation::ActiveModel {
+        id: Set(hash(&signed_revocation)),
+        revoker: Set(f.issuer.clone()),
+        revoked: Set(child.id),
+        serialization: Set(signed_revocation),
+        revoked_at: Set(Some(OffsetDateTime::now_utc())),
+    }
+    .insert(&tx)
+    .await
+    .unwrap();
+    let bytes = |id: Hash| sea_orm::Value::Bytes(Some(Box::new(Vec::<u8>::from(id))));
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,'did:key:grantor','did:key:renewer',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,2592000,$3)",
+        [bytes(parent.id), bytes(child.id), sea_orm::Value::Bytes(Some(Box::new(vec![7u8; 32])))],
+    ))
+    .await
+    .unwrap();
+    records::request_for_records(&tx, &[child.id])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(records::sweep_next(&f.db, &f.keys, None).await.unwrap());
+    assert!(models::revocation::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap()
+        .is_empty());
+    let tombstones = models::revocation_tombstone::Entity::find()
+        .all(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].delegation_canonical, child.id);
+    assert!(tombstones[0].delegation_expiry.is_some());
+    assert!(tombstones[0].revoked_at.is_some());
+    let leases =
+        f.db.query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS n FROM renewal_lease".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(leases, 0, "the lease row goes with its delegation");
+    f.dispose().await;
+}

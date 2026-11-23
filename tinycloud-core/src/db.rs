@@ -5,6 +5,9 @@ mod cacao_terminal_mode_tests;
 #[path = "db/purge_readmission_tests.rs"]
 mod purge_readmission_tests;
 #[cfg(test)]
+#[path = "db/purge_tombstone_tests.rs"]
+mod purge_tombstone_tests;
+#[cfg(test)]
 #[path = "db/session_retire_tests.rs"]
 mod session_retire_tests;
 #[cfg(test)]
