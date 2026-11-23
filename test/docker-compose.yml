@@ -26,8 +26,8 @@ services:
       - "postgres"
 
   localstack:
-    # LocalStack 4.14.0, linux/amd64 digest.
-    image: localstack/localstack:4.14.0@sha256:75ba7a4bda54a3020019fba23e99c61bbff7dbf23eea12919e5b75b15c6f03f2
+    # LocalStack 4.14.0, multi-arch index digest.
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
     ports:
       - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
     healthcheck:
