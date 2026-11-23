@@ -7,6 +7,7 @@
 pub mod key;
 pub mod manifest;
 pub mod memory;
+pub mod mode;
 pub mod object;
 pub mod policy;
 pub mod shadow;
