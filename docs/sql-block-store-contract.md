@@ -695,9 +695,11 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   later re-upgrade inherit stale rows (which `base_checkpoint_cid` also
   guards against). The release note says so.
   The same holds for `m20261124_000000_sql_wal_mark` (P3): rolling back past
-  it means `DROP TABLE IF EXISTS sql_wal_mark` as the table owner and
-  `DELETE FROM seaql_migrations WHERE version =
-  'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
+  it means `DELETE FROM seaql_migrations WHERE version =
+  'm20261124_000000_sql_wal_mark'`; the table stays (the node's own role owns it, so an
+  operator role cannot drop it: `docs/releasing.md`, TC-3755). Marks are derived data and
+  are written by ordinary SQL saves even with the shadow off; stale marks only cause the
+  cumulative-segment fallback. Leftover `wal-delta-v1` object rows only
   matter to an older restore-check, and only if shadow was ever enabled.
 - Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
   SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
