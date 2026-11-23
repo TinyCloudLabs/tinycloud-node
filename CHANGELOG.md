@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- CI: the workspace unit-test job runs the S3 block deletion lifecycle and six live S3 storage tests against disposable LocalStack 4.14.0 and PostgreSQL. The test compose uses the ready-stage bucket initializer and checks bucket readiness. Details: TC-153
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
