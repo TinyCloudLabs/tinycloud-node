@@ -418,6 +418,12 @@ still refuses `enabled`).
   Marks are derived data: the migration only creates the table (`IF NOT
   EXISTS`), `down` drops it, and without marks the uploader publishes
   `wal-cum-v1`.
+  The shared artifact repository also writes `service='duckdb'` marks. They
+  are retained to keep the PostgreSQL CTE and transactional save paths
+  service-independent; the SQL shadow uploader reads only `service='sql'`,
+  so DuckDB marks are unused and create no block-store objects. They consume
+  database rows until the next DuckDB checkpoint or space purge deletes
+  them, under the same cleanup rules above.
 - **The WAL is append-only between our checkpoints.** SQLite appends frames
   until `wal_checkpoint(TRUNCATE)`, which the node runs and `save` records.
   So the WAL at revision `r` is a byte prefix of the WAL at any later revision
