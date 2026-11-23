@@ -808,7 +808,7 @@ where
         // on PostgreSQL and never fails boot: any skipped/unmarked row derives
         // the identical mode on read via `delegation_mode::derive_when_unmarked`.
         if let Err(error) = delegation_mode::backfill(&pool, encryption.as_ref()).await {
-            tracing::warn!(
+            tracing::info!(
                 error = %error,
                 "delegation mode boot backfill failed; unmarked rows derive on read"
             );
