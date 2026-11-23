@@ -525,3 +525,358 @@ async fn tc4092_runbook_audit_queries_execute_and_return_counts_only() {
         }
     }
 }
+
+/// Like `token`, with several resources under one ability.
+fn token_for(
+    issuer_seed: u8,
+    audience: &str,
+    resources: &[&str],
+    ability: &str,
+    parents: &[Hash],
+    nonce: &str,
+    exp: i64,
+) -> String {
+    let (jwk, _, method) = key(issuer_seed);
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut caps =
+        tinycloud_auth::ucan_capabilities_object::Capabilities::<serde_json::Value>::new();
+    for resource in resources {
+        caps.with_action(
+            resource.parse().unwrap(),
+            ability.parse().unwrap(),
+            [BTreeMap::new()],
+        );
+    }
+    tinycloud_auth::ssi::ucan::Payload::<serde_json::Value> {
+        issuer: method.parse().unwrap(),
+        audience: audience.parse().unwrap(),
+        not_before: Some(
+            tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds((now - 5) as f64)
+                .unwrap(),
+        ),
+        expiration: tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(exp as f64)
+            .unwrap(),
+        nonce: Some(nonce.to_owned()),
+        facts: None,
+        proof: parents.iter().map(|id| id.to_cid(0x55)).collect(),
+        attenuation: caps,
+    }
+    .sign(tinycloud_auth::ssi::jwk::Algorithm::EdDSA, &jwk)
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
+/// T1 and T2 (PostgreSQL only: the sweep is). An UNEXPIRED parent P and an
+/// UNEXPIRED original O both name spaces S1 and S2. S1 is purged by the real
+/// `complete_space`; S2 stays hosted and unfenced, so P and O stay as residue.
+/// The owner then revokes a child C that names only S2 and a lease L on O.
+/// The automatic sweep (`sweep_next`) deletes both with their revocations, as
+/// the repository's own r4/r5 test asserts. Re-posting C or L through
+/// `SpaceDatabase::delegate` (what `POST /delegate` calls) must be refused and
+/// the old lease must not stamp. A child naming only S1, revoked before the
+/// purge, is deleted by `complete_space`: tombstones come from BOTH paths.
+#[tokio::test]
+async fn postgres_tc4092_multi_space_ancestor_sweep_and_complete_both_tombstone() {
+    let Some(url) = crate::test_support::postgres_test_url(
+        "postgres_tc4092_multi_space_ancestor_sweep_and_complete_both_tombstone",
+    ) else {
+        return;
+    };
+    let admin = sea_orm::Database::connect(sea_orm::ConnectOptions::new(url.clone()))
+        .await
+        .unwrap();
+    let schema = format!(
+        "tc4092m_{}_{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options
+        .max_connections(4)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
+    let conn = sea_orm::Database::connect(options).await.unwrap();
+    let ran = tokio::spawn(multi_space_ancestor(conn)).await;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    ran.unwrap();
+}
+
+async fn multi_space_ancestor(conn: sea_orm::DatabaseConnection) {
+    use crate::space_purge_ledger::LedgerKeys;
+    let db = open(conn.clone()).await;
+    let identity = db.renewal_identity().unwrap().clone();
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder1, _) = key(0x21);
+    let (_, holder2, _) = key(0x22);
+    let (_, holder3, _) = key(0x23);
+    let bare = owner_did.strip_prefix("did:").unwrap();
+    let s1: SpaceId = format!("tinycloud:{bare}:first").parse().unwrap();
+    let s2: SpaceId = format!("tinycloud:{bare}:second").parse().unwrap();
+    let kv = |space: &SpaceId| {
+        space
+            .clone()
+            .to_resource(
+                "kv".parse().unwrap(),
+                Some("docs".parse().unwrap()),
+                None,
+                None,
+            )
+            .to_string()
+    };
+    let host = |space: &SpaceId| {
+        space
+            .clone()
+            .to_resource("space".parse().unwrap(), None, None, None)
+            .to_string()
+    };
+    let (kv1, kv2) = (kv(&s1), kv(&s2));
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let ability = "tinycloud.kv/get";
+    let host1 = token(
+        0x11,
+        &owner_did,
+        &host(&s1),
+        "tinycloud.space/host",
+        &[],
+        "h1",
+        now + 3600,
+    );
+    let host2 = token(
+        0x11,
+        &owner_did,
+        &host(&s2),
+        "tinycloud.space/host",
+        &[],
+        "h2",
+        now + 3600,
+    );
+    // Unexpired parent and original, both on S1 and S2.
+    let parent = token_for(
+        0x11,
+        &holder1,
+        &[&kv1, &kv2],
+        ability,
+        &[],
+        "parent",
+        now + 3600,
+    );
+    let original = token_for(
+        0x11,
+        &holder3,
+        &[&kv1, &kv2],
+        ability,
+        &[],
+        "original",
+        now + 3600,
+    );
+    let original_cid = cid_of(&original).to_cid(0x55).to_string();
+    let lease = token(
+        0x11,
+        &identity.renewer_did,
+        &format!("urn:cid:{original_cid}"),
+        "tinycloud.delegation/renew",
+        &[],
+        "lease",
+        now + 7200,
+    );
+    // C names only S2 (live); C1 names only S1 (purged).
+    let child = token(
+        0x21,
+        &holder2,
+        &kv2,
+        ability,
+        &[cid_of(&parent)],
+        "child",
+        now + 3000,
+    );
+    let child1 = token(
+        0x21,
+        &holder2,
+        &kv1,
+        ability,
+        &[cid_of(&parent)],
+        "child-1",
+        now + 3000,
+    );
+    for t in [&host1, &host2, &parent, &original, &lease, &child, &child1] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let revoke = |target: &str, nonce: &str| {
+        let revocation = token(
+            0x11,
+            &owner_did,
+            &format!("urn:cid:{}", cid_of(target).to_cid(0x55)),
+            "tinycloud.delegation/revoke",
+            &[],
+            nonce,
+            now + 600,
+        );
+        Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap()
+    };
+    let stamp_request = |label: &str| {
+        let invocation =
+            tinycloud_auth::authorization::TinyCloudInvocation::decode(&original).unwrap();
+        let mut request = crate::renewal::StampIssue {
+            invocation: crate::util::InvocationInfo::try_from(invocation).unwrap(),
+            original_cid: original_cid.clone(),
+            lease_cid: cid_of(&lease).to_cid(0x55).to_string(),
+            replay_hash: crate::hash::hash(label.as_bytes()),
+            replay_expires_at: now + 600,
+        };
+        request.invocation.invoker = identity.renewer_did.clone();
+        request.invocation.parents = vec![request.lease_cid.parse().unwrap()];
+        request.invocation.capabilities = vec![crate::util::Capability {
+            resource: format!("urn:cid:{original_cid}").parse().unwrap(),
+            ability: "tinycloud.delegation/renew".to_owned().try_into().unwrap(),
+            caveats: Default::default(),
+        }];
+        request
+    };
+    db.issue_renewal_stamp(stamp_request("control"))
+        .await
+        .expect("control: the live lease stamps");
+
+    // The owner revokes C1 (S1 only) before the purge.
+    db.revoke(revoke(&child1, "revoke-child-1"))
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+
+    // Purge S1 through the real terminal transaction.
+    let keys = LedgerKeys::new(
+        "test".into(),
+        BTreeMap::from([("test".into(), vec![7; 32])]),
+    )
+    .unwrap();
+    let purge_id = format!("{}", uuid::Uuid::from_bytes(rand::random()));
+    let target = keys.target_hmac("test", "space", &s1.to_string()).unwrap();
+    let accepted_at = OffsetDateTime::now_utc();
+    crate::models::space_purge_job::ActiveModel {
+        purge_id: Set(purge_id.clone()),
+        space: Set(Some(s1.to_string())),
+        tombstone_hmac: Set(target.clone()),
+        hmac_key_id: Set("test".into()),
+        owner_hmac: Set(keys.target_hmac("test", "owner", &owner_did).unwrap()),
+        accepted_at: Set(accepted_at),
+        phase: Set("objects".into()),
+        fence_generation: Set(1),
+        updated_at: Set(accepted_at),
+        next_attempt_at: Set(accepted_at),
+        attempt_count: Set(0),
+        last_error_code: Set(None),
+        lease_token: Set(None),
+        lease_until: Set(None),
+    }
+    .insert(&conn)
+    .await
+    .unwrap();
+    let lease_token = format!("{}", uuid::Uuid::from_bytes(rand::random()));
+    let job = crate::space_purge_worker::claim_specific(&conn, &lease_token, &purge_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let record = keys
+        .sign(
+            "test",
+            "space",
+            &target,
+            &purge_id,
+            "complete",
+            accepted_at.unix_timestamp(),
+        )
+        .unwrap();
+    assert!(
+        crate::space_purge_worker::complete_with_encryption(&conn, &job, &keys, &record, None)
+            .await
+            .unwrap()
+    );
+    let stored = |t: &str| {
+        let conn = conn.clone();
+        let id = cid_of(t);
+        async move {
+            crate::models::delegation::Entity::find_by_id(id)
+                .one(&conn)
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+    let tombstoned = || {
+        let conn = conn.clone();
+        async move {
+            crate::models::revocation_tombstone::Entity::find()
+                .all(&conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.delegation_canonical)
+                .collect::<HashSet<_>>()
+        }
+    };
+    // complete_space: P and O are live through S2 and stay; C1 is gone with
+    // its revocation and has a tombstone; C is untouched.
+    assert!(stored(&parent).await && stored(&original).await && stored(&child).await);
+    assert!(!stored(&child1).await, "C1 deleted by complete_space");
+    assert_eq!(
+        tombstoned().await,
+        HashSet::from([cid_of(&child1)]),
+        "complete_space wrote C1's tombstone"
+    );
+    assert_eq!(count(&conn, "revocation").await, 0);
+
+    // Real revokes of C and of the lease on S2's side.
+    for (target, nonce) in [(&child, "revoke-child"), (&lease, "revoke-lease")] {
+        db.revoke(revoke(target, nonce))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    assert_eq!(count(&conn, "revocation").await, 2);
+    assert!(
+        crate::space_purge_records::sweep_next(&conn, &keys, None)
+            .await
+            .unwrap(),
+        "the revokes woke the residue sweep"
+    );
+    // The sweep deleted C, L and both revocations, and kept P and O.
+    assert!(
+        stored(&parent).await && stored(&original).await,
+        "P and O stay"
+    );
+    assert!(
+        !stored(&child).await && !stored(&lease).await,
+        "C and L deleted"
+    );
+    assert_eq!(count(&conn, "revocation").await, 0);
+    assert_eq!(count(&conn, "renewal_lease").await, 0);
+    assert_eq!(count(&conn, "renewal_stamp").await, 0);
+    assert_eq!(
+        tombstoned().await,
+        HashSet::from([cid_of(&child1), cid_of(&child), cid_of(&lease)]),
+        "sweep_transaction wrote C's and L's tombstones"
+    );
+
+    // Real /delegate: refused, not admitted.
+    refused_as_revoked(db.delegate(deleg(&child)).await.map(|_| ()), "C re-post");
+    // C1 names the purged space: refused (the space is gone), not stored.
+    assert!(db.delegate(deleg(&child1)).await.is_err(), "C1 re-post");
+    assert!(!stored(&child1).await);
+    refused_as_revoked(db.delegate(deleg(&lease)).await.map(|_| ()), "L re-post");
+    assert!(!stored(&child).await && !stored(&lease).await);
+    assert_eq!(count(&conn, "renewal_lease").await, 0);
+    // No stamp on the old lease.
+    let stamp = db.issue_renewal_stamp(stamp_request("after")).await;
+    assert!(stamp.is_err(), "no stamp after the purge: {stamp:?}");
+    assert_eq!(count(&conn, "renewal_stamp").await, 0);
+}
