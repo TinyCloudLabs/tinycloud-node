@@ -799,3 +799,440 @@ async fn scheduler_issues_no_stamp_after_ancestor_revocation() -> Result<()> {
     )
     .await
 }
+
+/// The `issued` query page `signer` sees for its own delegations: one
+/// `tinycloud.delegation/list` capability on the signer's `.../delegation`
+/// resource, signed for the node (TC-4046).
+async fn issued_query_page(h: &Harness, signer: &JWK) -> Result<Value> {
+    let issuer = key_did(signer)?;
+    let auth = token(
+        signer,
+        &h.secret.node_did(),
+        &format!(
+            "tinycloud:{}:agent/delegation",
+            issuer.strip_prefix("did:").unwrap()
+        ),
+        "tinycloud.delegation/list",
+        h.now - 1,
+        h.now + 3600,
+    )?;
+    let response = h
+        .client
+        .post(format!("{}/delegation/query", h.base))
+        .header("Authorization", auth)
+        .json(&json!({"direction": "issued"}))
+        .send()
+        .await?;
+    let code = response.status();
+    let body = response.text().await?;
+    ensure!(code.is_success(), "query {code}: {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// The query record for `cid` in `page`.
+fn query_record<'a>(page: &'a Value, cid: &str) -> Result<&'a Value> {
+    page["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|item| item["cid"] == cid)
+        .with_context(|| format!("no record for {cid}: {page}"))
+}
+
+async fn issued_query_status(h: &Harness, signer: &JWK, cid: &str) -> Result<String> {
+    let page = issued_query_page(h, signer).await?;
+    Ok(query_record(&page, cid)?["status"]
+        .as_str()
+        .context("status")?
+        .to_string())
+}
+
+/// Advances the test clock to `at` and waits until `target` has `count` stamps.
+async fn await_stamps(h: &Harness, target: &Renewable, at: i64, count: usize) -> Result<Value> {
+    advance(&h.clock, at)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = h.status(target).await?;
+        if stamps(&value)? >= count {
+            return Ok(value);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "scheduler did not admit stamp {count}: {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A renewable grant owned by a fresh key: signed expiry `now + 120`, lease
+/// end `now + 240`. Returns the owner, the grant and its resource.
+async fn new_renewable(h: &Harness) -> Result<(JWK, Renewable, String)> {
+    let owner = JWK::generate_ed25519()?;
+    let space: SpaceId = format!(
+        "tinycloud:{}:scheduler",
+        key_did(&owner)?.strip_prefix("did:").unwrap()
+    )
+    .parse()?;
+    let resource = space
+        .to_resource("kv".parse()?, Some("test".parse()?), None, None)
+        .to_string();
+    let target = h.renewable(&owner, &resource, false).await?;
+    Ok((owner, target, resource))
+}
+
+/// Two scheduler stamps: to `now + 196`, then to the lease end `now + 240`.
+/// The clock ends at `now + 150`.
+async fn renew_twice(h: &Harness, target: &Renewable) -> Result<()> {
+    let first = await_stamps(h, target, h.now + 75, 1).await?;
+    ensure!(
+        first["effective_expiry"] == h.now + 196,
+        "unexpected first extension: {first}"
+    );
+    let second = await_stamps(h, target, h.now + 150, 2).await?;
+    ensure!(
+        second["effective_expiry"] == h.now + 240,
+        "lease did not cap stamp: {second}"
+    );
+    Ok(())
+}
+
+/// `delegation/status` and the `issued` query must report `expected` for the
+/// renewed grant, and `stale_expected` for the never-renewed control.
+async fn assert_agree(
+    h: &Harness,
+    owner: &JWK,
+    target: &Renewable,
+    stale_cid: &str,
+    expected: &str,
+    stale_expected: &str,
+) -> Result<()> {
+    let status = h.status(target).await?;
+    ensure!(
+        status["status"] == expected,
+        "status is not {expected}: {status}"
+    );
+    let record = issued_query_status(h, owner, &target.cid).await?;
+    ensure!(
+        record == expected,
+        "query says {record}, status says {expected}"
+    );
+    let stale = issued_query_status(h, owner, stale_cid).await?;
+    ensure!(
+        stale == stale_expected,
+        "never-renewed grant says {stale}, expected {stale_expected}"
+    );
+    Ok(())
+}
+
+/// POST `/invoke` as the holder with the renewed grant as the one proof.
+async fn invoke_as_holder(
+    h: &Harness,
+    target: &Renewable,
+    resource: &str,
+) -> Result<(u16, String)> {
+    let auth = token_with_proof(
+        &target.holder,
+        &h.secret.node_did(),
+        resource,
+        "tinycloud.kv/get",
+        h.now - 1,
+        h.now + 200,
+        &target.cid,
+    )?;
+    let response = h
+        .client
+        .post(format!("{}/invoke", h.base))
+        .header("Authorization", auth)
+        .send()
+        .await?;
+    let code = response.status().as_u16();
+    Ok((code, response.text().await?))
+}
+
+/// TC-4046: `POST /delegation/query` must agree with `/delegation/status`
+/// through a grant's whole renewal lifecycle: renewed past the original
+/// signed expiry, past the lease end, and after revocation, while a
+/// never-renewed grant that lapsed stays `expired`.
+async fn query_status_parity(database: Option<&str>) -> Result<()> {
+    let h = Harness::start(database).await?;
+    let (owner, target, resource) = new_renewable(&h).await?;
+    // A never-renewed grant the owner issued; it lapses at `now + 60`, before
+    // the clock reaches `now + 122`.
+    let stale = token(
+        &owner,
+        &key_did(&target.holder)?,
+        &resource,
+        "tinycloud.kv/get",
+        h.now - 1,
+        h.now + 60,
+    )?;
+    let stale_cid = h.register(stale).await?;
+    renew_twice(&h, &target).await?;
+    // Past the ORIGINAL signed expiry (now + 120): the clock is now +150,
+    // after two stamps; both routes must say `active`.
+    assert_agree(&h, &owner, &target, &stale_cid, "active", "expired").await?;
+    // Past the lease end (now + 240): renewal can no longer hold it open.
+    advance(&h.clock, h.now + 241)?;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_agree(&h, &owner, &target, &stale_cid, "expired", "expired").await?;
+    // Revocation: both routes agree on `revoked`.
+    h.revoke(&target.issuer, &target.cid).await?;
+    assert_agree(&h, &owner, &target, &stale_cid, "revoked", "expired").await?;
+    Ok(())
+}
+
+/// `/revoke` still accepts a renewed grant whose signed expiry has passed;
+/// afterwards both routes read `revoked` and the holder is refused.
+async fn revoke_after_original_expiry(database: Option<&str>) -> Result<()> {
+    let h = Harness::start(database).await?;
+    let (owner, target, resource) = new_renewable(&h).await?;
+    renew_twice(&h, &target).await?;
+    // `renew_twice` leaves the clock at now + 150, past the signed expiry.
+    let live = h.status(&target).await?;
+    ensure!(
+        live["status"] == "active",
+        "renewed grant not active: {live}"
+    );
+    let (before_code, before_body) = invoke_as_holder(&h, &target, &resource).await?;
+    ensure!(
+        before_code == 404,
+        "renewed authority did not reach the missing-key lookup: {before_code} {before_body}"
+    );
+    h.revoke(&target.issuer, &target.cid).await?;
+    let status = h.status(&target).await?;
+    ensure!(
+        status["status"] == "revoked",
+        "status not revoked: {status}"
+    );
+    ensure!(
+        issued_query_status(&h, &owner, &target.cid).await? == "revoked",
+        "query not revoked"
+    );
+    let (after_code, after_body) = invoke_as_holder(&h, &target, &resource).await?;
+    ensure!(
+        after_code == 401 && after_body.to_ascii_lowercase().contains("revoked"),
+        "revoked authority was not refused: {after_code} {after_body}"
+    );
+    Ok(())
+}
+
+/// The query's JSON key sets are exactly main's: no new field, and `expiresAt`
+/// stays the signed expiry of a renewed grant.
+async fn query_json_key_sets(database: Option<&str>) -> Result<()> {
+    let h = Harness::start(database).await?;
+    let (owner, target, _) = new_renewable(&h).await?;
+    renew_twice(&h, &target).await?;
+    // `renew_twice` leaves the clock past the signed expiry.
+    let keys = |value: &Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let sorted = |names: &[&str]| -> Vec<String> {
+        let mut names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let page = issued_query_page(&h, &owner).await?;
+    ensure!(
+        keys(&page) == sorted(&["items", "schemaVersion"]),
+        "page keys changed: {page}"
+    );
+    let record = query_record(&page, &target.cid)?;
+    ensure!(record["status"] == "active", "not active: {record}");
+    let active_keys = [
+        "cid",
+        "delegateDid",
+        "delegatorDid",
+        "direction",
+        "expiresAt",
+        "issuedAt",
+        "notBefore",
+        "parents",
+        "resources",
+        "status",
+    ];
+    ensure!(
+        keys(record) == sorted(&active_keys),
+        "active record keys changed: {record}"
+    );
+    let signed_expiry = time::OffsetDateTime::from_unix_timestamp(h.now + 120)?;
+    ensure!(
+        time::OffsetDateTime::parse(
+            record["expiresAt"].as_str().context("expiresAt")?,
+            &time::format_description::well_known::Rfc3339
+        )? == signed_expiry,
+        "expiresAt is not the signed expiry: {record}"
+    );
+    h.revoke(&target.issuer, &target.cid).await?;
+    let page = issued_query_page(&h, &owner).await?;
+    let record = query_record(&page, &target.cid)?;
+    let mut revoked_keys = active_keys.to_vec();
+    revoked_keys.extend(["revokedAt", "revokedBy"]);
+    ensure!(
+        keys(record) == sorted(&revoked_keys),
+        "revoked record keys changed: {record}"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QueryCase {
+    Parity,
+    RevokeAfterOriginalExpiry,
+    KeySets,
+}
+
+async fn query_case(database: Option<&str>, case: QueryCase) -> Result<()> {
+    match case {
+        QueryCase::Parity => query_status_parity(database).await,
+        QueryCase::RevokeAfterOriginalExpiry => revoke_after_original_expiry(database).await,
+        QueryCase::KeySets => query_json_key_sets(database).await,
+    }
+}
+
+/// Runs a query case on SQLite, then on an isolated PostgreSQL 16 schema when
+/// configured, as `revoke_then_tick_all` does.
+async fn query_case_all(test: &str, case: QueryCase) -> Result<()> {
+    query_case(None, case).await?;
+    eprintln!("{test}: SQLite PASS");
+    if let Some(url) = common::postgres_test_url(test) {
+        use tinycloud_core::sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+        let admin = Database::connect(&url).await?;
+        let version = admin
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SHOW server_version_num",
+            ))
+            .await?
+            .context("PG version")?
+            .try_get::<String>("", "server_version_num")?;
+        ensure!(
+            version.starts_with("16"),
+            "harness requires PostgreSQL 16, got {version}"
+        );
+        let schema = format!("renewal_query_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+            .await?;
+        let mut isolated = reqwest::Url::parse(&url)?;
+        isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={schema}"));
+        let result = query_case(Some(isolated.as_str()), case).await;
+        admin
+            .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await?;
+        result?;
+        eprintln!("{test}: PostgreSQL {version} PASS");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegation_query_agrees_with_status_through_renewal_lifecycle() -> Result<()> {
+    query_case_all(
+        "delegation_query_agrees_with_status_through_renewal_lifecycle",
+        QueryCase::Parity,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn revoking_renewed_grant_after_original_expiry_reads_revoked_everywhere() -> Result<()> {
+    query_case_all(
+        "revoking_renewed_grant_after_original_expiry_reads_revoked_everywhere",
+        QueryCase::RevokeAfterOriginalExpiry,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn delegation_query_json_key_sets_unchanged_for_renewed_grant() -> Result<()> {
+    query_case_all(
+        "delegation_query_json_key_sets_unchanged_for_renewed_grant",
+        QueryCase::KeySets,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn delegation_query_full_hundred_row_page_with_renewal_enabled() -> Result<()> {
+    let h = Harness::start(None).await?;
+    let (owner, first, resource) = new_renewable(&h).await?;
+    let mut renewed = vec![first];
+    for _ in 0..4 {
+        renewed.push(h.renewable(&owner, &resource, false).await?);
+    }
+    let mut unrenewed = Vec::new();
+    for _ in 0..90 {
+        unrenewed.push(
+            h.register(token(
+                &owner,
+                &key_did(&renewed[0].holder)?,
+                &resource,
+                "tinycloud.kv/get",
+                h.now - 1,
+                h.now + 120,
+            )?)
+            .await?,
+        );
+    }
+    for target in &renewed {
+        await_stamps(&h, target, h.now + 75, 1).await?;
+    }
+    for target in &renewed {
+        await_stamps(&h, target, h.now + 150, 2).await?;
+    }
+    let issuer = key_did(&owner)?;
+    let authorization = token(
+        &owner,
+        &h.secret.node_did(),
+        &format!(
+            "tinycloud:{}:agent/delegation",
+            issuer.strip_prefix("did:").unwrap()
+        ),
+        "tinycloud.delegation/list",
+        h.now - 1,
+        h.now + 3600,
+    )?;
+    let response = h
+        .client
+        .post(format!("{}/delegation/query", h.base))
+        .header("Authorization", authorization)
+        .json(&json!({"direction": "issued", "limit": 100}))
+        .send()
+        .await?;
+    let code = response.status();
+    let body = response.text().await?;
+    ensure!(code.is_success(), "query {code}: {body}");
+    let page: Value = serde_json::from_str(&body)?;
+    ensure!(
+        page["items"].as_array().context("items")?.len() == 100,
+        "{page}"
+    );
+    ensure!(
+        page.get("nextCursor").is_none(),
+        "unexpected pagination: {page}"
+    );
+    for target in &renewed {
+        let status = h.status(target).await?;
+        ensure!(status["status"] == "active", "{status}");
+        ensure!(
+            query_record(&page, &target.cid)?["status"] == status["status"],
+            "{page}"
+        );
+    }
+    for cid in &unrenewed {
+        ensure!(query_record(&page, cid)?["status"] == "expired", "{page}");
+    }
+    Ok(())
+}
