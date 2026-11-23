@@ -1721,7 +1721,6 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_entries,
         kv_sync: None,
         replay: None,
-        read_replay: None,
         kv_batch_if_none_match,
     })
 }
@@ -2687,17 +2686,21 @@ async fn invoke_impl(
         // so a write that rolls back leaves the signed request retryable. A
         // read has no such transaction and spends the row up front.
         let write_spends_replay = !tinycloud_core::kv_mutation_keys(admitted.invocation()).is_empty();
-        let reservation = if policy_session_invocation {
-            InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
-        } else {
-            InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
-        };
         if write_spends_replay {
+            let reservation = if policy_session_invocation {
+                InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
+            } else {
+                InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
+            };
             kv_options.replay = Some(reservation);
+        } else if policy_session_invocation {
+            invocation_replay_cache
+                .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                .await?;
         } else {
-            kv_options.read_replay = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
-                reservation,
-            ))));
+            invocation_replay_cache
+                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                .await?;
         }
         let invocation_info = admitted.invocation().0.clone();
         let cursor_limit = kv_options.list_limit;
@@ -2758,7 +2761,9 @@ async fn invoke_impl(
         );
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
-                crate::prometheus::observe_replay_insert(true);
+                if write_spends_replay {
+                    crate::prometheus::observe_replay_insert(true);
+                }
                 // Server-side successful-validation site: the invocation passed
                 // its time window (and everything else), so record how much
                 // validity remained.

@@ -2568,3 +2568,170 @@ async fn postgres_boot_backfill_skips_for_update_locked_row_and_derives_on_read(
     assert!(steady.completed);
     assert_eq!(steady.scanned, 0);
 }
+
+/// TC-3810 (R-reg F1 + Bobbie condition): booting backfill with a missing or
+/// wrong column-encryption key must NEVER persist `"invalid"` for rows that
+/// fail decryption — those rows stay unmarked, still read as `Invalid` (refused
+/// for both direct invocation and redelegation, never `Attenuable`), and once
+/// the backfill reruns with the right key they are classified and persisted
+/// with their true modes.
+#[tokio::test]
+async fn backfill_wrong_or_missing_key_leaves_encrypted_rows_unmarked_refused_and_recovers() {
+    let right_key = ColumnEncryption::new([0x3b; 32]);
+    let wrong_key = ColumnEncryption::new([0x99; 32]);
+    let f = Fixture::new(Some(right_key.clone())).await;
+
+    let k_term = JWK::generate_ed25519().unwrap();
+    let (d_term, _) = verification_method(&k_term);
+    let k_att = JWK::generate_ed25519().unwrap();
+    let (d_att, _) = verification_method(&k_att);
+    let k_sub = JWK::generate_ed25519().unwrap();
+    let (d_sub, _) = verification_method(&k_sub);
+
+    // Insert two encrypted pre-upgrade CACAO rows (one terminal, one
+    // attenuable) with NO `delegation_mode` rows.
+    let (t_tok, t_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &d_term,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "f1term00001",
+    );
+    let (_, t_bytes) = TinyCloudDelegation::decode(&t_tok).unwrap();
+    let t_hash = Hash::from(t_cid);
+    f.insert_pre_upgrade_row(
+        t_hash,
+        &f.wallet.did,
+        &d_term,
+        &t_bytes,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(&right_key),
+    )
+    .await;
+
+    let (a_tok, a_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &d_att,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Attenuable),
+        "f1att000001",
+    );
+    let (_, a_bytes) = TinyCloudDelegation::decode(&a_tok).unwrap();
+    let a_hash = Hash::from(a_cid);
+    f.insert_pre_upgrade_row(
+        a_hash,
+        &f.wallet.did,
+        &d_att,
+        &a_bytes,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(&right_key),
+    )
+    .await;
+
+    // 1. Run backfill with missing key (`None`) AND with wrong key: neither
+    // may persist a `delegation_mode` row for rows that fail decryption.
+    for bad_key in [None, Some(&wrong_key)] {
+        let stats = delegation_mode::backfill(&f.db.conn, bad_key)
+            .await
+            .unwrap();
+        assert!(
+            !stats.completed,
+            "backfill with decrypt failures must report incomplete"
+        );
+        assert_eq!(stats.skipped_decrypt_failed, 2);
+        assert_eq!(stats.reindexed_terminal, 0);
+        assert_eq!(stats.marked_attenuable, 0);
+        assert_eq!(stats.marked_invalid, 0);
+        for id in [t_hash, a_hash] {
+            assert!(
+                delegation_mode::Entity::find_by_id(id)
+                    .one(&f.db.conn)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "decrypt failure during backfill must leave row unmarked"
+            );
+        }
+
+        // Bobbie condition: while unmarked and undecryptable, read-time mode
+        // MUST be `Invalid` (never `Attenuable`), refusing both direct
+        // invocation and redelegation.
+        let graph = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+            &f.db.conn,
+            &[a_hash],
+            bad_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            graph.delegation_mode(&a_hash),
+            Some(delegation_mode::StoredDelegationMode::Invalid),
+            "unmarked row failing decrypt must read as Invalid, never Attenuable"
+        );
+        let inv_err = invocation::preflight_terminal_ancestors(&f.db.conn, &[a_cid], bad_key)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            inv_err,
+            invocation::Error::InvalidInvocation(
+                invocation::InvocationError::InvalidDelegationMode
+            )
+        ));
+        let (child, _) = signed_ucan_delegation(
+            &k_att,
+            &d_sub,
+            &[(&f.kv_res, "tinycloud.kv/get")],
+            &[a_cid],
+            false,
+        );
+        let del_err = delegation::precheck_standing_with_encryption(
+            &f.db.conn, &child, false, false, None, bad_key,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            del_err,
+            delegation::Error::InvalidDelegation(
+                delegation::DelegationError::TerminalParentCannotRedelegate
+            )
+        ));
+    }
+
+    // 2. Re-run backfill with the right key: both rows recover and persist
+    // their exact true modes (`terminal` and `attenuable`).
+    let recovered = delegation_mode::backfill(&f.db.conn, Some(&right_key))
+        .await
+        .unwrap();
+    assert!(recovered.completed);
+    assert_eq!(recovered.skipped_decrypt_failed, 0);
+    assert_eq!(recovered.reindexed_terminal, 1);
+    assert_eq!(recovered.marked_attenuable, 1);
+    assert_eq!(recovered.marked_invalid, 0);
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(t_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("terminal".to_string())
+    );
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(a_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("attenuable".to_string())
+    );
+
+    // Steady-state next boot scans 0 rows.
+    let steady = delegation_mode::backfill(&f.db.conn, Some(&right_key))
+        .await
+        .unwrap();
+    assert!(steady.completed);
+    assert_eq!(steady.scanned, 0);
+}

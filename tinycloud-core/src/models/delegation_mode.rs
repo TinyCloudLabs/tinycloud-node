@@ -113,17 +113,28 @@ fn classify_cacao(cacao: &tinycloud_auth::cacaos::siwe_cacao::SiweCacao) -> Stor
     }
 }
 
+/// Classify already-decrypted delegation plaintext bytes. Shared between
+/// read-time [`derive_when_unmarked`] and boot-time [`backfill_bounded`] so
+/// both paths always produce identical modes for decrypted rows:
+/// - Real CACAOs are parsed strictly (`Terminal`, `Attenuable`, or `Invalid`
+///   for malformed/null/unknown/duplicate `delegationMode` or invalid statement).
+/// - Real UCANs read their signed `facts` array (`Terminal` or `Attenuable`).
+/// - Unparseable plaintext bytes fail closed as non-attenuable (`Terminal`).
+fn classify_plaintext(plaintext: &[u8]) -> StoredDelegationMode {
+    match TinyCloudDelegation::from_bytes(plaintext) {
+        Ok(TinyCloudDelegation::Cacao(cacao)) => classify_cacao(&cacao),
+        Ok(TinyCloudDelegation::Ucan(ucan)) => StoredDelegationMode::from_live(
+            util::read_delegation_mode_from_ucan_facts(ucan.payload().facts.as_ref()),
+        ),
+        Err(_) => StoredDelegationMode::Terminal,
+    }
+}
+
 /// Derive a stored delegation's mode directly from its persisted signed bytes
 /// when its `delegation_mode` side-table row is absent (fail-closed default).
 ///
 /// - Encrypted rows that fail decryption fail closed as [`StoredDelegationMode::Invalid`].
-/// - Real CACAOs are parsed strictly; malformed, null, unknown, or duplicate
-///   `xyz.tinycloud.policy/delegationMode` values (or invalid statements) fail
-///   closed as [`StoredDelegationMode::Invalid`].
-/// - Real UCANs read their signed `facts` array.
-/// - Unparseable plaintext bytes fail closed as non-attenuable
-///   ([`StoredDelegationMode::Terminal`]): they can never be used as a parent
-///   for redelegation (including CACAO decrypt redelegation).
+/// - Decrypted rows use [`classify_plaintext`].
 pub(crate) fn derive_when_unmarked(
     id: Hash,
     stored: &[u8],
@@ -134,13 +145,7 @@ pub(crate) fn derive_when_unmarked(
     else {
         return StoredDelegationMode::Invalid;
     };
-    match TinyCloudDelegation::from_bytes(plaintext.as_ref()) {
-        Ok(TinyCloudDelegation::Cacao(cacao)) => classify_cacao(&cacao),
-        Ok(TinyCloudDelegation::Ucan(ucan)) => StoredDelegationMode::from_live(
-            util::read_delegation_mode_from_ucan_facts(ucan.payload().facts.as_ref()),
-        ),
-        Err(_) => StoredDelegationMode::Terminal,
-    }
+    classify_plaintext(plaintext.as_ref())
 }
 
 /// Fail-closed fallback lookup for delegation IDs that had no row in
@@ -179,6 +184,7 @@ pub(crate) struct BackfillStats {
     pub marked_attenuable: usize,
     pub marked_invalid: usize,
     pub skipped_locked_pages: usize,
+    pub skipped_decrypt_failed: usize,
     pub elapsed_ms: u64,
     pub completed: bool,
 }
@@ -278,7 +284,7 @@ where
                 Err(error) if is_lock_not_available(&error) => {
                     let _ = tx.rollback().await;
                     stats.skipped_locked_pages += 1;
-                    stats.completed = true;
+                    stats.completed = false;
                     stats.elapsed_ms = started.elapsed().as_millis() as u64;
                     tracing::info!(
                         scanned = stats.scanned,
@@ -286,8 +292,9 @@ where
                         marked_attenuable = stats.marked_attenuable,
                         marked_invalid = stats.marked_invalid,
                         skipped_locked_pages = stats.skipped_locked_pages,
+                        skipped_decrypt_failed = stats.skipped_decrypt_failed,
                         elapsed_ms = stats.elapsed_ms,
-                        "delegation mode boot reindex complete"
+                        "delegation mode boot reindex incomplete (lock timeout); remaining rows derive on read"
                     );
                     return Ok(stats);
                 }
@@ -321,17 +328,37 @@ where
         };
         if rows.is_empty() {
             tx.commit().await?;
-            stats.completed = true;
+            stats.completed = stats.skipped_locked_pages == 0 && stats.skipped_decrypt_failed == 0;
             stats.elapsed_ms = started.elapsed().as_millis() as u64;
-            tracing::info!(
-                scanned = stats.scanned,
-                reindexed_terminal = stats.reindexed_terminal,
-                marked_attenuable = stats.marked_attenuable,
-                marked_invalid = stats.marked_invalid,
-                skipped_locked_pages = stats.skipped_locked_pages,
-                elapsed_ms = stats.elapsed_ms,
-                "delegation mode boot reindex complete"
-            );
+            if stats.skipped_decrypt_failed > 0 {
+                tracing::warn!(
+                    skipped_decrypt_failed = stats.skipped_decrypt_failed,
+                    "delegation mode boot reindex skipped rows that failed decryption; leaving unmarked for read-time fail-closed handling"
+                );
+            }
+            if stats.completed {
+                tracing::info!(
+                    scanned = stats.scanned,
+                    reindexed_terminal = stats.reindexed_terminal,
+                    marked_attenuable = stats.marked_attenuable,
+                    marked_invalid = stats.marked_invalid,
+                    skipped_locked_pages = stats.skipped_locked_pages,
+                    skipped_decrypt_failed = stats.skipped_decrypt_failed,
+                    elapsed_ms = stats.elapsed_ms,
+                    "delegation mode boot reindex complete"
+                );
+            } else {
+                tracing::info!(
+                    scanned = stats.scanned,
+                    reindexed_terminal = stats.reindexed_terminal,
+                    marked_attenuable = stats.marked_attenuable,
+                    marked_invalid = stats.marked_invalid,
+                    skipped_locked_pages = stats.skipped_locked_pages,
+                    skipped_decrypt_failed = stats.skipped_decrypt_failed,
+                    elapsed_ms = stats.elapsed_ms,
+                    "delegation mode boot reindex incomplete; skipped rows remain unmarked and derive on read"
+                );
+            }
             return Ok(stats);
         }
 
@@ -339,12 +366,25 @@ where
         let mut page_terminal = 0usize;
         let mut page_attenuable = 0usize;
         let mut page_invalid = 0usize;
+        let mut page_decrypt_failed = 0usize;
         let mut last_id = after;
+        let page_scanned = rows.len();
         for (id, stored, format) in rows {
             last_id = Some(id);
-            // Shared classification path with read-time `derive_when_unmarked`
-            // so boot backfill and unmarked read-time derivation always agree.
-            let mode = derive_when_unmarked(id, &stored, format, encryption);
+            // Never persist `"invalid"` when decryption fails (wrong/missing
+            // column key): leave the row unmarked so read-time derivation still
+            // fails closed (`Invalid`), and a subsequent boot with the right
+            // key can classify and persist the true mode.
+            let Ok(plaintext) =
+                delegation_cid_alias::stored_plaintext(encryption, id, &stored, format)
+            else {
+                page_decrypt_failed += 1;
+                continue;
+            };
+            // Shared plaintext classifier with read-time `derive_when_unmarked`:
+            // persist `"invalid"` only for deterministic decode/mode failures
+            // after successful decryption.
+            let mode = classify_plaintext(plaintext.as_ref());
             match mode {
                 StoredDelegationMode::Terminal => page_terminal += 1,
                 StoredDelegationMode::Attenuable => page_attenuable += 1,
@@ -356,7 +396,6 @@ where
             });
         }
         after = last_id;
-        let page_count = inserts.len();
 
         if !inserts.is_empty() {
             match Entity::insert_many(inserts)
@@ -379,10 +418,11 @@ where
             }
         }
         tx.commit().await?;
-        stats.scanned += page_count;
+        stats.scanned += page_scanned;
         stats.reindexed_terminal += page_terminal;
         stats.marked_attenuable += page_attenuable;
         stats.marked_invalid += page_invalid;
+        stats.skipped_decrypt_failed += page_decrypt_failed;
         pages += 1;
     }
 }

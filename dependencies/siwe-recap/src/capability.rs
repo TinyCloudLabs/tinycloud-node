@@ -377,10 +377,11 @@ where
         }
     }
 
+    /// Never use to authorize; mode-ignoring, for stored-row listing/purge only.
+    ///
     /// Extract and verify the encoded capabilities while ignoring any
-    /// `xyz.tinycloud.policy/delegationMode` value. Intended only for tolerant
-    /// stored-row inspection/listing/purge paths when a pre-upgrade row carries
-    /// a malformed mode; live admission must always call [`Self::extract_and_verify`].
+    /// `xyz.tinycloud.policy/delegationMode` value. Live admission must always
+    /// call [`Self::extract_and_verify`].
     pub fn extract_and_verify_ignoring_mode(
         message: &Message,
     ) -> Result<Option<Self>, VerificationError> {

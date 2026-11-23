@@ -390,11 +390,6 @@ pub struct KvInvokeOptions {
     /// no KV mutation (see [`kv_mutation_keys`]), which has no such
     /// transaction.
     pub replay: Option<invocation_replay::Model>,
-    /// Optional invocation-replay reservation for a read-only KV invocation
-    /// (TC-3810): spent inside `invoke_read_only` right after authorization
-    /// succeeds and before reading KV, so refused reads spend zero replay rows
-    /// and retried reads do not double-spend after the insert has committed.
-    pub read_replay: Option<Arc<std::sync::Mutex<Option<invocation_replay::Model>>>>,
     /// TC-3217: `Some` for a batch read (every capability a `kv/get`, or
     /// every one a `kv/metadata`), holding the batch states the client
     /// already has (from `If-None-Match`; often none). The invocation answers
@@ -812,8 +807,11 @@ where
         // row. Backfill uses `FOR KEY SHARE SKIP LOCKED` + `lock_timeout = 2s`
         // on PostgreSQL and never fails boot: any skipped/unmarked row derives
         // the identical mode on read via `delegation_mode::derive_when_unmarked`.
-        if let Err(_error) = delegation_mode::backfill(&pool, encryption.as_ref()).await {
-            tracing::info!("delegation mode boot backfill deferred; unmarked rows derive on read");
+        if let Err(error) = delegation_mode::backfill(&pool, encryption.as_ref()).await {
+            tracing::warn!(
+                error = %error,
+                "delegation mode boot backfill failed; unmarked rows derive on read"
+            );
         }
         let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
             (Some(seed), Some(stable_node_did)) => {
@@ -4709,32 +4707,6 @@ where
         }
         if let Some((_, state)) = batch_rows.filter(|_| !unreadable) {
             results.push(InvocationOutcome::KvBatchState(state));
-        }
-
-        // TC-3810: spend the read's replay row at the final write boundary
-        // (right before the read audit), after authorization and all read
-        // queries succeed:
-        // - refused invocations never spend a replay row;
-        // - transient connection loss during the preceding read queries leaves
-        //   no write observed so `retry_owner` can safely retry the read;
-        // - a replayed invocation fails before returning any KV data or audit;
-        // - round-trip count stays identical to main (0 extra queries).
-        if let Some(slot) = &options.read_replay {
-            let pending = slot.lock().unwrap().clone();
-            if let Some(row) = pending {
-                let inserted = invocation_replay::Entity::insert(row.into_active_model())
-                    .on_conflict(
-                        OnConflict::column(invocation_replay::Column::ContentHash)
-                            .do_nothing()
-                            .to_owned(),
-                    )
-                    .exec_without_returning(&self.conn)
-                    .await?;
-                if inserted == 0 {
-                    return Err(TxStoreError::InvocationReplayed);
-                }
-                *slot.lock().unwrap() = None;
-            }
         }
 
         let read_audit_start = Instant::now();

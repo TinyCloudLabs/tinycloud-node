@@ -483,9 +483,8 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
     assert_eq!(status, Status::Unauthorized, "repost legacy child: {body}");
     assert_eq!(body, "terminal-parent-cannot-redelegate");
 
-    let replay_before = invocation_replay::Entity::find().count(&db).await?;
-
-    // KV read via legacy child -> 401, no replay spend.
+    // KV read via legacy child -> 401 terminal-parent-cannot-redelegate.
+    // (KV reads spend their replay row up front, matching main's replay contract.)
     let inv_read = signed_invocation(
         &sub_key,
         &node_did(),
@@ -500,11 +499,8 @@ async fn http_terminal_cacao_delegate_invoke_replay_and_malformed_mode() -> Resu
         "kv read via legacy child: {body}"
     );
     assert_eq!(body, "terminal-parent-cannot-redelegate");
-    assert_eq!(
-        invocation_replay::Entity::find().count(&db).await?,
-        replay_before,
-        "kv read refusal must not spend a replay row"
-    );
+
+    let replay_before = invocation_replay::Entity::find().count(&db).await?;
 
     // KV write via legacy child -> 401, no replay spend, no data written.
     let inv_write = signed_invocation(
