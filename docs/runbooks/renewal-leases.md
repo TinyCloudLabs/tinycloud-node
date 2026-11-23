@@ -12,7 +12,7 @@ A database restore can roll the persisted epoch back. An old-epoch lease could b
 
 `renewal_lease.state` is a registration state, not a liveness flag. The node writes it in three places only: `active` when a lease is registered, `active` to `expired` when a replacement lease is issued for the same original and renewer epoch, and `active` to `stopped` and back through the owner's stop/enable control. Nothing writes `revoked`, and nothing marks a lease `expired` when its time simply passes. A revoked lease, or a lease whose original or any ancestor delegation is revoked, therefore keeps `state = 'active'`, and so does a lease past `lease_expiry` that was never replaced.
 
-The `revocation` table, joined through `parent_delegation`, is the source of truth for revocation. The renewer, stamp issue and stop/enable all use it (`is_revoked_chain` and `live_chain_effective_ends` in `tinycloud-core/src/renewal.rs`), and they also require `lease_expiry` in the future. A lease is live for renewal only when all of these hold:
+Revocation (including aliases through `delegation_cid_alias`: revoking one encoding of a delegation revokes every encoding with the same canonical id, TC-1071), joined through `parent_delegation`, is the source of truth for revocation. The renewer, stamp issue and stop/enable all use it (`is_revoked_chain` and `live_chain_effective_ends` in `tinycloud-core/src/renewal.rs`), and they also require `lease_expiry` in the future. A lease is renewable only when all of these hold (the node also checks `not_before`, ancestor expiry, a retired holder and STOP-ALL, which this query does not):
 
 - `state = 'active'`;
 - `lease_expiry` is in the future;
@@ -32,17 +32,24 @@ WITH RECURSIVE lease_chain(lease_cid, id) AS (
 ),
 revoked AS (
   SELECT DISTINCT c.lease_cid FROM lease_chain c JOIN revocation r ON r.revoked = c.id
+  UNION
+  SELECT c.lease_cid FROM lease_chain c
+    JOIN delegation_cid_alias a ON a.id = c.id
+    JOIN delegation_cid_alias o ON o.canonical = a.canonical
+    JOIN revocation r ON r.revoked = o.id
 )
 SELECT
   count(*) FILTER (WHERE l.state = 'active' AND l.lease_expiry > now()
-                     AND rv.lease_cid IS NULL)                   AS live,
+                     AND rv.lease_cid IS NULL)                   AS active_unrevoked_unexpired,
   count(*) FILTER (WHERE l.state = 'active' AND rv.lease_cid IS NOT NULL) AS active_but_revoked,
   count(*) FILTER (WHERE l.state = 'active' AND l.lease_expiry <= now()
                      AND rv.lease_cid IS NULL)                   AS active_but_past_expiry
-FROM renewal_lease l LEFT JOIN revoked rv ON rv.lease_cid = l.lease_cid;
+FROM renewal_lease l LEFT JOIN revoked rv ON rv.lease_cid = l.lease_cid
+WHERE l.renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1)
+  AND l.renewer_did = (SELECT renewer_did FROM renewal_identity WHERE id = 1);
 ```
 
-`live` still counts leases of an older renewer epoch; add `AND l.renewer_epoch = (SELECT epoch FROM renewal_identity WHERE id = 1)` to the first filter to count only the current epoch. `active_but_revoked` and `active_but_past_expiry` are expected to be non-zero and need no action: the renewer skips both. Do not "fix" them by updating `state`.
+The query counts only leases of the node's current renewer identity and epoch, as the scheduler does. `active_unrevoked_unexpired` is necessary, not sufficient, for a lease to be renewed: a retired holder, `not_before`, an expired ancestor and STOP-ALL also stop renewal. `active_but_revoked` and `active_but_past_expiry` are expected to be non-zero and need no action: the renewer skips both. Do not "fix" them by updating `state`.
 
 ## Pausing all renewals (STOP-ALL)
 
