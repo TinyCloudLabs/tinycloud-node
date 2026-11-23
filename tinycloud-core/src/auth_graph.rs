@@ -2506,6 +2506,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tc3952_parentless_alias_and_mode_rows_seed_once() {
+        let (mut db, _) = counted_database().await;
+        assert_parentless_alias_and_mode_rows_seed_once(&mut db).await;
+        if let Some(mut fixture) =
+            crate::test_support::PostgresTestSchema::new("tc3952_parentless_alias_and_mode").await
+        {
+            actor::ActiveModel {
+                id: Set("did:key:actor".to_owned()),
+            }
+            .insert(&fixture.conn)
+            .await
+            .unwrap();
+            assert_parentless_alias_and_mode_rows_seed_once(&mut fixture.conn).await;
+        }
+    }
+
+    async fn assert_parentless_alias_and_mode_rows_seed_once(db: &mut DatabaseConnection) {
+        let root = hash(b"parentless delegation with an alias and mode");
+        let canonical = hash(b"canonical parentless delegation");
+        insert_delegation(db, root).await;
+        delegation_cid_alias::ActiveModel {
+            id: Set(root),
+            canonical: Set(canonical),
+            encrypted: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(root),
+            mode: Set("terminal".to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        let statement = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&statement);
+        db.set_metric_callback(move |info| {
+            *captured.lock().unwrap() = Some(info.statement.clone());
+        });
+
+        let closure = load_chain_lock_ids_and_modes(db, &[root]).await.unwrap();
+        assert_eq!(closure.nodes, vec![canonical]);
+        assert!(closure.edges.is_empty());
+        assert_eq!(
+            closure.modes.get(&root),
+            Some(&delegation_mode::StoredDelegationMode::Terminal),
+        );
+        // Replay the read to check the SQL row count before the maps deduplicate.
+        let query = statement.lock().unwrap().take().unwrap();
+        let rows = db.query_all(query).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
     async fn tc3952_retention_grant_requires_attenuable_ancestors() {
         use crate::kv_sync::{retention_until, KvSyncRetentionError, KV_RETAIN_ACTION};
         use sea_orm::IntoActiveModel;
