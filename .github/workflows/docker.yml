@@ -1531,16 +1531,20 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/app-compose"
           MANIFEST="$RUNNER_TEMP/app-compose/app-compose.json"
-          if ! SERVED="$(phala api /cvms/tinycloud-node/compose_file 2>/dev/null)"; then
+          # Written to a file, not read through $(...): phala 1.1.19 stdout through a pipe is cut at
+          # 64 KiB (TC-3928), and this runs after the deploy mutated the CVM.
+          SERVED="$RUNNER_TEMP/app-compose/served.json"
+          if ! phala api /cvms/tinycloud-node/compose_file >"${SERVED}" 2>/dev/null; then
             echo "::error::Cannot read the compose file of tinycloud-node from Phala"
             exit 1
           fi
           # The compose file never carries sealed values; refuse if it ever does.
-          if [ "$(jq '(type == "object") and (has("encrypted_env") | not)' <<<"${SERVED}")" != "true" ]; then
+          if [ "$(jq '(type == "object") and (has("encrypted_env") | not)' <"${SERVED}")" != "true" ]; then
             echo "::error::The Phala compose file is not an object without encrypted_env; not publishing it."
             exit 1
           fi
-          jq -cjS . <<<"${SERVED}" > "${MANIFEST}"
+          jq -cjS . <"${SERVED}" > "${MANIFEST}"
+          rm -f "${SERVED}"
           HASH="$(sha256sum "${MANIFEST}" | cut -d' ' -f1)"
           REPORTED=""
           for _ in 1 2 3; do

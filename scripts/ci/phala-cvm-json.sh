@@ -18,12 +18,18 @@ attempts="${PHALA_READ_ATTEMPTS:-4}"
 pause="${PHALA_READ_PAUSE:-5}"
 
 body=""
+# The CLI writes to a FILE, never to a pipe or `$(...)`: node 1.26.22 deploy run 45132117203 read the
+# CVM JSON through a pipe four times and got exactly 65532 bytes each time (a 64 KiB pipe truncation
+# of a body that embeds the compose), which is not JSON. [INFERENCE] A file write is not truncated.
+tmp="$(mktemp)"
+trap 'rm -f "${tmp}"' EXIT
 for attempt in $(seq 1 "${attempts}"); do
   status=0
-  body="$(phala cvms get "${cvm_name}" --json 2>/dev/null)" || status=$?
+  phala cvms get "${cvm_name}" --json >"${tmp}" 2>/dev/null || status=$?
+  body="$(cat "${tmp}")"
   # jq -e on empty input exits 0 in some jq versions, so an empty body is refused explicitly.
   if [ "${status}" = 0 ] && [ -n "${body}" ] \
-    && jq -e 'type == "object" and (.os | type) == "object"' >/dev/null 2>&1 <<<"${body}"; then
+    && jq -e 'type == "object" and (.os | type) == "object"' >/dev/null 2>&1 <"${tmp}"; then
     printf '%s\n' "${body}"
     exit 0
   fi
