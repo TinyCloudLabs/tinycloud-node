@@ -2891,4 +2891,273 @@ mod tests {
             Err(RenewalStoreError::InvalidInput)
         ));
     }
+
+    /// A revocation committed after the scheduler's revocation check and before
+    /// its stamp transaction (TC-4049). `scheduler_tick` checks
+    /// `effective_end`, then calls `issue_renewal_stamp`, which opens its own
+    /// transaction; nothing holds the two together. The stamp transaction must
+    /// re-check revocation, so the stamp is not written, no replay is spent,
+    /// and the lease row is left as it was. Each case runs the scheduler's
+    /// order step by step (check, revoke, stamp) with no hook in the code; the
+    /// no-revoke case is the control that this setup does stamp.
+    #[tokio::test]
+    async fn revocation_between_scheduler_check_and_stamp_writes_no_stamp() {
+        #[derive(Clone, Copy, Debug)]
+        enum Gap {
+            NoRevoke,
+            Lease,
+            Original,
+            Ancestor,
+        }
+        for gap in [Gap::NoRevoke, Gap::Lease, Gap::Original, Gap::Ancestor] {
+            let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_owned()))
+                .await
+                .unwrap();
+            crate::migrations::Migrator::up(&db, None).await.unwrap();
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../tinycloud-node-server/tests/fixtures/renewal-lease-v1.json"
+            ))
+            .unwrap();
+            let original_serialization = fixture["originalToken"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            let lease_serialization = fixture["leaseToken"].as_str().unwrap().as_bytes().to_vec();
+            let original_info = signed_delegation_info(&original_serialization).unwrap();
+            let lease_info = signed_delegation_info(&lease_serialization).unwrap();
+            let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+            let (renewer_did, renewer_epoch, audience) =
+                initialize_renewal_identity(&db, secret.derive_key(RENEWER_KEY_CONTEXT))
+                    .await
+                    .unwrap();
+            let identity = RenewalNodeIdentity {
+                stable_node_did: secret.node_did(),
+                renewer_did: renewer_did.clone(),
+                epoch: renewer_epoch,
+            };
+            let original_cid = "bafkr4ibdtwxhoauccwuknmf7cd5m3o74rwek7al4wgs33ecoygubpmour4";
+            let lease_cid = "bafkr4ignh3iowa5gysgegtuosa62pdkw6mpvrhsr3umjey5x2zo4fvjgqq";
+            let original = canonical_cid(original_cid).unwrap().1;
+            let lease = canonical_cid(lease_cid).unwrap().1;
+            let ancestor = hash(b"renewal ancestor");
+            let original_expiry = original_info.expiry.unwrap().unix_timestamp();
+            let lease_expiry = lease_info.expiry.unwrap().unix_timestamp();
+            let period = period_seconds(
+                original_expiry,
+                original_info.not_before.map(|value| value.unix_timestamp()),
+                original_info.issued_at.map(|value| value.unix_timestamp()),
+                OriginalFormat::Ucan,
+            )
+            .unwrap();
+            let now = original_expiry - 4_000;
+            let ancestor_end = now + 8_000;
+            let grantor = original_info.delegator.clone();
+            let bytes = |id: Hash| Value::Bytes(Some(Box::new(Vec::<u8>::from(id))));
+            let tx = crate::db::begin_write_transaction(&db, None).await.unwrap();
+            for actor in [
+                grantor.clone(),
+                renewer_did.clone(),
+                "did:key:child".to_owned(),
+                original_info.delegate.clone(),
+            ] {
+                tx.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO actor (id) VALUES ($1)",
+                    [Value::String(Some(Box::new(actor)))],
+                ))
+                .await
+                .unwrap();
+            }
+            for (id, delegatee, expiry, serialization) in [
+                (ancestor, "did:key:child".to_owned(), ancestor_end, vec![1]),
+                (
+                    original,
+                    original_info.delegate.clone(),
+                    original_expiry,
+                    original_serialization,
+                ),
+                (
+                    lease,
+                    lease_info.delegate.clone(),
+                    lease_expiry,
+                    lease_serialization,
+                ),
+            ] {
+                tx.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO delegation (id, delegator, delegatee, expiry, issued_at, not_before, facts, serialization, serialization_format) VALUES ($1,$2,$3,$4,NULL,NULL,NULL,$5,0)",
+                    [
+                        bytes(id),
+                        Value::String(Some(Box::new(grantor.clone()))),
+                        Value::String(Some(Box::new(delegatee))),
+                        Value::TimeDateTime(Some(Box::new(db_datetime(expiry).unwrap()))),
+                        Value::Bytes(Some(Box::new(serialization))),
+                    ],
+                ))
+                .await
+                .unwrap();
+                tx.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1,$1,FALSE)",
+                    [bytes(id)],
+                ))
+                .await
+                .unwrap();
+            }
+            tx.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO parent_delegation (parent, child) VALUES ($1, $2)",
+                [bytes(ancestor), bytes(original)],
+            ))
+            .await
+            .unwrap();
+            tx.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO ability (delegation, resource, ability, caveats) VALUES ($1,$2,$3,$4)",
+                [
+                    bytes(lease),
+                    Value::String(Some(Box::new(format!("urn:cid:{original_cid}")))),
+                    Value::String(Some(Box::new("tinycloud.delegation/renew".to_owned()))),
+                    Value::Json(Some(Box::new(serde_json::json!({})))),
+                ],
+            ))
+            .await
+            .unwrap();
+            tx.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1,$2,'active',1,$3,$4,$5,$6,$7,$8,$9)",
+                [
+                    bytes(original),
+                    bytes(lease),
+                    Value::String(Some(Box::new(grantor.clone()))),
+                    Value::String(Some(Box::new(renewer_did.clone()))),
+                    Value::BigInt(Some(renewer_epoch as i64)),
+                    Value::TimeDateTime(Some(Box::new(db_datetime(lease_expiry).unwrap()))),
+                    Value::TimeDateTime(Some(Box::new(db_datetime(original_expiry).unwrap()))),
+                    Value::BigInt(Some(period)),
+                    Value::Bytes(Some(Box::new(audience.to_vec()))),
+                ],
+            ))
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+
+            let invocation_token = tinycloud_auth::authorization::TinyCloudInvocation::decode(
+                fixture["originalToken"].as_str().unwrap(),
+            )
+            .unwrap();
+            let mut request = StampIssue {
+                invocation: crate::util::InvocationInfo::try_from(invocation_token).unwrap(),
+                original_cid: original_cid.to_owned(),
+                lease_cid: lease_cid.to_owned(),
+                replay_hash: hash(b"gap request replay"),
+                replay_expires_at: now + 60,
+            };
+            request.invocation.invoker = renewer_did.clone();
+            request.invocation.parents = vec![lease_cid.parse().unwrap()];
+            request.invocation.capabilities = vec![crate::util::Capability {
+                resource: format!("urn:cid:{original_cid}").parse().unwrap(),
+                ability: "tinycloud.delegation/renew".to_owned().try_into().unwrap(),
+                caveats: Default::default(),
+            }];
+
+            let lease_rows = || async {
+                db.query_all(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT state, generation, lease_expiry, original_expiry FROM renewal_lease ORDER BY lease_cid",
+                ))
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row.try_get::<String>("", "state").unwrap(),
+                        row.try_get::<i64>("", "generation").unwrap(),
+                        row.try_get::<OffsetDateTime>("", "lease_expiry").unwrap(),
+                        row.try_get::<OffsetDateTime>("", "original_expiry").unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+            };
+
+            // Scheduler step 1: the revocation check. Every case passes it.
+            assert_eq!(
+                effective_end(&db, original_cid, lease_cid, now, &identity)
+                    .await
+                    .unwrap(),
+                Some(original_expiry),
+                "{gap:?}: the scheduler's check sees a renewable lease"
+            );
+            let leases_before = lease_rows().await;
+            assert_eq!(leases_before.len(), 1);
+
+            // The gap: a revocation commits before the stamp transaction opens.
+            let revoked = match gap {
+                Gap::NoRevoke => None,
+                Gap::Lease => Some(lease),
+                Gap::Original => Some(original),
+                Gap::Ancestor => Some(ancestor),
+            };
+            if let Some(target) = revoked {
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO revocation (id, revoker, revoked, serialization, revoked_at) VALUES ($1,$2,$3,$4,NULL)",
+                    [
+                        bytes(hash(b"gap revocation")),
+                        Value::String(Some(Box::new(grantor.clone()))),
+                        bytes(target),
+                        Value::Bytes(Some(Box::new(vec![1]))),
+                    ],
+                ))
+                .await
+                .unwrap();
+            }
+
+            // Scheduler step 2: the stamp transaction.
+            let stamped = issue_stamp_at(&db, request, &secret, &identity, now, None).await;
+            if revoked.is_none() {
+                let record = stamped.unwrap_or_else(|error| {
+                    panic!(
+                        "{gap:?}: control must stamp, or the cases below prove nothing: {error:?}"
+                    )
+                });
+                assert!(record.new_end > original_expiry);
+                assert_eq!(row_count(&db, "renewal_stamp").await, 1);
+                assert_eq!(row_count(&db, "invocation_replay").await, 1);
+                assert_eq!(
+                    effective_end(&db, original_cid, lease_cid, now, &identity)
+                        .await
+                        .unwrap(),
+                    Some(record.new_end)
+                );
+            } else {
+                assert!(
+                    matches!(
+                        stamped,
+                        Err(RenewalStoreError::Revoked) | Err(RenewalStoreError::LeaseUnavailable)
+                    ),
+                    "{gap:?}: a stamp after a revocation must be refused, got {stamped:?}"
+                );
+                assert_eq!(row_count(&db, "renewal_stamp").await, 0, "{gap:?}");
+                assert_eq!(
+                    row_count(&db, "invocation_replay").await,
+                    0,
+                    "{gap:?}: a refused stamp spends no replay"
+                );
+                assert_eq!(
+                    lease_rows().await,
+                    leases_before,
+                    "{gap:?}: lease untouched"
+                );
+                assert!(
+                    !matches!(
+                        effective_end(&db, original_cid, lease_cid, now, &identity).await,
+                        Ok(Some(_))
+                    ),
+                    "{gap:?}: the revoked lease no longer has an effective end"
+                );
+            }
+        }
+    }
 }
