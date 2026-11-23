@@ -218,6 +218,37 @@ pub(super) async fn preload(
     Ok(())
 }
 
+/// TC-4092: a Policy/v3 root or policy delegation revoked in its own store
+/// (`policy_v3_root.revoked_at`, `policy_delegation.revoked_at`; the
+/// `RootRevocation/v1` route writes only the former) loses that revocation when
+/// `remove` deletes the row, exactly like a `revocation` row does. Tombstone
+/// them first, in the same table, so `/delegate` still refuses the delegation.
+/// Run before anything is deleted: the tombstone reads the delegation's expiry
+/// and its alias row. The revocation time is stored as text there, so the
+/// tombstone's `revoked_at` stays empty.
+pub(super) async fn tombstone_revoked(
+    tx: &DatabaseTransaction,
+    deleted: &HashSet<Hash>,
+    lease: &mut Lease<'_>,
+) -> Result<(), DbErr> {
+    let mut revoked = Vec::new();
+    for row in models::policy_v3_root::Entity::find().all(tx).await? {
+        lease.keep(tx).await?;
+        let id = cid(&row.root_cid)?;
+        if row.revoked_at.is_some() && deleted.contains(&id) {
+            revoked.push((id, None));
+        }
+    }
+    for row in models::policy_delegation::Entity::find().all(tx).await? {
+        lease.keep(tx).await?;
+        let id = cid(&row.delegation_cid)?;
+        if row.revoked_at.is_some() && deleted.contains(&id) {
+            revoked.push((id, None));
+        }
+    }
+    super::insert_tombstones(tx, revoked).await
+}
+
 pub(super) async fn remove(
     tx: &DatabaseTransaction,
     deleted: &HashSet<Hash>,

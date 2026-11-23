@@ -943,3 +943,172 @@ async fn multi_space_ancestor(conn: sea_orm::DatabaseConnection) {
     assert!(stamp.is_err(), "no stamp after the purge: {stamp:?}");
     assert_eq!(count(&conn, "renewal_stamp").await, 0);
 }
+
+/// A Policy/v3 root revoked through its own store (`policy_v3_root.revoked_at`,
+/// what `RootRevocation/v1` writes; no `revocation` row) must stay refused
+/// after purge deletes that row. A root that was never revoked gets no
+/// tombstone and registers again.
+async fn policy_root_revoked_purge_repost(conn: sea_orm::DatabaseConnection) {
+    let db = open(conn.clone()).await;
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder1, _) = key(0x21);
+    let (_, holder2, _) = key(0x22);
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = token(
+        0x11,
+        &owner_did,
+        &host,
+        "tinycloud.space/host",
+        &[],
+        "host",
+        now + 3600,
+    );
+    let root = token(
+        0x11,
+        &holder1,
+        &kv,
+        "tinycloud.kv/get",
+        &[],
+        "root",
+        now + 3600,
+    );
+    let child = token(
+        0x21,
+        &holder2,
+        &kv,
+        "tinycloud.kv/get",
+        &[cid_of(&root)],
+        "child",
+        now + 3000,
+    );
+    for t in [&host_token, &root, &child] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let policy_root =
+        |token: &str, revoked_at: Option<&str>| crate::models::policy_v3_root::ActiveModel {
+            root_cid: Set(cid_of(token).to_cid(0x55).to_string()),
+            policy_cid: Set("policy".to_string()),
+            role: Set("policy".to_string()),
+            authorization_bytes: Set(vec![1]),
+            status_checkpoint_bytes: Set(None),
+            previous_checkpoint_digest_hex: Set(None),
+            status_sequence: Set(0),
+            admission_epoch: Set(0),
+            status_checked_at: Set(None),
+            status_fresh_until: Set(None),
+            revoked_at: Set(revoked_at.map(str::to_string)),
+            revocation_bytes: Set(revoked_at.map(|_| vec![2])),
+        };
+    crate::models::policy_v3_root::Entity::insert_many([
+        policy_root(&child, Some("2026-01-01T00:00:00Z")),
+        policy_root(&root, None),
+    ])
+    .exec(&conn)
+    .await
+    .unwrap();
+    assert_eq!(count(&conn, "revocation").await, 0, "no revocation row");
+
+    purge(&conn, [&host_token, &root, &child].map(|t| cid_of(t))).await;
+    assert_eq!(count(&conn, "policy_v3_root").await, 0);
+    assert_eq!(count(&conn, "delegation").await, 0);
+    let tombstones = crate::models::revocation_tombstone::Entity::find()
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(tombstones.len(), 1, "only the revoked root is tombstoned");
+    assert_eq!(tombstones[0].delegation_canonical, cid_of(&child));
+    assert!(tombstones[0].delegation_expiry.is_some());
+
+    let process = |t: &str| {
+        let conn = conn.clone();
+        let delegation = deleg(t);
+        async move {
+            crate::models::delegation::process_with(
+                &conn,
+                &delegation,
+                None,
+                false,
+                true,
+                None,
+                false,
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        process(&root).await.unwrap(),
+        DelegationRegistration::New(cid_of(&root))
+    );
+    match process(&child).await {
+        Err(SaveError::InvalidDelegation(DelegationError::Revoked(cid))) => {
+            assert_eq!(cid, cid_of(&child).to_cid(0x55).to_string())
+        }
+        other => panic!("expected Revoked, got {other:?}"),
+    }
+    refused_as_revoked(db.delegate(deleg(&child)).await.map(|_| ()), "delegate");
+}
+
+#[tokio::test]
+async fn tc4092_policy_v3_root_revoked_in_its_own_store_stays_refused_after_purge_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("policy-root.sqlite").display()
+    );
+    policy_root_revoked_purge_repost(sea_orm::Database::connect(url).await.unwrap()).await;
+}
+
+#[tokio::test]
+async fn postgres_tc4092_policy_v3_root_revoked_in_its_own_store_stays_refused_after_purge() {
+    let Some(url) = crate::test_support::postgres_test_url(
+        "postgres_tc4092_policy_v3_root_revoked_in_its_own_store_stays_refused_after_purge",
+    ) else {
+        return;
+    };
+    let admin = sea_orm::Database::connect(sea_orm::ConnectOptions::new(url.clone()))
+        .await
+        .unwrap();
+    let schema = format!(
+        "tc4092p_{}_{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    admin
+        .execute_unprepared(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options
+        .max_connections(4)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
+    let conn = sea_orm::Database::connect(options).await.unwrap();
+    let ran = tokio::spawn(policy_root_revoked_purge_repost(conn)).await;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    ran.unwrap();
+}

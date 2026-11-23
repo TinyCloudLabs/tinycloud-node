@@ -747,10 +747,27 @@ async fn write_tombstones(
         )
         .all(tx)
         .await?;
-    if rows.is_empty() {
+    insert_tombstones(
+        tx,
+        rows.into_iter()
+            .map(|row| (row.revoked, row.revoked_at))
+            .collect(),
+    )
+    .await
+}
+
+/// One tombstone per revoked delegation, keyed by canonical hash; `revoked`
+/// holds the stored id and, when known, the revocation time. Shared by the
+/// `revocation` rows and the Policy/v3 revocation stores (`policy::remove`'s
+/// caller). Must run while the delegation and alias rows still exist.
+pub(super) async fn insert_tombstones(
+    tx: &DatabaseTransaction,
+    revoked: Vec<(Hash, Option<OffsetDateTime>)>,
+) -> Result<(), DbErr> {
+    if revoked.is_empty() {
         return Ok(());
     }
-    let targets: Vec<Hash> = rows.iter().map(|row| row.revoked).collect();
+    let targets: Vec<Hash> = revoked.iter().map(|(id, _)| *id).collect();
     let canonical: HashMap<Hash, Hash> = delegation_cid_alias::Entity::find()
         .filter(delegation_cid_alias::Column::Id.is_in(targets.iter().copied()))
         .all(tx)
@@ -769,14 +786,14 @@ async fn write_tombstones(
         .collect();
     let recorded_at = OffsetDateTime::now_utc();
     let mut tombstones = HashMap::new();
-    for row in rows {
-        let key = canonical.get(&row.revoked).copied().unwrap_or(row.revoked);
+    for (target, revoked_at) in revoked {
+        let key = canonical.get(&target).copied().unwrap_or(target);
         tombstones
             .entry(key)
             .or_insert_with(|| models::revocation_tombstone::ActiveModel {
                 delegation_canonical: Set(key),
-                delegation_expiry: Set(expiry.get(&row.revoked).copied().flatten()),
-                revoked_at: Set(row.revoked_at),
+                delegation_expiry: Set(expiry.get(&target).copied().flatten()),
+                revoked_at: Set(revoked_at),
                 recorded_at: Set(recorded_at),
             });
     }
@@ -861,6 +878,9 @@ async fn remove_records(
     // TC-4092, before anything is deleted: a tombstone for every revocation
     // about to go, and the renewal rows of every delegation about to go. Both
     // read alias rows, which the pass below deletes.
+    // Policy/v3 roots and policy delegations keep their revocation in their
+    // own rows, which `policy::remove` deletes: tombstone those too.
+    policy::tombstone_revoked(tx, deleted, lease).await?;
     for page in ids.chunks(PAGE) {
         lease.keep(tx).await?;
         let refs = alias_family(graph, page);
