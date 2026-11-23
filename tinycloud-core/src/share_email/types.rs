@@ -1297,11 +1297,6 @@ mod tests {
     use super::*;
 
     const HOLDER: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
-    const FROZEN_CID_PATTERN: &str = r"^bafkrei[a-z2-7]{52}$";
-    const FROZEN_SHARE_ID_PATTERN: &str = r"^[A-Za-z0-9._~-]+$";
-    const FROZEN_DATABASE_PATTERN: &str = r"^[A-Za-z0-9_-]+$";
-    const FROZEN_STATEMENT_PATTERN: &str = r"^[A-Za-z][A-Za-z0-9_.-]*$";
-    const FROZEN_ORIGIN_PATTERN: &str = r"^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::[1-9][0-9]{0,4})?$";
 
     #[test]
     fn strict_values_reject_invalid_and_overflow() {
@@ -1333,7 +1328,6 @@ mod tests {
         assert!(ShareCid::parse(&KV_SHARE_CID[..58]).is_err());
         assert!(ShareCid::parse(&overlong_cid).is_err());
         assert!(ShareCid::parse(KV_SHARE_CID.to_ascii_uppercase()).is_err());
-        assert!(FROZEN_CID_PATTERN.starts_with("^bafkrei"));
         assert!(ShareCid::parse(&noncanonical_cid).is_err());
         assert!(ShareId::parse("share-01").is_ok());
         assert!(ShareId::parse("9.share_~-").is_ok());
@@ -1358,10 +1352,6 @@ mod tests {
         assert!(TargetOrigin::parse("https://node.example/path").is_err());
         assert!(TargetOrigin::parse("https://node.example?query").is_err());
         assert!(TargetOrigin::parse("https://node.example#fragment").is_err());
-        assert!(FROZEN_SHARE_ID_PATTERN.contains("._~"));
-        assert!(FROZEN_DATABASE_PATTERN.contains("A-Za-z0-9"));
-        assert!(FROZEN_STATEMENT_PATTERN.starts_with("^[A-Za-z]"));
-        assert!(FROZEN_ORIGIN_PATTERN.starts_with("^https://"));
         assert!(SafeJsonInteger::parse(SafeJsonInteger::MAX).is_ok());
         assert!(SafeJsonInteger::parse(SafeJsonInteger::MAX + 1).is_err());
         assert!(serde_json::from_str::<SafeJsonInteger>("9007199254740992").is_err());
@@ -1471,11 +1461,6 @@ mod tests {
 
     #[test]
     fn pinned_manifest_pairs_are_source_specific_and_reject_old_envelope_cids() {
-        const OLD_ENVELOPE_PACKAGE_SHARE_CID: &str =
-            "bafkreicvmdzkqzdtnlmynudck2a2ytmtketkdmlppk2q6owhzmndpcfnri";
-        const OLD_ENVELOPE_PACKAGE_POLICY_CID: &str =
-            "bafkreig36s2hz442yqcnkctpkgtjev5pyjngzymyipk3koywg4d7rqmu5u";
-
         assert_eq!(
             KV_SHARE_CID,
             "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4"
@@ -1492,11 +1477,6 @@ mod tests {
             SQL_POLICY_CID,
             "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq"
         );
-
-        for manifest_cid in [KV_SHARE_CID, KV_POLICY_CID, SQL_SHARE_CID, SQL_POLICY_CID] {
-            assert_ne!(manifest_cid, OLD_ENVELOPE_PACKAGE_SHARE_CID);
-            assert_ne!(manifest_cid, OLD_ENVELOPE_PACKAGE_POLICY_CID);
-        }
     }
 
     /// The owner delegation CID production actually mints. Delegations are

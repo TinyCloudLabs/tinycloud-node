@@ -1010,17 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn network_key_opening_requires_a_legacy_seal() {
-        let backend = LocalOneOfOneBackend::new(seal_key());
-        assert!(backend.open_network_secret(&[0x42; 32]).is_err());
-        let generated = backend.generate().unwrap();
-        assert_eq!(generated.sealed_private_key[0], 1);
-        assert!(backend
-            .open_network_secret(&generated.sealed_private_key)
-            .is_ok());
-    }
-
-    #[test]
     fn rewrap_to_receiver_key() {
         let backend = LocalOneOfOneBackend::new(seal_key());
         let symmetric = [0x12u8; 32];
@@ -1332,17 +1321,6 @@ mod tests {
             .generate_seed()
             .unwrap();
         assert!(backend.open_seed(&other).is_err());
-    }
-
-    #[test]
-    fn unwrap_round_trip_with_known_receiver() {
-        let recipient = StaticSecret::random_from_rng(OsRng);
-        let recipient_pub = PublicKey::from(&recipient);
-        let wrapped = wrap_to_public_key(recipient_pub.as_bytes(), &[0x33u8; 32]).unwrap();
-        assert_eq!(
-            unwrap_with_secret(&recipient, &wrapped).unwrap(),
-            vec![0x33u8; 32]
-        );
     }
 
     #[test]

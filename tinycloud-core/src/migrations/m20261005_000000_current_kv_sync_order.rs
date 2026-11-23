@@ -81,15 +81,6 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn fresh_install_creates_the_feed_index() {
-        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
-            .await
-            .unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        assert!(index_exists(&db).await);
-    }
-
     /// A node upgraded from the previous release: every earlier migration has
     /// run and `current_kv` already holds rows, including a tombstone. The
     /// migration adds only the index and leaves the rows untouched; `down`

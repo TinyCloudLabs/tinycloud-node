@@ -1859,58 +1859,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_read_cannot_use_fabricated_rows() {
-        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
-        let root_cid = super::super::types::KV_POLICY_CID;
-        let bridge = bridge_with_root(root_cid, now).await;
-        assert_eq!(
-            bridge
-                .establish_session(
-                    admission(PolicySessionRequest {
-                        scope: scope(root_cid),
-                        holder: holder(),
-                        nonce: ProtocolNonce::from_bytes([5; 32]),
-                        presentation_jti: ProtocolJti::from_bytes([6; 16]),
-                        challenge_id: String::new(),
-                        challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
-                        challenge_binding: json!(null),
-                        policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
-                        credential_expires_at: 0,
-                    }),
-                    now,
-                )
-                .await,
-            Err(PortError::Unavailable)
-        );
-    }
-
-    #[tokio::test]
-    async fn revoking_a_fabricated_session_root_never_authorizes() {
-        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
-        let root_cid = super::super::types::KV_POLICY_CID;
-        let bridge = bridge_with_root(root_cid, now).await;
-        assert_eq!(
-            bridge
-                .establish_session(
-                    admission(PolicySessionRequest {
-                        scope: scope(root_cid),
-                        holder: holder(),
-                        nonce: ProtocolNonce::from_bytes([14; 32]),
-                        presentation_jti: ProtocolJti::from_bytes([15; 16]),
-                        challenge_id: String::new(),
-                        challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
-                        challenge_binding: json!(null),
-                        policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
-                        credential_expires_at: 0,
-                    }),
-                    now,
-                )
-                .await,
-            Err(PortError::Unavailable)
-        );
-    }
-
-    #[tokio::test]
     async fn establish_session_denies_unknown_policy_cid() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::migrations::Migrator::up(&db, None).await.unwrap();

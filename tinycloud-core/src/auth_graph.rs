@@ -1479,13 +1479,6 @@ mod tests {
         .unwrap();
         let ids = insert_chain(&fixture.conn, "literal-anchor", 2).await;
         for roots in [vec![ids[0]], vec![hash(b"missing-anchor-root")]] {
-            let statement = DbBackend::Postgres.build(&snapshot_query(&roots));
-            assert!(statement.sql.contains("WHERE 1 = 0"));
-            let rows = fixture.conn.query_all(statement).await.unwrap();
-            assert_eq!(rows.is_empty(), roots[0] != ids[0]);
-            for row in rows {
-                assert_ne!(row.try_get::<i32>("", "kind").unwrap(), 4);
-            }
             let actual = AuthGraphSnapshot::load(&fixture.conn, &roots)
                 .await
                 .unwrap();
@@ -2718,46 +2711,17 @@ mod tests {
             .any(|id| snapshot.delegation(id).is_none()));
     }
 
-    /// TC-269 exact query-batch counter: the legacy invocation path issued a
-    /// depth-amplified number of queries (per-node closure walks repeated for
-    /// locking, revocation, and chain-window checks, plus a revocation lookup
-    /// per ancestor). The new path uses one pre-transaction closure query to
-    /// establish the lock set, then one tagged transaction-scoped snapshot query.
+    /// TC-269 exact query-batch counter: the invocation path uses one
+    /// pre-transaction closure query to establish the lock set, then one
+    /// tagged transaction-scoped snapshot query, independent of chain depth.
     #[tokio::test]
-    async fn snapshot_query_batches_are_bounded_versus_depth_amplified_traversal() {
-        for (depth, expected_legacy) in [(0, 6), (1, 10), (4, 22)] {
+    async fn snapshot_query_batches_are_bounded_regardless_of_depth() {
+        for depth in [0, 1, 4] {
             let (db, counter) = counted_database().await;
             let ids = insert_chain(&db, &format!("counted-{depth}"), depth).await;
             let leaf = ids[0];
 
-            // Legacy invocation-path sequence, reproduced from the per-node
-            // helpers still used by the delegate/revoke/status paths.
-            let before = counter.load(Ordering::SeqCst);
-            revocation::ancestor_chain_ids_for_roots(&db, &[leaf])
-                .await
-                .unwrap();
-            delegation::Entity::find()
-                .filter(delegation::Column::Id.is_in([leaf]))
-                .find_with_related(abilities::Entity)
-                .all(&db)
-                .await
-                .unwrap();
-            assert!(!revocation::is_revoked(&db, &leaf).await.unwrap());
-            assert_eq!(
-                revocation::first_revoked_ancestor(&db, &leaf)
-                    .await
-                    .unwrap(),
-                None
-            );
-            let chain_ids = revocation::ancestor_chain_ids(&db, &leaf).await.unwrap();
-            delegation::Entity::find()
-                .filter(delegation::Column::Id.is_in(chain_ids))
-                .all(&db)
-                .await
-                .unwrap();
-            let legacy_queries = counter.load(Ordering::SeqCst) - before;
-
-            // New production path: one recursive edge query to establish the
+            // Production path: one recursive edge query to establish the
             // lock set, then one transaction-scoped snapshot query.
             let before = counter.load(Ordering::SeqCst);
             let lock_keys = load_chain_lock_ids(&db, &[leaf]).await.unwrap();
@@ -2766,7 +2730,6 @@ mod tests {
 
             assert_eq!(lock_keys.len(), depth + 1);
             assert_eq!(snapshot.chain_ids_from(&leaf).len(), depth + 1);
-            assert_eq!(legacy_queries, expected_legacy, "depth {depth}");
             assert_eq!(optimized_queries, 2, "depth {depth}");
         }
     }

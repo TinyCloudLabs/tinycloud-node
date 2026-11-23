@@ -654,14 +654,11 @@ mod tests {
     #[test]
     fn refusal_limiter_counts_suppression_and_bounds_global_warnings() {
         let mut limiter = RefusalLimiter::default();
-        let counter = prometheus::IntCounter::new("refusals", "test").unwrap();
         let now = Instant::now();
         let mut emitted = 0;
         for _ in 0..100 {
-            counter.inc();
             emitted += usize::from(limiter.observe("web", "localhost", now).is_some());
         }
-        assert_eq!(counter.get(), 100);
         assert_eq!(emitted, 1);
         assert_eq!(
             limiter.observe("web", "localhost", now + WARN_WINDOW),

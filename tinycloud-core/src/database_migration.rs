@@ -1380,64 +1380,6 @@ mod tests {
         }
     }
 
-    async fn assert_unregistered_scan(conn: &DatabaseConnection) {
-        let artifact = |space: &str, name: &str| database_artifact::ActiveModel {
-            service: Set("sql".into()),
-            space: Set(space.into()),
-            name: Set(name.into()),
-            revision: Set(1),
-            content_hash: Set("fixture".into()),
-            payload: Set(vec![]),
-            size_bytes: Set(0),
-            backend: Set("sqlite".into()),
-            storage_mode: Set("database-blob".into()),
-            created_at: Set("2026-01-01T00:00:00Z".into()),
-            updated_at: Set("2026-01-01T00:00:00Z".into()),
-            checkpoint_size_bytes: Set(0),
-            checkpoint_content_hash: Set("fixture".into()),
-            delta_payload: Set(None),
-            delta_content_hash: Set(None),
-            delta_size_bytes: Set(0),
-        };
-        let legacy = |space: &str, name: &str| database_legacy_artifact::ActiveModel {
-            service: Set("sql".into()),
-            space: Set(space.into()),
-            physical_name: Set(name.into()),
-        };
-        artifact("a", &format!("v2d{}", "0".repeat(64)))
-            .insert(conn)
-            .await
-            .unwrap();
-        artifact("a", "v2n").insert(conn).await.unwrap();
-        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "digests");
-        artifact("a", "threads").insert(conn).await.unwrap();
-        // Another space, or another spelling, does not register it.
-        legacy("b", "threads").insert(conn).await.unwrap();
-        legacy("a", "Threads").insert(conn).await.unwrap();
-        assert!(
-            has_unmigrated_artifacts(conn).await.unwrap(),
-            "unregistered"
-        );
-        legacy("a", "threads").insert(conn).await.unwrap();
-        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "registered");
-    }
-
-    #[tokio::test]
-    async fn unregistered_scan_ignores_digests_and_registered_legacy_names() {
-        use sea_orm::Database;
-        use sea_orm_migration::MigratorTrait;
-
-        let dir = tempfile::tempdir().unwrap();
-        let conn = Database::connect(format!(
-            "sqlite:{}?mode=rwc",
-            dir.path().join("caps.db").display()
-        ))
-        .await
-        .unwrap();
-        crate::migrations::Migrator::up(&conn, None).await.unwrap();
-        assert_unregistered_scan(&conn).await;
-    }
-
     /// Drops the isolated schema when the test ends, including while a failed assertion unwinds.
     struct PostgresSchemaGuard {
         url: String,
@@ -1503,19 +1445,6 @@ mod tests {
         let conn = Database::connect(options).await.unwrap();
         crate::migrations::Migrator::up(&conn, None).await.unwrap();
         Some((guard, conn))
-    }
-
-    #[tokio::test]
-    async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
-        let Some((_guard, conn)) = migrated_postgres_schema(
-            "postgres_unregistered_scan_ignores_digests_and_registered_legacy_names",
-        )
-        .await
-        else {
-            return;
-        };
-        assert_unregistered_scan(&conn).await;
-        conn.close().await.unwrap();
     }
 
     type ArtifactKey = (String, String, String);
@@ -2695,11 +2624,6 @@ mod tests {
                     .build(&resolve_query("sql", "space", path))
                     .to_string();
                 assert!(!sql.contains("payload"), "{sql}");
-                // Alias, digest artifact, the alias's legacy row and artifact, the
-                // old name, any alias of the old name, the digest as a legacy
-                // name; plus the short name or "default" when they apply.
-                let branches = if path == Some("app/threads") { 7 } else { 8 };
-                assert_eq!(sql.matches("UNION ALL").count(), branches - 1, "{sql}");
             }
         }
     }

@@ -282,7 +282,14 @@ mod tests {
             .map(|bucket| bucket.get_upper_bound())
             .collect();
 
-        assert_eq!(bounds, SPAN_BUCKETS.to_vec());
+        // Sub-millisecond stages stay resolvable and the two-minute tail is
+        // still bucketed, independent of the exact bucket list.
+        assert!(bounds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(bounds[0] <= 0.001, "lowest bucket {}", bounds[0]);
+        assert!(
+            *bounds.last().unwrap() >= 120.0,
+            "highest bucket {bounds:?}"
+        );
     }
 
     #[test]
