@@ -553,13 +553,25 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     action: ControlAction,
     target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
-    control_proof_decision_at(
+    control_proof_decision_with_encryption(db, signer, proofs, action, target, None).await
+}
+
+pub(crate) async fn control_proof_decision_with_encryption<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+    action: ControlAction,
+    target: &Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<ControlProofDecision, DbErr> {
+    control_proof_decision_at_with_encryption(
         db,
         signer,
         proofs,
         action,
         target,
         OffsetDateTime::now_utc(),
+        encryption,
     )
     .await
 }
@@ -571,6 +583,18 @@ pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
     action: ControlAction,
     target: &Hash,
     now: OffsetDateTime,
+) -> Result<ControlProofDecision, DbErr> {
+    control_proof_decision_at_with_encryption(db, signer, proofs, action, target, now, None).await
+}
+
+async fn control_proof_decision_at_with_encryption<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+    action: ControlAction,
+    target: &Hash,
+    now: OffsetDateTime,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
         return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
@@ -606,7 +630,9 @@ pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
     }
 
     if action == ControlAction::Status {
-        match crate::models::invocation::preflight_terminal_ancestors(db, &[proofs[0]]).await {
+        match crate::models::invocation::preflight_terminal_ancestors(db, &[proofs[0]], encryption)
+            .await
+        {
             Ok(()) => {}
             Err(crate::models::invocation::Error::Db(error)) => return Err(error),
             Err(crate::models::invocation::Error::InvalidInvocation(_)) => {

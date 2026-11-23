@@ -1721,6 +1721,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_entries,
         kv_sync: None,
         replay: None,
+        read_replay: None,
         kv_batch_if_none_match,
     })
 }
@@ -2235,20 +2236,6 @@ async fn invoke_impl(
         for space in admitted.invocation().0.spaces() {
             tinycloud_core::request_telemetry::observe_space(space);
         }
-        // TC-3810: refuse invocations descending from a terminal ancestor (or
-        // directly citing a boot-marked malformed-mode leaf) after signature
-        // admission and before any replay spend, upload staging, lock, or data
-        // access across every /invoke handler.
-        tinycloud
-            .preflight_invocation_terminal_ancestors(&admitted.invocation().0)
-            .await
-            .map_err(|error| {
-                authorization_refusal(
-                    "server.invoke.auth",
-                    &TxStoreError::Tx(error.into()),
-                    false,
-                )
-            })?;
 
         // Named keys are served only while `named_keys_v1` is on: with it
         // off, an invocation on a key or key prefix is refused before any
@@ -2700,21 +2687,17 @@ async fn invoke_impl(
         // so a write that rolls back leaves the signed request retryable. A
         // read has no such transaction and spends the row up front.
         let write_spends_replay = !tinycloud_core::kv_mutation_keys(admitted.invocation()).is_empty();
-        if write_spends_replay {
-            let reservation = if policy_session_invocation {
-                InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
-            } else {
-                InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
-            };
-            kv_options.replay = Some(reservation);
-        } else if policy_session_invocation {
-            invocation_replay_cache
-                .check_and_insert_invoker_nonce(admitted.invocation(), 60)
-                .await?;
+        let reservation = if policy_session_invocation {
+            InvocationReplayCache::invoker_nonce_reservation(admitted.invocation(), 60)?
         } else {
-            invocation_replay_cache
-                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-                .await?;
+            InvocationReplayCache::reservation(&admitted, config.invocation.max_lifetime_secs)
+        };
+        if write_spends_replay {
+            kv_options.replay = Some(reservation);
+        } else {
+            kv_options.read_replay = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                reservation,
+            ))));
         }
         let invocation_info = admitted.invocation().0.clone();
         let cursor_limit = kv_options.list_limit;
@@ -2775,9 +2758,7 @@ async fn invoke_impl(
         );
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
-                if write_spends_replay {
-                    crate::prometheus::observe_replay_insert(true);
-                }
+                crate::prometheus::observe_replay_insert(true);
                 // Server-side successful-validation site: the invocation passed
                 // its time window (and everything else), so record how much
                 // validity remained.
@@ -6747,6 +6728,12 @@ mod tests {
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&conn)
+            .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&conn)
             .await?;
@@ -12878,6 +12865,12 @@ mod tests {
             }
             .insert(&self.conn)
             .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
+            }
+            .insert(&self.conn)
+            .await?;
             for (space, path, action) in abilities {
                 let service = action
                     .split_once('.')
@@ -14050,6 +14043,12 @@ mod tests {
                 serialization: Set(label.as_bytes().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&self.conn)
+            .await?;
+            tinycloud_core::models::delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&self.conn)
             .await?;

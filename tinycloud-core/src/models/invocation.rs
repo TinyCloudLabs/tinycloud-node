@@ -419,25 +419,27 @@ pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     .await
 }
 
-/// TC-3810: refuse an invocation if any cited delegation leaf was marked
-/// unusable during boot reindexing (`invalid-delegation-mode`), or if any
-/// strict ancestor of a cited leaf is terminal (or invalid). Direct use of a
-/// valid terminal leaf is allowed: invocation is not redelegation.
+/// TC-3810: refuse an invocation if any cited delegation leaf is marked
+/// `invalid` (or fails closed when unmarked), or if any strict ancestor of a
+/// cited leaf is `terminal` or `invalid`. Reads `graph.delegation_mode(...)`
+/// (from the joined `delegation_mode` side table, never `delegation.facts`).
+/// Direct use of a valid terminal leaf is allowed: invocation is not
+/// redelegation.
 pub(crate) fn check_no_terminal_strict_ancestor(
     graph: &crate::auth_graph::AuthGraphSnapshot,
     leaf_ids: &[Hash],
 ) -> Result<(), InvocationError> {
     for leaf_id in leaf_ids {
         if graph
-            .delegation(leaf_id)
-            .is_some_and(delegation::delegation_mode_is_invalid)
+            .delegation_mode(leaf_id)
+            .is_some_and(delegation_mode::StoredDelegationMode::is_invalid)
         {
             return Err(InvocationError::InvalidDelegationMode);
         }
         for ancestor_id in graph.chain_ids_from(leaf_id).into_iter().skip(1) {
             if graph
-                .delegation(&ancestor_id)
-                .is_some_and(delegation::parent_is_terminal)
+                .delegation_mode(&ancestor_id)
+                .is_some_and(delegation_mode::StoredDelegationMode::is_terminal_or_invalid)
             {
                 return Err(InvocationError::TerminalParentCannotRedelegate);
             }
@@ -446,61 +448,46 @@ pub(crate) fn check_no_terminal_strict_ancestor(
     Ok(())
 }
 
-/// Lock-free, pure read-only preflight check for terminal strict ancestors
-/// (and unusable malformed-mode leaves) before taking chain/space/writer locks,
-/// spending a replay row, staging uploads, or touching data. Uses only pure
-/// read-only SQL (no string literals) so `track_writes` never marks it as a
-/// potential write.
-pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
+/// Evaluate leaf (`invalid`) and strict-ancestor (`terminal`/`invalid`) modes
+/// against an already-loaded [`crate::auth_graph::ClosureWithModes`] with zero
+/// extra queries when every node has a `delegation_mode` row. Any unmarked
+/// node falls back to fail-closed derivation from its stored signed bytes.
+pub(crate) async fn check_closure_modes<C: ConnectionTrait>(
     db: &C,
-    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    root_ids: &[Hash],
+    closure: &crate::auth_graph::ClosureWithModes,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<(), Error> {
-    use sea_orm::QuerySelect;
-    if parents.is_empty() {
+    if root_ids.is_empty() {
         return Ok(());
     }
-    let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
-    let (nodes, edges) = crate::auth_graph::load_closure_edges(db, &root_ids)
-        .await
-        .map_err(|error| match error {
-            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
-            crate::auth_graph::ChainTraversalError::LimitExceeded => {
-                Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+    let mut strict_ancestors: Vec<Hash> = Vec::new();
+    let mut unmarked: Vec<Hash> = Vec::new();
+    for leaf_id in root_ids {
+        match closure.modes.get(leaf_id) {
+            Some(mode) if mode.is_invalid() => {
+                return Err(InvocationError::InvalidDelegationMode.into());
             }
-        })?;
-    let facts_by_id: HashMap<Hash, Option<Facts>> = delegation::Entity::find()
-        .select_only()
-        .column(delegation::Column::Id)
-        .column(delegation::Column::Facts)
-        .filter(delegation::Column::Id.is_in(nodes))
-        .into_tuple::<(Hash, Option<Facts>)>()
-        .all(db)
-        .await?
-        .into_iter()
-        .collect();
-    for leaf_id in &root_ids {
-        if facts_by_id
-            .get(leaf_id)
-            .and_then(Option::as_ref)
-            .is_some_and(|facts| delegation::facts_mode_is_invalid(Some(facts)))
-        {
-            return Err(InvocationError::InvalidDelegationMode.into());
+            Some(_) => {}
+            None => unmarked.push(*leaf_id),
         }
-        // Walk strict ancestors of `leaf_id` using `edges` (excluding `leaf_id` itself).
         let mut visited = std::collections::HashSet::from([*leaf_id]);
-        let mut frontier: Vec<Hash> = edges.get(leaf_id).cloned().unwrap_or_default();
+        let mut frontier: Vec<Hash> = closure.edges.get(leaf_id).cloned().unwrap_or_default();
         while let Some(ancestor_id) = frontier.pop() {
             if !visited.insert(ancestor_id) {
                 continue;
             }
-            if facts_by_id
-                .get(&ancestor_id)
-                .and_then(Option::as_ref)
-                .is_some_and(|facts| delegation::facts_is_terminal(Some(facts)))
-            {
-                return Err(InvocationError::TerminalParentCannotRedelegate.into());
+            match closure.modes.get(&ancestor_id) {
+                Some(mode) if mode.is_terminal_or_invalid() => {
+                    return Err(InvocationError::TerminalParentCannotRedelegate.into());
+                }
+                Some(_) => {}
+                None => {
+                    strict_ancestors.push(ancestor_id);
+                    unmarked.push(ancestor_id);
+                }
             }
-            if let Some(next_parents) = edges.get(&ancestor_id) {
+            if let Some(next_parents) = closure.edges.get(&ancestor_id) {
                 for parent in next_parents {
                     if !visited.contains(parent) {
                         frontier.push(*parent);
@@ -509,7 +496,50 @@ pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
             }
         }
     }
+    if unmarked.is_empty() {
+        return Ok(());
+    }
+    unmarked.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    unmarked.dedup();
+    let derived = delegation_mode::resolve_unmarked_modes(db, &unmarked, encryption).await?;
+    for leaf_id in root_ids {
+        if derived.get(leaf_id).is_some_and(|mode| mode.is_invalid()) {
+            return Err(InvocationError::InvalidDelegationMode.into());
+        }
+    }
+    for ancestor_id in &strict_ancestors {
+        if derived
+            .get(ancestor_id)
+            .is_some_and(|mode| mode.is_terminal_or_invalid())
+        {
+            return Err(InvocationError::TerminalParentCannotRedelegate.into());
+        }
+    }
     Ok(())
+}
+
+/// Lock-free, single-query preflight check for terminal strict ancestors and
+/// quarantined `invalid` leaves (used by `/delegation/status` and
+/// `revocation::control_proof_decision_at`). Pure read-only SQL, never reads
+/// `delegation.facts`.
+pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
+    db: &C,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
+    let closure = crate::auth_graph::load_closure_with_modes(db, &root_ids)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    check_closure_modes(db, &root_ids, &closure, encryption).await
 }
 
 async fn validate_capabilities<C: ConnectionTrait>(
@@ -2305,6 +2335,13 @@ mod tests {
             .insert(&db)
             .await
             .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
             abilities::ActiveModel {
                 delegation: Set(id),
                 resource: Set(resource.parse().unwrap()),
@@ -2470,6 +2507,13 @@ mod tests {
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
                 first_seen_at: Default::default(),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&db)
             .await

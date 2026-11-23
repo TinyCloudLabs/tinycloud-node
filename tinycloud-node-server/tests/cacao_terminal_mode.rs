@@ -37,7 +37,9 @@ use tinycloud_auth::{
 use tinycloud_core::{
     hash::Hash,
     keys::StaticSecret,
-    models::{abilities, actor, delegation, delegation_cid_alias, invocation_replay},
+    models::{
+        abilities, actor, delegation, delegation_cid_alias, delegation_mode, invocation_replay,
+    },
     relationships::parent_delegations,
     sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, EntityTrait, PaginatorTrait},
 };
@@ -689,6 +691,7 @@ async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() 
     let status_body = json!({ "cid": target_cid.to_string() }).to_string();
 
     // 1. Invalid-marked status grant on `<space>/delegation` -> 401 invalid-delegation-mode.
+    // `delegation.facts` is left `None`; the mark lives exclusively in `delegation_mode`.
     let bad_holder = JWK::generate_ed25519()?;
     let (bad_holder_did, _) = verification_method(&bad_holder);
     let bad_tok = signed_cacao_malformed_mode(
@@ -710,11 +713,6 @@ async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() 
         .ok();
     }
     let now = OffsetDateTime::now_utc();
-    let mut invalid_facts = BTreeMap::new();
-    invalid_facts.insert(
-        tinycloud_core::util::DelegationMode::FACT_KEY.to_string(),
-        json!("invalid"),
-    );
     delegation::ActiveModel {
         id: Set(bad_hash),
         delegator: Set(wallet.did.clone()),
@@ -722,7 +720,7 @@ async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() 
         expiry: Set(Some(now + time::Duration::hours(1))),
         issued_at: Set(Some(now)),
         not_before: Set(Some(now - time::Duration::minutes(1))),
-        facts: Set(Some(tinycloud_core::types::Facts(invalid_facts))),
+        facts: Set(None),
         serialization: Set(bad_bytes),
         serialization_format: Set(0),
         first_seen_at: Set(Some(now)),
@@ -733,6 +731,12 @@ async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() 
         id: Set(bad_hash),
         canonical: Set(bad_hash),
         encrypted: Set(false),
+    }
+    .insert(&db)
+    .await?;
+    delegation_mode::ActiveModel {
+        delegation_id: Set(bad_hash),
+        mode: Set("invalid".to_string()),
     }
     .insert(&db)
     .await?;
@@ -767,6 +771,33 @@ async fn http_delegation_status_enforces_invalid_and_terminal_ancestor_proofs() 
         status,
         Status::Unauthorized,
         "invalid-marked status grant must return 401: {body}"
+    );
+    assert_eq!(body, "invalid-delegation-mode");
+
+    // 1b. Deleting the `delegation_mode` row (unmarked) STILL returns 401
+    // invalid-delegation-mode via fail-closed derive-on-read.
+    delegation_mode::Entity::delete_by_id(bad_hash)
+        .exec(&db)
+        .await?;
+    let inv_bad_unmarked = signed_invocation(
+        &bad_holder,
+        &node_did(),
+        &[(&target_status_res, "tinycloud.delegation/status")],
+        &[bad_cid],
+        None,
+    )?;
+    let (status, body) = post_auth(
+        &client,
+        "/delegation/status",
+        &inv_bad_unmarked,
+        Some(&status_body),
+        ContentType::JSON,
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "unmarked malformed status grant must fail closed with 401: {body}"
     );
     assert_eq!(body, "invalid-delegation-mode");
 

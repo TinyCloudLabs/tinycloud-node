@@ -390,6 +390,11 @@ pub struct KvInvokeOptions {
     /// no KV mutation (see [`kv_mutation_keys`]), which has no such
     /// transaction.
     pub replay: Option<invocation_replay::Model>,
+    /// Optional invocation-replay reservation for a read-only KV invocation
+    /// (TC-3810): spent inside `invoke_read_only` right after authorization
+    /// succeeds and before reading KV, so refused reads spend zero replay rows
+    /// and retried reads do not double-spend after the insert has committed.
+    pub read_replay: Option<Arc<std::sync::Mutex<Option<invocation_replay::Model>>>>,
     /// TC-3217: `Some` for a batch read (every capability a `kv/get`, or
     /// every one a `kv/metadata`), holding the batch states the client
     /// already has (from `If-None-Match`; often none). The invocation answers
@@ -590,20 +595,25 @@ async fn invocation_authorization_graph<C: ConnectionTrait>(
     roots: &[Hash],
     identity: Option<&crate::renewal::RenewalNodeIdentity>,
     now: OffsetDateTime,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<crate::auth_graph::AuthGraphSnapshot, invocation::Error> {
     let result = match identity {
         Some(identity) => {
-            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+            crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity_and_encryption(
                 conn,
                 roots,
                 &identity.stable_node_did,
                 &identity.renewer_did,
                 identity.epoch,
                 now.unix_timestamp(),
+                encryption,
             )
             .await
         }
-        None => crate::auth_graph::AuthGraphSnapshot::load(conn, roots).await,
+        None => {
+            crate::auth_graph::AuthGraphSnapshot::load_with_encryption(conn, roots, encryption)
+                .await
+        }
     };
     result.map_err(|error| match error {
         crate::auth_graph::ChainTraversalError::Db(error) => invocation::Error::Db(error),
@@ -620,6 +630,7 @@ async fn verify_invocation_authorization<C: ConnectionTrait>(
     now: OffsetDateTime,
     identity: Option<&crate::renewal::RenewalNodeIdentity>,
     delegated_sql_caveats: bool,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<(), invocation::Error> {
     invocation::verify_invocation(&invocation.invocation).await?;
     let roots = invocation
@@ -628,7 +639,7 @@ async fn verify_invocation_authorization<C: ConnectionTrait>(
         .copied()
         .map(Hash::from)
         .collect::<Vec<_>>();
-    let graph = invocation_authorization_graph(conn, &roots, identity, now).await?;
+    let graph = invocation_authorization_graph(conn, &roots, identity, now, encryption).await?;
     invocation::authorize_admitted(conn, invocation, now, Some(&graph), delegated_sql_caveats).await
 }
 
@@ -647,6 +658,7 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
     renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
     check_hosted: bool,
     fence: Option<&crate::space_purge_fence::SpacePurgeFence>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<(), TxError<B, K>> {
     let (mode, lifecycle) = space_purge::probe::<B, K, _>(conn, fence, &invocation.0, mode).await?;
     match mode {
@@ -658,9 +670,10 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
                 .copied()
                 .map(Hash::from)
                 .collect::<Vec<_>>();
-            let graph = invocation_authorization_graph(conn, &roots, renewal_identity, now)
-                .await
-                .map_err(TxError::<B, K>::from)?;
+            let graph =
+                invocation_authorization_graph(conn, &roots, renewal_identity, now, encryption)
+                    .await
+                    .map_err(TxError::<B, K>::from)?;
             invocation::authorize_admitted(
                 conn,
                 &invocation.0,
@@ -677,6 +690,7 @@ async fn authorize_mutation_preupload<C: ConnectionTrait, B: StorageSetup, K: Se
             now,
             renewal_identity,
             delegated_sql_caveats,
+            encryption,
         )
         .await
         .map_err(TxError::<B, K>::from)?,
@@ -793,10 +807,11 @@ where
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
-        // TC-3810: reindex stored pre-upgrade CACAO delegation modes from their
-        // signed bytes before returning so no authorization traffic runs until
-        // terminal and malformed-mode markers are indexed.
-        delegation::reindex_cacao_modes(&pool, encryption.as_ref()).await?;
+        // TC-3810: backfill the `delegation_mode` side table from stored signed
+        // bytes before returning so no authorization traffic runs until
+        // terminal and malformed-mode markers are indexed, without rewriting
+        // any historical `delegation` row.
+        delegation_mode::backfill(&pool, encryption.as_ref()).await?;
         let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
             (Some(seed), Some(stable_node_did)) => {
                 let (renewer_did, epoch, _) =
@@ -1295,17 +1310,6 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
-    /// TC-3810: lock-free preflight rejecting invocations whose cited chains
-    /// descend from a terminal ancestor or directly cite a boot-marked
-    /// malformed-mode leaf. Must run after signature verification and before
-    /// replay spend, upload staging, chain/space/writer guards, or data access.
-    pub async fn preflight_invocation_terminal_ancestors(
-        &self,
-        invocation: &crate::util::InvocationInfo,
-    ) -> Result<(), crate::models::invocation::Error> {
-        invocation::preflight_terminal_ancestors(&self.conn, &invocation.parents).await
-    }
-
     /// Run the ordinary invocation authorization kernel without recording an
     /// invocation or performing a data-plane operation.  Specialized routes
     /// (notably encryption decrypt) must call this before dispatch so they
@@ -1337,6 +1341,7 @@ where
             now,
             self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
+            self.encryption.as_ref(),
         )
         .await
     }
@@ -1373,9 +1378,14 @@ where
             .copied()
             .map(Hash::from)
             .collect::<Vec<_>>();
-        let graph =
-            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
-                .await?;
+        let graph = invocation_authorization_graph(
+            &self.conn,
+            &roots,
+            self.renewal_identity.as_ref(),
+            now,
+            self.encryption.as_ref(),
+        )
+        .await?;
         invocation::authorize_admitted(
             &self.conn,
             invocation_info,
@@ -1498,6 +1508,7 @@ where
             now,
             self.renewal_identity.as_ref(),
             self.delegated_sql_caveats,
+            self.encryption.as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -2733,6 +2744,7 @@ where
                 self.renewal_identity
                     .as_ref()
                     .map(|identity| identity.renewer_did.as_str()),
+                self.encryption.as_ref(),
             )
             .await
             .map_err(TxError::from)
@@ -2860,8 +2872,12 @@ where
                 }
             }
             if !db_parent_ids.is_empty() {
-                delegation::check_parent_closure_not_terminal_readonly(&self.conn, &db_parent_ids)
-                    .await?;
+                delegation::check_parent_closure_not_terminal_readonly(
+                    &self.conn,
+                    &db_parent_ids,
+                    self.encryption.as_ref(),
+                )
+                .await?;
             }
             in_batch_terminal.insert(
                 delegation.content_hash(),
@@ -3066,12 +3082,13 @@ where
             if delegation::verify_time(&delegation.0.delegation).is_err() {
                 // Not valid yet: every check but the time window, then
                 // cover it without storing it.
-                delegation::precheck_standing(
+                delegation::precheck_standing_with_encryption(
                     &self.conn,
                     &delegation,
                     self.delegated_sql_caveats,
                     self.named_keys,
                     renewer_did,
+                    self.encryption.as_ref(),
                 )
                 .await
                 .map_err(|error| refused(TxError::from(error)))?;
@@ -3088,6 +3105,7 @@ where
                 self.delegated_sql_caveats,
                 self.named_keys,
                 renewer_did,
+                self.encryption.as_ref(),
             )
             .await
             .map_err(|error| refused(TxError::from(error)))?;
@@ -3295,27 +3313,31 @@ where
             .delegation_effective_expiry_on(&tx, target, verifier_now)
             .await?;
         after_expiry.await;
-        let history =
-            crate::renewal::renewal_history(&tx, &target.to_cid(0x55).to_string(), invoker, proofs)
-                .await
-                .map_err(|error| match error {
-                    crate::renewal::RenewalStoreError::Unauthorized => {
-                        TxError::RenewalHistoryUnauthorized
-                    }
-                    error => TxError::Renewal(error),
-                })?;
+        let history = crate::renewal::renewal_history(
+            &tx,
+            &target.to_cid(0x55).to_string(),
+            invoker,
+            proofs,
+            self.encryption.as_ref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::renewal::RenewalStoreError::Unauthorized => TxError::RenewalHistoryUnauthorized,
+            error => TxError::Renewal(error),
+        })?;
         tx.commit().await?;
         Ok(Some((status, expiry, history)))
     }
 
-    /// Lock-free, read-only delegation-mode check for proof-bearing control
+    /// Lock-free, single-query delegation-mode check for proof-bearing control
     /// requests such as `/delegation/status` (TC-3810): refuses if any cited
     /// leaf is `invalid` or any strict ancestor is `terminal`/`invalid`.
     pub async fn preflight_proof_modes(
         &self,
         parents: &[tinycloud_auth::authorization::Cid],
     ) -> Result<(), invocation::Error> {
-        invocation::preflight_terminal_ancestors(&self.conn, parents).await
+        invocation::preflight_terminal_ancestors(&self.conn, parents, self.encryption.as_ref())
+            .await
     }
 
     async fn delegation_status_on<D: ConnectionTrait>(
@@ -3339,12 +3361,13 @@ where
             .all(conn)
             .await?;
 
-        let authorized = match revocation::control_proof_decision(
+        let authorized = match revocation::control_proof_decision_with_encryption(
             conn,
             invoker,
             proofs,
             revocation::ControlAction::Status,
             &target,
+            self.encryption.as_ref(),
         )
         .await?
         {
@@ -3567,9 +3590,10 @@ where
                 }
             }
         }
-        // TC-3810: verify public invocation signatures once and refuse
-        // terminal strict ancestors (or boot-marked malformed-mode leaves)
-        // before taking chain, KV-object, space-sequence, or writer locks.
+        // TC-3810: verify public invocation signatures once and check modes
+        // directly from the single `load_chain_lock_ids_and_modes` query below
+        // (zero extra round trips) before taking chain, KV-object, space, or
+        // writer locks.
         let mode = if mode == InvokeMode::Public {
             invocation::verify_invocation(&invocation.0.invocation)
                 .await
@@ -3578,11 +3602,6 @@ where
         } else {
             mode
         };
-        if mode == InvokeMode::Admitted {
-            invocation::preflight_terminal_ancestors(&self.conn, &invocation.0.parents)
-                .await
-                .map_err(TxError::<B, K>::from)?;
-        }
         let roots: Vec<Hash> = invocation
             .0
             .parents
@@ -3602,7 +3621,7 @@ where
         );
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_chain_lock_ids(&self.conn, &guard_roots)
+        let closure = crate::auth_graph::load_chain_lock_ids_and_modes(&self.conn, &guard_roots)
             .await
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
@@ -3612,11 +3631,11 @@ where
             });
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainClosureQuery,
-            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            crate::telemetry::StageOutcome::from(closure.is_ok()),
             closure_start.elapsed(),
         );
-        let lock_keys = match lock_keys {
-            Ok(keys) => keys,
+        let closure = match closure {
+            Ok(closure) => closure,
             Err(error) => {
                 crate::telemetry::observe_stage(
                     crate::telemetry::InvocationStage::AuthorizationGraphLoad,
@@ -3626,6 +3645,12 @@ where
                 return Err(TxStoreError::Tx(error));
             }
         };
+        if mode == InvokeMode::Admitted {
+            invocation::check_closure_modes(&self.conn, &roots, &closure, self.encryption.as_ref())
+                .await
+                .map_err(TxError::<B, K>::from)?;
+        }
+        let lock_keys = closure.nodes;
         // TC-324: invocations take the chain guards SHARED. The full ancestor
         // closure is still guarded and the guards are still held through
         // commit, so a revocation (which takes them exclusive) remains
@@ -3947,17 +3972,25 @@ where
                 crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
             let auth_graph_result = match self.renewal_identity.as_ref() {
                 Some(identity) => {
-                    crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                    crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity_and_encryption(
                         &tx,
                         &roots,
                         &identity.stable_node_did,
                         &identity.renewer_did,
                         identity.epoch,
                         now.unix_timestamp(),
+                        self.encryption.as_ref(),
                     )
                     .await
                 }
-                None => crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await,
+                None => {
+                    crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+                        &tx,
+                        &roots,
+                        self.encryption.as_ref(),
+                    )
+                    .await
+                }
             };
             let auth_graph = match auth_graph_result {
                 Ok(graph) => graph,
@@ -4112,6 +4145,7 @@ where
             self.renewal_identity.as_ref(),
             !claim_checks_hosting,
             self.space_purge_fence.as_deref(),
+            self.encryption.as_ref(),
         )
         .await?;
         for space in spaces {
@@ -4405,10 +4439,15 @@ where
                     .and_then(|sync| sync.retention_grant),
             );
         }
-        let auth_graph =
-            invocation_authorization_graph(&self.conn, &roots, self.renewal_identity.as_ref(), now)
-                .await
-                .map_err(TxError::<B, K>::from)?;
+        let auth_graph = invocation_authorization_graph(
+            &self.conn,
+            &roots,
+            self.renewal_identity.as_ref(),
+            now,
+            self.encryption.as_ref(),
+        )
+        .await
+        .map_err(TxError::<B, K>::from)?;
         // The admitted path keeps its single signature verification at admission;
         // public envelopes were verified above. Both re-check time and authority.
         invocation::authorize_admitted(
@@ -4667,6 +4706,32 @@ where
         }
         if let Some((_, state)) = batch_rows.filter(|_| !unreadable) {
             results.push(InvocationOutcome::KvBatchState(state));
+        }
+
+        // TC-3810: spend the read's replay row at the final write boundary
+        // (right before the read audit), after authorization and all read
+        // queries succeed:
+        // - refused invocations never spend a replay row;
+        // - transient connection loss during the preceding read queries leaves
+        //   no write observed so `retry_owner` can safely retry the read;
+        // - a replayed invocation fails before returning any KV data or audit;
+        // - round-trip count stays identical to main (0 extra queries).
+        if let Some(slot) = &options.read_replay {
+            let pending = slot.lock().unwrap().clone();
+            if let Some(row) = pending {
+                let inserted = invocation_replay::Entity::insert(row.into_active_model())
+                    .on_conflict(
+                        OnConflict::column(invocation_replay::Column::ContentHash)
+                            .do_nothing()
+                            .to_owned(),
+                    )
+                    .exec_without_returning(&self.conn)
+                    .await?;
+                if inserted == 0 {
+                    return Err(TxStoreError::InvocationReplayed);
+                }
+                *slot.lock().unwrap() = None;
+            }
         }
 
         let read_audit_start = Instant::now();

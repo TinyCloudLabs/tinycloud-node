@@ -9,6 +9,7 @@ fn graph(edges: &[(Hash, Hash)], rows: &[(Hash, &str)]) -> AuthGraphSnapshot {
     AuthGraphSnapshot {
         parents,
         retired: HashMap::new(),
+        modes: HashMap::new(),
         delegations: rows
             .iter()
             .map(|(id, _)| {

@@ -55,6 +55,7 @@ pub mod m20261117_000000_renewal_switch;
 pub mod m20261120_000000_root_wrap;
 pub mod m20261121_000000_session_retire;
 pub mod m20261122_000000_sql_store_owner;
+pub mod m20261123_000000_delegation_mode;
 
 pub struct Migrator;
 
@@ -115,6 +116,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261120_000000_root_wrap::Migration),
             Box::new(m20261121_000000_session_retire::Migration),
             Box::new(m20261122_000000_sql_store_owner::Migration),
+            Box::new(m20261123_000000_delegation_mode::Migration),
         ]
     }
 }

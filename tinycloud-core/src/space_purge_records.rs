@@ -828,6 +828,10 @@ async fn remove_records(
             .filter(delegation_cid_alias::Column::Id.is_in(page.iter().copied()))
             .exec(tx)
             .await?;
+        models::delegation_mode::Entity::delete_many()
+            .filter(models::delegation_mode::Column::DelegationId.is_in(page.iter().copied()))
+            .exec(tx)
+            .await?;
         revocation::Entity::delete_many()
             .filter(revocation::Column::Id.is_in(page.iter().copied()))
             .exec(tx)
@@ -871,6 +875,19 @@ async fn remove_records(
             .exec(tx).await?;
     }
     Ok(affected)
+}
+
+#[cfg(test)]
+pub(crate) async fn remove_records_for_test(
+    tx: &DatabaseTransaction,
+    deleted: &HashSet<Hash>,
+) -> Result<HashSet<String>, DbErr> {
+    let graph = Graph::default();
+    let mut lease = Lease {
+        job: None,
+        last: std::time::Instant::now(),
+    };
+    remove_records(tx, &graph, deleted, &mut lease).await
 }
 
 /// Called inside the lease-checked terminal transaction, before its tombstone.

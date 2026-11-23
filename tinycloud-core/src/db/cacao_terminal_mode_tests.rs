@@ -460,13 +460,30 @@ async fn terminal_cacao_direct_use_ok_and_ucan_or_cacao_children_refused() {
     );
     must_ok(f.db.delegate(parse_delegation(&t_token)).await);
 
-    // Persisted facts carries terminal mode.
+    // Side table carries terminal mode (written atomically in the same
+    // transaction as the delegation row), and facts keeps "terminal" for
+    // rollback compatibility with older nodes.
+    let mode_row = delegation_mode::Entity::find_by_id(Hash::from(t_cid))
+        .one(&f.db.conn)
+        .await
+        .unwrap()
+        .expect("delegation_mode row must be written in the same transaction as delegation");
+    assert_eq!(
+        delegation_mode::StoredDelegationMode::from_db_str(&mode_row.mode),
+        delegation_mode::StoredDelegationMode::Terminal
+    );
     let row = delegation::Entity::find_by_id(Hash::from(t_cid))
         .one(&f.db.conn)
         .await
         .unwrap()
         .unwrap();
-    assert!(delegation::parent_is_terminal(&row));
+    assert_eq!(
+        row.facts
+            .as_ref()
+            .and_then(|crate::types::Facts(m)| m.get(crate::util::DelegationMode::FACT_KEY))
+            .and_then(|v| v.as_str()),
+        Some("terminal")
+    );
 
     // Direct invocation of T by authenticated audience succeeds for both abilities.
     let inv_kv = signed_invocation(&app_key, &[(&f.kv_res, "tinycloud.kv/get")], &[t_cid]);
@@ -1284,14 +1301,27 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
     .await
     .expect("boot must succeed despite stored malformed-mode CACAO");
 
-    // 1. Terminal CACAO reindexed: direct invoke OK; old child invoke & repost refused.
+    // 1. Terminal CACAO backfilled into side table without rewriting the
+    // historical delegation row (`facts` stays `None`): direct invoke OK; old
+    // child invoke & repost refused.
     let t_row = delegation::Entity::find_by_id(Hash::from(t_cid))
         .one(&reopened.conn)
         .await
         .unwrap()
         .unwrap();
-    assert!(delegation::parent_is_terminal(&t_row));
-    assert!(!delegation::delegation_mode_is_invalid(&t_row));
+    assert!(
+        t_row.facts.is_none(),
+        "boot backfill must never rewrite delegation.facts on historical rows"
+    );
+    let t_mode = delegation_mode::Entity::find_by_id(Hash::from(t_cid))
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .expect("terminal CACAO must have a delegation_mode row");
+    assert_eq!(
+        delegation_mode::StoredDelegationMode::from_db_str(&t_mode.mode),
+        delegation_mode::StoredDelegationMode::Terminal
+    );
     let direct_inv = signed_invocation(&k_term, &[(&f.kv_res, "tinycloud.kv/get")], &[t_cid]);
     reopened
         .authorize_invocation(&direct_inv.0, OffsetDateTime::now_utc())
@@ -1317,15 +1347,27 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         ))
     ));
 
-    // 2. Malformed-mode CACAO marked terminal AND refused: direct invoke,
-    // descendant invoke, and new child registration all fail.
+    // 2. Malformed-mode CACAO marked invalid in side table (delegation row
+    // untouched): direct invoke, descendant invoke, and new child registration
+    // all fail.
     let bad_row = delegation::Entity::find_by_id(bad_hash)
         .one(&reopened.conn)
         .await
         .unwrap()
         .unwrap();
-    assert!(delegation::parent_is_terminal(&bad_row));
-    assert!(delegation::delegation_mode_is_invalid(&bad_row));
+    assert!(
+        bad_row.facts.is_none(),
+        "boot backfill must never rewrite delegation.facts on malformed historical rows"
+    );
+    let bad_mode = delegation_mode::Entity::find_by_id(bad_hash)
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .expect("malformed CACAO must have a delegation_mode row");
+    assert_eq!(
+        delegation_mode::StoredDelegationMode::from_db_str(&bad_mode.mode),
+        delegation_mode::StoredDelegationMode::Invalid
+    );
     let bad_direct = signed_invocation(&k_bad, &[(&f.kv_res, "tinycloud.kv/get")], &[bad_cid]);
     assert!(matches!(
         reopened
@@ -1380,24 +1422,26 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         None
     );
 
-    // 3. Normal attenuable row & its child are marked explicitly "attenuable",
-    // never treated as terminal (including by older-node rollback checks), and
+    // 3. Normal attenuable row & its child are marked "attenuable" in the
+    // side table while leaving `delegation.facts` untouched (`None`), and
     // remain unaffected.
     let ok_row = delegation::Entity::find_by_id(Hash::from(ok_cid))
         .one(&reopened.conn)
         .await
         .unwrap()
         .unwrap();
-    assert!(!delegation::parent_is_terminal(&ok_row));
-    assert!(!delegation::delegation_mode_is_invalid(&ok_row));
+    assert!(
+        ok_row.facts.is_none(),
+        "boot backfill must never rewrite delegation.facts on attenuable historical rows"
+    );
+    let ok_mode = delegation_mode::Entity::find_by_id(Hash::from(ok_cid))
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .expect("attenuable CACAO must have a delegation_mode row");
     assert_eq!(
-        ok_row
-            .facts
-            .as_ref()
-            .and_then(|crate::types::Facts(m)| m.get(crate::util::DelegationMode::FACT_KEY))
-            .and_then(|v| v.as_str()),
-        Some("attenuable"),
-        "scanned legacy row must be marked explicitly attenuable so future boots skip it"
+        delegation_mode::StoredDelegationMode::from_db_str(&ok_mode.mode),
+        delegation_mode::StoredDelegationMode::Attenuable
     );
     let ok_inv = signed_invocation(
         &k_ok_child,
@@ -1483,9 +1527,9 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         Err(crate::renewal::RenewalStoreError::InvalidInput)
     ));
 
-    // 5. F1: Second boot scans 0 rows (both previously indexed rows and newly
-    // saved rows already carry `delegationMode` in `facts`).
-    let stats = delegation::reindex_cacao_modes(&reopened.conn, Some(&encryption))
+    // 5. F1: Second boot scans 0 rows (both previously backfilled rows and
+    // newly saved rows already carry a `delegation_mode` row).
+    let stats = delegation_mode::backfill(&reopened.conn, Some(&encryption))
         .await
         .unwrap();
     assert!(stats.completed);
@@ -1496,7 +1540,7 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
 
     let fresh_key = JWK::generate_ed25519().unwrap();
     let (fresh_did, _) = verification_method(&fresh_key);
-    let (fresh_tok, _, _) = signed_cacao_token(
+    let (fresh_tok, fresh_cid, _) = signed_cacao_token(
         &f.wallet,
         &fresh_did,
         &[(&f.kv_res, "tinycloud.kv/get")],
@@ -1505,7 +1549,26 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
         "freshsave01",
     );
     must_ok(reopened.delegate(parse_delegation(&fresh_tok)).await);
-    let stats_after_save = delegation::reindex_cacao_modes(&reopened.conn, Some(&encryption))
+    // Same-tx mark row exists immediately, and `delegation.facts` stays None.
+    let fresh_mode = delegation_mode::Entity::find_by_id(Hash::from(fresh_cid))
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .expect("newly saved attenuable delegation must write delegation_mode in same tx");
+    assert_eq!(
+        delegation_mode::StoredDelegationMode::from_db_str(&fresh_mode.mode),
+        delegation_mode::StoredDelegationMode::Attenuable
+    );
+    let fresh_row = delegation::Entity::find_by_id(Hash::from(fresh_cid))
+        .one(&reopened.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fresh_row.facts.is_none(),
+        "newly saved attenuable CACAO keeps facts = None"
+    );
+    let stats_after_save = delegation_mode::backfill(&reopened.conn, Some(&encryption))
         .await
         .unwrap();
     assert!(stats_after_save.completed);
@@ -1547,22 +1610,20 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
     }
 
     // Simulate interruption after page 1 (128 rows).
-    let partial = delegation::reindex_cacao_modes_bounded(&f_plain.db.conn, None, Some(1))
+    let partial = delegation_mode::backfill_bounded(&f_plain.db.conn, None, Some(1))
         .await
         .unwrap();
     assert!(!partial.completed, "1-page bounded run must stop early");
     assert_eq!(partial.scanned, 128);
     assert_eq!(partial.reindexed_terminal, 128);
 
-    // Confirm 12 rows on page 2 are not yet marked.
-    let unmarked_before: usize = delegation::Entity::find()
+    // Confirm 12 rows on page 2 are not yet marked in `delegation_mode`.
+    let marked_before = delegation_mode::Entity::find()
         .all(&f_plain.db.conn)
         .await
         .unwrap()
-        .into_iter()
-        .filter(|row| !delegation::parent_is_terminal(row))
-        .count();
-    assert_eq!(unmarked_before, 12);
+        .len();
+    assert_eq!(marked_before, 128);
 
     // Restart: SpaceDatabase::new runs reindex to completion before returning.
     let restarted = SpaceDatabase::new(
@@ -1572,18 +1633,21 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
     )
     .await
     .unwrap();
-    let unmarked_after: usize = delegation::Entity::find()
+    let marked_after: usize = delegation_mode::Entity::find()
         .all(&restarted.conn)
         .await
         .unwrap()
         .into_iter()
-        .filter(|row| !delegation::parent_is_terminal(row))
+        .filter(|row| {
+            delegation_mode::StoredDelegationMode::from_db_str(&row.mode)
+                == delegation_mode::StoredDelegationMode::Terminal
+        })
         .count();
     assert_eq!(
-        unmarked_after, 0,
-        "all 140 rows must be reindexed on restart"
+        marked_after, 140,
+        "all 140 rows must be backfilled in delegation_mode on restart"
     );
-    let second_boot = delegation::reindex_cacao_modes(&restarted.conn, None)
+    let second_boot = delegation_mode::backfill(&restarted.conn, None)
         .await
         .unwrap();
     assert!(second_boot.completed);
@@ -1613,11 +1677,403 @@ async fn boot_reindex_handles_plaintext_encrypted_malformed_and_interrupted_rest
     }
 }
 
-/// TC-3810 (F6): exercise the PostgreSQL `facts::jsonb ->> 'xyz.tinycloud.policy/delegationMode'`
-/// filter and per-page `EXEMPT_STATEMENT_TIMEOUT` transaction during boot
-/// reindex, verifying scan, mark (`terminal`, `invalid`, `attenuable`), and
-/// that a second boot scans 0 rows. Runs in `.github/workflows/rust.yml`
-/// (`test (workspace, PostgreSQL-backed, unit)`).
+/// TC-3810 (Bobbie checklist a, b, c):
+/// (a) Missing `delegation_mode` mark row is always fail-closed: unmarked rows
+///     derive their mode on read from the stored signed bytes, and decryption
+///     or parse failures map to `Invalid` (never `Attenuable`).
+/// (b) `delegate()` writes `delegation_mode` in the same transaction as
+///     `delegation` (for both accepted writes and rolled-back/refused writes).
+/// (c) Space purge cleans up `delegation_mode` rows alongside `delegation`.
+#[tokio::test]
+async fn unmarked_rows_fail_closed_same_tx_write_and_purge_cleanup() {
+    let encryption = ColumnEncryption::new([0x4c; 32]);
+    let f = Fixture::new(Some(encryption.clone())).await;
+    let seeder = JWK::generate_ed25519().unwrap();
+    f.seed_kv_value(&seeder, b"side-table-secret").await;
+
+    let k_term = JWK::generate_ed25519().unwrap();
+    let (d_term, _) = verification_method(&k_term);
+    let k_bad = JWK::generate_ed25519().unwrap();
+    let (d_bad, _) = verification_method(&k_bad);
+    let k_enc = JWK::generate_ed25519().unwrap();
+    let (d_enc, _) = verification_method(&k_enc);
+    let k_corrupt = JWK::generate_ed25519().unwrap();
+    let (d_corrupt, _) = verification_method(&k_corrupt);
+    let k_sub = JWK::generate_ed25519().unwrap();
+    let (d_sub, _) = verification_method(&k_sub);
+
+    // 1. Register a terminal CACAO via normal delegate(), verify mark row
+    // exists in the same tx, then DELETE its mark row to simulate an unmarked
+    // row (e.g. crashed/skipped backfill or manual row deletion).
+    let (t_tok, t_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &d_term,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "unmarkterm1",
+    );
+    must_ok(f.db.delegate(parse_delegation(&t_tok)).await);
+    let t_hash = Hash::from(t_cid);
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(t_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("terminal".to_string())
+    );
+    delegation_mode::Entity::delete_by_id(t_hash)
+        .exec(&f.db.conn)
+        .await
+        .unwrap();
+    assert!(delegation_mode::Entity::find_by_id(t_hash)
+        .one(&f.db.conn)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Unmarked terminal CACAO: direct use still works, child registration and
+    // child invocation STILL refuse (derive-on-read from signed bytes).
+    let direct_inv = signed_invocation(&k_term, &[(&f.kv_res, "tinycloud.kv/get")], &[t_cid]);
+    must_ok(
+        f.db.invoke::<MemoryStaging>(direct_inv, HashMap::new())
+            .await,
+    );
+    let (child_of_unmarked_t, child_of_unmarked_t_cid) = signed_ucan_delegation(
+        &k_term,
+        &d_sub,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[t_cid],
+        false,
+    );
+    assert!(matches!(
+        f.db.delegate(child_of_unmarked_t.clone()).await,
+        Err(TxError::InvalidDelegation(
+            delegation::DelegationError::TerminalParentCannotRedelegate
+        ))
+    ));
+    // Refused delegation wrote neither `delegation` nor `delegation_mode`.
+    assert!(
+        delegation::Entity::find_by_id(Hash::from(child_of_unmarked_t_cid))
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        delegation_mode::Entity::find_by_id(Hash::from(child_of_unmarked_t_cid))
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Insert a pre-upgrade legacy child under the unmarked terminal parent ->
+    // invocation and delegation_status must refuse.
+    f.insert_pre_upgrade_row(
+        child_of_unmarked_t.content_hash(),
+        &d_term,
+        &d_sub,
+        child_of_unmarked_t.serialized_bytes(),
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[t_hash],
+        Some(&encryption),
+    )
+    .await;
+    let inv_via_unmarked_t = signed_invocation(
+        &k_sub,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[child_of_unmarked_t_cid],
+    );
+    assert!(matches!(
+        f.db.invoke::<MemoryStaging>(inv_via_unmarked_t, HashMap::new())
+            .await,
+        Err(TxStoreError::Tx(TxError::InvalidInvocation(
+            invocation::InvocationError::TerminalParentCannotRedelegate
+        )))
+    ));
+    assert_eq!(
+        must_ok(
+            f.db.delegation_status(t_hash, &d_sub, &[child_of_unmarked_t_cid])
+                .await
+        ),
+        None
+    );
+
+    // 2. Unmarked malformed-mode CACAO (encrypted, NO delegation_mode row):
+    // direct invocation refused with InvalidDelegationMode, child refused with
+    // TerminalParentCannotRedelegate.
+    let (bad_bytes, bad_hash, bad_cid) = signed_cacao_with_raw_recap_tail(
+        &f.wallet,
+        &d_bad,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        r#""xyz.tinycloud.policy/delegationMode":"bogus""#,
+        "unmarkbad01",
+    );
+    f.insert_pre_upgrade_row(
+        bad_hash,
+        &f.wallet.did,
+        &d_bad,
+        &bad_bytes,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(&encryption),
+    )
+    .await;
+    let bad_direct = signed_invocation(&k_bad, &[(&f.kv_res, "tinycloud.kv/get")], &[bad_cid]);
+    assert!(matches!(
+        f.db.invoke::<MemoryStaging>(bad_direct, HashMap::new())
+            .await,
+        Err(TxStoreError::Tx(TxError::InvalidInvocation(
+            invocation::InvocationError::InvalidDelegationMode
+        )))
+    ));
+    let (bad_child, _) = signed_ucan_delegation(
+        &k_bad,
+        &d_sub,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[bad_cid],
+        false,
+    );
+    assert!(matches!(
+        f.db.delegate(bad_child).await,
+        Err(TxError::InvalidDelegation(
+            delegation::DelegationError::TerminalParentCannotRedelegate
+        ))
+    ));
+
+    // 3. Unmarked encrypted CACAO whose decryption FAILS (wrong/missing key):
+    // derive-on-read fails closed to `Invalid`, NEVER `Attenuable`.
+    let (enc_tok, enc_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &d_enc,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Attenuable),
+        "unmarkenc01",
+    );
+    let (_, enc_bytes) = TinyCloudDelegation::decode(&enc_tok).unwrap();
+    let enc_hash = Hash::from(enc_cid);
+    f.insert_pre_upgrade_row(
+        enc_hash,
+        &f.wallet.did,
+        &d_enc,
+        &enc_bytes,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(&encryption),
+    )
+    .await;
+    // Load the graph WITHOUT the encryption key (decryption fails).
+    let wrong_key_graph =
+        crate::auth_graph::AuthGraphSnapshot::load_with_encryption(&f.db.conn, &[enc_hash], None)
+            .await
+            .unwrap();
+    assert_eq!(
+        wrong_key_graph.delegation_mode(&enc_hash),
+        Some(delegation_mode::StoredDelegationMode::Invalid),
+        "undecryptable unmarked row must fail closed to Invalid"
+    );
+    let wrong_key_err = invocation::preflight_terminal_ancestors(&f.db.conn, &[enc_cid], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_key_err,
+        invocation::Error::InvalidInvocation(invocation::InvocationError::InvalidDelegationMode)
+    ));
+
+    // 4. Unmarked unparseable plaintext row: fails closed as non-attenuable
+    // (`Terminal`), so it can never be cited as a parent for redelegation.
+    let corrupt_bytes = b"not-a-valid-ucan-or-cacao-payload".to_vec();
+    let corrupt_hash = crate::hash::hash(&corrupt_bytes);
+    let corrupt_cid = corrupt_hash.to_cid(0x55);
+    f.insert_pre_upgrade_row(
+        corrupt_hash,
+        &f.wallet.did,
+        &d_corrupt,
+        &corrupt_bytes,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+    let corrupt_graph = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+        &f.db.conn,
+        &[corrupt_hash],
+        Some(&encryption),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        corrupt_graph.delegation_mode(&corrupt_hash),
+        Some(delegation_mode::StoredDelegationMode::Terminal),
+        "unparseable unmarked plaintext row must fail closed to Terminal (non-attenuable)"
+    );
+    let (corrupt_child, _) = signed_ucan_delegation(
+        &k_corrupt,
+        &d_sub,
+        &[(&f.kv_res, "tinycloud.kv/get")],
+        &[corrupt_cid],
+        false,
+    );
+    assert!(matches!(
+        f.db.delegate(corrupt_child).await,
+        Err(TxError::InvalidDelegation(
+            delegation::DelegationError::TerminalParentCannotRedelegate
+        ))
+    ));
+
+    // 5. Space purge record deletion cleans up `delegation_mode` rows
+    // alongside `delegation` rows (even when SQLite foreign_keys is OFF).
+    let backfilled = delegation_mode::backfill(&f.db.conn, Some(&encryption))
+        .await
+        .unwrap();
+    assert!(backfilled.completed);
+    assert!(delegation_mode::Entity::find_by_id(t_hash)
+        .one(&f.db.conn)
+        .await
+        .unwrap()
+        .is_some());
+    let deleted: HashSet<Hash> = [t_hash].into_iter().collect();
+    let tx = f.db.conn.begin().await.unwrap();
+    crate::space_purge_records::remove_records_for_test(&tx, &deleted)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        delegation_mode::Entity::find_by_id(t_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .is_none(),
+        "space purge must remove delegation_mode rows for deleted delegations"
+    );
+}
+
+/// TC-3810 (required test): a REAL legacy signed DAG-CBOR CACAO row that is
+/// attenuable by its signed statement, stored with NO `delegation_mode` row,
+/// resolves to `Attenuable` on the read path (before backfill) AND after boot
+/// backfill, and can parent a redelegation and authorize its child invocation.
+#[tokio::test]
+async fn real_legacy_attenuable_cacao_unmarked_read_path_and_after_backfill_can_parent_redelegation(
+) {
+    for encrypted in [false, true] {
+        let encryption = encrypted.then(|| ColumnEncryption::new([0x6d; 32]));
+        let f = Fixture::new(encryption.clone()).await;
+        let seeder = JWK::generate_ed25519().unwrap();
+        f.seed_kv_value(&seeder, b"legacy-attenuable-ok").await;
+
+        let holder = JWK::generate_ed25519().unwrap();
+        let (holder_did, _) = verification_method(&holder);
+        let sub1 = JWK::generate_ed25519().unwrap();
+        let (sub1_did, _) = verification_method(&sub1);
+        let sub2 = JWK::generate_ed25519().unwrap();
+        let (sub2_did, _) = verification_method(&sub2);
+
+        // Insert a real wallet-signed DAG-CBOR CACAO (absent delegationMode ->
+        // attenuable by its signed statement) with NO `delegation_mode` row.
+        let (cacao_tok, cacao_cid, _) = signed_cacao_token(
+            &f.wallet,
+            &holder_did,
+            &[(&f.kv_res, "tinycloud.kv/get")],
+            &[],
+            None,
+            if encrypted {
+                "legattenc01"
+            } else {
+                "legattpln01"
+            },
+        );
+        let (_, cacao_bytes) = TinyCloudDelegation::decode(&cacao_tok).unwrap();
+        let cacao_hash = Hash::from(cacao_cid);
+        f.insert_pre_upgrade_row(
+            cacao_hash,
+            &f.wallet.did,
+            &holder_did,
+            &cacao_bytes,
+            &[(&f.kv_res, "tinycloud.kv/get")],
+            &[],
+            encryption.as_ref(),
+        )
+        .await;
+        assert!(
+            delegation_mode::Entity::find_by_id(cacao_hash)
+                .one(&f.db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "legacy CACAO starts with no delegation_mode row"
+        );
+
+        // 1. Read path BEFORE backfill: resolves Attenuable and can parent a
+        // redelegation + invoke.
+        let graph_before = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+            &f.db.conn,
+            &[cacao_hash],
+            encryption.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            graph_before.delegation_mode(&cacao_hash),
+            Some(delegation_mode::StoredDelegationMode::Attenuable),
+            "unmarked real legacy attenuable CACAO must resolve Attenuable on read path"
+        );
+        let (child1, child1_cid) = signed_ucan_delegation(
+            &holder,
+            &sub1_did,
+            &[(&f.kv_res, "tinycloud.kv/get")],
+            &[cacao_cid],
+            false,
+        );
+        must_ok(f.db.delegate(child1).await);
+        let inv1 = signed_invocation(&sub1, &[(&f.kv_res, "tinycloud.kv/get")], &[child1_cid]);
+        must_ok(f.db.invoke::<MemoryStaging>(inv1, HashMap::new()).await);
+
+        // 2. Boot backfill marks the legacy CACAO `attenuable` without
+        // rewriting `delegation.facts`, and it continues to parent
+        // redelegations.
+        let stats = delegation_mode::backfill(&f.db.conn, encryption.as_ref())
+            .await
+            .unwrap();
+        assert!(stats.completed);
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.marked_attenuable, 1);
+        let row = delegation::Entity::find_by_id(cacao_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.facts.is_none());
+        let mode_row = delegation_mode::Entity::find_by_id(cacao_hash)
+            .one(&f.db.conn)
+            .await
+            .unwrap()
+            .expect("backfill must mark legacy CACAO");
+        assert_eq!(
+            delegation_mode::StoredDelegationMode::from_db_str(&mode_row.mode),
+            delegation_mode::StoredDelegationMode::Attenuable
+        );
+        let (child2, child2_cid) = signed_ucan_delegation(
+            &holder,
+            &sub2_did,
+            &[(&f.kv_res, "tinycloud.kv/get")],
+            &[cacao_cid],
+            false,
+        );
+        must_ok(f.db.delegate(child2).await);
+        let inv2 = signed_invocation(&sub2, &[(&f.kv_res, "tinycloud.kv/get")], &[child2_cid]);
+        must_ok(f.db.invoke::<MemoryStaging>(inv2, HashMap::new()).await);
+    }
+}
+
+/// TC-3810 (F6 + Bobbie checklist b, c, d): exercise the PostgreSQL side-table
+/// `delegation_mode` backfill (`NOT EXISTS` PK anti-join + per-page
+/// `EXEMPT_STATEMENT_TIMEOUT`), verify historical `delegation` rows are NEVER
+/// rewritten, verify same-tx writes via `SpaceDatabase::delegate`, verify
+/// `ON DELETE CASCADE` removes `delegation_mode` rows when `delegation` rows
+/// are deleted, and verify a second boot scans 0 rows. Runs in
+/// `.github/workflows/rust.yml` (`test (workspace, PostgreSQL-backed, unit)`).
 #[tokio::test]
 async fn postgres_cacao_delegation_mode_boot_reindex() {
     let Some(pg) =
@@ -1738,50 +2194,84 @@ async fn postgres_cacao_delegation_mode_boot_reindex() {
     )
     .await;
 
-    // First boot reindex against Postgres.
-    let first = delegation::reindex_cacao_modes(&pg.conn, None)
+    // Before backfill on Postgres: `ok_cid` is a real legacy signed DAG-CBOR
+    // CACAO with NO `delegation_mode` row. On the read path it resolves
+    // Attenuable and can parent a redelegation (before boot backfill runs).
+    assert!(delegation_mode::Entity::find_by_id(Hash::from(ok_cid))
+        .one(&pg.conn)
         .await
-        .unwrap();
+        .unwrap()
+        .is_none());
+    let unmarked_pg_graph =
+        crate::auth_graph::AuthGraphSnapshot::load(&pg.conn, &[Hash::from(ok_cid)])
+            .await
+            .unwrap();
+    assert_eq!(
+        unmarked_pg_graph.delegation_mode(&Hash::from(ok_cid)),
+        Some(delegation_mode::StoredDelegationMode::Attenuable),
+        "unmarked real legacy attenuable CACAO must resolve Attenuable on Postgres read path"
+    );
+    let k_pre = JWK::generate_ed25519().unwrap();
+    let (d_pre, _) = verification_method(&k_pre);
+    let (pre_child, _) = signed_ucan_delegation(
+        &k_ok,
+        &d_pre,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[ok_cid],
+        false,
+    );
+    delegation::precheck_standing_with_encryption(&pg.conn, &pre_child, false, false, None, None)
+        .await
+        .expect(
+            "unmarked real legacy attenuable CACAO must allow redelegation on Postgres read path",
+        );
+
+    // First boot backfill against Postgres.
+    let first = delegation_mode::backfill(&pg.conn, None).await.unwrap();
     assert!(first.completed);
     assert_eq!(first.scanned, 4);
     assert_eq!(first.reindexed_terminal, 1);
     assert_eq!(first.marked_invalid, 1);
     assert_eq!(first.marked_attenuable, 2);
 
-    let t_row = delegation::Entity::find_by_id(Hash::from(t_cid))
-        .one(&pg.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(delegation::parent_is_terminal(&t_row));
-    assert!(!delegation::delegation_mode_is_invalid(&t_row));
-
-    let bad_row = delegation::Entity::find_by_id(bad_hash)
-        .one(&pg.conn)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(delegation::parent_is_terminal(&bad_row));
-    assert!(delegation::delegation_mode_is_invalid(&bad_row));
-
-    for id in [Hash::from(ok_cid), ucan_child.content_hash()] {
+    // Historical `delegation` rows were NOT rewritten (facts remains None),
+    // and `delegation_mode` carries the exact expected marks.
+    for (id, expected) in [
+        (
+            Hash::from(t_cid),
+            delegation_mode::StoredDelegationMode::Terminal,
+        ),
+        (bad_hash, delegation_mode::StoredDelegationMode::Invalid),
+        (
+            Hash::from(ok_cid),
+            delegation_mode::StoredDelegationMode::Attenuable,
+        ),
+        (
+            ucan_child.content_hash(),
+            delegation_mode::StoredDelegationMode::Attenuable,
+        ),
+    ] {
         let row = delegation::Entity::find_by_id(id)
             .one(&pg.conn)
             .await
             .unwrap()
             .unwrap();
-        assert!(!delegation::parent_is_terminal(&row));
-        assert!(!delegation::delegation_mode_is_invalid(&row));
+        assert!(
+            row.facts.is_none(),
+            "Postgres backfill must never rewrite delegation.facts"
+        );
+        let mode_row = delegation_mode::Entity::find_by_id(id)
+            .one(&pg.conn)
+            .await
+            .unwrap()
+            .expect("backfilled delegation_mode row must exist");
         assert_eq!(
-            row.facts
-                .as_ref()
-                .and_then(|crate::types::Facts(m)| m.get(crate::util::DelegationMode::FACT_KEY))
-                .and_then(|v| v.as_str()),
-            Some("attenuable")
+            delegation_mode::StoredDelegationMode::from_db_str(&mode_row.mode),
+            expected
         );
     }
 
-    // Second boot reindex via SpaceDatabase::new + direct check must scan 0 rows.
+    // Second boot backfill via SpaceDatabase::new + direct check must scan 0 rows.
     let db = SpaceDatabase::new(
         pg.conn.clone(),
         MemoryStore::default(),
@@ -1789,12 +2279,79 @@ async fn postgres_cacao_delegation_mode_boot_reindex() {
     )
     .await
     .unwrap();
-    let second = delegation::reindex_cacao_modes(&db.conn, None)
-        .await
-        .unwrap();
+    let second = delegation_mode::backfill(&db.conn, None).await.unwrap();
     assert!(second.completed);
     assert_eq!(second.scanned, 0, "second Postgres boot must scan 0 rows");
     assert_eq!(second.reindexed_terminal, 0);
     assert_eq!(second.marked_attenuable, 0);
     assert_eq!(second.marked_invalid, 0);
+
+    // After backfill on Postgres: the legacy attenuable CACAO (`ok_cid`) can
+    // parent a new child redelegation through `SpaceDatabase::delegate`.
+    let k_post = JWK::generate_ed25519().unwrap();
+    let (d_post, _) = verification_method(&k_post);
+    let (post_child, _) = signed_ucan_delegation(
+        &k_ok,
+        &d_post,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[ok_cid],
+        false,
+    );
+    must_ok(db.delegate(post_child).await);
+
+    // Same-transaction write on Postgres multi-CTE delegate() path: writes both
+    // `delegation` and `delegation_mode` atomically so backfill scans 0 rows.
+    let k_new = JWK::generate_ed25519().unwrap();
+    let (d_new, _) = verification_method(&k_new);
+    let (new_tok, new_cid, _) = signed_cacao_token(
+        &wallet,
+        &d_new,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "pgsametx001",
+    );
+    must_ok(db.delegate(parse_delegation(&new_tok)).await);
+    let new_mode = delegation_mode::Entity::find_by_id(Hash::from(new_cid))
+        .one(&pg.conn)
+        .await
+        .unwrap()
+        .expect("Postgres delegate() must write delegation_mode in the same tx");
+    assert_eq!(
+        delegation_mode::StoredDelegationMode::from_db_str(&new_mode.mode),
+        delegation_mode::StoredDelegationMode::Terminal
+    );
+    assert_eq!(
+        delegation_mode::backfill(&pg.conn, None)
+            .await
+            .unwrap()
+            .scanned,
+        0
+    );
+
+    // ON DELETE CASCADE on Postgres: removing the RESTRICT-FK children
+    // (`ability`, `delegation_cid_alias`) and deleting the `delegation` row
+    // automatically cascades and removes its `delegation_mode` row.
+    let new_hash = Hash::from(new_cid);
+    abilities::Entity::delete_many()
+        .filter(abilities::Column::Delegation.eq(new_hash))
+        .exec(&pg.conn)
+        .await
+        .unwrap();
+    delegation_cid_alias::Entity::delete_by_id(new_hash)
+        .exec(&pg.conn)
+        .await
+        .unwrap();
+    delegation::Entity::delete_by_id(new_hash)
+        .exec(&pg.conn)
+        .await
+        .unwrap();
+    assert!(
+        delegation_mode::Entity::find_by_id(new_hash)
+            .one(&pg.conn)
+            .await
+            .unwrap()
+            .is_none(),
+        "ON DELETE CASCADE must remove delegation_mode row when delegation is deleted"
+    );
 }

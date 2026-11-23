@@ -1538,6 +1538,7 @@ async fn status_authorized<C: ConnectionTrait>(
     invoker: &str,
     proofs: &[Cid],
     target_id: Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<bool, RenewalStoreError> {
     use crate::models::revocation::{ControlAction, ControlProofDecision};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -1549,12 +1550,13 @@ async fn status_authorized<C: ConnectionTrait>(
         .all(db)
         .await?;
     Ok(
-        match crate::models::revocation::control_proof_decision(
+        match crate::models::revocation::control_proof_decision_with_encryption(
             db,
             invoker,
             proofs,
             ControlAction::Status,
             &target_id,
+            encryption,
         )
         .await?
         {
@@ -1580,11 +1582,12 @@ pub(crate) async fn renewal_history<C: ConnectionTrait>(
     original_cid: &str,
     invoker: &str,
     proofs: &[Cid],
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<Vec<StampRecord>, RenewalStoreError> {
     let original_id = Cid::from_str(original_cid)
         .map(Hash::from)
         .map_err(|_| RenewalStoreError::InvalidInput)?;
-    if !status_authorized(db, invoker, proofs, original_id).await? {
+    if !status_authorized(db, invoker, proofs, original_id, encryption).await? {
         return Err(RenewalStoreError::Unauthorized);
     }
     let canonical_original_cid = original_id.to_cid(0x55).to_string();
