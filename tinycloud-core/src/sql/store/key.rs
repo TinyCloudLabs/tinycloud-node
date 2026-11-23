@@ -205,7 +205,11 @@ impl ObjectKey {
         })
     }
 
-    /// Changes `from_seq..=to_seq` on top of the snapshot taken at `base_seq`.
+    /// Changes `from_seq..=to_seq` on top of the snapshot taken at `base_seq`:
+    /// the whole WAL since the snapshot (`wal-cum-v1`, `from_seq = base_seq+1`)
+    /// or only what was added after the frontier (`wal-delta-v1`, `from_seq`
+    /// above it). The key does not name the format, which is a function of the
+    /// range and is recorded in the inventory.
     pub fn segment(
         db: &DbRef<'_>,
         lineage: &Lineage,

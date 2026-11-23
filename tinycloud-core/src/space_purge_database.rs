@@ -38,6 +38,7 @@ pub const PURGED_BY_SPACE: &[(&str, PurgePhase)] = &[
     ("hook_subscription", PurgePhase::Database),
     ("signed_kv_ticket", PurgePhase::Database),
     ("database_artifact", PurgePhase::Database),
+    ("sql_wal_mark", PurgePhase::Database),
     ("database_alias", PurgePhase::Database),
     ("database_legacy_artifact", PurgePhase::Database),
     ("meeting_legacy_write_guard", PurgePhase::Database),
@@ -128,6 +129,7 @@ pub async fn delete_sql_and_hook_rows(
         "DELETE FROM signed_kv_ticket WHERE space_id=$1",
         // Payload and WAL-delta bytes are both in database_artifact.
         "DELETE FROM database_artifact WHERE space=$1",
+        "DELETE FROM sql_wal_mark WHERE space=$1",
         "DELETE FROM database_alias WHERE space=$1",
         "DELETE FROM database_legacy_artifact WHERE space=$1",
         "DELETE FROM meeting_legacy_write_guard WHERE space=$1",

@@ -313,10 +313,12 @@ INSERT INTO database_artifact(service,space,name,checkpoint_part_id,revision,con
 SELECT $1,$2,$3,$4,$5,$6,$6,$7,$7,''::bytea,'storage.database','checkpoint-parts-v1',$8,$8,0,1
 FROM ready ON CONFLICT DO NOTHING"#
         };
-        let scope = self.write_scope(space).await?;
+        let scope = self.marked_write_scope(space).await?;
         if scope.execute(statement(sql, values)).await?.rows_affected() != 1 {
             return Err(DatabaseArtifactError::StaleLineage);
         }
+        // A new checkpoint truncates the WAL, so the marks of the old one go.
+        drop_wal_marks(&scope, service, space, name).await?;
         scope.commit().await?;
         cleanup.armed = false;
         // Reclamation is outside the publish statement. If this pass cannot

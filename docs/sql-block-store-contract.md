@@ -82,6 +82,11 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/snap/{at_seq:020}-{content_hash}
 sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:020}-{content_hash}
 ```
 
+- **Two segment formats share the `seg/` key.** `wal-cum-v1` (`from_seq =
+  base_seq+1`, the whole WAL since the checkpoint) and `wal-delta-v1`
+  (`from_seq > base_seq+1`, only the WAL added after the frontier, 4.5). The
+  format is a pure function of the range, so the same key never holds both,
+  and it is recorded in the inventory's `format` column.
 - **Backend mapping.** S3: the same bucket, key exactly as above. Filesystem:
   a sibling root `{datadir}/sql-store/` (not under `blocks.path`). KV keys are
   `{space}/{base64url(hash)}` (`S3BlockStore::key`), and the filesystem KV store
@@ -241,15 +246,23 @@ sql_store_object                                    -- PK (space, db_id, lineage
   base_seq           big_integer  not null          -- snapshot: at_seq
   from_seq, to_seq   big_integer  not null          -- snapshot: both = at_seq
   content_hash       string(64)   not null          -- lowercase hex SHA-256
-  format             string(16)   not null          -- 'sqlite-v1' | 'wal-cum-v1' (D4)
+  format             string(16)   not null          -- 'sqlite-v1' | 'wal-cum-v1' | 'wal-delta-v1' (D4)
   key                text         not null          -- full object key, derivable from the columns, not indexed
   bytes              big_integer  not null
   state              string(16)   not null          -- 'uploaded' | 'published' (an 'orphan' value is never written, 4.3)
   created_at         string       not null
+
+sql_wal_mark                                        -- PK (service, space, name, revision); no FK, like the other tables
+  service, space, name string(255) not null         -- the artifact: ('sql', space, physical db name)
+  revision           big_integer  not null          -- the save (database_artifact.revision) that wrote this mark
+  checkpoint_content_hash string(255) not null      -- the checkpoint the WAL was built on
+  wal_end_bytes      big_integer  not null          -- length of the stored WAL after that save
+  wal_prefix_sha256  string(64)   not null          -- lowercase hex SHA-256 of WAL bytes [0, wal_end_bytes)
 ```
 
 Largest PK on MySQL: `(255+255+32+16+64)` chars × 4 + 3×8 = 2,512 bytes,
-under 3,072. Because the key fields are columns, frontier validation (4.2) is
+under 3,072 (`sql_wal_mark`: `3×255` chars × 4 + 8 = 3,068 bytes, also under).
+Because the key fields are columns, frontier validation (4.2) is
 a query, not key parsing. A test asserts the generated MySQL DDL (section 7).
 
 ### 4.1 Publish = upload first, CAS second
@@ -288,10 +301,18 @@ path. Then, in **one control-database transaction** (`publish_chain`):
         AND base_snapshot_key=:snap AND base_checkpoint_cid=:cid
         AND last_seq >= :from_seq - 1 AND last_seq < :to_seq
      ```
-     For a delta format `from_seq = last_seq+1`, i.e. the strict
-     `last_seq = :from_seq - 1`: contiguity is a DB invariant. For
-     `wal-cum-v1` (D4, cumulative WAL since the checkpoint) `from_seq =
-     base_seq+1` always, so the clause is "no gap, and strictly advances".
+     `wal-delta-v1` (4.5) covers exactly the revisions after the frontier:
+     `from_seq = last_seq+1`, so the clause is the strict `last_seq =
+     :from_seq - 1` and contiguity is a DB invariant. The strict form is
+     written for that format only; the publish names the format it is
+     publishing (the kind of publish carries it), and the same transaction's
+     state flip (step 3) requires the object row to have been recorded with
+     it, so a delta-format object never publishes through the lax clause and
+     the reverse. For `wal-cum-v1` (D4, cumulative WAL since the checkpoint)
+     `from_seq = base_seq+1` always, so the clause is "no gap, and strictly
+     advances". A delta publishes after a cumulative segment (the frontier
+     is then at the segment's `to_seq`), and a cumulative segment publishes
+     after deltas (it is what heals a gap, 4.5).
    - **Lineage switch** (cannot continue, 3.3 shadow rule):
      ```
      UPDATE sql_store_manifest SET lineage=:new, revision=revision+1,
@@ -332,8 +353,10 @@ and SQLite (writers serialized), and holds no lock across the PUT.
 The **recoverable frontier** of a database is `(lineage, last_seq)` of its
 manifest row, valid if the object at `base_snapshot_key` is `published` and
 published segments of the same `lineage` and `base_seq` cover
-`base_seq+1 ..= last_seq` (one cumulative segment for `wal-cum-v1`; contiguous
-delta segments otherwise). The check is a query over the structured columns.
+`base_seq+1 ..= last_seq`: the highest published `wal-cum-v1` segment
+`base_seq+1 ..= C` and the published `wal-delta-v1` segments after it, end to
+end (`C+1 ..= D`, `D+1 ..= E`, ... ending at `last_seq`; 4.5). The check is
+a query over the structured columns.
 An `uploaded` object (PUT done, not published) is **not recoverable**, nor is
 any object outside the chain. On a gap the frontier is the last contiguous
 `seq` and the restore check reports the shortfall; it is never repaired by
@@ -372,6 +395,67 @@ present. The lease, drain and response-gate protocol (SCOPING "Ordered writer
 handover") is **defined there, not built here**. D3's recommendation: the
 authority is a row in the same control database, so the epoch check and the
 manifest CAS commit in one transaction.
+
+### 4.5 WAL marks and `wal-delta-v1` (TC-1491 P3)
+
+A `wal-cum-v1` segment uploads the whole WAL since the checkpoint every time
+(up to 8 MiB), so the bytes uploaded per WAL generation grow with the square
+of the number of uploads. `wal-delta-v1` uploads only the WAL bytes added
+since the frontier. Postgres stays master; the only new state is the
+`sql_wal_mark` table, and the shadow remains off (`validate_for_database`
+still refuses `enabled`).
+
+- **Marks.** `save_delta` writes one `sql_wal_mark` row, `(revision,
+  checkpoint_content_hash, wal_end_bytes, wal_prefix_sha256)`, in the same
+  transaction that stores the WAL. A new checkpoint (`save`, or a chunked
+  snapshot publish) deletes every mark of the database in its transaction,
+  because a checkpoint truncates the WAL; a space purge deletes them too. A
+  rejected save leaves no mark. Marks are derived data: the migration only
+  creates the table (`IF NOT EXISTS`), `down` drops it, and without marks the
+  uploader publishes `wal-cum-v1`.
+- **The WAL is append-only between our checkpoints.** SQLite appends frames
+  until `wal_checkpoint(TRUNCATE)`, which the node runs and `save` records.
+  So the WAL at revision `r` is a byte prefix of the WAL at any later revision
+  of the same checkpoint, even across a close and reopen of the database from
+  Postgres's artifact, and every `wal_end_bytes` is the end of a whole commit
+  (the stored WAL cut at a mark passes the whole-frames-ending-on-a-commit
+  check of 8.1). A test asserts both on a real SQLite database.
+- **Delta.** With the frontier at `last_seq = L` (past its snapshot) and the
+  artifact at revision `H` on the same checkpoint, the marks at `L` and `H`
+  must exist, name that checkpoint, satisfy `wal_end(L) < wal_end(H)` and
+  `wal_end(H) =` the stored WAL's length. The uploader streams the stored WAL
+  once, hashes the prefix at both marks, compares them with the marks'
+  `wal_prefix_sha256`, and writes only `[wal_end(L), wal_end(H))` to scratch.
+  The prefix hash is an **upload-time consistency check** that the stored WAL
+  still extends the one the marks were cut from; it is not a security
+  control (it sits in the same database as the bytes it covers). The object
+  is `seg/{base_seq}-{L+1}-{H}-{sha}` with `format = 'wal-delta-v1'`: **one
+  delta per upload interval, spanning every save since the frontier.**
+- **Anything else is `wal-cum-v1`**, as before: a missing, invalid or
+  other-checkpoint mark; a frontier still at its snapshot; a WAL that did not
+  grow; a prefix hash that does not match; a WAL under `delta_min_wal_bytes`
+  (scheduler setting, default 64 KiB: a small WAL is cheaper whole than
+  chained); and every 64th publish (`MAX_DELTA_CHAIN`), which bounds the
+  chain a restore walks to one cumulative segment plus at most 63 deltas. A
+  cumulative segment `base_seq+1 ..= H` supersedes the deltas before it and
+  heals a gap among them. Databases saved before the migration have no marks
+  and publish cumulative segments until their next save writes one.
+- **CAS.** A delta publishes with the strict `last_seq = from_seq - 1` (4.1),
+  checked in the CAS predicate for that format only; a cumulative segment
+  keeps `last_seq >= from_seq - 1`. A delta after a cumulative segment passes.
+  A delta for a superseded checkpoint cannot publish: the base snapshot and
+  `base_checkpoint_cid` are part of the predicate.
+- **Restore** = the snapshot, the highest published cumulative segment, and
+  the published deltas that follow it end to end up to `last_seq` (8.1). The
+  segments are concatenated into one WAL and checked as one: the salt pair
+  every frame carries, page numbers, the cumulative checksum and commit
+  boundaries. A delta cut from another WAL generation, a flipped byte, a
+  reordering or a gap is `unreadable`; a gap reports where the chain ends.
+- **Object count.** One object per upload interval that has a commit, per
+  database, whatever its format: at the default `upload_interval_secs = 60`,
+  at most 1,440 a day and **43,200 objects in a 30-day month** for a database
+  written without pause (D2's ~43k). `wal-delta-v1` changes the bytes, not
+  the count. A checkpoint adds a snapshot and its cumulative segment.
 
 ## 5. Upload and retention policy
 
@@ -670,18 +754,23 @@ the manifest primary key) from `[sql_store] spaces`, which it reads whether
 or not the store is enabled, and checks each:
 
 1. **Frontier only.** It reads the manifest row and resolves the chain of
-   4.2 by primary-key lookups in `sql_store_object`: the base snapshot by its
-   full key (rebuilt from the frontier's columns and the hash its key ends
-   in), and for `last_seq > base_seq` the published `wal-cum-v1` segment
-   `base_seq+1 ..= last_seq` by the key prefix `(space, db_id, lineage,
-   'segment', base_seq, from_seq, to_seq)`. Restore = snapshot + that one
-   segment. A frontier at `last_seq = 0` is `unreadable` (a snapshot at
-   `at_seq = 0` is never a restore point, 4.2 and 11.6). Without the segment,
-   the reason names the highest published `to_seq` on the base (the
-   shortfall). Every key read from the manifest or the inventory must start
-   with the database's own `{db_prefix}{lineage}/`, else `unreadable: key
-   outside db prefix`. The formats, `published` state and `frontier_bytes`
-   must agree with the inventory.
+   4.2 by lookups in `sql_store_object`: the base snapshot by its full key
+   (rebuilt from the frontier's columns and the hash its key ends in), and
+   for `last_seq > base_seq` the published segments of the base: the
+   highest `wal-cum-v1` segment `base_seq+1 ..= C` with `C <= last_seq`
+   (a key-prefix lookup on `(space, db_id, lineage, 'segment', base_seq,
+   from_seq)`), then, while short of `last_seq`, the `wal-delta-v1` segment
+   that starts at `covered+1` and reaches furthest without passing
+   `last_seq`. A delta that overlaps what is covered is never chained, and two
+   published segments with the same start and end are `unreadable`. Restore =
+   the snapshot plus those segments in order. A frontier at `last_seq = 0` is
+   `unreadable` (a snapshot at `at_seq = 0` is never a restore point, 4.2 and
+   11.6). A step without a published segment is the shortfall: the reason
+   names the seq the published chain reaches (or that no segment is
+   published on the base). Every key read from the manifest or the inventory
+   must start with the database's own `{db_prefix}{lineage}/`, else
+   `unreadable: key outside db prefix`. The formats, `published` state and
+   `frontier_bytes` must agree with the inventory.
 2. **Same revision or nothing.** Postgres's head must be at revision
    `last_seq` with the frontier's checkpoint CID; otherwise the database is
    `not_comparable` ("not comparable at this revision") and nothing is read.
@@ -690,10 +779,12 @@ or not the store is enabled, and checks each:
    (`--scratch-dir`, `--scratch-bytes`) before streaming. Scratch holds
    tenant databases in plaintext: every scratch directory is `0700`, every
    file `0600`, and each directory is removed by its drop guard on every exit
-   path (success, error, early return). The snapshot and the
-   segment are streamed with `get_to_file`, capped at their recorded sizes; a
+   path (success, error, early return). The snapshot and every segment of the
+   chain are streamed with `get_to_file`, capped at their recorded sizes (the
+   first segment straight into the `-wal` file, each later one into a part
+   file that is appended to it and removed); a
    refused download is removed and never opened. Before SQLite opens the
-   pair, the database header and the WAL are checked: page sizes equal (the
+   pair, the database header and the whole WAL (every segment, concatenated) are checked: page sizes equal (the
    guard against RUSTSEC-2026-0459, libsqlite3-sys < 0.39), WAL magic,
    version, header checksum, every frame's salts, page number and cumulative
    checksum, whole frames ending on a commit. SQLite would otherwise ignore a
@@ -724,9 +815,9 @@ failed.
 | # | Decision | Owner | Needed by |
 |---|---|---|---|
 | D1 | **Key custody** (TC-887): enclave/KMS plus escrowed recovery wrap vs owner-held. The `v1` prefix means plaintext; an encrypted format is a new prefix. | Sam / security | Slice 2 code, and before the shadow goes beyond pilot spaces |
-| D2 | **Retention numbers** per tier (last wording 100 MB/7 d, 1 GB/30 d; paid not restated). Keep-all meanwhile; each continuously written database adds ~43k objects/month, which the S3 boot scan pages over (consider a separate SQL bucket option). | Sam | Slice 4 |
+| D2 | **Retention numbers** per tier (last wording 100 MB/7 d, 1 GB/30 d; paid not restated). Keep-all meanwhile; each continuously written database adds ~43k objects/month (one per upload interval, 4.5; the same with either segment format), which the S3 boot scan pages over (consider a separate SQL bucket option). | Sam | Slice 4 |
 | D3 | **Authority/epoch/drain**: recommended a PG row in the same control database, so the epoch check and the manifest CAS commit together. | Naomi | Slice 3; before any second node publishes |
-| D4 | **Segment format**: 1b uses cumulative WAL since the checkpoint, byte-identical to `delta_payload` (`wal-cum-v1`); restore = snapshot + highest segment. Sealed frame ranges arrive with the encrypted format. Recorded per object in `format`. | Naomi | Before 1b code |
+| D4 | **Segment format**: 1b uses cumulative WAL since the checkpoint, byte-identical to `delta_payload` (`wal-cum-v1`); restore = snapshot + highest segment. TC-1491 P3 adds `wal-delta-v1`, the WAL bytes between two marks (4.5), after the first cumulative segment of a chain, with cumulative as the fallback and every 64th publish; restore = snapshot + highest cumulative segment + the deltas after it. Sealed frame ranges arrive with the encrypted format. Recorded per object in `format`. | Naomi | Before 1b code |
 | D5 | **Conditional PUT** (`If-None-Match: *`) on the production provider, SHA-256 in user metadata. HEAD→PUT fallback only while nothing deletes. [INFERENCE: S3 supports it since 2024; R2/MinIO not verified here.] | Ops | Before 1b; mandatory before slice 4 |
 | D6 | In-place deploy keeps the data disk. | Ops | Before cutover (slice 5) |
 | D7 | **Gating**: `sql_store.spaces` allowlist, **fail-closed: empty = nothing uploads** even when `enabled = true`. | decided (R8) | Before 1b is enabled |
@@ -762,9 +853,9 @@ This section applies from slice 1b PR A. Where sections 4.1, 5.1, 5.2, 5.3 or 8 
 
 ### 11.1 Object format and kind
 
-- A snapshot is accepted only with `format = "sqlite-v1"`. A segment is accepted only with `format = "wal-cum-v1"`. Any other pairing is rejected as invalid.
-- A segment publish whose `from_seq` is not `base_seq + 1` is rejected as invalid. The manifest does not change, and the object row stays `uploaded`. This is a request error, not a lost CAS.
-- A publish moves its object row from `uploaded` to `published` only when the row's `format` is the one its kind requires.
+- A snapshot is accepted only with `format = "sqlite-v1"`. A segment is accepted only with `format = "wal-cum-v1"` or `"wal-delta-v1"`. Any other pairing is rejected as invalid.
+- A `wal-cum-v1` segment publish whose `from_seq` is not `base_seq + 1` is rejected as invalid, and so is a `wal-delta-v1` one whose `from_seq` is not above `base_seq + 1` (a delta starts after the frontier, which is at least `base_seq + 1`). The manifest does not change, and the object row stays `uploaded`. This is a request error, not a lost CAS. A `wal-delta-v1` publish whose `from_seq` is not exactly `last_seq + 1` is a lost CAS (4.1).
+- A publish moves its object row from `uploaded` to `published` only when the row's `format` is the one its kind requires: `sqlite-v1` for a snapshot, `wal-cum-v1` for a cumulative segment, `wal-delta-v1` for a delta.
 
 ### 11.2 Timestamps
 
@@ -816,6 +907,8 @@ These keys sit under `[sql_store]`. They are checked at boot only when `enabled 
 ### 11.9 Tests for this section
 
 PR A tests: `object_format_must_match_its_kind`, `segment_from_must_follow_base_seq` and `object_state_flip_checks_the_format` (11.1); `created_at_is_stored_canonically` and `created_at_out_of_range_is_invalid_not_a_panic` (11.2; `revive_restarts_the_orphan_clock` went with the orphan state in TC-1491 P1); `sql_store_refuses_enable_mysql_and_non_canonical_spaces` (11.3); `sql_store_defaults_match_the_contract`, `sql_store_new_setting_defaults_and_pg_concurrency_floor`, `sql_store_new_settings_parse_and_are_bounded`, `sql_store_settings_are_checked_only_when_enabled` and `sql_store_new_settings_are_bounded_when_enabled` (11.4). The manifest tests run against SQLite and PostgreSQL.
+
+TC-1491 P3 tests (4.1, 4.5, 8.1): manifest `a_delta_after_a_cumulative_segment_passes_and_a_cumulative_one_heals`, `a_delta_must_start_exactly_after_the_frontier`, `a_delta_starts_after_base_seq_plus_one_and_a_cumulative_segment_at_it`, `the_recorded_format_must_match_the_publish_kind`, `delta_chains_add_their_bytes_and_a_cumulative_segment_replaces_them` and `a_delta_for_a_superseded_checkpoint_is_never_published` (SQLite and PostgreSQL); `database_artifacts` marks (`each_delta_save_writes_the_mark_of_the_wal_it_stored`, `a_checkpoint_save_drops_the_marks_of_the_artifact_it_replaces`, `a_rejected_delta_save_leaves_no_mark`, `a_mark_row_that_cannot_be_read_back_is_not_returned`); the WAL carve in `shadow::source` (marks carve the stored WAL and the pieces concatenate to the prefix, independent of the chunking, refused on a prefix mismatch); the planner cells `delta_plan::*` and the property test `mixed_cumulative_and_delta_chains_restore_the_pg_artifact_at_every_frontier` next to `lost_reordered_duplicated_notices_converge_to_the_pg_head` (mixed chains, missing marks); restore `a_delta_chain_restores_byte_exact`, `a_gap_in_the_delta_chain_reports_the_shortfall`, `a_corrupted_delta_byte_is_unreadable`, `a_delta_from_another_wal_generation_is_refused_by_its_salts`, `a_cum_segment_heals_a_delta_gap`, `a_mixed_cum_and_delta_chain_restores` and `the_wal_only_grows_between_checkpoints_and_every_mark_is_a_commit_boundary` (a real SQLite WAL).
 
 ## 12. Object store backends
 

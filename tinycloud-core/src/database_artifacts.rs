@@ -3,7 +3,7 @@ pub mod chunks;
 
 use async_trait::async_trait;
 use sea_orm::{
-    sea_query::{Expr, Func},
+    sea_query::{Expr, Func, OnConflict},
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, DbErr, EntityTrait, QueryFilter, QuerySelect, SqlErr,
@@ -12,7 +12,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     hash::{hash, Blake3Hasher},
-    models::database_artifact,
+    models::{database_artifact, sql_wal_mark},
 };
 
 #[derive(Debug, Clone)]
@@ -101,6 +101,19 @@ pub struct DeltaSave {
     pub revision: i64,
     pub size_bytes: i64,
     pub delta_size_bytes: i64,
+}
+
+/// Where the stored WAL of one revision ended (`sql_wal_mark`, contract 4.5).
+/// The shadow uploader carves the bytes between two marks of one checkpoint
+/// out of the cumulative WAL and uploads only those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalMark {
+    pub revision: i64,
+    pub checkpoint_content_hash: String,
+    /// Length of the stored WAL at `revision`.
+    pub wal_end_bytes: u64,
+    /// SHA-256 of the WAL bytes `[0, wal_end_bytes)`.
+    pub wal_prefix_sha256: [u8; 32],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -784,6 +797,21 @@ pub trait DatabaseArtifactRepository: Send + Sync {
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
     }
+
+    /// The WAL marks `save_delta` stored for `revisions` of the artifact, with
+    /// no payload byte read. A revision with no mark, or a row that fails
+    /// validation, is left out: a repository that records no marks cannot say
+    /// where a WAL ended, and the shadow uploader then publishes cumulative
+    /// segments.
+    async fn load_wal_marks(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _revisions: &[i64],
+    ) -> Result<Vec<WalMark>, DatabaseArtifactError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The largest artifact payload a read moves in one part statement, and the
@@ -931,6 +959,18 @@ impl SeaOrmDatabaseArtifactRepository {
             .await
             .map_err(artifact_fence_error)?;
         Ok(FencedWrite::Transaction(tx))
+    }
+
+    /// [`Self::write_scope`] that is always one transaction, so the artifact
+    /// statement and the WAL-mark statements commit together (contract 4.5).
+    /// The transaction spans only those short statements: no read and no
+    /// chunk upload runs inside it (TC-2961).
+    async fn marked_write_scope(&self, space: &str) -> Result<FencedWrite, DatabaseArtifactError> {
+        use sea_orm::TransactionTrait;
+        if self.purge_fence.is_some() {
+            return self.write_scope(space).await;
+        }
+        Ok(FencedWrite::Transaction(self.conn.begin().await?))
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -1484,7 +1524,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // revision before either commits, exercising the CAS conflict path.
         #[cfg(test)]
         self.wait_at_race_barrier().await;
-        let scope = self.write_scope(space).await?;
+        let scope = self.marked_write_scope(space).await?;
 
         match existing.as_ref() {
             Some(existing) => {
@@ -1594,6 +1634,8 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 })?;
             }
         }
+        // A new checkpoint truncates the WAL, so the marks of the old one go.
+        drop_wal_marks(&scope, service, space, name).await?;
         scope.commit().await?;
 
         Ok(DatabaseArtifact {
@@ -1660,7 +1702,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
-        let scope = self.write_scope(space).await?;
+        let scope = self.marked_write_scope(space).await?;
 
         let update = database_artifact::Entity::update_many()
             .col_expr(database_artifact::Column::Revision, Expr::value(revision))
@@ -1702,6 +1744,34 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             ));
         }
 
+        // The mark commits with the WAL it describes: where the stored WAL
+        // ends at this revision, and the SHA-256 of its bytes.
+        sql_wal_mark::Entity::insert(sql_wal_mark::ActiveModel {
+            service: Set(service.to_string()),
+            space: Set(space.to_string()),
+            name: Set(name.to_string()),
+            revision: Set(revision),
+            checkpoint_content_hash: Set(existing.2.clone()),
+            wal_end_bytes: Set(delta_size_bytes),
+            wal_prefix_sha256: Set(sha256_hex(&payload)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                sql_wal_mark::Column::Service,
+                sql_wal_mark::Column::Space,
+                sql_wal_mark::Column::Name,
+                sql_wal_mark::Column::Revision,
+            ])
+            .update_columns([
+                sql_wal_mark::Column::CheckpointContentHash,
+                sql_wal_mark::Column::WalEndBytes,
+                sql_wal_mark::Column::WalPrefixSha256,
+            ])
+            .to_owned(),
+        )
+        .exec_without_returning(&scope)
+        .await?;
+
         scope.commit().await?;
         Ok(DeltaSave {
             revision,
@@ -1709,6 +1779,59 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             delta_size_bytes,
         })
     }
+
+    async fn load_wal_marks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        revisions: &[i64],
+    ) -> Result<Vec<WalMark>, DatabaseArtifactError> {
+        use sql_wal_mark::Column;
+        if revisions.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.check_space_read(space).await?;
+        let rows = sql_wal_mark::Entity::find()
+            .filter(Column::Service.eq(service))
+            .filter(Column::Space.eq(space))
+            .filter(Column::Name.eq(name))
+            .filter(Column::Revision.is_in(revisions.iter().copied()))
+            .all(&self.conn)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(WalMark {
+                    revision: row.revision,
+                    checkpoint_content_hash: row.checkpoint_content_hash,
+                    wal_end_bytes: u64::try_from(row.wal_end_bytes).ok()?,
+                    wal_prefix_sha256: hex::decode(&row.wal_prefix_sha256).ok()?.try_into().ok()?,
+                })
+            })
+            .collect())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Delete every WAL mark of the artifact in `scope`'s transaction.
+async fn drop_wal_marks(
+    scope: &FencedWrite,
+    service: &str,
+    space: &str,
+    name: &str,
+) -> Result<(), DbErr> {
+    sql_wal_mark::Entity::delete_many()
+        .filter(sql_wal_mark::Column::Service.eq(service))
+        .filter(sql_wal_mark::Column::Space.eq(space))
+        .filter(sql_wal_mark::Column::Name.eq(name))
+        .exec(scope)
+        .await?;
+    Ok(())
 }
 
 /// Test-only whole-artifact read built on the public streaming API, so tests
@@ -3543,5 +3666,202 @@ mod tests {
                 sink.checkpoint.capacity()
             );
         }
+    }
+
+    // ---- TC-1491 P3: WAL marks ------------------------------------------
+
+    async fn marks_repo() -> (
+        sea_orm::DatabaseConnection,
+        SeaOrmDatabaseArtifactRepository,
+    ) {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        (conn.clone(), SeaOrmDatabaseArtifactRepository::new(conn))
+    }
+
+    fn wal_sha256(wal: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(wal).into()
+    }
+
+    async fn marks_of(repo: &SeaOrmDatabaseArtifactRepository, name: &str) -> Vec<WalMark> {
+        let mut marks = repo
+            .load_wal_marks("sql", "space", name, &[1, 2, 3, 4, 99])
+            .await
+            .unwrap();
+        marks.sort_by_key(|m| m.revision);
+        marks
+    }
+
+    #[tokio::test]
+    async fn each_delta_save_writes_the_mark_of_the_wal_it_stored() {
+        let (_conn, repo) = marks_repo().await;
+        let base = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100].into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let derived = |revision| ArtifactExpectation::Derived {
+            revision,
+            checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+        };
+        let wal1 = vec![2u8; 12];
+        let mut wal2 = wal1.clone();
+        wal2.extend([3u8; 20]);
+        for (wal, revision) in [(&wal1, 1), (&wal2, 2)] {
+            repo.save_delta(
+                "sql",
+                "space",
+                "main",
+                wal.clone().into(),
+                derived(revision),
+            )
+            .await
+            .unwrap();
+        }
+        let mark = |revision, wal: &Vec<u8>| WalMark {
+            revision,
+            checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+            wal_end_bytes: wal.len() as u64,
+            wal_prefix_sha256: wal_sha256(wal),
+        };
+        // The checkpoint's own revision has no mark; each delta has its own.
+        assert_eq!(
+            marks_of(&repo, "main").await,
+            vec![mark(2, &wal1), mark(3, &wal2)]
+        );
+        assert!(marks_of(&repo, "other").await.is_empty());
+        assert!(repo
+            .load_wal_marks("sql", "space", "main", &[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_save_drops_the_marks_of_the_artifact_it_replaces() {
+        let (_conn, repo) = marks_repo().await;
+        for name in ["main", "other"] {
+            let base = repo
+                .save(
+                    "sql",
+                    "space",
+                    name,
+                    vec![1; 100].into(),
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+            repo.save_delta(
+                "sql",
+                "space",
+                name,
+                vec![2; 12].into(),
+                ArtifactExpectation::Derived {
+                    revision: 1,
+                    checkpoint_content_hash: base.checkpoint_content_hash,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(marks_of(&repo, name).await.len(), 1);
+        }
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![3; 80].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        assert!(marks_of(&repo, "main").await.is_empty());
+        assert_eq!(marks_of(&repo, "other").await.len(), 1, "only its own");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_delta_save_leaves_no_mark() {
+        let (_conn, repo) = marks_repo().await;
+        let base = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100].into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![2; 100].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let err = repo
+            .save_delta(
+                "sql",
+                "space",
+                "main",
+                vec![3; 12].into(),
+                ArtifactExpectation::Derived {
+                    revision: 2,
+                    checkpoint_content_hash: base.checkpoint_content_hash,
+                },
+            )
+            .await
+            .expect_err("a delta on a superseded checkpoint is refused");
+        assert!(
+            matches!(err, DatabaseArtifactError::StaleLineage),
+            "{err:?}"
+        );
+        assert!(marks_of(&repo, "main").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mark_row_that_cannot_be_read_back_is_not_returned() {
+        let (conn, repo) = marks_repo().await;
+        let row = |revision: i64, wal_end_bytes: i64, wal_prefix_sha256: &str| {
+            sql_wal_mark::ActiveModel {
+                service: Set("sql".into()),
+                space: Set("space".into()),
+                name: Set("main".into()),
+                revision: Set(revision),
+                checkpoint_content_hash: Set("cid".into()),
+                wal_end_bytes: Set(wal_end_bytes),
+                wal_prefix_sha256: Set(wal_prefix_sha256.into()),
+            }
+        };
+        let valid = "ab".repeat(32);
+        for model in [
+            row(1, 10, &valid),
+            row(2, -1, &valid),
+            row(3, 10, "not-hex"),
+            row(4, 10, &"ab".repeat(31)),
+        ] {
+            sql_wal_mark::Entity::insert(model)
+                .exec(&conn)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            marks_of(&repo, "main").await,
+            vec![WalMark {
+                revision: 1,
+                checkpoint_content_hash: "cid".into(),
+                wal_end_bytes: 10,
+                wal_prefix_sha256: [0xab; 32],
+            }]
+        );
     }
 }
