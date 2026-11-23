@@ -938,34 +938,27 @@ where
             .map_or(target, |delegation| delegation.id);
         let roots = [effective_root];
         let snapshot = match self.renewal_identity.as_ref() {
-            Some(identity) => crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
-                conn,
-                &roots,
-                &identity.stable_node_did,
-                &identity.renewer_did,
-                identity.epoch,
-                verifier_now,
-            )
-            .await
-            .map_err(|error| match error {
-                crate::models::revocation::ChainTraversalError::Db(error) => {
-                    crate::renewal::RenewalStoreError::Db(error)
-                }
-                crate::models::revocation::ChainTraversalError::LimitExceeded => {
-                    crate::renewal::RenewalStoreError::InvalidInput
-                }
-            })?,
-            _ => crate::auth_graph::AuthGraphSnapshot::load(conn, &roots)
+            Some(identity) => {
+                crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                    conn,
+                    &roots,
+                    &identity.stable_node_did,
+                    &identity.renewer_did,
+                    identity.epoch,
+                    verifier_now,
+                )
                 .await
-                .map_err(|error| match error {
-                    crate::models::revocation::ChainTraversalError::Db(error) => {
-                        crate::renewal::RenewalStoreError::Db(error)
-                    }
-                    crate::models::revocation::ChainTraversalError::LimitExceeded => {
-                        crate::renewal::RenewalStoreError::InvalidInput
-                    }
-                })?,
-        };
+            }
+            None => crate::auth_graph::AuthGraphSnapshot::load(conn, &roots).await,
+        }
+        .map_err(|error| match error {
+            crate::models::revocation::ChainTraversalError::Db(error) => {
+                crate::renewal::RenewalStoreError::Db(error)
+            }
+            crate::models::revocation::ChainTraversalError::LimitExceeded => {
+                crate::renewal::RenewalStoreError::InvalidInput
+            }
+        })?;
         Ok(snapshot.effective_expiry(&effective_root))
     }
 }
@@ -1509,7 +1502,7 @@ where
         invocation: &crate::util::InvocationInfo,
         query: &DelegationQuery,
     ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
-        let now = OffsetDateTime::now_utc();
+        let now = crate::renewal::verifier_now();
         verify_invocation_authorization(
             &self.conn,
             invocation,
@@ -1526,7 +1519,13 @@ where
         if matches!(query.direction, DelegationQueryDirection::Issued) {
             let invoker = issued_query_principal(invocation)
                 .ok_or(AccountDelegationQueryError::Unauthorized)?;
-            return issued_delegations_page(&self.conn, &invoker, query).await;
+            return issued_delegations_page_with_renewal(
+                &self.conn,
+                &invoker,
+                query,
+                self.renewal_identity.as_ref(),
+            )
+            .await;
         }
         let principal = account_query_principal(&self.conn, invocation)
             .await?
@@ -1544,8 +1543,13 @@ where
             .await?;
         let (delegations, ability_rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
         let roots = delegations.iter().map(|row| row.id).collect::<Vec<_>>();
-        let ancestor_state = load_account_ancestor_state(&self.conn, &roots).await?;
-        let now = OffsetDateTime::now_utc();
+        let ancestor_state = load_account_ancestor_state_with_renewal(
+            &self.conn,
+            &roots,
+            self.renewal_identity.as_ref(),
+            now.unix_timestamp(),
+        )
+        .await?;
         let mut records = Vec::new();
 
         for (delegation, abilities) in delegations.into_iter().zip(ability_rows) {
@@ -7126,6 +7130,8 @@ struct AccountAncestorState {
     parents: HashMap<Hash, Vec<Hash>>,
     delegations: HashMap<Hash, delegation::Model>,
     revocations: HashMap<Hash, Vec<revocation::Model>>,
+    /// Ancestor-capped ends from the same resolver as `/delegation/status`.
+    effective_ends: HashMap<Hash, i64>,
 }
 
 struct AccountLifecycle {
@@ -7191,18 +7197,20 @@ impl AccountAncestorState {
                 "account-ancestor-delegation-missing".to_string(),
             ));
         }
-        let status = if effective
-            .iter()
-            .any(|row| row.expiry.is_some_and(|expiry| now >= expiry))
-        {
-            "expired"
-        } else if effective
-            .iter()
-            .any(|row| row.not_before.is_some_and(|not_before| now < not_before))
-        {
-            "pending"
-        } else {
-            "active"
+        // An unverifiable renewal chain has no effective end; fail closed
+        // without adding a new status to the query's vocabulary.
+        let status = match self.effective_ends.get(&root) {
+            Some(end) if now.unix_timestamp() < *end => {
+                if effective
+                    .iter()
+                    .any(|row| row.not_before.is_some_and(|not_before| now < not_before))
+                {
+                    "pending"
+                } else {
+                    "active"
+                }
+            }
+            _ => "expired",
         };
         Ok(AccountLifecycle {
             status,
@@ -7230,15 +7238,27 @@ fn issued_delegation_select(
     select
 }
 
+/// Non-renewal page loader for tests that pin its `(db, invoker, query)`
+/// signature; the route goes through `issued_delegations_page_with_renewal`.
+#[cfg(test)]
+async fn issued_delegations_page<C: ConnectionTrait>(
+    db: &C,
+    invoker: &str,
+    query: &DelegationQuery,
+) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
+    issued_delegations_page_with_renewal(db, invoker, query, None).await
+}
+
 /// One page of the delegations `invoker` issued. Work is bounded by `limit`:
 /// one indexed scan of at most `limit + 1` rows, then abilities and ancestor
 /// state for the page's rows only. `status` and `space` filter the scanned
 /// rows, so a page can be short or empty while `next_cursor` is still set;
 /// only a missing `next_cursor` ends the listing.
-async fn issued_delegations_page<C: ConnectionTrait>(
+async fn issued_delegations_page_with_renewal<C: ConnectionTrait>(
     db: &C,
     invoker: &str,
     query: &DelegationQuery,
+    renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
 ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
     let after = query
         .decoded_issued_cursor(invoker)
@@ -7259,8 +7279,14 @@ async fn issued_delegations_page<C: ConnectionTrait>(
     let next_cursor = has_more.then(|| query.encode_issued_cursor(invoker, last));
     let ability_rows = rows.load_many(abilities::Entity, db).await?;
     let roots = rows.iter().map(|row| row.id).collect::<Vec<_>>();
-    let ancestor_state = load_account_ancestor_state(db, &roots).await?;
-    let now = OffsetDateTime::now_utc();
+    let now = crate::renewal::verifier_now();
+    let ancestor_state = load_account_ancestor_state_with_renewal(
+        db,
+        &roots,
+        renewal_identity,
+        now.unix_timestamp(),
+    )
+    .await?;
     let mut items = Vec::new();
     for (delegation, ability_rows) in rows.into_iter().zip(ability_rows) {
         if let Some(record) = build_account_record(
@@ -7381,9 +7407,22 @@ fn build_account_record(
     }))
 }
 
+/// Non-renewal loader for tests that pin its `(db, roots)` signature.
+#[cfg(test)]
 async fn load_account_ancestor_state<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
+) -> Result<AccountAncestorState, DbErr> {
+    load_account_ancestor_state_with_renewal(db, roots, None, 0).await
+}
+
+/// Loads the ancestor closure of `roots` plus each root's renewal-aware
+/// effective end (TC-4046); `verifier_now` is only read with a renewal identity.
+async fn load_account_ancestor_state_with_renewal<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+    renewal_identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    verifier_now: i64,
 ) -> Result<AccountAncestorState, DbErr> {
     let mut all_ids = roots.iter().copied().collect::<HashSet<_>>();
     let mut frontier = roots.to_vec();
@@ -7438,10 +7477,20 @@ async fn load_account_ancestor_state<C: ConnectionTrait>(
     for values in revocations.values_mut() {
         values.sort_by(|left, right| left.id.as_ref().cmp(right.id.as_ref()));
     }
+    let effective_ends = crate::auth_graph::account_effective_ends(
+        db,
+        &parents,
+        &delegations,
+        &revocations.keys().copied().collect(),
+        renewal_identity,
+        verifier_now,
+    )
+    .await?;
     Ok(AccountAncestorState {
         parents,
         delegations,
         revocations,
+        effective_ends,
     })
 }
 
@@ -15438,5 +15487,112 @@ mod test {
             .await
             .expect("drop isolated TC-730 schema");
         exercise.expect("TC-730 PostgreSQL literal prefix filter");
+    }
+
+    #[tokio::test]
+    async fn issued_lifecycle_supports_a_full_hundred_row_page() {
+        let db = get_db().await.unwrap();
+        let issuer = "did:key:tc4046-page-issuer";
+        let ids = seed_issued(&db.conn, issuer, 100).await;
+        let page = issued_delegations_page(&db.conn, issuer, &issued_query(100, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.cid.clone())
+                .collect::<Vec<_>>(),
+            cids(&ids)
+        );
+        assert!(page.items.iter().all(|item| item.status == "active"));
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// TC-4046: `lifecycle` reads the snapshot's ancestor-capped effective
+    /// ends, never the per-row signed expiry. Seeded rows exercise the
+    /// never-renewed cases; the renewed-then-lease-expired chain is covered
+    /// by the node's real-HTTP renewal harness.
+    #[tokio::test]
+    async fn account_lifecycle_uses_capped_effective_ends() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        for did in ["did:key:tc4046-issuer", "did:key:tc4046-holder"] {
+            actor::ActiveModel {
+                id: Set(did.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        let now = OffsetDateTime::now_utc();
+        let delegation =
+            |label: &str, expiry: Option<OffsetDateTime>, not_before: Option<OffsetDateTime>| {
+                let id = crate::hash::hash(label.as_bytes());
+                delegation::ActiveModel {
+                    id: Set(id),
+                    delegator: Set("did:key:tc4046-issuer".to_string()),
+                    delegatee: Set("did:key:tc4046-holder".to_string()),
+                    expiry: Set(expiry),
+                    issued_at: Set(Some(now - time::Duration::hours(3))),
+                    not_before: Set(not_before),
+                    facts: Set(None),
+                    serialization: Set(label.as_bytes().to_vec()),
+                    serialization_format: Set(0),
+                    first_seen_at: Default::default(),
+                }
+            };
+        let fresh = crate::hash::hash(b"tc4046-fresh");
+        let expired = crate::hash::hash(b"tc4046-expired");
+        let pending = crate::hash::hash(b"tc4046-pending");
+        let open = crate::hash::hash(b"tc4046-open");
+        let expired_parent = crate::hash::hash(b"tc4046-expired-parent");
+        let capped_child = crate::hash::hash(b"tc4046-capped-child");
+        for model in [
+            delegation("tc4046-fresh", Some(now + time::Duration::hours(1)), None),
+            delegation("tc4046-expired", Some(now - time::Duration::hours(1)), None),
+            delegation(
+                "tc4046-pending",
+                Some(now + time::Duration::hours(2)),
+                Some(now + time::Duration::hours(1)),
+            ),
+            delegation("tc4046-open", None, None),
+            delegation(
+                "tc4046-expired-parent",
+                Some(now - time::Duration::minutes(30)),
+                None,
+            ),
+            delegation(
+                "tc4046-capped-child",
+                Some(now + time::Duration::hours(1)),
+                None,
+            ),
+        ] {
+            model.insert(&db.conn).await.unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(expired_parent),
+            child: Set(capped_child),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let state =
+            load_account_ancestor_state(&db.conn, &[fresh, expired, pending, open, capped_child])
+                .await
+                .unwrap();
+        for (id, expected) in [
+            (fresh, "active"),
+            (expired, "expired"),
+            (pending, "pending"),
+            (open, "active"),
+            // The child's own expiry is future, but the ancestor cap makes it
+            // expired: the renewed view `/delegation/status` would give the
+            // same answer.
+            (capped_child, "expired"),
+        ] {
+            assert_eq!(state.lifecycle(id, now).unwrap().status, expected);
+        }
     }
 }

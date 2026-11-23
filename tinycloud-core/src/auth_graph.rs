@@ -715,80 +715,18 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         )
         .and_where(within_budget());
     query.union(UnionType::All, aliased_revocations);
-    let lease = Alias::new("renewal_lease");
-    let stamp = Alias::new("renewal_stamp");
-    let original_alias = Alias::new("renewal_original_alias");
-    let renewal_revoked = Expr::cust(format!(
-        "EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN revocation r ON r.revoked = c.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN delegation_cid_alias a ON a.id = c.id JOIN delegation_cid_alias other ON other.canonical = a.canonical JOIN revocation r ON r.revoked = other.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN parent_delegation p ON p.child = c.id WHERE c.depth = {MAX_CHAIN_TRAVERSAL_NODES})"
-    ));
-    let mut renewal_rows = snapshot_branch(
-        5,
-        [
-            node(lookup_name.clone()),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            null(),
-            Expr::col((lease.clone(), Alias::new("original_canonical"))).into(),
-            Expr::col((lease.clone(), Alias::new("lease_cid"))).into(),
-            Expr::col((lease.clone(), Alias::new("state"))).into(),
-            Expr::col((lease.clone(), Alias::new("generation"))).into(),
-            Expr::col((lease.clone(), Alias::new("renewer_did"))).into(),
-            Expr::col((lease.clone(), Alias::new("renewer_epoch"))).into(),
-            Expr::col((lease.clone(), Alias::new("lease_expiry"))).into(),
-            Expr::col((lease.clone(), Alias::new("original_expiry"))).into(),
-            Expr::col((lease.clone(), Alias::new("period_seconds"))).into(),
-            Expr::col((lease.clone(), Alias::new("audience_public_key"))).into(),
-            Expr::col((stamp.clone(), Alias::new("cid"))).into(),
-            Expr::col((stamp.clone(), Alias::new("previous_stamp_cid"))).into(),
-            Expr::col((stamp.clone(), Alias::new("renewer_epoch"))).into(),
-            Expr::col((stamp.clone(), Alias::new("new_end"))).into(),
-            Expr::col((stamp.clone(), Alias::new("signed_bytes"))).into(),
-            Expr::col((stamp.clone(), Alias::new("signature"))).into(),
-            renewal_revoked,
-            Expr::col((stamp.clone(), Alias::new("generation"))).into(),
-        ],
-    );
+    let mut renewal_rows = renewal_rows_query();
     renewal_rows
-        .from(lease.clone())
-        .join(
-            JoinType::InnerJoin,
-            stamp.clone(),
-            Expr::col((stamp.clone(), Alias::new("original_canonical")))
-                .equals((lease.clone(), Alias::new("original_canonical")))
-                .and(
-                    Expr::col((stamp.clone(), Alias::new("lease_cid")))
-                        .equals((lease.clone(), Alias::new("lease_cid"))),
-                ),
-        )
-        .join_as(
-            JoinType::InnerJoin,
-            delegation_cid_alias::Entity,
-            original_alias.clone(),
-            Expr::col((
-                original_alias.clone(),
-                delegation_cid_alias::Column::Canonical,
-            ))
-            .equals((lease.clone(), Alias::new("original_canonical"))),
-        )
         .join(
             JoinType::InnerJoin,
             lookup_name.clone(),
-            Expr::col((original_alias, delegation_cid_alias::Column::Id))
-                .equals((lookup_name.clone(), id.clone())),
+            Expr::col((
+                Alias::new("renewal_original_alias"),
+                delegation_cid_alias::Column::Id,
+            ))
+            .equals((lookup_name.clone(), id.clone())),
         )
-        .and_where(within_budget())
-        .and_where(Expr::cust(
-            "renewal_lease.lease_cid = renewal_stamp.lease_cid",
-        ));
+        .and_where(within_budget());
     query.union(UnionType::All, renewal_rows);
     // TC-3443: the retire row, if any, of every delegator and delegatee in
     // the closure. `delegator` carries the retired DID, `expiry` the retire
@@ -844,6 +782,78 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
     )
 }
 
+fn renewal_rows_query() -> SelectStatement {
+    let null = || Expr::cust("NULL");
+    let lease = Alias::new("renewal_lease");
+    let stamp = Alias::new("renewal_stamp");
+    let original_alias = Alias::new("renewal_original_alias");
+    let renewal_revoked = Expr::cust(format!(
+        "EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN revocation r ON r.revoked = c.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN delegation_cid_alias a ON a.id = c.id JOIN delegation_cid_alias other ON other.canonical = a.canonical JOIN revocation r ON r.revoked = other.id) OR EXISTS (WITH RECURSIVE lease_chain(id, depth) AS (SELECT renewal_lease.lease_cid, 0 UNION ALL SELECT p.parent, c.depth + 1 FROM parent_delegation p JOIN lease_chain c ON p.child = c.id WHERE c.depth < {MAX_CHAIN_TRAVERSAL_NODES}) SELECT 1 FROM lease_chain c JOIN parent_delegation p ON p.child = c.id WHERE c.depth = {MAX_CHAIN_TRAVERSAL_NODES})"
+    ));
+    let mut renewal_rows = snapshot_branch(
+        5,
+        [
+            Expr::col((original_alias.clone(), delegation_cid_alias::Column::Id)).into(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            Expr::col((lease.clone(), Alias::new("original_canonical"))).into(),
+            Expr::col((lease.clone(), Alias::new("lease_cid"))).into(),
+            Expr::col((lease.clone(), Alias::new("state"))).into(),
+            Expr::col((lease.clone(), Alias::new("generation"))).into(),
+            Expr::col((lease.clone(), Alias::new("renewer_did"))).into(),
+            Expr::col((lease.clone(), Alias::new("renewer_epoch"))).into(),
+            Expr::col((lease.clone(), Alias::new("lease_expiry"))).into(),
+            Expr::col((lease.clone(), Alias::new("original_expiry"))).into(),
+            Expr::col((lease.clone(), Alias::new("period_seconds"))).into(),
+            Expr::col((lease.clone(), Alias::new("audience_public_key"))).into(),
+            Expr::col((stamp.clone(), Alias::new("cid"))).into(),
+            Expr::col((stamp.clone(), Alias::new("previous_stamp_cid"))).into(),
+            Expr::col((stamp.clone(), Alias::new("renewer_epoch"))).into(),
+            Expr::col((stamp.clone(), Alias::new("new_end"))).into(),
+            Expr::col((stamp.clone(), Alias::new("signed_bytes"))).into(),
+            Expr::col((stamp.clone(), Alias::new("signature"))).into(),
+            renewal_revoked,
+            Expr::col((stamp.clone(), Alias::new("generation"))).into(),
+        ],
+    );
+    renewal_rows
+        .from(lease.clone())
+        .join(
+            JoinType::InnerJoin,
+            stamp.clone(),
+            Expr::col((stamp.clone(), Alias::new("original_canonical")))
+                .equals((lease.clone(), Alias::new("original_canonical")))
+                .and(
+                    Expr::col((stamp.clone(), Alias::new("lease_cid")))
+                        .equals((lease.clone(), Alias::new("lease_cid"))),
+                ),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            delegation_cid_alias::Entity,
+            original_alias.clone(),
+            Expr::col((
+                original_alias.clone(),
+                delegation_cid_alias::Column::Canonical,
+            ))
+            .equals((lease.clone(), Alias::new("original_canonical"))),
+        )
+        .and_where(Expr::cust(
+            "renewal_lease.lease_cid = renewal_stamp.lease_cid",
+        ));
+    renewal_rows
+}
+
 // The old metadata query had no ORDER BY. Authorization accepts any matching
 // ability, but the last rejected caveat supplies a diagnostic reason. Use the
 // typed `(resource, ability)` order on every backend; only that diagnostic can
@@ -857,11 +867,9 @@ fn sort_abilities(abilities: &mut HashMap<Hash, Vec<abilities::Model>>) {
         });
     }
 }
-#[derive(Clone)]
 struct RenewalCandidate {
     node: Hash,
     original: String,
-    state: String,
     lease: String,
     stamp: String,
     previous: String,
@@ -877,6 +885,139 @@ struct RenewalCandidate {
     lease_expiry: i64,
     original_expiry: i64,
 }
+
+fn renewal_candidate(
+    row: &sea_orm::QueryResult,
+    (stable_node_did, renewer_did, epoch, verifier_now): (&str, &str, u64, i64),
+) -> Result<Option<RenewalCandidate>, DbErr> {
+    let state: String = row.try_get("", "lease_state")?;
+    let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
+    if !matches!(state.as_str(), "active" | "stopped")
+        || lease_expiry.unix_timestamp() <= verifier_now
+        || row.try_get::<bool>("", "lease_revoked")?
+        || row.try_get::<String>("", "renewer_did")? != renewer_did
+    {
+        return Ok(None);
+    }
+    let renewer_epoch: i64 = row.try_get("", "renewer_epoch")?;
+    let stamp_epoch: i64 = row.try_get("", "stamp_epoch")?;
+    let stamp_generation: i64 = row.try_get("", "stamp_generation")?;
+    let period: i64 = row.try_get("", "lease_period")?;
+    if renewer_epoch as u64 != epoch
+        || stamp_epoch as u64 != epoch
+        || stamp_generation < 0
+        || period <= 0
+    {
+        return Ok(None);
+    }
+    let cid = |name: &str| -> Result<String, DbErr> {
+        Ok(Hash::try_from(row.try_get::<Vec<u8>>("", name)?)
+            .map_err(DbErr::from)?
+            .to_cid(0x55)
+            .to_string())
+    };
+    let audience: Vec<u8> = row.try_get("", "audience_key")?;
+    let Ok(audience): Result<[u8; 32], _> = audience.try_into() else {
+        return Ok(None);
+    };
+    let end: time::OffsetDateTime = row.try_get("", "stamp_end")?;
+    let original_expiry: time::OffsetDateTime = row.try_get("", "lease_original_expiry")?;
+    Ok(Some(RenewalCandidate {
+        node: row.try_get("", "node")?,
+        original: cid("renewal_original")?,
+        lease: cid("lease_cid")?,
+        stamp: cid("stamp_cid")?,
+        previous: cid("previous_stamp_cid")?,
+        generation: stamp_generation as u64,
+        end: end.unix_timestamp(),
+        signed_bytes: row.try_get("", "signed_bytes")?,
+        signature: row.try_get("", "signature")?,
+        did: stable_node_did.to_owned(),
+        epoch,
+        audience,
+        now: verifier_now,
+        period,
+        lease_expiry: lease_expiry.unix_timestamp(),
+        original_expiry: original_expiry.unix_timestamp(),
+    }))
+}
+
+fn effective_ends(
+    parents: &HashMap<Hash, Vec<Hash>>,
+    delegations: &HashMap<Hash, delegation::Model>,
+    revoked: &HashSet<Hash>,
+    candidates: Vec<RenewalCandidate>,
+) -> HashMap<Hash, i64> {
+    let mut grouped: HashMap<Hash, HashMap<String, Vec<RenewalCandidate>>> = HashMap::new();
+    for candidate in candidates {
+        grouped
+            .entry(candidate.node)
+            .or_default()
+            .entry(candidate.lease.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let candidate_map = grouped
+        .into_iter()
+        .filter(|(_, leases)| leases.len() == 1)
+        .filter_map(|(node, leases)| leases.into_values().next().map(|rows| (node, rows)))
+        .collect();
+    let mut resolved = HashMap::new();
+    let mut visiting = HashSet::new();
+    for id in delegations.keys().copied() {
+        let _ = resolve_effective_end(
+            id,
+            parents,
+            delegations,
+            &candidate_map,
+            revoked,
+            &mut resolved,
+            &mut visiting,
+        );
+    }
+    resolved
+}
+
+/// Reuse account-query metadata rather than loading a second authorization
+/// graph with its smaller (64-node) admission budget.
+pub(crate) async fn account_effective_ends<C: ConnectionTrait>(
+    db: &C,
+    parents: &HashMap<Hash, Vec<Hash>>,
+    delegations: &HashMap<Hash, delegation::Model>,
+    revoked: &HashSet<Hash>,
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    verifier_now: i64,
+) -> Result<HashMap<Hash, i64>, DbErr> {
+    let mut candidates = Vec::new();
+    if let Some(identity) = identity.filter(|_| !delegations.is_empty()) {
+        let mut query = renewal_rows_query();
+        query.and_where(
+            Expr::col((
+                Alias::new("renewal_original_alias"),
+                delegation_cid_alias::Column::Id,
+            ))
+            .is_in(delegations.keys().copied()),
+        );
+        for row in db
+            .query_all(db.get_database_backend().build(&query))
+            .await?
+        {
+            if let Some(candidate) = renewal_candidate(
+                &row,
+                (
+                    &identity.stable_node_did,
+                    &identity.renewer_did,
+                    identity.epoch,
+                    verifier_now,
+                ),
+            )? {
+                candidates.push(candidate);
+            }
+        }
+    }
+    Ok(effective_ends(parents, delegations, revoked, candidates))
+}
+
 fn cap_effective_end(signed_end: i64, renewed_end: Option<i64>, ancestor_ends: &[i64]) -> i64 {
     let own_end = renewed_end.map_or(signed_end, |end| signed_end.max(end));
     ancestor_ends
@@ -1137,61 +1278,11 @@ impl AuthGraphSnapshot {
                     revoked.insert(node);
                 }
                 5 => {
-                    let Some((stable_node_did, renewer_did, epoch, verifier_now)) = identity else {
-                        continue;
-                    };
-                    let state: String = row.try_get("", "lease_state")?;
-                    let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
-                    if !matches!(state.as_str(), "active" | "stopped")
-                        || lease_expiry.unix_timestamp() <= verifier_now
-                        || row.try_get::<bool>("", "lease_revoked")?
-                        || row.try_get::<String>("", "renewer_did")? != renewer_did
-                    {
-                        continue;
+                    if let Some(identity) = identity {
+                        if let Some(candidate) = renewal_candidate(&row, identity)? {
+                            renewal_candidates.push(candidate);
+                        }
                     }
-                    let renewer_epoch: i64 = row.try_get("", "renewer_epoch")?;
-                    let stamp_epoch: i64 = row.try_get("", "stamp_epoch")?;
-                    let stamp_generation: i64 = row.try_get("", "stamp_generation")?;
-                    let period: i64 = row.try_get("", "lease_period")?;
-                    if renewer_epoch as u64 != epoch
-                        || stamp_epoch as u64 != epoch
-                        || stamp_generation < 0
-                        || period <= 0
-                    {
-                        continue;
-                    }
-                    let cid = |name: &str| -> Result<String, ChainTraversalError> {
-                        Ok(Hash::try_from(row.try_get::<Vec<u8>>("", name)?)
-                            .map_err(DbErr::from)?
-                            .to_cid(0x55)
-                            .to_string())
-                    };
-                    let audience: Vec<u8> = row.try_get("", "audience_key")?;
-                    let Ok(audience): Result<[u8; 32], _> = audience.try_into() else {
-                        continue;
-                    };
-                    let end: time::OffsetDateTime = row.try_get("", "stamp_end")?;
-                    let original_expiry: time::OffsetDateTime =
-                        row.try_get("", "lease_original_expiry")?;
-                    renewal_candidates.push(RenewalCandidate {
-                        node,
-                        state,
-                        original: cid("renewal_original")?,
-                        lease: cid("lease_cid")?,
-                        stamp: cid("stamp_cid")?,
-                        previous: cid("previous_stamp_cid")?,
-                        generation: stamp_generation as u64,
-                        end: end.unix_timestamp(),
-                        signed_bytes: row.try_get("", "signed_bytes")?,
-                        signature: row.try_get("", "signature")?,
-                        did: stable_node_did.to_owned(),
-                        epoch,
-                        audience,
-                        now: verifier_now,
-                        period,
-                        lease_expiry: lease_expiry.unix_timestamp(),
-                        original_expiry: original_expiry.unix_timestamp(),
-                    });
                 }
                 6 => {
                     retired.insert(
@@ -1221,38 +1312,8 @@ impl AuthGraphSnapshot {
             }
         }
 
-        let mut grouped: HashMap<Hash, HashMap<String, Vec<RenewalCandidate>>> = HashMap::new();
-        for candidate in renewal_candidates {
-            grouped
-                .entry(candidate.node)
-                .or_default()
-                .entry(candidate.lease.clone())
-                .or_default()
-                .push(candidate);
-        }
-        let mut candidate_map: HashMap<Hash, Vec<RenewalCandidate>> = HashMap::new();
-        for (node, leases) in grouped {
-            let active: Vec<_> = leases
-                .values()
-                .filter(|rows| matches!(rows[0].state.as_str(), "active" | "stopped"))
-                .collect();
-            if active.len() == 1 {
-                candidate_map.insert(node, active[0].clone());
-            }
-        }
-        let mut renewal_effective_ends = HashMap::new();
-        let mut resolving = HashSet::new();
-        for id in nodes.iter().copied() {
-            let _ = resolve_effective_end(
-                id,
-                &parents,
-                &delegations,
-                &candidate_map,
-                &revoked,
-                &mut renewal_effective_ends,
-                &mut resolving,
-            );
-        }
+        let renewal_effective_ends =
+            effective_ends(&parents, &delegations, &revoked, renewal_candidates);
         Ok(Self {
             parents,
             delegations,
