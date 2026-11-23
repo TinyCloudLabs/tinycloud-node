@@ -178,8 +178,19 @@ pub(crate) struct BackfillStats {
     pub reindexed_terminal: usize,
     pub marked_attenuable: usize,
     pub marked_invalid: usize,
+    pub skipped_locked_pages: usize,
     pub elapsed_ms: u64,
     pub completed: bool,
+}
+
+/// PostgreSQL per-page lock wait cap during boot backfill so an
+/// idle-in-transaction `FOR UPDATE` holder (TC-2954) can never stall node
+/// readiness past the health window.
+const BACKFILL_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '2s'";
+
+fn is_lock_not_available(error: &DbErr) -> bool {
+    let message = error.to_string();
+    message.contains("55P03") || message.contains("lock timeout")
 }
 
 /// Populate `delegation_mode` for every stored delegation lacking a mode row
@@ -197,7 +208,11 @@ where
 
 /// Bounded-page variant of [`backfill`] (used by interrupted-restart tests).
 /// Runs each page's `SELECT` and `INSERT ... ON CONFLICT DO NOTHING` inside one
-/// transaction with `EXEMPT_STATEMENT_TIMEOUT` on PostgreSQL.
+/// transaction with `EXEMPT_STATEMENT_TIMEOUT` and `SET LOCAL lock_timeout = '2s'`
+/// on PostgreSQL. On PostgreSQL, the page query uses `FOR KEY SHARE SKIP LOCKED`
+/// so rows currently held `FOR UPDATE` by another session are skipped without
+/// waiting and left unmarked for the identical read-time [`derive_when_unmarked`]
+/// path.
 pub(crate) async fn backfill_bounded<C>(
     pool: &C,
     encryption: Option<&ColumnEncryption>,
@@ -222,31 +237,88 @@ where
         if backend == DbBackend::Postgres {
             tx.execute_unprepared(crate::db_pool::EXEMPT_STATEMENT_TIMEOUT)
                 .await?;
+            tx.execute_unprepared(BACKFILL_LOCK_TIMEOUT_SQL).await?;
         }
-        let mut query = delegation::Entity::find()
-            .select_only()
-            .column(delegation::Column::Id)
-            .column(delegation::Column::Serialization)
-            .column(delegation::Column::SerializationFormat)
-            .filter(
-                Expr::exists(
-                    Query::select()
-                        .expr(Expr::value(1))
-                        .from(Entity)
-                        .and_where(
-                            Expr::col((Entity, Column::DelegationId))
-                                .equals((delegation::Entity, delegation::Column::Id)),
-                        )
-                        .to_owned(),
+        let rows: Vec<(Hash, Vec<u8>, i16)> = if backend == DbBackend::Postgres {
+            let stmt = match after {
+                Some(id) => sea_orm::Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT d.id, d.serialization, d.serialization_format \
+                     FROM delegation d \
+                     WHERE NOT EXISTS (SELECT 1 FROM delegation_mode m WHERE m.delegation_id = d.id) \
+                       AND d.id > $1 \
+                     ORDER BY d.id ASC \
+                     LIMIT $2 \
+                     FOR KEY SHARE OF d SKIP LOCKED",
+                    [Vec::<u8>::from(id).into(), (PAGE_SIZE as i64).into()],
+                ),
+                None => sea_orm::Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT d.id, d.serialization, d.serialization_format \
+                     FROM delegation d \
+                     WHERE NOT EXISTS (SELECT 1 FROM delegation_mode m WHERE m.delegation_id = d.id) \
+                     ORDER BY d.id ASC \
+                     LIMIT $1 \
+                     FOR KEY SHARE OF d SKIP LOCKED",
+                    [(PAGE_SIZE as i64).into()],
+                ),
+            };
+            match tx.query_all(stmt).await {
+                Ok(raw_rows) => {
+                    let mut parsed = Vec::with_capacity(raw_rows.len());
+                    for row in raw_rows {
+                        parsed.push((
+                            row.try_get::<Hash>("", "id")?,
+                            row.try_get::<Vec<u8>>("", "serialization")?,
+                            row.try_get::<i16>("", "serialization_format")?,
+                        ));
+                    }
+                    parsed
+                }
+                Err(error) if is_lock_not_available(&error) => {
+                    let _ = tx.rollback().await;
+                    stats.skipped_locked_pages += 1;
+                    stats.completed = true;
+                    stats.elapsed_ms = started.elapsed().as_millis() as u64;
+                    tracing::info!(
+                        scanned = stats.scanned,
+                        reindexed_terminal = stats.reindexed_terminal,
+                        marked_attenuable = stats.marked_attenuable,
+                        marked_invalid = stats.marked_invalid,
+                        skipped_locked_pages = stats.skipped_locked_pages,
+                        elapsed_ms = stats.elapsed_ms,
+                        "delegation mode boot reindex complete"
+                    );
+                    return Ok(stats);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let mut query = delegation::Entity::find()
+                .select_only()
+                .column(delegation::Column::Id)
+                .column(delegation::Column::Serialization)
+                .column(delegation::Column::SerializationFormat)
+                .filter(
+                    Expr::exists(
+                        Query::select()
+                            .expr(Expr::value(1))
+                            .from(Entity)
+                            .and_where(
+                                Expr::col((Entity, Column::DelegationId))
+                                    .equals((delegation::Entity, delegation::Column::Id)),
+                            )
+                            .to_owned(),
+                    )
+                    .not(),
                 )
-                .not(),
-            )
-            .order_by_asc(delegation::Column::Id)
-            .limit(PAGE_SIZE);
-        if let Some(id) = after {
-            query = query.filter(delegation::Column::Id.gt(id));
-        }
-        let rows = query.into_tuple::<(Hash, Vec<u8>, i16)>().all(&tx).await?;
+                .order_by_asc(delegation::Column::Id)
+                .limit(PAGE_SIZE);
+            if let Some(id) = after {
+                query = query.filter(delegation::Column::Id.gt(id));
+            }
+            query.into_tuple::<(Hash, Vec<u8>, i16)>().all(&tx).await?
+        };
         if rows.is_empty() {
             tx.commit().await?;
             stats.completed = true;
@@ -256,6 +328,7 @@ where
                 reindexed_terminal = stats.reindexed_terminal,
                 marked_attenuable = stats.marked_attenuable,
                 marked_invalid = stats.marked_invalid,
+                skipped_locked_pages = stats.skipped_locked_pages,
                 elapsed_ms = stats.elapsed_ms,
                 "delegation mode boot reindex complete"
             );
@@ -263,31 +336,27 @@ where
         }
 
         let mut inserts = Vec::with_capacity(rows.len());
+        let mut page_terminal = 0usize;
+        let mut page_attenuable = 0usize;
+        let mut page_invalid = 0usize;
+        let mut last_id = after;
         for (id, stored, format) in rows {
-            after = Some(id);
-            stats.scanned += 1;
-            // Missing or wrong encryption key fails boot (same contract as
-            // `delegation_cid_alias::backfill`); malformed/duplicate CACAO
-            // delegation modes are marked `"invalid"` without failing boot.
-            let plaintext =
-                delegation_cid_alias::stored_plaintext(encryption, id, &stored, format)?;
-            let mode = match TinyCloudDelegation::from_bytes(plaintext.as_ref()) {
-                Ok(TinyCloudDelegation::Cacao(cacao)) => classify_cacao(&cacao),
-                Ok(TinyCloudDelegation::Ucan(ucan)) => StoredDelegationMode::from_live(
-                    util::read_delegation_mode_from_ucan_facts(ucan.payload().facts.as_ref()),
-                ),
-                Err(_) => StoredDelegationMode::Terminal,
-            };
+            last_id = Some(id);
+            // Shared classification path with read-time `derive_when_unmarked`
+            // so boot backfill and unmarked read-time derivation always agree.
+            let mode = derive_when_unmarked(id, &stored, format, encryption);
             match mode {
-                StoredDelegationMode::Terminal => stats.reindexed_terminal += 1,
-                StoredDelegationMode::Attenuable => stats.marked_attenuable += 1,
-                StoredDelegationMode::Invalid => stats.marked_invalid += 1,
+                StoredDelegationMode::Terminal => page_terminal += 1,
+                StoredDelegationMode::Attenuable => page_attenuable += 1,
+                StoredDelegationMode::Invalid => page_invalid += 1,
             }
             inserts.push(ActiveModel {
                 delegation_id: Set(id),
                 mode: Set(mode.as_str().to_string()),
             });
         }
+        after = last_id;
+        let page_count = inserts.len();
 
         if !inserts.is_empty() {
             match Entity::insert_many(inserts)
@@ -300,10 +369,20 @@ where
                 .await
             {
                 Ok(_) | Err(DbErr::RecordNotInserted) => {}
+                Err(error) if is_lock_not_available(&error) => {
+                    let _ = tx.rollback().await;
+                    stats.skipped_locked_pages += 1;
+                    pages += 1;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
         tx.commit().await?;
+        stats.scanned += page_count;
+        stats.reindexed_terminal += page_terminal;
+        stats.marked_attenuable += page_attenuable;
+        stats.marked_invalid += page_invalid;
         pages += 1;
     }
 }

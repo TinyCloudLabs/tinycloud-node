@@ -2355,3 +2355,216 @@ async fn postgres_cacao_delegation_mode_boot_reindex() {
         "ON DELETE CASCADE must remove delegation_mode row when delegation is deleted"
     );
 }
+
+/// TC-3810 (Bobbie ruling): an idle-in-transaction `FOR UPDATE` holder on a
+/// `delegation` row (TC-2954) must never stall or fail boot backfill. The
+/// locked row is skipped via `FOR KEY SHARE SKIP LOCKED` / `lock_timeout = 2s`,
+/// boot completes promptly within the readiness window, unlocked rows are
+/// marked, and the still-unmarked locked row resolves to its exact mode on the
+/// read path via the shared `derive_when_unmarked` classifier.
+#[tokio::test]
+async fn postgres_boot_backfill_skips_for_update_locked_row_and_derives_on_read() {
+    let Some(pg) = crate::test_support::PostgresTestSchema::new(
+        "postgres_boot_backfill_skips_for_update_locked_row_and_derives_on_read",
+    )
+    .await
+    else {
+        return;
+    };
+
+    let wallet = Wallet::from_seed(0x95);
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        wallet.did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space.clone())),
+    }
+    .insert(&pg.conn)
+    .await
+    .unwrap();
+    let kv_res = space
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("secrets/locked".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+
+    let k_term = JWK::generate_ed25519().unwrap();
+    let (d_term, _) = verification_method(&k_term);
+    let k_ok = JWK::generate_ed25519().unwrap();
+    let (d_ok, _) = verification_method(&k_ok);
+    let k_bad = JWK::generate_ed25519().unwrap();
+    let (d_bad, _) = verification_method(&k_bad);
+    let k_sub = JWK::generate_ed25519().unwrap();
+    let (d_sub, _) = verification_method(&k_sub);
+
+    let (t_token, t_cid, _) = signed_cacao_token(
+        &wallet,
+        &d_term,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        Some(DelegationModeFact::Terminal),
+        "pglockterm1",
+    );
+    let (_, t_bytes) = TinyCloudDelegation::decode(&t_token).unwrap();
+    let t_hash = Hash::from(t_cid);
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        t_hash,
+        &wallet.did,
+        &d_term,
+        &t_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    let (ok_token, ok_cid, _) = signed_cacao_token(
+        &wallet,
+        &d_ok,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+        "pglockok001",
+    );
+    let (_, ok_bytes) = TinyCloudDelegation::decode(&ok_token).unwrap();
+    let ok_hash = Hash::from(ok_cid);
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        ok_hash,
+        &wallet.did,
+        &d_ok,
+        &ok_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    let (bad_bytes, bad_hash, _) = signed_cacao_with_raw_recap_tail(
+        &wallet,
+        &d_bad,
+        &[(&kv_res, "tinycloud.kv/get")],
+        r#""xyz.tinycloud.policy/delegationMode":"bogus""#,
+        "pglockbad01",
+    );
+    insert_pre_upgrade_row_on(
+        &pg.conn,
+        bad_hash,
+        &wallet.did,
+        &d_bad,
+        &bad_bytes,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[],
+        None,
+    )
+    .await;
+
+    // Hold `FOR UPDATE` on the terminal CACAO row from a separate connection,
+    // simulating an idle-in-transaction holder (TC-2954).
+    let holder_conn = pg.connect(1).await;
+    let holder_tx = holder_conn.begin().await.unwrap();
+    holder_tx
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM delegation WHERE id = $1 FOR UPDATE",
+            [Vec::<u8>::from(t_hash).into()],
+        ))
+        .await
+        .unwrap()
+        .expect("locked delegation row must exist");
+
+    // Boot `SpaceDatabase::new` on a separate pool: must finish well inside the
+    // readiness window without waiting on `holder_tx`.
+    let boot_conn = pg.connect(4).await;
+    let db = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SpaceDatabase::new(
+            boot_conn,
+            MemoryStore::default(),
+            StaticSecret::new(vec![0x55; 32]).unwrap(),
+        ),
+    )
+    .await
+    .expect("boot must not stall behind a FOR UPDATE lock on delegation")
+    .expect("boot must succeed while a row is locked FOR UPDATE");
+
+    // Unlocked rows were marked; the locked terminal row stayed unmarked.
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(ok_hash)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("attenuable".to_string())
+    );
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(bad_hash)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("invalid".to_string())
+    );
+    assert!(
+        delegation_mode::Entity::find_by_id(t_hash)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none(),
+        "FOR UPDATE-locked row must be skipped and left unmarked during boot"
+    );
+
+    // While `holder_tx` STILL holds `FOR UPDATE`, the unmarked locked row
+    // resolves to `Terminal` on the read path: direct invocation succeeds and
+    // child redelegation is refused with `TerminalParentCannotRedelegate`.
+    let graph = crate::auth_graph::AuthGraphSnapshot::load(&db.conn, &[t_hash])
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.delegation_mode(&t_hash),
+        Some(delegation_mode::StoredDelegationMode::Terminal)
+    );
+    let direct_inv = signed_invocation(&k_term, &[(&kv_res, "tinycloud.kv/get")], &[t_cid]);
+    db.authorize_invocation(&direct_inv.0, OffsetDateTime::now_utc())
+        .await
+        .expect("direct invocation of unmarked terminal CACAO must succeed");
+    let (child, _) = signed_ucan_delegation(
+        &k_term,
+        &d_sub,
+        &[(&kv_res, "tinycloud.kv/get")],
+        &[t_cid],
+        false,
+    );
+    assert!(matches!(
+        db.delegate(child).await,
+        Err(TxError::InvalidDelegation(
+            delegation::DelegationError::TerminalParentCannotRedelegate
+        ))
+    ));
+
+    // Once the holder commits, the next backfill picks up only the remaining
+    // unmarked row, and a subsequent backfill scans 0 rows.
+    holder_tx.commit().await.unwrap();
+    let after_unlock = delegation_mode::backfill(&db.conn, None).await.unwrap();
+    assert!(after_unlock.completed);
+    assert_eq!(after_unlock.scanned, 1);
+    assert_eq!(after_unlock.reindexed_terminal, 1);
+    assert_eq!(
+        delegation_mode::Entity::find_by_id(t_hash)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.mode),
+        Some("terminal".to_string())
+    );
+    let steady = delegation_mode::backfill(&db.conn, None).await.unwrap();
+    assert!(steady.completed);
+    assert_eq!(steady.scanned, 0);
+}

@@ -808,10 +808,13 @@ where
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
         // TC-3810: backfill the `delegation_mode` side table from stored signed
-        // bytes before returning so no authorization traffic runs until
-        // terminal and malformed-mode markers are indexed, without rewriting
-        // any historical `delegation` row.
-        delegation_mode::backfill(&pool, encryption.as_ref()).await?;
+        // bytes before returning, without rewriting any historical `delegation`
+        // row. Backfill uses `FOR KEY SHARE SKIP LOCKED` + `lock_timeout = 2s`
+        // on PostgreSQL and never fails boot: any skipped/unmarked row derives
+        // the identical mode on read via `delegation_mode::derive_when_unmarked`.
+        if let Err(_error) = delegation_mode::backfill(&pool, encryption.as_ref()).await {
+            tracing::info!("delegation mode boot backfill deferred; unmarked rows derive on read");
+        }
         let renewal_identity = match (secrets.renewal_seed(), secrets.renewal_node_did()) {
             (Some(seed), Some(stable_node_did)) => {
                 let (renewer_did, epoch, _) =
