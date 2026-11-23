@@ -313,7 +313,7 @@ secret = "{}"
         .map(|stamp| stamp["generation"].as_u64())
         .collect::<Vec<_>>();
     ensure!(
-        generations == vec![Some(1); generations.len()],
+        generations.len() >= 2 && generations == vec![Some(1); generations.len()],
         "stamp generations of one lease differ: {capped}"
     );
     if let Some(directory) = std::env::var_os("TINYCLOUD_HISTORY_SDK_FIXTURE_DIR") {
