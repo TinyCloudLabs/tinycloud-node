@@ -1,0 +1,394 @@
+//! TC-4092: after the owner revokes a delegation and a lease and the
+//! records of their space are purged, is the same signed chain admitted again
+//! through the real admission path (`SpaceDatabase::delegate`, what `POST
+//! /delegate` calls) and does the old lease stamp again?
+use super::*;
+use crate::storage::memory::MemoryStore;
+use std::collections::BTreeMap;
+use tinycloud_auth::{
+    authorization::{TinyCloudDelegation, TinyCloudRevocation},
+    resolver::DID_METHODS,
+    ssi::{
+        claims::jwt::NumericDate,
+        jwk::{Algorithm, JWK},
+        ucan::Payload,
+    },
+    ucan_capabilities_object::Capabilities,
+};
+
+fn key(seed: u8) -> (JWK, String, String) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let secret = [seed; 32];
+    let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
+    let jwk: JWK = serde_json::from_value(serde_json::json!({
+        "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA",
+        "x": URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes()),
+        "d": URL_SAFE_NO_PAD.encode(secret),
+    }))
+    .unwrap();
+    let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+    let method = format!("{did}#{}", did.rsplit(':').next().unwrap());
+    (jwk, did, method)
+}
+
+fn token(
+    issuer_seed: u8,
+    audience: &str,
+    resource: &str,
+    ability: &str,
+    parents: &[Hash],
+    nonce: &str,
+    exp: i64,
+) -> String {
+    let (jwk, _, method) = key(issuer_seed);
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut caps = Capabilities::<serde_json::Value>::new();
+    caps.with_action(
+        resource.parse().unwrap(),
+        ability.parse().unwrap(),
+        [BTreeMap::new()],
+    );
+    Payload::<serde_json::Value> {
+        issuer: method.parse().unwrap(),
+        audience: audience.parse().unwrap(),
+        not_before: Some(NumericDate::try_from_seconds((now - 5) as f64).unwrap()),
+        expiration: NumericDate::try_from_seconds(exp as f64).unwrap(),
+        nonce: Some(nonce.to_owned()),
+        facts: None,
+        proof: parents.iter().map(|id| id.to_cid(0x55)).collect(),
+        attenuation: caps,
+    }
+    .sign(Algorithm::EdDSA, &jwk)
+    .unwrap()
+    .encode()
+    .unwrap()
+}
+
+fn deleg(token: &str) -> Delegation {
+    Delegation::from_header_ser::<TinyCloudDelegation>(token).unwrap()
+}
+
+fn cid_of(token: &str) -> Hash {
+    crate::hash::hash(token.as_bytes())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// (a) records gone, the space row still hosted, no purge fence.
+    Hosted,
+    /// (b) records gone, the space row gone too, no fence; the owner posts a
+    /// fresh `tinycloud.space/host` delegation first.
+    Rehosted,
+    /// (c) records gone, space row gone, permanent purge fence on the space.
+    Fenced,
+}
+
+async fn count(db: &sea_orm::DatabaseConnection, table: &str) -> i64 {
+    db.query_one(Statement::from_string(
+        DbBackend::Sqlite,
+        format!("SELECT COUNT(*) AS n FROM {table}"),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "n")
+    .unwrap()
+}
+
+fn outcome<T>(result: &Result<T, TxError<MemoryStore, StaticSecret>>) -> String {
+    match result {
+        Ok(_) => "ADMITTED".to_owned(),
+        Err(error) => format!("REFUSED: {error}"),
+    }
+}
+
+async fn scenario(state: State) -> Vec<String> {
+    let mut report = Vec::new();
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("tc4092.sqlite").display()
+    );
+    let secret = StaticSecret::new(vec![0x42; 32]).unwrap();
+    let mut db = SpaceDatabase::new(
+        sea_orm::Database::connect(url).await.unwrap(),
+        MemoryStore::default(),
+        secret.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+    .unwrap();
+    let identity = db.renewal_identity().unwrap().clone();
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder1, _) = key(0x21);
+    let (_, holder2, _) = key(0x22);
+    let (_, holder3, _) = key(0x23);
+    let space: SpaceId = format!("tinycloud:{}:default", owner_did.strip_prefix("did:").unwrap())
+        .parse()
+        .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = |nonce: &str| {
+        token(
+            0x11,
+            &owner_did,
+            &host,
+            "tinycloud.space/host",
+            &[],
+            nonce,
+            now + 3600,
+        )
+    };
+    // The space is hosted by the owner's host delegation, as in production.
+    db.delegate(deleg(&host_token("host-1")))
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    assert_eq!(count(&db.conn, "space").await, 1);
+
+    // Plain chain: root -> child, signed by the owner then by holder 1.
+    let root = token(0x11, &holder1, &kv, "tinycloud.kv/get", &[], "root", now + 3600);
+    let child = token(
+        0x21,
+        &holder2,
+        &kv,
+        "tinycloud.kv/get",
+        &[cid_of(&root)],
+        "child",
+        now + 3000,
+    );
+    // Lease chain: original (holder 3) and its owner-signed lease.
+    let original = token(0x11, &holder3, &kv, "tinycloud.kv/get", &[], "original", now + 3600);
+    let original_cid = cid_of(&original).to_cid(0x55).to_string();
+    let lease = token(
+        0x11,
+        &identity.renewer_did,
+        &format!("urn:cid:{original_cid}"),
+        "tinycloud.delegation/renew",
+        &[],
+        "lease",
+        now + 7200,
+    );
+    for t in [&root, &child, &original, &lease] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    assert_eq!(count(&db.conn, "renewal_lease").await, 1);
+
+    // Control: the live lease stamps.
+    let request = |label: &str| {
+        let invocation = tinycloud_auth::authorization::TinyCloudInvocation::decode(&original)
+            .unwrap();
+        let mut request = crate::renewal::StampIssue {
+            invocation: crate::util::InvocationInfo::try_from(invocation).unwrap(),
+            original_cid: original_cid.clone(),
+            lease_cid: cid_of(&lease).to_cid(0x55).to_string(),
+            replay_hash: crate::hash::hash(label.as_bytes()),
+            replay_expires_at: now + 600,
+        };
+        request.invocation.invoker = identity.renewer_did.clone();
+        request.invocation.parents = vec![request.lease_cid.parse().unwrap()];
+        request.invocation.capabilities = vec![crate::util::Capability {
+            resource: format!("urn:cid:{original_cid}").parse().unwrap(),
+            ability: "tinycloud.delegation/renew".to_owned().try_into().unwrap(),
+            caveats: Default::default(),
+        }];
+        request
+    };
+    db.issue_renewal_stamp(request("control"))
+        .await
+        .expect("control: the live lease stamps");
+    report.push(format!(
+        "control: renewal_stamp={}, renewal_lease={:?}",
+        count(&db.conn, "renewal_stamp").await,
+        lease_states(&db.conn).await
+    ));
+
+    // The owner revokes the child and the lease through /revoke.
+    for target in [&child, &lease] {
+        let revocation = token(
+            0x11,
+            &owner_did,
+            &format!("urn:cid:{}", cid_of(target).to_cid(0x55)),
+            "tinycloud.delegation/revoke",
+            &[],
+            &format!("revoke-{}", &target[target.len() - 8..]),
+            now + 600,
+        );
+        db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    assert_eq!(count(&db.conn, "revocation").await, 2);
+
+    // Purge the records of the space.
+    let mut deleted: std::collections::HashSet<Hash> =
+        [&root, &child, &original, &lease].iter().map(|t| cid_of(t)).collect();
+    deleted.insert(cid_of(&host_token("host-1")));
+    for row in db
+        .conn
+        .query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id FROM revocation".to_owned(),
+        ))
+        .await
+        .unwrap()
+    {
+        deleted.insert(row.try_get::<Hash>("", "id").unwrap());
+    }
+    let tx = db.conn.begin().await.unwrap();
+    crate::space_purge_records::remove_records_for_test(&tx, &deleted)
+        .await
+        .unwrap();
+    if state != State::Hosted {
+        // The space-keyed rows complete_space deletes before the space row.
+        for table in ["event_order", "epoch_order", "epoch_head", "epoch", "space"] {
+            tx.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("DELETE FROM {table}"),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    if state == State::Fenced {
+        let keys = std::sync::Arc::new(
+            crate::space_purge_ledger::LedgerKeys::new(
+                "test".into(),
+                BTreeMap::from([("test".into(), vec![7; 32])]),
+            )
+            .unwrap(),
+        );
+        let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
+            keys.clone(),
+        ));
+        fence.set_serving_ready(true);
+        let tx = db.conn.begin().await.unwrap();
+        fence
+            .fence_hmac(
+                &tx,
+                "space",
+                "test",
+                &keys
+                    .target_hmac("test", "space", &space.to_string())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db = db.with_space_purge_fence(fence);
+    }
+    report.push(format!(
+        "after purge: delegation={}, revocation={}, renewal_lease={:?}, renewal_stamp={}, space={}",
+        count(&db.conn, "delegation").await,
+        count(&db.conn, "revocation").await,
+        lease_states(&db.conn).await,
+        count(&db.conn, "renewal_stamp").await,
+        count(&db.conn, "space").await,
+    ));
+    if lease_states(&db.conn).await.iter().any(|state| state == "active") {
+        report.push("VIOLATION: a lease row is 'active' after its records were purged".to_owned());
+    }
+
+    if state != State::Hosted {
+        let rehost = db.delegate(deleg(&host_token("host-2"))).await;
+        report.push(format!("re-host (fresh host delegation): {}", outcome(&rehost)));
+        // The same host delegation, byte for byte.
+        let same = db.delegate(deleg(&host_token("host-1"))).await;
+        report.push(format!("re-host (identical host delegation): {}", outcome(&same)));
+    }
+    for (label, t, revoked) in [
+        ("root", &root, false),
+        ("child (revoked)", &child, true),
+        ("original", &original, false),
+        ("lease (revoked)", &lease, true),
+    ] {
+        let result = db.delegate(deleg(t)).await;
+        report.push(format!("re-post {label}: {}", outcome(&result)));
+        if revoked && result.is_ok() {
+            report.push(format!("VIOLATION: revoked {label} admitted again"));
+        }
+    }
+    let child_row = count_where(&db.conn, "delegation", &cid_of(&child)).await;
+    let child_revoked = crate::models::revocation::is_revoked(&db.conn, &cid_of(&child))
+        .await
+        .unwrap();
+    report.push(format!(
+        "child stored={child_row}, still revoked={child_revoked}; renewal_lease={:?}, renewal_stamp={}",
+        lease_states(&db.conn).await,
+        count(&db.conn, "renewal_stamp").await,
+    ));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let stamp = db.issue_renewal_stamp(request("after purge")).await;
+    report.push(format!(
+        "stamp for the old lease: {}",
+        match &stamp {
+            Ok(record) => format!("ISSUED new_end={}", record.new_end),
+            Err(error) => format!("REFUSED: {error:?}"),
+        }
+    ));
+    if stamp.is_ok() {
+        report.push("VIOLATION: a purged, revoked lease stamped".to_owned());
+    }
+    report
+}
+
+async fn lease_states(db: &sea_orm::DatabaseConnection) -> Vec<String> {
+    db.query_all(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT state FROM renewal_lease".to_owned(),
+    ))
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.try_get::<String>("", "state").unwrap())
+    .collect()
+}
+
+async fn count_where(db: &sea_orm::DatabaseConnection, table: &str, id: &Hash) -> i64 {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!("SELECT COUNT(*) AS n FROM {table} WHERE id = $1"),
+        [Vec::<u8>::from(*id).into()],
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "n")
+    .unwrap()
+}
+
+/// The safe outcome in every state: the revoked child and the revoked lease
+/// are not admitted again, the old lease never stamps, and no lease row
+/// stays 'active' once its records are purged. Fails today in `Hosted` and
+/// `Rehosted`: nothing remembers a revocation once purge deletes its row.
+#[tokio::test]
+async fn tc4092_real_admission_after_revoke_and_purge() {
+    let mut violations = Vec::new();
+    for state in [State::Hosted, State::Rehosted, State::Fenced] {
+        eprintln!("=== TC-4092 {state:?} ===");
+        for line in scenario(state).await {
+            eprintln!("{line}");
+            if line.starts_with("VIOLATION") {
+                violations.push(format!("{state:?}: {line}"));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
