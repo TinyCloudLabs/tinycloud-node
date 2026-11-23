@@ -814,7 +814,10 @@ async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
         })
     };
     schema
-        .wait_for_sessions("wait_event_type = 'Lock' AND query LIKE 'UPDATE%'", 1)
+        .wait_for_sessions(
+            "wait_event_type = 'Lock' AND (query LIKE 'UPDATE%' OR query LIKE 'WITH%UPDATE%')",
+            1,
+        )
         .await;
     // What a delta save does to the row: the next revision, same checkpoint.
     holder
