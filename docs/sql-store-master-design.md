@@ -259,7 +259,7 @@ Recommendation: after P4 is built and soaked, cut Inbox's per-source databases o
 
 P4.1-P4.3 can be built and merged with no database cut over (no user-visible change). **Nothing after P4.4 is enabled in production without Sam's explicit go for the named databases.** Sizes are relative only; Bobbie's read (section 15) made P4.2a and P4.2c necessary, so the work is larger than the first draft said.
 
-## 13. Decisions (ruled by Naomi 2026-11-23 13:12Z; Sam to confirm)
+## 13. Decisions (ruled by Naomi 2026-11-23 13:12Z; Sam answered 5, 6 and 8 on 2026-11-23 21:37Z)
 
 | # | Decision | Ruling |
 |---|---|---|
@@ -267,10 +267,12 @@ P4.1-P4.3 can be built and merged with no database cut over (no user-visible cha
 | 2 | Encryption | **Required before any non-owned cutover.** |
 | 3 | Large databases | **(a): store-master databases are capped at the PG copy-back limit for the pilot.** Consequence: the pilot does not yet use P4's main benefit, writing databases above 64 MiB. That needs the later policy decision below. |
 | 4 | Frozen PG artifact retention | **30 days** after cutover. Store history per tier stays with contract D2. |
-| 5 | `owner_lost` | Manual operator claim in v1; automatic with TC-1471 later. (Proposed, not yet ruled.) |
-| 6 | Supported maximum size after the pilot | Open. A number from disk and hydration measurements (P4.3), not "unlimited". Lifting the pilot cap needs a copy-back path: the opt-in PG parts store (section 8) with capacities set, or TC-3764. |
+| 5 | `owner_lost` | **Sam (21:37Z): approved.** A manual operator takeover of a database, **only after the dead node's lease has expired, and with the loss logged.** Automatic takeover waits for TC-1471. |
+| 6 | Supported maximum size after the pilot | **Sam (21:37Z): approved the recommendation: a 64 MiB per-database pilot cap, which keeps the Postgres copy-back as the rollback.** A higher cap is a later decision from disk and hydration measurements (P4.3), not "unlimited"; lifting it needs a copy-back path: the opt-in PG parts store (section 8) with capacities set, or TC-3764. |
 | 7 | Pilot order | **Owned spaces, then Inbox per-source, then opt-in users.** |
-| 8 | Write-through instead of the 60 s window | Not offered in v1 (it reverses the 10-19 ruling). If Sam wants the node's disk to be a pure cache, the node would acknowledge a write only after the object store has it; the lease, epoch fence, never-overwrite and loss-bound machinery then mostly disappear, at the cost of an object-store PUT on every commit. Asked of Sam on the card (Holden 14:13Z). |
+| 8 | Write-through instead of the 60 s window | **Sam (21:37Z): approved the recommendation: keep the asynchronous window, 60 s or 8 MiB ahead; no write-through** (it would reverse the 10-19 ruling). |
+
+**End state Sam confirmed (21:37Z):** the object store is the master of the same KV; Postgres is not the master; the node's disk file is a working copy. The old Postgres copy stays for 30 days as the rollback (decision 4). **First step: a persistent volume for the node's SQL working copy (P4.2b); the staging proof is a separate production change with its own GO.** This confirmation is not a merge, deploy or migration GO; each slice below keeps its own gate.
 
 ## 14. What was unknown, and how each was resolved
 
