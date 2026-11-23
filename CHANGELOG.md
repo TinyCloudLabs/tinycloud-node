@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Ingress: locally generated upstream connection failures and timeouts answer plain 503 with `Retry-After: 5` instead of 502/504; node responses stay unchanged, and no request is replayed or write outcome implied. Details: TC-3972.
 - CI: the Phala deploy guard's CVM read (`scripts/ci/phala-cvm-json.sh`) and the post-deploy compose-file capture in `docker.yml` write the CLI output to a file instead of `$(...)`. The node 1.26.22 deploy failed twice before changing anything: CI's `phala` 1.1.19 output, read through a pipe, was cut at 65532 bytes once the CVM JSON passed 64 KiB (70094 bytes). The CVM read still retries and still fails closed on empty, non-JSON or `os`-less output. Details: TC-3928.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;

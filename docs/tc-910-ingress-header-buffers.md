@@ -27,6 +27,42 @@ Size: the access log goes to the container's stdout. The compose caps the ingres
 
 CI runs it in the `build-ingress` job before the image is pushed. Locally: `DOCKER="sudo docker" deploy/ingress/test-redacted-logging.sh`, or `IMAGE=<ref>` to test a published wrapper.
 
+## Temporary upstream failures (TC-3972)
+
+While ingress is running, a locally generated proxy 502 (including connection
+refusal or a response lost before headers) or 504 (upstream timeout) becomes
+503 with `Content-Type: text/plain`, `Retry-After: 5`, and the body
+`Service temporarily unavailable.` followed by a newline. Five seconds is a
+short suggested pause to reduce immediate reconnect pressure, not an estimate
+of when startup will finish.
+
+The Dockerfile patches the pinned entrypoint's proxy location and fails the
+build if its anchors or relevant error/retry directives change. A named error
+location preserves the original URI for redacted route classification.
+`proxy_intercept_errors` remains off: node-generated statuses, bodies and
+headers, including the node's typed 503 retry contract, pass through unchanged.
+Streaming and buffering settings are unchanged; streams using
+`X-Accel-Buffering: no` still pass without buffering. Once response headers have
+been sent, a broken stream cannot be replaced with a 503.
+
+This does not remove the restart outage. Ingress cannot answer while its own
+CVM is down. It does not retry requests, say whether a write was applied, or
+make a generic failure safe to retry. A lost response after a write remains
+ambiguous; `Retry-After` alone is not the node's typed retry contract.
+
+CI runs `python3 deploy/ingress/test-upstream-unavailable.py` against the built
+wrapper and its generated TLS server block: refused upstream and timeout →
+503 plus header/body; healthy and node-error responses unchanged; loss after
+receiving a POST body → one received body, no replay; unbuffered streaming;
+upstream shutdown; and original redacted route/status logging. The existing
+redacted-logging test remains unchanged (its injected `/public/` proxy location
+is outside the production proxy location's error mapping).
+
+A no-Docker check can use a source-built nginx with SSL and HTTP/2 modules:
+`python3 deploy/ingress/test-upstream-unavailable.py --nginx /path/to/nginx --entrypoint /path/to/pinned-image/entrypoint.sh`.
+Supply the wrapper-patched entrypoint to check the new behavior, or the base
+entrypoint to reproduce the former 502/504 responses and failing assertions.
+
 ## Deploy and rollback
 
 1. **Build:** dispatch `docker.yml` on the release ref, then record the ingress image digest from the job summary.
