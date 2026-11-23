@@ -10,7 +10,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
-    ConnectionTrait, DbBackend, QuerySelect, QueryTrait, Statement,
+    ConnectionTrait, DbBackend, Iterable, QuerySelect, Statement,
 };
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -170,6 +170,12 @@ pub enum DelegationError {
     /// Maps to `terminal-parent-cannot-redelegate` in the W0 vectors.
     #[error("terminal-parent-cannot-redelegate")]
     TerminalParentCannotRedelegate,
+    /// TC-4092: these exact signed bytes (or another encoding of the same
+    /// delegation) were revoked, and a space purge has since deleted the
+    /// `revocation` row; `revocation_tombstone` remembers it. A revoked
+    /// delegation never comes back by being posted again.
+    #[error("delegation-revoked: {0}")]
+    Revoked(String),
     #[error("delegation-parent-revoked: {0}")]
     ParentRevoked(String),
     #[error("delegation-ancestor-revoked: ancestor={ancestor_cid} parent={parent_cid}")]
@@ -217,6 +223,7 @@ impl DelegationError {
     pub fn revocation_code(&self) -> Option<super::revocation::RevocationCode> {
         use super::revocation::RevocationCode;
         match self {
+            Self::Revoked(_) => Some(RevocationCode::DelegationRevoked),
             Self::ParentRevoked(_) => Some(RevocationCode::ParentRevoked),
             Self::AncestorRevoked { .. } => Some(RevocationCode::AncestorRevoked),
             _ => None,
@@ -1615,7 +1622,7 @@ async fn save<C: ConnectionTrait>(
             now,
         )
     });
-    let insert = Entity::insert(ActiveModel::from(Model {
+    let model = ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
         delegatee: delegation.delegate,
@@ -1628,12 +1635,44 @@ async fn save<C: ConnectionTrait>(
         // The conflict below does nothing, so a resubmission keeps the first
         // insert's time.
         first_seen_at: Some(now),
-    }))
-    .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
+    });
     if db.get_database_backend() == DbBackend::Postgres {
         let claimed = Alias::new("registered_delegation");
-        let mut delegation_insert = insert.into_query();
-        delegation_insert.returning(Query::returning().column(Column::Id).to_owned());
+        // TC-4092: the row is inserted only while no tombstone names these
+        // bytes or their canonical form. It runs in this statement, after the
+        // shared purge lock of `save_actors` above, so it sees what a purge
+        // that held the exclusive lock committed, and costs no round trip.
+        let mut values = Vec::new();
+        for column in Column::iter() {
+            values.push(Expr::val(model.get(column).into_value().ok_or_else(
+                || DbErr::Custom("delegation insert: column not set".into()),
+            )?));
+        }
+        let mut delegation_insert = Query::insert();
+        delegation_insert
+            .into_table(Entity)
+            .columns(Column::iter())
+            .select_from(
+                Query::select()
+                    .exprs(values)
+                    .and_where(
+                        Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1))
+                                .from(revocation_tombstone::Entity)
+                                .and_where(
+                                    Expr::col(revocation_tombstone::Column::DelegationCanonical)
+                                        .is_in([hash, canonical]),
+                                )
+                                .to_owned(),
+                        )
+                        .not(),
+                    )
+                    .to_owned(),
+            )
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
+            .returning(Query::returning().column(Column::Id).to_owned());
         let mut alias_insert = Query::insert();
         alias_insert
             .into_table(delegation_cid_alias::Entity)
@@ -1712,10 +1751,19 @@ async fn save<C: ConnectionTrait>(
             .await?
             .is_none()
         {
+            // Not inserted: either already stored, or refused by the
+            // tombstone guard in the insert. One lookup tells them apart; a
+            // fresh registration never reaches it.
+            refuse_tombstoned(db, hash, canonical).await?;
             return Ok(DelegationRegistration::Existing(hash));
         }
     } else {
-        match insert.exec(db).await {
+        refuse_tombstoned(db, hash, canonical).await?;
+        match Entity::insert(model)
+            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
+            .exec(db)
+            .await
+        {
             Err(DbErr::RecordNotInserted) => return Ok(DelegationRegistration::Existing(hash)),
             result => {
                 result?;
@@ -1778,6 +1826,20 @@ async fn save<C: ConnectionTrait>(
     }
 
     Ok(DelegationRegistration::New(hash))
+}
+
+/// TC-4092: refuse bytes whose delegation was revoked and whose `revocation`
+/// row a space purge deleted. The tombstone is keyed by canonical hash, so
+/// every encoding of the delegation is covered.
+async fn refuse_tombstoned<C: ConnectionTrait>(
+    db: &C,
+    hash: Hash,
+    canonical: Hash,
+) -> Result<(), Error> {
+    if revocation_tombstone::is_tombstoned(db, &[hash, canonical]).await? {
+        return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
+    }
+    Ok(())
 }
 
 async fn save_actors<C: ConnectionTrait>(

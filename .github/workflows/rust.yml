@@ -192,6 +192,51 @@ jobs:
       timeout-minutes: 25
       run: cargo test --workspace --lib
 
+    - name: Start disposable LocalStack for live S3 storage tests
+      if: matrix.group == 'unit'
+      env:
+        COMPOSE_PROJECT_NAME: tc153-${{ github.run_id }}-${{ github.run_attempt }}
+        LOCALSTACK_PORT: "0"
+      run: |
+        set -euo pipefail
+        docker compose -f test/docker-compose.yml up -d --wait --wait-timeout 180 localstack
+        endpoint="http://$(docker compose -f test/docker-compose.yml port localstack 4566)"
+        echo "TC887_S3_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
+        echo "TC735_TEST_MINIO_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
+
+    - name: Run live S3 storage tests
+      if: matrix.group == 'unit'
+      timeout-minutes: 25
+      env:
+        AWS_ACCESS_KEY_ID: test
+        AWS_SECRET_ACCESS_KEY: test
+        AWS_REGION: us-east-1
+        AWS_EC2_METADATA_DISABLED: "true"
+        TC887_S3_ACCESS_KEY_ID: test
+        TC887_S3_SECRET_ACCESS_KEY: test
+        TC887_S3_REGION: us-east-1
+        TC887_S3_BUCKET: tinycloud-blocks
+        TC735_TEST_MINIO_BUCKET: tinycloud-blocks
+      run: |
+        set -euo pipefail
+        : "${TC887_S3_ENDPOINT:?LocalStack endpoint must be set}"
+        : "${TC735_TEST_MINIO_ENDPOINT:?LocalStack endpoint must be set}"
+        : "${TINYCLOUD_TEST_POSTGRES_URL:?PostgreSQL must be set for the boot test}"
+        cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored --list \
+          | grep -qx 'remove_deletes_the_block_and_releases_its_size: test'
+        count="$(cargo test --locked -p tinycloud-node --lib storage::s3::tests::minio_ -- --list \
+          | grep -cE '^storage::s3::tests::minio_[a-z0-9_]+: test$' || true)"
+        [ "${count}" -ge 6 ]
+        cargo test --locked -p tinycloud-node --test s3_block_store -- --ignored --nocapture --test-threads=1
+        cargo test --locked -p tinycloud-node --lib storage::s3::tests::minio_ -- --nocapture --test-threads=1
+
+    - name: Remove disposable LocalStack
+      if: always() && matrix.group == 'unit'
+      env:
+        COMPOSE_PROJECT_NAME: tc153-${{ github.run_id }}-${{ github.run_attempt }}
+        LOCALSTACK_PORT: "0"
+      run: docker compose -f test/docker-compose.yml down --volumes
+
     - name: Run the workspace bin and integration tests (a-o)
       if: matrix.group == 'integration-a-o'
       timeout-minutes: 25

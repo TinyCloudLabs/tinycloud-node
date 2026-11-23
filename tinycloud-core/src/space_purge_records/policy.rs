@@ -218,6 +218,46 @@ pub(super) async fn preload(
     Ok(())
 }
 
+/// TC-4092: a Policy/v3 root revoked in its own store (`policy_v3_root.revoked_at`;
+/// the `RootRevocation/v1` route `POST /revoke` writes only that row, never a
+/// `revocation` row) loses that revocation when `remove` deletes the row,
+/// exactly like a `revocation` row does. Tombstone it first, in the same table
+/// and transaction, so `delegation::save` still refuses the root's bytes on
+/// `/delegate` and on `POST /policy/v3/policies`. Run before anything is
+/// deleted: the tombstone reads the delegation's expiry and its alias row.
+/// `revoked_at` is copied from the row (RFC 3339 text there); no key, DID or
+/// signature goes into the tombstone.
+///
+/// Not tombstoned, on purpose: `policy_delegation` (share-email authority
+/// artifacts) is re-admitted through the authority bridge, which refreshes the
+/// revocation status from the authority, and not through `delegation::save`, so
+/// a tombstone would guard nothing; `policy_v3_session` rows are only ever
+/// written as `admitted` (their delegation's revocation is a `revocation` row);
+/// `policy_v3_registration` has no revocation column (it is revoked through its
+/// roots); `owner_share_policy.revoked_at` and `share_session_handle.revoked_at`
+/// name no delegation and are never written outside tests.
+pub(super) async fn tombstone_revoked(
+    tx: &DatabaseTransaction,
+    deleted: &HashSet<Hash>,
+    lease: &mut Lease<'_>,
+) -> Result<(), DbErr> {
+    let mut revoked = Vec::new();
+    for row in models::policy_v3_root::Entity::find().all(tx).await? {
+        lease.keep(tx).await?;
+        let id = cid(&row.root_cid)?;
+        let Some(revoked_at) = row.revoked_at.as_deref() else {
+            continue;
+        };
+        if deleted.contains(&id) {
+            let at =
+                OffsetDateTime::parse(revoked_at, &time::format_description::well_known::Rfc3339)
+                    .ok();
+            revoked.push((id, at));
+        }
+    }
+    super::insert_tombstones(tx, revoked).await
+}
+
 pub(super) async fn remove(
     tx: &DatabaseTransaction,
     deleted: &HashSet<Hash>,

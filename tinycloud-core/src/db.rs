@@ -2,6 +2,12 @@
 #[path = "db/cacao_terminal_mode_tests.rs"]
 mod cacao_terminal_mode_tests;
 #[cfg(test)]
+#[path = "db/purge_readmission_tests.rs"]
+mod purge_readmission_tests;
+#[cfg(test)]
+#[path = "db/purge_tombstone_tests.rs"]
+mod purge_tombstone_tests;
+#[cfg(test)]
 #[path = "db/session_retire_tests.rs"]
 mod session_retire_tests;
 #[cfg(test)]
@@ -1410,6 +1416,13 @@ where
         let roots = roots.iter().copied().map(Hash::from).collect::<Vec<_>>();
         if roots.is_empty() {
             return Ok(None);
+        }
+        // TC-4092: a cited delegation whose revocation a purge deleted (the
+        // delegation is gone with it, so the walk below finds nothing) is
+        // still revoked: signed-URL and hook tickets minted from it before the
+        // revocation must not work again.
+        if crate::models::revocation_tombstone::is_tombstoned(&self.conn, &roots).await? {
+            return Ok(Some(RevocationCode::DelegationRevoked));
         }
         // The shared traversal budget covers every cited root together.
         let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)

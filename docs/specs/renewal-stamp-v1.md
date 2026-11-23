@@ -11,6 +11,8 @@ A renewal lease is an existing owner-authorized UCAN/CACAO delegation. This spec
 
 The CIDs named `originalCid` and `leaseCid` in the known-answer fixture are generated from synthetic DAG-CBOR placeholder artifacts. They test stamp encoding and the non-null root link only; they are not signed UCAN/CACAO delegation records and do not freeze the lease's actual bytes.
 
+A space purge deletes the `renewal_lease` and `renewal_stamp` rows of every lease or original delegation it deletes, so a lease does not survive its records (TC-4092). A revocation of a lease, its original or an ancestor is remembered across a purge by a `revocation_tombstone` row keyed by the canonical hash, and after a purge `/delegate` refuses the same lease again with `delegation_revoked` (401). A stored lease posted again while it, its original or an ancestor is revoked answers 401 `renewal lease is revoked`. A lease whose original was never revoked registers again after a purge as a new lease with no stamp history.
+
 ## Signed stamp bytes
 
 The signed byte sequence is the deterministic DAG-CBOR encoding of exactly this two-entry map:

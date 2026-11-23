@@ -1116,7 +1116,19 @@ async fn register_lease_checked<C: ConnectionTrait>(
             Value::Bytes(Some(Box::new(Vec::<u8>::from(lease_hash)))),
         ],
     )).await?;
+    // TC-4092: a lease or original a purge tombstoned is never registered
+    // again, whether or not a row exists. `delegation::save` refuses it
+    // first; this keeps the renewal layer sound on its own.
+    if crate::models::revocation_tombstone::is_tombstoned(tx, &[lease_hash, original]).await? {
+        return Err(RenewalStoreError::Revoked);
+    }
     if let Some(row) = existing {
+        // A stored lease is not re-accepted once it, its original or an
+        // ancestor is revoked. The fresh path below refuses the same;
+        // answering `Ok` here told the caller a revoked lease was registered.
+        if is_revoked_chain(tx, &lease_hash).await? || is_revoked_chain(tx, &original).await? {
+            return Err(RenewalStoreError::Revoked);
+        }
         // Renewal metadata is stored at whole-second precision.
         let same = row.try_get::<String>("", "grantor")? == lease.delegator
             && row.try_get::<String>("", "renewer_did")? == renewer_did
