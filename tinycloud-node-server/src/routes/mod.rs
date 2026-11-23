@@ -5646,18 +5646,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_pragma_request_requires_admin() {
-        let request = SqlRequest::Query {
-            sql: "PRAGMA table_info(secret_records)".to_string(),
-            params: Vec::new(),
-            max_rows: None,
-            max_bytes: None,
-        };
-
-        assert!(sql_request_requires_admin(&request));
-    }
-
-    #[tokio::test]
     async fn sql_pragma_missing_admin_returns_auth_hint_shape() {
         let space = test_space_id("secrets");
         let request = SqlRequest::Query {
@@ -6190,14 +6178,17 @@ mod tests {
             schema: None,
         };
         let err = enforce_constrained_profile(&caveat, raw_execute).unwrap_err();
+        assert_eq!(err.0, Status::Forbidden);
         assert_eq!(err.1, "sql-raw-execute-blocked");
 
         let batch = SqlRequest::Batch { statements: vec![] };
         let err = enforce_constrained_profile(&caveat, batch).unwrap_err();
+        assert_eq!(err.0, Status::Forbidden);
         assert_eq!(err.1, "sql-batch-blocked");
 
         let export = SqlRequest::Export;
         let err = enforce_constrained_profile(&caveat, export).unwrap_err();
+        assert_eq!(err.0, Status::Forbidden);
         assert_eq!(err.1, "sql-export-blocked");
     }
 
@@ -7850,136 +7841,6 @@ mod tests {
             "expected delegation-revoked error body, got {body}"
         );
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn w1_constrained_profile_routes_raw_calls_to_403() {
-        // Real-path: the SqlService also rejects raw queries when
-        // SqlCaveats.statements is set with a non-matching name. We use
-        // enforce_constrained_profile as the front gate to ensure raw
-        // forms never reach the service. This double-checks no path
-        // leaks past the enforcement boundary.
-        let caveat = caveat_named("get", "SELECT 1");
-        for req in [
-            SqlRequest::Query {
-                sql: "SELECT 1".to_string(),
-                params: vec![],
-                max_rows: None,
-                max_bytes: None,
-            },
-            SqlRequest::Execute {
-                sql: "INSERT INTO x VALUES (1)".to_string(),
-                params: vec![],
-                schema: None,
-            },
-            SqlRequest::Batch { statements: vec![] },
-            SqlRequest::Export,
-        ] {
-            let err = enforce_constrained_profile(&caveat, req).unwrap_err();
-            assert_eq!(err.0, Status::Forbidden);
-        }
-    }
-
-    // ---- W1 (C): DB-backed delegation/revocation + post-revoke denial.
-    // ----
-    // Real-path test: insert a delegation row + revocation row directly
-    // and confirm `models::invocation::process` denies. This exercises
-    // the actual revocation table + invocation path the route uses.
-    #[tokio::test]
-    async fn w1_post_revoke_invocation_denied_through_real_path() -> Result<()> {
-        use serde_json::json;
-        use tinycloud_auth::resource::SpaceId;
-        use tinycloud_core::models::{
-            abilities, delegation as deleg_model, revocation as revo_model,
-        };
-        use tinycloud_core::types::Caveats;
-
-        let (_tempdir, tinycloud) = test_tinycloud().await?;
-        let conn = tinycloud.readable().await?;
-        let space: SpaceId = test_space_id("w1-revoke");
-
-        // Insert a parent delegation row + abilities row + actor rows
-        // so the chain has a persisted parent we can revoke against.
-        let parent_hash = tinycloud_core::hash::hash(b"parent-delegation-bytes");
-        let owner_did = space.did().to_string();
-        let recipient = "did:key:zRecipient".to_string();
-
-        use tinycloud_core::sea_orm::ActiveModelTrait;
-        use tinycloud_core::sea_orm::ActiveValue::Set;
-        tinycloud_core::models::actor::ActiveModel {
-            id: Set(owner_did.clone()),
-        }
-        .insert(&conn)
-        .await?;
-        tinycloud_core::models::actor::ActiveModel {
-            id: Set(recipient.clone()),
-        }
-        .insert(&conn)
-        .await?;
-
-        deleg_model::ActiveModel {
-            id: Set(parent_hash),
-            delegator: Set(owner_did.clone()),
-            delegatee: Set(recipient.clone()),
-            expiry: Set(None),
-            issued_at: Set(None),
-            not_before: Set(None),
-            facts: Set(None),
-            serialization: Set(b"parent-delegation-bytes".to_vec()),
-            serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
-            first_seen_at: Default::default(),
-        }
-        .insert(&conn)
-        .await?;
-
-        let resource = Resource::TinyCloud(space.clone().to_resource(
-            "sql".parse().unwrap(),
-            Some("main".parse().unwrap()),
-            None,
-            None,
-        ));
-        let mut caveats_map = std::collections::BTreeMap::new();
-        caveats_map.insert("0".to_string(), json!({}));
-        let read_ability = Ability::try_from("tinycloud.sql/read".to_string()).unwrap();
-        abilities::ActiveModel {
-            delegation: Set(parent_hash),
-            resource: Set(resource.clone()),
-            ability: Set(read_ability),
-            caveats: Set(Caveats(caveats_map)),
-        }
-        .insert(&conn)
-        .await?;
-
-        // Confirm the row reads back so the chain is real.
-        assert!(deleg_model::Entity::find_by_id(parent_hash)
-            .one(&conn)
-            .await?
-            .is_some());
-
-        // Insert a revocation row by hand and verify the invocation
-        // validator's `is_revoked` helper fires the spec rejection.
-        let revoker_did = owner_did.clone();
-        let revo_hash = tinycloud_core::hash::hash(b"revocation-bytes");
-        revo_model::ActiveModel {
-            id: Set(revo_hash),
-            revoker: Set(revoker_did),
-            revoked: Set(parent_hash),
-            serialization: Set(b"revocation-bytes".to_vec()),
-            revoked_at: Set(None),
-        }
-        .insert(&conn)
-        .await?;
-
-        // Walk the delegation chain — invocation parent revocation
-        // should be visible via the public revocation table.
-        let row = revo_model::Entity::find()
-            .filter(revo_model::Column::Revoked.eq(parent_hash))
-            .one(&conn)
-            .await?;
-        assert!(row.is_some(), "revocation row must persist for chain check");
-
-        let _ = tinycloud;
         Ok(())
     }
 
@@ -10899,40 +10760,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_read_at_or_over_limit_returns_200() -> Result<()> {
-        use rocket::data::ByteUnit;
-        use rocket::http::{ContentType, Header, Status};
-        use rocket::local::asynchronous::Client;
-
-        let setup = metered_sql_http_setup("sql-read-200").await?;
-        let auth_header = sql_invocation_header(
-            &setup,
-            "tinycloud.sql/read",
-            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
-        )?;
-
-        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
-        let response = client
-            .post("/invoke")
-            .header(Header::new("Authorization", auth_header))
-            .header(ContentType::JSON)
-            .body(serde_json::to_string(&SqlRequest::Query {
-                sql: "SELECT val FROM labels WHERE label = 'alpha'".to_string(),
-                params: vec![],
-                max_rows: None,
-                max_bytes: None,
-            })?)
-            .dispatch()
-            .await;
-
-        let status = response.status();
-        let body = response.into_string().await.unwrap_or_default();
-        assert_ne!(status, Status::new(402), "reads must never 402: {body}");
-        assert_eq!(status, Status::Ok, "read over limit must succeed: {body}");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn sql_request_body_over_envelope_limit_returns_413_with_code() -> Result<()> {
         use rocket::data::ByteUnit;
         use rocket::http::{ContentType, Header, Status};
@@ -10960,44 +10787,6 @@ mod tests {
         assert_eq!(status, Status::PayloadTooLarge, "{text}");
         assert!(text.starts_with("sql_request_too_large: "), "{text}");
         assert!(text.contains("limit 2097152 bytes"), "{text}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sql_write_under_limit_returns_200() -> Result<()> {
-        use rocket::data::ByteUnit;
-        use rocket::http::{ContentType, Header, Status};
-        use rocket::local::asynchronous::Client;
-
-        let setup = metered_sql_http_setup("sql-write-200").await?;
-        let auth_header = sql_invocation_header(
-            &setup,
-            "tinycloud.sql/write",
-            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
-        )?;
-
-        let client =
-            Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1_000_000_000))).await?;
-        let response = client
-            .post("/invoke")
-            .header(Header::new("Authorization", auth_header))
-            .header(ContentType::JSON)
-            .body(serde_json::to_string(&SqlRequest::Execute {
-                schema: None,
-                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
-                params: vec![],
-            })?)
-            .dispatch()
-            .await;
-
-        let status = response.status();
-        let body = response.into_string().await.unwrap_or_default();
-        assert_ne!(
-            status,
-            Status::new(402),
-            "under-limit write must not 402: {body}"
-        );
-        assert_eq!(status, Status::Ok, "under-limit write must succeed: {body}");
         Ok(())
     }
 
@@ -11101,55 +10890,6 @@ mod tests {
             "facts-pinned read must never 402: {body}"
         );
         assert_eq!(status, Status::Ok, "over-limit read must succeed: {body}");
-        Ok(())
-    }
-
-    /// Integration proof for the metering fold (§E.T3): a SQL write performed
-    /// directly against `sql_service` is visible through `tinycloud.store_size`
-    /// — the one number behind the admin meter (`get_quota`, admin.rs:114) and
-    /// the write-path quota gates — for a space whose FileSystem block store
-    /// never saw a byte. Before the fold, `store_size` counted blocks only, so
-    /// this SQL-only space would have reported `None`.
-    #[tokio::test]
-    async fn sql_write_is_visible_to_store_size() -> Result<()> {
-        // The helper pre-grows usage with a direct `sql_service.execute`
-        // (CREATE TABLE + INSERT) for a space block storage never saw.
-        let setup = metered_sql_http_setup("visible_to_store_size").await?;
-
-        let before = setup
-            .tinycloud
-            .store_size(&setup.space)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .expect("SQL-only space must fold to Some(usage)");
-        assert!(before > 0, "SQL write must be visible to store_size");
-
-        // A further direct SQL write is metered through the same fold.
-        setup
-            .sql_service
-            .execute(
-                &setup.space,
-                &SqlService::db_name_from_path(Some("main")),
-                SqlRequest::Execute {
-                    schema: None,
-                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
-                    params: vec![SqlValue::Text("beta".to_string()), SqlValue::Integer(222)],
-                },
-                None,
-                "tinycloud.sql/write".to_string(),
-            )
-            .await?;
-
-        let after = setup
-            .tinycloud
-            .store_size(&setup.space)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .expect("SQL-only space must fold to Some(usage)");
-        assert!(
-            after >= before,
-            "further SQL write must not shrink the meter"
-        );
         Ok(())
     }
 

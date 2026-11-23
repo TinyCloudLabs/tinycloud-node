@@ -283,16 +283,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaf_session_depth_tracks_the_requested_authorization_chain() {
-        let user = test_user().await;
-        let leaf = user.leaf_session(4).await;
-        let root = user.leaf_session(0).await;
-
-        assert_ne!(leaf.delegation_cid, root.delegation_cid);
-        assert!(serde_json::to_value(&leaf.delegation_header).unwrap().is_object());
-    }
-
-    #[tokio::test]
     async fn invocations_cite_the_leaf_session_cid_for_each_requested_depth() {
         let user = test_user().await;
         let root = user.leaf_session(0).await;

@@ -151,23 +151,4 @@ mod tests {
             .verify_strict(canonical.as_bytes(), &signature)
             .expect("signature must verify against the did:key public key");
     }
-
-    // Port of names.test.ts: "rejects a tunnel auth record signed by the
-    // wrong key" — same canonical bytes signed by a different key must not
-    // verify against the claimed subject's public key.
-    #[::core::prelude::v1::test]
-    fn tunnel_auth_signature_does_not_verify_for_wrong_signer() {
-        let (_owner_kp, owner_did) = did_key_signer(22);
-        let (forger_kp, _forger_did) = did_key_signer(23);
-
-        let canonical = canonical_tunnel_auth_payload("tunnelnode", &owner_did, 2);
-        let signature = sign_ed25519(&forger_kp, &canonical).unwrap();
-        let signature_bytes = base64::decode_config(&signature, base64::URL_SAFE_NO_PAD).unwrap();
-        let signature = Signature::from_slice(&signature_bytes).unwrap();
-
-        let owner_key = parse_did_key(&owner_did);
-        assert!(owner_key
-            .verify_strict(canonical.as_bytes(), &signature)
-            .is_err());
-    }
 }

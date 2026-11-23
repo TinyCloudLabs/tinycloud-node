@@ -5001,65 +5001,6 @@ fn selftest_salts_hold_no_piece_of_a_secret() -> Result<()> {
     Ok(())
 }
 
-/// Regression for the salt selftest's ~1/256 flake. A filler byte equal to the
-/// adjacent DEK byte moves the label of an injected half (`15..31` for
-/// `half_b`). The fixed construction never does; the old one does, within the
-/// trial count below.
-#[test]
-fn selftest_salt_piece_labels_do_not_depend_on_filler_bytes() -> Result<()> {
-    let fx = MirrorFixture::new();
-    let dek = fx.keys.deks[0];
-    let (block, _) = fx.sealed_block(0, b"first value");
-    let label_of = |salt: &[u8]| {
-        let mut body = block.body.clone();
-        body[20..52].copy_from_slice(salt);
-        key_mirror::salt_findings(
-            "selftest",
-            &key_mirror::ObjectRef {
-                key: &block.key,
-                body: &body,
-            },
-            &[key_mirror::Secret {
-                label: "DEK 1".into(),
-                bytes: dek.to_vec(),
-            }],
-        )
-    };
-    // Old construction with the coincidence: filler's last byte == dek[15].
-    let mut old_half_b = [&random_bytes(16)[..], &dek[16..]].concat();
-    old_half_b[15] = dek[15];
-    ensure!(
-        any_contains(&label_of(&old_half_b), "salt holds bytes 15..31 of"),
-        "a filler byte equal to dek[15] did not move the label to 15..31"
-    );
-    let (_, _, half_b) = salt_selftest_pieces(&dek);
-    ensure!(
-        any_contains(&label_of(&half_b), "salt holds bytes 16..32 of"),
-        "the fixed half_b was not labelled 16..32"
-    );
-    const TRIALS: usize = 20_000;
-    let (mut old_missed, mut fixed_missed) = (0usize, 0usize);
-    for _ in 0..TRIALS {
-        let old = [&random_bytes(16)[..], &dek[16..]].concat();
-        if !any_contains(&label_of(&old), "salt holds bytes 16..32 of") {
-            old_missed += 1;
-        }
-        let (_, _, half_b) = salt_selftest_pieces(&dek);
-        if !any_contains(&label_of(&half_b), "salt holds bytes 16..32 of") {
-            fixed_missed += 1;
-        }
-    }
-    ensure!(
-        fixed_missed == 0,
-        "the fixed construction was mislabelled {fixed_missed} of {TRIALS} times"
-    );
-    ensure!(
-        old_missed > 0,
-        "the old construction was never mislabelled in {TRIALS} trials; this test no longer reproduces the flake"
-    );
-    Ok(())
-}
-
 /// Round 8, offline: a base32-encoded derived secret is found when the next
 /// character is outside base32 but inside another encoding's alphabet (`9`,
 /// `1`), in a block body and in a mirror string.

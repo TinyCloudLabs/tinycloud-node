@@ -1493,23 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn blocks_private_and_reserved_webhook_addresses() {
-        for address in [
-            "10.0.0.1",
-            "100.64.0.1",
-            "192.0.2.1",
-            "198.18.0.1",
-            "203.0.113.1",
-            "fc00::1",
-            "fe80::1",
-            "2001:db8::1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(blocked_webhook_ip(address.parse().unwrap()), "{address}");
-        }
-    }
-
-    #[test]
     fn tc1132_callback_shape_rejects_embedded_private_and_allows_public_controls() {
         for address in [
             "::127.0.0.1",

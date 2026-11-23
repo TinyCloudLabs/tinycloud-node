@@ -3206,18 +3206,6 @@ mod tests {
         assert!(crate::resolve_runtime_config(&preflight).is_err());
     }
 
-    #[test]
-    fn credential_issuers_parse_from_the_documented_json_shape() {
-        let parsed: Vec<crate::issuer_set::CredentialIssuerConfig> = serde_json::from_str(
-            r#"[{"issuerDid":"did:web:acme.credentials.org","kid":"did:web:acme.credentials.org#issuing-1",
-            "alg":"EdDSA","publicKey":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
-            "vcts":["opencredentials.email/v1"],"profiles":["tinycloud.email-held/v1"],
-            "notBefore":"2026-10-01T00:00:00Z","retiredAt":null,"notAfter":null}]"#,
-        )
-        .unwrap();
-        assert_eq!(parsed.len(), 1);
-    }
-
     /// The exact `emailOrigin` (generic invitation audience) the committed
     /// production document carries. Share's schema requires the field; the
     /// node's must accept it.

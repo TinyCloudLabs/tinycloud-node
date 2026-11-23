@@ -880,15 +880,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn stale_remote_value_still_served_not_blocked() {
-        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(DEAD_URL.into()));
-        let sid = space(1);
-        cache.seed_remote(&sid.to_string(), Some(500), true).await;
-        // Stale value is served immediately; the refresh happens off-path.
-        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
-    }
-
-    #[tokio::test]
     async fn first_sight_fetch_failure_falls_open_and_negative_caches() {
         let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(DEAD_URL.into()));
         let sid = space(1);

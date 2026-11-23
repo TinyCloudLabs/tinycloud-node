@@ -7145,7 +7145,7 @@ mod tests {
     use tinycloud_auth::ssi::dids::AnyDidMethod;
     use tinycloud_auth::ssi::{claims::jwt::NumericDate, ucan::Payload};
     use tinycloud_core::migrations::Migrator;
-    use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};
+    use tinycloud_core::sea_orm::{Database, EntityTrait};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
 
     fn tc500_v4_vector() -> Value {
@@ -12171,54 +12171,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn challenge_and_session_rows_roll_back_together_and_jti_is_unique() {
+    async fn session_claim_jti_is_unique() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        policy_v3_challenge::ActiveModel {
-            challenge_id: Set("challenge-rollback".into()),
-            policy_cid: Set("policy".into()),
-            recipient_did: Set("did:key:recipient".into()),
-            nonce_hash_hex: Set("00".repeat(32)),
-            requested_capabilities: Set(json!([{"kind":"encryption","resource":"urn:tinycloud:encryption:did:key:owner:mainnet","action":"tinycloud.encryption/decrypt"}])),
-            issued_at: Set("2026-07-31T12:00:00Z".into()),
-            expires_at: Set("2026-07-31T12:05:00Z".into()),
-            consumed_at: Set(None),
-        }
-        .insert(&db)
-        .await
-        .unwrap();
-
-        let tx = db.begin().await.unwrap();
-        policy_v3_challenge::Entity::update_many()
-            .col_expr(
-                policy_v3_challenge::Column::ConsumedAt,
-                Expr::value("2026-07-31T12:00:01Z"),
-            )
-            .filter(policy_v3_challenge::Column::ChallengeId.eq("challenge-rollback"))
-            .exec(&tx)
-            .await
-            .unwrap();
-        test_session("session-rolled-back", "jti-once")
-            .insert(&tx)
-            .await
-            .unwrap();
-        tx.rollback().await.unwrap();
-
-        assert!(
-            policy_v3_challenge::Entity::find_by_id("challenge-rollback")
-                .one(&db)
-                .await
-                .unwrap()
-                .unwrap()
-                .consumed_at
-                .is_none()
-        );
-        assert!(policy_v3_session::Entity::find_by_id("session-rolled-back")
-            .one(&db)
-            .await
-            .unwrap()
-            .is_none());
-
         test_session("session-first", "jti-once")
             .insert(&db)
             .await

@@ -142,10 +142,16 @@ mod tests {
     #[::core::prelude::v1::test]
     fn ack_resets_backoff_and_serves() {
         let mut state = BackoffState::new();
-        state.attempt = 5;
+        for _ in 0..5 {
+            state.next_action(AttemptOutcome::TransportError, 0.0);
+        }
         let action = state.next_action(AttemptOutcome::Ack, 0.0);
         assert_eq!(action, ReconnectAction::Serve);
-        assert_eq!(state.attempt, 0);
+        // The next failure backs off from the base delay, as on a fresh start.
+        assert_eq!(
+            state.next_action(AttemptOutcome::TransportError, 0.0),
+            BackoffState::new().next_action(AttemptOutcome::TransportError, 0.0)
+        );
     }
 
     #[::core::prelude::v1::test]

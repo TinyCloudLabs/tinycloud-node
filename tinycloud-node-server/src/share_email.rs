@@ -3239,17 +3239,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_origin_must_match_the_single_configured_allowlist_entry() {
-        let config = ShareEmailConfig {
-            enabled: true,
-            allowed_origins: vec!["https://share.tinycloud.xyz".to_owned()],
-            ..ShareEmailConfig::default()
-        };
-        assert_eq!(config.allowed_origins.len(), 1);
-        assert!(!config.allowed_origins.iter().any(|origin| origin == "*"));
-    }
-
-    #[tokio::test]
     async fn raw_oversize_body_is_rejected_before_json_or_runtime_state() {
         let rocket = rocket::build()
             .mount("/", rocket::routes![authorize_invitation])

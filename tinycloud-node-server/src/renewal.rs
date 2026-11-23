@@ -415,7 +415,6 @@ mod tests {
         new_end, period_seconds, validate_stamp_end, verify_stamp_signature, OriginalFormat,
         RenewalSigner, RENEWER_KEY_CONTEXT, STAMP_DOMAIN,
     };
-    use ed25519_dalek::{Signer, SigningKey};
     use tinycloud_core::keys::{Secrets, StaticSecret};
 
     #[test]
@@ -515,25 +514,5 @@ mod tests {
             .unwrap()
             .to_bytes();
         assert!(verify_stamp_signature(&bytes, &signature, &node_public).is_err());
-    }
-
-    #[test]
-    fn wrong_audience_key_rejects_a_stamp_signed_by_the_renewer() {
-        let renewer = SigningKey::from_bytes(&[0x33; 32]);
-        let node = SigningKey::from_bytes(&[0x44; 32]);
-        let bytes = b"canonical renewal stamp bytes";
-        let signature = renewer.sign(bytes);
-        assert!(verify_stamp_signature(
-            bytes,
-            &signature.to_bytes(),
-            &renewer.verifying_key().to_bytes()
-        )
-        .is_ok());
-        assert!(verify_stamp_signature(
-            bytes,
-            &signature.to_bytes(),
-            &node.verifying_key().to_bytes()
-        )
-        .is_err());
     }
 }

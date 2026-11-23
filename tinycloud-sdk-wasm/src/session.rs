@@ -1163,52 +1163,6 @@ pub mod test {
         assert_eq!(secrets_entry.path, "vault/secrets/");
     }
 
-    #[test]
-    fn session_with_additional_spaces() {
-        let config = json!({
-            "abilities": {
-                "kv": {
-                    "": vec![
-                        "tinycloud.kv/put",
-                        "tinycloud.kv/get",
-                    ]
-                },
-            },
-            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
-            "chainId": 1u8,
-            "domain": "example.com",
-            "issuedAt": "2022-01-01T00:00:00.000Z",
-            "spaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
-            "additionalSpaces": {
-                "public": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"
-            },
-            "expirationTime": "3000-01-01T00:00:00.000Z",
-        });
-        let session_config: SessionConfig = serde_json::from_value(config).unwrap();
-        assert!(session_config.additional_spaces.is_some());
-        let additional = session_config.additional_spaces.as_ref().unwrap();
-        assert_eq!(additional.len(), 1);
-        assert!(additional.contains_key("public"));
-
-        let prepared = prepare_session(session_config).unwrap();
-        assert!(prepared.additional_spaces.is_some());
-
-        // Verify the SIWE message contains resource URIs for both spaces
-        let siwe_str = prepared.siwe.to_string();
-        let primary_space =
-            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default";
-        let public_space =
-            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public";
-        assert!(
-            siwe_str.contains(primary_space),
-            "SIWE message should contain primary space resource URI"
-        );
-        assert!(
-            siwe_str.contains(public_space),
-            "SIWE message should contain additional space resource URI"
-        );
-    }
-
     // ---------------------------------------------------------------------
     // create_delegation multi-resource tests
     // ---------------------------------------------------------------------

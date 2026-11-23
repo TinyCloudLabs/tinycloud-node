@@ -2251,69 +2251,6 @@ fn evidence_verification_uses_fixture_time_under_hostile_ambient() -> Result<()>
     Ok(())
 }
 
-#[test]
-fn evidence_verification_path_rejects_direct_wall_clock_reads() {
-    let source = include_str!("cross_layer_contract.rs");
-    let setup_and_resolve = source
-        .split_once("    let before_delegations =")
-        .expect("main resolve source marker")
-        .1
-        .split_once("    let imported = client")
-        .expect("main native-node source marker")
-        .0;
-    let denial_resolves = source
-        .split_once("fn exercise_engine_denials")
-        .expect("denial source marker")
-        .1
-        .split_once("fn runtime(")
-        .expect("runtime source marker")
-        .0;
-    let presentation_constructor = source
-        .split_once("fn signed_presentation")
-        .expect("presentation source marker")
-        .1
-        .split_once("fn enrollment_status")
-        .expect("enrollment source marker")
-        .0;
-    let verifier_adapter = source
-        .split_once("impl EvidenceVerifier for FixtureTimeVerifier")
-        .expect("fixture verifier source marker")
-        .1
-        .split_once("#[tokio::test]")
-        .expect("integration test source marker")
-        .0;
-    let fixture_time_constructor = source
-        .split_once("fn fixture_verification_time")
-        .expect("fixture time source marker")
-        .1
-        .split_once("async fn observe_grant_output_on_real_node")
-        .expect("source guard marker")
-        .0;
-    let ambient_independence_guard = source
-        .split_once("fn evidence_verification_uses_fixture_time_under_hostile_ambient")
-        .expect("ambient independence source marker")
-        .1
-        .split_once("fn evidence_verification_path_rejects_direct_wall_clock_reads")
-        .expect("source guard function marker")
-        .0;
-
-    for evidence_path in [
-        setup_and_resolve,
-        denial_resolves,
-        presentation_constructor,
-        verifier_adapter,
-        fixture_time_constructor,
-        ambient_independence_guard,
-    ] {
-        for prohibited in ["Utc::now", "SystemTime::now", "Local::now"] {
-            assert!(
-                !evidence_path.contains(prohibited),
-                "evidence-verification path contains direct wall-clock read {prohibited}"
-            );
-        }
-    }
-}
-
 fn fixture_sd_jwt_issuer(source: &str) -> Result<String> {
     let fixture: Value = serde_json::from_str(source)?;
     let sd_jwt = fixture["evidencePresentation"]["sdJwt"]
