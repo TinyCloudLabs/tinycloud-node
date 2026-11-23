@@ -964,13 +964,126 @@ impl SeaOrmDatabaseArtifactRepository {
     /// [`Self::write_scope`] that is always one transaction, so the artifact
     /// statement and the WAL-mark statements commit together (contract 4.5).
     /// The transaction spans only those short statements: no read and no
-    /// chunk upload runs inside it (TC-2961).
+    /// chunk upload runs inside it (TC-2961). Not used on the PostgreSQL pool
+    /// without a purge fence: see [`Self::single_statement_marks`].
     async fn marked_write_scope(&self, space: &str) -> Result<FencedWrite, DatabaseArtifactError> {
         use sea_orm::TransactionTrait;
         if self.purge_fence.is_some() {
             return self.write_scope(space).await;
         }
         Ok(FencedWrite::Transaction(self.conn.begin().await?))
+    }
+
+    /// On the PostgreSQL pool without a purge fence, an artifact write and
+    /// its WAL-mark change are ONE autocommit statement (a data-modifying
+    /// CTE), not a transaction. The pool's statement timeout, its retry
+    /// classification and its "did the write apply" tracking are defined
+    /// over a single autocommit write statement (TC-1054): a `BEGIN` would
+    /// change all three. A statement is atomic, so the mark still commits
+    /// with the WAL it describes (contract 4.5). SQLite, which has no
+    /// data-modifying CTE and no statement timeout, keeps the transaction.
+    fn single_statement_marks(&self) -> bool {
+        use sea_orm::ConnectionTrait;
+        self.purge_fence.is_none()
+            && self.conn.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+    }
+
+    /// Run one data-modifying CTE that ends in `SELECT count(*)` of the
+    /// artifact rows it wrote, and return that count.
+    async fn rows_written(&self, sql: &str, values: Vec<sea_orm::Value>) -> Result<i64, DbErr> {
+        use sea_orm::ConnectionTrait;
+        let row = self
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?
+            .ok_or_else(|| DbErr::Custom("a write statement returned no row".to_string()))?;
+        row.try_get_by_index::<i64>(0)
+    }
+
+    /// PostgreSQL, no fence: the checkpoint write and the drop of the old
+    /// checkpoint's WAL marks in one statement. Returns the rows written
+    /// (1 on success, 0 when the compare-and-swap found another revision).
+    #[allow(clippy::too_many_arguments)]
+    async fn checkpoint_one_statement(
+        &self,
+        key: (&str, &str, &str),
+        base: Option<(i64, &str)>,
+        revision: i64,
+        payload: &[u8],
+        content_hash: &str,
+        size_bytes: i64,
+        now: &str,
+    ) -> Result<i64, DbErr> {
+        use sea_orm::Value;
+        let (service, space, name) = key;
+        let drop_marks = r#""gone" AS (DELETE FROM "sql_wal_mark" WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND EXISTS (SELECT 1 FROM "written") RETURNING 1)"#;
+        let mut values: Vec<Value> = vec![
+            service.into(),
+            space.into(),
+            name.into(),
+            revision.into(),
+            content_hash.into(),
+            payload.to_vec().into(),
+            size_bytes.into(),
+            now.into(),
+        ];
+        let sql = match base {
+            // Compare-and-swap on the (revision, checkpoint) the save read.
+            Some((base_revision, base_checkpoint)) => {
+                values.push(base_revision.into());
+                values.push(base_checkpoint.into());
+                format!(
+                    r#"WITH "written" AS (UPDATE "database_artifact" SET "revision" = $4, "content_hash" = $5, "payload" = $6, "size_bytes" = $7, "backend" = 'storage.database', "storage_mode" = 'database-blob', "updated_at" = $8, "checkpoint_size_bytes" = $7, "checkpoint_content_hash" = $5, "delta_payload" = NULL, "delta_content_hash" = NULL, "delta_size_bytes" = 0 WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND "revision" = $9 AND "checkpoint_content_hash" = $10 RETURNING 1), {drop_marks} SELECT (SELECT count(*) FROM "written")::bigint"#
+                )
+            }
+            None => format!(
+                r#"WITH "written" AS (INSERT INTO "database_artifact" ("service", "space", "name", "revision", "content_hash", "payload", "size_bytes", "backend", "storage_mode", "created_at", "updated_at", "checkpoint_size_bytes", "checkpoint_content_hash", "delta_payload", "delta_content_hash", "delta_size_bytes") VALUES ($1, $2, $3, $4, $5, $6, $7, 'storage.database', 'database-blob', $8, $8, $7, $5, NULL, NULL, 0) RETURNING 1), {drop_marks} SELECT (SELECT count(*) FROM "written")::bigint"#
+            ),
+        };
+        self.rows_written(&sql, values).await
+    }
+
+    /// PostgreSQL, no fence: the WAL delta write and its mark in one
+    /// statement. Returns the rows written (1 on success, 0 when the
+    /// compare-and-swap found another revision).
+    #[allow(clippy::too_many_arguments)]
+    async fn delta_one_statement(
+        &self,
+        key: (&str, &str, &str),
+        base: (i64, &str),
+        revision: i64,
+        delta: &[u8],
+        logical_content_hash: &str,
+        delta_content_hash: &str,
+        size_bytes: i64,
+        now: &str,
+    ) -> Result<i64, DbErr> {
+        let (service, space, name) = key;
+        let delta_size_bytes = i64::try_from(delta.len()).unwrap_or(i64::MAX);
+        let sql = r#"WITH "written" AS (UPDATE "database_artifact" SET "revision" = $4, "content_hash" = $5, "delta_payload" = $6, "delta_content_hash" = $7, "delta_size_bytes" = $8, "size_bytes" = $9, "storage_mode" = 'checkpoint+wal', "updated_at" = $10 WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND "revision" = $11 AND "checkpoint_content_hash" = $12 RETURNING 1), "marked" AS (INSERT INTO "sql_wal_mark" ("service", "space", "name", "revision", "checkpoint_content_hash", "wal_end_bytes", "wal_prefix_sha256") SELECT $1::text, $2::text, $3::text, $4::bigint, $12::text, $8::bigint, $13::text FROM "written" ON CONFLICT ("service", "space", "name", "revision") DO UPDATE SET "checkpoint_content_hash" = EXCLUDED."checkpoint_content_hash", "wal_end_bytes" = EXCLUDED."wal_end_bytes", "wal_prefix_sha256" = EXCLUDED."wal_prefix_sha256" RETURNING 1) SELECT (SELECT count(*) FROM "written")::bigint"#;
+        self.rows_written(
+            sql,
+            vec![
+                service.into(),
+                space.into(),
+                name.into(),
+                revision.into(),
+                logical_content_hash.into(),
+                delta.to_vec().into(),
+                delta_content_hash.into(),
+                delta_size_bytes.into(),
+                size_bytes.into(),
+                now.into(),
+                base.0.into(),
+                base.1.into(),
+                sha256_hex(delta).into(),
+            ],
+        )
+        .await
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -1524,6 +1637,53 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // revision before either commits, exercising the CAS conflict path.
         #[cfg(test)]
         self.wait_at_race_barrier().await;
+        if self.single_statement_marks() {
+            let base = existing
+                .as_ref()
+                .map(|model| (model.revision, model.checkpoint_content_hash.as_str()));
+            let written = self
+                .checkpoint_one_statement(
+                    (service, space, name),
+                    base,
+                    revision,
+                    &payload,
+                    &content_hash,
+                    size_bytes,
+                    &now,
+                )
+                .await
+                .map_err(|error| {
+                    // The composite primary key is the only unique constraint:
+                    // a unique violation on an Absent INSERT means another
+                    // writer created the artifact first. Details: TC-2214
+                    if existing.is_none()
+                        && expected == ArtifactExpectation::Absent
+                        && matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
+                    {
+                        DatabaseArtifactError::StaleLineage
+                    } else {
+                        error.into()
+                    }
+                })?;
+            if written != 1 {
+                return Err(DatabaseArtifactError::Backend(
+                    "concurrent database artifact update".to_string(),
+                ));
+            }
+            return Ok(DatabaseArtifact {
+                payload: payload.to_vec(),
+                content_hash: content_hash.clone(),
+                revision,
+                size_bytes,
+                updated_at: now,
+                backend: "storage.database".to_string(),
+                storage_mode: "database-blob".to_string(),
+                checkpoint_content_hash: content_hash,
+                delta_payload: None,
+                delta_content_hash: None,
+                delta_size_bytes: 0,
+            });
+        }
         let scope = self.marked_write_scope(space).await?;
 
         match existing.as_ref() {
@@ -1702,6 +1862,30 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
+        if self.single_statement_marks() {
+            let written = self
+                .delta_one_statement(
+                    (service, space, name),
+                    (existing.0, existing.2.as_str()),
+                    revision,
+                    &payload,
+                    &logical_content_hash,
+                    &delta_content_hash,
+                    size_bytes,
+                    &now,
+                )
+                .await?;
+            if written != 1 {
+                return Err(DatabaseArtifactError::Backend(
+                    "concurrent database artifact update".to_string(),
+                ));
+            }
+            return Ok(DeltaSave {
+                revision,
+                size_bytes,
+                delta_size_bytes,
+            });
+        }
         let scope = self.marked_write_scope(space).await?;
 
         let update = database_artifact::Entity::update_many()

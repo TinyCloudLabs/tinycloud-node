@@ -406,13 +406,18 @@ since the frontier. Postgres stays master; the only new state is the
 still refuses `enabled`).
 
 - **Marks.** `save_delta` writes one `sql_wal_mark` row, `(revision,
-  checkpoint_content_hash, wal_end_bytes, wal_prefix_sha256)`, in the same
-  transaction that stores the WAL. A new checkpoint (`save`, or a chunked
-  snapshot publish) deletes every mark of the database in its transaction,
-  because a checkpoint truncates the WAL; a space purge deletes them too. A
-  rejected save leaves no mark. Marks are derived data: the migration only
-  creates the table (`IF NOT EXISTS`), `down` drops it, and without marks the
-  uploader publishes `wal-cum-v1`.
+  checkpoint_content_hash, wal_end_bytes, wal_prefix_sha256)`, atomically with
+  the WAL it stores. A new checkpoint (`save`, or a chunked snapshot publish)
+  deletes every mark of the database atomically with the checkpoint, because
+  a checkpoint truncates the WAL; a space purge deletes them too. A rejected
+  save leaves no mark. "Atomically" is one transaction on SQLite and with a
+  purge fence. On the PostgreSQL pool without a fence it is ONE autocommit
+  statement (a data-modifying CTE): the pool's statement timeout, its retry
+  classification and its did-the-write-apply tracking are defined over a
+  single autocommit write statement, and a `BEGIN` would change all three.
+  Marks are derived data: the migration only creates the table (`IF NOT
+  EXISTS`), `down` drops it, and without marks the uploader publishes
+  `wal-cum-v1`.
 - **The WAL is append-only between our checkpoints.** SQLite appends frames
   until `wal_checkpoint(TRUNCATE)`, which the node runs and `save` records.
   So the WAL at revision `r` is a byte prefix of the WAL at any later revision
