@@ -523,7 +523,7 @@ rows with the manifest (objects phase).
   mismatch. P4.2c's lease and write fence must still check `mode =
   store_master` and `owner_node` = this node, not only the epoch.
 - **Rollback leftovers.** After a rollback that leaves the table in place
-  (section 7), a 1.26.22 space purge does not delete this table's rows. The
+  (section 7), a 1.26.23 space purge does not delete this table's rows. The
   orphans are harmless while every row is `pg_master` or `shadow`, and the
   next purge by a binary that ships this migration removes them.
 
@@ -759,11 +759,14 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
   matter to an older restore-check, and only if shadow was ever enabled.
   The same holds for `m20261125_000000_sql_store_mode` (P4.1). An image-only
-  rollback to node 1.26.22 fails on it: that binary refuses to start on a
-  database with an applied migration it does not ship (proven 2026-11-23).
-  Rolling back past it means
-  `DELETE FROM seaql_migrations WHERE version =
-  'm20261125_000000_sql_store_mode'; DROP TABLE IF EXISTS sql_store_mode;`.
+  rollback to node 1.26.23 fails on it: that binary refuses to start on a
+  database with an applied migration it does not ship (proven 2026-11-23 for
+  1.26.22 and the `sql_wal_mark` ledger row). It ships in the same release as
+  `m20261125_000000_revocation_tombstone` (TC-4092), and the older image refuses
+  to start while EITHER row is present, so delete both in one transaction:
+  `DELETE FROM seaql_migrations WHERE version IN
+  ('m20261125_000000_revocation_tombstone','m20261125_000000_sql_store_mode');`.
+  An optional `DROP TABLE IF EXISTS sql_store_mode;` may follow.
   The `DELETE` needs only `postgres` and is enough for the older image to
   boot. The `DROP` needs the table owner, the node's own role
   (`docs/releasing.md`, TC-3755). A table left behind is harmless: `up` is
