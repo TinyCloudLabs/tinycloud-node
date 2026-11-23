@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use super::machine::{ArtifactHead, Head};
+use super::machine::{ArtifactHead, DeltaPlan, Head};
 use crate::database_artifacts::{
     ArtifactMeta, ArtifactPart, ArtifactSink, DatabaseArtifactError, DatabaseArtifactRepository,
+    WalMark,
 };
 use crate::sql::store::key::DbRef;
 
@@ -72,6 +73,29 @@ pub trait ShadowSource: Send + Sync {
         head: &Head,
         file: &mut tokio::fs::File,
     ) -> Result<Copied, SourceError>;
+
+    /// The WAL marks the artifact stored for `revisions`; a revision without
+    /// a (valid) mark is left out.
+    async fn wal_marks(
+        &self,
+        db: &DbRef<'_>,
+        revisions: &[i64],
+    ) -> Result<Vec<WalMark>, SourceError>;
+
+    /// Write the WAL bytes `delta.start.wal_end_bytes .. delta.end.wal_end_bytes`
+    /// of exactly `head` into `file` (truncated first). The whole stored WAL
+    /// streams past and is hashed: if its first `start` bytes or its first
+    /// `end` bytes do not hash to the marks' SHA-256, or it is not `end`
+    /// bytes long, it is not the WAL the marks describe and the result is
+    /// `None` (the caller publishes the cumulative WAL instead). `MovedOn`
+    /// once the row is elsewhere.
+    async fn wal_delta_to(
+        &self,
+        db: &DbRef<'_>,
+        head: &Head,
+        delta: &DeltaPlan,
+        file: &mut tokio::fs::File,
+    ) -> Result<Option<Copied>, SourceError>;
 }
 
 /// [`ShadowSource`] over the Postgres artifact repository, including the
@@ -91,6 +115,18 @@ impl PgArtifactSource {
             .await
             .map_err(source_error)?
             .ok_or(SourceError::Gone)
+    }
+
+    /// The row's metadata, if it is still at `head` and carries a WAL.
+    async fn wal_meta(&self, db: &DbRef<'_>, head: &Head) -> Result<ArtifactMeta, SourceError> {
+        let meta = self.meta(db).await?;
+        if meta.revision != head.revision
+            || meta.checkpoint_content_hash != head.cid
+            || !meta.has_delta()
+        {
+            return Err(SourceError::MovedOn);
+        }
+        Ok(meta)
     }
 
     async fn copy(
@@ -147,14 +183,43 @@ impl ShadowSource for PgArtifactSource {
         head: &Head,
         file: &mut tokio::fs::File,
     ) -> Result<Copied, SourceError> {
-        let meta = self.meta(db).await?;
-        if meta.revision != head.revision
-            || meta.checkpoint_content_hash != head.cid
-            || !meta.has_delta()
-        {
-            return Err(SourceError::MovedOn);
-        }
+        let meta = self.wal_meta(db, head).await?;
         self.copy(db, &meta, ArtifactPart::Wal, file).await
+    }
+
+    async fn wal_marks(
+        &self,
+        db: &DbRef<'_>,
+        revisions: &[i64],
+    ) -> Result<Vec<WalMark>, SourceError> {
+        self.repository
+            .load_wal_marks(SERVICE, db.space, db.db_id, revisions)
+            .await
+            .map_err(source_error)
+    }
+
+    async fn wal_delta_to(
+        &self,
+        db: &DbRef<'_>,
+        head: &Head,
+        delta: &DeltaPlan,
+        file: &mut tokio::fs::File,
+    ) -> Result<Option<Copied>, SourceError> {
+        let meta = self.wal_meta(db, head).await?;
+        let mut sink = RangeSink::new(file, delta);
+        sink.truncate().await.map_err(sink_error)?;
+        self.repository
+            .read_part_chunks(
+                SERVICE,
+                db.space,
+                db.db_id,
+                &meta,
+                ArtifactPart::Wal,
+                &mut sink,
+            )
+            .await
+            .map_err(source_error)?;
+        sink.done().await
     }
 }
 
@@ -243,6 +308,129 @@ impl ArtifactSink for FileSink<'_> {
         self.file.write_all(bytes).await.map_err(io)?;
         self.hasher.update(bytes);
         self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+        Ok(())
+    }
+}
+
+/// Writes the bytes of the one part it is handed that lie between two marks
+/// into a scratch file, hashing the whole prefix up to each mark on the way.
+struct RangeSink<'a> {
+    file: &'a mut tokio::fs::File,
+    start: u64,
+    end: u64,
+    start_sha256: [u8; 32],
+    end_sha256: [u8; 32],
+    /// SHA-256 of the part's bytes `[0, offset)`, up to `end`.
+    prefix: Sha256,
+    start_digest: Option<[u8; 32]>,
+    end_digest: Option<[u8; 32]>,
+    /// The slice written to the file.
+    slice: Sha256,
+    written: u64,
+    /// Bytes of the part seen so far.
+    offset: u64,
+    parts: usize,
+}
+
+impl<'a> RangeSink<'a> {
+    fn new(file: &'a mut tokio::fs::File, delta: &DeltaPlan) -> Self {
+        Self {
+            file,
+            start: delta.start.wal_end_bytes,
+            end: delta.end.wal_end_bytes,
+            start_sha256: delta.start.wal_prefix_sha256,
+            end_sha256: delta.end.wal_prefix_sha256,
+            prefix: Sha256::new(),
+            start_digest: None,
+            end_digest: None,
+            slice: Sha256::new(),
+            written: 0,
+            offset: 0,
+            parts: 0,
+        }
+    }
+
+    async fn truncate(&mut self) -> std::io::Result<()> {
+        self.file.set_len(0).await?;
+        self.file.rewind().await?;
+        self.prefix = Sha256::new();
+        self.slice = Sha256::new();
+        self.written = 0;
+        self.offset = 0;
+        self.parts = 0;
+        self.start_digest = None;
+        self.end_digest = None;
+        self.seal();
+        Ok(())
+    }
+
+    /// Record the prefix hash when the stream reaches a mark.
+    fn seal(&mut self) {
+        if self.offset == self.start {
+            self.start_digest = Some(self.prefix.clone().finalize().into());
+        }
+        if self.offset == self.end {
+            self.end_digest = Some(self.prefix.clone().finalize().into());
+        }
+    }
+
+    async fn done(mut self) -> Result<Option<Copied>, SourceError> {
+        if self.parts != 1 {
+            return Err(SourceError::Unreadable("the part was not delivered".into()));
+        }
+        if self.offset != self.end
+            || self.start_digest != Some(self.start_sha256)
+            || self.end_digest != Some(self.end_sha256)
+        {
+            return Ok(None);
+        }
+        self.file.flush().await.map_err(sink_error)?;
+        Ok(Some(Copied {
+            bytes: self.written,
+            sha256: std::mem::take(&mut self.slice).finalize().into(),
+        }))
+    }
+}
+
+#[async_trait]
+impl ArtifactSink for RangeSink<'_> {
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+        self.truncate().await.map_err(io)
+    }
+
+    async fn begin_part(&mut self, _part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        self.parts += 1;
+        Ok(())
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+        let mut rest = bytes;
+        while !rest.is_empty() && self.offset < self.end {
+            // Up to the next mark: the start of the slice, then its end.
+            let boundary = if self.offset < self.start {
+                self.start
+            } else {
+                self.end
+            };
+            let take =
+                usize::try_from(boundary - self.offset).map_or(rest.len(), |n| n.min(rest.len()));
+            let (chunk, tail) = rest.split_at(take);
+            self.prefix.update(chunk);
+            if self.offset >= self.start {
+                self.file.write_all(chunk).await.map_err(io)?;
+                self.slice.update(chunk);
+                self.written += chunk.len() as u64;
+            }
+            self.offset += chunk.len() as u64;
+            self.seal();
+            rest = tail;
+        }
+        // Bytes past the end are counted, so a longer WAL is told apart.
+        self.offset += rest.len() as u64;
         Ok(())
     }
 
@@ -407,5 +595,177 @@ pub(crate) mod tests {
             source.wal_to(&DB, &head.head(), &mut file).await,
             Err(SourceError::MovedOn)
         ));
+    }
+
+    // ---- TC-1491 P3: WAL deltas --------------------------------------------
+
+    fn mark(cid: &str, revision: i64, wal: &[u8]) -> WalMark {
+        WalMark {
+            revision,
+            checkpoint_content_hash: cid.into(),
+            wal_end_bytes: wal.len() as u64,
+            wal_prefix_sha256: sha256(wal),
+        }
+    }
+
+    fn delta(start: WalMark, end: WalMark) -> DeltaPlan {
+        DeltaPlan {
+            from_seq: start.revision as u64 + 1,
+            to_seq: end.revision as u64,
+            start,
+            end,
+        }
+    }
+
+    #[tokio::test]
+    async fn marks_carve_the_stored_wal_and_the_pieces_concatenate_to_the_prefix() {
+        let (_, repo) = repository().await;
+        let w1: &[u8] = b"wal-1";
+        let w2: &[u8] = b"wal-1+2";
+        let w3: &[u8] = b"wal-1+2+3";
+        let meta = saved(&repo, "main", b"ck", &[w1, w2, w3]).await;
+        let cid = meta.checkpoint_content_hash.clone();
+        let source = PgArtifactSource::new(repo);
+        let mut marks = source.wal_marks(&DB, &[2, 3, 4, 9]).await.unwrap();
+        marks.sort_by_key(|m| m.revision);
+        assert_eq!(
+            marks,
+            vec![mark(&cid, 2, w1), mark(&cid, 3, w2), mark(&cid, 4, w3)]
+        );
+
+        // Revision 2's WAL, then the bytes up to the head.
+        let plan = delta(marks[0].clone(), marks[2].clone());
+        let (path, mut file) = scratch().await;
+        let copied = source
+            .wal_delta_to(&DB, &meta_head(&meta), &plan, &mut file)
+            .await
+            .unwrap()
+            .expect("the stored WAL extends the marked prefix");
+        let piece = std::fs::read(&path).unwrap();
+        assert_eq!(piece, b"+2+3");
+        assert_eq!(
+            copied,
+            Copied {
+                bytes: 4,
+                sha256: sha256(b"+2+3")
+            }
+        );
+        assert_eq!([w1, &piece[..]].concat(), w3, "prefix + delta = the WAL");
+    }
+
+    fn meta_head(meta: &ArtifactMeta) -> Head {
+        artifact_head(meta).head()
+    }
+
+    #[tokio::test]
+    async fn the_carve_does_not_depend_on_how_the_wal_is_chunked() {
+        let wal = b"0123456789abcdefghij";
+        let plan = delta(mark("ck", 2, &wal[..6]), mark("ck", 5, wal));
+        for chunk in [1, 2, 5, 6, 7, 9, 15, 20, 64] {
+            let (path, mut file) = scratch().await;
+            let mut sink = RangeSink::new(&mut file, &plan);
+            sink.truncate().await.unwrap();
+            sink.begin_part(ArtifactPart::Wal).await.unwrap();
+            for piece in wal.chunks(chunk) {
+                sink.write(piece).await.unwrap();
+            }
+            sink.finish_part().await.unwrap();
+            let copied = sink.done().await.unwrap().expect("matching prefixes");
+            assert_eq!(std::fs::read(&path).unwrap(), &wal[6..], "chunk {chunk}");
+            assert_eq!(copied.bytes, 14, "chunk {chunk}");
+            assert_eq!(copied.sha256, sha256(&wal[6..]), "chunk {chunk}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wal_that_does_not_extend_the_marked_prefix_is_not_carved() {
+        let (_, repo) = repository().await;
+        // Revision 3's WAL does not start with revision 2's: another WAL
+        // generation reused the revision's place.
+        let meta = saved(&repo, "main", b"ck", &[b"aaaaa", b"bbbbbbb"]).await;
+        let cid = meta.checkpoint_content_hash.clone();
+        let source = PgArtifactSource::new(repo);
+        let plan = delta(mark(&cid, 2, b"aaaaa"), mark(&cid, 3, b"bbbbbbb"));
+        let (_path, mut file) = scratch().await;
+        assert_eq!(
+            source
+                .wal_delta_to(&DB, &meta_head(&meta), &plan, &mut file)
+                .await
+                .unwrap(),
+            None,
+            "the start mark's prefix hash differs"
+        );
+        // The end mark disagrees with the stored bytes.
+        let plan = delta(mark(&cid, 2, b"bbbbb"), mark(&cid, 3, b"bbbbbbc"));
+        assert_eq!(
+            source
+                .wal_delta_to(&DB, &meta_head(&meta), &plan, &mut file)
+                .await
+                .unwrap(),
+            None,
+            "the end mark's prefix hash differs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_wal_longer_than_the_end_mark_is_not_carved() {
+        let (_, repo) = repository().await;
+        let meta = saved(&repo, "main", b"ck", &[b"wal-1", b"wal-1+2"]).await;
+        let cid = meta.checkpoint_content_hash.clone();
+        let source = PgArtifactSource::new(repo);
+        // Both prefixes hash right, but the stored WAL goes on past `end`.
+        let plan = delta(mark(&cid, 2, b"wal-1"), mark(&cid, 3, b"wal-1+"));
+        let (_path, mut file) = scratch().await;
+        assert_eq!(
+            source
+                .wal_delta_to(&DB, &meta_head(&meta), &plan, &mut file)
+                .await
+                .unwrap(),
+            None
+        );
+        // And a WAL shorter than `end` never reaches it.
+        let plan = delta(mark(&cid, 2, b"wal-1"), mark(&cid, 3, b"wal-1+2xx"));
+        assert_eq!(
+            source
+                .wal_delta_to(&DB, &meta_head(&meta), &plan, &mut file)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delta_read_of_a_head_that_moved_on_is_refused() {
+        let (_, repo) = repository().await;
+        let meta = saved(&repo, "main", b"ck", &[b"wal-1", b"wal-1+2"]).await;
+        let cid = meta.checkpoint_content_hash.clone();
+        let source = PgArtifactSource::new(repo);
+        let plan = delta(mark(&cid, 2, b"wal-1"), mark(&cid, 3, b"wal-1+2"));
+        let (_path, mut file) = scratch().await;
+        let stale = Head {
+            revision: meta.revision - 1,
+            cid,
+        };
+        assert!(matches!(
+            source.wal_delta_to(&DB, &stale, &plan, &mut file).await,
+            Err(SourceError::MovedOn)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_new_checkpoint_leaves_no_marks_to_plan_from() {
+        let (_, repo) = repository().await;
+        saved(&repo, "main", b"ck", &[b"wal-1"]).await;
+        repo.save(
+            SERVICE,
+            SPACE,
+            "main",
+            bytes::Bytes::from_static(b"ck2"),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let source = PgArtifactSource::new(repo);
+        assert!(source.wal_marks(&DB, &[1, 2, 3]).await.unwrap().is_empty());
     }
 }

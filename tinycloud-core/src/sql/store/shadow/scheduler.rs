@@ -5,8 +5,9 @@
 //!   the lag scan (once at startup, which is how bootstrap begins, then every
 //!   `scan_every`), a periodic tick, and upload completions.
 //! - Uploads run as jobs on a `JoinSet`. A job reads the artifact head,
-//!   plans with [`plan_publish`], reserves scratch disk and upload bytes,
-//!   streams the checkpoint and/or WAL into scratch files, puts them, and
+//!   plans with [`plan_publish`] (and [`plan_delta`] for a segment), reserves
+//!   scratch disk and upload bytes, streams the checkpoint and/or WAL (or
+//!   the WAL delta) into scratch files, puts them, and
 //!   publishes the chain in one control-database transaction. Its result
 //!   comes back to the machine as `Published`, `Lost` or `Failed`.
 //! - Limits: one byte semaphore (charged with the job's size before it
@@ -26,16 +27,18 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use super::budget::{DiskBudget, Reservation};
 use super::machine::{
-    plan_publish, step, ArtifactHead, BlockReason, Command, DbMachine, Event, Failure, Head,
-    LineagePick, Phase, Policy, PolicyReason, PublishPlan, Work,
+    plan_delta, plan_publish, step, ArtifactHead, BlockReason, Command, DbMachine, DeltaPlan,
+    Event, Failure, Head, LineagePick, Phase, Policy, PolicyReason, PublishPlan, Work,
+    DELTA_MIN_WAL_BYTES,
 };
 use super::metrics::{PublishResult, ShadowMetrics, UploadResult};
 use super::scan::scan_space;
-use super::source::{ShadowSource, SourceError};
+use super::source::{Copied, ShadowSource, SourceError};
 use super::{DbKey, NoticeBoard};
 use crate::sql::store::key::{DbRef, Lineage, ObjectKey, PublishId};
 use crate::sql::store::manifest::{
-    now_timestamp, Frontier, ObjectRecord, PublishChain, PublishOutcome, SqlManifest,
+    now_timestamp, segment_format, Frontier, ObjectRecord, PublishChain, PublishOutcome,
+    SqlManifest,
 };
 use crate::sql::store::object::{SqlObjectStore, SqlStoreError};
 
@@ -71,6 +74,9 @@ pub struct SchedulerConfig {
     /// Consecutive infrastructure failures that open the breaker.
     pub breaker_failures: u32,
     pub breaker_cooldown: Duration,
+    /// A cumulative WAL smaller than this is uploaded whole instead of as a
+    /// delta (`plan_delta`).
+    pub delta_min_wal_bytes: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -86,6 +92,7 @@ impl Default for SchedulerConfig {
             daily_upload_byte_budget: 0,
             breaker_failures: 5,
             breaker_cooldown: Duration::from_secs(60),
+            delta_min_wal_bytes: DELTA_MIN_WAL_BYTES,
         }
     }
 }
@@ -164,6 +171,8 @@ struct JobDeps {
     bytes: Semaphore,
     /// `bytes`' capacity in KiB permits.
     bytes_kib: u32,
+    /// See [`SchedulerConfig::delta_min_wal_bytes`].
+    delta_min_wal_bytes: u64,
 }
 
 impl JobDeps {
@@ -258,6 +267,7 @@ impl Scheduler {
                 pg: Semaphore::new(config.pg_concurrency.max(1)),
                 bytes: Semaphore::new(bytes_kib as usize),
                 bytes_kib,
+                delta_min_wal_bytes: config.delta_min_wal_bytes,
             }),
             control: deps.control,
             board: deps.board,
@@ -672,6 +682,42 @@ fn below(have: Option<&Frontier>, head: &ArtifactHead) -> bool {
     })
 }
 
+/// The WAL bytes since the frontier, as a delta: when the artifact's marks
+/// allow one ([`plan_delta`]) and the stored WAL still matches them. `None`
+/// publishes the cumulative WAL instead, which is right whenever the marks
+/// are missing, stale or disagree with the stored bytes, and heals a gap.
+async fn wal_delta(
+    deps: &JobDeps,
+    db: &DbRef<'_>,
+    have: &Frontier,
+    head: &ArtifactHead,
+    reservation: &Reservation,
+) -> Result<Option<(tempfile::TempPath, Copied, DeltaPlan)>, JobError> {
+    let Ok(last) = i64::try_from(have.last_seq) else {
+        return Ok(None);
+    };
+    let marks = {
+        let _pg = deps.pg.acquire().await;
+        deps.source.wal_marks(db, &[last, head.revision]).await
+    }
+    .map_err(source_failure)?;
+    let Some(delta) = plan_delta(have, head, &marks, deps.delta_min_wal_bytes) else {
+        return Ok(None);
+    };
+    let (path, mut file) = scratch(reservation).await?;
+    let read = {
+        let _pg = deps.pg.acquire().await;
+        deps.source
+            .wal_delta_to(db, &head.head(), &delta, &mut file)
+            .await
+    };
+    match read {
+        Ok(Some(copied)) => Ok(Some((path, copied, delta))),
+        Ok(None) | Err(SourceError::MovedOn) => Ok(None),
+        Err(error) => Err(source_failure(error)),
+    }
+}
+
 /// One upload job.
 async fn upload(
     deps: &JobDeps,
@@ -756,56 +802,64 @@ async fn upload(
         }
     };
     if segment {
-        let mut retries = 0;
-        let (path, copied) = loop {
-            let (path, mut file) = scratch(&reservation).await?;
-            let read = {
-                let _pg = deps.pg.acquire().await;
-                deps.source.wal_to(&db, &head.head(), &mut file).await
-            };
-            match read {
-                Ok(copied) => break (path, copied),
-                Err(SourceError::MovedOn) if retries < WAL_READ_RETRIES => {
-                    retries += 1;
-                    // Only a WAL that grew on the same checkpoint is retried
-                    // here; anything else goes back to the machine.
-                    let now = {
+        // A segment on the frontier's own chain may carry only the WAL bytes
+        // since the frontier; every other publish carries the cumulative WAL.
+        let delta = match (plan, have) {
+            (PublishPlan::Segment { .. }, Some(f)) => {
+                wal_delta(deps, &db, f, &head, &reservation).await?
+            }
+            _ => None,
+        };
+        let (path, copied, from_seq, to_seq) = match delta {
+            Some((path, copied, delta)) => (path, copied, delta.from_seq, delta.to_seq),
+            None => {
+                let mut retries = 0;
+                let (path, copied) = loop {
+                    let (path, mut file) = scratch(&reservation).await?;
+                    let read = {
                         let _pg = deps.pg.acquire().await;
-                        deps.source.head(&db).await
+                        deps.source.wal_to(&db, &head.head(), &mut file).await
+                    };
+                    match read {
+                        Ok(copied) => break (path, copied),
+                        Err(SourceError::MovedOn) if retries < WAL_READ_RETRIES => {
+                            retries += 1;
+                            // Only a WAL that grew on the same checkpoint is
+                            // retried here; anything else goes back to the
+                            // machine.
+                            let now = {
+                                let _pg = deps.pg.acquire().await;
+                                deps.source.head(&db).await
+                            }
+                            .map_err(source_failure)?
+                            .ok_or(JobError::Policy(PolicyReason::SourceGone))?;
+                            let fits = objects
+                                .first()
+                                .map_or(0, |(record, _)| record.bytes)
+                                .saturating_add(now.delta_bytes)
+                                <= reservation.bytes();
+                            if now.cid != head.cid || !now.has_delta || !fits {
+                                return Err(JobError::Transient {
+                                    infra: false,
+                                    observed: Some(now.head()),
+                                });
+                            }
+                            head = now;
+                        }
+                        Err(error) => return Err(source_failure(error)),
                     }
-                    .map_err(source_failure)?
-                    .ok_or(JobError::Policy(PolicyReason::SourceGone))?;
-                    let fits = objects
-                        .first()
-                        .map_or(0, |(record, _)| record.bytes)
-                        .saturating_add(now.delta_bytes)
-                        <= reservation.bytes();
-                    if now.cid != head.cid || !now.has_delta || !fits {
-                        return Err(JobError::Transient {
-                            infra: false,
-                            observed: Some(now.head()),
-                        });
-                    }
-                    head = now;
-                }
-                Err(error) => return Err(source_failure(error)),
+                };
+                let to_seq = u64::try_from(head.revision)
+                    .map_err(|_| JobError::Policy(PolicyReason::Refused))?;
+                (path, copied, base_seq + 1, to_seq)
             }
         };
-        let to_seq =
-            u64::try_from(head.revision).map_err(|_| JobError::Policy(PolicyReason::Refused))?;
-        let key = ObjectKey::segment(
-            &db,
-            &lineage,
-            base_seq,
-            base_seq + 1,
-            to_seq,
-            &copied.sha256,
-        )
-        .map_err(|e| store_failure(e.into()))?;
+        let key = ObjectKey::segment(&db, &lineage, base_seq, from_seq, to_seq, &copied.sha256)
+            .map_err(|e| store_failure(e.into()))?;
         objects.push((
             ObjectRecord {
                 key,
-                format: "wal-cum-v1".into(),
+                format: segment_format(base_seq, from_seq).into(),
                 bytes: copied.bytes,
                 created_at: now_timestamp(),
             },
@@ -1116,6 +1170,22 @@ mod tests {
             file: &mut tokio::fs::File,
         ) -> Result<Copied, SourceError> {
             self.0.wal_to(db, head, file).await
+        }
+        async fn wal_marks(
+            &self,
+            db: &DbRef<'_>,
+            revisions: &[i64],
+        ) -> Result<Vec<crate::database_artifacts::WalMark>, SourceError> {
+            self.0.wal_marks(db, revisions).await
+        }
+        async fn wal_delta_to(
+            &self,
+            db: &DbRef<'_>,
+            head: &Head,
+            delta: &DeltaPlan,
+            file: &mut tokio::fs::File,
+        ) -> Result<Option<Copied>, SourceError> {
+            self.0.wal_delta_to(db, head, delta, file).await
         }
     }
 

@@ -194,6 +194,18 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
             .await;
         Ok(saved)
     }
+
+    async fn load_wal_marks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        revisions: &[i64],
+    ) -> Result<Vec<crate::database_artifacts::WalMark>, DatabaseArtifactError> {
+        self.inner
+            .load_wal_marks(service, space, name, revisions)
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -24,11 +24,14 @@
 //! the frontier up) goes `Clean` without uploading.
 //!
 //! [`plan_publish`] is the upload job's pure half: what to publish for a
-//! given frontier and artifact head.
+//! given frontier and artifact head. [`plan_delta`] decides whether a
+//! segment can carry only the WAL bytes since the frontier (`wal-delta-v1`)
+//! rather than the cumulative WAL (`wal-cum-v1`).
 
 use std::time::{Duration, Instant};
 
 use super::super::manifest::Frontier;
+use crate::database_artifacts::WalMark;
 
 /// PG's artifact head as last learned (hook notice or lag scan).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -521,6 +524,76 @@ pub fn plan_publish(have: Option<&Frontier>, head: &ArtifactHead) -> Option<Publ
         // a WAL: either way the checkpoint alone is the state at `revision`.
         Some(_) => Some(chain(LineagePick::Same)),
     }
+}
+
+/// A cumulative WAL smaller than this is uploaded whole: one object restores
+/// faster than a chain of small ones and costs no more requests. Deltas pay
+/// once the WAL they avoid re-uploading is larger than this.
+pub const DELTA_MIN_WAL_BYTES: u64 = 64 * 1024;
+
+/// A restore reads at most this many segments: every `MAX_DELTA_CHAIN`-th
+/// publish (counted by the manifest's publication counter) is a cumulative
+/// segment, which supersedes the deltas before it.
+pub const MAX_DELTA_CHAIN: i64 = 64;
+
+/// A delta: the stored WAL between two marks of the frontier's checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaPlan {
+    /// The revisions the object covers: `from_seq = last_seq + 1`.
+    pub from_seq: u64,
+    pub to_seq: u64,
+    /// The mark of the frontier's revision: the delta starts at its
+    /// `wal_end_bytes`.
+    pub start: WalMark,
+    /// The mark of the head: the delta ends at its `wal_end_bytes`.
+    pub end: WalMark,
+}
+
+/// Whether the `Segment` that [`plan_publish`] chose can be a delta, given
+/// the artifact's `marks` (any order, any extras; the uploader loads the
+/// frontier's and the head's). `None` means a cumulative segment: always a
+/// correct publish, and the one that heals a gap.
+///
+/// A delta needs both marks on the frontier's checkpoint, the WAL growing
+/// from one to the other and ending where the head's WAL ends. A frontier
+/// still at its snapshot (`last_seq = base_seq`) has no segment yet and the
+/// cumulative WAL is the delta from byte 0, so it is a cumulative segment. A
+/// missing, regressed or other-checkpoint mark, a WAL that did not grow, a
+/// cumulative WAL under `min_wal_bytes` and a chain at its [`MAX_DELTA_CHAIN`]
+/// bound all give `None` too.
+pub fn plan_delta(
+    have: &Frontier,
+    head: &ArtifactHead,
+    marks: &[WalMark],
+    min_wal_bytes: u64,
+) -> Option<DeltaPlan> {
+    let to_seq = u64::try_from(head.revision).ok()?;
+    if !head.has_delta
+        || head.cid != have.base_checkpoint_cid
+        || to_seq <= have.last_seq
+        || have.last_seq <= have.base_seq
+        || (have.revision + 1) % MAX_DELTA_CHAIN == 0
+    {
+        return None;
+    }
+    let mark = |seq: u64| {
+        marks
+            .iter()
+            .find(|m| u64::try_from(m.revision) == Ok(seq) && m.checkpoint_content_hash == head.cid)
+    };
+    let (start, end) = (mark(have.last_seq)?, mark(to_seq)?);
+    if start.wal_end_bytes >= end.wal_end_bytes
+        || end.wal_end_bytes != head.delta_bytes
+        || end.wal_end_bytes < min_wal_bytes
+    {
+        return None;
+    }
+    Some(DeltaPlan {
+        from_seq: have.last_seq + 1,
+        to_seq,
+        start: start.clone(),
+        end: end.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -1519,6 +1592,602 @@ mod tests {
             fn lost_reordered_duplicated_notices_converge_to_the_pg_head(s in script()) {
                 run(s)?;
             }
+        }
+
+        /// The byte-level model (TC-1491 P3). The same machine and
+        /// `plan_publish` drive it, but the manifest keeps every published
+        /// segment with its bytes, PG keeps its WAL at every revision, and the
+        /// shell plans deltas from marks, some of them missing. At every
+        /// publish, restoring the frontier (the highest cumulative segment and
+        /// the deltas after it, end to end) must give PG's artifact at the
+        /// frontier's revision byte for byte.
+        mod delta {
+            use super::*;
+            use crate::sql::store::object::sha256;
+            use std::collections::HashMap;
+
+            /// PG's artifact at one revision.
+            #[derive(Debug, Clone, PartialEq, Eq)]
+            struct State {
+                cid: String,
+                wal: Vec<u8>,
+            }
+
+            /// PG's history by revision, and the marks of the current
+            /// checkpoint's saves that wrote one.
+            #[derive(Default)]
+            struct Pg {
+                history: Vec<State>,
+                marks: HashMap<i64, WalMark>,
+            }
+
+            impl Pg {
+                /// One save: a new checkpoint, or `len` more WAL bytes.
+                fn save(&mut self, checkpoint: bool, len: u8, mark_missing: bool) -> ArtifactHead {
+                    let revision = self.history.len() as i64 + 1;
+                    let state = match self.history.last() {
+                        Some(prev) if !checkpoint => {
+                            let mut wal = prev.wal.clone();
+                            wal.extend(
+                                (0..len).map(|i| (revision as u8).wrapping_mul(31).wrapping_add(i)),
+                            );
+                            State {
+                                cid: prev.cid.clone(),
+                                wal,
+                            }
+                        }
+                        _ => {
+                            // `save` drops the marks of the checkpoint it replaces.
+                            self.marks.clear();
+                            State {
+                                cid: format!("cid-{revision}"),
+                                wal: Vec::new(),
+                            }
+                        }
+                    };
+                    if !state.wal.is_empty() && !mark_missing {
+                        self.marks.insert(
+                            revision,
+                            WalMark {
+                                revision,
+                                checkpoint_content_hash: state.cid.clone(),
+                                wal_end_bytes: state.wal.len() as u64,
+                                wal_prefix_sha256: sha256(&state.wal),
+                            },
+                        );
+                    }
+                    self.history.push(state);
+                    self.head()
+                }
+
+                fn head(&self) -> ArtifactHead {
+                    let state = self.history.last().expect("a save");
+                    ArtifactHead {
+                        revision: self.history.len() as i64,
+                        cid: state.cid.clone(),
+                        has_delta: !state.wal.is_empty(),
+                        checkpoint_bytes: 10,
+                        delta_bytes: state.wal.len() as u64,
+                    }
+                }
+
+                fn marks_at(&self, revisions: [i64; 2]) -> Vec<WalMark> {
+                    revisions
+                        .iter()
+                        .filter_map(|r| self.marks.get(r).cloned())
+                        .collect()
+                }
+            }
+
+            /// What the source streams for a delta: the WAL between the two
+            /// marks, provided its prefixes hash to them.
+            fn carve(wal: &[u8], delta: &DeltaPlan) -> Option<Vec<u8>> {
+                let start = delta.start.wal_end_bytes as usize;
+                let end = delta.end.wal_end_bytes as usize;
+                (end == wal.len()
+                    && sha256(&wal[..start]) == delta.start.wal_prefix_sha256
+                    && sha256(&wal[..end]) == delta.end.wal_prefix_sha256)
+                    .then(|| wal[start..end].to_vec())
+            }
+
+            /// A published segment and its bytes.
+            struct Seg {
+                lineage: Lineage,
+                base: u64,
+                from: u64,
+                to: u64,
+                bytes: Vec<u8>,
+            }
+
+            #[derive(Default)]
+            struct Model {
+                row: Option<Frontier>,
+                segments: Vec<Seg>,
+                cums: usize,
+                deltas: usize,
+            }
+
+            impl Model {
+                /// The shell's publish, with the manifest's CAS rules: a
+                /// cumulative segment needs `last_seq < to`, a delta needs
+                /// `last_seq = from - 1`.
+                fn publish(
+                    &mut self,
+                    plan: PublishPlan,
+                    pg: &Pg,
+                    have: Option<&Frontier>,
+                    min_wal: u64,
+                ) -> Frontier {
+                    let head = pg.head();
+                    let wal = &pg.history.last().expect("a save").wal;
+                    let prev = self.row.clone();
+                    let revision = prev.as_ref().map_or(0, |f| f.revision + 1);
+                    let next = match (plan, prev) {
+                        (
+                            PublishPlan::Chain {
+                                lineage,
+                                snapshot_at,
+                                segment_to,
+                            },
+                            prev,
+                        ) => {
+                            let lineage = match (lineage, prev) {
+                                (LineagePick::Same, Some(p)) => p.lineage,
+                                _ => Lineage::random(),
+                            };
+                            if let Some(to) = segment_to {
+                                self.segments.push(Seg {
+                                    lineage: lineage.clone(),
+                                    base: snapshot_at,
+                                    from: snapshot_at + 1,
+                                    to,
+                                    bytes: wal.clone(),
+                                });
+                                self.cums += 1;
+                            }
+                            Frontier {
+                                lineage,
+                                epoch: 0,
+                                revision,
+                                base_snapshot_key: String::new(),
+                                base_seq: snapshot_at,
+                                base_checkpoint_cid: head.cid.clone(),
+                                last_seq: segment_to.unwrap_or(snapshot_at),
+                                publish_id: "00".repeat(16),
+                                published_at: String::new(),
+                                frontier_bytes: 0,
+                            }
+                        }
+                        (PublishPlan::Segment { base_seq, to_seq }, Some(p)) => {
+                            assert_eq!(p.base_seq, base_seq);
+                            assert_eq!(p.base_checkpoint_cid, head.cid);
+                            let marks = pg.marks_at([p.last_seq as i64, head.revision]);
+                            let delta = have
+                                .and_then(|h| plan_delta(h, &head, &marks, min_wal))
+                                .and_then(|d| carve(wal, &d).map(|bytes| (d, bytes)));
+                            let (from, to, bytes) = match delta {
+                                Some((d, bytes)) => {
+                                    assert_eq!(p.last_seq, d.from_seq - 1, "a delta is contiguous");
+                                    self.deltas += 1;
+                                    (d.from_seq, d.to_seq, bytes)
+                                }
+                                None => {
+                                    assert!(p.last_seq < to_seq, "a cumulative segment advances");
+                                    self.cums += 1;
+                                    (base_seq + 1, to_seq, wal.clone())
+                                }
+                            };
+                            self.segments.push(Seg {
+                                lineage: p.lineage.clone(),
+                                base: base_seq,
+                                from,
+                                to,
+                                bytes,
+                            });
+                            Frontier {
+                                revision,
+                                last_seq: to,
+                                ..p
+                            }
+                        }
+                        (PublishPlan::Segment { .. }, None) => panic!("segment without a base"),
+                    };
+                    self.row = Some(next.clone());
+                    next
+                }
+
+                /// A restore at the frontier: the highest cumulative segment,
+                /// then the segments that start where the chain ends.
+                fn restore(&self) -> Result<State, String> {
+                    let f = self.row.as_ref().expect("published");
+                    let on_base = |from: u64| {
+                        self.segments
+                            .iter()
+                            .filter(|s| s.lineage == f.lineage && s.base == f.base_seq)
+                            .filter(move |s| s.from == from && s.to <= f.last_seq)
+                            .max_by_key(|s| s.to)
+                    };
+                    let mut wal = Vec::new();
+                    let mut covered = f.base_seq;
+                    while covered < f.last_seq {
+                        let Some(s) = on_base(covered + 1) else {
+                            return Err(format!("the chain reaches {covered}, not {}", f.last_seq));
+                        };
+                        wal.extend_from_slice(&s.bytes);
+                        covered = s.to;
+                    }
+                    Ok(State {
+                        cid: f.base_checkpoint_cid.clone(),
+                        wal,
+                    })
+                }
+            }
+
+            #[derive(Debug, Clone)]
+            struct ByteScript {
+                base: Script,
+                /// Per save: the WAL bytes it appends, and whether its mark
+                /// was never written (a save from before marks existed).
+                wal_lens: Vec<u8>,
+                mark_missing: Vec<bool>,
+                min_wal: u64,
+            }
+
+            fn byte_script() -> impl Strategy<Value = ByteScript> {
+                script()
+                    .prop_flat_map(|base| {
+                        let n = base.checkpoints.len();
+                        (
+                            Just(base),
+                            proptest::collection::vec(1u8..40, n),
+                            proptest::collection::vec(proptest::bool::weighted(0.3), n),
+                            prop_oneof![Just(0u64), Just(1), Just(20)],
+                        )
+                    })
+                    .prop_map(|(base, wal_lens, mark_missing, min_wal)| ByteScript {
+                        base,
+                        wal_lens,
+                        mark_missing,
+                        min_wal,
+                    })
+            }
+
+            /// The cumulative and the delta segments published.
+            #[derive(Debug, PartialEq, Eq)]
+            struct Published {
+                cums: usize,
+                deltas: usize,
+            }
+
+            fn run(bytes: ByteScript) -> Result<Published, TestCaseError> {
+                let script = bytes.base.clone();
+                let policy = Policy {
+                    interval: 3 * S,
+                    backoff_base: S,
+                    backoff_max: 8 * S,
+                };
+                let t0 = Instant::now();
+                let mut m = DbMachine::new(None);
+                let mut model = Model::default();
+                let mut pg = Pg::default();
+                let mut head: Option<ArtifactHead> = None;
+                let mut next_save = 0usize;
+                let saves = script.checkpoints.len();
+                let mut mailbox: VecDeque<(u64, Head)> = VecDeque::new();
+                let mut job: Option<Job> = None;
+                let active = script.noise.len() as u64;
+
+                for tick in 0..(active + 400) {
+                    let now = t0 + S * tick as u32;
+                    let noisy = script.noise.get(tick as usize).copied();
+                    let quiet = noisy.is_none();
+                    let (save, fail, lose, delay) = noisy.unwrap_or((false, false, 0, 0));
+                    if (save || quiet || next_save == 0) && next_save < saves {
+                        let checkpoint = script.checkpoints[next_save] || next_save == 0;
+                        let saved = pg.save(
+                            checkpoint,
+                            bytes.wal_lens[next_save],
+                            bytes.mark_missing[next_save],
+                        );
+                        let (delivery, lag) = script.deliveries[next_save];
+                        let copies = match delivery {
+                            Delivery::Drop => 0,
+                            Delivery::Once => 1,
+                            Delivery::Twice => 2,
+                        };
+                        for i in 0..copies {
+                            mailbox.push_back((tick + lag as u64 + i, saved.head()));
+                        }
+                        head = Some(saved);
+                        next_save += 1;
+                    }
+                    let mut due: Vec<Head> = Vec::new();
+                    mailbox.retain(|(at, h)| {
+                        if *at <= tick {
+                            due.push(h.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    due.reverse();
+                    for h in due {
+                        step(&mut m, Event::Notified(h), now, &policy);
+                    }
+                    if tick % script.scan_every == 0 {
+                        if let Some(head) = &head {
+                            step(&mut m, Event::Scanned(head.head()), now, &policy);
+                        }
+                    }
+                    if job.as_ref().is_some_and(|j| j.completes_at <= tick) {
+                        let j = job.take().unwrap();
+                        let head = head.clone().expect("a job implies a head");
+                        step(&mut m, Event::Scanned(head.head()), now, &policy);
+                        let event = if fail && !quiet {
+                            Event::Failed(Failure::Transient)
+                        } else if j.have.as_ref().map(|f| f.revision)
+                            != model.row.as_ref().map(|f| f.revision)
+                        {
+                            Event::Lost(model.row.clone())
+                        } else {
+                            match plan_publish(j.have.as_ref(), &head) {
+                                None => Event::Lost(model.row.clone()),
+                                Some(plan) => {
+                                    let f =
+                                        model.publish(plan, &pg, j.have.as_ref(), bytes.min_wal);
+                                    // Every frontier restores PG's artifact at
+                                    // its revision, byte for byte.
+                                    let at = &pg.history[f.last_seq as usize - 1];
+                                    let restored = model.restore();
+                                    prop_assert_eq!(
+                                        restored.as_ref(),
+                                        Ok(at),
+                                        "the frontier at {} restores PG's artifact",
+                                        f.last_seq
+                                    );
+                                    if lose == 0 && !quiet {
+                                        Event::Lost(model.row.clone())
+                                    } else {
+                                        Event::Published(f)
+                                    }
+                                }
+                            }
+                        };
+                        step(&mut m, event, now, &policy);
+                    }
+                    for command in step(&mut m, Event::Tick { permit: true }, now, &policy) {
+                        match command {
+                            Command::Upload { have, .. } => {
+                                prop_assert!(job.is_none(), "two uploads in flight");
+                                job = Some(Job {
+                                    have,
+                                    completes_at: tick + delay as u64,
+                                });
+                            }
+                            Command::Blocked(reason) => {
+                                return Err(TestCaseError::fail(format!("blocked: {reason:?}")))
+                            }
+                        }
+                    }
+                }
+
+                let head = head.expect("at least one save");
+                prop_assert_eq!(&m.phase, &Phase::Clean);
+                let have = m.have.clone().expect("published");
+                prop_assert_eq!(have.last_seq, head.revision as u64);
+                prop_assert_eq!(&have.base_checkpoint_cid, &head.cid);
+                prop_assert_eq!(Some(have), model.row.clone());
+                Ok(Published {
+                    cums: model.cums,
+                    deltas: model.deltas,
+                })
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+                #[test]
+                fn mixed_cumulative_and_delta_chains_restore_the_pg_artifact_at_every_frontier(
+                    s in byte_script()
+                ) {
+                    run(s)?;
+                }
+            }
+
+            /// One generation, a save per tick, an upload every few ticks.
+            fn steady(marks_missing: bool) -> ByteScript {
+                let saves = 14;
+                ByteScript {
+                    base: Script {
+                        checkpoints: vec![false; saves],
+                        deliveries: vec![(Delivery::Once, 0); saves],
+                        noise: vec![(true, false, 5, 0); saves + 6],
+                        scan_every: 4,
+                    },
+                    wal_lens: vec![8; saves],
+                    mark_missing: vec![marks_missing; saves],
+                    min_wal: 0,
+                }
+            }
+
+            #[test]
+            fn marks_turn_the_segments_after_the_first_into_deltas() {
+                let published = run(steady(false)).unwrap();
+                // The bootstrap and the first append (the frontier still at
+                // its snapshot) are cumulative; the rest are deltas.
+                assert!(
+                    published.cums >= 1 && published.deltas >= 1,
+                    "{published:?}"
+                );
+            }
+
+            #[test]
+            fn without_marks_every_segment_is_cumulative() {
+                let published = run(steady(true)).unwrap();
+                assert_eq!(published.deltas, 0);
+                assert!(published.cums >= 2, "{published:?}");
+            }
+
+            #[test]
+            fn a_missing_mark_anywhere_falls_back_to_a_cumulative_segment_and_the_chain_still_restores(
+            ) {
+                // Whichever save lost its mark, every frontier restores PG's
+                // artifact (`run` checks each publish), and where the missing
+                // mark was one a publish needed, the chain mixes both kinds.
+                let saves = steady(false).wal_lens.len();
+                let mut mixed = false;
+                for missing in 0..saves {
+                    let mut bytes = steady(false);
+                    bytes.mark_missing[missing] = true;
+                    let published = run(bytes).unwrap();
+                    mixed |= published.cums >= 2 && published.deltas >= 1;
+                }
+                assert!(mixed, "some missing mark forced a cumulative segment");
+            }
+        }
+    }
+
+    // ---- plan_delta ------------------------------------------------------
+
+    mod delta_plan {
+        use super::*;
+
+        fn mark(revision: i64, cid: &str, wal_end_bytes: u64) -> WalMark {
+            WalMark {
+                revision,
+                checkpoint_content_hash: cid.into(),
+                wal_end_bytes,
+                wal_prefix_sha256: [revision as u8; 32],
+            }
+        }
+
+        /// A frontier on base 2 of checkpoint `a` that reached revision 5, after
+        /// `revision` publishes.
+        fn have(revision: i64) -> Frontier {
+            let mut f = frontier(5, "a");
+            f.base_seq = 2;
+            f.revision = revision;
+            f
+        }
+
+        fn plan(f: &Frontier, head: &ArtifactHead, marks: &[WalMark]) -> Option<DeltaPlan> {
+            plan_delta(f, head, marks, 0)
+        }
+
+        fn grown() -> (ArtifactHead, Vec<WalMark>) {
+            let mut head = artifact(8, "a", true);
+            head.delta_bytes = 300;
+            (head, vec![mark(5, "a", 100), mark(8, "a", 300)])
+        }
+
+        #[test]
+        fn the_wal_between_the_frontier_and_the_head_is_a_delta() {
+            let (head, marks) = grown();
+            let delta = plan(&have(3), &head, &marks).expect("a delta");
+            assert_eq!((delta.from_seq, delta.to_seq), (6, 8));
+            assert_eq!(
+                (delta.start.wal_end_bytes, delta.end.wal_end_bytes),
+                (100, 300)
+            );
+            // Any order, any extra marks.
+            let mut shuffled = marks.clone();
+            shuffled.reverse();
+            shuffled.push(mark(6, "a", 150));
+            assert_eq!(plan(&have(3), &head, &shuffled), Some(delta));
+        }
+
+        #[test]
+        fn a_missing_or_pruned_mark_is_a_cumulative_segment() {
+            let (head, marks) = grown();
+            assert_eq!(plan(&have(3), &head, &marks[..1]), None, "no head mark");
+            assert_eq!(plan(&have(3), &head, &marks[1..]), None, "no frontier mark");
+            assert_eq!(plan(&have(3), &head, &[]), None, "no marks at all");
+        }
+
+        #[test]
+        fn marks_of_another_checkpoint_are_not_used() {
+            let (head, mut marks) = grown();
+            marks[0] = mark(5, "b", 100);
+            assert_eq!(plan(&have(3), &head, &marks), None);
+            let (head, mut marks) = grown();
+            marks[1] = mark(8, "b", 300);
+            assert_eq!(plan(&have(3), &head, &marks), None);
+        }
+
+        #[test]
+        fn a_head_on_another_checkpoint_or_without_a_wal_is_not_a_delta() {
+            let (head, marks) = grown();
+            let mut other = head.clone();
+            other.cid = "b".into();
+            assert_eq!(plan(&have(3), &other, &marks), None);
+            let mut bare = head.clone();
+            bare.has_delta = false;
+            assert_eq!(plan(&have(3), &bare, &marks), None);
+        }
+
+        #[test]
+        fn a_wal_that_did_not_grow_or_shrank_is_a_cumulative_segment() {
+            let (mut head, mut marks) = grown();
+            marks[1] = mark(8, "a", 100);
+            head.delta_bytes = 100;
+            assert_eq!(plan(&have(3), &head, &marks), None, "zero growth");
+            marks[1] = mark(8, "a", 60);
+            head.delta_bytes = 60;
+            assert_eq!(plan(&have(3), &head, &marks), None, "regression");
+        }
+
+        #[test]
+        fn a_head_whose_wal_is_not_the_marked_one_is_a_cumulative_segment() {
+            let (mut head, marks) = grown();
+            head.delta_bytes = 301;
+            assert_eq!(plan(&have(3), &head, &marks), None);
+        }
+
+        #[test]
+        fn a_frontier_at_or_past_the_head_or_still_at_its_snapshot_plans_no_delta() {
+            let (head, marks) = grown();
+            let mut at_head = have(3);
+            at_head.last_seq = 8;
+            assert_eq!(plan(&at_head, &head, &marks), None);
+            let mut at_snapshot = have(3);
+            at_snapshot.last_seq = 2;
+            assert_eq!(
+                plan(&at_snapshot, &head, &[mark(2, "a", 0), marks[1].clone()]),
+                None
+            );
+        }
+
+        #[test]
+        fn a_small_wal_is_uploaded_whole() {
+            let (head, marks) = grown();
+            assert!(plan_delta(&have(3), &head, &marks, 300).is_some());
+            assert_eq!(plan_delta(&have(3), &head, &marks, 301), None);
+            assert_eq!(
+                plan_delta(&have(3), &head, &marks, DELTA_MIN_WAL_BYTES),
+                None
+            );
+        }
+
+        #[test]
+        fn every_nth_publish_is_a_cumulative_segment() {
+            let (head, marks) = grown();
+            // The deltas between two cumulative segments are at most
+            // MAX_DELTA_CHAIN - 1: the publish that would make the chain's
+            // MAX_DELTA_CHAIN-th object is cumulative.
+            assert!(plan(&have(MAX_DELTA_CHAIN - 2), &head, &marks).is_some());
+            assert_eq!(plan(&have(MAX_DELTA_CHAIN - 1), &head, &marks), None);
+            assert!(plan(&have(MAX_DELTA_CHAIN), &head, &marks).is_some());
+            assert_eq!(plan(&have(2 * MAX_DELTA_CHAIN - 1), &head, &marks), None);
+        }
+
+        #[test]
+        fn the_chain_never_outgrows_its_bound() {
+            // Publish every revision as a delta until the planner refuses: the
+            // refusal comes within MAX_DELTA_CHAIN publishes.
+            let (head, marks) = grown();
+            let refused = (0..2 * MAX_DELTA_CHAIN)
+                .find(|revision| plan(&have(*revision), &head, &marks).is_none())
+                .expect("a cumulative publish");
+            assert!(refused < MAX_DELTA_CHAIN, "{refused}");
         }
     }
 }
