@@ -19,6 +19,10 @@ case "$(sed -n "${n}p" "${STUB_SCRIPT}")" in
   text) echo "Secret-looking notice that must never be echoed" ;;
   noos) echo '{"name":"cvm"}' ;;
   exit) echo '{"os":{}}'; exit 3 ;;
+  # A CVM body over 64 KiB (it embeds the compose). A pipe reader gets it cut at 65532 bytes, as in
+  # node 1.26.22 deploy run 45132117203; a file gets it whole.
+  big) body="$(printf '{"name":"cvm","os":{"name":"x"},"compose":"%s"}' "$(head -c 70000 /dev/zero | tr '\0' 'a')")"
+       if [ -p /dev/stdout ]; then printf '%s' "${body}" | head -c 65532; else printf '%s\n' "${body}"; fi ;;
   *) echo "stub called too often" >&2; exit 9 ;;
 esac
 STUB
@@ -58,6 +62,10 @@ expect "empty output is retried" 0 3 "empty output"
 
 run noos exit ok
 expect "JSON without os and a failed exit are retried" 0 3 "without an os object.*|phala exited 3"
+
+run big
+expect "a CVM body over 64 KiB is read whole, not cut at the pipe size" 0 1
+[ "$(wc -c <<<"${out}")" -gt 70000 ] || { echo "FAIL the over-64KiB body is passed through whole"; failures=$((failures + 1)); }
 
 run text empty noos exit
 expect "four bad reads fail closed without echoing the body" 1 4 "after 4 attempts"
