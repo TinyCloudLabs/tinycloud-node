@@ -5,17 +5,22 @@
 //! Per database ([`check_database`]):
 //! 1. Read the frontier (the manifest's primary key) and resolve its chain in
 //!    the inventory by primary-key columns: the base snapshot and, when
-//!    `last_seq > base_seq`, the published `wal-cum-v1` segment
-//!    `base_seq+1 ..= last_seq` (restore = snapshot + highest segment). Every
-//!    key must sit under the database's own lineage prefix. A frontier at
-//!    `at_seq = 0` is never a restore point (contract 4.2, 11.6).
+//!    `last_seq > base_seq`, the WAL segments that reach `last_seq`: the
+//!    highest published `wal-cum-v1` segment `base_seq+1 ..= C`, then the
+//!    published `wal-delta-v1` segments after it end to end (`C+1 ..= D`,
+//!    `D+1 ..= E`, ...), the last ending at `last_seq`. A segment missing
+//!    from that chain is the shortfall. Every key must sit under the
+//!    database's own lineage prefix. A frontier at `at_seq = 0` is never a
+//!    restore point (contract 4.2, 11.6).
 //! 2. Read Postgres's head. Unless it is at the frontier's revision with the
 //!    frontier's checkpoint, the database is `not_comparable` and nothing
 //!    more is read: the check never compares across revisions.
-//! 3. Stream the snapshot and the segment from the store into scratch files
+//! 3. Stream the snapshot and the segments from the store into scratch files
 //!    (capped at their recorded sizes, SHA-256 checked against their keys; a
-//!    refused download is discarded and never opened), check the headers
-//!    ([`db_page_size`], [`check_wal`]) before SQLite opens anything, replay
+//!    refused download is discarded and never opened), appending the
+//!    segments in order into one WAL, check the headers ([`db_page_size`],
+//!    [`check_wal`], which walks the whole WAL: its salts and checksum chain
+//!    tie the deltas to one another) before SQLite opens anything, replay
 //!    with `wal_checkpoint(TRUNCATE)` and run `PRAGMA integrity_check`.
 //! 4. Stream Postgres's checkpoint and WAL through [`ShadowSource`] into
 //!    scratch files and materialise them the same way.
@@ -45,7 +50,8 @@ use super::source::{ShadowSource, SourceError};
 use crate::models::{sql_store_manifest as manifest_row, sql_store_object as object};
 use crate::sql::store::key::{lineage_prefix, DbRef, ObjectKey, ObjectKind};
 use crate::sql::store::manifest::{
-    object_pk, DbSqlManifest, Frontier, ObjectState, SqlManifest, SEGMENT_FORMAT, SNAPSHOT_FORMAT,
+    object_pk, DbSqlManifest, Frontier, ObjectState, SqlManifest, DELTA_FORMAT, SEGMENT_FORMAT,
+    SNAPSHOT_FORMAT,
 };
 use crate::sql::store::object::{
     discard_download, private_file_options, sha256_file, ObjectMeta, SqlObjectStore, SqlStoreError,
@@ -80,8 +86,10 @@ pub struct DbReport {
     pub last_seq: Option<u64>,
     /// Postgres's revision, when it was read.
     pub pg_revision: Option<i64>,
-    /// Segments the frontier needs for a restore at `last_seq` (`wal-cum-v1`:
-    /// the one highest segment when `last_seq > base_seq`, else none).
+    /// Segments the frontier needs for a restore at `last_seq`: none when
+    /// `last_seq = base_seq`, else the highest `wal-cum-v1` segment and the
+    /// `wal-delta-v1` segments after it. When the chain has a gap, the
+    /// segments found plus the one missing.
     pub segments_required: u64,
     /// Segments streamed, checked against their key and the WAL rules, and
     /// replayed into a sound database.
@@ -245,7 +253,16 @@ struct Link {
 /// What a restore at the frontier reads.
 struct Chain {
     snapshot: Link,
-    segment: Option<Link>,
+    /// In WAL order: the cumulative segment, then the deltas after it.
+    segments: Vec<Link>,
+}
+
+impl Chain {
+    fn wal_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .fold(0, |total, s| u64::saturating_add(total, s.bytes))
+    }
 }
 
 async fn check(deps: &RestoreDeps, db: &DbRef<'_>, report: &mut DbReport) -> Result<(), Verdict> {
@@ -278,11 +295,7 @@ async fn check(deps: &RestoreDeps, db: &DbRef<'_>, report: &mut DbReport) -> Res
         ));
     }
 
-    let need = scratch_need(
-        chain.snapshot.bytes,
-        chain.segment.as_ref().map_or(0, |s| s.bytes),
-    )
-    .max(scratch_need(
+    let need = scratch_need(chain.snapshot.bytes, chain.wal_bytes()).max(scratch_need(
         head.checkpoint_bytes,
         if head.has_delta { head.delta_bytes } else { 0 },
     ));
@@ -303,13 +316,11 @@ async fn check(deps: &RestoreDeps, db: &DbRef<'_>, report: &mut DbReport) -> Res
         let dir = reservation.scratch_dir().map_err(scratch_verdict)?;
         let db_path = dir.path().join(DB_FILE);
         download(&*deps.store, &chain.snapshot, &db_path).await?;
-        if let Some(segment) = &chain.segment {
-            download(&*deps.store, segment, &wal_path(&db_path)).await?;
-        }
-        let restored = materialise_file(db_path, chain.segment.is_some(), true)
+        assemble_wal(&*deps.store, &chain.segments, &db_path).await?;
+        let restored = materialise_file(db_path, !chain.segments.is_empty(), true)
             .await
             .map_err(|e| unreadable(format!("restored copy: {e}")))?;
-        report.segments_verified = u64::from(chain.segment.is_some());
+        report.segments_verified = chain.segments.len() as u64;
         restored
     };
 
@@ -359,8 +370,9 @@ async fn resolve_chain<C: ConnectionTrait>(
     if f.last_seq < f.base_seq {
         return Err(unreadable("the frontier's last_seq is below its base_seq"));
     }
-    // wal-cum-v1: the one segment base_seq+1..=last_seq carries every change
-    // on the base; the earlier cumulative segments are history.
+    // The WAL is the highest wal-cum-v1 segment on the base and the
+    // wal-delta-v1 segments after it; the earlier segments are history.
+    // `segments_of` refines the count once it has walked the chain.
     report.segments_required = u64::from(f.last_seq > f.base_seq);
     // Restore is defined only at the recoverable frontier; a snapshot
     // labelled at_seq 0 names no revision (contract 4.2, 11.6).
@@ -377,18 +389,16 @@ async fn resolve_chain<C: ConnectionTrait>(
         .map_err(db_verdict)?
         .ok_or_else(|| unreadable("the base snapshot is not in the inventory"))?;
     let snapshot = link(&prefix, &snapshot_key, &row, SNAPSHOT_FORMAT)?;
-    let segment = if f.last_seq > f.base_seq {
-        Some(segment_of(conn, db, f, &prefix).await?)
+    let segments = if f.last_seq > f.base_seq {
+        segments_of(conn, db, f, &prefix, report).await?
     } else {
-        None
+        Vec::new()
     };
-    let total = snapshot
-        .bytes
-        .saturating_add(segment.as_ref().map_or(0, |s| s.bytes));
-    if total != f.frontier_bytes {
+    let chain = Chain { snapshot, segments };
+    if chain.snapshot.bytes.saturating_add(chain.wal_bytes()) != f.frontier_bytes {
         return Err(unreadable("frontier_bytes disagrees with the inventory"));
     }
-    Ok(Chain { snapshot, segment })
+    Ok(chain)
 }
 
 /// The base snapshot's key, rebuilt from the frontier's columns and the hash
@@ -413,15 +423,18 @@ fn snapshot_key_of(db: &DbRef<'_>, f: &Frontier, prefix: &str) -> Result<ObjectK
     Ok(key)
 }
 
-/// The published segment `base_seq+1 ..= last_seq` on the frontier's base,
-/// by the primary-key prefix `(space, db_id, lineage, kind, base_seq,
-/// from_seq, to_seq)`. Without one, the shortfall is reported.
-async fn segment_of<C: ConnectionTrait>(
+/// The published segments that restore `last_seq` on the frontier's base: the
+/// highest `wal-cum-v1` segment `base_seq+1 ..= C`, then the `wal-delta-v1`
+/// segment that starts at `C+1`, and so on until one ends at `last_seq`. Each
+/// step is a primary-key prefix lookup `(space, db_id, lineage, kind,
+/// base_seq, from_seq)`; a step without a row reports the shortfall.
+async fn segments_of<C: ConnectionTrait>(
     conn: &C,
     db: &DbRef<'_>,
     f: &Frontier,
     prefix: &str,
-) -> Result<Link, Verdict> {
+    report: &mut DbReport,
+) -> Result<Vec<Link>, Verdict> {
     use object::Column as C;
     let on_base = || {
         object::Entity::find()
@@ -432,50 +445,58 @@ async fn segment_of<C: ConnectionTrait>(
             .filter(C::BaseSeq.eq(seq(f.base_seq)))
             .filter(C::State.eq(ObjectState::Published.as_str()))
     };
-    let rows = on_base()
-        .filter(C::FromSeq.eq(seq(f.base_seq + 1)))
-        .filter(C::ToSeq.eq(seq(f.last_seq)))
-        .limit(2)
-        .all(conn)
-        .await
-        .map_err(db_verdict)?;
-    match rows.as_slice() {
-        [row] => {
-            let hash = hex::decode(&row.content_hash)
-                .ok()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .ok_or_else(|| unreadable("a segment's content hash is malformed"))?;
-            let key = ObjectKey::segment(
-                db,
-                &f.lineage,
-                f.base_seq,
-                f.base_seq + 1,
-                f.last_seq,
-                &hash,
-            )
+    let mut chain: Vec<Link> = Vec::new();
+    let mut covered = f.base_seq;
+    while covered < f.last_seq {
+        // The longest segment that starts where the chain ends; the first
+        // step has the cumulative segments to choose from, the later ones a
+        // single delta.
+        let rows = on_base()
+            .filter(C::FromSeq.eq(seq(covered + 1)))
+            .filter(C::ToSeq.lte(seq(f.last_seq)))
+            .order_by_desc(C::ToSeq)
+            .limit(2)
+            .all(conn)
+            .await
+            .map_err(db_verdict)?;
+        let row = match rows.as_slice() {
+            [] => {
+                let published =
+                    !chain.is_empty() || on_base().one(conn).await.map_err(db_verdict)?.is_some();
+                return Err(unreadable(if published {
+                    format!(
+                        "the published chain reaches seq {covered}, the frontier claims {}",
+                        f.last_seq
+                    )
+                } else {
+                    format!(
+                        "no published segment on the base, the frontier claims seq {}",
+                        f.last_seq
+                    )
+                }));
+            }
+            [row] => row,
+            [row, next] if row.to_seq != next.to_seq => row,
+            _ => return Err(unreadable("two published segments claim the frontier")),
+        };
+        let hash = hex::decode(&row.content_hash)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| unreadable("a segment's content hash is malformed"))?;
+        let to =
+            u64::try_from(row.to_seq).map_err(|_| unreadable("a segment's range is malformed"))?;
+        let key = ObjectKey::segment(db, &f.lineage, f.base_seq, covered + 1, to, &hash)
             .map_err(|_| unreadable("a segment cannot form a key"))?;
-            link(prefix, &key, row, SEGMENT_FORMAT)
-        }
-        [] => {
-            let reached = on_base()
-                .order_by_desc(C::ToSeq)
-                .one(conn)
-                .await
-                .map_err(db_verdict)?
-                .map(|row| row.to_seq);
-            Err(unreadable(match reached {
-                Some(to) => format!(
-                    "the published chain reaches seq {to}, the frontier claims {}",
-                    f.last_seq
-                ),
-                None => format!(
-                    "no published segment on the base, the frontier claims seq {}",
-                    f.last_seq
-                ),
-            }))
-        }
-        _ => Err(unreadable("two published segments claim the frontier")),
+        let format = if covered == f.base_seq {
+            SEGMENT_FORMAT
+        } else {
+            DELTA_FORMAT
+        };
+        chain.push(link(prefix, &key, row, format)?);
+        covered = to;
+        report.segments_required = chain.len() as u64 + u64::from(covered < f.last_seq);
     }
+    Ok(chain)
 }
 
 /// One inventory row of the chain, checked against the key it was looked up by.
@@ -519,6 +540,38 @@ async fn download(store: &dyn SqlObjectStore, link: &Link, path: &Path) -> Resul
         "{}: {refused}",
         link.key.kind().as_str()
     )))
+}
+
+/// The chain's segments, in order, as the `-wal` file beside `db_path`. The
+/// first goes straight there; each later one lands in a part file, is
+/// appended and removed, so the scratch holds the WAL and one segment.
+async fn assemble_wal(
+    store: &dyn SqlObjectStore,
+    segments: &[Link],
+    db_path: &Path,
+) -> Result<(), Verdict> {
+    let Some((first, rest)) = segments.split_first() else {
+        return Ok(());
+    };
+    let wal = wal_path(db_path);
+    download(store, first, &wal).await?;
+    let part = sibling(db_path, "-part");
+    for segment in rest {
+        download(store, segment, &part).await?;
+        append(&part, &wal).await.map_err(scratch_verdict)?;
+        tokio::fs::remove_file(&part)
+            .await
+            .map_err(scratch_verdict)?;
+    }
+    Ok(())
+}
+
+async fn append(part: &Path, wal: &Path) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut from = tokio::fs::File::open(part).await?;
+    let mut to = tokio::fs::OpenOptions::new().append(true).open(wal).await?;
+    tokio::io::copy(&mut from, &mut to).await?;
+    to.flush().await
 }
 
 /// Postgres's checkpoint (and WAL, when the head has one) into `db_path`.
@@ -924,6 +977,7 @@ mod tests {
     use crate::database_artifacts::{
         ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
     };
+    use crate::models::sql_wal_mark;
     use crate::sql::store::key::{Lineage, PublishId};
     use crate::sql::store::manifest::{
         now_timestamp, ObjectRecord, Publish, PublishChain, PublishKind,
@@ -1771,5 +1825,490 @@ mod tests {
         );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["databases"][0]["result"], "ok");
+    }
+
+    // ---- TC-1491 P3: wal-delta-v1 chains -----------------------------------
+
+    impl Live {
+        /// The node reopening the database from its Postgres artifact (the
+        /// stored checkpoint and WAL) in a fresh directory, mid-generation.
+        fn hydrate(&mut self, checkpoint: &[u8], wal: &[u8]) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.db");
+            std::fs::write(&path, checkpoint).unwrap();
+            std::fs::write(wal_path(&path), wal).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+                .unwrap();
+            let rows = self.rows;
+            drop(std::mem::replace(
+                self,
+                Self {
+                    _dir: dir,
+                    path,
+                    conn,
+                    rows,
+                },
+            ));
+        }
+    }
+
+    impl Rig {
+        /// [`Rig::upload`] with deltas planned at any size.
+        async fn upload_deltas(&self, db_id: &str, revision: u64) -> Frontier {
+            let upload_scratch = tempfile::tempdir().unwrap();
+            let handle = scheduler::spawn(
+                ShadowDeps {
+                    control: self.conn.clone(),
+                    manifest: Arc::new(self.manifest()),
+                    store: self.store.clone(),
+                    source: Arc::new(PgArtifactSource::new(self.repo.clone())),
+                    disk: DiskBudget::new(upload_scratch.path(), 1 << 24),
+                    board: Arc::new(NoticeBoard::new(
+                        SpaceAllowlist::new([SPACE.to_string()]),
+                        Arc::new(NoopMetrics),
+                    )),
+                    metrics: Arc::new(NoopMetrics),
+                },
+                SchedulerConfig {
+                    policy: Policy {
+                        interval: Duration::ZERO,
+                        backoff_base: Duration::from_millis(10),
+                        backoff_max: Duration::from_millis(50),
+                    },
+                    tick: Duration::from_millis(5),
+                    delta_min_wal_bytes: 0,
+                    ..SchedulerConfig::default()
+                },
+            );
+            let manifest = self.manifest();
+            let frontier = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(f) = manifest.current(&db(db_id)).await.unwrap() {
+                        if f.last_seq >= revision {
+                            return f;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the uploader reaches the revision");
+            handle.drain(Duration::from_secs(5)).await;
+            frontier
+        }
+
+        /// The published segments of `db_id`, in chain order, with their formats.
+        async fn segments(&self, db_id: &str) -> Vec<(ObjectKey, String)> {
+            let mut segments: Vec<_> = self
+                .manifest()
+                .list_objects(&db(db_id), Some(ObjectState::Published))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.key.kind() == ObjectKind::Segment)
+                .map(|r| (r.key, r.format))
+                .collect();
+            segments.sort_by_key(|(key, _)| (key.from_seq(), key.to_seq()));
+            segments
+        }
+
+        /// The published segments as `(from, to, format)`.
+        async fn ranges(&self, db_id: &str) -> Vec<(u64, u64, String)> {
+            self.segments(db_id)
+                .await
+                .into_iter()
+                .map(|(key, format)| (key.from_seq(), key.to_seq(), format))
+                .collect()
+        }
+
+        /// The segment `from..=to` is no longer published.
+        async fn unpublish(&self, db_id: &str, from: u64, to: u64) {
+            object::Entity::update_many()
+                .col_expr(object::Column::State, Expr::value("uploaded"))
+                .filter(object::Column::DbId.eq(db_id))
+                .filter(object::Column::Kind.eq("segment"))
+                .filter(object::Column::FromSeq.eq(seq(from)))
+                .filter(object::Column::ToSeq.eq(seq(to)))
+                .exec(&self.conn)
+                .await
+                .unwrap();
+        }
+
+        async fn drop_mark(&self, db_id: &str, revision: i64) {
+            sql_wal_mark::Entity::delete_many()
+                .filter(sql_wal_mark::Column::Name.eq(db_id))
+                .filter(sql_wal_mark::Column::Revision.eq(revision))
+                .exec(&self.conn)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// One database on one checkpoint, saved and uploaded a revision at a
+    /// time: the chain is the snapshot at the checkpoint's revision, a
+    /// cumulative segment for the first save (the frontier is still at its
+    /// snapshot) and a delta for each save after it.
+    struct Generation {
+        db_id: &'static str,
+        live: Live,
+        cid: String,
+        revision: i64,
+        checkpoint_bytes: u64,
+    }
+
+    impl Generation {
+        async fn new(rig: &Rig, db_id: &'static str) -> Self {
+            let mut live = Live::new(4096);
+            live.write(3);
+            let checkpoint = live.checkpoint();
+            let meta = saved(&rig.repo, db_id, &checkpoint, &[]).await;
+            let g = Self {
+                db_id,
+                live,
+                cid: meta.checkpoint_content_hash,
+                revision: meta.revision,
+                checkpoint_bytes: checkpoint.len() as u64,
+            };
+            let f = rig.upload_deltas(db_id, 1).await;
+            assert_eq!((f.base_seq, f.last_seq), (1, 1));
+            g
+        }
+
+        /// Two more commits, stored as the next revision's WAL.
+        async fn save(&mut self, rig: &Rig) {
+            self.live.write(2);
+            self.revision = rig
+                .save_delta(self.db_id, &self.live.wal(), self.revision, &self.cid)
+                .await;
+        }
+
+        async fn upload(&self, rig: &Rig) -> Frontier {
+            rig.upload_deltas(self.db_id, self.revision as u64).await
+        }
+
+        async fn save_and_upload(&mut self, rig: &Rig) -> Frontier {
+            self.save(rig).await;
+            self.upload(rig).await
+        }
+    }
+
+    /// A generation with a cumulative segment `2..=2` and deltas `3..=3` and
+    /// `4..=4` published.
+    async fn delta_chain(rig: &Rig, db_id: &'static str) -> (Generation, Frontier) {
+        let mut g = Generation::new(rig, db_id).await;
+        for _ in 0..2 {
+            g.save_and_upload(rig).await;
+        }
+        let f = g.save_and_upload(rig).await;
+        assert_eq!((f.base_seq, f.last_seq), (1, 4));
+        assert_eq!(
+            rig.ranges(db_id).await,
+            vec![
+                (2, 2, "wal-cum-v1".to_string()),
+                (3, 3, "wal-delta-v1".to_string()),
+                (4, 4, "wal-delta-v1".to_string()),
+            ]
+        );
+        (g, f)
+    }
+
+    #[tokio::test]
+    async fn a_delta_chain_restores_byte_exact() {
+        let rig = rig().await;
+        let (g, f) = delta_chain(&rig, "main").await;
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Ok);
+        assert_eq!(report.reason, None);
+        assert_eq!(
+            (
+                report.segments_required,
+                report.segments_verified,
+                report.segments_unverified
+            ),
+            (3, 3, 0)
+        );
+        assert_eq!((report.last_seq, report.pg_revision), (Some(4), Some(4)));
+        assert!(rig.scratch_is_empty(), "scratch files are removed");
+
+        // The objects are the stored WAL cut at the revisions' boundaries:
+        // appended in order they are PG's WAL, byte for byte.
+        let wal = g.live.wal();
+        let mut joined = Vec::new();
+        let mut sizes = 0;
+        for (key, _) in rig.segments("main").await {
+            let bytes = rig.store.bytes(key.as_str()).unwrap();
+            assert!(!bytes.is_empty());
+            sizes += bytes.len() as u64;
+            joined.extend(bytes);
+        }
+        assert_eq!(joined, wal);
+        assert_eq!(f.frontier_bytes, g.checkpoint_bytes + sizes);
+        // Each delta is smaller than the whole WAL it extends.
+        let deltas = rig.segments("main").await;
+        for (key, _) in &deltas[1..] {
+            assert!((rig.store.bytes(key.as_str()).unwrap().len()) < wal.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_delta_chain_reports_the_shortfall() {
+        let rig = rig().await;
+        let (_g, f) = delta_chain(&rig, "main").await;
+        rig.unpublish("main", 3, 3).await;
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Unreadable);
+        assert_eq!(
+            report.reason,
+            Some(format!(
+                "the published chain reaches seq 2, the frontier claims {}",
+                f.last_seq
+            ))
+        );
+        // The cumulative segment found, and the delta missing after it.
+        assert_eq!(
+            (report.segments_required, report.segments_unverified),
+            (2, 2)
+        );
+
+        // Without the cumulative segment the chain does not start at all.
+        let (_g, f) = delta_chain(&rig, "other").await;
+        rig.unpublish("other", 2, 2).await;
+        let report = rig.check("other").await;
+        assert_result(&report, RestoreResult::Unreadable);
+        assert_eq!(
+            report.reason,
+            Some(format!(
+                "the published chain reaches seq 1, the frontier claims {}",
+                f.last_seq
+            ))
+        );
+        assert_eq!(report.segments_unverified, 1);
+    }
+
+    #[tokio::test]
+    async fn a_published_delta_beyond_the_frontier_is_not_part_of_its_chain() {
+        let rig = rig().await;
+        let (_g, f) = delta_chain(&rig, "main").await;
+        let beyond = ObjectKey::segment(
+            &db("main"),
+            &f.lineage,
+            f.base_seq,
+            f.last_seq + 1,
+            f.last_seq + 3,
+            &sha256(b"beyond"),
+        )
+        .unwrap();
+        object::Entity::insert(object::ActiveModel {
+            space: Set(SPACE.into()),
+            db_id: Set("main".into()),
+            lineage: Set(f.lineage.to_string()),
+            kind: Set("segment".into()),
+            base_seq: Set(seq(f.base_seq)),
+            from_seq: Set(seq(f.last_seq + 1)),
+            to_seq: Set(seq(f.last_seq + 3)),
+            content_hash: Set(beyond.content_hash()),
+            format: Set("wal-delta-v1".into()),
+            key: Set(beyond.as_str().into()),
+            bytes: Set(7),
+            state: Set("published".into()),
+            created_at: Set(now_timestamp()),
+        })
+        .exec(&rig.conn)
+        .await
+        .unwrap();
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Ok);
+        assert_eq!(report.segments_verified, 3);
+    }
+
+    #[tokio::test]
+    async fn a_corrupted_delta_byte_is_unreadable() {
+        let rig = rig().await;
+        let (_g, _f) = delta_chain(&rig, "main").await;
+        // A byte flipped in a stored delta: the download is refused.
+        let (key, format) = rig.segments("main").await.remove(1);
+        assert_eq!(format, "wal-delta-v1");
+        let mut bytes = rig.store.bytes(key.as_str()).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0x40;
+        rig.store.plant(key.as_str(), bytes);
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Unreadable);
+        assert!(
+            report.reason.as_deref().unwrap().starts_with("segment: "),
+            "{report:?}"
+        );
+        assert_eq!(
+            (
+                report.segments_required,
+                report.segments_verified,
+                report.segments_unverified
+            ),
+            (3, 0, 3)
+        );
+        assert!(rig.scratch_is_empty(), "the refused download is gone");
+
+        // A byte flipped before the delta was stored (so its key hashes it):
+        // the WAL walk over the whole chain finds the frame that fails its
+        // checksum, before SQLite opens anything.
+        let mut g = Generation::new(&rig, "torn").await;
+        g.save_and_upload(&rig).await;
+        g.live.write(2);
+        let mut torn = g.live.wal();
+        let at = torn.len() - 10;
+        torn[at] ^= 0x40;
+        g.revision = rig.save_delta("torn", &torn, g.revision, &g.cid).await;
+        g.upload(&rig).await;
+        assert_eq!(
+            rig.ranges("torn").await.last().map(|r| r.2.clone()),
+            Some("wal-delta-v1".to_string())
+        );
+        let report = rig.check("torn").await;
+        assert_result(&report, RestoreResult::Unreadable);
+        let reason = report.reason.unwrap();
+        assert!(
+            reason.starts_with("restored copy: refused before open: WAL frame")
+                && reason.ends_with("fails its checksum"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delta_from_another_wal_generation_is_refused_by_its_salts() {
+        let rig = rig().await;
+        let mut g = Generation::new(&rig, "main").await;
+        g.save_and_upload(&rig).await;
+        // Another WAL generation's frames appended to this one's: the stored
+        // key hashes them, so only the walk over the whole chain can tell.
+        let mut other = Live::new(4096);
+        other.write(5);
+        let foreign = other.wal();
+        let mut wal = g.live.wal();
+        wal.extend_from_slice(&foreign[WAL_HEADER..]);
+        g.revision = rig.save_delta("main", &wal, g.revision, &g.cid).await;
+        g.upload(&rig).await;
+        assert_eq!(
+            rig.ranges("main").await.last().map(|r| r.2.clone()),
+            Some("wal-delta-v1".to_string())
+        );
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Unreadable);
+        let reason = report.reason.unwrap();
+        assert!(
+            reason.starts_with("restored copy: refused before open: WAL frame")
+                && reason.ends_with("carries other salts"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cum_segment_heals_a_delta_gap() {
+        let rig = rig().await;
+        let (mut g, _) = delta_chain(&rig, "main").await;
+        rig.unpublish("main", 3, 3).await;
+        assert_result(&rig.check("main").await, RestoreResult::Unreadable);
+        // The next upload finds no mark at the frontier's revision and
+        // publishes the cumulative WAL: restore needs nothing before it.
+        rig.drop_mark("main", 4).await;
+        let f = g.save_and_upload(&rig).await;
+        assert_eq!((f.base_seq, f.last_seq), (1, 5));
+        assert_eq!(
+            rig.ranges("main").await,
+            vec![
+                (2, 2, "wal-cum-v1".to_string()),
+                (2, 5, "wal-cum-v1".to_string()),
+                (4, 4, "wal-delta-v1".to_string()),
+            ]
+        );
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Ok);
+        assert_eq!(
+            (
+                report.segments_required,
+                report.segments_verified,
+                report.segments_unverified
+            ),
+            (1, 1, 0)
+        );
+        // The frontier counts the snapshot and the one cumulative segment.
+        let cum = &rig.segments("main").await[1];
+        let bytes = rig.store.bytes(cum.0.as_str()).unwrap().len() as u64;
+        assert_eq!(f.frontier_bytes, g.checkpoint_bytes + bytes);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_cum_and_delta_chain_restores() {
+        let rig = rig().await;
+        let (mut g, _) = delta_chain(&rig, "main").await;
+        // A cumulative segment in the middle of the chain (no mark at the
+        // frontier's revision), then deltas after it.
+        rig.drop_mark("main", 4).await;
+        g.save_and_upload(&rig).await;
+        g.save_and_upload(&rig).await;
+        let f = g.save_and_upload(&rig).await;
+        assert_eq!((f.base_seq, f.last_seq), (1, 7));
+        assert_eq!(
+            rig.ranges("main").await,
+            vec![
+                (2, 2, "wal-cum-v1".to_string()),
+                (2, 5, "wal-cum-v1".to_string()),
+                (3, 3, "wal-delta-v1".to_string()),
+                (4, 4, "wal-delta-v1".to_string()),
+                (6, 6, "wal-delta-v1".to_string()),
+                (7, 7, "wal-delta-v1".to_string()),
+            ]
+        );
+        let report = rig.check("main").await;
+        assert_result(&report, RestoreResult::Ok);
+        // The highest cumulative segment 2..=5, then 6 and 7; the deltas
+        // before it are history.
+        assert_eq!(
+            (
+                report.segments_required,
+                report.segments_verified,
+                report.segments_unverified
+            ),
+            (3, 3, 0)
+        );
+        assert!(rig.scratch_is_empty());
+    }
+
+    #[test]
+    fn the_wal_only_grows_between_checkpoints_and_every_mark_is_a_commit_boundary() {
+        let mut live = Live::new(4096);
+        live.write(3);
+        let checkpoint = live.checkpoint();
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        let mut stored: Vec<u8> = Vec::new();
+        let mut marks = Vec::new();
+        for round in 0..9 {
+            // The node's actor reopens its database from Postgres's artifact:
+            // the next WAL must continue the stored one, not restart it.
+            if round == 3 || round == 6 {
+                live.hydrate(&checkpoint, &stored);
+            }
+            live.write(1 + round % 3);
+            let wal = live.wal();
+            assert!(
+                wal.starts_with(&stored),
+                "round {round}: the WAL must extend what was stored"
+            );
+            assert!(wal.len() > stored.len(), "round {round}: it grew");
+            marks.push(wal.len());
+            stored = wal;
+        }
+        // Each mark is the end of a whole commit: the stored WAL cut there is
+        // a WAL SQLite would replay in full.
+        for end in marks {
+            std::fs::write(&probe, &stored[..end]).unwrap();
+            assert!(check_wal(&probe, 4096).is_ok(), "mark {end}");
+        }
+        // A checkpoint (TRUNCATE) starts a new generation: the old marks no
+        // longer describe the WAL, and `save` dropped them.
+        live.checkpoint();
+        live.write(1);
+        assert!(!live.wal().starts_with(&stored));
     }
 }
