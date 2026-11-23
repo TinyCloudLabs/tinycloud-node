@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- CI: the post-deploy `/info` identity-root check and the compose-file GET in `docker.yml` retry a read that fails once, after 5 s, through `scripts/ci/retry-read.sh`; a second failure still fails the step, and only the attempt number and exit code are logged. Deploys, quota writes and restores are never retried. The OS-image read already retried (TC-3928). Details: TC-3881.
 - Test: a revocation (of the lease, the original or an ancestor) committed after the scheduler's revocation check and before its stamp transaction writes no stamp, spends no replay and leaves the lease row unchanged; the no-revoke control stamps. Test only, no node behaviour change. Details: TC-4049.
 - Docs: `docs/runbooks/renewal-leases.md` says what `renewal_lease.state` means and gives a read-only audit query. A revoked lease, or one whose original or an ancestor is revoked, keeps `state = 'active'`, as does a lease past `lease_expiry` that was never replaced; the `revocation` join is the source of truth and the renewer skips both. No behaviour change. Details: TC-3997.
 - `POST /delegation/query` reports renewed grants using the same renewal-aware effective expiry as `/delegation/status`, including ancestor and lease caps and Policy/v3 root revocations. Eligible leases are filtered in SQL; stamp-chain traversal is linear. Response keys and signed `expiresAt` are unchanged. Details: TC-4046
