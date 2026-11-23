@@ -1753,3 +1753,7 @@ mod tests {
         assert!(!signer_may_revoke(&db, target, OTHER_DID).await);
     }
 }
+
+#[cfg(test)]
+#[path = "revocation/invocation_terminal_tests.rs"]
+mod invocation_terminal_tests;
