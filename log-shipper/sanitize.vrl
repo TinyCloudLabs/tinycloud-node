@@ -137,6 +137,12 @@ if label == "tinycloud-node" {
       known = get(codes, [msg]) ?? null
       if is_string(known) { code = known }
       __PREFIX_DIAGNOSTICS__
+      # TC-3284: a line with no message is named by its constant `event` field, only when that event is listed.
+      if msg == "" && !exists(f.message) {
+        events = __EVENT_DIAGNOSTICS__
+        named = get(events, [string(f.event) ?? ""]) ?? null
+        if is_string(named) { code = named }
+      }
     }
     event = if level == "warn" { "node_warning" } else { "node_error" }
     out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}

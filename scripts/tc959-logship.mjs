@@ -78,6 +78,7 @@ export function buildConfig({ sinkUri = 'https://s2795437.us-west-2a.betterstack
     .replaceAll('__LEDGER_TARGETS__', JSON.stringify(LEDGER_TARGETS))
     .replace('__ROUTE_ALIASES__', JSON.stringify(aliases))
     .replace('__DIAGNOSTICS__', JSON.stringify(diagnostics.exact))
+    .replace('__EVENT_DIAGNOSTICS__', JSON.stringify(diagnostics.event))
     .replace('__PREFIX_DIAGNOSTICS__', Object.entries(diagnostics.prefix).sort(([a], [b]) => a.length - b.length).map(([prefix, code]) => `if starts_with(msg, ${JSON.stringify(prefix)}) { code = ${JSON.stringify(code)} }`).join('\n'));
   const config = {
     data_dir: dataDir,
