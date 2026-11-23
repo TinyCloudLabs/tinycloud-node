@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Docs: `renewal-stamp-v1.md` states that `leaseGeneration` is constant within a lease, so verifiers must not require it to increase between stamps; the scheduler e2e asserts it. No node behaviour change. Details: TC-3997.
 - Ingress: a locally generated 502 with no upstream connection answers plain 503 with `Retry-After: 5`; response loss after sending a request stays 502, timeouts stay 504, and node responses stay unchanged. No request is replayed or write outcome implied. Details: TC-3972.
 - CI: the Phala deploy guard's CVM read (`scripts/ci/phala-cvm-json.sh`) and the post-deploy compose-file capture in `docker.yml` write the CLI output to a file instead of `$(...)`. The node 1.26.22 deploy failed twice before changing anything: CI's `phala` 1.1.19 output, read through a pipe, was cut at 65532 bytes once the CVM JSON passed 64 KiB (70094 bytes). The CVM read still retries and still fails closed on empty, non-JSON or `os`-less output. Details: TC-3928.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
