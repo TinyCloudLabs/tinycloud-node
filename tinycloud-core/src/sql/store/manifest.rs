@@ -294,7 +294,7 @@ impl DbSqlManifest {
     }
 }
 
-fn check_db(db: &DbRef<'_>) -> Result<(), SqlStoreError> {
+pub(super) fn check_db(db: &DbRef<'_>) -> Result<(), SqlStoreError> {
     ObjectKey::db_prefix(db)?;
     if db.space.chars().count() > MAX_ID_CHARS || db.db_id.chars().count() > MAX_ID_CHARS {
         return Err(SqlStoreError::Invalid("space or database id too long"));

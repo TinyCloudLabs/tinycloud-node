@@ -55,6 +55,7 @@ pub mod space_purge_request;
 pub mod space_purge_tombstone;
 pub mod space_retirement;
 pub mod sql_store_manifest;
+pub mod sql_store_mode;
 pub mod sql_store_object;
 pub mod sql_store_owner;
 pub mod sql_wal_mark;

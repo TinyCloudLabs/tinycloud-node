@@ -468,6 +468,65 @@ still refuses `enabled`).
   written without pause (D2's ~43k). `wal-delta-v1` changes the bytes, not
   the count. A checkpoint adds a snapshot and its cumulative segment.
 
+### 4.6 Mode record (TC-1491 P4.1)
+
+`sql_store_mode` holds one row per SQL database saying where it is mastered
+(store-master design, section 4). It lives in the same control database as
+the manifest, so a later mode change and a manifest/epoch change can commit
+together. **No behaviour change in P4.1:** nothing outside tests writes or
+reads the table, no request path consults it, and every database is
+`pg_master` (no row) or `shadow`.
+
+```
+sql_store_mode                                      -- PK (space, db_id); no FK
+  space, db_id       string(255)  not null
+  mode               string(16)   not null          -- pg_master | shadow | cutting_over | store_master | copying_back | owner_lost
+  epoch              big_integer  not null          -- starts at 0; +1 on every owner change; never reset
+  owner_node         string(255)  null              -- node holding the working copy; set entering store_master
+  lease_holder       string(255)  null              -- P4.2c
+  lease_expires_at   string(64)   null              -- RFC 3339; P4.2c
+  mode_changed_at    string(64)   not null          -- canonical RFC 3339 UTC of the last transition
+  cutover_revision   big_integer  null              -- database_artifact.revision a cutover froze; P4.4
+```
+
+An absent row means `pg_master`. `sql::store::mode::rule` is the transition
+table. Every pair not in it, a mode to itself included, is refused:
+
+| From | To | Epoch | `owner_node` |
+|---|---|---|---|
+| (no row) / pg_master | shadow | keep (a new row starts at 0) | keep |
+| shadow | pg_master | keep | keep |
+| shadow | cutting_over | keep | keep |
+| cutting_over | store_master | +1 | set to the claimant |
+| cutting_over | shadow | keep | keep |
+| store_master | copying_back | keep | keep |
+| copying_back | pg_master | keep | cleared |
+| copying_back | store_master | keep | keep |
+| store_master | owner_lost | +1 | keep |
+| owner_lost | store_master | +1 | set to the claimant |
+
+`sql::store::mode::transition_row` applies one transition as one statement.
+From no row it is an insert at epoch 0 that changes nothing if a row exists:
+`INSERT … ON CONFLICT DO NOTHING` on Postgres and SQLite. On MySQL it is a
+plain `INSERT` whose key violation means "exists", because sea-query renders
+`DO NOTHING` there as `ON DUPLICATE KEY UPDATE`, and with `CLIENT_FOUND_ROWS`
+a duplicate counts as one row. Otherwise it is `UPDATE … WHERE mode = :from
+AND epoch = :e`. Either must change exactly one row. If it changes none
+(`Stale`), nothing changed and the caller rereads; it never retries blindly.
+A stored mode this binary does not know is refused (`Unknown`), never
+guessed. The design's guards (preconditions, restore check, size guard,
+lease expiry) belong to the callers in P4.2-P4.4. A space purge deletes the
+rows with the manifest (objects phase).
+
+- **The epoch alone is not a fence.** `owner_lost → store_master` claims
+  with epoch + 1, and a node holding an older epoch is fenced by the
+  mismatch. P4.2c's lease and write fence must still check `mode =
+  store_master` and `owner_node` = this node, not only the epoch.
+- **Rollback leftovers.** After a rollback that leaves the table in place
+  (section 7), a 1.26.23 space purge does not delete this table's rows. The
+  orphans are harmless while every row is `pg_master` or `shadow`, and the
+  next purge by a binary that ships this migration removes them.
+
 ## 5. Upload and retention policy
 
 ### 5.1 Node settings
@@ -699,6 +758,29 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   `DELETE FROM seaql_migrations WHERE version =
   'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
   matter to an older restore-check, and only if shadow was ever enabled.
+  The same holds for `m20261125_000000_sql_store_mode` (P4.1). An image-only
+  rollback to node 1.26.23 fails on it: that binary refuses to start on a
+  database with an applied migration it does not ship (proven 2026-11-23 for
+  1.26.22 and the `sql_wal_mark` ledger row). It ships in the same release as
+  `m20261125_000000_revocation_tombstone` (TC-4092), and the older image refuses
+  to start while EITHER row is present, so delete both in one transaction:
+  `DELETE FROM seaql_migrations WHERE version IN
+  ('m20261125_000000_revocation_tombstone','m20261125_000000_sql_store_mode');`.
+  An optional `DROP TABLE IF EXISTS sql_store_mode;` may follow.
+  The `DELETE` needs only `postgres` and is enough for the older image to
+  boot. The `DROP` needs the table owner, the node's own role
+  (`docs/releasing.md`, TC-3755). A table left behind is harmless: `up` is
+  `IF NOT EXISTS`, and P4.1 writes no rows. The `DROP` is safe only while
+  every row is `pg_master` or `shadow` **at epoch 0**. The migration's own
+  `down` refuses otherwise. A row past `shadow` may be the only record that
+  the store holds the newest data. A row whose epoch moved (a `pg_master`
+  after a copy-back) would restart at epoch 0 on its next insert, and the
+  epoch must never be reset. **Dropping the table by hand on a database where
+  any row has `epoch > 0` or a mode past `shadow` is a data-loss decision,
+  not a rollback step.** Check first with
+  `SELECT count(*) FROM sql_store_mode WHERE epoch > 0 OR mode NOT IN
+  ('pg_master','shadow')`, which must be 0. If it isn't, leave the table and
+  delete only the `seaql_migrations` row.
 - Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
   SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
   above; `migrations/mod.rs` versions list extended.
