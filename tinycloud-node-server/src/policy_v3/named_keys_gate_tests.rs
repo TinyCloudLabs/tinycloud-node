@@ -605,6 +605,54 @@ async fn a_start_with_an_empty_ledger_changes_nothing(backend: Backend) -> anyho
 }
 on_both_backends!(a_start_with_an_empty_ledger_changes_nothing);
 
+/// The three key caps a node starts with come from its configuration.
+async fn configured_key_caps_bound_the_service_the_node_starts(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use tinycloud_core::encryption_network::{key_id::KeyLocation, EncryptionServiceError};
+    let Some(h) = Harness::new_with(
+        backend,
+        Shape::KeySession,
+        "configured_key_caps_bound_the_service_the_node_starts",
+        |config| {
+            config.encryption_network.key_cap_per_network = Some(2);
+            config.encryption_network.key_cap_per_app_prefix = Some(1);
+            config.encryption_network.key_cap_secrets = Some(1);
+        },
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let network = network_with_keys(&h, &["apps/a/x", "secrets/a"]).await?;
+    let service = h
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    let create = |path: &'static str, deletable: bool| {
+        let loc = KeyLocation::new(&network, path).expect("a valid key path");
+        async move { service.create_key(&loc, deletable).await.map(|_| ()) }
+    };
+    assert!(matches!(
+        create("apps/a/y", true).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    assert!(matches!(
+        create("secrets/b", true).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    create("docs/a", false)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert!(matches!(
+        create("docs/b", false).await,
+        Err(EncryptionServiceError::KeyLimitExceeded)
+    ));
+    Ok(())
+}
+on_both_backends!(configured_key_caps_bound_the_service_the_node_starts);
+
 /// The events a test run logged, with their fields.
 #[derive(Clone, Default)]
 struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
@@ -645,11 +693,34 @@ impl ::tracing::Subscriber for EventLog {
     }
 }
 
-/// A ledger the node cannot replay (or cannot open) turns the key routes off
-/// as if `named_keys_v1` were off, logs one alert event with a fixed name and
-/// a fixed error kind, and the rest of the node serves. Runs on one thread so
-/// the thread-scoped subscriber sees every event of the start.
-async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(
+/// The one alert event a start logged for a failing ledger: a fixed name, a
+/// fixed error kind, and nothing else but the message.
+fn assert_one_ledger_alert(events: &EventLog, event: &str, error_kind: &str) {
+    let logged = events.0.lock().expect("event log").clone();
+    let alerts: Vec<_> = logged
+        .iter()
+        .filter(|fields| fields.get("event").map(String::as_str) == Some(&format!("{event:?}")))
+        .collect();
+    assert_eq!(alerts.len(), 1, "{logged:?}");
+    assert_eq!(
+        alerts[0].get("error_kind").map(String::as_str),
+        Some(format!("{error_kind:?}").as_str())
+    );
+    assert!(
+        alerts[0]
+            .keys()
+            .all(|name| ["event", "error_kind", "message"].contains(&name.as_str())),
+        "{:?}",
+        alerts[0]
+    );
+}
+
+/// With `named_keys_v1` on, a ledger the node cannot open (or cannot replay)
+/// stops the start: the boot answers an error naming the event, the ledger
+/// path and the error kind, no Rocket is built, and one alert event is
+/// logged. Runs on one thread so the thread-scoped subscriber sees every
+/// event of the start.
+async fn a_failing_ledger_stops_the_start(
     ledger: impl FnOnce(&std::path::Path) -> (std::path::PathBuf, &'static str, &'static str),
 ) -> anyhow::Result<()> {
     let events = EventLog::default();
@@ -660,17 +731,101 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
         config.encryption_network.named_keys_v1 = true;
         config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
     };
+    let error = match Harness::new_with(
+        Backend::Sqlite,
+        Shape::KeySession,
+        "a_failing_ledger_stops_the_start",
+        on,
+    )
+    .await
+    {
+        Ok(None) => return Ok(()),
+        Ok(Some(_)) => panic!("the node started with named keys on and a failing ledger"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.starts_with(&format!("{event}: ")), "{error}");
+    assert!(
+        error.contains(&ledger_path.display().to_string()),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("error_kind {error_kind}")),
+        "{error}"
+    );
+    assert!(error.contains("named_keys_v1 is on"), "{error}");
+    assert_one_ledger_alert(&events, event, error_kind);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ledger_with_a_malformed_line_stops_the_start() -> anyhow::Result<()> {
+    a_failing_ledger_stops_the_start(malformed_ledger).await
+}
+
+#[tokio::test]
+async fn a_ledger_that_cannot_be_opened_stops_the_start() -> anyhow::Result<()> {
+    a_failing_ledger_stops_the_start(unopenable_ledger).await
+}
+
+/// A ledger whose second line is not a ledger line: replay fails `malformed`.
+fn malformed_ledger(dir: &std::path::Path) -> (std::path::PathBuf, &'static str, &'static str) {
+    let path = dir.join("deletion-ledger.jsonl");
+    let op = ledger_op(
+        "o",
+        "urn:tinycloud:encryption:did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:mainnet",
+        &["apps/a/x"],
+    );
+    std::fs::write(&path, format!("{op}\nnot a ledger line\n{op}\n")).expect("write ledger");
+    (path, "deletion_ledger_replay_failed", "malformed")
+}
+
+/// A ledger in a directory that does not exist, so the file cannot be
+/// created: open fails `io`.
+fn unopenable_ledger(dir: &std::path::Path) -> (std::path::PathBuf, &'static str, &'static str) {
+    (
+        dir.join("missing").join("deletion-ledger.jsonl"),
+        "deletion_ledger_open_failed",
+        "io",
+    )
+}
+
+/// A ledger whose lock another holder keeps through the start: open fails
+/// `lock_held` once the (test-short) lock wait runs out.
+#[tokio::test]
+async fn a_locked_ledger_stops_the_start() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("deletion-ledger.jsonl");
+    let _held = tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open(&path)?;
+    a_failing_ledger_stops_the_start(|_| (path.clone(), "deletion_ledger_open_failed", "lock_held"))
+        .await
+}
+
+/// With `named_keys_v1` off, a failing ledger keeps today's behaviour: one
+/// alert event, and the node starts and serves with the key routes off as
+/// configured.
+async fn with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(
+    ledger: impl FnOnce(&std::path::Path) -> (std::path::PathBuf, &'static str, &'static str),
+) -> anyhow::Result<()> {
+    let events = EventLog::default();
+    let _subscriber = ::tracing::subscriber::set_default(events.clone());
+    let ledger_dir = tempfile::tempdir()?;
+    let (ledger_path, event, error_kind) = ledger(ledger_dir.path());
+    let off = |config: &mut crate::config::Config| {
+        config.encryption_network.named_keys_v1 = false;
+        config.encryption_network.deletion_ledger_path = Some(ledger_path.clone());
+    };
     let Some(h) = Harness::new_with(
         Backend::Sqlite,
         Shape::KeySession,
-        "a_failing_ledger_turns_the_key_routes_off",
-        on,
+        "with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves",
+        off,
     )
     .await?
     else {
         return Ok(());
     };
-
+    let (status, body, _) = answer(h.client.get("/version")).await;
+    assert_eq!(status, Status::Ok, "{body}");
     let unmounted = answer(
         h.client
             .post(format!("/encryption/networks/{}/no-such-route", h.network))
@@ -686,20 +841,7 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
     )
     .await;
     assert_eq!(unmounted.0, Status::NotFound);
-    assert_eq!(
-        delete, unmounted,
-        "the delete route answers as an unmounted path"
-    );
-    let (status, body, _) = answer(h.client.get("/version")).await;
-    assert_eq!(status, Status::Ok, "{body}");
-
-    // The configuration the routes read says named keys are off.
-    let config = h
-        .client
-        .rocket()
-        .state::<crate::config::Config>()
-        .expect("Config is managed");
-    assert!(!config.encryption_network.named_keys_v1);
+    assert_eq!(delete, unmounted, "the delete route is not mounted");
     let (status, body, _) = answer(h.client.get("/info")).await;
     assert_eq!(status, Status::Ok, "{body}");
     let info: serde_json::Value = serde_json::from_str(&body)?;
@@ -711,109 +853,20 @@ async fn a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serv
             .any(|feature| feature == "encryption-named-keys-v1"),
         "{body}"
     );
-    // A delegation on a key is refused as it is with named keys off.
-    let authorization = h.space_owner.delegate(
-        h.owner.did(),
-        &[(format!("{}/docs/a", h.network), KEY_DECRYPT)],
-        Window::until(now() + Duration::hours(1)),
-        &[],
-    )?;
-    let (status, body) = h.delegate(authorization).await;
-    assert_eq!(status, Status::Unauthorized, "{body}");
-    assert_eq!(body, NAMED_KEYS_UNAVAILABLE);
-    // Every key route answers as an unmounted path does.
-    let network = &h.network;
-    let remote = || "127.0.0.1:0".parse().expect("socket address");
-    let unmounted_get = answer(
-        h.client
-            .get(format!(
-                "/encryption/networks/{network}/no-such-route/docs/a"
-            ))
-            .remote(remote()),
-    )
-    .await;
-    let authorization = || Header::new("Authorization", "not-a-token");
-    for action in ["block", "unblock", "delete"] {
-        let got = answer(
-            h.client
-                .post(format!(
-                    "/encryption/networks/{network}/key-actions/{action}"
-                ))
-                .header(ContentType::JSON)
-                .header(authorization())
-                .body("{}"),
-        )
-        .await;
-        assert_eq!(got, unmounted, "{action}");
-    }
-    let create = answer(
-        h.client
-            .post(format!("/encryption/networks/{network}/keys"))
-            .header(ContentType::JSON)
-            .header(authorization())
-            .body("{}"),
-    )
-    .await;
-    assert_eq!(create, unmounted, "create");
-    let public_key = answer(
-        h.client
-            .get(format!("/encryption/networks/{network}/keys/docs/a"))
-            .remote(remote()),
-    )
-    .await;
-    assert_eq!(public_key, unmounted_get, "public key");
-    let describe = answer(
-        h.client
-            .get(format!("/encryption/networks/{network}/keys/docs/a"))
-            .header(authorization())
-            .remote(remote()),
-    )
-    .await;
-    assert_eq!(describe, unmounted_get, "describe");
-
-    let logged = events.0.lock().expect("event log").clone();
-    let alerts: Vec<_> = logged
-        .iter()
-        .filter(|fields| fields.get("event").map(String::as_str) == Some(&format!("{event:?}")))
-        .collect();
-    assert_eq!(alerts.len(), 1, "{logged:?}");
-    assert_eq!(
-        alerts[0].get("error_kind").map(String::as_str),
-        Some(format!("{error_kind:?}").as_str())
-    );
-    // The alert carries the event name and a kind, and nothing else but the message.
-    assert!(
-        alerts[0]
-            .keys()
-            .all(|name| ["event", "error_kind", "message"].contains(&name.as_str())),
-        "{:?}",
-        alerts[0]
-    );
+    assert_one_ledger_alert(&events, event, error_kind);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_ledger_with_a_malformed_line_turns_the_key_routes_off() -> anyhow::Result<()> {
-    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
-        let path = dir.join("deletion-ledger.jsonl");
-        let op = ledger_op("o", "urn:tinycloud:encryption:did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:mainnet", &["apps/a/x"]);
-        std::fs::write(&path, format!("{op}\nnot a ledger line\n{op}\n")).expect("write ledger");
-        (path, "deletion_ledger_replay_failed", "malformed")
-    })
-    .await
+async fn with_named_keys_off_a_malformed_ledger_is_logged_and_the_node_serves() -> anyhow::Result<()>
+{
+    with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(malformed_ledger).await
 }
 
 #[tokio::test]
-async fn a_ledger_that_cannot_be_opened_turns_the_key_routes_off() -> anyhow::Result<()> {
-    a_failing_ledger_turns_the_key_routes_off_and_the_rest_of_the_node_serves(|dir| {
-        // The directory does not exist, so the file cannot be created.
-        (
-            dir.join("missing").join("deletion-ledger.jsonl"),
-            "deletion_ledger_open_failed",
-            "io",
-        )
-    })
-    .await
+async fn with_named_keys_off_an_unopenable_ledger_is_logged_and_the_node_serves(
+) -> anyhow::Result<()> {
+    with_named_keys_off_a_failing_ledger_is_logged_and_the_node_serves(unopenable_ledger).await
 }
 
 /// With named keys on, `/delegate` refuses an `apps/` grant from a SIWE whose

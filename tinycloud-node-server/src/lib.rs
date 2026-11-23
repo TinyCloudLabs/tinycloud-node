@@ -32,6 +32,8 @@ pub mod config;
 pub mod delivery_limiter;
 pub mod delivery_link;
 pub mod dstack;
+#[cfg(feature = "dstack")]
+pub mod dstack_kms;
 pub mod egress;
 pub mod epoch_head_backfill;
 pub mod hooks;
@@ -63,7 +65,10 @@ pub mod share_v2 {
         }
     }
 }
+pub mod private_file;
 pub mod signed_urls;
+pub mod sql_restore_check;
+pub mod sql_store;
 pub mod storage;
 pub mod tee;
 mod tracing;
@@ -275,7 +280,9 @@ use routes::{
     node_keys::{node_keys, NodePublicKeys},
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    renewal_state_control, revoke, signed_kv_get,
+    renewal_state_control, revoke,
+    session::{retire_session, SessionRetireRuntime},
+    signed_kv_get,
     util_routes::*,
     version,
 };
@@ -412,9 +419,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
         connect_opts
             .sqlx_logging_level(STATEMENT_LOG_LEVEL)
             .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-        return Ok(RecoveringConnection::new(
-            Database::connect(connect_opts).await?,
-        ));
+        return Ok(
+            RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+                Duration::from_millis(tinycloud_config.database.retry_window_ms),
+            ),
+        );
     }
     let mut connect_opts = ConnectOptions::from(database);
     connect_opts
@@ -442,9 +451,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
     connect_opts
         .sqlx_logging_level(STATEMENT_LOG_LEVEL)
         .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
-    Ok(RecoveringConnection::new(
-        Database::connect(connect_opts).await?,
-    ))
+    Ok(
+        RecoveringConnection::new(Database::connect(connect_opts).await?).with_retry_window(
+            Duration::from_millis(tinycloud_config.database.retry_window_ms),
+        ),
+    )
 }
 
 static POSTGRES_CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
@@ -583,6 +594,128 @@ fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
 fn node_artifact_repository(tinycloud: &TinyCloud) -> SeaOrmDatabaseArtifactRepository {
     SeaOrmDatabaseArtifactRepository::new(tinycloud.connection().clone())
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+        .with_space_purge_fence(tinycloud.space_purge_fence().cloned())
+}
+
+/// TC-2871: the space lifecycle runtime and its ledger, present only when
+/// `host_id` and `purge_ledger_keys` are set (checked together by
+/// `resolve_runtime_config`). With lifecycle off, lifecycle state in the
+/// configured ledger or in the database stops the start.
+pub(crate) async fn space_lifecycle_runtime(
+    config: &Config,
+    conn: &RecoveringConnection,
+) -> Result<
+    Option<(
+        space_lifecycle::LifecycleRuntime,
+        Arc<storage::purge_ledger::PurgeLedger>,
+    )>,
+> {
+    use storage::purge_ledger::{PurgeLedgerConfig, PurgeLedgerStore};
+    let (Some(host_id), Some(keys)) = (&config.host_id, &config.purge_ledger_keys) else {
+        let ledger = match &config.storage.purge_ledger {
+            // A local ledger directory that was never created holds no records.
+            Some(PurgeLedgerConfig::Local { path }) if !path.exists() => None,
+            Some(ledger) => Some(ledger.open().await?),
+            None => None,
+        };
+        space_lifecycle::LifecycleRuntime::refuse_unconfigured(
+            conn,
+            ledger.as_ref().map(|ledger| ledger as &dyn PurgeLedgerStore),
+        )
+        .await
+        .context(
+            "space lifecycle is off (TINYCLOUD_HOST_ID and TINYCLOUD_PURGE_LEDGER_KEYS unset) but lifecycle state exists, or the purge ledger is unreadable",
+        )?;
+        return Ok(None);
+    };
+    let ledger = Arc::new(
+        config
+            .storage
+            .purge_ledger
+            .as_ref()
+            .context("space lifecycle needs [storage.purge_ledger]")?
+            .open()
+            .await?,
+    );
+    let runtime = space_lifecycle::LifecycleRuntime::from_settings(
+        conn.clone(),
+        ledger.clone(),
+        Some(host_id.clone()),
+        Some(keys.expose().to_owned()),
+    )
+    .await
+    .context("space lifecycle runtime unavailable")?
+    .context("space lifecycle runtime unavailable")?;
+    Ok(Some((runtime, ledger)))
+}
+
+/// `tinycloud node purge-ledger reconcile` (restore runbook step 7): the pass
+/// the node runs before it serves, run once against the configured database
+/// and stores. Idempotent. Run it with the node stopped.
+pub async fn reconcile_purge_ledger(
+    config: &Config,
+) -> Result<space_lifecycle::reconcile::ReconcileReport> {
+    let conn = connect_database(config).await?;
+    tinycloud_core::db::migrate(&conn).await?;
+    let (runtime, ledger) = space_lifecycle_runtime(config, &conn)
+        .await?
+        .context("space lifecycle is off: set TINYCLOUD_HOST_ID and TINYCLOUD_PURGE_LEDGER_KEYS")?;
+    let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&conn).await?;
+    let blocks: BlockStores = match &config.storage.blocks {
+        Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
+        Either::B(local) => Either::B(local.open().await?),
+    };
+    let repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SeaOrmDatabaseArtifactRepository::new(conn.clone())
+            .with_space_purge_fence(Some(runtime.fence.clone())),
+    );
+    let sql = &config.storage.sql;
+    let stores = space_purge_executor::PurgeStores {
+        blocks,
+        ledger,
+        sql: SqlService::new(
+            sql.path
+                .clone()
+                .context("storage.sql.path is not resolved")?,
+            sql.memory_threshold.as_u64(),
+            repository.clone(),
+        ),
+        #[cfg(feature = "duckdb")]
+        duckdb: Some({
+            let duckdb = &config.storage.duckdb;
+            DuckDbService::new(
+                duckdb
+                    .path
+                    .clone()
+                    .context("storage.duckdb.path is not resolved")?,
+                duckdb.memory_threshold.as_u64(),
+                duckdb.idle_timeout_secs,
+                duckdb.max_memory_per_connection.clone(),
+                repository,
+            )
+        }),
+        sql_objects: space_purge_executor::PurgeSqlObjects::open(&config.storage).await?,
+        encryption: None,
+        // The node holds the ledger's lock while it runs; this command is
+        // run with the node stopped.
+        deletions: match config.encryption_network.deletion_ledger_path.clone() {
+            Some(path) => Some(Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open(&path)
+                })
+                .await?
+                .map_err(|error| {
+                    anyhow::anyhow!("deletion ledger could not be opened: {}", error.kind())
+                })?,
+            )),
+            None => None,
+        },
+    };
+    let runtime = runtime.with_storage_layout(stores.layout().map_err(anyhow::Error::msg)?);
+    runtime
+        .reconcile(&stores)
+        .await
+        .context("purge ledger reconciliation failed")
 }
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
@@ -606,6 +739,11 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         .validate()
         .map_err(anyhow::Error::msg)?;
     resolved.sql_store.validate().map_err(anyhow::Error::msg)?;
+    resolved.spaces.validate().map_err(anyhow::Error::msg)?;
+    resolved
+        .session_retire
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     resolved
         .encryption_network
         .validate()
@@ -627,6 +765,13 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
         );
     }
 
+    resolved
+        .storage
+        .validate_purge_ledger()
+        .map_err(anyhow::Error::msg)?;
+    resolved
+        .validate_space_lifecycle()
+        .map_err(anyhow::Error::msg)?;
     resolved
         .sql_store
         .validate_for_database(resolved.storage.database())
@@ -681,6 +826,7 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
         delegation_status,
         renewal_state_control,
         revoke,
+        retire_session,
         create_signed_kv_url,
         signed_kv_get,
         create_hook_ticket,
@@ -721,10 +867,44 @@ fn production_routes(named_keys_v1: bool) -> Vec<Route> {
     routes
 }
 
+/// Opens the deletion ledger for a node start. Unit tests wait for a held
+/// lock for a fraction of a second instead of a minute.
+fn open_deletion_ledger(
+    path: &std::path::Path,
+) -> Result<
+    tinycloud_core::encryption_network::deletion_ledger::DeletionLedger,
+    tinycloud_core::encryption_network::deletion_ledger::DeletionLedgerError,
+> {
+    use tinycloud_core::encryption_network::deletion_ledger::DeletionLedger;
+    #[cfg(test)]
+    return DeletionLedger::open_waiting(
+        path,
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+    );
+    #[cfg(not(test))]
+    DeletionLedger::open(path)
+}
+
+/// What a failing deletion ledger means for this start, for its alert line.
+fn ledger_failure_consequence(named_keys_v1: bool) -> &'static str {
+    if named_keys_v1 {
+        "named_keys_v1 is on, so the node does not start"
+    } else {
+        "named keys are off; the node serves"
+    }
+}
+
 /// Settings the node no longer reads that a deployment may still set, in
 /// its file or environment. Configuration extraction ignores unknown keys,
 /// so each is named once at startup instead of being dropped silently.
-const REMOVED_SETTINGS: &[&str] = &["database.bulk_statement_timeout_ms"];
+///
+/// `did_resolution.network_methods` (TC-1500): the node verifies only DIDs
+/// whose keys it derives offline, and no setting enables another method.
+const REMOVED_SETTINGS: &[&str] = &[
+    "database.bulk_statement_timeout_ms",
+    "did_resolution.network_methods",
+];
 
 fn removed_settings(config: &Figment) -> Vec<&'static str> {
     REMOVED_SETTINGS
@@ -751,11 +931,6 @@ pub async fn app_with_control(
     if egress_policy.refresh().await.is_err() {
         ::tracing::warn!("webhook egress closed: internal endpoint lookup failed");
     }
-    tinycloud_core::did_resolution::configure(
-        tinycloud_core::did_resolution::DidResolutionPolicy {
-            network_methods: tinycloud_config.did_resolution.network_methods,
-        },
-    );
     tinycloud_core::did_resolution::set_refusal_observer(
         prometheus::observe_did_resolution_refused,
     );
@@ -775,40 +950,57 @@ pub async fn app_with_control(
         config.extract_inner::<rocket::config::LogLevel>("log_level")?,
     )?;
 
-    ::tracing::info!(network_methods = tinycloud_config.did_resolution.network_methods,
-        offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS, "did resolution policy");
-    if tinycloud_config.did_resolution.network_methods {
-        ::tracing::warn!("network DID resolution enabled: did:web/did:tz fetches use the unhardened ssi client (TC-1080)");
-    }
+    ::tracing::info!(offline_methods = ?tinycloud_core::did_resolution::OFFLINE_DID_METHODS,
+        "did resolution policy");
     for setting in removed_settings(config) {
         ::tracing::warn!(
             setting,
-            "removed setting is set and ignored; delete it from the configuration (TC-2961)"
+            "removed setting is set and ignored; delete it from the configuration"
         );
     }
 
-    let key_setup: StaticSecret =
-        match resolve_keys(&tinycloud_config.keys, &tinycloud_config.tee).await? {
-            Some(key_setup) => key_setup,
-            None => {
-                // The node's stored identity, generated on its first start. The
-                // control plane only probed it at spawn, so publish what serve
-                // resolved.
-                let identity = key_provider::resolve_identity_state(
-                    Some(&tinycloud_config.keys),
-                    &tinycloud_config.storage.datadir,
-                    IdentityPurpose::Serve,
-                )?;
-                if let Some(control) = control.as_ref() {
-                    control
-                        .set_identity_snapshot(key_provider::identity_snapshot(&identity))
-                        .await;
-                }
-                identity
-                    .secret
-                    .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?
+    // TC-3554: a `DstackKmsEpoch` root opens from the database's `root_wrap`
+    // blob, so that source connects the database itself; nothing else
+    // touches it before the identity checks below pass.
+    let (key_setup, early_database): (StaticSecret, Option<RecoveringConnection>) =
+        match &tinycloud_config.keys.source {
+            #[cfg(feature = "dstack")]
+            Keys::DstackKmsEpoch(source) => {
+                let (root, database) = dstack_kms::wrapped_node_root(&source.legacy, || {
+                    connect_database(&tinycloud_config)
+                })
+                .await?;
+                (root, Some(database))
             }
+            keys => match resolve_keys(keys, &tinycloud_config.tee).await? {
+                Some(key_setup) => (key_setup, None),
+                None => {
+                    // The node's stored identity, generated on its first start. The
+                    // control plane only probed it at spawn, so publish what serve
+                    // resolved.
+                    let identity = key_provider::resolve_identity_state(
+                        Some(&tinycloud_config.keys),
+                        &tinycloud_config.storage.datadir,
+                        IdentityPurpose::Serve,
+                    )?;
+                    if let Some(control) = control.as_ref() {
+                        control
+                            .set_identity_snapshot(key_provider::identity_snapshot(&identity))
+                            .await;
+                    }
+                    let key_setup = identity
+                        .secret
+                        .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
+                    (key_setup, None)
+                }
+            },
         };
+    // TC-3554: a pinned node DID is checked before anything uses the key or
+    // writes to the database (other than `root_wrap`), and for every other
+    // key source before the database is opened.
+    tinycloud_config
+        .keys
+        .check_node_did(&key_setup.node_did())?;
     let pseudonymizer =
         std::sync::Arc::new(tinycloud_core::telemetry::Pseudonymizer::new(&key_setup));
     let tracing_fairing = tracing::TracingFairing::new(
@@ -871,7 +1063,10 @@ pub async fn app_with_control(
         Some(TeeContext::derive_local(&key_setup))
     });
 
-    let database_connection = connect_database(&tinycloud_config).await?;
+    let database_connection = match early_database {
+        Some(database) => database,
+        None => connect_database(&tinycloud_config).await?,
+    };
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
     // wired into SpaceDatabase, then seeded
     // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
@@ -892,7 +1087,25 @@ pub async fn app_with_control(
         encryption_backend,
     )
     .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
-    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2);
+    .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2)
+    .with_key_cap_per_network(
+        tinycloud_config
+            .encryption_network
+            .key_cap_per_network
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_PER_NETWORK),
+    )
+    .with_key_cap_per_app_prefix(
+        tinycloud_config
+            .encryption_network
+            .key_cap_per_app_prefix
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_PER_APP_PREFIX),
+    )
+    .with_key_cap_secrets(
+        tinycloud_config
+            .encryption_network
+            .key_cap_secrets
+            .unwrap_or(tinycloud_core::encryption_network::keys::DEFAULT_KEY_CAP_SECRETS),
+    );
 
     // Migrate before opening S3: its one bucket listing both reconstructs
     // SpaceSizes and records which in-flight DELETE fences were counted.
@@ -902,6 +1115,7 @@ pub async fn app_with_control(
     // history current, then runs the CID-alias backfill with the column key
     // before any request is served.
     tinycloud_core::db::migrate(&database_connection).await?;
+    let lifecycle = space_lifecycle_runtime(&tinycloud_config, &seed_conn).await?;
     let deleting_fences = tinycloud_core::kv_orphans::deleting_fences(&database_connection).await?;
     let block_store: BlockStores = match &tinycloud_config.storage.blocks {
         Either::A(s3) => Either::A(s3.open_with_deleting(&deleting_fences).await?),
@@ -912,12 +1126,37 @@ pub async fn app_with_control(
         database_connection,
         block_store,
         key_setup.setup(()).await?,
-        Some(column_encryption),
+        Some(column_encryption.clone()),
     )
     .await?
     .with_sql_sizes(sql_sizes.clone())
     .with_delegated_sql_caveats(tinycloud_config.sql.delegated_caveats_enforced)
-    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1);
+    .with_named_keys(tinycloud_config.encryption_network.named_keys_v1)
+    .with_registry_admission(
+        tinycloud_config
+            .spaces
+            .registry_v2
+            .as_deref()
+            .map(|origin| {
+                tinycloud_core::registry_admission::RegistryAdmission::new(
+                    origin,
+                    key_setup.node_did(),
+                )
+                .and_then(|admission| {
+                    admission.with_outage_cache(Duration::from_secs(
+                        tinycloud_config.spaces.registry_cache_max_age_seconds,
+                    ))
+                })
+                .map(Arc::new)
+            })
+            .transpose()?,
+    );
+    // TC-2871: with lifecycle on, every space data path consults the fence,
+    // and the fence refuses all space traffic until reconciliation succeeds.
+    let tinycloud = match &lifecycle {
+        Some((runtime, _)) => tinycloud.with_space_purge_fence(runtime.fence.clone()),
+        None => tinycloud,
+    };
     let renewer_epoch = tinycloud
         .renewal_identity()
         .map(|identity| identity.epoch)
@@ -926,36 +1165,44 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    let mut named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    // With `named_keys_v1` on, a deletion ledger that cannot be opened or
+    // replayed stops the start: the node never serves with the gate quietly
+    // off. With it off, the failure is logged and the rest of the node serves.
+    let named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
     let deletion_ledger = match tinycloud_config
         .encryption_network
         .deletion_ledger_path
         .as_deref()
-        .map(tinycloud_core::encryption_network::deletion_ledger::DeletionLedger::open)
+        .map(|path| open_deletion_ledger(path).map_err(|error| (path, error)))
         .transpose()
     {
         Ok(ledger) => ledger.map(Arc::new),
-        Err(error) => {
-            named_keys_enabled = false;
+        Err((path, error)) => {
             ::tracing::error!(
                 event = "deletion_ledger_open_failed",
                 error_kind = error.kind(),
-                "deletion ledger could not be opened: the named-key routes are off"
+                "deletion ledger could not be opened: {}",
+                ledger_failure_consequence(named_keys_enabled)
             );
+            if named_keys_enabled {
+                anyhow::bail!(
+                    "deletion_ledger_open_failed: {error} ({}, error_kind {}); named_keys_v1 is on, so the node does not start",
+                    path.display(),
+                    error.kind()
+                );
+            }
             None
         }
     };
     let encryption_service = encryption_service
         .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
         .with_deletion_ledger(deletion_ledger.clone());
-    // Runs after the migrations: a key row under `apps/` that is not a
-    // deletable key stops the node from starting.
+    // Runs after the migrations: a key row under `apps/` or `secrets/` that
+    // is not a deletable key stops the node from starting.
     tinycloud_core::encryption_network::keys::ensure_no_deterministic_app_keys(&seed_conn).await?;
     // The deletion ledger is replayed onto the database before any route is
     // served, so a delete that a restore or a crash left out is applied
-    // first. If the replay fails the named-key routes stay off (as with
-    // `named_keys_v1` off) and the rest of the node serves.
-    // (`named_keys_enabled` is false if the ledger could not be opened.)
+    // first.
     if let Some(ledger) = &deletion_ledger {
         match ledger.replay_at_start(&seed_conn).await {
             Ok(report) => {
@@ -974,29 +1221,23 @@ pub async fn app_with_control(
                 }
             }
             Err(error) => {
-                named_keys_enabled = false;
                 ::tracing::error!(
                     event = "deletion_ledger_replay_failed",
                     error_kind = error.kind(),
-                    "deletion ledger replay failed: the named-key routes are off"
+                    "deletion ledger replay failed: {}",
+                    ledger_failure_consequence(named_keys_enabled)
                 );
+                if named_keys_enabled {
+                    anyhow::bail!(
+                        "deletion_ledger_replay_failed: {error} ({}, error_kind {}); named_keys_v1 is on, so the node does not start",
+                        ledger.path().display(),
+                        error.kind()
+                    );
+                }
             }
         }
     }
     let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
-    let figment_named_keys_off;
-    let config = if named_keys_enabled == tinycloud_config.encryption_network.named_keys_v1 {
-        config
-    } else {
-        figment_named_keys_off =
-            config
-                .clone()
-                .merge(rocket::figment::providers::Serialized::global(
-                    "encryption_network.named_keys_v1",
-                    false,
-                ));
-        &figment_named_keys_off
-    };
     let routes = production_routes(named_keys_enabled);
     #[cfg(feature = "tc-bench-v1")]
     let mut routes = routes;
@@ -1068,7 +1309,8 @@ pub async fn app_with_control(
     )
     .with_wait_bounds(tinycloud_config.storage.sql.wait_bounds())
     .with_durability(tinycloud_config.storage.sql.durability())
-    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema);
+    .with_ddl_policy(tinycloud_config.storage.sql.ddl_requires_schema)
+    .with_retry_policy(seed_conn.retry_policy());
 
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
@@ -1116,6 +1358,32 @@ pub async fn app_with_control(
         database_artifact_repository,
     );
 
+    // TC-2871 (restore runbook step 7): verify every purge-ledger record and
+    // reconcile before anything serves. Any failure stops the start.
+    let lifecycle = match lifecycle {
+        Some((runtime, ledger)) => {
+            let stores = Arc::new(space_purge_executor::PurgeStores {
+                blocks: orphan_store.clone(),
+                ledger,
+                sql: sql_service.clone(),
+                #[cfg(feature = "duckdb")]
+                duckdb: Some(duckdb_service.clone()),
+                sql_objects: space_purge_executor::PurgeSqlObjects::open(&tinycloud_config.storage)
+                    .await?,
+                encryption: Some(column_encryption),
+                deletions: deletion_ledger.clone(),
+            });
+            let runtime = runtime.with_storage_layout(stores.layout().map_err(anyhow::Error::msg)?);
+            let report = runtime
+                .reconcile(&stores)
+                .await
+                .context("purge ledger reconciliation failed; space data is not served")?;
+            report.log();
+            Some((runtime, stores))
+        }
+        None => None,
+    };
+
     // Billing shares TINYCLOUD_ADMIN_SECRET with the node (it calls the
     // node's admin API with it) and accepts it on quota fetches (TC-627).
     let quota_cache = QuotaCache::new(tinycloud_config.storage.limit, quota_url)
@@ -1127,6 +1395,13 @@ pub async fn app_with_control(
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+    // TC-3443: the retire request's audience is this node's DID, the one
+    // owner-signed key deletes are addressed to.
+    let session_retire_runtime = SessionRetireRuntime::new(
+        encryption_service.node_did().to_owned(),
+        &tinycloud_config.session_retire,
+    );
+    let retire_cleanup = tinycloud.clone();
     let webhook_dispatcher = WebhookDispatcher::new(
         tinycloud.clone(),
         tinycloud_config.hooks.clone(),
@@ -1234,12 +1509,15 @@ pub async fn app_with_control(
             "invocation-replay-cleanup",
             move |rocket| {
                 let replay_cleanup = replay_cleanup.clone();
+                let retire_cleanup = retire_cleanup.clone();
                 let shutdown = rocket.shutdown();
                 Box::pin(async move {
                     tokio::spawn(async move {
                         let _ = replay_cleanup
                             .cleanup(time::OffsetDateTime::now_utc(), replay_max_lifetime_secs)
                             .await;
+                        // TC-3443: expired session retires go on the same tick.
+                        let _ = retire_cleanup.prune_session_retires().await;
                         let period = std::time::Duration::from_secs(60);
                         let mut interval =
                             tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -1253,6 +1531,7 @@ pub async fn app_with_control(
                                             replay_max_lifetime_secs,
                                         )
                                         .await;
+                                    let _ = retire_cleanup.prune_session_retires().await;
                                 }
                                 _ = &mut shutdown => break,
                             }
@@ -1264,6 +1543,9 @@ pub async fn app_with_control(
         .attach(AdHoc::on_liftoff("kv-orphan-cleanup", move |rocket| {
             let conn = orphan_conn.clone();
             let store = orphan_store.clone();
+            let purge_fence = rocket
+                .state::<TinyCloud>()
+                .and_then(|db| db.space_purge_fence().cloned());
             let shutdown = rocket.shutdown();
             Box::pin(async move {
                 tokio::spawn(async move {
@@ -1273,9 +1555,15 @@ pub async fn app_with_control(
                         tokio::select! {
                             _ = interval.tick() => {
                                 let result = tokio::select! {
-                                    result = tinycloud_core::kv_orphans::drain_candidates_for_interval(
-                                        &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
-                                    ) => result,
+                                    result = async {
+                                        let _collector = match &purge_fence {
+                                            Some(fence) => Some(fence.collector_operation().await),
+                                            None => None,
+                                        };
+                                        tinycloud_core::kv_orphans::drain_candidates_for_interval(
+                                            &conn, &store, tinycloud_core::kv_orphans::ORPHAN_GRACE,
+                                        ).await
+                                    } => result,
                                     _ = &mut shutdown => break,
                                 };
                                 if let Err(error) = result {
@@ -1303,6 +1591,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(egress_policy)
         .manage(rate_limiter)
+        .manage(session_retire_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(policy_v3_runtime)
@@ -1339,6 +1628,55 @@ pub async fn app_with_control(
         }))
     } else {
         rocket
+    };
+
+    // TC-2871: the lifecycle routes, their catcher, the purge worker and the
+    // runtime reconciler exist only with lifecycle on; off, the routes 404.
+    let rocket = match lifecycle {
+        Some((runtime, stores)) => rocket
+            .mount(
+                "/",
+                rocket::routes![
+                    space_lifecycle::list_my_spaces,
+                    space_lifecycle::retire_owner,
+                    space_lifecycle::purge_space,
+                    space_lifecycle::purge_status,
+                ]
+                .into_iter()
+                .map(tracing::instrument_route)
+                .collect::<Vec<_>>(),
+            )
+            .register(
+                "/space",
+                rocket::catchers![space_lifecycle::lifecycle_error],
+            )
+            .attach(AdHoc::on_liftoff("space-purge-worker", {
+                let runtime = runtime.clone();
+                let stores = stores.clone();
+                move |rocket| {
+                    let shutdown = rocket.shutdown();
+                    let (runtime, stores) = (runtime.clone(), stores.clone());
+                    Box::pin(async move {
+                        tokio::spawn(space_purge_executor::run_purge_worker(
+                            runtime, stores, shutdown,
+                        ));
+                    })
+                }
+            }))
+            .attach(AdHoc::on_liftoff("space-purge-reconciler", {
+                let runtime = runtime.clone();
+                move |rocket| {
+                    let shutdown = rocket.shutdown();
+                    let (runtime, stores) = (runtime.clone(), stores.clone());
+                    Box::pin(async move {
+                        tokio::spawn(space_lifecycle::reconcile::run_reconciler(
+                            runtime, stores, shutdown,
+                        ));
+                    })
+                }
+            }))
+            .manage(runtime),
+        None => rocket,
     };
 
     // TC-1274: one gentle pass that fills the `epoch_head` cache of spaces
@@ -1864,6 +2202,11 @@ pub(crate) async fn resolve_keys(
                 .map(Some)
                 .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
         }
+        #[cfg(feature = "dstack")]
+        Keys::DstackKmsEpoch(_) => anyhow::bail!(
+            "keys.type = DstackKmsEpoch opens its root from the database (root_wrap) at serve; \
+             it has no database-free resolution"
+        ),
         Keys::Auto => {
             // Check TINYCLOUD_TEE_MODE env var first
             match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
@@ -2068,7 +2411,7 @@ mod sqlite_tuning_tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -2088,7 +2431,7 @@ mod sqlite_tuning_tests {
                         "sql",
                         "space",
                         "main",
-                        vec![2; 12],
+                        vec![2; 12].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -2099,7 +2442,7 @@ mod sqlite_tuning_tests {
                         "sql",
                         "space",
                         "main",
-                        vec![3; 120],
+                        vec![3; 120].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -2118,6 +2461,7 @@ mod sqlite_tuning_tests {
             facts: Set(None),
             serialization: Set(b"synthetic database race fixture".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&transaction)
         .await
@@ -2586,7 +2930,7 @@ mod retry_after_fairing_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: Vec<u8>,
+            _: ::bytes::Bytes,
             _: tinycloud_core::database_artifacts::ArtifactExpectation,
         ) -> Result<
             tinycloud_core::database_artifacts::DatabaseArtifact,
@@ -2600,7 +2944,7 @@ mod retry_after_fairing_tests {
             _: &str,
             _: &str,
             _: &str,
-            _: Vec<u8>,
+            _: ::bytes::Bytes,
             _: tinycloud_core::database_artifacts::ArtifactExpectation,
         ) -> Result<
             tinycloud_core::database_artifacts::DeltaSave,
@@ -2988,15 +3332,18 @@ mod no_transform_fairing_tests {
 #[cfg(test)]
 mod removed_settings_tests {
     use super::*;
-    use rocket::figment::providers::Serialized;
+    use rocket::figment::{providers::Serialized, value::Value};
 
-    /// TC-2961: `database.bulk_statement_timeout_ms` is gone; a deployment
-    /// that still sets it is told so, and a default one is not.
+    /// TC-2961 and TC-1500: `database.bulk_statement_timeout_ms` and
+    /// `did_resolution.network_methods` are gone; a deployment that still
+    /// sets one, with any value, is told so, and a default one is not.
     #[test]
     fn a_set_removed_setting_is_named() {
         let defaults = Figment::from(Serialized::defaults(Config::default()));
         assert!(removed_settings(&defaults).is_empty());
-        let old = defaults.merge(("database.bulk_statement_timeout_ms", 120_000));
+        let old = defaults
+            .clone()
+            .merge(("database.bulk_statement_timeout_ms", 120_000));
         assert_eq!(
             removed_settings(&old),
             ["database.bulk_statement_timeout_ms"]
@@ -3005,5 +3352,22 @@ mod removed_settings_tests {
             old.extract::<Config>().is_ok(),
             "still ignored, not refused"
         );
+        for value in [
+            Value::from(true),
+            Value::from(false),
+            Value::from(vec!["web"]),
+        ] {
+            let old = defaults
+                .clone()
+                .merge(("did_resolution.network_methods", value));
+            assert_eq!(removed_settings(&old), ["did_resolution.network_methods"]);
+            assert!(
+                old.extract::<Config>().is_ok(),
+                "still ignored, not refused"
+            );
+        }
     }
 }
+pub mod space_lifecycle;
+pub mod space_purge_executor;
+pub mod space_purge_owner_erasure;

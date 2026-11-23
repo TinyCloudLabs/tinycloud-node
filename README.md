@@ -38,6 +38,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `POST` | `/signed/kv` | Yes | Create an expiring signed URL for an exact KV object read |
 | `GET` | `/signed/kv/<ticketId>` | Signed URL ticket | Fetch a KV object, including single byte ranges |
 | `POST` | `/delegate` | Yes | Create capability delegations |
+| `POST` | `/session/retire` | Session-key UCAN | Sign out: retire the session key that signed the request |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
 | `GET` | `/admin/stats` | `NODE_STATS_READ_TOKEN` bearer | Distinct owner addresses that hold data beyond automatic sign-in records and vault metadata (read-only; disabled unless the token is set, at least 32 bytes) |
@@ -271,10 +272,76 @@ The following common options are available:
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
+| session_retire.ttl_secs | TINYCLOUD_SESSION_RETIRE__TTL_SECS | Minimum seconds a `/session/retire` is kept; default `2592000` (30 days); `0` refuses to start. A retire also lasts until the latest-expiring delegation, renewal stamp or active renewal lease the node holds for the key ends (forever for a delegation without an expiry). |
+| session_retire.rate_limit_per_minute | TINYCLOUD_SESSION_RETIRE__RATE_LIMIT_PER_MINUTE | `/session/retire` requests allowed per client IP per minute; default `10`. Over it answers `429`. |
+| spaces.registry_v2  | TINYCLOUD_SPACES__REGISTRY_V2 | Optional signed registry v2 origin for current per-space hosting authorization and read/write mode |
+| spaces.registry_cache_max_age_seconds | TINYCLOUD_SPACES__REGISTRY_CACHE_MAX_AGE_SECONDS | Seconds the last confirmed registry record keeps admitting reads and writes during a registry outage; `0` (default) turns it off, at most `300`, requires `registry_v2` |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 | column_encryption.strict | TINYCLOUD_COLUMN_ENCRYPTION__STRICT | Require authenticated envelopes for recorded legacy columns; default `false`. Recorded v2 columns always require v2. |
 | (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 | (n/a)               | NODE_STATS_READ_TOKEN         | Bearer token for the read-only `GET /admin/stats` (TC-1482). Unset, blank, shorter than 32 bytes, or equal to `TINYCLOUD_ADMIN_SECRET` disables the route (`404`). Generate it with `openssl rand -hex 32` (64 hex characters). Separate from `TINYCLOUD_ADMIN_SECRET`, which it does not replace and which does not open it. Secret: set it in the deployment secret store, never in `tinycloud.toml` or a committed env file. See [Admin stats](#admin-stats-get-adminstats) |
+
+### Signed registry v2 hosting
+
+Enable registry-based hosting explicitly on a node:
+
+```toml
+[global.spaces]
+registry_v2 = "http://127.0.0.1:48100"
+```
+
+Use an exact HTTPS origin, without a trailing slash or path. HTTP is accepted
+only for loopback `127.0.0.1` or `[::1]` lab origins. The node fetches
+`/v2/locations/<ownerKey>` and independently verifies the current owner-signed
+v2 record. EOA lookup uses the EIP-55 address independently of chain; Ed25519
+owners use their exact `did:key`.
+
+The signed space membership must list this node's DID. A listed read-only
+replica supports hosting/session registration and reads; ordinary data mutations
+require read-write membership. These checks also apply to previously hosted
+spaces, public and signed-URL reads, and hook streams. Missing or unavailable
+authorization is refused on a configured node. When `registry_v2` is unset,
+existing hosting and onboarding behavior is unchanged.
+
+Ordinary signatures, delegation chains, capability scopes, and revocation checks
+still apply. A valid data/session grant can activate a listed replica without a
+separate per-node hosting SIWE. A mixed grant is retained as its complete signed
+proof, but `/delegate` activates only this node's listed data spaces; its response
+keeps `cid`, `activated`, and `skipped`. Raw encryption-network grants and requests
+use the separately signed `encryptionNode` destination. Encryption-only
+registration returns a CID without activating an unlisted data space.
+
+Re-registering the same still-valid grant after membership expands activates
+newly admitted spaces without changing its CID or signed proof. Repeating that
+registration after activation does not append duplicate epochs or events.
+Registry unavailability returns HTTP `503`, including direct decrypt and hook
+authorization; it is not reported as invalid agent credentials.
+
+#### Registry outage cache
+
+`registry_cache_max_age_seconds` (default `0`, off; at most `300`) lets a node
+keep serving through a short registry outage. What the node knows then is the
+last record it fetched and verified successfully, and when that fetch began:
+
+- Only an outage uses it: the registry cannot be reached, times out, or answers
+  `502`, `503` or `504`. A refusal (`404`, an invalid, tampered or older record)
+  answers as without the cache and discards the cached record.
+- The cached record admits reads and writes exactly as the live one would: a
+  write needs the cached record to list this node read-write for the space.
+- It expires `registry_cache_max_age_seconds` after the last successful lookup
+  began. Requests it serves never extend it; past it, requests answer `503`
+  before any effect.
+- It lives in memory only: after a restart nothing is admitted until the
+  registry answers once.
+- Activating a replica for a new grant (`/delegate`) always needs the live
+  registry.
+
+Delegation revocation is enforced from the node's own database and needs no
+registry, so a revocation during an outage applies at once. A membership change
+published to the registry during an outage takes effect at most this window
+after the last successful lookup.
+
+Details: TC-2481
 
 ### Database Config
 
@@ -305,7 +372,7 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | database.statement_timeout_mode | `session` | How PostgreSQL's `statement_timeout` is applied: `session` sets it once on each new connection (no per-request cost; covers every statement); `local` sets it with `SET LOCAL` in each explicit transaction (safe behind a transaction-pooling proxy, but one more round trip per transaction, and autocommit statements are not covered); `off` disables it. |
 | database.statement_timeout_ms | `30000` | `statement_timeout` for every statement, whole-checkpoint saves and hydration slices included. `0` disables it. At most 2147483647 (PostgreSQL's largest); the node refuses to start with more. |
 | database.idle_in_transaction_timeout_ms | `300000` | PostgreSQL `idle_in_transaction_session_timeout`, set once on each new PostgreSQL connection (env `TINYCLOUD_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT_MS`): the server ends a session left idle inside a transaction this long, so a stalled or leaked transaction cannot keep holding its locks and pooled connection; the pool replaces the session. It must exceed the 240 s a protected legacy meeting write holds its transaction across its upload; the node refuses to start with a non-zero value of 240 s or less, or more than 2147483647. `0` disables it. Not set when `statement_timeout_mode` is `local`: behind a transaction-pooling proxy a session setting would reach the proxy's other clients. SQLite is unaffected; the operator tool `tinycloud-sql-identity` opens its own pool without it. |
-| database.retry_window_ms | `10000` | A read (or `BEGIN`) whose connection is lost is retried once only if that attempt failed within this window. A connection found dead at once is retried; one whose loss took a keepalive expiry to detect is not, so a lost connection costs a read at most one detection plus this window (about 40 s) instead of two detections (about 60 s). This bounds the retry, not the request or the per-database lock hold: acquisition waits, legitimate transfers and queueing behind the lock add to it, and a general deadline is later TC-1054 work. |
+| database.retry_window_ms | `10000` | The time budget of one database operation's single retry. An operation (`/delegate`, the `/invoke` authorization step, a KV read, a read-audit batch, the metadata read that starts a SQL hydration) whose connection is lost is run once more only when nothing can have committed, and only if the first run leaves room in this budget for a short backoff and a second run; the second run is stopped when the budget ends. Statements, `BEGIN` and `COMMIT` are not retried on their own. A request timeout, pool timeout or statement timeout pauses all retries for 30 seconds. The budget does not bound the request or the per-database lock hold. |
 
 Schema migrations always run with no statement timeout. On PostgreSQL they wait at most 30 s for any lock (`lock_timeout`), so a session holding a conflicting table lock makes the node fail to start with an error naming the lock wait instead of hanging; the migrations roll back together and the next start applies them (TC-1176). Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
 
@@ -391,38 +458,101 @@ If the TinyCloud Protocol instance is not able to find or establish a connection
 
 TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the example DApps and tutorials for detailed information.
 
-### UCAN DID resolution (TC-1080)
+### Sign-out: `POST /session/retire` (TC-3443)
 
-UCAN signature verification resolves only `did:key`, `did:pkh` and `did:jwk`
-by default. Other methods fail before resolution with `did_method_disabled:`.
-Issuer DID URLs carrying a query fail with `did_url_query_rejected:` under every
-setting. DID parsing and string comparisons, including share-email `did:web`
-identifiers, are unchanged. Existing route status codes and policy machine codes
-are preserved.
+A client signs out by retiring its session key. It sends an
+`Authorization: Bearer <UCAN>` header (the `Bearer ` prefix is optional). The
+UCAN is issued by the session `did:key` (bare or with a `#fragment`) to this
+node's DID, carries exactly
+`{"urn:tinycloud:session:self": {"tinycloud.session/retire": [{}]}}`, cites no
+proofs, has a nonce, and expires no more than 120 seconds from now.
 
-Keep `[global.did_resolution] network_methods = false` in `tinycloud.toml`
-or the canonical environment variable
-`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=false`. Network DID methods, including
-`did:web`, remain disabled under the current policy.
+The optional JSON body `{"delegations": ["<delegation>", ...]}` carries the
+session's root delegations (at most 8), each encoded exactly as
+`POST /delegate` takes it in its `Authorization` header. **The client must
+send every root it holds for the session key: one per space, including any
+it signed but never posted.** Each must be to the retiring key, or the whole
+request is refused. Each is admitted as `POST /delegate` admits it, inside
+the retire, so the retire covers it and posting it later cannot bring the
+key back; one already stored is fine. If any is refused, the request answers
+`401 session_retire_invalid: delegation <i>: <reason>` and nothing is
+written. A carried root that has already expired is skipped (it can never be
+posted) and its index is listed in `"skipped"`. One not valid yet (its
+`nbf` is ahead) is not stored, but its signature and issuer are checked and
+the retire lasts at least until it expires.
 
-**Full TC-1080 Part B hardening is REQUIRED before any future re-enable**,
-including setting the existing `network_methods` option to `true`. The
-unhardened SSI client is not an acceptable rollback path. Part B is not
-implemented here, and there is no Part B development bypass. The required
-node-side fetcher, destination enforcement, resource limits and local-listener
-acceptance checks are described in the
+The node answers `200 {"did": "<did:key>", "retiredAt": "<RFC3339>",
+"recorded": true, "expiresAt": "<RFC3339>", "skipped": [<i>, ...]}`
+(`skipped` only when an expired root was skipped); a repeat call answers the first
+`retiredAt`. `"recorded": false` (and no `expiresAt`) means this node holds no
+live grant for the key and none was carried, so nothing was written. A bad
+request answers `401 session_retire_invalid: <reason>`; too many requests from
+one IP answer `429`. From then on, the key can no longer use any delegated
+authority, a delegation it signs that this node had not stored before the
+retire is refused, and nothing it holds is renewed. These answer
+`401 session_retired: <reason>`. Authority the key holds as a root (a space
+or network it owns itself) is not delegated and is unaffected. Signed KV URL
+tickets and open hook streams obtained before the retire keep working for up
+to 300 seconds after it.
+
+A retire is recorded only when the node holds a live grant for the key (a
+delegation, renewal stamp or active renewal lease whose end is still ahead),
+counting the roots carried with it. It lasts at least
+`session_retire.ttl_secs` and until the latest-expiring of those grants ends,
+so it never lapses while the key still holds one; a delegation without an
+expiry keeps it for good.
+
+Sign-out covers only the grants this node holds or was given in the request.
+**A root the client does not send and this node does not hold is not
+covered:** posting it later makes the key usable here again until it
+expires. Sign-out does not end the delegations the key made before it, or
+their descendants; Revoke ends them. A node that starts hosting the space
+after the sign-out does not know about it and accepts the key until its
+session root expires (TC-3673).
+
+### UCAN DID verification (TC-1080, TC-1500)
+
+The node verifies a UCAN signature only when it derives the signer's key
+offline. It accepts these DIDs, as issuers and as the holders of new grants:
+
+- `did:key`: Ed25519, secp256k1 and P-256 (compressed) keys, base58btc. The
+  identifier must be exactly 48 (Ed25519) or 49 characters, checked before it
+  is decoded.
+- `did:jwk`: Ed25519 (OKP) and secp256k1 or P-256 (EC) public keys, in an
+  identifier of at most 256 characters, checked before it is decoded.
+- `did:pkh`: CAIP-10 accounts in the `eip155`, `solana` and `bip122`
+  (Bitcoin and Dogecoin mainnet) namespaces.
+
+Keys must be valid points on their curve, and an Ed25519 key (including a
+`solana` account) must not be of small order. A DID of another method fails before
+resolution with `did_method_disabled:`. A `did:key`, `did:jwk` or `did:pkh`
+naming another key type or namespace (P-384, `tezos`, the legacy `eth`/`sol`/
+`btc` forms) or a malformed identifier fails with `did_unverifiable:`. Issuer
+DID URLs carrying a query fail with `did_url_query_rejected:`.
+
+`POST /delegate` also refuses a new grant whose holder (`aud`) is not such a DID
+with `did_holder_unverifiable:`. A Policy/v3 delegate,
+`did:tinycloud:policy:<64 lowercase hex>`, is exempt: it holds a policy root and
+never signs. Grants already stored are unchanged. DID parsing and string
+comparisons, including share-email `did:web` identifiers, are unchanged.
+
+No setting enables network DID methods. `did_resolution.network_methods`
+(`TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS`) was removed: a node that still
+sets it starts, warns that the setting is ignored, and refuses `did:web`.
+**Full TC-1080 Part B hardening is REQUIRED before any future enable.** The
+required node-side fetcher, destination enforcement, resource limits and
+local-listener acceptance checks are described in the
 [developer gate](docs/delegation-flow.md#network-did-method-future-enable-gate-tc-1132).
 
-The startup log records the effective policy. Refusals increment
-`tinycloud_did_resolution_refused_total{method,reason}` (even when latency
-telemetry is disabled), with reasons `method_disabled` and `query_rejected`.
-Unknown methods use the bounded label `unknown`. Warnings contain only the
-method, sanitized host and reason, with one warning per method/host per minute
-and at most ten per minute globally; the next warning reports suppressed counts.
+Refusals increment `tinycloud_did_resolution_refused_total{method,reason}`
+(even when latency telemetry is disabled), with reasons `method_disabled`,
+`unverifiable`, `holder_unverifiable` and `query_rejected`. Unknown methods use
+the bounded label `unknown`. Warnings contain only the method, sanitized host
+and reason, with one warning per method/host per minute and at most ten per
+minute globally; the next warning reports suppressed counts.
 
 Public `GET /info` also exposes only counts and booleans:
 `"did_resolution": { "network_methods": false, "refused_total": 0 }`.
-Both values use relaxed atomic reads; `refused_total` counts every refusal for
-this process lifetime and resets on restart. Post-deploy, check
-`GET /info` gives `did_resolution.network_methods == false`, and compare
-`refused_total` over time. No DIDs, hosts, URLs or per-method data are exposed.
+`network_methods` is always `false`. `refused_total` counts every refusal for
+this process lifetime and resets on restart. No DIDs, hosts, URLs or
+per-method data are exposed.

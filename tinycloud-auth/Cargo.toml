@@ -17,6 +17,7 @@ base64.workspace = true
 time.workspace = true
 cacaos.workspace = true
 siwe-recap.workspace = true
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 lazy_static = "1.4"
 ssi = { git = "https://github.com/tinycloudlabs/ssi", features = ["ethereum"] }
 ucan-capabilities-object.workspace = true

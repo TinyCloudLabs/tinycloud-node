@@ -32,6 +32,9 @@ impl SpaceSizes {
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<SpaceId, u64>> {
         self.0.write().await
     }
+    pub(crate) async fn forget_space(&self, space: &SpaceId) {
+        self.0.write().await.remove(space);
+    }
     pub async fn get_size(&self, space: &SpaceId) -> Option<u64> {
         self.0.read().await.get(space).copied()
     }

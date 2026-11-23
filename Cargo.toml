@@ -24,6 +24,8 @@ exclude = [
     "vendor/sqlx-postgres",
     "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
+    "test/caveat-probe",
+    "test/named-key-probe",
 ]
 
 [workspace.dependencies]
@@ -93,6 +95,9 @@ lto = "thin"
 [workspace.metadata.dist]
 # CI backends to support
 ci = "github"
+# Preserve the custom PR-only concurrency in release.yml during normal generation.
+# Dist upgrades require a manual workflow update; explicit CI regeneration must reapply the block.
+allow-dirty = ["ci"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # The installers to generate for each app
@@ -118,3 +123,10 @@ install-path = "CARGO_HOME"
 
 [workspace.metadata.dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
+
+# Keep generated release actions pinned; update these refs before `dist generate`.
+# Tag labels live here because cargo-dist emits only the configured ref.
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8

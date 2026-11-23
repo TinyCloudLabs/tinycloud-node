@@ -567,10 +567,27 @@ pub fn verify_detached_ed25519(
     verify_ed25519(&public_key, message, signature)
 }
 
-fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
+/// Length of an Ed25519 `did:key`: the `did:key:` prefix and a 48-character identifier.
+const ED25519_DID_KEY_LEN: usize = "did:key:".len() + 48;
+
+#[cfg(test)]
+thread_local! {
+    static DID_KEY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The 32-byte public key of an Ed25519 `did:key`: base58btc multibase over the `0xed 0x01`
+/// multicodec only. The length is checked before the base58 decode (TC-1500 M1). The key must
+/// decompress and must not be of small order: ssi verifies with dalek's non-strict `verify`,
+/// under which anyone can sign for a small-order key.
+pub fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
+    if did.len() != ED25519_DID_KEY_LEN {
+        return Err(EvidenceError::Invalid);
+    }
     let encoded = did
         .strip_prefix("did:key:z")
         .ok_or(EvidenceError::Invalid)?;
+    #[cfg(test)]
+    DID_KEY_DECODES.with(|decodes| decodes.set(decodes.get() + 1));
     let (_, bytes) = crate::ipld_core::cid::multibase::decode(format!("z{encoded}"))
         .map_err(|_| EvidenceError::Invalid)?;
     if bytes.len() != 34 || bytes[..2] != [0xed, 0x01] {
@@ -578,7 +595,10 @@ fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
     }
     let mut key = [0; 32];
     key.copy_from_slice(&bytes[2..]);
-    Ok(key)
+    match ed25519_dalek::VerifyingKey::from_bytes(&key) {
+        Ok(verifying) if !verifying.is_weak() => Ok(key),
+        _ => Err(EvidenceError::Invalid),
+    }
 }
 
 fn canonical_kid(did: &str) -> Result<String, EvidenceError> {
@@ -800,6 +820,49 @@ fn utf16_cmp(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn did_key_public_key_refuses_wrong_lengths_without_decoding() {
+        let key = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let before = DID_KEY_DECODES.with(std::cell::Cell::get);
+        for did in [
+            format!("did:key:{}", &key[..47]),
+            format!("did:key:{key}1"),
+            format!("did:key:z6Mk{}", "1".repeat(65_532)),
+        ] {
+            assert!(did_key_public_key(&did).is_err());
+        }
+        assert_eq!(DID_KEY_DECODES.with(std::cell::Cell::get), before);
+        assert!(did_key_public_key(&format!("did:key:{key}")).is_ok());
+        assert_eq!(DID_KEY_DECODES.with(std::cell::Cell::get), before + 1);
+        // The right length, but not the Ed25519 multicodec.
+        assert!(did_key_public_key(&format!("did:key:z6Mk{}", "1".repeat(44))).is_err());
+    }
+
+    /// Small-order Ed25519 points (identity, order 2, order 4): anyone can sign for them.
+    fn small_order_keys() -> [[u8; 32]; 3] {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mut order_two = [0xff; 32];
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        [identity, order_two, [0; 32]]
+    }
+
+    #[test]
+    fn did_key_public_key_refuses_small_order_keys() {
+        for key in small_order_keys() {
+            let did = format!(
+                "did:key:{}",
+                crate::ipld_core::cid::multibase::encode(
+                    crate::ipld_core::cid::multibase::Base::Base58Btc,
+                    [&[0xed, 0x01][..], &key].concat()
+                )
+            );
+            assert_eq!(did.len(), ED25519_DID_KEY_LEN, "{did}");
+            assert!(did_key_public_key(&did).is_err(), "{did}");
+        }
+    }
 
     #[test]
     fn email_normalization_preserves_local_and_only_lowercases_domain() {

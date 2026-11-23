@@ -164,7 +164,7 @@ async fn race(competitor: Competitor, begin: Begin) -> (Result<(), DbErr>, bool)
                     "sql",
                     SPACE,
                     "account",
-                    b"tc899 artifact bytes".to_vec(),
+                    b"tc899 artifact bytes".to_vec().into(),
                     ArtifactExpectation::Absent,
                 )
                 .await

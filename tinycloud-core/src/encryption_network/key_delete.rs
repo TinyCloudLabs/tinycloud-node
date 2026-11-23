@@ -6,11 +6,8 @@
 //! so the ledger always names every committed deletion.
 
 use sea_orm::{
-    sea_query::{Alias, Expr, Func, SimpleExpr},
-    ActiveModelTrait,
-    ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
-    QueryOrder, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
+    DatabaseTransaction, DbBackend, EntityTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 
 use crate::{
@@ -23,9 +20,9 @@ use super::{
     delete_auth::{DeleteTarget, VerifiedOwnerDelete},
     deletion_ledger::{intent_committed, DeletionLedger, Intent, LedgerKey, Record},
     key_id::KeyKind,
-    keys::{find_key_row, lock_network_row, KeyState},
+    keys::{find_key_row, lock_network_row, path_starts_with, KeyState},
     network_id::NetworkId,
-    service::{now_rfc3339, EncryptionService, EncryptionServiceError},
+    service::{is_half_created, now_rfc3339, EncryptionService, EncryptionServiceError},
 };
 
 /// Audit outcome of a deleted key.
@@ -139,11 +136,11 @@ impl EncryptionService {
         // The guarded updates (the key version must still match) keep each
         // row's write correct without it; the lock is defense in depth.
         lock_network_row(tx, network).await?;
-        if encryption_network::Entity::find_by_id(network.to_string())
+        let row = encryption_network::Entity::find_by_id(network.to_string())
             .one(tx)
             .await?
-            .is_none()
-        {
+            .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        if is_half_created(tx, &row).await? {
             return Err(EncryptionServiceError::NetworkNotFound);
         }
 
@@ -320,10 +317,8 @@ pub fn audit_request_hash(auth_cid: &str, key_path: &str) -> String {
     hash_hex(&input)
 }
 
-/// The rows whose path starts with `prefix`, selected by a byte-exact
-/// `substr` comparison. Never `LIKE` (it treats `_` and `%` as wildcards, and
-/// SQLite's ignores case) and never a range (collation dependent). Each row
-/// is checked again here in Rust.
+/// The rows whose path starts with `prefix`, selected by
+/// [`path_starts_with`]. Each row is checked again here in Rust.
 async fn rows_under_prefix(
     tx: &DatabaseTransaction,
     network: &NetworkId,
@@ -331,16 +326,7 @@ async fn rows_under_prefix(
 ) -> Result<Vec<encryption_network_key::Model>, EncryptionServiceError> {
     let rows = encryption_network_key::Entity::find()
         .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-        // `substr(key_path, 1, n) = prefix`: an exact comparison of the
-        // first n characters, the same SQL on SQLite and PostgreSQL.
-        .filter(
-            Expr::expr(Func::cust(Alias::new("substr")).args([
-                Expr::col(encryption_network_key::Column::KeyPath).into(),
-                SimpleExpr::from(1i32),
-                SimpleExpr::from(prefix.len() as i32),
-            ]))
-            .eq(prefix.to_string()),
-        )
+        .filter(path_starts_with(prefix))
         .order_by_asc(encryption_network_key::Column::KeyPath)
         .all(tx)
         .await?;

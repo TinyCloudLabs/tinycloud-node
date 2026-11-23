@@ -37,7 +37,9 @@ use tinycloud_core::encryption_network::{
     NetworkDescriptor, NetworkId, Threshold, WellKnownRecord, KEY_BLOCK_ACTION, KEY_CREATE_ACTION,
     KEY_UNBLOCK_ACTION, NETWORK_CREATE_ACTION, NETWORK_REVOKE_ACTION,
 };
-use tinycloud_core::{events::Invocation, util::InvocationInfo, TxError, TxStoreError};
+use tinycloud_core::{
+    events::Invocation, models::invocation, util::InvocationInfo, TxError, TxStoreError,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateNetworkBody {
@@ -122,6 +124,7 @@ pub async fn create_network(
 pub async fn get_network(
     network_id: &str,
     service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<DescriptorView>, (Status, String)> {
     let net: NetworkId =
         network_id
@@ -129,6 +132,10 @@ pub async fn get_network(
             .map_err(|e: tinycloud_core::encryption_network::NetworkIdError| {
                 (Status::BadRequest, e.to_string())
             })?;
+    tinycloud
+        .check_registry_encryption(net.owner_did())
+        .await
+        .map_err(super::registry_failure)?;
     let start = Instant::now();
     let result = service.get_network(&net).await;
     crate::prometheus::observe_span(
@@ -148,9 +155,15 @@ pub async fn well_known_network(
     name: &str,
     query: WellKnownNetworkQuery,
     service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<WellKnownRecord>, (Status, String)> {
-    // V1 supports owner-qualified discovery when the caller has it, and a
-    // name-only fallback for single-owner nodes.
+    if let Some(owner) = query.owner_did.as_deref() {
+        tinycloud
+            .check_registry_encryption(owner)
+            .await
+            .map_err(super::registry_failure)?;
+    }
+    // Name-only discovery resolves the owner before checking its destination.
     let start = Instant::now();
     let result = service
         .get_network_by_name(name, query.owner_did.as_deref())
@@ -161,6 +174,10 @@ pub async fn well_known_network(
         start.elapsed(),
     );
     let descriptor = result.map_err(map_service_err)?;
+    tinycloud
+        .check_registry_encryption(descriptor.network_id.owner_did())
+        .await
+        .map_err(super::registry_failure)?;
     Ok(Json(WellKnownRecord::from(&descriptor)))
 }
 
@@ -230,12 +247,15 @@ pub async fn decrypt(
             return InvokeError::Revoked(code, error.to_string());
         }
         match &error {
-            tinycloud_core::models::invocation::Error::Db(db_error) => super::database_failure(
+            invocation::Error::Db(db_error) => super::database_failure(
                 tinycloud_core::failure_diagnostic::Service::Other,
                 db_error,
                 false,
                 error.to_string(),
             ),
+            invocation::Error::InvalidInvocation(invocation::InvocationError::Registry(error)) => {
+                super::registry_failure(*error)
+            }
             _ => (Status::Unauthorized, error.to_string()),
         }
         .into()
@@ -541,6 +561,7 @@ pub async fn public_encryption_key(
     client_ip: ClientIp,
     rate_limiter: &State<RateLimiter>,
     service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<KeyPublicView>, (Status, String)> {
     rate_limiter
         .check(client_ip.0)
@@ -548,7 +569,11 @@ pub async fn public_encryption_key(
     // Routing guard only; the key path is read from the raw request path.
     let _ = key_path;
     let key_path = raw_key_path(origin, network_id)?;
-    let (_, location) = key_location(network_id, &key_path)?;
+    let (network, location) = key_location(network_id, &key_path)?;
+    tinycloud
+        .check_registry_encryption(network.owner_did())
+        .await
+        .map_err(super::registry_failure)?;
     let public = service
         .public_key(&location)
         .await
@@ -694,6 +719,7 @@ pub async fn delete_encryption_key(
     authorization: RawAuthorization,
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<KeyDeleteView>, InvokeError> {
     let body_value = body.into_inner();
     let body: DeleteKeyBody = serde_json::from_value(body_value.clone()).map_err(|err| {
@@ -712,6 +738,10 @@ pub async fn delete_encryption_key(
         )
             .into());
     }
+    tinycloud
+        .check_registry_encryption(network.owner_did())
+        .await
+        .map_err(super::registry_failure)?;
     let target = DeleteTarget::parse(&network, &body.key_path).map_err(map_key_service_err)?;
     let verified = service
         .authorize_owner_delete(&authorization.0, &network, &target, &body_value)
@@ -775,6 +805,7 @@ async fn verify_auth(
                         err.to_string(),
                     )
                 }
+                TxStoreError::Tx(TxError::Registry(error)) => super::registry_failure(*error),
                 _ => (Status::Unauthorized, err.to_string()),
             }
             .into()
@@ -801,12 +832,22 @@ fn map_key_service_err(err: EncryptionServiceError) -> (Status, String) {
 }
 
 pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
-    let status = match err {
+    use tinycloud_core::failure_diagnostic::ErrorCode;
+    let status = match &err {
         EncryptionServiceError::NetworkNotFound => Status::NotFound,
         EncryptionServiceError::NetworkAlreadyExists => Status::Conflict,
-        EncryptionServiceError::Db(_) => Status::InternalServerError,
-        EncryptionServiceError::Backend(_) => Status::InternalServerError,
-        EncryptionServiceError::Signing(_) => Status::InternalServerError,
+        EncryptionServiceError::Db(error) => {
+            super::note_error_code(ErrorCode::for_db(error));
+            Status::InternalServerError
+        }
+        EncryptionServiceError::Backend(_)
+        | EncryptionServiceError::Signing(_)
+        | EncryptionServiceError::CorruptKeyRow
+        | EncryptionServiceError::StrayAppKeyRows(_)
+        | EncryptionServiceError::StraySecretKeyRows(_) => {
+            super::note_error_code(ErrorCode::Encryption);
+            Status::InternalServerError
+        }
         EncryptionServiceError::AudienceMismatch
         | EncryptionServiceError::TargetNodeMismatch
         | EncryptionServiceError::OwnerMismatch
@@ -829,9 +870,10 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         | EncryptionServiceError::KeyLimitExceeded
         | EncryptionServiceError::KeyUnwrapFailed(_)
         | EncryptionServiceError::OwnerOnly(_) => Status::Forbidden,
-        EncryptionServiceError::CorruptKeyRow
-        | EncryptionServiceError::StrayAppKeyRows(_)
-        | EncryptionServiceError::DeletionLedger(_) => Status::InternalServerError,
+        EncryptionServiceError::DeletionLedger(_) => {
+            super::note_error_code(ErrorCode::KeyLedger);
+            Status::InternalServerError
+        }
         EncryptionServiceError::KeyPathInvalid(_) => Status::BadRequest,
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey

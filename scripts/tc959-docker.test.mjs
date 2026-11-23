@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
-import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const request = { ts: '2026-10-16T12:00:00.000Z', level: 'info', event: 'node_request', svc: 'api', method: 'GET', route: '/healthz', status: 200, latency_us: 12 };
 const ingress = { ...request, event: 'ingress_request', svc: 'ingress', request_time_seconds: 0.001 };
@@ -59,6 +59,18 @@ test('capture accepts well-formed N2 correlation fields on node_request only', (
     assert.throws(() => assertCapture([{ ...ingress, [key]: value }]), `ingress ${key}`);
     assert.throws(() => assertCapture([{ ...warning, [key]: value }], { event_code: { values: ['unclassified'] } }), `warning ${key}`);
   }
+});
+
+// test-ruling: TC-3834 scripts/tc959-docker.test.mjs new test only (2026-11-24)
+test('capture accepts a declared error_code on a 5xx node_request only (TC-3834)', () => {
+  const fields = JSON.parse(readFileSync(new URL('../log-shipper/fields.json', import.meta.url), 'utf8')).services['tinycloud-node'].fields;
+  const failed = { ...request, method: 'POST', route: '/invoke', status: 503, error_code: 'db_timeout' };
+  assert.doesNotThrow(() => assertCapture([failed], fields));
+  assert.doesNotThrow(() => assertCapture([{ ...failed, status: 500, error_code: 'internal' }], fields));
+  for (const bad of [{ error_code: 'database timed out' }, { error_code: 'DB_TIMEOUT' }, { error_code: 7 }, { status: 404 }, { status: 200 }]) {
+    assert.throws(() => assertCapture([{ ...failed, ...bad }], fields), JSON.stringify(bad));
+  }
+  assert.throws(() => assertCapture([{ ...ingress, status: 503, error_code: 'db_timeout' }], fields), 'ingress error_code');
 });
 
 test('capture accepts the individual 5xx diagnostic with exactly its eight typed fields (TC-1840)', () => {
@@ -202,6 +214,15 @@ test('socket evidence measures effective receive buffer and drops rather than as
   assert.deepEqual(observed, { requested_receive_buffer_bytes: 8388608, rmem_max: 212992, effective_so_rcvbuf: 425984, socket_drops: 7 });
   assert.equal(socketEvidence('UNCONN 0 0 0.0.0.0:12201', 'private').effective_so_rcvbuf, null);
   assert.equal(socketEvidence('', '212992').socket_drops, null);
+});
+
+test('host UDP evidence sums drops on every host socket bound to the GELF port and reads kernel Udp counters by name', () => {
+  const snmp = 'Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\nUdp: 9100 3 66 9200 66 0 0 0 0\nUdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\nUdpLite: 1 1 1 1 1 1 0 0 0\n';
+  const header = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops';
+  const udp = `${header}\n  10: 0100007F:2FA9 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 4242 2 0000000000000000 66\n  11: 00000000:2FAA 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 4243 2 0000000000000000 900\n`;
+  const udp6 = `${header}\n  12: 00000000000000000000000001000000:2FA9 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 4244 2 0000000000000000 4\n`;
+  assert.deepEqual(hostUdpEvidence(snmp, [udp, udp6], 12201), { in_datagrams: 9100, in_errors: 66, rcvbuf_errors: 66, sndbuf_errors: 0, port_sockets: 2, port_drops: 70 });
+  assert.deepEqual(hostUdpEvidence('', [header], 12201), { in_datagrams: null, in_errors: null, rcvbuf_errors: null, sndbuf_errors: null, port_sockets: 0, port_drops: null });
 });
 
 test('buffer and error diagnostics never expose raw metric labels or invent absent counters', () => {

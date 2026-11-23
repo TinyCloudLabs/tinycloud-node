@@ -371,7 +371,8 @@ async fn policy_terminal_special_controls() {
                         &db,
                         &target.to_cid(0x55).to_string(),
                         &holder,
-                        &[root]
+                        &[root],
+                        None
                     )
                     .await,
                     Err(crate::renewal::RenewalStoreError::Unauthorized)

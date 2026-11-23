@@ -405,3 +405,163 @@ async fn a_json_revoked_root_reports_revoked_status(backend: Backend) -> anyhow:
     Ok(())
 }
 on_both_backends!(a_json_revoked_root_reports_revoked_status);
+
+/// TC-4046: renewal must not hide a policy-only root revocation from a listing.
+async fn renewed_child_query_agrees_with_json_root_revocation(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use rocket::http::{ContentType, Header};
+    use tinycloud_auth::authorization::{
+        make_invocation_from_uris, InvocationOptions, TinyCloudInvocation,
+    };
+    use tinycloud_core::events::Invocation;
+    use tinycloud_core::renewal::{StampIssue, RENEWER_KEY_CONTEXT};
+
+    let Some(h) = Harness::new(
+        backend,
+        Shape::PkhSession,
+        "renewed_child_query_agrees_with_json_root_revocation",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let admitted = admitted(&h).await?;
+    let session =
+        decode_delegation(&admitted.session).map_err(|(_, error)| anyhow::anyhow!(error))?;
+    let TinyCloudDelegation::Ucan(session_token) = &session.0.delegation else {
+        anyhow::bail!("UCAN session required");
+    };
+    let Signer::Key { jwk, vm, .. } = &h.holder else {
+        unreachable!();
+    };
+    let child_not_before = session.0.not_before.unwrap().unix_timestamp() + 1;
+    let signed_end = now() + Duration::seconds(60);
+    let mut payload = session_token.payload().clone();
+    payload.issuer = vm.parse()?;
+    payload.audience = admitted.reader.did().parse()?;
+    payload.proof = vec![session.content_hash().to_cid(0x55)];
+    payload.not_before = Some(
+        tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(child_not_before as f64)?,
+    );
+    payload.expiration = tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(
+        signed_end.unix_timestamp() as f64,
+    )?;
+    payload.nonce = Some(uuid::Uuid::new_v4().to_string());
+    payload.facts.as_mut().unwrap()[0]["remainingRedelegationDepth"] = json!(7);
+    // The child starts one second after its parent and must already be valid,
+    // with a second to spare, when it is imported and renewed.
+    let wait = child_not_before + 1 - OffsetDateTime::now_utc().unix_timestamp();
+    if wait > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(wait as u64 * 1000 + 50)).await;
+    }
+    let child = h
+        .import(payload.sign(Algorithm::EdDSA, jwk)?.encode()?)
+        .await?;
+    let secret = StaticSecret::new(vec![53; 32]).unwrap();
+    let lease = h
+        .import(h.holder.delegate(
+            &secret.renewal_did(),
+            &[(format!("urn:cid:{child}"), "tinycloud.delegation/renew")],
+            Window {
+                // A lease must not begin before the grant it renews.
+                not_before: OffsetDateTime::from_unix_timestamp(child_not_before)?,
+                expiry: now() + Duration::seconds(120),
+            },
+            &[],
+        )?)
+        .await?;
+    let mut renewer = JWK::from(Params::OKP(OctetParams {
+        curve: "Ed25519".to_owned(),
+        public_key: Base64urlUInt(
+            secret
+                .renewal_keypair()
+                .public()
+                .try_into_ed25519()?
+                .to_bytes()
+                .to_vec(),
+        ),
+        private_key: Some(Base64urlUInt(
+            secret.derive_key(RENEWER_KEY_CONTEXT).to_vec(),
+        )),
+    }));
+    renewer.algorithm = Some(Algorithm::EdDSA);
+    let renewer_did = secret.renewal_did();
+    let expiry = now().unix_timestamp() + 30;
+    let signed = make_invocation_from_uris(
+        [(
+            format!("urn:cid:{child}").parse()?,
+            ["tinycloud.delegation/renew".parse()?],
+        )],
+        &lease.parse()?,
+        &renewer,
+        &format!("{renewer_did}#{}", renewer_did.rsplit(':').next().unwrap()),
+        expiry as f64,
+        InvocationOptions {
+            nonce: Some(uuid::Uuid::new_v4().to_string()),
+            proof: Some(vec![lease.parse()?]),
+            ..Default::default()
+        },
+    )?;
+    let invocation = Invocation::from_header_ser::<TinyCloudInvocation>(&signed.encode()?)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let replay_hash = invocation.content_hash();
+    h.client
+        .rocket()
+        .state::<crate::TinyCloud>()
+        .unwrap()
+        .issue_renewal_stamp(StampIssue {
+            invocation: invocation.0,
+            original_cid: child.clone(),
+            lease_cid: lease,
+            replay_hash,
+            replay_expires_at: expiry,
+        })
+        .await?;
+    let status = h.delegation_status(&admitted.reader, &child).await?;
+    assert!(
+        status["effective_expiry"].as_i64().unwrap() > signed_end.unix_timestamp(),
+        "child was not renewed: {status}"
+    );
+    let root = &admitted.policy.policy_root_cid;
+    let (status, body) = h.revoke_root_json(&h.owner, root, POLICY_AUTHORITY).await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    for (issuer, viewer, cid) in [
+        (&h.owner, &h.owner, root),
+        (&h.holder, &admitted.reader, &child),
+    ] {
+        let status = h.delegation_status(viewer, cid).await?;
+        assert_eq!(status["status"], "revoked", "{status}");
+        let authorization = issuer.delegate(
+            &h.node_did(),
+            &[(
+                format!(
+                    "tinycloud:{}:agent/delegation",
+                    issuer.did().strip_prefix("did:").unwrap()
+                ),
+                "tinycloud.delegation/list",
+            )],
+            Window::until(now() + Duration::seconds(30)),
+            &[],
+        )?;
+        let response = h
+            .client
+            .post("/delegation/query")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", authorization))
+            .body(json!({"direction": "issued"}).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let page: Value = response.into_json().await.unwrap();
+        let row = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["cid"] == *cid)
+            .unwrap();
+        assert_eq!(row["status"], status["status"], "{page}");
+    }
+    Ok(())
+}
+on_both_backends!(renewed_child_query_agrees_with_json_root_revocation);

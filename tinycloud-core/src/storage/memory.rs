@@ -104,6 +104,19 @@ impl ImmutableReadStore for MemoryStore {
         result
     }
 
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(self.spaces.get(space).and_then(|objects| {
+            objects
+                .get(&(*id, generation))
+                .map(|data| data.len() as u64)
+        }))
+    }
+
     async fn read_range(
         &self,
         space: &SpaceId,

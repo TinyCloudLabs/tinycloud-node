@@ -171,6 +171,13 @@ pub async fn fixture_at(url: Option<&str>, lease_owner: u8, age: i64) -> Fixture
         ))
         .await
         .unwrap();
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO delegation_mode (delegation_id, mode) VALUES ($1,'attenuable')",
+            [Sql::Bytes(Some(Box::new(Vec::<u8>::from(id))))],
+        ))
+        .await
+        .unwrap();
     }
     conn.execute(Statement::from_sql_and_values(backend,
         "INSERT INTO ability (delegation, resource, ability, caveats) VALUES ($1,$2,'tinycloud.delegation/renew',$3)",

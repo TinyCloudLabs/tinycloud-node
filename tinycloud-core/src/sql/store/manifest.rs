@@ -25,8 +25,9 @@ pub const SHADOW_EPOCH: i64 = 0;
 const MAX_ID_CHARS: usize = 255;
 
 /// The `format` each object kind must be recorded with.
-const SNAPSHOT_FORMAT: &str = "sqlite-v1";
-const SEGMENT_FORMAT: &str = "wal-cum-v1";
+pub(crate) const SNAPSHOT_FORMAT: &str = "sqlite-v1";
+pub(crate) const SEGMENT_FORMAT: &str = "wal-cum-v1";
+pub(crate) const DELTA_FORMAT: &str = "wal-delta-v1";
 
 fn required_format(kind: ObjectKind) -> &'static str {
     match kind {
@@ -35,8 +36,26 @@ fn required_format(kind: ObjectKind) -> &'static str {
     }
 }
 
+/// Whether an object of `kind` may be recorded with `format`: a segment is
+/// `wal-cum-v1` or `wal-delta-v1`.
+fn accepts_format(kind: ObjectKind, format: &str) -> bool {
+    format == required_format(kind) || (kind == ObjectKind::Segment && format == DELTA_FORMAT)
+}
+
+/// The format of the segment `from_seq..=to_seq` on `base_seq`. It is a
+/// function of position, so one key never names two formats: a delta that
+/// starts at `base_seq + 1` carries the bytes of a cumulative segment, and is
+/// one.
+pub(crate) fn segment_format(base_seq: u64, from_seq: u64) -> &'static str {
+    if from_seq == base_seq + 1 {
+        SEGMENT_FORMAT
+    } else {
+        DELTA_FORMAT
+    }
+}
+
 /// Current time in the canonical `created_at` form.
-fn now_timestamp() -> String {
+pub fn now_timestamp() -> String {
     canonical_format(OffsetDateTime::now_utc())
 }
 
@@ -67,11 +86,13 @@ fn canonical_timestamp(text: &str) -> Result<String, SqlStoreError> {
     Ok(canonical_format(utc))
 }
 
+/// An inventory row's state. There is no `orphan` state: an `uploaded` row
+/// that no frontier reaches is an orphan, and GC derives that by query
+/// (contract 3.3, slice 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectState {
     Uploaded,
     Published,
-    Orphan,
 }
 
 impl ObjectState {
@@ -79,14 +100,12 @@ impl ObjectState {
         match self {
             Self::Uploaded => "uploaded",
             Self::Published => "published",
-            Self::Orphan => "orphan",
         }
     }
     fn parse(text: &str) -> Result<Self, SqlStoreError> {
         match text {
             "uploaded" => Ok(Self::Uploaded),
             "published" => Ok(Self::Published),
-            "orphan" => Ok(Self::Orphan),
             _ => Err(SqlStoreError::Invalid("unknown object state")),
         }
     }
@@ -96,7 +115,9 @@ impl ObjectState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub key: ObjectKey,
-    /// `sqlite-v1` for a snapshot, `wal-cum-v1` for a cumulative-WAL segment.
+    /// `sqlite-v1` for a snapshot; for a segment `wal-cum-v1` (the cumulative
+    /// WAL since the checkpoint) or `wal-delta-v1` (the WAL bytes of the
+    /// revisions it spans).
     pub format: String,
     pub bytes: u64,
     pub created_at: String,
@@ -127,7 +148,7 @@ impl Frontier {
         }
     }
 
-    fn from_model(m: manifest::Model) -> Result<Self, SqlStoreError> {
+    pub(crate) fn from_model(m: manifest::Model) -> Result<Self, SqlStoreError> {
         let nonneg = |v: i64| u64::try_from(v).map_err(|_| SqlStoreError::Invalid("negative seq"));
         Ok(Self {
             lineage: Lineage::parse(&m.lineage)?,
@@ -159,8 +180,23 @@ pub enum PublishKind {
     /// Append to the current chain. `base_snapshot_key` and the request's
     /// `base_checkpoint_cid` must still be the manifest's.
     Segment { base_snapshot_key: String },
+    /// Append a `wal-delta-v1` object: the WAL bytes of `from_seq..=to_seq`,
+    /// published only while `last_seq` is exactly `from_seq - 1`. The same
+    /// base requirements as `Segment`.
+    Delta { base_snapshot_key: String },
     /// Start `object.lineage()` on top of a different `token.lineage`.
     LineageSwitch,
+}
+
+impl PublishKind {
+    /// The `format` the published object must be recorded with.
+    fn format(&self) -> &'static str {
+        match self {
+            Self::Snapshot | Self::LineageSwitch => SNAPSHOT_FORMAT,
+            Self::Segment { .. } => SEGMENT_FORMAT,
+            Self::Delta { .. } => DELTA_FORMAT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +219,19 @@ pub enum PublishOutcome {
     /// `last_seq`, or a lost first-publish race). Not an error. Carries the
     /// current row, if any.
     Lost(Option<Frontier>),
+}
+
+/// Objects to record and publish in one control-database transaction
+/// ([`SqlManifest::publish_chain`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishChain {
+    /// Either a snapshot followed by zero or more segments on it, or one or
+    /// more segments on the expected frontier's base snapshot.
+    pub objects: Vec<ObjectRecord>,
+    /// The artifact's `checkpoint_content_hash` the chain is cut from.
+    pub base_checkpoint_cid: String,
+    pub publish_id: PublishId,
+    pub now: String,
 }
 
 #[async_trait]
@@ -213,13 +262,24 @@ pub trait SqlManifest: Send + Sync {
         state: Option<ObjectState>,
     ) -> Result<Vec<ObjectRecord>, SqlStoreError>;
 
-    /// `uploaded -> orphan` for rows created before `older_than`, conditional
-    /// on the row still being `uploaded`. Returns rows changed.
-    async fn mark_orphans(&self, db: &DbRef<'_>, older_than: &str) -> Result<u64, SqlStoreError>;
-
-    /// Explicit `orphan -> uploaded` before an object is reused. False if the
-    /// row is not an orphan.
-    async fn revive_object(&self, db: &DbRef<'_>, key: &ObjectKey) -> Result<bool, SqlStoreError>;
+    /// Record every object of `chain` as `uploaded` and CAS-publish them in
+    /// order, in one transaction (contract 4.1). `expected` is the frontier
+    /// the caller planned against (`None` for a first publication). A
+    /// leading snapshot publishes as `Snapshot` in `expected`'s lineage,
+    /// `LineageSwitch` in another, or as the first row; every segment chains
+    /// on the previous step. The chain must end at or above
+    /// `expected.last_seq`.
+    ///
+    /// A CAS lost on the first object commits the inventory rows (they stay
+    /// `uploaded`) and returns `Lost` with the current row. A CAS lost on a
+    /// later object rolls everything back and is an error: in one
+    /// transaction the earlier steps fixed the row it checks against.
+    async fn publish_chain(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: PublishChain,
+    ) -> Result<PublishOutcome, SqlStoreError>;
 }
 
 /// [`SqlManifest`] on the control database (Postgres, MySQL or SQLite).
@@ -247,7 +307,10 @@ fn to_i64(v: u64) -> Result<i64, SqlStoreError> {
 }
 
 /// The primary key filter of one object row.
-fn object_pk(db: &DbRef<'_>, key: &ObjectKey) -> Result<sea_orm::Condition, SqlStoreError> {
+pub(crate) fn object_pk(
+    db: &DbRef<'_>,
+    key: &ObjectKey,
+) -> Result<sea_orm::Condition, SqlStoreError> {
     use object::Column as C;
     Ok(sea_orm::Condition::all()
         .add(C::Space.eq(db.space))
@@ -350,18 +413,26 @@ impl DbSqlManifest {
                     )
                     .filter(C_::Lineage.eq(token.lineage.as_str()));
             }
-            PublishKind::Segment { base_snapshot_key } => {
-                // wal-cum-v1 segments are cumulative from base_seq + 1; publish_cas
-                // has already checked from_seq.
-                // last_seq in [from_seq - 1, to_seq): no gap, and it strictly advances.
+            PublishKind::Segment { base_snapshot_key }
+            | PublishKind::Delta { base_snapshot_key } => {
+                // publish_cas has already checked from_seq.
                 let from_prev = to_i64(p.object.from_seq() - 1)?;
                 update = update
                     .filter(C_::Lineage.eq(token.lineage.as_str()))
                     .filter(C_::BaseSnapshotKey.eq(base_snapshot_key.as_str()))
                     .filter(C_::BaseSeq.eq(to_i64(p.object.base_seq())?))
-                    .filter(C_::BaseCheckpointCid.eq(p.base_checkpoint_cid.as_str()))
-                    .filter(C_::LastSeq.gte(from_prev))
-                    .filter(C_::LastSeq.lt(at));
+                    .filter(C_::BaseCheckpointCid.eq(p.base_checkpoint_cid.as_str()));
+                update = if matches!(p.kind, PublishKind::Delta { .. }) {
+                    // wal-delta-v1 covers exactly the revisions after the
+                    // frontier: a delta never overlaps and never skips.
+                    update.filter(C_::LastSeq.eq(from_prev))
+                } else {
+                    // wal-cum-v1 is cumulative from base_seq + 1: last_seq in
+                    // [from_seq - 1, to_seq), no gap, and it strictly advances.
+                    update
+                        .filter(C_::LastSeq.gte(from_prev))
+                        .filter(C_::LastSeq.lt(at))
+                };
             }
         }
         Ok(update.exec(conn).await?.rows_affected)
@@ -404,7 +475,7 @@ impl DbSqlManifest {
             )
             .filter(object_pk(db, obj)?)
             .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
-            .filter(object::Column::Format.eq(required_format(obj.kind())))
+            .filter(object::Column::Format.eq(publish.kind.format()))
             .exec(txn)
             .await?
             .rows_affected;
@@ -413,75 +484,15 @@ impl DbSqlManifest {
         }
         Ok(PublishStep::Won(Self::read(txn, db).await?))
     }
-}
 
-#[async_trait]
-impl SqlManifest for DbSqlManifest {
-    async fn current(&self, db: &DbRef<'_>) -> Result<Option<Frontier>, SqlStoreError> {
-        check_db(db)?;
-        Self::read(&self.db, db).await
-    }
-
-    async fn publish_cas(
-        &self,
-        db: &DbRef<'_>,
-        expected: Option<&CasToken>,
-        publish: Publish,
-    ) -> Result<PublishOutcome, SqlStoreError> {
-        check_db(db)?;
-        let obj = &publish.object;
-        match (&publish.kind, expected) {
-            (PublishKind::Snapshot, None) if obj.kind() == ObjectKind::Snapshot => {}
-            (PublishKind::Snapshot, Some(t))
-                if obj.kind() == ObjectKind::Snapshot && obj.lineage() == &t.lineage => {}
-            (PublishKind::LineageSwitch, Some(t))
-                if obj.kind() == ObjectKind::Snapshot && obj.lineage() != &t.lineage => {}
-            (PublishKind::Segment { .. }, Some(t))
-                if obj.kind() == ObjectKind::Segment && obj.lineage() == &t.lineage => {}
-            _ => {
-                return Err(SqlStoreError::Invalid(
-                    "publish kind does not match its inputs",
-                ))
-            }
-        }
-        if matches!(publish.kind, PublishKind::Segment { .. })
-            && obj.from_seq() != obj.base_seq() + 1
-        {
-            return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"));
-        }
-        let txn = self.db.begin().await?;
-        let step = match Self::publish_in(&txn, db, expected, &publish).await {
-            Ok(step) => step,
-            Err(err) => {
-                let _ = txn.rollback().await;
-                return Err(err);
-            }
-        };
-        match step {
-            PublishStep::Lost => {
-                txn.rollback().await?;
-                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
-            }
-            PublishStep::Won(published) => {
-                txn.commit().await?;
-                match published {
-                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
-                    None => Err(SqlStoreError::Invalid(
-                        "manifest row vanished after publish",
-                    )),
-                }
-            }
-        }
-    }
-
-    async fn record_object(
-        &self,
+    /// Insert one inventory row as `uploaded`, or report the existing row's state.
+    async fn record_in<C: ConnectionTrait>(
+        conn: &C,
         db: &DbRef<'_>,
         record: &ObjectRecord,
     ) -> Result<ObjectState, SqlStoreError> {
-        check_db(db)?;
         let key = &record.key;
-        if record.format != required_format(key.kind()) {
+        if !accepts_format(key.kind(), &record.format) {
             return Err(SqlStoreError::Invalid(
                 "object format does not match its kind",
             ));
@@ -518,20 +529,240 @@ impl SqlManifest for DbSqlManifest {
                 .do_nothing()
                 .to_owned(),
             )
-            .exec_without_returning(&self.db)
+            .exec_without_returning(conn)
             .await?;
         if inserted == 1 {
             return Ok(ObjectState::Uploaded);
         }
         let existing = object::Entity::find()
             .filter(object_pk(db, key)?)
-            .one(&self.db)
+            .one(conn)
             .await?
             .ok_or(SqlStoreError::Invalid("object row vanished"))?;
         if existing.bytes != to_i64(record.bytes)? {
             return Err(SqlStoreError::Conflict);
         }
         ObjectState::parse(&existing.state)
+    }
+
+    /// The recorded size of the object stored under `key`.
+    async fn object_bytes<C: ConnectionTrait>(
+        conn: &C,
+        db: &DbRef<'_>,
+        key: &str,
+    ) -> Result<u64, SqlStoreError> {
+        let row = object::Entity::find()
+            .filter(object::Column::Space.eq(db.space))
+            .filter(object::Column::DbId.eq(db.db_id))
+            .filter(object::Column::Key.eq(key))
+            .one(conn)
+            .await?
+            .ok_or(SqlStoreError::Invalid("base snapshot is not recorded"))?;
+        u64::try_from(row.bytes).map_err(|_| SqlStoreError::Invalid("negative size"))
+    }
+
+    /// The transactional part of [`SqlManifest::publish_chain`]. Returns with
+    /// `txn` open; the caller commits after `Won` or `Lost` and rolls back on
+    /// an error.
+    async fn chain_in(
+        txn: &DatabaseTransaction,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: &PublishChain,
+    ) -> Result<ChainStep, SqlStoreError> {
+        for record in &chain.objects {
+            Self::record_in(txn, db, record).await?;
+        }
+        let mut current = expected.cloned();
+        let mut base_bytes = None;
+        for (i, record) in chain.objects.iter().enumerate() {
+            let obj = &record.key;
+            let kind = match (obj.kind(), &current) {
+                (ObjectKind::Snapshot, _) if i > 0 => {
+                    return Err(SqlStoreError::Invalid(
+                        "only the first object of a chain can be a snapshot",
+                    ))
+                }
+                (ObjectKind::Snapshot, Some(f)) if &f.lineage != obj.lineage() => {
+                    PublishKind::LineageSwitch
+                }
+                (ObjectKind::Snapshot, _) => PublishKind::Snapshot,
+                (ObjectKind::Segment, Some(f)) if record.format == DELTA_FORMAT => {
+                    PublishKind::Delta {
+                        base_snapshot_key: f.base_snapshot_key.clone(),
+                    }
+                }
+                (ObjectKind::Segment, Some(f)) => PublishKind::Segment {
+                    base_snapshot_key: f.base_snapshot_key.clone(),
+                },
+                (ObjectKind::Segment, None) => {
+                    return Err(SqlStoreError::Invalid("a segment needs a published base"))
+                }
+            };
+            let frontier_bytes = match (&kind, base_bytes) {
+                // A delta adds its bytes to the chain the frontier needs.
+                (PublishKind::Delta { .. }, _) => {
+                    current.as_ref().map_or(0, |f| f.frontier_bytes) + record.bytes
+                }
+                (PublishKind::Segment { .. }, Some(base)) => base + record.bytes,
+                (PublishKind::Segment { base_snapshot_key }, None) => {
+                    let base = Self::object_bytes(txn, db, base_snapshot_key).await?;
+                    base_bytes = Some(base);
+                    base + record.bytes
+                }
+                _ => {
+                    base_bytes = Some(record.bytes);
+                    record.bytes
+                }
+            };
+            let token = current.as_ref().map(Frontier::token);
+            let publish = Publish {
+                kind,
+                object: obj.clone(),
+                base_checkpoint_cid: chain.base_checkpoint_cid.clone(),
+                frontier_bytes,
+                publish_id: chain.publish_id.clone(),
+                now: chain.now.clone(),
+            };
+            check_publish(&publish, token.as_ref())?;
+            match Self::publish_in(txn, db, token.as_ref(), &publish).await? {
+                PublishStep::Lost if i == 0 => return Ok(ChainStep::Lost),
+                PublishStep::Lost => {
+                    return Err(SqlStoreError::Invalid(
+                        "publish chain lost its CAS after the first object",
+                    ))
+                }
+                PublishStep::Won(Some(frontier)) => current = Some(frontier),
+                PublishStep::Won(None) => {
+                    return Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    ))
+                }
+            }
+        }
+        current
+            .map(ChainStep::Won)
+            .ok_or(SqlStoreError::Invalid("empty publish chain"))
+    }
+}
+
+/// What the transactional part of a chain publish decided.
+enum ChainStep {
+    Won(Frontier),
+    /// The first CAS lost; the inventory rows are kept.
+    Lost,
+}
+
+/// A publish's kind must match its object and the token it replaces.
+fn check_publish(publish: &Publish, expected: Option<&CasToken>) -> Result<(), SqlStoreError> {
+    let obj = &publish.object;
+    match (&publish.kind, expected) {
+        (PublishKind::Snapshot, None) if obj.kind() == ObjectKind::Snapshot => {}
+        (PublishKind::Snapshot, Some(t))
+            if obj.kind() == ObjectKind::Snapshot && obj.lineage() == &t.lineage => {}
+        (PublishKind::LineageSwitch, Some(t))
+            if obj.kind() == ObjectKind::Snapshot && obj.lineage() != &t.lineage => {}
+        (PublishKind::Segment { .. } | PublishKind::Delta { .. }, Some(t))
+            if obj.kind() == ObjectKind::Segment && obj.lineage() == &t.lineage => {}
+        _ => {
+            return Err(SqlStoreError::Invalid(
+                "publish kind does not match its inputs",
+            ))
+        }
+    }
+    match publish.kind {
+        PublishKind::Segment { .. } if obj.from_seq() != obj.base_seq() + 1 => {
+            return Err(SqlStoreError::Invalid("segment must start at base_seq + 1"))
+        }
+        PublishKind::Delta { .. } if obj.from_seq() <= obj.base_seq() + 1 => {
+            return Err(SqlStoreError::Invalid(
+                "a delta must start after base_seq + 1",
+            ))
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl SqlManifest for DbSqlManifest {
+    async fn current(&self, db: &DbRef<'_>) -> Result<Option<Frontier>, SqlStoreError> {
+        check_db(db)?;
+        Self::read(&self.db, db).await
+    }
+
+    async fn publish_cas(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&CasToken>,
+        publish: Publish,
+    ) -> Result<PublishOutcome, SqlStoreError> {
+        check_db(db)?;
+        check_publish(&publish, expected)?;
+        let txn = self.db.begin().await?;
+        let step = match Self::publish_in(&txn, db, expected, &publish).await {
+            Ok(step) => step,
+            Err(err) => {
+                let _ = txn.rollback().await;
+                return Err(err);
+            }
+        };
+        match step {
+            PublishStep::Lost => {
+                txn.rollback().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            PublishStep::Won(published) => {
+                txn.commit().await?;
+                match published {
+                    Some(frontier) => Ok(PublishOutcome::Published(frontier)),
+                    None => Err(SqlStoreError::Invalid(
+                        "manifest row vanished after publish",
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn record_object(
+        &self,
+        db: &DbRef<'_>,
+        record: &ObjectRecord,
+    ) -> Result<ObjectState, SqlStoreError> {
+        check_db(db)?;
+        Self::record_in(&self.db, db, record).await
+    }
+
+    async fn publish_chain(
+        &self,
+        db: &DbRef<'_>,
+        expected: Option<&Frontier>,
+        chain: PublishChain,
+    ) -> Result<PublishOutcome, SqlStoreError> {
+        check_db(db)?;
+        let Some(last) = chain.objects.last() else {
+            return Err(SqlStoreError::Invalid("empty publish chain"));
+        };
+        if expected.is_some_and(|f| last.key.to_seq() < f.last_seq) {
+            return Err(SqlStoreError::Invalid(
+                "publish chain would regress last_seq",
+            ));
+        }
+        let txn = self.db.begin().await?;
+        match Self::chain_in(&txn, db, expected, &chain).await {
+            Ok(ChainStep::Won(frontier)) => {
+                txn.commit().await?;
+                Ok(PublishOutcome::Published(frontier))
+            }
+            Ok(ChainStep::Lost) => {
+                txn.commit().await?;
+                Ok(PublishOutcome::Lost(Self::read(&self.db, db).await?))
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     async fn list_objects(
@@ -589,38 +820,6 @@ impl SqlManifest for DbSqlManifest {
                 })
             })
             .collect()
-    }
-
-    async fn mark_orphans(&self, db: &DbRef<'_>, older_than: &str) -> Result<u64, SqlStoreError> {
-        check_db(db)?;
-        Ok(object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Orphan.as_str()),
-            )
-            .filter(object::Column::Space.eq(db.space))
-            .filter(object::Column::DbId.eq(db.db_id))
-            .filter(object::Column::State.eq(ObjectState::Uploaded.as_str()))
-            .filter(object::Column::CreatedAt.lt(older_than))
-            .exec(&self.db)
-            .await?
-            .rows_affected)
-    }
-
-    async fn revive_object(&self, db: &DbRef<'_>, key: &ObjectKey) -> Result<bool, SqlStoreError> {
-        check_db(db)?;
-        Ok(object::Entity::update_many()
-            .col_expr(
-                object::Column::State,
-                Expr::value(ObjectState::Uploaded.as_str()),
-            )
-            .col_expr(object::Column::CreatedAt, Expr::value(now_timestamp()))
-            .filter(object_pk(db, key)?)
-            .filter(object::Column::State.eq(ObjectState::Orphan.as_str()))
-            .exec(&self.db)
-            .await?
-            .rows_affected
-            == 1)
     }
 }
 
@@ -1034,34 +1233,20 @@ mod tests {
         let f = first(&m, &Lineage::random(), 5).await;
         let key = seg(&f.lineage, 5, 6, 7, "o");
         record(&m, &key).await;
-        // The reconciler marks it; a publisher that read it as `uploaded` now
-        // finds it orphaned and its CAS rolls back.
-        assert_eq!(m.mark_orphans(&DB, "9999").await.unwrap(), 1);
         let kind = PublishKind::Segment {
             base_snapshot_key: f.base_snapshot_key.clone(),
         };
-        assert!(matches!(
-            m.publish_cas(&DB, Some(&f.token()), publish(kind.clone(), &key, CID))
-                .await,
-            Err(SqlStoreError::ObjectNotUploaded)
-        ));
-        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f, "CAS rolled back");
-        // Reuse needs an explicit revive; recording alone reports `orphan`.
-        assert_eq!(state_of(&m, &key).await, ObjectState::Orphan);
-        assert!(m.revive_object(&DB, &key).await.unwrap());
-        assert!(!m.revive_object(&DB, &key).await.unwrap());
         let PublishOutcome::Published(f2) = m
             .publish_cas(&DB, Some(&f.token()), publish(kind, &key, CID))
             .await
             .unwrap()
         else {
-            panic!("publish after revive lost");
+            panic!("publish lost");
         };
         assert_eq!(f2.last_seq, 7);
-        // The reconciler never touches a published row.
-        assert_eq!(m.mark_orphans(&DB, "9999").await.unwrap(), 0);
+        // Recording again is idempotent and reports the flipped state.
         assert_eq!(state_of(&m, &key).await, ObjectState::Published);
-        // An object that was never recorded cannot be published either.
+        // An object that was never recorded cannot be published.
         let ghost = seg(&f2.lineage, 5, 6, 20, "ghost");
         assert!(matches!(
             m.publish_cas(
@@ -1078,7 +1263,11 @@ mod tests {
             .await,
             Err(SqlStoreError::ObjectNotUploaded)
         ));
-        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+        assert_eq!(
+            m.current(&DB).await.unwrap().unwrap(),
+            f2,
+            "CAS rolled back"
+        );
     }
 
     /// A publish whose read-back fails in Rust after the manifest row UPDATE
@@ -1306,26 +1495,100 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         }
     }
 
-    async fn revive_restarts_the_orphan_clock(m: DbSqlManifest) {
-        let l = Lineage::random();
-        let a = snap(&l, 1, "revive");
-        let rec = ObjectRecord {
-            key: a.clone(),
-            format: "sqlite-v1".into(),
+    fn rec(key: &ObjectKey) -> ObjectRecord {
+        ObjectRecord {
+            key: key.clone(),
+            format: required_format(key.kind()).into(),
             bytes: 10,
-            created_at: "2020-01-01T00:00:00Z".into(),
+            created_at: "2026-10-21T00:00:00Z".into(),
+        }
+    }
+
+    fn chain(keys: &[&ObjectKey]) -> PublishChain {
+        PublishChain {
+            objects: keys.iter().map(|k| rec(k)).collect(),
+            base_checkpoint_cid: CID.into(),
+            publish_id: PublishId::random(),
+            now: "2026-10-21T00:01:00Z".into(),
+        }
+    }
+
+    async fn chain_bootstrap_publishes_snapshot_and_segment_atomically(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let (s, g) = (snap(&l, 0, "boot"), seg(&l, 0, 1, 7, "wal"));
+        let PublishOutcome::Published(f) =
+            m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap()
+        else {
+            panic!("bootstrap chain lost");
         };
-        m.record_object(&DB, &rec).await.unwrap();
-        let cutoff = "2021-01-01T00:00:00.000000Z";
-        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 1);
-        assert!(m.revive_object(&DB, &a).await.unwrap());
-        let listed = m
-            .list_objects(&DB, Some(ObjectState::Uploaded))
+        assert_eq!(
+            (
+                f.base_seq,
+                f.last_seq,
+                f.frontier_bytes,
+                f.base_snapshot_key.as_str()
+            ),
+            (0, 7, 20, s.as_str())
+        );
+        assert_eq!(f.base_checkpoint_cid, CID);
+        assert_eq!(state_of(&m, &s).await, ObjectState::Published);
+        assert_eq!(state_of(&m, &g).await, ObjectState::Published);
+    }
+
+    async fn chain_lost_first_cas_keeps_the_inventory(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l = Lineage::random();
+        let (s, g) = (snap(&l, 0, "late"), seg(&l, 0, 1, 9, "late-wal"));
+        let current = lost(m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap());
+        assert_eq!(current.unwrap(), f);
+        assert_eq!(state_of(&m, &s).await, ObjectState::Uploaded);
+        assert_eq!(state_of(&m, &g).await, ObjectState::Uploaded);
+    }
+
+    async fn chain_switches_lineage_then_appends_on_the_recorded_base(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l2 = Lineage::random();
+        let (s, g) = (snap(&l2, 0, "switch"), seg(&l2, 0, 1, 9, "switch-wal"));
+        let PublishOutcome::Published(f2) = m
+            .publish_chain(&DB, Some(&f), chain(&[&s, &g]))
             .await
-            .unwrap();
-        assert_eq!(listed.len(), 1);
-        assert!(listed[0].created_at.as_str() > cutoff);
-        assert_eq!(m.mark_orphans(&DB, cutoff).await.unwrap(), 0);
+            .unwrap()
+        else {
+            panic!("switch chain lost");
+        };
+        assert_eq!((f2.lineage.clone(), f2.last_seq), (l2.clone(), 9));
+        assert!(f2.revision > f.revision, "revision stays monotonic");
+        // A segment-only chain sizes its frontier from the recorded base.
+        let g2 = seg(&l2, 0, 1, 12, "more-wal");
+        let PublishOutcome::Published(f3) = m
+            .publish_chain(&DB, Some(&f2), chain(&[&g2]))
+            .await
+            .unwrap()
+        else {
+            panic!("segment chain lost");
+        };
+        assert_eq!((f3.last_seq, f3.frontier_bytes), (12, 20));
+        assert_eq!(f3.base_snapshot_key, s.as_str());
+    }
+
+    async fn chain_loss_after_the_first_step_rolls_everything_back(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let l = f.lineage.clone();
+        // The segment names a base the snapshot step does not leave behind.
+        let (s, g) = (snap(&l, 9, "mid"), seg(&l, 3, 4, 12, "mid-wal"));
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), chain(&[&s, &g])).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+        assert_eq!(m.list_objects(&DB, None).await.unwrap().len(), 1);
+        // A chain ending below the frontier is refused before any write.
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), chain(&[&snap(&l, 3, "old")]))
+                .await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.list_objects(&DB, None).await.unwrap().len(), 1);
     }
 
     macro_rules! on_both {
@@ -1360,12 +1623,327 @@ CREATE TRIGGER tc1836_fail_manifest_readback BEFORE UPDATE ON sql_store_manifest
         lineage_switch_keeps_revision_monotonic,
         lost_response_is_reconciled_by_publish_id,
         state_flips_are_conditional,
+        chain_bootstrap_publishes_snapshot_and_segment_atomically,
+        chain_lost_first_cas_keeps_the_inventory,
+        chain_switches_lineage_then_appends_on_the_recorded_base,
+        chain_loss_after_the_first_step_rolls_everything_back,
         inventory_listing_and_conflicts,
         concurrent_publishers_have_one_winner,
         object_format_must_match_its_kind,
         created_at_is_stored_canonically,
-        revive_restarts_the_orphan_clock,
         segment_from_must_follow_base_seq,
         object_state_flip_checks_the_format,
+    );
+
+    // ---- TC-1491 P3: wal-delta-v1 ---------------------------------------
+
+    fn delta_rec(key: &ObjectKey) -> ObjectRecord {
+        ObjectRecord {
+            key: key.clone(),
+            format: DELTA_FORMAT.into(),
+            bytes: 10,
+            created_at: "2026-10-21T00:00:00Z".into(),
+        }
+    }
+
+    fn delta_kind(f: &Frontier) -> PublishKind {
+        PublishKind::Delta {
+            base_snapshot_key: f.base_snapshot_key.clone(),
+        }
+    }
+
+    /// Record `from..=to` on the frontier's base as a `wal-delta-v1` object
+    /// and publish it as one.
+    async fn delta_outcome(
+        m: &DbSqlManifest,
+        f: &Frontier,
+        from: u64,
+        to: u64,
+        tag: &str,
+    ) -> Result<PublishOutcome, SqlStoreError> {
+        let key = seg(&f.lineage, f.base_seq, from, to, tag);
+        m.record_object(&DB, &delta_rec(&key)).await.unwrap();
+        m.publish_cas(
+            &DB,
+            Some(&f.token()),
+            publish(delta_kind(f), &key, &f.base_checkpoint_cid),
+        )
+        .await
+    }
+
+    async fn publish_delta(
+        m: &DbSqlManifest,
+        f: &Frontier,
+        from: u64,
+        to: u64,
+        tag: &str,
+    ) -> Frontier {
+        match delta_outcome(m, f, from, to, tag).await.unwrap() {
+            PublishOutcome::Published(f) => f,
+            other => panic!("delta {from}..={to} lost: {other:?}"),
+        }
+    }
+
+    fn delta_chain(key: &ObjectKey, cid: &str) -> PublishChain {
+        PublishChain {
+            objects: vec![delta_rec(key)],
+            base_checkpoint_cid: cid.into(),
+            publish_id: PublishId::random(),
+            now: "2026-10-21T00:01:00Z".into(),
+        }
+    }
+
+    async fn a_delta_after_a_cumulative_segment_passes_and_a_cumulative_one_heals(
+        m: DbSqlManifest,
+    ) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "cum", CID).await else {
+            panic!("cumulative append lost");
+        };
+        // A delta continues the cumulative segment, and deltas chain.
+        let f2 = publish_delta(&m, &f1, 9, 12, "d1").await;
+        assert_eq!((f2.revision, f2.last_seq, f2.base_seq), (2, 12, 5));
+        assert_eq!(f2.base_snapshot_key, f.base_snapshot_key);
+        let f3 = publish_delta(&m, &f2, 13, 13, "d2").await;
+        assert_eq!((f3.revision, f3.last_seq), (3, 13));
+        // A cumulative segment over the whole base is still accepted after
+        // deltas (it is what heals a gap), and a delta follows it.
+        let PublishOutcome::Published(f4) = publish_segment(&m, &f3, 6, 20, "heal", CID).await
+        else {
+            panic!("healing segment lost");
+        };
+        assert_eq!((f4.revision, f4.last_seq), (4, 20));
+        let f5 = publish_delta(&m, &f4, 21, 25, "d3").await;
+        assert_eq!((f5.revision, f5.last_seq), (5, 25));
+        for key in [
+            seg(&f.lineage, 5, 9, 12, "d1"),
+            seg(&f.lineage, 5, 13, 13, "d2"),
+            seg(&f.lineage, 5, 21, 25, "d3"),
+        ] {
+            assert_eq!(state_of(&m, &key).await, ObjectState::Published);
+        }
+    }
+
+    async fn a_delta_must_start_exactly_after_the_frontier(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "cum", CID).await else {
+            panic!("cumulative append lost");
+        };
+        let f2 = publish_delta(&m, &f1, 9, 12, "d1").await;
+        // The frontier is at 12. A delta that overlaps it, or leaves a gap,
+        // loses even with the right token: the last_seq predicate is exact.
+        for (from, to, tag) in [
+            (9, 14, "overlap-from-the-start"),
+            (12, 14, "overlap-by-one"),
+            (8, 14, "overlap-the-cumulative-end"),
+            (14, 16, "gap-of-one"),
+            (20, 22, "gap"),
+        ] {
+            let current = lost(delta_outcome(&m, &f2, from, to, tag).await.unwrap());
+            assert_eq!(current.as_ref(), Some(&f2), "{tag}");
+            let key = seg(&f.lineage, 5, from, to, tag);
+            assert_eq!(state_of(&m, &key).await, ObjectState::Uploaded, "{tag}");
+        }
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+        // The cumulative rule stays lax: the same frontier accepts a segment
+        // from base_seq + 1 that overlaps what is published.
+        let PublishOutcome::Published(f3) = publish_segment(&m, &f2, 6, 13, "cum-over", CID).await
+        else {
+            panic!("cumulative segment lost");
+        };
+        assert_eq!(f3.last_seq, 13);
+        // And the exact next delta goes through.
+        assert_eq!(publish_delta(&m, &f3, 14, 16, "next").await.last_seq, 16);
+    }
+
+    async fn a_delta_starts_after_base_seq_plus_one_and_a_cumulative_segment_at_it(
+        m: DbSqlManifest,
+    ) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        // from = base_seq + 1 is a cumulative segment's place, not a delta's.
+        assert!(matches!(
+            delta_outcome(&m, &f, 6, 8, "at-base").await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        // And a cumulative segment may not start past it.
+        assert!(matches!(
+            segment_outcome(&m, &f, 7, 9, "past-base", CID).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+        // The same two refusals through a chain, where the object's recorded
+        // format picks the kind.
+        let at_base = seg(&f.lineage, 5, 6, 8, "chain-at-base");
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), delta_chain(&at_base, CID))
+                .await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        let past_base = seg(&f.lineage, 5, 7, 9, "chain-past-base");
+        assert!(matches!(
+            m.publish_chain(&DB, Some(&f), chain(&[&past_base])).await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f);
+    }
+
+    async fn the_recorded_format_must_match_the_publish_kind(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "cum", CID).await else {
+            panic!("cumulative append lost");
+        };
+        // A wal-delta-v1 object in a cumulative segment's place, published as
+        // a cumulative segment: the state flip refuses it and the whole
+        // publish rolls back.
+        let as_delta = seg(&f.lineage, 5, 6, 9, "delta-format-at-base");
+        m.record_object(&DB, &delta_rec(&as_delta)).await.unwrap();
+        assert!(matches!(
+            m.publish_cas(
+                &DB,
+                Some(&f1.token()),
+                publish(
+                    PublishKind::Segment {
+                        base_snapshot_key: f1.base_snapshot_key.clone()
+                    },
+                    &as_delta,
+                    CID
+                ),
+            )
+            .await,
+            Err(SqlStoreError::ObjectNotUploaded)
+        ));
+        // A wal-cum-v1 object in a delta's place, published as a delta (its
+        // exact last_seq predicate holds): refused the same way.
+        let as_cum = seg(&f.lineage, 5, 9, 12, "cum-format-after-base");
+        record(&m, &as_cum).await;
+        assert!(matches!(
+            m.publish_cas(
+                &DB,
+                Some(&f1.token()),
+                publish(delta_kind(&f1), &as_cum, CID)
+            )
+            .await,
+            Err(SqlStoreError::ObjectNotUploaded)
+        ));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f1);
+        for key in [&as_delta, &as_cum] {
+            assert_eq!(state_of(&m, key).await, ObjectState::Uploaded);
+        }
+    }
+
+    async fn delta_chains_add_their_bytes_and_a_cumulative_segment_replaces_them(m: DbSqlManifest) {
+        let l = Lineage::random();
+        let (s, g) = (snap(&l, 0, "boot"), seg(&l, 0, 1, 7, "wal"));
+        let PublishOutcome::Published(f) =
+            m.publish_chain(&DB, None, chain(&[&s, &g])).await.unwrap()
+        else {
+            panic!("bootstrap chain lost");
+        };
+        assert_eq!(f.frontier_bytes, 20, "snapshot + cumulative segment");
+        let d1 = seg(&l, 0, 8, 12, "d1");
+        let PublishOutcome::Published(f1) = m
+            .publish_chain(&DB, Some(&f), delta_chain(&d1, CID))
+            .await
+            .unwrap()
+        else {
+            panic!("delta chain lost");
+        };
+        assert_eq!((f1.last_seq, f1.frontier_bytes), (12, 30));
+        let d2 = seg(&l, 0, 13, 15, "d2");
+        let PublishOutcome::Published(f2) = m
+            .publish_chain(&DB, Some(&f1), delta_chain(&d2, CID))
+            .await
+            .unwrap()
+        else {
+            panic!("second delta chain lost");
+        };
+        assert_eq!((f2.last_seq, f2.frontier_bytes), (15, 40));
+        // A cumulative segment covers the base again: snapshot + itself.
+        let cum = seg(&l, 0, 1, 20, "heal");
+        let PublishOutcome::Published(f3) = m
+            .publish_chain(&DB, Some(&f2), chain(&[&cum]))
+            .await
+            .unwrap()
+        else {
+            panic!("cumulative chain lost");
+        };
+        assert_eq!((f3.last_seq, f3.frontier_bytes), (20, 20));
+        for key in [&d1, &d2] {
+            assert_eq!(state_of(&m, key).await, ObjectState::Published);
+        }
+    }
+
+    async fn a_delta_for_a_superseded_checkpoint_is_never_published(m: DbSqlManifest) {
+        let f = first(&m, &Lineage::random(), 5).await;
+        let PublishOutcome::Published(f1) = publish_segment(&m, &f, 6, 8, "cum", CID).await else {
+            panic!("cumulative append lost");
+        };
+        // A delta built on the old checkpoint, uploaded and waiting.
+        let late = seg(&f.lineage, 5, 9, 12, "late");
+        m.record_object(&DB, &delta_rec(&late)).await.unwrap();
+        // The checkpoint moves: a new snapshot and segment in a new lineage.
+        let l2 = Lineage::random();
+        let (s2, g2) = (snap(&l2, 0, "ck2"), seg(&l2, 0, 1, 9, "ck2-wal"));
+        let mut switch = chain(&[&s2, &g2]);
+        switch.base_checkpoint_cid = "ckpt-2".into();
+        let PublishOutcome::Published(f2) = m.publish_chain(&DB, Some(&f1), switch).await.unwrap()
+        else {
+            panic!("lineage switch lost");
+        };
+        // The old frontier's token is stale, and the old lineage's delta
+        // fails the CAS against the new frontier even with its token.
+        let stale = lost(
+            m.publish_cas(&DB, Some(&f1.token()), publish(delta_kind(&f1), &late, CID))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stale.as_ref(), Some(&f2));
+        assert!(matches!(
+            m.publish_cas(&DB, Some(&f2.token()), publish(delta_kind(&f1), &late, CID),)
+                .await,
+            Err(SqlStoreError::Invalid(_))
+        ));
+        // Same lineage, the right token, a delta from the new base but the
+        // old checkpoint's cid: the cid predicate loses.
+        let wrong_cid = seg(&l2, 0, 10, 12, "wrong-cid");
+        m.record_object(&DB, &delta_rec(&wrong_cid)).await.unwrap();
+        let stale = lost(
+            m.publish_cas(
+                &DB,
+                Some(&f2.token()),
+                publish(delta_kind(&f2), &wrong_cid, CID),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(stale.as_ref(), Some(&f2));
+        assert_eq!(m.current(&DB).await.unwrap().unwrap(), f2);
+        for key in [&late, &wrong_cid] {
+            assert_eq!(state_of(&m, key).await, ObjectState::Uploaded);
+        }
+        // The delta on the right checkpoint goes through.
+        let right = seg(&l2, 0, 10, 12, "right-cid");
+        m.record_object(&DB, &delta_rec(&right)).await.unwrap();
+        let PublishOutcome::Published(f3) = m
+            .publish_cas(
+                &DB,
+                Some(&f2.token()),
+                publish(delta_kind(&f2), &right, "ckpt-2"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("delta on the current checkpoint lost");
+        };
+        assert_eq!(f3.last_seq, 12);
+    }
+
+    on_both!(
+        a_delta_after_a_cumulative_segment_passes_and_a_cumulative_one_heals,
+        a_delta_must_start_exactly_after_the_frontier,
+        a_delta_starts_after_base_seq_plus_one_and_a_cumulative_segment_at_it,
+        the_recorded_format_must_match_the_publish_kind,
+        delta_chains_add_their_bytes_and_a_cumulative_segment_replaces_them,
+        a_delta_for_a_superseded_checkpoint_is_never_published,
     );
 }

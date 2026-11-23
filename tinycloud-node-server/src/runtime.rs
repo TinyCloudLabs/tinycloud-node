@@ -121,7 +121,7 @@ async fn launch_rocket(
     prometheus_port: u16,
     control: ControlPlaneServer,
     data_root: PathBuf,
-    keys: config::Keys,
+    keys: config::KeysConfig,
     public_api_port: u16,
 ) -> Result<()> {
     let shutdown = rocket.shutdown();
@@ -185,7 +185,7 @@ async fn launch_rocket(
 /// takes effect on the next (re)start, not live.
 fn spawn_tunnel_task(
     data_root: &Path,
-    keys: &config::Keys,
+    keys: &config::KeysConfig,
     public_api_port: u16,
     shutdown: watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -590,7 +590,6 @@ mod tests {
         let _telemetry_canonical = EnvGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
         let _telemetry_legacy = EnvGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _pool_canonical = EnvGuard::set("TINYCLOUD_DATABASE__MAX_CONNECTIONS", "200");
-        let _did_network = EnvGuard::set("TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS", "true");
         let _timeout_mode = EnvGuard::set("TINYCLOUD_DATABASE__STATEMENT_TIMEOUT_MODE", "local");
         let _user_timeout = EnvGuard::set("TINYCLOUD_DATABASE__TCP_USER_TIMEOUT_MS", "20000");
         let _keys_env = clear_keys_env();
@@ -606,7 +605,6 @@ mod tests {
         assert!(cfg.telemetry.enabled);
         // The pool knob is env-overridable via the double-underscore form.
         assert_eq!(cfg.database.max_connections, 200);
-        assert!(cfg.did_resolution.network_methods);
         // Absent config falls back to the hardcoded default of 100.
         assert_eq!(config::DatabaseConfig::default().max_connections, 100);
         assert_eq!(config::Config::default().database.max_connections, 100);
@@ -672,7 +670,7 @@ mod tests {
             std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(rocket_cfg.port, 8081);
-        assert_eq!(cfg.keys, config::Keys::Auto);
+        assert_eq!(cfg.keys.source, config::Keys::Auto);
     }
 
     #[::core::prelude::v1::test]
@@ -699,7 +697,7 @@ mod tests {
             std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(rocket_cfg.port, 8081);
-        assert_eq!(cfg.keys, config::Keys::Auto);
+        assert_eq!(cfg.keys.source, config::Keys::Auto);
     }
 
     #[::core::prelude::v1::test]
@@ -714,7 +712,7 @@ mod tests {
         let _cwd = CwdGuard::set(temp.path());
         let _keys_env = clear_keys_env();
         let config = legacy_config_figment().extract::<config::Config>().unwrap();
-        match config.keys {
+        match config.keys.source {
             config::Keys::Static(secret) => {
                 assert!(tinycloud_core::keys::StaticSecret::try_from(secret).is_err());
             }
@@ -743,7 +741,7 @@ mod tests {
 
         for _ in 0..2 {
             let config = legacy_config_figment().extract::<config::Config>().unwrap();
-            let config::Keys::Static(secret) = config.keys else {
+            let config::Keys::Static(secret) = config.keys.source else {
                 panic!("explicit key must select Static");
             };
             assert_eq!(
@@ -769,7 +767,7 @@ mod tests {
         let _keys_env = clear_keys_env();
         let _dstack = EnvGuard::set("TINYCLOUD_KEYS__TYPE", "Dstack");
         let config = legacy_config_figment().extract::<config::Config>().unwrap();
-        assert_eq!(config.keys, config::Keys::Dstack);
+        assert_eq!(config.keys.source, config::Keys::Dstack);
     }
 
     #[cfg(feature = "dstack")]
@@ -786,7 +784,54 @@ mod tests {
         let _keys_env = clear_keys_env();
         let _dstack = EnvGuard::set("TINYCLOUD_KEYS_TYPE", "Dstack");
         let config = legacy_config_figment().extract::<config::Config>().unwrap();
-        assert_eq!(config.keys, config::Keys::Dstack);
+        assert_eq!(config.keys.source, config::Keys::Dstack);
+    }
+
+    /// TC-3554: the compose env selects the historical-epoch source and pins
+    /// the node DID through the shipped config.
+    #[cfg(feature = "dstack")]
+    #[::core::prelude::v1::test]
+    fn shipped_config_loads_the_kms_epoch_source_and_did_pin_from_env() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("tinycloud.toml"),
+            include_str!("../../tinycloud.toml"),
+        )
+        .unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _keys_env = clear_keys_env();
+        let did = "did:key:z6Mki14g4VZeY9fra5wUt8m5DmYkmAfWDtUKecu65Kd1uWU9";
+        let _env = [
+            EnvGuard::set("TINYCLOUD_KEYS__TYPE", "DstackKmsEpoch"),
+            EnvGuard::set(
+                "TINYCLOUD_KEYS__LEGACY__KEY_RECOVERY_SOCKET",
+                "/run/key-recovery/kr.sock",
+            ),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__ROOT_EPOCH", "0"),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__KMS_ROOT_PUBKEY", "02ab"),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__APP_ID", "350d124c"),
+            EnvGuard::set("TINYCLOUD_KEYS__LEGACY__EXPECTED_DID", did),
+            EnvGuard::set("TINYCLOUD_KEYS__EXPECTED_NODE_DID", did),
+        ];
+        let config = legacy_config_figment().extract::<config::Config>().unwrap();
+        assert_eq!(
+            config.keys,
+            config::KeysConfig {
+                source: config::Keys::DstackKmsEpoch(config::DstackKmsEpoch {
+                    legacy: config::LegacyKmsEpoch {
+                        key_recovery_socket: Some("/run/key-recovery/kr.sock".into()),
+                        kms_url: None,
+                        kms_ca_cert: None,
+                        root_epoch: 0,
+                        kms_root_pubkey: "02ab".into(),
+                        app_id: "350d124c".into(),
+                        expected_did: did.into(),
+                    },
+                }),
+                expected_node_did: Some(did.into()),
+            }
+        );
     }
 
     #[cfg(feature = "dstack")]
@@ -811,7 +856,7 @@ mod tests {
         let figment = serve_config_figment(&missing_config).unwrap();
         let cfg = figment.extract::<config::Config>().unwrap();
 
-        assert_eq!(cfg.keys, config::Keys::Dstack);
+        assert_eq!(cfg.keys.source, config::Keys::Dstack);
     }
 
     #[cfg(feature = "dstack")]
@@ -834,6 +879,6 @@ mod tests {
         let figment = legacy_config_figment();
         let cfg = figment.extract::<config::Config>().unwrap();
 
-        assert_eq!(cfg.keys, config::Keys::Dstack);
+        assert_eq!(cfg.keys.source, config::Keys::Dstack);
     }
 }

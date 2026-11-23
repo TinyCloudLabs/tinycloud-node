@@ -1,0 +1,415 @@
+# Reviewed gitleaks baseline (full history at ccc14ec4, gitleaks 8.30.1 with .gitleaks.toml).
+# Every entry below was reviewed on 2026-11-22; none is a live credential.
+# Do not add entries for a live secret: rotate it instead. See docs/security/required-checks.md.
+
+# .github/workflows/renewal-scheduler.yml: rust-cache shared-key name, not a credential
+c4e0b744cf72451508520ff7dc8e4be31fabdce1:.github/workflows/renewal-scheduler.yml:generic-api-key:30
+
+# docker-compose.dstack-postgres.yaml: public Phala app id (TINYCLOUD_KEYS__LEGACY__APP_ID), not a credential
+3f66adcb7690b5796023a3cf755cfdcac94e1e13:docker-compose.dstack-postgres.yaml:generic-api-key:45
+58a9ae5874a034a076717e70c034c90bc24f6720:docker-compose.dstack-postgres.yaml:generic-api-key:42
+c3454c451edc230509bc440a7b9217041b435446:docker-compose.dstack-postgres.yaml:generic-api-key:44
+f2aa15ac724ddf5ee720b3d730fb483236afefdb:docker-compose.dstack-postgres.yaml:generic-api-key:45
+
+# docs/specs/stop-reenable-contract-v1.md: test UCANs copied from renewal fixtures (did:key test issuers, expired)
+693d68e7928978e1100b927834592549d7ac7bbf:docs/specs/stop-reenable-contract-v1.md:jwt:148
+693d68e7928978e1100b927834592549d7ac7bbf:docs/specs/stop-reenable-contract-v1.md:jwt:189
+693d68e7928978e1100b927834592549d7ac7bbf:docs/specs/stop-reenable-contract-v1.md:jwt:230
+de6146255b7156909039fcff594ffec8a39ffbc4:docs/specs/stop-reenable-contract-v1.md:jwt:148
+de6146255b7156909039fcff594ffec8a39ffbc4:docs/specs/stop-reenable-contract-v1.md:jwt:189
+de6146255b7156909039fcff594ffec8a39ffbc4:docs/specs/stop-reenable-contract-v1.md:jwt:230
+
+# fixtures/tenant_authorization_v1.json: TC-475 golden HMAC test vector (file since removed)
+08648407b2c81488fd65c99297b4bd6454b5f8bc:fixtures/tenant_authorization_v1.json:generic-api-key:1
+182c3cdea5a0e9e29091432196ad08f39bb79af3:fixtures/tenant_authorization_v1.json:generic-api-key:1
+3d51864ccd4a59d625f5a87de82309c97455cc39:fixtures/tenant_authorization_v1.json:generic-api-key:1
+42b076e37fb0f45016c25947d2f29a9363d6c5b5:fixtures/tenant_authorization_v1.json:generic-api-key:1
+
+# scripts/ci/fixtures/tc959-n0-compose.yaml: public Phala app id in the N0 compose fixture
+3f66adcb7690b5796023a3cf755cfdcac94e1e13:scripts/ci/fixtures/tc959-n0-compose.yaml:generic-api-key:45
+ed03ea5c49923e453aee86473e8242bb3b3ae0a1:scripts/ci/fixtures/tc959-n0-compose.yaml:generic-api-key:45
+
+# test/docker-compose.yml: public dev default static node-key secret (same value as tinycloud.toml before 7a704a10); local test compose only
+63890ba902fb88e76881747874700aa6edce5555:test/docker-compose.yml:generic-api-key:22
+
+# test/m1-realdata-e2e/vendor/MANIFEST.json: content hashes / git revisions of vendored files
+2ad3cef916264f038bb910a3d087935dcfbd5bb1:test/m1-realdata-e2e/vendor/MANIFEST.json:generic-api-key:33
+2ad3cef916264f038bb910a3d087935dcfbd5bb1:test/m1-realdata-e2e/vendor/MANIFEST.json:generic-api-key:65
+7c14e53cd2f8cd91e45e716e0f90ad7724818c19:test/m1-realdata-e2e/vendor/MANIFEST.json:generic-api-key:95
+
+# test/m1-realdata-e2e/vendor/grant-output/accept.json: vendored M1 test outputs: test UCANs (expired) and did:key placeholders
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/accept.json:jwt:191
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/accept.json:jwt:205
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/accept.json:jwt:75
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/accept.json:jwt:78
+
+# test/m1-realdata-e2e/vendor/grant-output/audit-reject.json: vendored M1 test outputs: test UCANs (expired) and did:key placeholders
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:11
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:167
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:178
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:253
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:257
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:268
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:343
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/audit-reject.json:jwt:92
+
+# test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json: vendored M1 test outputs: test UCANs (expired) and did:key placeholders
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:11
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:173
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:254
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:338
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:419
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:497
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/node-import-reject.json:jwt:92
+
+# test/m1-realdata-e2e/vendor/grant-output/producer-reject.json: vendored M1 test outputs: test UCANs (expired) and did:key placeholders
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:104
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:11
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:183
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:269
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:355
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:441
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:524
+0ad0fb7ac5d63f68ddfe48e3d8579ca6504af28c:test/m1-realdata-e2e/vendor/grant-output/producer-reject.json:jwt:604
+
+# test/m1-realdata-e2e/vendor/opencredentials/opencredentials_verify/src/lib.rs: vendored M1 test outputs: test UCANs (expired) and did:key placeholders
+7c14e53cd2f8cd91e45e716e0f90ad7724818c19:test/m1-realdata-e2e/vendor/opencredentials/opencredentials_verify/src/lib.rs:generic-api-key:664
+
+# test/probe/probe-core.test.ts: well-known public web3.js documentation example private key, used as a redaction probe
+1d59143ac329fa454ae05914fe660d88e76a11a7:test/probe/probe-core.test.ts:generic-api-key:18
+5f37b914038d00172d48e81749df2f6d6cf1af10:test/probe/probe-core.test.ts:generic-api-key:21
+
+# tinycloud-auth/src/share_email_evidence.rs: did:key multibase public key assigned to a `key` variable in tests
+3227a000ee2b86ffe016533ba7f52418ab5c719c:tinycloud-auth/src/share_email_evidence.rs:generic-api-key:821
+4a93060ba7d2a18066d2dfcdf191d9d411b09dde:tinycloud-auth/src/share_email_evidence.rs:generic-api-key:826
+b4b8a66054c1a44aad7f8667f73a002fef211d12:tinycloud-auth/src/share_email_evidence.rs:generic-api-key:819
+
+# tinycloud-auth/tests/fixtures/openkey-owner-retirement.json: test fixtures: test UCANs (expired or test-key issuers)
+5e29a2a6d07954e448cc67315f2b5d28a288a24d:tinycloud-auth/tests/fixtures/openkey-owner-retirement.json:generic-api-key:1
+5e29a2a6d07954e448cc67315f2b5d28a288a24d:tinycloud-auth/tests/fixtures/openkey-owner-retirement.json:jwt:1
+
+# tinycloud-auth/tests/fixtures/recipient-did-v2.json: test fixtures: test UCANs (expired or test-key issuers)
+c9164b0527fdf52e2cb9ddc729d065f15e1a65f4:tinycloud-auth/tests/fixtures/recipient-did-v2.json:jwt:12
+
+# tinycloud-core/src/did_resolution.rs: did:key multibase public key assigned to a `key` variable in tests
+1557ca9a5291346270188908bb5dc8349b0cfd7d:tinycloud-core/src/did_resolution.rs:generic-api-key:346
+
+# tinycloud-core/src/encryption_network/create_network_tests.rs: did:key-shaped test placeholder (non-base58 or truncated), public identifier
+5b91e71bf3ec2b0f8cb5abd796550114a718212d:tinycloud-core/src/encryption_network/create_network_tests.rs:generic-api-key:26
+926cd4f9ed1173d3b2d3778fbcbeff18ff9c7050:tinycloud-core/src/encryption_network/create_network_tests.rs:generic-api-key:23
+ef82044be273fa281fce0b6565497aff21be86d8:tinycloud-core/src/encryption_network/create_network_tests.rs:generic-api-key:26
+
+# tinycloud-core/src/models/delegation.rs: did:key-shaped test placeholder (non-base58 or truncated), public identifier
+37f62fee9021541f78386ccdd6a1ff44c2cdca6c:tinycloud-core/src/models/delegation.rs:generic-api-key:1364
+37f62fee9021541f78386ccdd6a1ff44c2cdca6c:tinycloud-core/src/models/delegation.rs:generic-api-key:1378
+ee19150b3d5a0e19d36244a33793b31361df20b1:tinycloud-core/src/models/delegation.rs:generic-api-key:1335
+ee19150b3d5a0e19d36244a33793b31361df20b1:tinycloud-core/src/models/delegation.rs:generic-api-key:1349
+
+# tinycloud-core/src/policy_authority/mod.rs: did:key-shaped test placeholder (non-base58 or truncated), public identifier
+eb11047419e4408a38f2c3935d466f0b4b5975e0:tinycloud-core/src/policy_authority/mod.rs:generic-api-key:2358
+
+# tinycloud-core/tests/fixtures/key-wrap-v2.json: generated test fixtures: test-key UCANs, digests, lookup ids, wrapped test keys
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:21
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:43
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:58
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:67
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:82
+f50398480b4b063b1a4d576c9d4e45a924c87a9b:tinycloud-core/tests/fixtures/key-wrap-v2.json:generic-api-key:86
+
+# tinycloud-core/tests/fixtures/registry-v2.json: generated test fixtures: test-key UCANs, digests, lookup ids, wrapped test keys
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:184
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:237
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:258
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:313
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:374
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:429
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:483
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:5
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:541
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:604
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:61
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:662
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:716
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:770
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:824
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:878
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:932
+17a9ff0fedb2296b32ab2e67399d830197b52925:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:987
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:184
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:237
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:258
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:313
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:374
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:429
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:483
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:5
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:541
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:604
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:61
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:662
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:716
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:770
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:824
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:878
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:932
+72e1f7609e914a69c4d289c90a3ef4709d249490:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:987
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:184
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:237
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:258
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:313
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:374
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:429
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:483
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:5
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:541
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:604
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:61
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:662
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:716
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:770
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:824
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:878
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:932
+a1de6730285c0cac922cae4a82d168af5d8af959:tinycloud-core/tests/fixtures/registry-v2.json:generic-api-key:987
+
+# tinycloud-core/tests/fixtures/tc1071/generated/manifest.json: generated test fixtures: test-key UCANs, digests, lookup ids, wrapped test keys
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:106
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:114
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:122
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:130
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:138
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:146
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:182
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:190
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:198
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:206
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:214
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:222
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:258
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:266
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:274
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:282
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:290
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:298
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:30
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:334
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:38
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:46
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:54
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:62
+2f1faec0a13b1b2a5aba54a526fb6cb0f7afd030:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:70
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:106
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:114
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:122
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:130
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:138
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:146
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:182
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:190
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:198
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:206
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:214
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:222
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:258
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:266
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:274
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:282
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:290
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:298
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:30
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:334
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:38
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:46
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:54
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:62
+9bbaf3bff6d57bd6b6eb342f2f1005b66c337a27:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:70
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:106
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:114
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:122
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:130
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:138
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:146
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:182
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:190
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:198
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:206
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:214
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:222
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:258
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:266
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:274
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:282
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:290
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:298
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:30
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:334
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:38
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:46
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:54
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:62
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:70
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:106
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:114
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:122
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:130
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:138
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:146
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:182
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:190
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:198
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:206
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:214
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:222
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:258
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:266
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:274
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:282
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:290
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:298
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:30
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:334
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:38
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:46
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:54
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:62
+d13f174841c55cf93f774a5e8141d67ef2b49474:tinycloud-core/tests/fixtures/tc1071/generated/manifest.json:jwt:70
+
+# tinycloud-node-server/src/held_email.rs: well-known Anvil dev account #1 private key (test)
+9f3eb78f1d98dc493c5be8863754d43f7a234e93:tinycloud-node-server/src/held_email.rs:generic-api-key:2061
+
+# tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json: generated test fixtures: test-key UCANs, digests
+1135f33f78e37706647cf2b4dc628aaa847f7295:tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json:jwt:101
+1135f33f78e37706647cf2b4dc628aaa847f7295:tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json:jwt:85
+1135f33f78e37706647cf2b4dc628aaa847f7295:tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json:jwt:89
+1135f33f78e37706647cf2b4dc628aaa847f7295:tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json:jwt:93
+1135f33f78e37706647cf2b4dc628aaa847f7295:tinycloud-node-server/test-fixtures/tc-405-compact-authorization.json:jwt:97
+
+# tinycloud-node-server/test-fixtures/tc-500-policy-presentation-v4.json: generated test fixtures: test-key UCANs, digests
+a3368166e6106a4b0588f6aee705e03487c2befd:tinycloud-node-server/test-fixtures/tc-500-policy-presentation-v4.json:generic-api-key:14
+b473c36ff86687a3b632e81f784c3fede56ee114:tinycloud-node-server/test-fixtures/tc-500-policy-presentation-v4.json:generic-api-key:14
+
+# tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1546
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1588
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1651
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1693
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1757
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1799
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1862
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1904
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:1967
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:2009
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:2072
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:2114
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:2177
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:2219
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:807
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/negative.json:generic-api-key:856
+
+# tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1084
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1126
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1252
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1409
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1545
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1610
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:164
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1658
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1778
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1916
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:1966
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2133
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2200
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:223
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2246
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2272
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2291
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2567
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2615
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:271
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2765
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:2928
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:379
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:499
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:543
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:704
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:759
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:799
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:825
+d510fbf3394f04ffb9a9104be0c87d8007405036:tinycloud-node-server/tests/fixtures/email-claim-v1/positive.json:generic-api-key:844
+
+# tinycloud-node-server/tests/fixtures/held-email-v1/gen-s1-differential.mjs: well-known Anvil dev account #0 private key (test generator)
+647a06843ecdd175bbb38c6724dabfdb374a2b24:tinycloud-node-server/tests/fixtures/held-email-v1/gen-s1-differential.mjs:generic-api-key:18
+
+# tinycloud-node-server/tests/fixtures/renewal-lease-v1.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+dba6ead8349e79ee0ee9715086b0dfcac5724477:tinycloud-node-server/tests/fixtures/renewal-lease-v1.json:jwt:15
+dba6ead8349e79ee0ee9715086b0dfcac5724477:tinycloud-node-server/tests/fixtures/renewal-lease-v1.json:jwt:19
+
+# tinycloud-node-server/tests/fixtures/renewal-state-v1.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+693d68e7928978e1100b927834592549d7ac7bbf:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:30
+693d68e7928978e1100b927834592549d7ac7bbf:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:62
+693d68e7928978e1100b927834592549d7ac7bbf:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:91
+74f2ea5150608d9fbb51495f6a14095c6b226729:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:30
+74f2ea5150608d9fbb51495f6a14095c6b226729:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:62
+74f2ea5150608d9fbb51495f6a14095c6b226729:tinycloud-node-server/tests/fixtures/renewal-state-v1.json:jwt:91
+
+# tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+103beecfbfc07f1b6b3ae3951e2416335c78e830:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+103beecfbfc07f1b6b3ae3951e2416335c78e830:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+103beecfbfc07f1b6b3ae3951e2416335c78e830:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:207
+103beecfbfc07f1b6b3ae3951e2416335c78e830:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:216
+103beecfbfc07f1b6b3ae3951e2416335c78e830:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:308
+8252ca0558c68991fb44673b08a74ded4ae8fc93:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+8252ca0558c68991fb44673b08a74ded4ae8fc93:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+8252ca0558c68991fb44673b08a74ded4ae8fc93:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:206
+8252ca0558c68991fb44673b08a74ded4ae8fc93:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:215
+8252ca0558c68991fb44673b08a74ded4ae8fc93:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:307
+840af87f9e44d017cdbd03cd1cc872752ef73250:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+840af87f9e44d017cdbd03cd1cc872752ef73250:tinycloud-node-server/tests/fixtures/share-v2-production/corpus.json:generic-api-key:171
+
+# tinycloud-node-server/tests/fixtures/short-links-api-vectors.json: generated test fixtures: test-key UCANs, digests, simulated-node tokens
+116355214f796ad717e706a0ba5037a1a8f62d22:tinycloud-node-server/tests/fixtures/short-links-api-vectors.json:generic-api-key:4039
+c6eaea688315886c3618c5879df131f7d2b52d83:tinycloud-node-server/tests/fixtures/short-links-api-vectors.json:generic-api-key:4039
+
+# tinycloud-node-server/tests/siwe_issuer_identity.rs: did:key-shaped test placeholder (non-base58 or truncated), public identifier
+2fad7176b87f6c8a0c2abdc9a607142b63154c71:tinycloud-node-server/tests/siwe_issuer_identity.rs:generic-api-key:464
+cc41e770e406da4cabfb51407771152c663117c1:tinycloud-node-server/tests/siwe_issuer_identity.rs:generic-api-key:475
+d9867c1b0757a97ff99b8e1751b69cfe1b2bdcdf:tinycloud-node-server/tests/siwe_issuer_identity.rs:generic-api-key:464
+ef16b051df86c04f8ea80e3abb438ab83db8aa27:tinycloud-node-server/tests/siwe_issuer_identity.rs:generic-api-key:464
+f26e636a632c2c350572e605413c6b81fa148e7b:tinycloud-node-server/tests/siwe_issuer_identity.rs:generic-api-key:464
+
+# tinycloud-threshold/vectors/v1/primitives.json: published threshold test vectors (derived test keys)
+00643ae8b445e019b45a03923caf65400102825d:tinycloud-threshold/vectors/v1/primitives.json:generic-api-key:144
+00643ae8b445e019b45a03923caf65400102825d:tinycloud-threshold/vectors/v1/primitives.json:generic-api-key:89
+8e052208d2e2023b05ef8e522c01395c3f289002:tinycloud-threshold/vectors/v1/primitives.json:generic-api-key:144
+8e052208d2e2023b05ef8e522c01395c3f289002:tinycloud-threshold/vectors/v1/primitives.json:generic-api-key:89
+
+# tinycloud.toml: public dev default static node-key secret, shipped 63890ba9..7a704a10 (TC-1282 removed it); prod uses DstackKmsEpoch
+63890ba902fb88e76881747874700aa6edce5555:tinycloud.toml:generic-api-key:25
+c35b8eccda8bdf3a214124fea237e028c78f1a3d:tinycloud.toml:generic-api-key:25
+
+# vendor/libsqlite3-sys/sqlcipher/sqlite3.c: upstream SQLite source identifiers (sqlite3_api->…), not credentials
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:141350
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:141506
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:141598
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3.c:generic-api-key:252582
+
+# vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h: upstream SQLite source identifiers (sqlite3_api->…), not credentials
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:416
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:572
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlcipher/sqlite3ext.h:generic-api-key:664
+
+# vendor/libsqlite3-sys/sqlite3/sqlite3.c: upstream SQLite source identifiers (sqlite3_api->…), not credentials
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:136840
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:136996
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:137088
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3.c:generic-api-key:248815
+
+# vendor/libsqlite3-sys/sqlite3/sqlite3ext.h: upstream SQLite source identifiers (sqlite3_api->…), not credentials
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:416
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:572
+a4d828babce8cf84c427f5e6ab97929ad6528963:vendor/libsqlite3-sys/sqlite3/sqlite3ext.h:generic-api-key:664
+
+# vendor/sqlx-postgres/src/options/mod.rs: doc comment naming the PEM header, no key material
+96253a95a670347b1abb8f20c6c699046c67c0ba:vendor/sqlx-postgres/src/options/mod.rs:private-key:299
+b4b29cb129e8428bda87f6896eb90d7242c46f0f:vendor/sqlx-postgres/src/options/mod.rs:private-key:299

@@ -28,7 +28,7 @@ env:
 # `build` job.
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -40,8 +40,8 @@ jobs:
       CARGO_TARGET_DIR: target/threshold
       PROPTEST_CASES: "1024"
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -63,7 +63,7 @@ jobs:
         echo "${tool_dir}" >> "${GITHUB_PATH}"
     - name: Check threshold dependency policy
       run: cargo deny --manifest-path tinycloud-threshold/Cargo.toml --locked --config tinycloud-threshold/deny.toml check licenses bans advisories sources
-    - uses: oven-sh/setup-bun@v2
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       with:
         bun-version: "1.4.4"
     - name: Run the independent vector checker over every committed document
@@ -76,10 +76,10 @@ jobs:
     timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -128,10 +128,10 @@ jobs:
       TINYCLOUD_TEST_BLACKHOLE: "1"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
 
@@ -211,7 +211,7 @@ jobs:
 
     - name: Retain holder history for SDK verification
       if: always() && matrix.group == 'integration-rest'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: holder-renewal-history-sdk
         path: ${{ runner.temp }}/holder-renewal-history
@@ -237,7 +237,7 @@ jobs:
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 25
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test duckdb_read_only_admin
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin
 
     # A hung PostgreSQL test holds row locks until its step is killed by the
     # timeout above. This dumps the sessions and what blocks them, so the
@@ -272,10 +272,10 @@ jobs:
     timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -298,10 +298,10 @@ jobs:
     timeout-minutes: 10
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
 
@@ -312,13 +312,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Setup Node
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
         node-version: 20
     - name: Verify generated capability artifacts match capabilities.json
@@ -346,8 +346,8 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -356,7 +356,7 @@ jobs:
         shared-key: rust-1.97.1-test-m1-realdata
         workspaces: test/m1-realdata-e2e -> target
         save-if: ${{ github.ref == 'refs/heads/main' }}
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.12"
     - name: Install M1 vector generator dependencies
@@ -382,8 +382,8 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@1.97.1
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
     - name: Resolve each fetchable workspace with --locked
       run: |
         for manifest in Cargo.toml test/m1-realdata-e2e/Cargo.toml test/load/signer/Cargo.toml; do
@@ -408,12 +408,12 @@ jobs:
       contents: read
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
 
     - name: Install reviewed Rust toolchain
-      uses: dtolnay/rust-toolchain@1.97.1
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
       with:
         components: clippy, rustfmt
     - name: Cache Rust dependencies
@@ -434,6 +434,9 @@ jobs:
     - name: Fetch pinned MinIO and mc (sha256-verified)
       run: bash scripts/at-rest-harness/harness.sh bins
 
+    - name: Harness stop tests (pid-reuse guard, vanished process)
+      run: bash scripts/at-rest-harness/test-stop.sh
+
     - name: Start the harness (native PostgreSQL, MinIO, tinycloud-node)
       run: bash scripts/at-rest-harness/harness.sh up
 
@@ -453,6 +456,101 @@ jobs:
       run: |
         (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
          cargo test --locked -p tinycloud-node --test sql_object_store -- --ignored)
+
+    - name: Harness logs
+      if: failure()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh logs "$TC887_STATE"
+        fi
+
+    - name: Stop the harness
+      if: always()
+      run: |
+        if [ -f "$TC887_STATE" ]; then
+          bash scripts/at-rest-harness/harness.sh down --purge "$TC887_STATE"
+        fi
+
+  # TC-2871 erase-30 proof: the space purge end to end on native PostgreSQL
+  # and MinIO, started by the at-rest harness from its pinned, sha256-verified
+  # binaries. `harness.sh up` also starts a lifecycle-off node on the harness
+  # bucket and database; the tests below use isolated schemas and buckets of
+  # their own beside it. The ledger bucket has Object Lock with a default
+  # COMPLIANCE retention, as in production (the ledger tests check a record
+  # lands locked); the runner's MinIO is thrown away with the run dir.
+  # Credentials stay in harness.env: each step maps them inside a subshell, so
+  # none reaches argv or the log.
+  erase30-proof:
+    name: erase-30 proof (native PostgreSQL + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      ERASE30_DATA_BUCKET: erase30-data
+      ERASE30_LEDGER_BUCKET: erase30-purge-ledger
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-erase30-proof
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Harness paths
+      run: |
+        {
+          echo "TC887_SCRATCH_ROOT=$RUNNER_TEMP/tc887"
+          echo "TC887_BIN_DIR=$RUNNER_TEMP/tc887/bin"
+          echo "TC887_RUN_DIR=$RUNNER_TEMP/tc887/harness-run-erase30"
+          echo "TC887_STATE=$RUNNER_TEMP/tc887/harness-run-erase30/state.json"
+        } >> "$GITHUB_ENV"
+
+    - name: Fetch pinned MinIO and mc (sha256-verified)
+      run: bash scripts/at-rest-harness/harness.sh bins
+
+    - name: Start native PostgreSQL and MinIO (at-rest harness)
+      run: bash scripts/at-rest-harness/harness.sh up
+
+    - name: Create the data and ledger buckets
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         export MC_CONFIG_DIR="$TC887_RUN_DIR/mc"
+         export MC_HOST_erase30="http://$TC887_S3_ACCESS_KEY_ID:$TC887_S3_SECRET_ACCESS_KEY@${TC887_S3_ENDPOINT#http://}"
+         "$TC887_BIN_DIR/mc" --quiet mb "erase30/$ERASE30_DATA_BUCKET"
+         "$TC887_BIN_DIR/mc" --quiet mb --with-lock "erase30/$ERASE30_LEDGER_BUCKET"
+         "$TC887_BIN_DIR/mc" --quiet retention set --default compliance 1d \
+           "erase30/$ERASE30_LEDGER_BUCKET")
+
+    - name: Space purge tests (against the harness PostgreSQL and MinIO)
+      timeout-minutes: 30
+      run: |
+        (set -a; . "$TC887_RUN_DIR/harness.env"; set +a
+         export TINYCLOUD_TEST_POSTGRES_URL="$TC887_PG_URL"
+         export TC735_TEST_MINIO_ENDPOINT="$TC887_S3_ENDPOINT"
+         export TC735_TEST_MINIO_BUCKET="$ERASE30_DATA_BUCKET"
+         export TC735_TEST_MINIO_LEDGER_BUCKET="$ERASE30_LEDGER_BUCKET"
+         export AWS_ACCESS_KEY_ID="$TC887_S3_ACCESS_KEY_ID"
+         export AWS_SECRET_ACCESS_KEY="$TC887_S3_SECRET_ACCESS_KEY"
+         export AWS_REGION="$TC887_S3_REGION" AWS_DEFAULT_REGION="$TC887_S3_REGION"
+         export AWS_EC2_METADATA_DISABLED=true
+         # The MinIO tests skip without these; here they must run.
+         for var in TINYCLOUD_TEST_POSTGRES_URL TC735_TEST_MINIO_ENDPOINT AWS_ACCESS_KEY_ID; do
+           [ -n "${!var}" ] || { echo "$var is empty" >&2; exit 1; }
+         done
+         cargo test --locked -p tinycloud-node --lib space_purge
+         cargo test --locked -p tinycloud-node --test space_purge_restore_prefix \
+           --test space_purge_sql_prefixes --test space_purge_end_to_end
+         cargo test --locked -p tinycloud-core --test space_purge_database \
+           --test space_purge_table_inventory --test space_purge_ledger
+         cargo test --locked -p tinycloud-core --lib -- chunks space_purge)
 
     - name: Harness logs
       if: failure()
@@ -493,7 +591,7 @@ jobs:
       run: echo "::notice title=w5 lockfile not checked::POLICY_ENGINE_DEPLOY_KEY is not available (fork PR, or the key is not added yet); the w5 --locked resolve was skipped."
     - name: Checkout TinyCloud repository
       if: env.HAS_DEPLOY_KEY == 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         persist-credentials: false
     # No toolchain action: rustup on the runner installs the toolchain pinned

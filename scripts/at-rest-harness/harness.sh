@@ -160,11 +160,16 @@ stop_recorded() {
   if kill -0 "$pid" 2>/dev/null; then
     local actual
     actual=$(proc_start "$pid" || true)
-    if [[ -z "$start" || "$actual" != "$start" ]]; then
+    # A recorded start time that is unreadable now (/proc/$pid/stat gone) means
+    # the process has exited or is exiting, not that the pid was reused: fall
+    # through to the group check. Refuse a live pid with no recorded start time,
+    # and one whose readable start time differs from the recorded one.
+    if [[ -z "$start" ]] || [[ -n "$actual" && "$actual" != "$start" ]]; then
       log "pid $pid is not the recorded $what (start time ${actual:-?} != ${start:-unrecorded}); leaving it alone"
       return 1
     fi
-  elif ! group_alive "$pid"; then
+  fi
+  if ! group_alive "$pid"; then
     log "$what (pid $pid) is not running"
     return 0
   fi
@@ -742,12 +747,15 @@ cmd_logs() {
   done
 }
 
-case ${1:-} in
-  bins) shift; cmd_bins "$@" ;;
-  up) shift; cmd_up "$@" ;;
-  down) shift; cmd_down "$@" ;;
-  test) shift; cmd_test "$@" ;;
-  status) shift; cmd_status "$@" ;;
-  logs) shift; cmd_logs "$@" ;;
-  *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect EXPECT] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
-esac
+# Dispatch only when executed: test-stop.sh sources this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case ${1:-} in
+    bins) shift; cmd_bins "$@" ;;
+    up) shift; cmd_up "$@" ;;
+    down) shift; cmd_down "$@" ;;
+    test) shift; cmd_test "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    *) die "usage: harness.sh bins | up [--no-build] | test green|red [--expect EXPECT] STATE | status STATE | logs STATE | down [--purge] STATE" ;;
+  esac
+fi

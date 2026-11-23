@@ -1,0 +1,55 @@
+name: quota-verify
+
+# TC-3881: read-only re-verification of the reviewed storage quota floors after a
+# deploy printed OVERRIDES UNVERIFIED without a quota mutation (1.26.20: a
+# transient read failed before "Restore storage quota overrides" ran). It runs
+# only scripts/ci/reconcile-quota.py, and only while ops/quota-overrides.json
+# names authority=billing, where that script is GET-only: it never PUTs or
+# DELETEs a node override and touches no CVM, compose or whitelist. In
+# node-override mode the script would restore overrides, so this refuses.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Deploy secrets, including PROD_TINYCLOUD_ADMIN_SECRET, live only here.
+    environment: production
+    steps:
+      - name: Refuse any ref but main
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::quota-verify runs only from main."
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Refuse unless the reviewed authority is billing
+        run: |
+          set -euo pipefail
+          authority="$(jq -r '.authority' ops/quota-overrides.json)"
+          if [ "$authority" != "billing" ]; then
+            echo "::error::quota-verify is read-only and runs only under authority=billing (found: ${authority})."
+            exit 1
+          fi
+
+      - name: Verify storage quota floors (read-only)
+        env:
+          # Production environment secret; never read by an agent or passed in argv.
+          QUOTA_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
+          QUOTA_BILLING_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ci/reconcile-quota.py

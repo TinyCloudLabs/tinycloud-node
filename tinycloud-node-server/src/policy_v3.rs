@@ -2293,6 +2293,22 @@ pub async fn register_policy(
         .iter()
         .flat_map(|delegation| delegation.0.spaces().cloned())
         .collect::<Vec<_>>();
+    let verified = tinycloud
+        .precheck_delegation_batch_verified(&root_delegations, &verified)
+        .await
+        .map_err(|error| {
+            let status = if matches!(
+                error,
+                tinycloud_core::db::TxError::InvalidDelegation(
+                    tinycloud_core::models::delegation::DelegationError::TerminalParentCannotRedelegate
+                )
+            ) {
+                Status::Unauthorized
+            } else {
+                Status::Forbidden
+            };
+            (status, error.to_string())
+        })?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;
@@ -2301,6 +2317,9 @@ pub async fn register_policy(
         None => None,
     };
     let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
         .await
         .map_err(db_error)?;
     let roots = [
@@ -2911,11 +2930,28 @@ pub async fn mint(
     // TC-732: per-space sequence locks before the row locks below; see
     // `register_policy`.
     let sequence_spaces = event.0.spaces().cloned().collect::<Vec<_>>();
-    // TC-2986: the node-signed session is verified before the locks below.
+    // TC-2986 + TC-3810: verify signature and preflight terminal ancestors
+    // before acquiring space/writer locks or opening the transaction.
     let verified = tinycloud
         .preverify_delegation(&event)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
+    let verified = tinycloud
+        .precheck_delegation_batch_verified(std::slice::from_ref(&event), &verified)
+        .await
+        .map_err(|error| {
+            let status = if matches!(
+                error,
+                tinycloud_core::db::TxError::InvalidDelegation(
+                    tinycloud_core::models::delegation::DelegationError::TerminalParentCannotRedelegate
+                )
+            ) {
+                Status::Unauthorized
+            } else {
+                Status::Forbidden
+            };
+            (status, error.to_string())
+        })?;
     let _sequence_guards = tinycloud
         .acquire_space_sequence_guards(&sequence_spaces)
         .await;
@@ -2924,6 +2960,9 @@ pub async fn mint(
         None => None,
     };
     let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
         .await
         .map_err(db_error)?;
     tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
@@ -3711,6 +3750,12 @@ async fn ingest_status_checkpoint_unmounted(
         }
         None
     };
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::PreviousCheckpointDigestHex,
@@ -3743,12 +3788,18 @@ async fn ingest_status_checkpoint_unmounted(
         )
         .filter(policy_v3_root::Column::RootCid.eq(request.root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "status-concurrent-update".into()));
     }
+    if state == "revoked" {
+        tinycloud_core::space_purge_records::request_all(&txn)
+            .await
+            .map_err(db_error)?;
+    }
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(StatusResponse {
         root_cid: request.root_cid,
         sequence,
@@ -3826,6 +3877,12 @@ pub async fn status(
         None,
         None,
     )?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::StatusCheckpointBytes,
@@ -3850,12 +3907,13 @@ pub async fn status(
         .filter(policy_v3_root::Column::RootCid.eq(request.root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
         .filter(policy_v3_root::Column::RevokedAt.is_null())
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "status-concurrent-update".into()));
     }
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(StatusResponse {
         root_cid: request.root_cid,
         sequence,
@@ -3994,6 +4052,12 @@ pub async fn revoke_root(
         Some(format_time(revoked_at)),
         Some(revocation_digest),
     )?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
+    tinycloud_core::space_purge_records::operation(&txn)
+        .await
+        .map_err(db_error)?;
     let updated = policy_v3_root::Entity::update_many()
         .col_expr(
             policy_v3_root::Column::StatusCheckpointBytes,
@@ -4026,12 +4090,16 @@ pub async fn revoke_root(
         .filter(policy_v3_root::Column::RootCid.eq(root_cid.clone()))
         .filter(policy_v3_root::Column::StatusSequence.eq(root.status_sequence))
         .filter(policy_v3_root::Column::RevokedAt.is_null())
-        .exec(&runtime.conn)
+        .exec(&txn)
         .await
         .map_err(db_error)?;
     if updated.rows_affected != 1 {
         return Err((Status::Conflict, "root-revocation-concurrent".into()));
     }
+    tinycloud_core::space_purge_records::request_all(&txn)
+        .await
+        .map_err(db_error)?;
+    txn.commit().await.map_err(db_error)?;
     Ok(Json(crate::routes::RevokeResponse {
         revoked: true,
         cid: root_cid,
@@ -5873,6 +5941,9 @@ async fn authenticate_account_owner(
             authorization_failure(policy_refusal(error, "account-authorization-invalid"))
         })?
         .ok_or((Status::Forbidden, "account-authorization-missing".into()))?;
+    if event.0.delegation_mode == tinycloud_core::util::DelegationMode::Invalid {
+        return Err((Status::Forbidden, "account-authorization-invalid".into()));
+    }
     if !holder_did.starts_with("did:key:") {
         return Err((Status::Forbidden, "account-holder-invalid".into()));
     }
@@ -7137,6 +7208,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(authorization.as_bytes().to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&runtime.conn)
         .await?;
@@ -12301,8 +12373,16 @@ mod test_harness;
 mod named_keys_gate_tests;
 
 #[cfg(test)]
+#[path = "policy_v3/secret_keys_tests.rs"]
+mod secret_keys_tests;
+
+#[cfg(test)]
 #[path = "policy_v3/root_revocation_tests.rs"]
 mod root_revocation_tests;
+
+#[cfg(test)]
+#[path = "policy_v3/encryption_owner_revocation_tests.rs"]
+mod encryption_owner_revocation_tests;
 
 #[cfg(test)]
 #[path = "policy_v3/registration_probe_tests.rs"]

@@ -82,6 +82,11 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/snap/{at_seq:020}-{content_hash}
 sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:020}-{content_hash}
 ```
 
+- **Two segment formats share the `seg/` key.** `wal-cum-v1` (`from_seq =
+  base_seq+1`, the whole WAL since the checkpoint) and `wal-delta-v1`
+  (`from_seq > base_seq+1`, only the WAL added after the frontier, 4.5). The
+  format is a pure function of the range, so the same key never holds both,
+  and it is recorded in the inventory's `format` column.
 - **Backend mapping.** S3: the same bucket, key exactly as above. Filesystem:
   a sibling root `{datadir}/sql-store/` (not under `blocks.path`). KV keys are
   `{space}/{base64url(hash)}` (`S3BlockStore::key`), and the filesystem KV store
@@ -150,17 +155,24 @@ sql/v1/{space_enc}/{db_enc}/{lineage}/seg/{base_seq:020}-{from_seq:020}-{to_seq:
   pure function of its content and position. Two uploaders (a stale node, a
   retry, a duplicate) producing the same range with different bytes produce
   different keys.
-- `put_if_absent(key, bytes, expected_sha256)`: if the key exists, `head`
-  must show the same length and the SHA-256 stored in object user metadata,
-  else `Conflict` (loud; never replace). It uses a conditional PUT
-  (`If-None-Match: *`). A HEAD-then-PUT fallback is acceptable **only while
-  nothing in the system deletes SQL objects** (this phase); slice 4 must
-  require the conditional PUT, or a generation/pin fence, before
+- `put_file(key, path, size)`: streams a local file to the key. The file's
+  length must equal `size` (else `Invalid`) and its SHA-256 the one in the
+  key (else `BodyMismatch`); both are checked before anything is stored. If
+  the key exists, `head` must show the same length and the SHA-256 stored in
+  object user metadata, else `Conflict` (loud; never replace). It uses a
+  conditional PUT (`If-None-Match: *`). A HEAD-then-PUT fallback is acceptable
+  **only while nothing in the system deletes SQL objects** (this phase);
+  slice 4 must require the conditional PUT, or a generation/pin fence, before
   `AlreadyPresent` may count toward a publish (the race TC-735 had).
+  `get_to_file(key, path, max_bytes)` is the streaming read; it verifies the
+  SHA-256, stops with `Oversize` once more than `max_bytes` arrive (a caller
+  passes the inventory's recorded size), and empties the target file on any
+  error, so a refused download is never read.
 - **Orphan = an object not referenced by any published manifest frontier.** A
   PUT that completed but whose CAS did not (crash, lost response, lost the
-  race) is an orphan. Nothing reads it. This phase counts and marks orphans,
-  never deletes them (4.3).
+  race) is an orphan. Nothing reads it. This phase neither marks nor deletes
+  orphans; there is no orphan state, and GC (slice 4) derives them by query
+  (4.3).
 - **[shadow only] Postgres wins.** Because Postgres is master, the manifest
   never "wins" a disagreement with the artifact. The uploader continues the
   existing lineage with a **new snapshot** when the artifact's checkpoint
@@ -193,7 +205,7 @@ The relevant behaviours on `main` that SQL must **not** inherit:
 | KV behaviour (`tinycloud-node-server/src/storage/s3.rs`) | Why unsafe for SQL |
 |---|---|
 | Key is bare `{space}/{base64(hash)}` (`key()`) | Two logical objects with equal bytes share one key; a delete for one removes the other. SQL keys are lineage/position-qualified. |
-| `persist` does `contains` (HEAD) then PUT, `increment_size` | Dedup is correct for an immutable content-addressed body but means "exists" is treated as "mine". SQL needs the length/hash check in `put_if_absent`, and it must not touch KV `sizes`. |
+| `persist` does `contains` (HEAD) then PUT, `increment_size` | Dedup is correct for an immutable content-addressed body but means "exists" is treated as "mine". SQL needs the length/hash check in `put_file`, and it must not touch KV `sizes`. |
 | `remove` does `object_size` then unconditional `DELETE` | A late or ambiguous delete can remove an object a newer reference needs (the TC-735 hazard). SQL has no delete in this phase; the trait has none. GC (slice 4) will need its own generation-safe protocol. |
 | `sizes` map seeded by listing the bucket | SQL bytes must not enter `StoreSize`/quota totals (double counting with `SqlSizes`); see 3.1. |
 
@@ -234,28 +246,37 @@ sql_store_object                                    -- PK (space, db_id, lineage
   base_seq           big_integer  not null          -- snapshot: at_seq
   from_seq, to_seq   big_integer  not null          -- snapshot: both = at_seq
   content_hash       string(64)   not null          -- lowercase hex SHA-256
-  format             string(16)   not null          -- 'sqlite-v1' | 'wal-cum-v1' (D4)
+  format             string(16)   not null          -- 'sqlite-v1' | 'wal-cum-v1' | 'wal-delta-v1' (D4)
   key                text         not null          -- full object key, derivable from the columns, not indexed
   bytes              big_integer  not null
-  state              string(16)   not null          -- 'uploaded' | 'published' | 'orphan'
+  state              string(16)   not null          -- 'uploaded' | 'published' (an 'orphan' value is never written, 4.3)
   created_at         string       not null
+
+sql_wal_mark                                        -- PK (service, space, name, revision); no FK, like the other tables
+  service, space, name string(255) not null         -- the artifact: ('sql', space, physical db name)
+  revision           big_integer  not null          -- the save (database_artifact.revision) that wrote this mark
+  checkpoint_content_hash string(255) not null      -- the checkpoint the WAL was built on
+  wal_end_bytes      big_integer  not null          -- length of the stored WAL after that save
+  wal_prefix_sha256  string(64)   not null          -- lowercase hex SHA-256 of WAL bytes [0, wal_end_bytes)
 ```
 
 Largest PK on MySQL: `(255+255+32+16+64)` chars × 4 + 3×8 = 2,512 bytes,
-under 3,072. Because the key fields are columns, frontier validation (4.2) is
+under 3,072 (`sql_wal_mark`: `3×255` chars × 4 + 8 = 3,068 bytes, also under).
+Because the key fields are columns, frontier validation (4.2) is
 a query, not key parsing. A test asserts the generated MySQL DDL (section 7).
 
 ### 4.1 Publish = upload first, CAS second
 
-Capture is defined in 5.2; sealing, hashing and `put_if_absent` happen off the
-operation lock. Then:
+Notices and the pull from Postgres are defined in 5.2; streaming to scratch,
+hashing and `put_file` happen off the operation lock and off the request
+path. Then, in **one control-database transaction** (`publish_chain`):
 
-1. `record_object`: `INSERT … ON CONFLICT DO NOTHING` the `uploaded` row. If
-   a row exists, read its state: `uploaded`/`published` with equal `bytes` and
-   `content_hash` is fine (idempotent reuse); `orphan` must be **explicitly
-   revived** with `UPDATE … SET state='uploaded' WHERE <pk> AND state='orphan'`
-   (rows_affected checked) before reuse, otherwise use a fresh key.
-2. Publish in **one metadata transaction**. The three statements, all
+1. `record_object` for every object of the publish: `INSERT … ON CONFLICT DO
+   NOTHING` the `uploaded` row. If a row exists with equal `bytes` it is
+   reused (idempotent; `content_hash` is part of the key); different `bytes`
+   fail the publish with `Conflict`. The inventory is committed even when
+   the CAS below is lost, so an uploaded object keeps its row.
+2. Publish in the same transaction. The three statements, all
    compare-and-set, each checked by `rows_affected`:
 
    - **First publish** (no manifest row): `INSERT … ON CONFLICT DO NOTHING`
@@ -280,10 +301,18 @@ operation lock. Then:
         AND base_snapshot_key=:snap AND base_checkpoint_cid=:cid
         AND last_seq >= :from_seq - 1 AND last_seq < :to_seq
      ```
-     For a delta format `from_seq = last_seq+1`, i.e. the strict
-     `last_seq = :from_seq - 1`: contiguity is a DB invariant. For
-     `wal-cum-v1` (D4, cumulative WAL since the checkpoint) `from_seq =
-     base_seq+1` always, so the clause is "no gap, and strictly advances".
+     `wal-delta-v1` (4.5) covers exactly the revisions after the frontier:
+     `from_seq = last_seq+1`, so the clause is the strict `last_seq =
+     :from_seq - 1` and contiguity is a DB invariant. The strict form is
+     written for that format only; the publish names the format it is
+     publishing (the kind of publish carries it), and the same transaction's
+     state flip (step 3) requires the object row to have been recorded with
+     it, so a delta-format object never publishes through the lax clause and
+     the reverse. For `wal-cum-v1` (D4, cumulative WAL since the checkpoint)
+     `from_seq = base_seq+1` always, so the clause is "no gap, and strictly
+     advances". A delta publishes after a cumulative segment (the frontier
+     is then at the segment's `to_seq`), and a cumulative segment publishes
+     after deltas (it is what heals a gap, 4.5).
    - **Lineage switch** (cannot continue, 3.3 shadow rule):
      ```
      UPDATE sql_store_manifest SET lineage=:new, revision=revision+1,
@@ -294,9 +323,14 @@ operation lock. Then:
      `revision` is never reset; `epoch` is unchanged.
 3. In the same transaction, flip the published object(s):
    `UPDATE sql_store_object SET state='published' WHERE <pk> AND state='uploaded'`.
-   A publish adds exactly one object (the snapshot, or the one segment); the
-   transaction **rolls back unless rows_affected = 1**. So a concurrently
-   orphaned or already-published row cannot be silently published.
+   A publish step adds exactly one object (the snapshot, or the one segment);
+   the transaction **rolls back unless rows_affected = 1**. So an
+   already-published or missing row cannot be silently published.
+4. A bootstrap or a new checkpoint with a WAL publishes a snapshot and a
+   segment as one chain: the snapshot CAS, then the segment CAS on the
+   snapshot's result, in the same transaction. Only a loss of the first CAS
+   is reported as lost (with the inventory kept); a later step that does
+   not apply rolls the whole transaction back.
 
 **On a lost CAS (0 rows):** re-read `current()`.
 - `publish_id` equals ours: the publish happened (lost response); done.
@@ -319,27 +353,37 @@ and SQLite (writers serialized), and holds no lock across the PUT.
 The **recoverable frontier** of a database is `(lineage, last_seq)` of its
 manifest row, valid if the object at `base_snapshot_key` is `published` and
 published segments of the same `lineage` and `base_seq` cover
-`base_seq+1 ..= last_seq` (one cumulative segment for `wal-cum-v1`; contiguous
-delta segments otherwise). The check is a query over the structured columns.
+`base_seq+1 ..= last_seq`: the highest published `wal-cum-v1` segment
+`base_seq+1 ..= C` and the published `wal-delta-v1` segments after it, end to
+end (`C+1 ..= D`, `D+1 ..= E`, ... ending at `last_seq`; 4.5). The check is
+a query over the structured columns.
 An `uploaded` object (PUT done, not published) is **not recoverable**, nor is
 any object outside the chain. On a gap the frontier is the last contiguous
 `seq` and the restore check reports the shortfall; it is never repaired by
-adopting an orphan.
+adopting an object outside the chain.
+
+**Restore is defined only at the recoverable frontier.** A snapshot alone is
+not a restore point unless its `at_seq` is the frontier: a bootstrap snapshot
+published with a segment is labelled `at_seq = 0` (11.6) because Postgres
+does not record the revision its checkpoint was cut at, so its `seq` is
+unknown and nothing may restore "at 0".
 
 ### 4.3 States and inventory
 
 - `uploaded`: PUT confirmed, not in a published chain (also in flight).
 - `published`: in the manifest's current chain, or in an earlier chain that
   was superseded (kept for history under the retention policy).
-- `orphan`: set by the reconciler for `uploaded` objects older than
-  `orphan_after` (24 h) not referenced by a published chain, and for objects
-  of a superseded lineage. Every transition is conditional on the **current
-  state**: `SET state='orphan' WHERE <pk> AND state='uploaded'`. The
-  reconciler never overwrites `published`; slice 4's GC consumes `orphan`, so
-  a race here would delete a chain member.
+- There is **no `orphan` state** in this phase. The column still accepts the
+  value from the slice-0 migration (no migration drops it), but nothing
+  writes it and nothing reads it. An orphan is derived when needed: an
+  `uploaded` object older than `orphan_after` that no published chain
+  references, or an object of a superseded lineage. Slice 4's GC must derive
+  it by query, under its own reference-safe protocol.
 - **This phase never deletes an object.** Operators remove the area with a
-  prefix delete (runbook). An object with no inventory row (crash between PUT
-  and INSERT) is an unregistered orphan found only by prefix listing (slice 4).
+  prefix delete (runbook). Because the inventory row is committed with the
+  publish (4.1), an object with no row is one whose PUT completed while the
+  publish transaction did not commit (crash, lost race on a new key); it is
+  found only by prefix listing (slice 4).
 - Deleting a database or space does **not** remove its store copy in this
   phase (R8; see 5.2).
 
@@ -351,6 +395,78 @@ present. The lease, drain and response-gate protocol (SCOPING "Ordered writer
 handover") is **defined there, not built here**. D3's recommendation: the
 authority is a row in the same control database, so the epoch check and the
 manifest CAS commit in one transaction.
+
+### 4.5 WAL marks and `wal-delta-v1` (TC-1491 P3)
+
+A `wal-cum-v1` segment uploads the whole WAL since the checkpoint every time
+(up to 8 MiB), so the bytes uploaded per WAL generation grow with the square
+of the number of uploads. `wal-delta-v1` uploads only the WAL bytes added
+since the frontier. Postgres stays master; the only new state is the
+`sql_wal_mark` table, and the shadow remains off (`validate_for_database`
+still refuses `enabled`).
+
+- **Marks.** `save_delta` writes one `sql_wal_mark` row, `(revision,
+  checkpoint_content_hash, wal_end_bytes, wal_prefix_sha256)`, atomically with
+  the WAL it stores. A new checkpoint (`save`, or a chunked snapshot publish)
+  deletes every mark of the database atomically with the checkpoint, because
+  a checkpoint truncates the WAL; a space purge deletes them too. A rejected
+  save leaves no mark. "Atomically" is one transaction on SQLite and with a
+  purge fence. On the PostgreSQL pool without a fence it is ONE autocommit
+  statement (a data-modifying CTE): the pool's statement timeout, its retry
+  classification and its did-the-write-apply tracking are defined over a
+  single autocommit write statement, and a `BEGIN` would change all three.
+  Marks are derived data: the migration only creates the table (`IF NOT
+  EXISTS`), `down` drops it, and without marks the uploader publishes
+  `wal-cum-v1`.
+  The shared artifact repository also writes `service='duckdb'` marks. They
+  are retained to keep the PostgreSQL CTE and transactional save paths
+  service-independent; the SQL shadow uploader reads only `service='sql'`,
+  so DuckDB marks are unused and create no block-store objects. They consume
+  database rows until the next DuckDB checkpoint or space purge deletes
+  them, under the same cleanup rules above.
+- **The WAL is append-only between our checkpoints.** SQLite appends frames
+  until `wal_checkpoint(TRUNCATE)`, which the node runs and `save` records.
+  So the WAL at revision `r` is a byte prefix of the WAL at any later revision
+  of the same checkpoint, even across a close and reopen of the database from
+  Postgres's artifact, and every `wal_end_bytes` is the end of a whole commit
+  (the stored WAL cut at a mark passes the whole-frames-ending-on-a-commit
+  check of 8.1). A test asserts both on a real SQLite database.
+- **Delta.** With the frontier at `last_seq = L` (past its snapshot) and the
+  artifact at revision `H` on the same checkpoint, the marks at `L` and `H`
+  must exist, name that checkpoint, satisfy `wal_end(L) < wal_end(H)` and
+  `wal_end(H) =` the stored WAL's length. The uploader streams the stored WAL
+  once, hashes the prefix at both marks, compares them with the marks'
+  `wal_prefix_sha256`, and writes only `[wal_end(L), wal_end(H))` to scratch.
+  The prefix hash is an **upload-time consistency check** that the stored WAL
+  still extends the one the marks were cut from; it is not a security
+  control (it sits in the same database as the bytes it covers). The object
+  is `seg/{base_seq}-{L+1}-{H}-{sha}` with `format = 'wal-delta-v1'`: **one
+  delta per upload interval, spanning every save since the frontier.**
+- **Anything else is `wal-cum-v1`**, as before: a missing, invalid or
+  other-checkpoint mark; a frontier still at its snapshot; a WAL that did not
+  grow; a prefix hash that does not match; a WAL under `delta_min_wal_bytes`
+  (scheduler setting, default 64 KiB: a small WAL is cheaper whole than
+  chained); and every 64th publish (`MAX_DELTA_CHAIN`), which bounds the
+  chain a restore walks to one cumulative segment plus at most 63 deltas. A
+  cumulative segment `base_seq+1 ..= H` supersedes the deltas before it and
+  heals a gap among them. Databases saved before the migration have no marks
+  and publish cumulative segments until their next save writes one.
+- **CAS.** A delta publishes with the strict `last_seq = from_seq - 1` (4.1),
+  checked in the CAS predicate for that format only; a cumulative segment
+  keeps `last_seq >= from_seq - 1`. A delta after a cumulative segment passes.
+  A delta for a superseded checkpoint cannot publish: the base snapshot and
+  `base_checkpoint_cid` are part of the predicate.
+- **Restore** = the snapshot, the highest published cumulative segment, and
+  the published deltas that follow it end to end up to `last_seq` (8.1). The
+  segments are concatenated into one WAL and checked as one: the salt pair
+  every frame carries, page numbers, the cumulative checksum and commit
+  boundaries. A delta cut from another WAL generation, a flipped byte, a
+  reordering or a gap is `unreadable`; a gap reports where the chain ends.
+- **Object count.** One object per upload interval that has a commit, per
+  database, whatever its format: at the default `upload_interval_secs = 60`,
+  at most 1,440 a day and **43,200 objects in a 30-day month** for a database
+  written without pause (D2's ~43k). `wal-delta-v1` changes the bytes, not
+  the count. A checkpoint adds a snapshot and its cumulative segment.
 
 ## 5. Upload and retention policy
 
@@ -392,18 +508,38 @@ and the space is in `spaces` (R8).
   empty segments; no heartbeat object.
 - **No wait-for-store on commit.** The write path never awaits an upload or a
   CAS, in any tier (Sam 10-19, v1).
+- **[shadow] Metadata-only notice, pull from Postgres.** After a save
+  commits, the write path calls `ShadowSink::notify(Notice { space, db_id,
+  revision, cid })`: synchronous, never fails, never blocks, copies no
+  bytes. The sink max-merges by revision into a map and wakes the scheduler;
+  spaces outside the allowlist are dropped there. The scheduler pulls the
+  bytes from Postgres when an upload is due (`ShadowSource`: `head`,
+  `checkpoint_to` verified against the expected cid while streaming, and
+  `wal_to`, which refuses if the artifact moved on; a move-on is a transient
+  failure and the next attempt re-reads the head). A lost notice costs
+  latency only: a keyset-paginated lag scan (no manifest row, `revision ≠
+  last_seq`, or a different checkpoint, over the allowlisted spaces, one
+  space at a time and no `IN` list) runs at startup and every `scan_every`,
+  and is also how a database with no frontier is bootstrapped (11.6). A
+  `revision` below `last_seq` is a regression (11.7). In the shadow phase the trigger
+  is `upload_interval` after the first notice; the `upload_bytes` size
+  trigger is not used, because the notice carries no sizes.
 - **Drain on planned stop.** On SIGTERM the uploader stops taking new work,
   uploads and publishes every database with an un-uploaded commit, bounded by
   the shutdown grace period; what is left is logged by count only. In the
   shadow phase an incomplete drain loses nothing (Postgres is master); in
-  [store-master] it is the data-loss boundary.
+  [store-master] it is the data-loss boundary. [shadow] `ShadowHandle::drain`
+  stops scheduling, waits for in-flight uploads up to the deadline and
+  reports, per database, `last_seq` against the newest revision it learned.
 - **Backlog cap.** [store-master] When un-uploaded bytes reach `backlog_cap`,
   new SQL writes are refused *before they start* with `503 sql_busy:
   store_backlog` and `Retry-After`, resuming below 75 % of the cap; that is a
   rejected outcome. **In the shadow phase refusing buys no durability** (Postgres
-  is master), so the cap only **sheds** the spool (section 8), counts it
-  (`sql_store_backlog_cap_exceeded_total`) and never blocks or refuses a write;
-  enforcement is `enforce_backlog_cap`, default `false` until cutover.
+  is master), and there is no spool to shed: the uploader bounds the bytes it
+  streams at once with a byte semaphore charged before streaming, and its
+  scratch files with a disk budget released on drop. It never blocks or
+  refuses a write; enforcement is `enforce_backlog_cap`, default `false`
+  until cutover.
 - **Store down.** Upload failures back off (1 s doubling to 60 s, jittered),
   keep the backlog, never fail a request, and never delete local state. A
   single log line per transition (healthy ↔ failing), SQLSTATE/HTTP class only.
@@ -446,10 +582,15 @@ impl ObjectKey {
 
 #[async_trait]
 pub trait SqlObjectStore: Send + Sync {
-    /// Create the object unless it exists. Existing with the same length and
-    /// sha256 => Ok(AlreadyPresent). Existing with different => Err(Conflict).
-    async fn put_if_absent(&self, key: &ObjectKey, body: ObjectBody, sha256: [u8; 32])
+    /// Stream the file at `path` (exactly `size` bytes, SHA-256 = the key's)
+    /// to the key unless it exists. Existing with the same length and sha256
+    /// => Ok(AlreadyPresent). Existing with different => Err(Conflict).
+    async fn put_file(&self, key: &ObjectKey, path: &Path, size: u64)
         -> Result<PutOutcome, SqlStoreError>;
+    /// Stream the whole object into `path`, verified; None when absent.
+    /// More than `max_bytes` => Err(Oversize). On any Err `path` is emptied.
+    async fn get_to_file(&self, key: &ObjectKey, path: &Path, max_bytes: u64)
+        -> Result<Option<ObjectMeta>, SqlStoreError>;
     async fn get_range(&self, key: &ObjectKey, range: ByteRangeSpec)
         -> Result<Option<ObjectRange>, SqlStoreError>;   // reuses storage::ByteRangeSpec
     async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError>;
@@ -468,12 +609,29 @@ pub trait SqlManifest: Send + Sync {
     /// Compare-and-set (4.1). Ok(Published(new)) or Ok(Lost(current)) -- losing is not an error.
     async fn publish_cas(&self, db: &DbRef, expected: Option<&CasToken>, next: PublishRequest)
         -> Result<PublishOutcome, SqlStoreError>;
-    async fn record_object(&self, db: &DbRef, obj: &ObjectRecord) -> Result<(), SqlStoreError>; // state=uploaded, idempotent
+    async fn record_object(&self, db: &DbRef, obj: &ObjectRecord) -> Result<ObjectState, SqlStoreError>; // state=uploaded, idempotent
     async fn list_objects(&self, db: &DbRef, state: Option<ObjectState>) -> Result<Vec<ObjectRecord>, SqlStoreError>;
-    /// `uploaded -> orphan` only (conditional on current state); returns rows changed.
-    async fn mark_orphans(&self, db: &DbRef, older_than: &str) -> Result<u64, SqlStoreError>;
-    /// Explicit `orphan -> uploaded` before an object is reused; false if not orphan.
-    async fn revive_object(&self, db: &DbRef, key: &ObjectKey) -> Result<bool, SqlStoreError>;
+    /// record_object for every object, then one CAS per object, in one
+    /// transaction (4.1); a lost first CAS keeps the inventory.
+    async fn publish_chain(&self, db: &DbRef, expected: Option<&Frontier>, chain: PublishChain)
+        -> Result<PublishOutcome, SqlStoreError>;
+}
+
+/// [shadow] Where the uploader reads from (5.2). `PgArtifactSource` reads the
+/// artifact repository, chunked and external layouts included, in bounded
+/// chunks.
+#[async_trait]
+pub trait ShadowSource: Send + Sync {
+    async fn head(&self, db: &DbRef) -> Result<Option<ArtifactHead>, SourceError>;
+    async fn checkpoint_to(&self, db: &DbRef, expected_cid: &str, file: &mut File)
+        -> Result<Copied, SourceError>;                  // MovedOn on a cid mismatch
+    async fn wal_to(&self, db: &DbRef, head: &Head, file: &mut File)
+        -> Result<Copied, SourceError>;                  // MovedOn once the row moved
+}
+
+/// [shadow] The save hook. Sync; never fails, never blocks.
+pub trait ShadowSink: Send + Sync {
+    fn notify(&self, notice: Notice);                  // Notice { space, db_id, revision, cid }
 }
 
 pub struct UploadPolicy { pub interval: Duration, pub max_bytes: u64, pub backlog_cap: u64,
@@ -536,6 +694,11 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   'm20261021_000000_sql_store_manifest'`; deleting the row alone would let a
   later re-upgrade inherit stale rows (which `base_checkpoint_cid` also
   guards against). The release note says so.
+  The same holds for `m20261124_000000_sql_wal_mark` (P3): rolling back past
+  it means `DROP TABLE IF EXISTS sql_wal_mark` as the table owner and
+  `DELETE FROM seaql_migrations WHERE version =
+  'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
+  matter to an older restore-check, and only if shadow was ever enabled.
 - Tests: fresh, existing-database, re-run (`up` twice), `down` then `up`, on
   SQLite and, where the repo has a Postgres harness, Postgres; MySQL DDL as
   above; `migrations/mod.rs` versions list extended.
@@ -545,34 +708,34 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
 State key: `P` = Postgres artifact (master), `O` = object in store, `I` =
 `sql_store_object` row, `M` = manifest row.
 
-**Capture point and spool (R7).** The uploader captures *inside the per-DB
-operation lock, only after `persist_write` returns Ok*, from the checkpoint /
-WAL bytes already in memory for that save, together with the artifact's
-`revision` and `checkpoint_content_hash`. It never reads `P` (that would bring
-back TC-822 whole-row loads and add TC-1274 load) and never captures before
-`P` commits. Segments must apply to `P`'s exact checkpoint bytes, so a
-`VACUUM INTO` / backup-API copy is not a valid snapshot. The lock is never held
-across PUT or CAS. The spool is bounded: at `backlog_cap` the uploader
-**sheds**: it drops pending captures, marks the database `needs_snapshot` (the
-next window cuts a full snapshot), and counts it. It never grows disk without
-limit and never blocks or refuses a write. `discard_local_state` and idle
-eviction remove the local copy, so the next window after either may need a
-snapshot.
+**Pull point (P1; replaces the R7 capture and spool).** The save hook sends a
+metadata-only notice after `persist_write` returns Ok (5.2); it copies no
+bytes and never touches disk. When an upload is due the uploader reads `P`
+itself through `ShadowSource`, off the request path and the operation lock,
+bounded by `pg_concurrency`: the checkpoint is streamed to a scratch file and
+verified against the expected `checkpoint_content_hash`, the cumulative WAL
+is read only for the exact head it planned from, and both are read in bounded
+chunks (never a whole-row load, so TC-822 is not brought back). Segments must
+apply to `P`'s exact checkpoint bytes, so the snapshot is those bytes and a
+`VACUUM INTO` / backup-API copy is never used. Scratch space is reserved
+through a disk budget released on drop and in-flight bytes through a byte
+semaphore, both charged before streaming; there is no spool and nothing to
+shed. Lock and transactions are never held across PUT or CAS.
 
 | Crash / fault point | State after | Required behaviour on restart |
 |---|---|---|
-| Before PUT | none | Re-plan from the next capture; nothing lost (`P` is master). |
-| **PUT done, before `I` insert** | `O` unregistered | Same key is recomputed (content-addressed); `put_if_absent` returns AlreadyPresent; insert `I`. If content changed, the new key differs and `O` stays an unregistered orphan. |
-| **PUT done, `I=uploaded`, before CAS** | `O`,`I`, `M` old | Not recoverable (4.2). Restart re-reads `M`, re-derives the range, reuses `O` if identical (revive if `orphan`), CASes. Orphan if superseded. |
+| Before PUT | none | The startup lag scan finds the database again; nothing lost (`P` is master). |
+| **PUT done, before `I` insert** | `O` unregistered | Same key is recomputed (content-addressed); `put_file` returns AlreadyPresent; insert `I` with the publish. If content changed, the new key differs and `O` stays an unregistered orphan. |
+| **PUT done, publish transaction not committed** | `O`, `M` old | Not recoverable (4.2). Restart re-reads `M`, re-derives the range, reuses `O` if identical, records and CASes in one transaction. |
 | **CAS committed, response lost** | `M` new | `current().publish_id` equals ours: success; never re-issue. |
-| CAS lost to another publisher | `M` differs | Per 4.1: same lineage re-derive from `last_seq+1`; matching other lineage continue it; non-matching lineage-switch (bounded). Own `O` becomes orphan. |
-| Reconciler vs publisher race | `I` flips | Both writes are `WHERE state='uploaded'`; the loser sees 0 rows. A publish whose flip hits 0 rows rolls back its CAS. |
-| Store down / 5xx / timeout | `P`, `M` unchanged | Back off; backlog grows, then sheds; requests unaffected. |
+| CAS lost to another publisher | `M` differs, `I` kept | Per 4.1: same lineage re-derive from `last_seq+1`; matching other lineage continue it; non-matching lineage-switch (bounded). Own `O` stays `uploaded`, unreferenced. |
+| Store down / 5xx / timeout | `P`, `M` unchanged | Back off; the breaker opens after repeated failures; requests unaffected. |
 | PUT OK but `head` shows different length/hash | `O` wrong | `I` is not written. No deletes; report `Conflict`, stop uploading this database, alert. |
-| **Duplicate uploader** (restart overlap, TC-1471 instance) | two PUTs, one CAS wins | Same range, same bytes: same key, harmless. Different bytes: different keys; loser orphans. Neither regresses `M` (`last_seq` clauses). |
-| Manifest stale after downgrade / re-upgrade or import | `base_checkpoint_cid` ≠ `P` | Next capture publishes a new snapshot in the same lineage; no segment is appended to the old base. |
-| `kill -9` mid-capture | partial temp | Discarded; capture is from in-memory save bytes. |
-| Metadata DB briefly down | `O` exists | As "before CAS". |
+| **Duplicate uploader** (restart overlap, TC-1471 instance) | two PUTs, one CAS wins | Same range, same bytes: same key, harmless. Different bytes: different keys; the loser's object stays unreferenced. Neither regresses `M` (`last_seq` clauses). |
+| Manifest stale after downgrade / re-upgrade or import | `base_checkpoint_cid` ≠ `P` | The next upload publishes a new snapshot in the same lineage (a lineage switch at `at_seq = 0` if a WAL rides on it); no segment is appended to the old base. |
+| `kill -9` mid-stream | partial scratch file | Discarded (temporary file, budget released); the next attempt re-reads `P`. |
+| `P` moved on mid-stream | scratch for an old head | `MovedOn`: a transient failure; the next attempt plans from the new head. |
+| Metadata DB briefly down | `O` exists | As "publish transaction not committed". |
 
 **Slice 1a tests (separate PR):** `kill -9` before reservation; after
 reservation before COMMIT; after COMMIT before artifact save; after save
@@ -581,12 +744,9 @@ transaction is rejected before COMMIT, counted against an external ack log.
 
 **Slice 1b tests (separate PR):** fault-injecting `SqlObjectStore` /
 `SqlManifest` wrappers drive every row above in process; `kill -9` of a real
-node at PUT, `I`, CAS and drain. Nightly **restore check**: rebuild sampled
-databases from the published chain onto an empty disk, `PRAGMA
-integrity_check` = `ok`, and per-table row count + ordered row digest equal to
-`P` replayed to the same `seq` (or restricted to databases quiescent for a
-window). Flag-off test: no store requests, no manifest queries. Allowlist test:
-empty allowlist uploads nothing even with `enabled = true`.
+node at PUT, `I`, CAS and drain. Nightly **restore check**: see 8.1. Flag-off
+test: no store requests, no manifest queries. Allowlist test: empty allowlist
+uploads nothing even with `enabled = true`.
 
 **Slice 0 tests (this PR):** key properties (injective over the generated
 space/db/lineage/seq/hash domain; **also injective after ASCII case folding**;
@@ -601,14 +761,79 @@ keeps `revision` monotonic, first publish is `ON CONFLICT DO NOTHING`, a
 conditional state flip with 0 rows rolls the CAS back, orphan revive;
 migration idempotence and MySQL DDL (section 7).
 
+### 8.1 Restore check (TC-1491 P2)
+
+`tinycloud node sql-store restore-check` (`shadow::restore` in the core,
+`sql_restore_check` in the node) gates turning the shadow on for a space. It
+samples up to `--sample` databases (reservoir sampling over keyset pages of
+the manifest primary key) from `[sql_store] spaces`, which it reads whether
+or not the store is enabled, and checks each:
+
+1. **Frontier only.** It reads the manifest row and resolves the chain of
+   4.2 by lookups in `sql_store_object`: the base snapshot by its full key
+   (rebuilt from the frontier's columns and the hash its key ends in), and
+   for `last_seq > base_seq` the published segments of the base: the
+   highest `wal-cum-v1` segment `base_seq+1 ..= C` with `C <= last_seq`
+   (a key-prefix lookup on `(space, db_id, lineage, 'segment', base_seq,
+   from_seq)`), then, while short of `last_seq`, the `wal-delta-v1` segment
+   that starts at `covered+1` and reaches furthest without passing
+   `last_seq`. A delta that overlaps what is covered is never chained, and two
+   published segments with the same start and end are `unreadable`. Restore =
+   the snapshot plus those segments in order. A frontier at `last_seq = 0` is
+   `unreadable` (a snapshot at `at_seq = 0` is never a restore point, 4.2 and
+   11.6). A step without a published segment is the shortfall: the reason
+   names the seq the published chain reaches (or that no segment is
+   published on the base). Every key read from the manifest or the inventory
+   must start with the database's own `{db_prefix}{lineage}/`, else
+   `unreadable: key outside db prefix`. The formats, `published` state and
+   `frontier_bytes` must agree with the inventory.
+2. **Same revision or nothing.** Postgres's head must be at revision
+   `last_seq` with the frontier's checkpoint CID; otherwise the database is
+   `not_comparable` ("not comparable at this revision") and nothing is read.
+   The check never compares across revisions.
+3. **Restore.** Scratch space for both copies is reserved from a disk budget
+   (`--scratch-dir`, `--scratch-bytes`) before streaming. Scratch holds
+   tenant databases in plaintext: every scratch directory is `0700`, every
+   file `0600`, and each directory is removed by its drop guard on every exit
+   path (success, error, early return). The snapshot and every segment of the
+   chain are streamed with `get_to_file`, capped at their recorded sizes (the
+   first segment straight into the `-wal` file, each later one into a part
+   file that is appended to it and removed); a
+   refused download is removed and never opened. Before SQLite opens the
+   pair, the database header and the whole WAL (every segment, concatenated) are checked: page sizes equal (the
+   guard against RUSTSEC-2026-0459, libsqlite3-sys < 0.39), WAL magic,
+   version, header checksum, every frame's salts, page number and cumulative
+   checksum, whole frames ending on a commit. SQLite would otherwise ignore a
+   bad header or stop at the first bad frame and silently restore an older
+   state. Then `wal_checkpoint(PASSIVE)` must have replayed every frame,
+   `wal_checkpoint(TRUNCATE)` must report `busy = 0` and `log =
+   checkpointed` and leave the WAL empty, and `PRAGMA integrity_check` must
+   be exactly `ok`.
+4. **Compare.** Postgres's checkpoint and WAL are streamed through
+   `ShadowSource` and materialised the same way; the SHA-256 of the two
+   materialised files must be equal.
+
+Results per database: `ok`; `mismatch` (a sound restore that differs from
+Postgres); `not_comparable`; `unreadable` (missing or refused objects, chain
+faults, a refused WAL, an SQLite error or an integrity failure). Reasons are
+fixed phrases with numbers; the report carries no keys, SQL or payload
+bytes. `segments_unverified` = segments the frontier needs minus segments
+streamed, checked and replayed; it is computed per database and summed.
+Metrics (`--metrics-file`, a node-exporter textfile):
+`sql_store_restore_checks_total{result}`,
+`sql_store_restore_segments_unverified_total`,
+`sql_store_restore_check_seconds`. The command fails (exit 1) when any
+database is `mismatch` or `unreadable`; `not_comparable` is reported, not
+failed.
+
 ## 9. Open decisions and gates
 
 | # | Decision | Owner | Needed by |
 |---|---|---|---|
 | D1 | **Key custody** (TC-887): enclave/KMS plus escrowed recovery wrap vs owner-held. The `v1` prefix means plaintext; an encrypted format is a new prefix. | Sam / security | Slice 2 code, and before the shadow goes beyond pilot spaces |
-| D2 | **Retention numbers** per tier (last wording 100 MB/7 d, 1 GB/30 d; paid not restated). Keep-all meanwhile; each continuously written database adds ~43k objects/month, which the S3 boot scan pages over (consider a separate SQL bucket option). | Sam | Slice 4 |
+| D2 | **Retention numbers** per tier (last wording 100 MB/7 d, 1 GB/30 d; paid not restated). Keep-all meanwhile; each continuously written database adds ~43k objects/month (one per upload interval, 4.5; the same with either segment format), which the S3 boot scan pages over (consider a separate SQL bucket option). | Sam | Slice 4 |
 | D3 | **Authority/epoch/drain**: recommended a PG row in the same control database, so the epoch check and the manifest CAS commit together. | Naomi | Slice 3; before any second node publishes |
-| D4 | **Segment format**: 1b uses cumulative WAL since the checkpoint, byte-identical to `delta_payload` (`wal-cum-v1`); restore = snapshot + highest segment. Sealed frame ranges arrive with the encrypted format. Recorded per object in `format`. | Naomi | Before 1b code |
+| D4 | **Segment format**: 1b uses cumulative WAL since the checkpoint, byte-identical to `delta_payload` (`wal-cum-v1`); restore = snapshot + highest segment. TC-1491 P3 adds `wal-delta-v1`, the WAL bytes between two marks (4.5), after the first cumulative segment of a chain, with cumulative as the fallback and every 64th publish; restore = snapshot + highest cumulative segment + the deltas after it. Sealed frame ranges arrive with the encrypted format. Recorded per object in `format`. | Naomi | Before 1b code |
 | D5 | **Conditional PUT** (`If-None-Match: *`) on the production provider, SHA-256 in user metadata. HEAD→PUT fallback only while nothing deletes. [INFERENCE: S3 supports it since 2024; R2/MinIO not verified here.] | Ops | Before 1b; mandatory before slice 4 |
 | D6 | In-place deploy keeps the data disk. | Ops | Before cutover (slice 5) |
 | D7 | **Gating**: `sql_store.spaces` allowlist, **fail-closed: empty = nothing uploads** even when `enabled = true`. | decided (R8) | Before 1b is enabled |
@@ -644,15 +869,15 @@ This section applies from slice 1b PR A. Where sections 4.1, 5.1, 5.2, 5.3 or 8 
 
 ### 11.1 Object format and kind
 
-- A snapshot is accepted only with `format = "sqlite-v1"`. A segment is accepted only with `format = "wal-cum-v1"`. Any other pairing is rejected as invalid.
-- A segment publish whose `from_seq` is not `base_seq + 1` is rejected as invalid. The manifest does not change, and the object row stays `uploaded`. This is a request error, not a lost CAS.
-- A publish moves its object row from `uploaded` to `published` only when the row's `format` is the one its kind requires.
+- A snapshot is accepted only with `format = "sqlite-v1"`. A segment is accepted only with `format = "wal-cum-v1"` or `"wal-delta-v1"`. Any other pairing is rejected as invalid.
+- A `wal-cum-v1` segment publish whose `from_seq` is not `base_seq + 1` is rejected as invalid, and so is a `wal-delta-v1` one whose `from_seq` is not above `base_seq + 1` (a delta starts after the frontier, which is at least `base_seq + 1`). The manifest does not change, and the object row stays `uploaded`. This is a request error, not a lost CAS. A `wal-delta-v1` publish whose `from_seq` is not exactly `last_seq + 1` is a lost CAS (4.1).
+- A publish moves its object row from `uploaded` to `published` only when the row's `format` is the one its kind requires: `sqlite-v1` for a snapshot, `wal-cum-v1` for a cumulative segment, `wal-delta-v1` for a delta.
 
 ### 11.2 Timestamps
 
 - `created_at` is stored as a fixed-width UTC RFC 3339 string with microseconds, `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Input with another offset is converted to UTC before it is stored.
 - Input that is not RFC 3339, or whose year is outside 0 to 9999 after conversion to UTC, is rejected as invalid.
-- Reviving an orphan object sets `created_at` to the current time. The orphan age is therefore measured from the most recent revive.
+- There is no revive (4.3): `created_at` is set once, when the row is first recorded.
 
 ### 11.3 Backend and gating
 
@@ -667,22 +892,23 @@ These keys sit under `[sql_store]`. They are checked at boot only when `enabled 
 - `drain_secs`, default 8, at least 1: time budget for draining pending uploader work at shutdown. It is set explicitly and is not derived from the HTTP server's shutdown grace or the container stop timeout.
 - `pg_concurrency`, default 2, from 1 to 4: maximum number of concurrent Postgres operations made by the uploader. Manifest reads and CAS, the sweep and bootstrap reads share this limit.
 - `snapshot_min_interval_secs`, default 900, at least 1: minimum interval between two snapshots of one database. It applies together with `snapshot_every` in section 5.3.
-- `daily_upload_byte_budget`, default 2 GiB, nonzero: bytes the uploader may upload for one database per UTC day. Captures over the budget are shed and counted. They are not queued.
-- `spool_cap`, default 1 GiB, at least `upload_bytes`: upper bound on the local spool.
+- `daily_upload_byte_budget`, default 2 GiB, nonzero: bytes the uploader may upload for one database per UTC day. An upload that would exceed it is not started; the database is blocked until the UTC day changes and then catches up from Postgres. Nothing is queued.
+- `spool_cap`, default 1 GiB, at least `upload_bytes`: in the shadow phase, the bytes uploads may stream at once and hold in scratch files (11.5).
 
-### 11.5 Rules for the uploader: spool and disk
+### 11.5 Rules for the uploader: scratch and disk
 
-- The spool reserves its bytes through the node's disk budget. Spooling does not cause a user write to fail for lack of space.
-- The capture channel is bounded in bytes, not in items.
-- The shed decision is taken before the copy. A capture that will be shed is not copied.
-- A node with `enabled = false` deletes leftover spool files at boot. Spool file names include the process ID. A lock file refuses a second process on the same data directory.
+- There is no spool and no capture channel (section 8, pull point). Uploads stream from Postgres into scratch files under the node's data directory.
+- Scratch space is reserved through the node's disk budget before the copy and released when the scratch file is dropped. A reservation that does not fit is a transient failure for that database; a user write never fails for lack of space.
+- In-flight upload bytes are bounded by a byte semaphore charged before streaming, not by a count of items.
+- Scratch files are anonymous temporary files: a crash leaves nothing that a later boot must recognise.
 
 ### 11.6 Rules for the uploader: bootstrap
 
-- The checkpoint is read guarded by `checkpoint_content_hash` only, not by `revision`. The delta is read separately, so a database that keeps committing does not block the bootstrap.
-- Exception to section 8: the bootstrap reads `P` (the checkpoint and the delta) to publish the initial snapshot. This bounded exception applies to the bootstrap read only. Capture keeps the section 8 rule that the node never reads `P`.
-- The snapshot is published as `seq = R-1` and the delta as segment `R..R`, where `R` is the current revision. Both come from one consistent read pair. If the checkpoint hash changes between the two reads, the pair is retried once and then backed off. A snapshot is never labelled with a revision it was not taken at. When a delta exists, the snapshot alone is not a restore point: restoring to `R` uses the snapshot and the highest segment. With no delta, the snapshot is `seq = R`.
-- One database is bootstrapped at a time. The bootstrap is paced, hash-verified against `checkpoint_content_hash`, run off the request path, and counted against `pg_concurrency`.
+- Bootstrap is the ordinary upload of a database without a manifest row; the lag scan finds it (at startup, then periodically). It reads `P` like every other upload (section 8).
+- The snapshot is the artifact's exact checkpoint bytes, streamed and verified against `checkpoint_content_hash`. There is no `VACUUM INTO` and no materialised copy: a segment must apply to those exact bytes.
+- Postgres does not record the revision a checkpoint was cut at, so the snapshot cannot be labelled with it. With no delta, the checkpoint is the database at the current revision `R`, and the snapshot is `at_seq = R`. With a delta, the snapshot is `at_seq = 0` and the cumulative WAL is one segment `1..=R` on it, published in the same transaction (4.1 step 4). Only `R` is a restore point (4.2); `0` names no revision. The same rule applies when a new checkpoint carries a WAL later: that publish is a lineage switch at `0`.
+- The WAL is read only for the exact head the upload planned from. If the artifact moved on (new revision or new checkpoint), the read is refused and the upload fails transiently; the next attempt plans from the new head after a backoff.
+- Bootstraps share the uploader's limits with other uploads: the job count, the byte semaphore and `pg_concurrency`. They run off the request path.
 
 ### 11.7 Rules for the uploader: revision regression
 
@@ -696,7 +922,9 @@ These keys sit under `[sql_store]`. They are checked at boot only when `enabled 
 
 ### 11.9 Tests for this section
 
-PR A tests: `object_format_must_match_its_kind`, `segment_from_must_follow_base_seq` and `object_state_flip_checks_the_format` (11.1); `created_at_is_stored_canonically`, `created_at_out_of_range_is_invalid_not_a_panic` and `revive_restarts_the_orphan_clock` (11.2); `sql_store_refuses_enable_mysql_and_non_canonical_spaces` (11.3); `sql_store_defaults_match_the_contract`, `sql_store_new_setting_defaults_and_pg_concurrency_floor`, `sql_store_new_settings_parse_and_are_bounded`, `sql_store_settings_are_checked_only_when_enabled` and `sql_store_new_settings_are_bounded_when_enabled` (11.4). The manifest tests run against SQLite and PostgreSQL.
+PR A tests: `object_format_must_match_its_kind`, `segment_from_must_follow_base_seq` and `object_state_flip_checks_the_format` (11.1); `created_at_is_stored_canonically` and `created_at_out_of_range_is_invalid_not_a_panic` (11.2; `revive_restarts_the_orphan_clock` went with the orphan state in TC-1491 P1); `sql_store_refuses_enable_mysql_and_non_canonical_spaces` (11.3); `sql_store_defaults_match_the_contract`, `sql_store_new_setting_defaults_and_pg_concurrency_floor`, `sql_store_new_settings_parse_and_are_bounded`, `sql_store_settings_are_checked_only_when_enabled` and `sql_store_new_settings_are_bounded_when_enabled` (11.4). The manifest tests run against SQLite and PostgreSQL.
+
+TC-1491 P3 tests (4.1, 4.5, 8.1): manifest `a_delta_after_a_cumulative_segment_passes_and_a_cumulative_one_heals`, `a_delta_must_start_exactly_after_the_frontier`, `a_delta_starts_after_base_seq_plus_one_and_a_cumulative_segment_at_it`, `the_recorded_format_must_match_the_publish_kind`, `delta_chains_add_their_bytes_and_a_cumulative_segment_replaces_them` and `a_delta_for_a_superseded_checkpoint_is_never_published` (SQLite and PostgreSQL); `database_artifacts` marks (`each_delta_save_writes_the_mark_of_the_wal_it_stored`, `a_checkpoint_save_drops_the_marks_of_the_artifact_it_replaces`, `a_rejected_delta_save_leaves_no_mark`, `a_mark_row_that_cannot_be_read_back_is_not_returned`); the WAL carve in `shadow::source` (marks carve the stored WAL and the pieces concatenate to the prefix, independent of the chunking, refused on a prefix mismatch); the planner cells `delta_plan::*` and the property test `mixed_cumulative_and_delta_chains_restore_the_pg_artifact_at_every_frontier` next to `lost_reordered_duplicated_notices_converge_to_the_pg_head` (mixed chains, missing marks); restore `a_delta_chain_restores_byte_exact`, `a_gap_in_the_delta_chain_reports_the_shortfall`, `a_corrupted_delta_byte_is_unreadable`, `a_delta_from_another_wal_generation_is_refused_by_its_salts`, `a_cum_segment_heals_a_delta_gap`, `a_mixed_cum_and_delta_chain_restores` and `the_wal_only_grows_between_checkpoints_and_every_mark_is_a_commit_boundary` (a real SQLite WAL).
 
 ## 12. Object store backends
 

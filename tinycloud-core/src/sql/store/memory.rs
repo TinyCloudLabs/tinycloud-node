@@ -1,11 +1,14 @@
 //! In-memory [`SqlObjectStore`] for tests.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, path::Path, sync::Mutex};
 
 use async_trait::async_trait;
 
 use super::key::ObjectKey;
-use super::object::{sha256, ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError};
+use super::object::{
+    discard_download, private_file_options, sha256, ObjectMeta, ObjectRange, PutOutcome,
+    SqlObjectStore, SqlStoreError,
+};
 use crate::storage::ByteRangeSpec;
 
 #[derive(Default)]
@@ -20,15 +23,31 @@ impl MemorySqlObjectStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// The stored bytes of `key`, for test assertions.
+    pub fn bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.objects.lock().unwrap().get(key).cloned()
+    }
+    /// Store `body` under `key` with no check at all, as a corrupt disk or a
+    /// foreign writer would; for tests of what reads do with bad bytes.
+    pub fn plant(&self, key: &str, body: Vec<u8>) {
+        self.objects.lock().unwrap().insert(key.to_owned(), body);
+    }
 }
 
 #[async_trait]
 impl SqlObjectStore for MemorySqlObjectStore {
-    async fn put_if_absent(
+    async fn put_file(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        size: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
+        let body = tokio::fs::read(path)
+            .await
+            .map_err(|e| SqlStoreError::file("read", &e))?;
+        if body.len() as u64 != size {
+            return Err(SqlStoreError::Invalid("body file size does not match"));
+        }
         if &sha256(&body) != key.sha256() {
             return Err(SqlStoreError::BodyMismatch);
         }
@@ -41,6 +60,48 @@ impl SqlObjectStore for MemorySqlObjectStore {
                 Ok(PutOutcome::Created)
             }
         }
+    }
+
+    async fn get_to_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        let Some(body) = self.bytes(key.as_str()) else {
+            return Ok(None);
+        };
+        // Written first and checked after, like a streaming backend, so a
+        // refusal must leave the target empty.
+        let result = async {
+            let delivered = &body[..body.len().min(max_bytes.saturating_add(1) as usize)];
+            let mut file = tokio::fs::OpenOptions::from(private_file_options())
+                .open(path)
+                .await
+                .map_err(|e| SqlStoreError::file("create", &e))?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, delivered)
+                .await
+                .map_err(|e| SqlStoreError::file("write", &e))?;
+            tokio::io::AsyncWriteExt::flush(&mut file)
+                .await
+                .map_err(|e| SqlStoreError::file("write", &e))?;
+            if body.len() as u64 > max_bytes {
+                return Err(SqlStoreError::Oversize);
+            }
+            let meta = ObjectMeta {
+                bytes: body.len() as u64,
+                sha256: sha256(&body),
+            };
+            if &meta.sha256 != key.sha256() {
+                return Err(SqlStoreError::BodyMismatch);
+            }
+            Ok(Some(meta))
+        }
+        .await;
+        if result.is_err() {
+            discard_download(path);
+        }
+        result
     }
 
     async fn get_range(
@@ -91,22 +152,36 @@ mod tests {
         .unwrap()
     }
 
+    fn file_with(dir: &tempfile::TempDir, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     #[tokio::test]
-    async fn put_if_absent_never_overwrites() {
+    async fn put_file_never_overwrites_and_get_to_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
         let store = MemorySqlObjectStore::default();
         let key = key_for(b"abc", 1);
+        let abc = file_with(&dir, "abc", b"abc");
         assert_eq!(
-            store.put_if_absent(&key, b"abc".to_vec()).await.unwrap(),
+            store.put_file(&key, &abc, 3).await.unwrap(),
             PutOutcome::Created
         );
         assert_eq!(
-            store.put_if_absent(&key, b"abc".to_vec()).await.unwrap(),
+            store.put_file(&key, &abc, 3).await.unwrap(),
             PutOutcome::AlreadyPresent
         );
         // Different bytes under a key that names other bytes are refused.
+        let abd = file_with(&dir, "abd", b"abd");
         assert!(matches!(
-            store.put_if_absent(&key, b"abd".to_vec()).await,
+            store.put_file(&key, &abd, 3).await,
             Err(SqlStoreError::BodyMismatch)
+        ));
+        // A declared size the file does not have is refused.
+        assert!(matches!(
+            store.put_file(&key, &abc, 4).await,
+            Err(SqlStoreError::Invalid(_))
         ));
         assert_eq!(store.len(), 1);
         assert_eq!(store.head(&key).await.unwrap().unwrap().bytes, 3);
@@ -119,6 +194,38 @@ mod tests {
             (part.start, part.total_size, part.data),
             (1, 3, b"bc".to_vec())
         );
+        let out = dir.path().join("out");
+        let meta = store.get_to_file(&key, &out, 3).await.unwrap().unwrap();
+        assert_eq!(meta.bytes, 3);
+        assert_eq!(std::fs::read(&out).unwrap(), b"abc");
         assert!(store.head(&key_for(b"zz", 2)).await.unwrap().is_none());
+        assert!(store
+            .get_to_file(&key_for(b"zz", 2), &out, 3)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_leaves_no_bytes_in_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemorySqlObjectStore::default();
+        let key = key_for(b"abc", 1);
+        let out = dir.path().join("out");
+        // More bytes than the recorded size: aborted, the target emptied.
+        store.plant(key.as_str(), b"abc".to_vec());
+        std::fs::write(&out, b"stale").unwrap();
+        assert!(matches!(
+            store.get_to_file(&key, &out, 2).await,
+            Err(SqlStoreError::Oversize)
+        ));
+        assert_eq!(std::fs::read(&out).unwrap(), b"");
+        // Bytes that do not hash to the key: refused, the target emptied.
+        store.plant(key.as_str(), b"abd".to_vec());
+        assert!(matches!(
+            store.get_to_file(&key, &out, 3).await,
+            Err(SqlStoreError::BodyMismatch)
+        ));
+        assert_eq!(std::fs::read(&out).unwrap(), b"");
     }
 }

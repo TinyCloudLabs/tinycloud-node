@@ -31,7 +31,7 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::config::Keys;
+use crate::config::KeysConfig;
 use crate::link::state::TunnelRuntimeState;
 use crate::node_control::key_provider::{self, IdentityPurpose};
 
@@ -139,7 +139,7 @@ type SharedSink = Arc<Mutex<WsSink>>;
 #[derive(Clone)]
 pub struct TunnelContext {
     pub data_root: PathBuf,
-    pub keys: Option<Keys>,
+    pub keys: Option<KeysConfig>,
     /// The loopback public API address requests are forwarded to, e.g.
     /// `127.0.0.1:8081`.
     pub upstream_addr: SocketAddr,

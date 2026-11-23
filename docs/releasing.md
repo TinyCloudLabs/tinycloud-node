@@ -63,9 +63,10 @@ The `deploy-phala` job in `docker.yml` refuses to deploy, and fails after a
 deploy, unless the `tinycloud-node` CVM reports one of:
 
 - the production image: `.os.is_dev == false` with the name and hash pinned in
-  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.12`); or
+  `PHALA_OS_IMAGE` / `PHALA_OS_IMAGE_HASH` (`dstack-0.5.15`); or
 - a dev image whose `.os.os_image_hash` is listed in
-  `scripts/ci/phala-dev-os-allowlist.txt` (today only `dstack-dev-0.5.12`), and
+  `scripts/ci/phala-dev-os-allowlist.txt` (`dstack-dev-0.5.12`, and
+  `dstack-dev-0.5.15`, which the node CVM runs since the TC-3554 KMS move), and
   that passes a fresh check in the same job: `download.dstack.org` serves
   `mr_<hash>.tar.gz`, and `sha256sum sha256sum.txt` of the extracted archive
   equals `<hash>`, and every file it lists matches (`sha256sum -c`).
@@ -73,15 +74,19 @@ deploy, unless the `tinycloud-node` CVM reports one of:
 Anything else fails closed: an unknown dev hash, a missing field, a failed fetch
 or a hash mismatch. The allowlist is changed only by a reviewed PR. The logic is
 `scripts/ci/phala-os-guard.sh`, tested by `scripts/ci/test-phala-os-guard.sh`.
+The CVM is read through `scripts/ci/phala-cvm-json.sh` (tested by
+`scripts/ci/test-phala-cvm-json.sh`), which retries an empty or non-JSON Phala
+read up to 4 times. The check after the deploy runs last, after the quota
+restore, so a failed read there fails the run without skipping the restore.
 CI never changes the OS. If the check fails, set it by hand, then re-run:
 
 ```sh
 phala cvms get tinycloud-node --json | jq .os
-phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12
+phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15
 ```
 
-`phala deploy --image/--no-dev-os` is ignored for an existing CVM; the PATCH is
-what changes the OS.
+The deploy does not pass `--image`/`--no-dev-os` (they are ignored for an
+existing CVM anyway); the PATCH is what changes the OS.
 
 ## Operator steps before a node deploy
 
@@ -146,6 +151,33 @@ operator-built index, or a database plan or size change), the release record
 must show that step's validity query output (the `SELECT` in its section), or
 the release waits. An out-of-band prerequisite listed only in a ticket or a
 note is not a gate.
+
+### Rollback plans: who owns the tables a release creates (TC-3755)
+
+A table created by a migration at boot is owned by the role the node connects
+as (in production, its own PlanetScale API role, `pscale_api_…`). The older
+tables, such as `delegation` and `seaql_migrations`, are owned by `postgres`,
+and `postgres` is not a member of the node's role. An operator role that
+inherits `postgres` can therefore alter the old tables but **cannot `DROP` a
+table the release creates**. Only the node's own sealed credential can, or a
+PlanetScale `roles/{id}/reassign`, which changes ownership in production and
+needs its own GO. This bit 1.26.18: the pre-deploy ownership read of the
+existing tables passed, but `session_retire` and `sql_store_owner` were then
+created under the node's role, and the staged down-migration could not run.
+
+So, for any release whose migrations create tables:
+
+1. A pre-deploy ownership check of existing tables **does not prove** that a
+   down-migration is runnable. The release plan states the rollback as
+   fix-forward only, unless its down path drops nothing the release creates.
+2. Re-read the owners of the new tables on the replica after the deploy
+   (`SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public'
+   AND tablename IN (...)`) and record them in the release record.
+3. Deleting a migration's `seaql_migrations` row needs only `postgres`. After
+   that, the previous image boots with the release's additive tables and
+   columns left in place. Going forward again then needs that migration's `up`
+   to be idempotent (`IF NOT EXISTS`); otherwise the boot fails with "already
+   exists".
 
 ### Verify out-of-band indexes after every node deploy (TC-2062)
 
@@ -470,7 +502,11 @@ Items for the release notes of the release that ships this:
   to `allowed_envs`.
 - **(b) Node DID.** The node DID is unchanged across the compose-hash change:
   the key path is `tinycloud/keys/primary`, derived from the app id and that
-  path. The post-deploy DID and key-fingerprint gate stays.
+  path. The post-deploy DID and key-fingerprint gate stays. A change that
+  does move the DID (a new app id, or an unrecovered KMS root) must also
+  update every service that pins the node or renewer DID (OpenKey,
+  OpenCredentials) in the same change window; see
+  [Dependent pins](tc-3554-kms-epoch-fetch.md#dependent-pins-who-else-trusts-this-did).
 - **(c) Rule: never delete or blank `PROD_TINYCLOUD_NODE_STATS_READ_TOKEN`
   while the name is in the CVM's `allowed_envs`.** A later deploy without it
   fails closed before any CVM mutation with exactly
@@ -531,6 +567,17 @@ malformed responses fail closed and never count as absence.
 No raw response, identity list, credential or error body is logged.
 Any attempted restart without verified reconciliation is fatal
 **OVERRIDES UNVERIFIED**, requiring authorized operator/TC-1161 fallback.
+In `authority=billing`, when the deploy mutated nothing quota-related and only
+the verification did not run (for example a transient read failed earlier in
+the job), clear it without redeploying: on the operator's GO, dispatch
+
+```sh
+gh workflow run quota-verify.yml -R TinyCloudLabs/tinycloud-node --ref main
+```
+
+It runs only `scripts/ci/reconcile-quota.py` (GET-only in billing mode) and
+refuses under any other authority or ref. A green run is the verification; a
+red one stays OVERRIDES UNVERIFIED (TC-3881).
 
 If a job that names the environment ever runs before the environment exists,
 GitHub creates `production` with no branch policy. Create the environment and
@@ -622,6 +669,23 @@ its branch policy before any workflow that names it runs.
      that profile's space. This exercises `/delegate`, `/invoke` KV and SQL.
      Run it with stderr visible (no `2>/dev/null`), so a failing request shows
      its error rather than an empty result.
+   - Delegated SQL caveats (TC-1791): after a deploy that changes caveat
+     handling (the `sql.delegated_caveats_enforced` setting, its N0, or code
+     in `models/delegation.rs` or the SQL caveat checks), run the caveat
+     probe against the live node. It signs with throwaway keys kept in a
+     state file you name, outside any repository; the first run creates the
+     file (mode 0600), and later runs reuse its one `caveatprobe` space. Do
+     not commit or paste the file:
+
+     ```sh
+     cargo build --manifest-path test/caveat-probe/Cargo.toml
+     test/caveat-probe/target/debug/tinycloud-caveat-probe https://tee.node.tinycloud.xyz ~/.cache/tc1791-probe.json
+     ```
+
+     It prints one `step status= expected= code= PASS|FAIL` line per step and
+     exits 0 only on `result PASS`. With the setting off, only `e-delegate`
+     fails (401 `unsupported-caveat`); any other failure is a regression.
+     Details: `test/caveat-probe/src/main.rs`.
 4. **Watch.** The `promote-watch` job then dispatches the Write Probe's dense
    promote watch (TC-1176): signed-in KV and SQL reads every 30 s for 5 min,
    then every 5 min for 60 min, paging team@ through Better Stack on 2 reads
@@ -662,7 +726,18 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51`**
+  **`8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`**
+  (raw `7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e` normalized). Before TC-3973 startup diagnostics and reindex counts in the Vector config the template was `e0f99bcca6f220c65d81cad15504790099d634243ea701350a509e995b672aa0`
+  (raw `a8fb25f7c3608cbf69911d054825fd4dd0da0a9a78fc5c8ff7701bf346693b6b` normalized). Before the TC-3284 named node diagnostics (every node warning and error message mapped to its own `event_code`) in the Vector config the template was `97a180a43ec70c7950e717417c5455b13ede1a3adab5a196f65b5aa21dcc5271`
+  (raw `bced82d3f0e975c176cf35b72cea0bc26c9aa4acf5212304b946c068db1d6394` normalized); before the TC-3284 deletion ledger error events (`deletion_ledger_open_failed`, `deletion_ledger_replay_failed`, `deletion_ledger_unrepaired`) in the Vector config the template was `db348152c6b7a03beb42373299400b35bc0badf8b188988d9406192b4b88a540`
+  (raw `27287a3823d35deb91ebfd4f28dc56ace262d6044313134e23c65e2216cf379f` normalized); before the TC-3834 `node_request` `error_code` in the Vector config the template was `cc219eb5a05deda365a9683b6c6dc407eb872cb77d9f3954a819d1805ddd2249`
+  (raw `02d907552b74066b0d49f1088cc0b7ba9ca3e842eb9c1444b3cd778474498eb9` normalized); before the TC-3739 `node_request` DB timing fields (`pool_wait_ms`, `query_time_ms`, `query_count`) in the Vector config the template was `c6d05e1e4d8c15c384c7b3a86e8a8f9e3560d17efbb9b0236b9e724f1dfe8f46`
+  (raw `46287bc31dc09649b0679bacfe611ee24ad5ced5c51cd7909821dee895c1f6d2` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES` / `MIN_FREE_BYTES` env lines the template was `e5f1c356d68fe9dfac3d1f93109ded95108a8def42984b4bbeab1a29c5ee05ea`
+  (raw `d1d2ef49f3c69c802b9a1e26a48488aae6f370fe5205d3d2d709cdb4cfa907d5` normalized); before the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED` env line the template was `e1cf031b7f042ed006e625fd8e7026a6ca4a2dd636dd0f567b60a7f0ad32570e`
+  (raw `f4f51e75076f21c7bd05e93e24d08ffe7290e2f9567fe1ed4daca7ec0e9ad7a5` normalized); before the TC-287 `TINYCLOUD_RETENTION__ENABLED` env line the template was `6a577c6dc138b456b4ff514564fe7aeb17c8fa94c85335db75719f2e30e57ea7`
+  (raw `272f43b8d969478388c57f089cf352db1eadb1b8e8cf73b3fe09f3bb34b1f468` normalized). With the TC-3554 key-recovery sidecar (1.26.14), before the node opened its root from `root_wrap`, the template was `70c71aa0acb7ebe157a1c1fac3e30fb3536b7cc21ba51d4013f905599c22ea4f`
+  (raw `8e6029591516134f3706a170fe402e81f816216475eeac01072aa6facbc415a9` normalized); before the TC-3554 key-recovery sidecar and `DstackKmsEpoch` epoch-0 pins the template was `417719648a0c0daac6f0de186bdcda2c992a3fc8504fbf509c9b26a1dec9c5da`
+  (raw `d6af7a704ba532a2f9fce5166f4c7f05125e31f33e5cabf885b35efac61aa8b9` normalized); before the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_ARTIFACT_READ_BYTES` env line the template was `90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51`
   (raw `5419a6fbb73efe8b4430e4ab76d5e2970b2c9204525854e23f59dbdc01f4e250` normalized; before the TC-2917 `node_storage_headroom` event (the node's disk headroom line shipped as an individual event) in the Vector config the template was `9d0cd8a2…`, raw `d703d69b…`; before the TC-2346 `db_operation_retried` and `db_operation_retry_skipped_slow` warning codes in the Vector config the template was `c9bcbea9…`, raw `298ea356…`; before the TC-1777 named-keys gate env lines (`TINYCLOUD_ENCRYPTION_NETWORK__NAMED_KEYS_V1`, `…__DELETION_LEDGER_PATH`) and the `deletion-ledger` volume the template was `8df7e0f2…`, raw `192dfb7e407fa591d4f0232b95e43a41a85dd18add1d4976e70ebdbff5ddebca`; before the TC-1843 per-minute caps on 4xx and 5xx request events and on the 5xx diagnostic, and the `errors_dropped` event (the dropped count), in the Vector config the template was `7c3456dc…`, raw `d0e72bde…`; before the TC-1840 `db_failure_5xx` event (the node's 5xx diagnostic line shipped as an individual event) in the Vector config the template was `c91e5b7a…`, raw `99013c40…`; before the TC-950 pool of 10 (`TINYCLOUD_DATABASE__MAX_CONNECTIONS` 15 to 10) the template was `79469f97…`, raw `32a002ef…`; before the three `current_kv_c_index_*` warning codes in the Vector config (TC-1274 `current_kv` C-index migration) the template was `87b5d12a…`, raw `d1fcd665…`; before the optional TC-1482 `NODE_STATS_READ_TOKEN` env line and the TC-1482 route in the Vector config the template was `7fabba70…`, raw `1228d81927fc0a3fbba85745103e77b3112606f5d314d15974d400b222409350`: the 1.21.0 compose
   `d95bfb707871c1d626c4a8f2b8d32d354103edbb5077847c6a21fe5f7f6cfa50`, template
   `51f8e9e9…`, with only the embedded Vector config regenerated for TC-1274's,
@@ -674,17 +749,23 @@ Before any CVM mutation the workflow requires:
   profile stay byte-exact;
 - the deployed compose to differ from that template only by
   `deploy_image_digest`;
+- the exact spliced compose sent to Phala to pass `config -q` under the
+  guest's docker compose v2.26.0 (sha256-pinned release binary; placeholders
+  for required `${NAME:?}` inputs), after the image is pinned and before the
+  deploy step;
 - OCI labels `1.21.0-dstack` / `<release-commit-sha>`, the `v1.21.0` tag on
   that commit, its `Cargo.toml` at `1.21.0`, and the commit in main history.
   An untagged, mislabelled, feature-variant or freshly built image is
   refused;
 - the release revision to be a **strict descendant** of the revision running
   in production (read from the CVM's pinned image by the ancestry guard).
-  A downgrade (for example 1.20.5 or 1.0.0), the same revision as running,
-  or an unknown running revision is refused. The same ancestry rule makes
-  the 12c same-image command refuse an image older than the running
-  revision once 1.21.0 is live, so it cannot downgrade across migrations.
-  The captured pre-N0 rollback is the only intentional downgrade route.
+  A downgrade (for example 1.20.5 or 1.0.0) or an unknown running revision is
+  refused. The same revision as running is accepted only for the exact image
+  digest Phala's current compose runs: a config-only deployment (TC-3765, see
+  [A compose-only change on the running image](#a-compose-only-change-on-the-running-image)).
+  The same ancestry rule makes the 12c same-image command refuse an image older
+  than the running revision once 1.21.0 is live, so it cannot downgrade across
+  migrations. The captured pre-N0 rollback is the only intentional downgrade route.
 
 Sealed preflight, `BETTERSTACK_SOURCE_TOKEN` sealing with the
 `allowed_envs` sync, and the general quota reconciliation run as on every
@@ -702,6 +783,50 @@ Rolling this release back means a database snapshot restore (a separate
 decision) plus the [captured pre-N0 rollback](#tc-1302-captured-pre-n0-rollback)
 to 1.20.6 with Sam's explicit privacy mode.
 
+## What each deploy publishes (TC-3839)
+
+Provenance is checked with `gh attestation verify`, and every check pins who
+signed it. Without these flags, any workflow on any branch of this repository
+can produce provenance the command accepts:
+
+```sh
+gh attestation verify <subject> -R TinyCloudLabs/tinycloud-node \
+  --signer-workflow TinyCloudLabs/tinycloud-node/.github/workflows/docker.yml \
+  --source-ref refs/heads/main \
+  --deny-self-hosted-runners
+```
+
+For an image built by a release-tag push, use `--source-ref refs/tags/v<version>`
+instead. Accept no other ref.
+
+- **Build provenance.** `build-dstack` and `build-ingress` sign SLSA provenance
+  for every pushed image with `actions/attest-build-provenance`, which needs
+  `id-token: write` and `attestations: write` on those two jobs. The provenance
+  is pushed to GHCR next to the image. The subject is
+  `oci://ghcr.io/tinycloudlabs/tinycloud-node@<digest>` (or
+  `tinycloud-node-ingress`). PR builds of the ingress image are not pushed, so
+  they are not attested. Images built before TC-3839 have no provenance, so a
+  rollback to one of them deploys an image that cannot be checked this way.
+- **The measured manifest.** After every check of a successful `deploy-phala`:
+  1. *Capture the deployed app-compose.json* reads the CVM's compose file
+     (`phala api /cvms/tinycloud-node/compose_file`). It refuses one that is
+     not a JSON object or that carries `encrypted_env`. It writes the file as
+     compact, key-sorted JSON (`jq -cjS .`). Those are the bytes dstack
+     hashes: on 1.26.19 they hashed to the attested `1dc2fe4a…`, while the
+     pretty-printed response does not.
+  2. It requires that their SHA-256 equals the `compose_hash` the live node
+     reports from `/attestation`. CI does not verify that quote; a verifier
+     does, by replaying RTMR3 to the same hash.
+  3. *Sign provenance for the deployed app-compose.json* (`actions/attest`)
+     signs `app-compose-<hash>.json`. This is the deploy job's only use of
+     `id-token: write` and `attestations: write`. Nothing needs
+     `contents: write`: releases are immutable, so no asset is uploaded.
+  4. The file is kept as the run artifact `app-compose-<hash>` for 90 days.
+     Check it with the command above, with `app-compose-<hash>.json` as the
+     subject, then compare its SHA-256 with the replayed compose hash.
+  A mismatch fails the deploy run after the deploy: production already runs
+  the new compose, and nothing is signed until the cause is understood.
+
 ## Rolling back
 
 Keep the digest, actual OCI version and actual revision of every promoted
@@ -714,32 +839,37 @@ The downstream watcher cannot skip quota restoration.
 For column encryption cutovers, use the backup-based rollback in
 [Column encryption cutover](#column-encryption-cutover-tc-2682).
 
-### A compose-only change ships as a release
+### A compose-only change on the running image
 
 The production compose is the reviewed N0 template (locked by the template
 hash in `docker.yml`), and the compose on `main` is the one that gets
 deployed. For any image digest other than the reviewed 1.20.6 image, the
-N0-template path requires a released image (`require_release`): the tag commit
-must be a strict descendant of the revision running in production. So a change
-to the production compose (for example the database pool in TC-950) reaches
-production with a release, which means a version bump even when the node code
-is unchanged. A digest promotion of the revision that is already running, with
-a changed compose, is refused by the ancestry guard ("Released image must be a
-strict descendant of the running production revision").
+N0-template path requires a released image (`require_release`): its tag commit
+must descend from the revision running in production. A compose change (for
+example a flag turn-on) can ship without a new release by promoting the image
+that is already running: the release revision may equal the running revision
+only when the selected digest equals the digest pinned in Phala's current
+compose (TC-3765). The same revision under any other digest, or a running image
+the ancestry guard cannot read, is refused ("…or the exact running image digest
+for a config-only deployment"). `allow_non_descendant` does not help here: it
+skips the ancestry guard, so the running image is unknown and the pin step
+refuses.
 
 1. Merge the compose change (the compose, its byte-identical fixture
    `scripts/ci/fixtures/tc959-n0-compose.yaml`, the template hash in
    `docker.yml` and the hashes in this file move together).
-2. Cut the release PR (version bump in `Cargo.toml` and the three lockfiles,
-   `[Unreleased]` moved under the new version) and let the tag build finish.
-3. Read the digest and labels of the new `X.Y.Z-dstack` image, then use the
-   promotion command above with that digest, version and revision.
+2. Use the promotion command above with the **running** image's digest,
+   version and revision (from the `Deployment image:` line of the run that
+   deployed it).
 
-A rollback of a compose-only change still follows the same path: revert plus a
-new release. To restore an earlier node image while retaining the current N0
-compose, use the explicit audited rollback below. The same-image recovery
-command below is for the reviewed 1.20.6 image only and is refused once a later
-release is running.
+Rolling back a compose-only change is the same path in reverse: revert the
+compose change on `main` (compose, fixture, template hash), then promote the
+running digest again. A change that needs new node code still ships as a
+release (version bump in `Cargo.toml` and the three lockfiles, `[Unreleased]`
+moved under the new version). To restore an earlier node image while retaining
+the current N0 compose, use the explicit audited rollback below. The same-image
+recovery command below is for the reviewed 1.20.6 image only and is refused
+once a later release is running.
 
 ### Audited rollback to a prior N0 release
 
@@ -811,12 +941,28 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`5419a6fbb73efe8b4430e4ab76d5e2970b2c9204525854e23f59dbdc01f4e250`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow` and TC-2917 `node_storage_headroom` Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, and the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume), whatever digest
-main's template currently pins. It is not a rollback of a
+`7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code`, TC-3284 deletion ledger error event and TC-3284 named node diagnostics and TC-3973 startup events in the Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
+main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
+on this compose, and only once the database holds the `root_wrap` blob:**
+1.26.14 needs the sidecar this compose lacks,
+and an older binary does not know `DstackKmsEpoch`; both refuse to start, so
+this command and any rollback below 1.26.15 fail closed rather
+than serve under the moved KMS root. It is not a rollback of a
 later release across a schema migration. Current pre-N0 tag/pinned
 equivalents are separately hash-checked; arbitrary same-image config
 substitutions fail before mutation.
+
+From 1.26.15 the node's root lives in the database (`root_wrap`, TC-3554,
+`docs/tc-3554-kms-epoch-fetch.md`). A database backup restore carries the
+`root_wrap` row, so the restored node opens the same root without a fetch.
+A fresh or empty database has no row, and the node refuses to start on this
+sidecar-free compose until one boot on the sidecar compose (1.26.15's) has
+sealed it. That refusal is expected; it is not a fault in the restore.
+A restore that opens the same `root_wrap` row keeps the DID, so the services
+that pin it stay valid. If the node comes back under a new DID, follow
+[Dependent pins](tc-3554-kms-epoch-fetch.md#dependent-pins-who-else-trusts-this-did)
+before the node serves account setup or renewals.
 
 ### TC-1302 captured pre-N0 rollback
 

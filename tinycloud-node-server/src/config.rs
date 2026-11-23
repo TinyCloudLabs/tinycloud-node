@@ -1,6 +1,10 @@
 use crate::{
     allow_list::SpaceAllowListService,
-    storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
+    storage::{
+        file_system::FileSystemConfig,
+        purge_ledger::{DataStoreLocation, PurgeLedgerConfig},
+        s3::S3BlockConfig,
+    },
     BlockConfig, BlockStage,
 };
 use base64::{decode_config, URL_SAFE_NO_PAD};
@@ -30,8 +34,6 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub invocation: InvocationConfig,
-    #[serde(default)]
-    pub did_resolution: DidResolutionConfig,
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -43,11 +45,13 @@ pub struct Config {
     pub prometheus: Prometheus,
     pub cors: bool,
     #[serde(default)]
-    pub keys: Keys,
+    pub keys: KeysConfig,
     #[serde(default)]
     pub tee: TeeConfig,
     #[serde(default)]
     pub public_spaces: PublicSpacesConfig,
+    #[serde(default)]
+    pub session_retire: SessionRetireConfig,
     #[serde(default)]
     pub share_email: ShareEmailConfig,
     #[serde(default)]
@@ -62,6 +66,80 @@ pub struct Config {
     pub column_encryption: ColumnEncryptionConfig,
     #[serde(default)]
     pub sql: SqlConfig,
+    /// `TINYCLOUD_HOST_ID` (e.g. `node-prod-1`): the stable, non-secret host
+    /// identifier signed into space lifecycle requests, `[a-z0-9-]{1,63}`.
+    /// Set together with `purge_ledger_keys`; both absent keeps space
+    /// lifecycle off (TC-2871).
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// `TINYCLOUD_PURGE_LEDGER_KEYS`: the purge ledger's HMAC keys. Secret;
+    /// never serialized or printed.
+    #[serde(default, skip_serializing)]
+    pub purge_ledger_keys: Option<PurgeLedgerKeys>,
+}
+
+/// The purge ledger's HMAC keys, accepted only in the JSON form
+/// `{"active_key_id":"plk-YYYYMMDD","keys":{"<id>":"<base64url, at least 32 bytes>"}}`.
+/// The bare single-key form is refused. Debug output is redacted.
+#[derive(Deserialize, Clone, Hash, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct PurgeLedgerKeys(String);
+
+impl PurgeLedgerKeys {
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+    /// The raw secret, for `LedgerKeys::from_config` only.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PurgeLedgerKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PurgeLedgerKeys(<redacted>)")
+    }
+}
+
+impl Config {
+    /// Space lifecycle is on when `host_id` and `purge_ledger_keys` are both
+    /// set, and off when both are absent. Call after `storage.resolve()`.
+    /// Messages never carry the key value.
+    pub fn validate_space_lifecycle(&self) -> Result<(), String> {
+        let (host, keys) = match (&self.host_id, &self.purge_ledger_keys) {
+            (None, None) => return Ok(()),
+            (Some(host), Some(keys)) => (host, keys),
+            _ => {
+                return Err(
+                    "space lifecycle: set host_id (TINYCLOUD_HOST_ID) and purge_ledger_keys (TINYCLOUD_PURGE_LEDGER_KEYS) together, or neither"
+                        .into(),
+                )
+            }
+        };
+        if host.is_empty()
+            || host.len() > 63
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err("host_id must match [a-z0-9-]{1,63}".into());
+        }
+        if !keys.expose().trim_start().starts_with('{') {
+            return Err(
+                "purge_ledger_keys must be the JSON form {\"active_key_id\":…,\"keys\":{…}}; the bare-key form is refused"
+                    .into(),
+            );
+        }
+        tinycloud_core::space_purge_ledger::LedgerKeys::from_config(keys.expose().to_owned())
+            .map_err(|_| "purge_ledger_keys is not a valid key set".to_owned())?;
+        if self.storage.purge_ledger.is_none() {
+            return Err("space lifecycle needs [storage.purge_ledger]".into());
+        }
+        if !self.storage.database().starts_with("postgres") {
+            return Err("space lifecycle requires PostgreSQL".into());
+        }
+        Ok(())
+    }
 }
 
 /// Recorded column reads may require encrypted storage when explicitly enabled.
@@ -82,6 +160,11 @@ pub struct ColumnEncryptionConfig {
 /// `deletion_ledger_path` is the append-only file, outside the database, that
 /// records every deleted key (one JSON line each). It is required while
 /// `named_keys_v1` is on, and must be an absolute path.
+///
+/// `key_cap_per_network`, `key_cap_per_app_prefix` and `key_cap_secrets` cap
+/// the live (not deleted) named keys of one network: outside `secrets`,
+/// under one `apps/<app id>/` prefix, and at or under `secrets`. Unset means
+/// the node's default (1000, 100, 1000); a set value must be above 0.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct EncryptionNetworkConfig {
     #[serde(default)]
@@ -94,12 +177,27 @@ pub struct EncryptionNetworkConfig {
     pub key_wrap_require_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub key_cap_per_network: Option<u64>,
+    #[serde(default)]
+    pub key_cap_per_app_prefix: Option<u64>,
+    #[serde(default)]
+    pub key_cap_secrets: Option<u64>,
 }
 
 impl EncryptionNetworkConfig {
     /// Startup validation. Does not touch the filesystem; the ledger file is
     /// opened when the node starts.
     pub fn validate(&self) -> Result<(), String> {
+        for (name, cap) in [
+            ("key_cap_per_network", self.key_cap_per_network),
+            ("key_cap_per_app_prefix", self.key_cap_per_app_prefix),
+            ("key_cap_secrets", self.key_cap_secrets),
+        ] {
+            if cap == Some(0) {
+                return Err(format!("encryption_network.{name} must be above 0"));
+            }
+        }
         match (&self.deletion_ledger_path, self.named_keys_v1) {
             (None, true) => Err(
                 "encryption_network.deletion_ledger_path is required when named_keys_v1 is on"
@@ -1091,6 +1189,50 @@ impl Default for PublicSpacesConfig {
     }
 }
 
+/// TC-3443: `POST /session/retire` (sign-out). A retired session key stays
+/// refused for at least `ttl_secs`, and until the latest-expiring delegation
+/// the node holds for it ends.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SessionRetireConfig {
+    #[serde(default = "default_session_retire_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Per-client-IP requests per minute; also the burst.
+    #[serde(default = "default_session_retire_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+}
+
+fn default_session_retire_ttl_secs() -> u64 {
+    30 * 24 * 60 * 60
+}
+
+fn default_session_retire_rate_limit_per_minute() -> u32 {
+    10
+}
+
+impl SessionRetireConfig {
+    pub fn ttl(&self) -> time::Duration {
+        time::Duration::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX))
+    }
+
+    /// A zero TTL would let a retire lapse at once for a key holding no
+    /// longer grant, so the node refuses to start with it.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ttl_secs == 0 {
+            return Err("session_retire.ttl_secs must be greater than 0");
+        }
+        Ok(())
+    }
+}
+
+impl Default for SessionRetireConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_session_retire_ttl_secs(),
+            rate_limit_per_minute: default_session_retire_rate_limit_per_minute(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct TcBenchConfig {
     #[serde(default = "default_tc_bench_region")]
@@ -1508,6 +1650,42 @@ impl SqlStoreConfig {
     }
 }
 
+/// `[keys]`: where the node identity comes from, plus an optional pin on the
+/// DID that identity must have.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct KeysConfig {
+    #[serde(flatten)]
+    pub source: Keys,
+    /// `keys.expected_node_did` (`TINYCLOUD_KEYS__EXPECTED_NODE_DID`): when
+    /// set, the node refuses to start, and the control plane refuses to
+    /// report an identity, unless the resolved node DID equals this value.
+    /// Applies to every key source (TC-3554).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_node_did: Option<String>,
+}
+
+impl From<Keys> for KeysConfig {
+    fn from(source: Keys) -> Self {
+        Self {
+            source,
+            expected_node_did: None,
+        }
+    }
+}
+
+impl KeysConfig {
+    /// Refuse a node DID other than the pinned one, if a pin is configured.
+    pub fn check_node_did(&self, node_did: &str) -> anyhow::Result<()> {
+        match &self.expected_node_did {
+            Some(expected) if expected != node_did => anyhow::bail!(
+                "node identity {node_did} is not the pinned keys.expected_node_did {expected}; \
+                 refusing to use it"
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
@@ -1516,11 +1694,53 @@ pub enum Keys {
     #[cfg(feature = "dstack")]
     #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
+    /// The app root of a historical dstack KMS root epoch, fetched from the
+    /// KMS inside the TEE and verified fail-closed once, then sealed in the
+    /// database's `root_wrap` under a key of the current root (TC-3554,
+    /// docs/tc-3554-kms-epoch-fetch.md).
+    #[cfg(feature = "dstack")]
+    #[serde(rename = "dstack_kms_epoch", alias = "DstackKmsEpoch")]
+    DstackKmsEpoch(DstackKmsEpoch),
     #[default]
     #[serde(rename = "auto", alias = "Auto")]
     Auto,
     #[serde(rename = "provider", alias = "Provider")]
     Provider,
+}
+
+/// `keys.type = "DstackKmsEpoch"`; every value is public and pinned in the
+/// attested compose (`TINYCLOUD_KEYS__LEGACY__*`).
+#[cfg(feature = "dstack")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct DstackKmsEpoch {
+    pub legacy: LegacyKmsEpoch,
+}
+
+#[cfg(feature = "dstack")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct LegacyKmsEpoch {
+    /// Transport: the dstack-key-recovery sidecar's unix socket. Set this or
+    /// `kms_url` + `kms_ca_cert`, never both; there is no runtime fallback.
+    /// Needed only while the database holds no `root_wrap` blob: the boot
+    /// that fetches the root seals it there, and later boots open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_recovery_socket: Option<String>,
+    /// Transport: the KMS origin, `https://host[:port]`, fetched over our own
+    /// RA-TLS client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_url: Option<String>,
+    /// The KMS RPC CA certificate, standard base64 of its DER. The only TLS
+    /// trust anchor for `kms_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kms_ca_cert: Option<String>,
+    /// The KMS root epoch to fetch; the response must carry exactly this.
+    pub root_epoch: u32,
+    /// That epoch's KMS root secp256k1 key, SEC1 compressed, hex.
+    pub kms_root_pubkey: String,
+    /// This app's 20-byte dstack app id, hex.
+    pub app_id: String,
+    /// The node DID the fetched root must derive.
+    pub expected_did: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -1602,6 +1822,36 @@ pub struct Tracing {
 pub struct SpacesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<SpaceAllowListService>,
+    /// Explicit registry v2 origin. When set, current owner-signed membership
+    /// authorizes hosting and data mode; ordinary capability checks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_v2: Option<String>,
+    /// How long the last confirmed registry record keeps admitting reads and
+    /// writes while the registry is unreachable (TC-2481). 0 (the default)
+    /// turns the cache off; at most 300; requires `registry_v2`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub registry_cache_max_age_seconds: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl SpacesConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.registry_cache_max_age_seconds == 0 {
+            return Ok(());
+        }
+        if self.registry_v2.is_none() {
+            return Err("spaces.registry_cache_max_age_seconds requires spaces.registry_v2");
+        }
+        if self.registry_cache_max_age_seconds
+            > tinycloud_core::registry_admission::MAX_OUTAGE_CACHE.as_secs()
+        {
+            return Err("spaces.registry_cache_max_age_seconds must be at most 300");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -1824,6 +2074,12 @@ pub struct Storage {
     pub sql: SqlStorageConfig,
     #[serde(default)]
     pub duckdb: DuckDbStorageConfig,
+    /// `[storage.purge_ledger]`: the space-purge ledger's own store (TC-2871),
+    /// never the block store. Local block storage defaults it to
+    /// `<datadir>/purge-ledger`; S3 block storage has no default, and the
+    /// purge stays unavailable until a ledger bucket is configured.
+    #[serde(default)]
+    pub purge_ledger: Option<PurgeLedgerConfig>,
 }
 
 fn default_datadir() -> PathBuf {
@@ -1856,6 +2112,12 @@ impl Storage {
             }
         }
 
+        if self.purge_ledger.is_none() && matches!(self.blocks, BlockConfig::B(_)) {
+            self.purge_ledger = Some(PurgeLedgerConfig::Local {
+                path: dir.join("purge-ledger"),
+            });
+        }
+
         if self.limit.map(|limit| limit.as_u64()) == Some(0) {
             self.limit = None;
         }
@@ -1866,6 +2128,21 @@ impl Storage {
         self.database
             .as_deref()
             .expect("Storage::resolve() must be called before accessing database")
+    }
+
+    /// Refuse a purge ledger that shares the block store. Call after resolve().
+    pub fn validate_purge_ledger(&self) -> Result<(), String> {
+        let Some(ledger) = &self.purge_ledger else {
+            return Ok(());
+        };
+        let data = match &self.blocks {
+            BlockConfig::A(s3) => DataStoreLocation::S3 {
+                bucket: &s3.bucket,
+                endpoint: s3.endpoint.as_ref(),
+            },
+            BlockConfig::B(fs) => DataStoreLocation::Local(fs.path()),
+        };
+        ledger.validate_separate_from(&data)
     }
 }
 
@@ -1879,6 +2156,7 @@ impl Default for Storage {
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
+            purge_ledger: None,
         }
     }
 }
@@ -1989,16 +2267,17 @@ pub struct DatabaseConfig {
     /// kernel default.
     #[serde(default = "default_database_tcp_user_timeout_ms")]
     pub tcp_user_timeout_ms: u64,
-    /// A read (or `BEGIN`) whose connection is lost is retried once only if
-    /// that attempt failed within this many milliseconds (TC-1054). A
-    /// connection found dead at once is retried; one whose loss took a
-    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not. This
-    /// bounds the retry, so one read waits for one detection plus at most
-    /// this window (~40 s) of connection-loss detection rather than two
-    /// detections (~60 s). It is not a request or per-db lock deadline:
-    /// acquisition waits, legitimate transfers and queueing behind the lock
-    /// add to it (those are bounded by `invocation.deadline_ms` and the
-    /// `storage.sql` wait bounds, TC-1274).
+    /// The time budget of one database operation's single retry, in
+    /// milliseconds (TC-2610). An operation (`/delegate`, the `/invoke`
+    /// authorization step, a KV read, a read-audit batch, the metadata read
+    /// that starts a SQL hydration) whose connection is lost is run once more
+    /// only when nothing can have committed, and only if the first run leaves
+    /// room in this budget for a short backoff and a second run; the second
+    /// run is stopped when the budget ends. Statements, `BEGIN` and `COMMIT`
+    /// are not retried on their own. It is not a request or per-db lock
+    /// deadline: acquisition waits, legitimate transfers and queueing behind
+    /// the lock add to it (those are bounded by `invocation.deadline_ms` and
+    /// the `storage.sql` wait bounds, TC-1274).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
     /// How long an authorized read waits for its audit record to commit
@@ -2079,16 +2358,6 @@ impl Default for DatabaseConfig {
             read_audit_wait_ms: default_database_read_audit_wait_ms(),
         }
     }
-}
-
-/// UCAN issuer resolution policy (TC-1080). Parsing and identity comparisons are unchanged.
-#[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct DidResolutionConfig {
-    /// Allow methods beyond key, pkh and jwk. Default: false.
-    /// Canonical env: TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS=true.
-    /// Requires a restart; issuer queries are always refused.
-    #[serde(default)]
-    pub network_methods: bool,
 }
 
 impl DatabaseConfig {
@@ -2372,6 +2641,23 @@ mod tests {
         }
     }
 
+    /// TC-3443: a zero session-retire TTL refuses to start.
+    #[test]
+    fn tc3443_startup_rejects_a_zero_session_retire_ttl() {
+        for (ttl_secs, ok) in [(0, false), (1, true), (2_592_000, true)] {
+            let mut config = Config::default();
+            config.session_retire.ttl_secs = ttl_secs;
+            let resolved = crate::resolve_runtime_config(&config);
+            assert_eq!(resolved.is_ok(), ok, "{ttl_secs}");
+            if !ok {
+                assert!(resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("session_retire.ttl_secs must be greater than 0"));
+            }
+        }
+    }
+
     /// TC-2954: the idle-in-transaction timeout is on by default (300 s) and,
     /// when on, must outlast the 240 s a protected legacy write holds its
     /// transaction.
@@ -2525,8 +2811,34 @@ mod tests {
                 key_wrap_v2: false,
                 key_wrap_require_v2: false,
                 deletion_ledger_path: Some(bad.into()),
+                ..Default::default()
             };
             assert!(config.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_caps_are_unset_by_default_and_refuse_zero() {
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert_eq!(default.key_cap_per_network, None);
+        assert_eq!(default.key_cap_per_app_prefix, None);
+        assert_eq!(default.key_cap_secrets, None);
+        let set: EncryptionNetworkConfig = toml::from_str(
+            "key_cap_per_network = 5\nkey_cap_per_app_prefix = 2\nkey_cap_secrets = 3",
+        )
+        .unwrap();
+        assert_eq!(set.key_cap_per_network, Some(5));
+        assert_eq!(set.key_cap_per_app_prefix, Some(2));
+        assert_eq!(set.key_cap_secrets, Some(3));
+        assert!(set.validate().is_ok());
+        for name in [
+            "key_cap_per_network",
+            "key_cap_per_app_prefix",
+            "key_cap_secrets",
+        ] {
+            let zero: EncryptionNetworkConfig = toml::from_str(&format!("{name} = 0")).unwrap();
+            let err = zero.validate().unwrap_err();
+            assert!(err.contains(name) && err.contains("above 0"), "{err}");
         }
     }
 

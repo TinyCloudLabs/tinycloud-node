@@ -25,16 +25,17 @@ The delegation hierarchy enables:
 
 ### Network DID method future-enable gate (TC-1132)
 
-The node's UCAN issuer resolver currently permits only offline `did:key`,
-`did:pkh` and `did:jwk` resolution by default. Network methods, including
-`did:web`, remain disabled with `network_methods = false`. DID identifiers used
-for parsing or identity comparisons (for example share-email `did:web` values)
-are unaffected; this gate concerns network resolution during verification.
+The node verifies a signature only when it derives the signer's key offline:
+`did:key` (Ed25519, secp256k1, P-256), `did:jwk` (the same three key types) and
+`did:pkh` (`eip155`, `solana`, `bip122`). Every other method, including
+`did:web`, is refused before resolution, and no setting enables one (TC-1500).
+DID identifiers used for parsing or identity comparisons (for example
+share-email `did:web` values) are unaffected; this gate concerns network
+resolution during verification.
 
-**Full TC-1080 plan Part B is REQUIRED before any future re-enable**, including
-the existing `network_methods = true` setting. Do not restore the unhardened SSI
-fetcher as a rollback. Part B is not implemented by TC-1132 Parts C/D, and no
-Part B development flag or bypass is provided.
+**Full TC-1080 plan Part B is REQUIRED before any future enable.** Do not
+restore the unhardened SSI fetcher. Part B is not implemented, and no
+development flag or bypass is provided.
 
 Before a future change enables `did:web`, it must implement and verify all of
 Part B:
@@ -92,9 +93,9 @@ Actions follow the `{namespace}.{service}/{action}` format:
 |---------|-------------|
 | `tinycloud.kv/get` | Read KV entries |
 | `tinycloud.kv/put` | Write KV entries |
-| `tinycloud.kv/list` | List KV entries |
+| `tinycloud.kv/list` | List KV entries under a prefix. With `x-tinycloud-list-entries: true`, each entry also carries the live value's exact byte size and write time (`updatedAt`, whole seconds by the node's clock), but only for keys the caller may read: the space's owner, or a caller whose cited delegations hold an unexpired, unrevoked `tinycloud.kv/get` covering that key, checked per key. For any other key both fields are absent (not null), so a list-only grant, including a share-link list recipient's, sees keys only. It never reveals writer DIDs, other versions, deleted values or keys outside the prefix (TC-2492) |
 | `tinycloud.kv/del` | Delete KV entries |
-| `tinycloud.kv/metadata` | Read KV metadata |
+| `tinycloud.kv/metadata` | Read KV metadata. A single-key head also returns the value's byte size (`x-tinycloud-content-length`) and write time (`Last-Modified`), under the same per-key `kv/get` rule as list entries; otherwise both headers are absent (TC-2492) |
 | `tinycloud.kv/sync` | Read the ordered change feed (key, ETag, deleted, metadata) under a KV prefix through `/invoke`; must be the invocation's only capability. Never implied by `*` or default session actions; grant it explicitly (TC-732) |
 | `tinycloud.kv/retain` | Never invoked. A delegation carrying it is named in `x-tinycloud-retention-grant` on a `kv/sync` request so the node attests `authority.retainUntil`; never implied (TC-732) |
 | `tinycloud.capabilities/read` | Read user capabilities |
@@ -505,6 +506,34 @@ support. On the same `utf8mb4`/default-strict configuration, unmodified
 `f9d700bf` fails the older initial schema with error 1074 on `id`, before the
 alias migration exists. That separate full-schema prerequisite must be resolved
 and exercised before claiming end-to-end support for that configuration.
+
+## Sign-out: Retiring the Session Key (TC-3443)
+
+Signing out posts `POST /session/retire` with a UCAN the session key signs to
+the node (`tinycloud.session/retire` on `urn:tinycloud:session:self`, no
+proofs, expiry within 120 seconds). Its optional body
+`{"delegations": [...]}` carries the session's root delegations, each encoded
+as `POST /delegate` takes it; the client must send every root it holds for
+the key, for all its spaces, posted or not. Each must be to the retiring key,
+and each is admitted exactly as `/delegate` admits it, inside the retire's
+transaction, so the retire covers it and posting it later cannot bring the
+key back; any refusal writes nothing. The node records the key and the time
+only when it then holds a live grant for the key, and says so
+(`"recorded"`); a node holding none records nothing. After that, the key can
+no longer use any delegated authority, and any delegation it signs that the
+node had not stored before the retire answers `401 session_retired:`.
+Authority the key holds as a root (a space or network it owns itself) is not
+delegated and is unaffected. The record lasts at least
+`session_retire.ttl_secs` and until the key's latest-expiring delegation,
+renewal stamp or active renewal lease ends. Each delegation records when the
+node first stored it (`first_seen_at`), so a child that raced the retire is
+refused at invoke. Children the key made before the retire, and their
+descendants, keep working until they expire; revoking them ends them.
+Sign-out covers only the grants the node holds or was given in the request:
+a root the client does not send and the node does not hold is not covered.
+Only the nodes that served the retire know about it: a node that starts
+hosting the space later accepts the key until its session root expires
+(TC-3673).
 
 ## Child Delegation (UCAN) Creation
 

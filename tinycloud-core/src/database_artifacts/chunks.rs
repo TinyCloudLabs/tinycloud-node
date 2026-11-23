@@ -284,6 +284,8 @@ WHERE service=$1 AND space=$2 AND name=$3 AND part_id=$4 AND state='uploading'
         }
         // One metadata-only statement is the acknowledgement boundary. Parts
         // are already durable and sealed; no transaction spans the transfer.
+        // With a purge fence, only this statement and the fence's live lock
+        // share a transaction (TC-2871).
         let sql = if let Some(previous) = current {
             values.extend([
                 previous.revision.into(),
@@ -311,15 +313,13 @@ INSERT INTO database_artifact(service,space,name,checkpoint_part_id,revision,con
 SELECT $1,$2,$3,$4,$5,$6,$6,$7,$7,''::bytea,'storage.database','checkpoint-parts-v1',$8,$8,0,1
 FROM ready ON CONFLICT DO NOTHING"#
         };
-        if self
-            .conn
-            .execute(statement(sql, values))
-            .await?
-            .rows_affected()
-            != 1
-        {
+        let scope = self.marked_write_scope(space).await?;
+        if scope.execute(statement(sql, values)).await?.rows_affected() != 1 {
             return Err(DatabaseArtifactError::StaleLineage);
         }
+        // A new checkpoint truncates the WAL, so the marks of the old one go.
+        drop_wal_marks(&scope, service, space, name).await?;
+        scope.commit().await?;
         cleanup.armed = false;
         // Reclamation is outside the publish statement. If this pass cannot
         // finish, the periodic collector keeps the bytes charged until freed.
@@ -521,7 +521,7 @@ mod tests {
                 "sql",
                 first,
                 "legacy",
-                vec![1; 128],
+                vec![1; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -573,7 +573,13 @@ mod tests {
         assert_eq!(sink.checkpoint, payload);
         assert!(matches!(
             legacy
-                .save("sql", space, "main", vec![1], ArtifactExpectation::Any)
+                .save(
+                    "sql",
+                    space,
+                    "main",
+                    vec![1].into(),
+                    ArtifactExpectation::Any
+                )
                 .await,
             Err(DatabaseArtifactError::StaleLineage)
         ));
@@ -615,7 +621,7 @@ mod tests {
                 "sql",
                 space,
                 "main",
-                vec![0; 128],
+                vec![0; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -760,7 +766,7 @@ mod tests {
                     "duckdb",
                     space,
                     "main",
-                    vec![1; 600],
+                    vec![1; 600].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -796,7 +802,7 @@ mod tests {
                 "duckdb",
                 parent,
                 "second",
-                vec![2; 400],
+                vec![2; 400].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -806,7 +812,7 @@ mod tests {
                 "duckdb",
                 parent,
                 "third",
-                vec![3; 1],
+                vec![3; 1].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -819,7 +825,7 @@ mod tests {
                 "duckdb",
                 child,
                 "second",
-                vec![4; 400],
+                vec![4; 400].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1346,7 +1352,7 @@ mod tests {
                         "sql",
                         space,
                         "main",
-                        vec![1; 512],
+                        vec![1; 512].into(),
                         ArtifactExpectation::Absent,
                     )
                     .await
@@ -1517,7 +1523,7 @@ mod tests {
                     if i % 2 == 0 { "sql" } else { "duckdb" },
                     if i % 2 == 0 { first } else { second },
                     &format!("db-{i}"),
-                    vec![],
+                    vec![].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -1551,7 +1557,7 @@ mod tests {
                         if i % 2 == 0 { "sql" } else { "duckdb" },
                         if i % 2 == 0 { first } else { second },
                         &format!("db-{i}"),
-                        vec![7; 256],
+                        vec![7; 256].into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -1770,7 +1776,7 @@ mod tests {
                 "sql",
                 space,
                 "legacy",
-                vec![3; over],
+                vec![3; over].into(),
                 ArtifactExpectation::Absent,
             )
             .await

@@ -131,6 +131,32 @@ export function socketEvidence(text, rmemMax) {
     socket_drops: number(/(?:\(|,)d(\d+)\)/.exec(text)?.[1]) };
 }
 
+/**
+ * Host network namespace UDP counters (TC-3741). The Docker daemon sends GELF to the published 127.0.0.1:12201,
+ * which on a default daemon is a host-side docker-proxy socket in front of Vector's. Counting drops on every host
+ * socket bound to the port, plus the kernel-wide Udp counters, locates loss that Vector's own socket cannot see.
+ */
+export function hostUdpEvidence(snmpText, udpTables, port) {
+  const lines = snmpText.split('\n').filter(line => line.startsWith('Udp: '));
+  const header = lines[0]?.split(/\s+/).slice(1) ?? [];
+  const values = lines[1]?.split(/\s+/).slice(1) ?? [];
+  const counter = name => {
+    const value = values[header.indexOf(name)];
+    return header.includes(name) && /^\d+$/.test(value ?? '') ? Number(value) : null;
+  };
+  const portHex = `:${port.toString(16).toUpperCase().padStart(4, '0')}`;
+  let sockets = 0;
+  let drops = 0;
+  for (const table of udpTables) for (const line of table.split('\n').slice(1)) {
+    const fields = line.trim().split(/\s+/);
+    if (!fields[1]?.endsWith(portHex) || !/^\d+$/.test(fields.at(-1) ?? '')) continue;
+    sockets++;
+    drops += Number(fields.at(-1));
+  }
+  return { in_datagrams: counter('InDatagrams'), in_errors: counter('InErrors'), rcvbuf_errors: counter('RcvbufErrors'), sndbuf_errors: counter('SndbufErrors'),
+    port_sockets: sockets, port_drops: sockets ? drops : null };
+}
+
 /** Numeric diagnostics only: raw Prometheus labels and text never leave this function. */
 export function numericMetrics(text) {
   const names = ['buffer_events', 'buffer_byte_size', 'buffer_received_events_total', 'buffer_sent_events_total', 'buffer_discarded_events_total', 'buffer_discarded_bytes_total', 'buffer_send_duration_seconds_sum', 'buffer_send_duration_seconds_count', 'component_send_latency_seconds_sum', 'component_send_latency_seconds_count', 'component_errors_total', 'component_discarded_events_total', 'component_received_events_total', 'component_sent_events_total', 'component_received_event_bytes_total', 'component_sent_event_bytes_total', 'utilization'];

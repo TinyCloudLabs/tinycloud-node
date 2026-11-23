@@ -21,10 +21,38 @@ With INFO logging enabled, Rocket emits one `tinycloud::request` completion even
 | `pool_wait_ms` | Nonnegative numeric elapsed time inside actual pooled-connection acquisition |
 | `query_time_ms` | Nonnegative numeric driver execution elapsed time; not database CPU time |
 | `query_count` | Nonnegative integer execution-attempt count, including failed attempts and awaited transaction controls |
+| `error_code` | Status 500 and above only: the fixed code of the 5xx's origin, one of the closed set below (TC-3834); absent below 500 |
 
 All production route handlers are wrapped, including generated request/data guards and responder construction. Request identity and counters are installed only for each future poll, restored on every return/yield, and explicitly carried to database workers. They are not globals keyed by a caller-supplied request ID. Reusing the same accepted UUID does not share counters between requests.
 
 Request IDs and pseudonyms are event fields, never Prometheus labels. Methods, route templates, and status retain the existing bounded metric labels. No request URI, query text, SQL parameters, raw space/DID/wallet, or raw database error is added to the event. SQLx (including notices/pool errors), SeaORM, and sqlparser diagnostic output is filtered before all subscriber sinks, independently of log level. Request-related application database warnings use fixed operation/error classes instead of raw causes. HTTP error responses retain their existing behavior.
+
+### `error_code` (TC-3834)
+
+A request answered with a 5xx carries `error_code` on its `node_request` event, so two failures whose client bodies read alike stay apart in the logs. The value is always one of `ErrorCode::ALL` in `tinycloud-core/src/failure_diagnostic.rs`, never text taken from the error: no message, payload, key, DID, SQL or path. A request keeps the code of the last failure it recorded; a 5xx no origin classified carries `internal`. Codes are at most `MAX_ERROR_CODE_LEN` (13) bytes, the longest the log shipper's capped 5xx reserve fits (`log-shipper/budget.mjs`).
+
+| Code | Origin |
+| --- | --- |
+| `db_error` | A database error other than a timeout (lost connection, refused or failed statement, serialization failure, an SQL commit failure) |
+| `db_timeout` | The pool gave no connection in time or was closed, or the server cancelled the statement at its timeout |
+| `db_busy` | The SQL/DuckDB database stayed busy past a wait bound (`sql_busy`) |
+| `req_timeout` | The `/invoke` deadline was reached before any write began |
+| `read_audit` | A read's audit record was not confirmed |
+| `storage_io` | The block store failed to stage, write or read a blob |
+| `caveat_db` | The database read of a delegation chain's SQL caveats failed |
+| `read_tx_error` | No read transaction could be opened |
+| `key_ledger` | The encryption-key deletion ledger is missing or its append failed |
+| `lifecycle` | The space lifecycle state could not be read |
+| `registry_down` | The delegation registry could not be consulted |
+| `cutover_fence` | An SQL/DuckDB identity cutover fence is active |
+| `kv_candidate` | A KV blob candidate could not be committed |
+| `engine_error` | The SQL or DuckDB engine failed for a reason other than its database connection |
+| `encryption` | The encryption backend or signer failed, or a key row is corrupt |
+| `size_limit` | A database refused to grow past, or load beyond, its size limit (507) |
+| `disk_headroom` | The node's disk is below its free-space headroom (507) |
+| `internal` | Any other 5xx, including one no origin classified |
+
+The log shipper keeps `error_code` on `node_request` events with status 500 and above only, and only when it is exactly one of these codes (`log-shipper/fields.json`).
 
 ## UUID contract and forwarding
 

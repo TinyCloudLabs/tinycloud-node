@@ -3,7 +3,7 @@ pub mod chunks;
 
 use async_trait::async_trait;
 use sea_orm::{
-    sea_query::{Expr, Func},
+    sea_query::{Expr, Func, OnConflict},
     ActiveModelTrait,
     ActiveValue::Set,
     ColumnTrait, DbErr, EntityTrait, QueryFilter, QuerySelect, SqlErr,
@@ -12,7 +12,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     hash::{hash, Blake3Hasher},
-    models::database_artifact,
+    models::{database_artifact, sql_wal_mark},
 };
 
 #[derive(Debug, Clone)]
@@ -103,8 +103,25 @@ pub struct DeltaSave {
     pub delta_size_bytes: i64,
 }
 
+/// Where the stored WAL of one revision ended (`sql_wal_mark`, contract 4.5).
+/// The shadow uploader carves the bytes between two marks of one checkpoint
+/// out of the cumulative WAL and uploads only those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalMark {
+    pub revision: i64,
+    pub checkpoint_content_hash: String,
+    /// Length of the stored WAL at `revision`.
+    pub wal_end_bytes: u64,
+    /// SHA-256 of the WAL bytes `[0, wal_end_bytes)`.
+    pub wal_prefix_sha256: [u8; 32],
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseArtifactError {
+    #[error("space_deleted")]
+    SpaceDeleted,
+    #[error("space lifecycle unavailable")]
+    LifecycleUnavailable,
     #[error("database artifact storage error: {0}")]
     Db(DbErr),
     #[error("artifact storage limit reached")]
@@ -287,6 +304,54 @@ impl ArtifactSink for MemorySink {
     async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
         self.current = None;
         Ok(())
+    }
+}
+
+/// Passes one part through to `inner` and drops the other
+/// ([`DatabaseArtifactRepository::read_part_chunks`]'s default).
+struct OnePartSink<'a> {
+    part: ArtifactPart,
+    active: bool,
+    inner: &'a mut dyn ArtifactSink,
+}
+
+#[async_trait]
+impl ArtifactSink for OnePartSink<'_> {
+    async fn reset(&mut self) -> Result<(), DatabaseArtifactError> {
+        self.active = false;
+        self.inner.reset().await
+    }
+
+    async fn begin_part(&mut self, part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
+        self.active = part == self.part;
+        if self.active {
+            self.inner.begin_part(part).await?;
+        }
+        Ok(())
+    }
+
+    fn size_hint(&mut self, part: ArtifactPart, bytes: u64) {
+        if part == self.part {
+            self.inner.size_hint(part, bytes);
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
+        if self.active {
+            self.inner.write(bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_part(&mut self) -> Result<(), DatabaseArtifactError> {
+        if std::mem::take(&mut self.active) {
+            self.inner.finish_part().await?;
+        }
+        Ok(())
+    }
+
+    fn buffers_in_memory(&self) -> bool {
+        self.inner.buffers_in_memory()
     }
 }
 
@@ -615,6 +680,11 @@ pub async fn read_artifact<R: DatabaseArtifactRepository + ?Sized>(
 
 #[async_trait]
 pub trait DatabaseArtifactRepository: Send + Sync {
+    /// Largest single-statement save payload; zero disables the limit.
+    fn max_write_bytes(&self) -> u64 {
+        DEFAULT_MAX_ARTIFACT_WRITE_BYTES
+    }
+
     /// The artifact's stored metadata, with no payload bytes read.
     ///
     /// One cheap statement whatever the artifact's size: use it for existence
@@ -661,6 +731,38 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError>;
 
+    /// Stream one stored part of the row `meta` describes into `sink`:
+    /// `begin_part(part)`, `write`*, `finish_part`, nothing for the other
+    /// part. The bytes are verified against the part's stored hash, and a row
+    /// that moved on yields [`DatabaseArtifactError::ArtifactChanged`], as in
+    /// [`Self::read_chunks`]. Asking for the WAL of a row without a delta is
+    /// an error.
+    ///
+    /// The default reads the whole artifact and drops the other part; a
+    /// backend that can read one column on its own overrides it.
+    async fn read_part_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        part: ArtifactPart,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        if part == ArtifactPart::Wal && !meta.has_delta() {
+            return Err(DatabaseArtifactError::Sink(
+                "the artifact has no WAL delta".into(),
+            ));
+        }
+        let mut only = OnePartSink {
+            part,
+            active: false,
+            inner: sink,
+        };
+        self.read_chunks(service, space, name, meta, &mut only)
+            .await
+    }
+
     fn chunked_checkpoints(&self, _service: &str, _space: &str, _name: &str) -> bool {
         false
     }
@@ -681,7 +783,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError>;
 
@@ -690,10 +792,25 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         _service: &str,
         _space: &str,
         _name: &str,
-        _payload: Vec<u8>,
+        _payload: ::bytes::Bytes,
         _expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
+    }
+
+    /// The WAL marks `save_delta` stored for `revisions` of the artifact, with
+    /// no payload byte read. A revision with no mark, or a row that fails
+    /// validation, is left out: a repository that records no marks cannot say
+    /// where a WAL ended, and the shadow uploader then publishes cumulative
+    /// segments.
+    async fn load_wal_marks(
+        &self,
+        _service: &str,
+        _space: &str,
+        _name: &str,
+        _revisions: &[i64],
+    ) -> Result<Vec<WalMark>, DatabaseArtifactError> {
+        Ok(Vec::new())
     }
 }
 
@@ -754,6 +871,7 @@ struct CurrentArtifact {
 
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
+    purge_fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
     conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// The largest payload a save sends; 0 = no limit (local tests only).
@@ -779,6 +897,7 @@ pub struct SeaOrmDatabaseArtifactRepository {
 impl SeaOrmDatabaseArtifactRepository {
     pub fn new(conn: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
         Self {
+            purge_fence: None,
             conn: conn.into(),
             sqlite_writer_lock: None,
             max_write_bytes: DEFAULT_MAX_ARTIFACT_WRITE_BYTES,
@@ -800,6 +919,171 @@ impl SeaOrmDatabaseArtifactRepository {
     pub fn with_chunk_limits(mut self, limits: Option<chunks::ChunkLimits>) -> Self {
         self.chunk_limits = limits;
         self
+    }
+    pub fn with_space_purge_fence(
+        mut self,
+        fence: Option<std::sync::Arc<crate::space_purge_fence::SpacePurgeFence>>,
+    ) -> Self {
+        self.purge_fence = fence;
+        self
+    }
+    async fn check_space_read(&self, space: &str) -> Result<(), DatabaseArtifactError> {
+        if let Some(fence) = &self.purge_fence {
+            let space = space
+                .parse()
+                .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+            fence
+                .check(&self.conn, &space)
+                .await
+                .map_err(artifact_fence_error)?;
+        }
+        Ok(())
+    }
+    /// Where a metadata write runs. With a purge fence, the write and the
+    /// fence's live lock share one transaction, so a purge cannot fence and
+    /// delete the space between them (TC-2871). Open it immediately before
+    /// the write statement and commit right after: no read and no chunk
+    /// upload runs inside it (TC-2961). Without a fence the write stays one
+    /// autocommit statement on the pool.
+    async fn write_scope(&self, space: &str) -> Result<FencedWrite, DatabaseArtifactError> {
+        use sea_orm::TransactionTrait;
+        let Some(fence) = &self.purge_fence else {
+            return Ok(FencedWrite::Pool(self.conn.clone()));
+        };
+        let space = space
+            .parse()
+            .map_err(|_| DatabaseArtifactError::LifecycleUnavailable)?;
+        let tx = self.conn.begin().await?;
+        fence
+            .lock_live(&tx, &space)
+            .await
+            .map_err(artifact_fence_error)?;
+        Ok(FencedWrite::Transaction(tx))
+    }
+
+    /// [`Self::write_scope`] that is always one transaction, so the artifact
+    /// statement and the WAL-mark statements commit together (contract 4.5).
+    /// The transaction spans only those short statements: no read and no
+    /// chunk upload runs inside it (TC-2961). Not used on the PostgreSQL pool
+    /// without a purge fence: see [`Self::single_statement_marks`].
+    async fn marked_write_scope(&self, space: &str) -> Result<FencedWrite, DatabaseArtifactError> {
+        use sea_orm::TransactionTrait;
+        if self.purge_fence.is_some() {
+            return self.write_scope(space).await;
+        }
+        Ok(FencedWrite::Transaction(self.conn.begin().await?))
+    }
+
+    /// On the PostgreSQL pool without a purge fence, an artifact write and
+    /// its WAL-mark change are ONE autocommit statement (a data-modifying
+    /// CTE), not a transaction. The pool's statement timeout, its retry
+    /// classification and its "did the write apply" tracking are defined
+    /// over a single autocommit write statement (TC-1054): a `BEGIN` would
+    /// change all three. A statement is atomic, so the mark still commits
+    /// with the WAL it describes (contract 4.5). SQLite, which has no
+    /// data-modifying CTE and no statement timeout, keeps the transaction.
+    fn single_statement_marks(&self) -> bool {
+        use sea_orm::ConnectionTrait;
+        self.purge_fence.is_none()
+            && self.conn.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+    }
+
+    /// Run one data-modifying CTE that ends in `SELECT count(*)` of the
+    /// artifact rows it wrote, and return that count.
+    async fn rows_written(&self, sql: &str, values: Vec<sea_orm::Value>) -> Result<i64, DbErr> {
+        use sea_orm::ConnectionTrait;
+        let row = self
+            .conn
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?
+            .ok_or_else(|| DbErr::Custom("a write statement returned no row".to_string()))?;
+        row.try_get_by_index::<i64>(0)
+    }
+
+    /// PostgreSQL, no fence: the checkpoint write and the drop of the old
+    /// checkpoint's WAL marks in one statement. Returns the rows written
+    /// (1 on success, 0 when the compare-and-swap found another revision).
+    #[allow(clippy::too_many_arguments)]
+    async fn checkpoint_one_statement(
+        &self,
+        key: (&str, &str, &str),
+        base: Option<(i64, &str)>,
+        revision: i64,
+        payload: &[u8],
+        content_hash: &str,
+        size_bytes: i64,
+        now: &str,
+    ) -> Result<i64, DbErr> {
+        use sea_orm::Value;
+        let (service, space, name) = key;
+        let drop_marks = r#""gone" AS (DELETE FROM "sql_wal_mark" WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND EXISTS (SELECT 1 FROM "written") RETURNING 1)"#;
+        let mut values: Vec<Value> = vec![
+            service.into(),
+            space.into(),
+            name.into(),
+            revision.into(),
+            content_hash.into(),
+            payload.to_vec().into(),
+            size_bytes.into(),
+            now.into(),
+        ];
+        let sql = match base {
+            // Compare-and-swap on the (revision, checkpoint) the save read.
+            Some((base_revision, base_checkpoint)) => {
+                values.push(base_revision.into());
+                values.push(base_checkpoint.into());
+                format!(
+                    r#"WITH "written" AS (UPDATE "database_artifact" SET "revision" = $4, "content_hash" = $5, "payload" = $6, "size_bytes" = $7, "backend" = 'storage.database', "storage_mode" = 'database-blob', "updated_at" = $8, "checkpoint_size_bytes" = $7, "checkpoint_content_hash" = $5, "delta_payload" = NULL, "delta_content_hash" = NULL, "delta_size_bytes" = 0 WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND "revision" = $9 AND "checkpoint_content_hash" = $10 RETURNING 1), {drop_marks} SELECT (SELECT count(*) FROM "written")::bigint"#
+                )
+            }
+            None => format!(
+                r#"WITH "written" AS (INSERT INTO "database_artifact" ("service", "space", "name", "revision", "content_hash", "payload", "size_bytes", "backend", "storage_mode", "created_at", "updated_at", "checkpoint_size_bytes", "checkpoint_content_hash", "delta_payload", "delta_content_hash", "delta_size_bytes") VALUES ($1, $2, $3, $4, $5, $6, $7, 'storage.database', 'database-blob', $8, $8, $7, $5, NULL, NULL, 0) RETURNING 1), {drop_marks} SELECT (SELECT count(*) FROM "written")::bigint"#
+            ),
+        };
+        self.rows_written(&sql, values).await
+    }
+
+    /// PostgreSQL, no fence: the WAL delta write and its mark in one
+    /// statement. Returns the rows written (1 on success, 0 when the
+    /// compare-and-swap found another revision).
+    #[allow(clippy::too_many_arguments)]
+    async fn delta_one_statement(
+        &self,
+        key: (&str, &str, &str),
+        base: (i64, &str),
+        revision: i64,
+        delta: &[u8],
+        logical_content_hash: &str,
+        delta_content_hash: &str,
+        size_bytes: i64,
+        now: &str,
+    ) -> Result<i64, DbErr> {
+        let (service, space, name) = key;
+        let delta_size_bytes = i64::try_from(delta.len()).unwrap_or(i64::MAX);
+        let sql = r#"WITH "written" AS (UPDATE "database_artifact" SET "revision" = $4, "content_hash" = $5, "delta_payload" = $6, "delta_content_hash" = $7, "delta_size_bytes" = $8, "size_bytes" = $9, "storage_mode" = 'checkpoint+wal', "updated_at" = $10 WHERE "service" = $1 AND "space" = $2 AND "name" = $3 AND "revision" = $11 AND "checkpoint_content_hash" = $12 RETURNING 1), "marked" AS (INSERT INTO "sql_wal_mark" ("service", "space", "name", "revision", "checkpoint_content_hash", "wal_end_bytes", "wal_prefix_sha256") SELECT $1::text, $2::text, $3::text, $4::bigint, $12::text, $8::bigint, $13::text FROM "written" ON CONFLICT ("service", "space", "name", "revision") DO UPDATE SET "checkpoint_content_hash" = EXCLUDED."checkpoint_content_hash", "wal_end_bytes" = EXCLUDED."wal_end_bytes", "wal_prefix_sha256" = EXCLUDED."wal_prefix_sha256" RETURNING 1) SELECT (SELECT count(*) FROM "written")::bigint"#;
+        self.rows_written(
+            sql,
+            vec![
+                service.into(),
+                space.into(),
+                name.into(),
+                revision.into(),
+                logical_content_hash.into(),
+                delta.to_vec().into(),
+                delta_content_hash.into(),
+                delta_size_bytes.into(),
+                size_bytes.into(),
+                now.into(),
+                base.0.into(),
+                base.1.into(),
+                sha256_hex(delta).into(),
+            ],
+        )
+        .await
     }
 
     /// Share the node's SQLite gate: artifact writes use the capability DB and
@@ -867,6 +1151,90 @@ impl SeaOrmDatabaseArtifactRepository {
             if let Some(barrier) = &self.race_barrier {
                 barrier.wait().await;
             }
+        }
+    }
+}
+
+fn artifact_fence_error(error: crate::space_purge_fence::FenceError) -> DatabaseArtifactError {
+    match error {
+        crate::space_purge_fence::FenceError::Deleted => DatabaseArtifactError::SpaceDeleted,
+        crate::space_purge_fence::FenceError::Unavailable => {
+            DatabaseArtifactError::LifecycleUnavailable
+        }
+        crate::space_purge_fence::FenceError::Database(error) => DatabaseArtifactError::Db(error),
+    }
+}
+
+/// A [`SeaOrmDatabaseArtifactRepository::write_scope`]: the pool, or the
+/// short transaction that holds the purge fence's live lock.
+enum FencedWrite {
+    Pool(crate::db_pool::RecoveringConnection),
+    Transaction(sea_orm::DatabaseTransaction),
+}
+
+impl FencedWrite {
+    async fn commit(self) -> Result<(), DbErr> {
+        match self {
+            Self::Pool(_) => Ok(()),
+            Self::Transaction(transaction) => transaction.commit().await,
+        }
+    }
+}
+
+#[async_trait]
+impl sea_orm::ConnectionTrait for FencedWrite {
+    fn get_database_backend(&self) -> sea_orm::DatabaseBackend {
+        match self {
+            Self::Pool(conn) => conn.get_database_backend(),
+            Self::Transaction(transaction) => transaction.get_database_backend(),
+        }
+    }
+
+    async fn execute(&self, stmt: sea_orm::Statement) -> Result<sea_orm::ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute(stmt).await,
+            Self::Transaction(transaction) => transaction.execute(stmt).await,
+        }
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<sea_orm::ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute_unprepared(sql).await,
+            Self::Transaction(transaction) => transaction.execute_unprepared(sql).await,
+        }
+    }
+
+    async fn query_one(
+        &self,
+        stmt: sea_orm::Statement,
+    ) -> Result<Option<sea_orm::QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_one(stmt).await,
+            Self::Transaction(transaction) => transaction.query_one(stmt).await,
+        }
+    }
+
+    async fn query_all(
+        &self,
+        stmt: sea_orm::Statement,
+    ) -> Result<Vec<sea_orm::QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_all(stmt).await,
+            Self::Transaction(transaction) => transaction.query_all(stmt).await,
+        }
+    }
+
+    fn support_returning(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.support_returning(),
+            Self::Transaction(transaction) => transaction.support_returning(),
+        }
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.is_mock_connection(),
+            Self::Transaction(transaction) => transaction.is_mock_connection(),
         }
     }
 }
@@ -967,6 +1335,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         name: &str,
     ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
         use database_artifact::Column;
+        self.check_space_read(space).await?;
         let row = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),
@@ -1042,6 +1411,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         meta: &ArtifactMeta,
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
+        self.check_space_read(space).await?;
         // Parts stream in bounded statements: the whole-artifact read cap and
         // the large-transfer permit below are for the single-row layout.
         if self
@@ -1107,11 +1477,62 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         Ok(())
     }
 
+    async fn read_part_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        part: ArtifactPart,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        self.check_space_read(space).await?;
+        // The chunked layout carries only a checkpoint (never a delta).
+        if part == ArtifactPart::Checkpoint
+            && self
+                .read_chunk_layout(service, space, name, meta, sink)
+                .await?
+        {
+            return Ok(());
+        }
+        let (size_bytes, expected_hash) = match part {
+            ArtifactPart::Checkpoint => (
+                meta.checkpoint_size_bytes,
+                meta.checkpoint_content_hash.as_str(),
+            ),
+            ArtifactPart::Wal => (
+                meta.delta_size_bytes,
+                meta.delta_content_hash.as_deref().ok_or_else(|| {
+                    DatabaseArtifactError::Sink("the artifact has no WAL delta".into())
+                })?,
+            ),
+        };
+        let bytes = u64::try_from(size_bytes).unwrap_or(0);
+        if self.max_read_bytes != 0 && bytes > self.max_read_bytes {
+            return Err(DatabaseArtifactError::ReadLimitExceeded {
+                part: part.as_str(),
+            });
+        }
+        let _large = self.large_transfer_permit(bytes).await;
+        let key = ArtifactKey {
+            service,
+            space,
+            name,
+        };
+        self.read_part(&key, meta, part, size_bytes, expected_hash, sink)
+            .await?;
+        Ok(())
+    }
+
     fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
         self.chunk_limits.is_some()
             || self
                 .observed_chunked
                 .contains(&(service.into(), space.into(), name.into()))
+    }
+
+    fn max_write_bytes(&self) -> u64 {
+        self.max_write_bytes
     }
 
     async fn save_snapshot(
@@ -1131,7 +1552,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         // TC-2961: before the writer lock, the hash and any statement.
@@ -1216,6 +1637,54 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // revision before either commits, exercising the CAS conflict path.
         #[cfg(test)]
         self.wait_at_race_barrier().await;
+        if self.single_statement_marks() {
+            let base = existing
+                .as_ref()
+                .map(|model| (model.revision, model.checkpoint_content_hash.as_str()));
+            let written = self
+                .checkpoint_one_statement(
+                    (service, space, name),
+                    base,
+                    revision,
+                    &payload,
+                    &content_hash,
+                    size_bytes,
+                    &now,
+                )
+                .await
+                .map_err(|error| {
+                    // The composite primary key is the only unique constraint:
+                    // a unique violation on an Absent INSERT means another
+                    // writer created the artifact first. Details: TC-2214
+                    if existing.is_none()
+                        && expected == ArtifactExpectation::Absent
+                        && matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
+                    {
+                        DatabaseArtifactError::StaleLineage
+                    } else {
+                        error.into()
+                    }
+                })?;
+            if written != 1 {
+                return Err(DatabaseArtifactError::Backend(
+                    "concurrent database artifact update".to_string(),
+                ));
+            }
+            return Ok(DatabaseArtifact {
+                payload: payload.to_vec(),
+                content_hash: content_hash.clone(),
+                revision,
+                size_bytes,
+                updated_at: now,
+                backend: "storage.database".to_string(),
+                storage_mode: "database-blob".to_string(),
+                checkpoint_content_hash: content_hash,
+                delta_payload: None,
+                delta_content_hash: None,
+                delta_size_bytes: 0,
+            });
+        }
+        let scope = self.marked_write_scope(space).await?;
 
         match existing.as_ref() {
             Some(existing) => {
@@ -1236,7 +1705,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     )
                     .col_expr(
                         database_artifact::Column::Payload,
-                        Expr::value(payload.clone()),
+                        Expr::value(payload.to_vec()),
                     )
                     .col_expr(
                         database_artifact::Column::SizeBytes,
@@ -1282,7 +1751,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                         database_artifact::Column::CheckpointContentHash
                             .eq(existing.checkpoint_content_hash.clone()),
                     )
-                    .exec(&self.conn)
+                    .exec(&scope)
                     .await?;
                 if update.rows_affected != 1 {
                     return Err(DatabaseArtifactError::Backend(
@@ -1297,7 +1766,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     name: Set(name.to_string()),
                     revision: Set(revision),
                     content_hash: Set(content_hash.clone()),
-                    payload: Set(payload.clone()),
+                    payload: Set(payload.to_vec()),
                     size_bytes: Set(size_bytes),
                     backend: Set("storage.database".to_string()),
                     storage_mode: Set("database-blob".to_string()),
@@ -1309,7 +1778,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     delta_content_hash: Set(None),
                     delta_size_bytes: Set(0),
                 }
-                .insert(&self.conn)
+                .insert(&scope)
                 .await
                 .map_err(|error| {
                     // For this table the composite primary key is the only unique
@@ -1325,9 +1794,12 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 })?;
             }
         }
+        // A new checkpoint truncates the WAL, so the marks of the old one go.
+        drop_wal_marks(&scope, service, space, name).await?;
+        scope.commit().await?;
 
         Ok(DatabaseArtifact {
-            payload,
+            payload: payload.to_vec(),
             content_hash: content_hash.clone(),
             revision,
             size_bytes,
@@ -1346,7 +1818,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         service: &str,
         space: &str,
         name: &str,
-        payload: Vec<u8>,
+        payload: ::bytes::Bytes,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         self.check_write(payload.len())?;
@@ -1390,6 +1862,31 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("current timestamps should format as RFC3339");
+        if self.single_statement_marks() {
+            let written = self
+                .delta_one_statement(
+                    (service, space, name),
+                    (existing.0, existing.2.as_str()),
+                    revision,
+                    &payload,
+                    &logical_content_hash,
+                    &delta_content_hash,
+                    size_bytes,
+                    &now,
+                )
+                .await?;
+            if written != 1 {
+                return Err(DatabaseArtifactError::Backend(
+                    "concurrent database artifact update".to_string(),
+                ));
+            }
+            return Ok(DeltaSave {
+                revision,
+                size_bytes,
+                delta_size_bytes,
+            });
+        }
+        let scope = self.marked_write_scope(space).await?;
 
         let update = database_artifact::Entity::update_many()
             .col_expr(database_artifact::Column::Revision, Expr::value(revision))
@@ -1399,7 +1896,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             )
             .col_expr(
                 database_artifact::Column::DeltaPayload,
-                Expr::value(Some(payload)),
+                Expr::value(Some(payload.to_vec())),
             )
             .col_expr(
                 database_artifact::Column::DeltaContentHash,
@@ -1423,7 +1920,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .filter(database_artifact::Column::Name.eq(name))
             .filter(database_artifact::Column::Revision.eq(existing.0))
             .filter(database_artifact::Column::CheckpointContentHash.eq(existing.2.clone()))
-            .exec(&self.conn)
+            .exec(&scope)
             .await?;
         if update.rows_affected != 1 {
             return Err(DatabaseArtifactError::Backend(
@@ -1431,12 +1928,94 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             ));
         }
 
+        // The mark commits with the WAL it describes: where the stored WAL
+        // ends at this revision, and the SHA-256 of its bytes.
+        sql_wal_mark::Entity::insert(sql_wal_mark::ActiveModel {
+            service: Set(service.to_string()),
+            space: Set(space.to_string()),
+            name: Set(name.to_string()),
+            revision: Set(revision),
+            checkpoint_content_hash: Set(existing.2.clone()),
+            wal_end_bytes: Set(delta_size_bytes),
+            wal_prefix_sha256: Set(sha256_hex(&payload)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                sql_wal_mark::Column::Service,
+                sql_wal_mark::Column::Space,
+                sql_wal_mark::Column::Name,
+                sql_wal_mark::Column::Revision,
+            ])
+            .update_columns([
+                sql_wal_mark::Column::CheckpointContentHash,
+                sql_wal_mark::Column::WalEndBytes,
+                sql_wal_mark::Column::WalPrefixSha256,
+            ])
+            .to_owned(),
+        )
+        .exec_without_returning(&scope)
+        .await?;
+
+        scope.commit().await?;
         Ok(DeltaSave {
             revision,
             size_bytes,
             delta_size_bytes,
         })
     }
+
+    async fn load_wal_marks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        revisions: &[i64],
+    ) -> Result<Vec<WalMark>, DatabaseArtifactError> {
+        use sql_wal_mark::Column;
+        if revisions.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.check_space_read(space).await?;
+        let rows = sql_wal_mark::Entity::find()
+            .filter(Column::Service.eq(service))
+            .filter(Column::Space.eq(space))
+            .filter(Column::Name.eq(name))
+            .filter(Column::Revision.is_in(revisions.iter().copied()))
+            .all(&self.conn)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(WalMark {
+                    revision: row.revision,
+                    checkpoint_content_hash: row.checkpoint_content_hash,
+                    wal_end_bytes: u64::try_from(row.wal_end_bytes).ok()?,
+                    wal_prefix_sha256: hex::decode(&row.wal_prefix_sha256).ok()?.try_into().ok()?,
+                })
+            })
+            .collect())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Delete every WAL mark of the artifact in `scope`'s transaction.
+async fn drop_wal_marks(
+    scope: &FencedWrite,
+    service: &str,
+    space: &str,
+    name: &str,
+) -> Result<(), DbErr> {
+    sql_wal_mark::Entity::delete_many()
+        .filter(sql_wal_mark::Column::Service.eq(service))
+        .filter(sql_wal_mark::Column::Space.eq(space))
+        .filter(sql_wal_mark::Column::Name.eq(name))
+        .exec(scope)
+        .await?;
+    Ok(())
 }
 
 /// Test-only whole-artifact read built on the public streaming API, so tests
@@ -1505,7 +2084,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![1; 100],
+            vec![1; 100].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -1515,7 +2094,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 12],
+                vec![2; 12].into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -1537,7 +2116,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![3; 80],
+            vec![3; 80].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -1567,7 +2146,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1579,7 +2158,7 @@ mod tests {
 
         // A live actor advances the database. The stale actor's base is now gone.
         let current = repo
-            .save("sql", "space", "main", vec![2; 200], stale.clone())
+            .save("sql", "space", "main", vec![2; 200].into(), stale.clone())
             .await
             .unwrap();
         assert_eq!(current.revision, 2);
@@ -1588,7 +2167,7 @@ mod tests {
         // it performs matches whatever is current — only the lineage it carries
         // says its 100 bytes never derived from these 200.
         let err = repo
-            .save("sql", "space", "main", vec![1; 100], stale.clone())
+            .save("sql", "space", "main", vec![1; 100].into(), stale.clone())
             .await
             .expect_err("a save from a superseded checkpoint must not commit");
         assert!(
@@ -1596,7 +2175,7 @@ mod tests {
             "expected a lineage rejection, got {err:?}"
         );
         let err = repo
-            .save_delta("sql", "space", "main", vec![9; 12], stale)
+            .save_delta("sql", "space", "main", vec![9; 12].into(), stale)
             .await
             .expect_err("a WAL built on a superseded checkpoint must not attach");
         assert!(
@@ -1619,7 +2198,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![3; 300],
+            vec![3; 300].into(),
             ArtifactExpectation::Derived {
                 revision: current.revision,
                 checkpoint_content_hash: current.checkpoint_content_hash,
@@ -1643,7 +2222,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            vec![1; 4096],
+            vec![1; 4096].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1654,7 +2233,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![0; 8],
+                vec![0; 8].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1702,7 +2281,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 4097],
+                vec![1; 4097].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -1718,7 +2297,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 4096],
+                vec![1; 4096].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1728,7 +2307,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 4097],
+                vec![2; 4097].into(),
                 ArtifactExpectation::Derived {
                     revision: saved.revision,
                     checkpoint_content_hash: saved.checkpoint_content_hash,
@@ -1773,7 +2352,7 @@ mod tests {
             "sql",
             "space",
             "big",
-            vec![1; 4097],
+            vec![1; 4097].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1793,7 +2372,7 @@ mod tests {
                 "sql",
                 "space",
                 "wal",
-                vec![1; 4096],
+                vec![1; 4096].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -1805,7 +2384,7 @@ mod tests {
             "sql",
             "space",
             "wal",
-            vec![2; 4097],
+            vec![2; 4097].into(),
             ArtifactExpectation::Derived {
                 revision: saved.revision,
                 checkpoint_content_hash: saved.checkpoint_content_hash,
@@ -1868,7 +2447,7 @@ mod tests {
             "sql",
             "space",
             "large",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1877,7 +2456,7 @@ mod tests {
             "sql",
             "space",
             "small",
-            vec![1; 16],
+            vec![1; 16].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -1963,7 +2542,7 @@ mod tests {
                     "sql",
                     "t",
                     name,
-                    vec![1; large],
+                    vec![1; large].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -1991,7 +2570,7 @@ mod tests {
                         "sql",
                         "t",
                         name,
-                        vec![2; large],
+                        vec![2; large].into(),
                         ArtifactExpectation::Derived {
                             revision,
                             checkpoint_content_hash,
@@ -2071,7 +2650,7 @@ mod tests {
                 "sql",
                 "other",
                 name,
-                vec![1; large],
+                vec![1; large].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -2110,7 +2689,7 @@ mod tests {
                     "sql",
                     "victim",
                     "big",
-                    vec![2; large],
+                    vec![2; large].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -2124,7 +2703,7 @@ mod tests {
                 "sql",
                 "victim",
                 "small",
-                vec![3; 16],
+                vec![3; 16].into(),
                 ArtifactExpectation::Absent,
             ),
         )
@@ -2157,9 +2736,15 @@ mod tests {
         let repo = SeaOrmDatabaseArtifactRepository::new(conn)
             .with_max_write_bytes(4096)
             .with_max_read_bytes(4096);
-        repo.save("sql", "s", "at", vec![1; 4096], ArtifactExpectation::Absent)
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "s",
+            "at",
+            vec![1; 4096].into(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
         let meta = repo.load_meta("sql", "s", "at").await.unwrap().unwrap();
         assert_eq!(meta.checkpoint_size_bytes, 4096);
         let mut sink = MemorySink::default();
@@ -2239,7 +2824,7 @@ mod tests {
                     "sql",
                     "space",
                     "main",
-                    vec![0; 8],
+                    vec![0; 8].into(),
                     ArtifactExpectation::Absent,
                 )
                 .await
@@ -2317,16 +2902,22 @@ mod tests {
             }
         );
 
-        repo.save("sql", "space", "empty", vec![], ArtifactExpectation::Any)
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "empty",
+            vec![].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         let empty_before = repo.load_meta("sql", "space", "empty").await.unwrap();
         let result = repo
             .save(
                 "sql",
                 "space",
                 "empty",
-                vec![9; 8],
+                vec![9; 8].into(),
                 ArtifactExpectation::Absent,
             )
             .await;
@@ -2365,7 +2956,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![1; 100],
+                vec![1; 100].into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -2388,14 +2979,14 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                vec![2; 80],
+                vec![2; 80].into(),
                 ArtifactExpectation::Any
             ),
             second.save(
                 "sql",
                 "space",
                 "main",
-                vec![3; 60],
+                vec![3; 60].into(),
                 ArtifactExpectation::Any
             ),
         );
@@ -2485,16 +3076,22 @@ mod tests {
                     "sql",
                     "space",
                     &name,
-                    payload.clone(),
+                    payload.clone().into(),
                     ArtifactExpectation::Any,
                 )
                 .await
                 .unwrap();
                 let wal = delta.map(|len| bytes(len, 2));
                 if let Some(wal) = &wal {
-                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                        .await
-                        .unwrap();
+                    repo.save_delta(
+                        "sql",
+                        "space",
+                        &name,
+                        wal.clone().into(),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .unwrap();
                 }
 
                 statements.lock().unwrap().clear();
@@ -2539,7 +3136,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(CHUNK + 5, 3),
+            bytes(CHUNK + 5, 3).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2548,7 +3145,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(9, 4),
+            bytes(9, 4).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2617,12 +3214,18 @@ mod tests {
                 self.disturbances_left -= 1;
                 let (checkpoint, wal) = (self.disturb)(self.disturbances_left);
                 self.repo
-                    .save("sql", "space", "main", checkpoint, ArtifactExpectation::Any)
+                    .save(
+                        "sql",
+                        "space",
+                        "main",
+                        checkpoint.into(),
+                        ArtifactExpectation::Any,
+                    )
                     .await
                     .unwrap();
                 if let Some(wal) = wal {
                     self.repo
-                        .save_delta("sql", "space", "main", wal, ArtifactExpectation::Any)
+                        .save_delta("sql", "space", "main", wal.into(), ArtifactExpectation::Any)
                         .await
                         .unwrap();
                 }
@@ -2656,7 +3259,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2682,7 +3285,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 1, 1),
+            bytes(2 * CHUNK + 1, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2691,7 +3294,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(5, 2),
+            bytes(5, 2).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2717,7 +3320,13 @@ mod tests {
                     self.1 = true;
                     self.0
                         .repo
-                        .save_delta("sql", "space", "main", vec![7; 6], ArtifactExpectation::Any)
+                        .save_delta(
+                            "sql",
+                            "space",
+                            "main",
+                            vec![7; 6].into(),
+                            ArtifactExpectation::Any,
+                        )
                         .await
                         .unwrap();
                 }
@@ -2745,7 +3354,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 1, 1),
+            bytes(2 * CHUNK + 1, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2788,7 +3397,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2823,7 +3432,7 @@ mod tests {
                             "sql",
                             "space",
                             "main",
-                            vec![5; CHUNK + 2],
+                            vec![5; CHUNK + 2].into(),
                             ArtifactExpectation::Any,
                         )
                         .await
@@ -2868,7 +3477,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(len, 1),
+            bytes(len, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2877,7 +3486,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(20, 2),
+            bytes(20, 2).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2900,7 +3509,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                bytes(len, 1),
+                bytes(len, 1).into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -2909,7 +3518,7 @@ mod tests {
                 "sql",
                 "space",
                 "main",
-                bytes(20, 2),
+                bytes(20, 2).into(),
                 ArtifactExpectation::Any,
             )
             .await
@@ -2938,7 +3547,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(len, 1),
+            bytes(len, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -2962,7 +3571,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            b"MAGIC-body".to_vec(),
+            b"MAGIC-body".to_vec().into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3006,16 +3615,22 @@ mod tests {
                     "sql",
                     "space",
                     &name,
-                    payload.clone(),
+                    payload.clone().into(),
                     ArtifactExpectation::Any,
                 )
                 .await
                 .unwrap();
                 let wal = delta.map(|len| bytes(len, 2));
                 if let Some(wal) = &wal {
-                    repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                        .await
-                        .unwrap();
+                    repo.save_delta(
+                        "sql",
+                        "space",
+                        &name,
+                        wal.clone().into(),
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .unwrap();
                 }
                 let mut sink = MemorySink::default();
                 read_artifact(&repo, "sql", "space", &name, &mut sink)
@@ -3032,7 +3647,7 @@ mod tests {
             "sql",
             "space",
             "main",
-            bytes(2 * CHUNK + 7, 1),
+            bytes(2 * CHUNK + 7, 1).into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3087,14 +3702,20 @@ mod tests {
                 "sql",
                 "space",
                 &name,
-                payload.clone(),
+                payload.clone().into(),
                 ArtifactExpectation::Any,
             )
             .await
             .unwrap();
-            repo.save_delta("sql", "space", &name, wal.clone(), ArtifactExpectation::Any)
-                .await
-                .unwrap();
+            repo.save_delta(
+                "sql",
+                "space",
+                &name,
+                wal.clone().into(),
+                ArtifactExpectation::Any,
+            )
+            .await
+            .unwrap();
             let mut sink = MemorySink::default();
             read_artifact(&repo, "sql", "space", &name, &mut sink)
                 .await
@@ -3229,5 +3850,405 @@ mod tests {
                 sink.checkpoint.capacity()
             );
         }
+    }
+
+    // ---- TC-1491 P3: WAL marks ------------------------------------------
+
+    async fn marks_repo() -> (
+        sea_orm::DatabaseConnection,
+        SeaOrmDatabaseArtifactRepository,
+    ) {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        (conn.clone(), SeaOrmDatabaseArtifactRepository::new(conn))
+    }
+
+    fn wal_sha256(wal: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(wal).into()
+    }
+
+    async fn marks_of(repo: &SeaOrmDatabaseArtifactRepository, name: &str) -> Vec<WalMark> {
+        let mut marks = repo
+            .load_wal_marks("sql", "space", name, &[1, 2, 3, 4, 99])
+            .await
+            .unwrap();
+        marks.sort_by_key(|m| m.revision);
+        marks
+    }
+
+    #[tokio::test]
+    async fn each_delta_save_writes_the_mark_of_the_wal_it_stored() {
+        let (_conn, repo) = marks_repo().await;
+        let base = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100].into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let derived = |revision| ArtifactExpectation::Derived {
+            revision,
+            checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+        };
+        let wal1 = vec![2u8; 12];
+        let mut wal2 = wal1.clone();
+        wal2.extend([3u8; 20]);
+        for (wal, revision) in [(&wal1, 1), (&wal2, 2)] {
+            repo.save_delta(
+                "sql",
+                "space",
+                "main",
+                wal.clone().into(),
+                derived(revision),
+            )
+            .await
+            .unwrap();
+        }
+        let mark = |revision, wal: &Vec<u8>| WalMark {
+            revision,
+            checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+            wal_end_bytes: wal.len() as u64,
+            wal_prefix_sha256: wal_sha256(wal),
+        };
+        // The checkpoint's own revision has no mark; each delta has its own.
+        assert_eq!(
+            marks_of(&repo, "main").await,
+            vec![mark(2, &wal1), mark(3, &wal2)]
+        );
+        assert!(marks_of(&repo, "other").await.is_empty());
+        assert!(repo
+            .load_wal_marks("sql", "space", "main", &[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn postgres_delta_cte_wal_marks_round_trip() {
+        let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("postgres_delta_cte_wal_marks_round_trip")
+                .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        let base = repo
+            .save(
+                "sql",
+                "cte-space",
+                "cte-db",
+                b"checkpoint".to_vec().into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let wal = b"wal-mark-cte-readback";
+        let saved = repo
+            .save_delta(
+                "sql",
+                "cte-space",
+                "cte-db",
+                wal.to_vec().into(),
+                ArtifactExpectation::Derived {
+                    revision: base.revision,
+                    checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.revision, base.revision + 1);
+        assert_eq!(
+            sql_wal_mark::Entity::find()
+                .all(&fixture.conn)
+                .await
+                .unwrap(),
+            vec![sql_wal_mark::Model {
+                service: "sql".into(),
+                space: "cte-space".into(),
+                name: "cte-db".into(),
+                revision: saved.revision,
+                checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+                wal_end_bytes: wal.len() as i64,
+                wal_prefix_sha256: hex::encode(wal_sha256(wal)),
+            }]
+        );
+        assert_eq!(
+            repo.load_wal_marks(
+                "sql",
+                "cte-space",
+                "cte-db",
+                &[base.revision, saved.revision, saved.revision + 1],
+            )
+            .await
+            .unwrap(),
+            vec![WalMark {
+                revision: saved.revision,
+                checkpoint_content_hash: base.checkpoint_content_hash,
+                wal_end_bytes: wal.len() as u64,
+                wal_prefix_sha256: wal_sha256(wal),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_cas_lost_delta_cte_writes_no_wal_marks() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+        use std::time::Duration;
+
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_cas_lost_delta_cte_writes_no_wal_marks",
+        )
+        .await
+        else {
+            return;
+        };
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone());
+        for (name, change) in [
+            ("revision", "revision = revision + 1"),
+            ("checkpoint", "checkpoint_content_hash = 'other-checkpoint'"),
+        ] {
+            let base = repo
+                .save(
+                    "sql",
+                    "space",
+                    name,
+                    b"checkpoint".to_vec().into(),
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+            let competitor = fixture.connect(1).await;
+            let holder = competitor.begin().await.unwrap();
+            let pid: i32 = holder
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT pg_backend_pid()",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            holder
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    format!("UPDATE database_artifact SET {change} WHERE name = $1"),
+                    [name.into()],
+                ))
+                .await
+                .unwrap();
+            let winner = database_artifact::Entity::find_by_id((
+                "sql".to_string(),
+                "space".to_string(),
+                name.to_string(),
+            ))
+            .one(&holder)
+            .await
+            .unwrap()
+            .unwrap();
+
+            // The metadata read sees the committed base; only the CTE waits
+            // on the competing update, then rechecks its CAS after commit.
+            let saver = repo.clone();
+            let mut save = tokio::spawn(async move {
+                saver
+                    .save_delta(
+                        "sql",
+                        "space",
+                        name,
+                        b"losing-wal".to_vec().into(),
+                        ArtifactExpectation::Derived {
+                            revision: base.revision,
+                            checkpoint_content_hash: base.checkpoint_content_hash,
+                        },
+                    )
+                    .await
+            });
+            let blocked = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if fixture
+                        .conn
+                        .query_one(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                            [pid.into()],
+                        ))
+                        .await?
+                        .is_some()
+                    {
+                        return Ok::<_, DbErr>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            // Release the lock even if observing the blocked CTE timed out.
+            let committed = holder.commit().await;
+            let result = match tokio::time::timeout(Duration::from_secs(10), &mut save).await {
+                Ok(result) => result.unwrap(),
+                Err(error) => {
+                    save.abort();
+                    let _ = save.await;
+                    panic!("{name}: delta save did not finish after competitor release: {error}");
+                }
+            };
+            committed.unwrap();
+            blocked
+                .expect("delta CTE must wait for the competing update")
+                .unwrap();
+            assert!(
+                matches!(&result, Err(DatabaseArtifactError::Backend(message))
+                    if message == "concurrent database artifact update"),
+                "{name}: {result:?}"
+            );
+            assert_eq!(
+                database_artifact::Entity::find_by_id((
+                    "sql".to_string(),
+                    "space".to_string(),
+                    name.to_string(),
+                ))
+                .one(&fixture.conn)
+                .await
+                .unwrap()
+                .unwrap(),
+                winner,
+                "{name}: the competing row must stand"
+            );
+            assert!(marks_of(&repo, name).await.is_empty(), "{name}");
+            assert!(
+                sql_wal_mark::Entity::find()
+                    .all(&fixture.conn)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{name}: a CAS-lost CTE must insert no mark"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_save_drops_the_marks_of_the_artifact_it_replaces() {
+        let (_conn, repo) = marks_repo().await;
+        for name in ["main", "other"] {
+            let base = repo
+                .save(
+                    "sql",
+                    "space",
+                    name,
+                    vec![1; 100].into(),
+                    ArtifactExpectation::Absent,
+                )
+                .await
+                .unwrap();
+            repo.save_delta(
+                "sql",
+                "space",
+                name,
+                vec![2; 12].into(),
+                ArtifactExpectation::Derived {
+                    revision: 1,
+                    checkpoint_content_hash: base.checkpoint_content_hash,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(marks_of(&repo, name).await.len(), 1);
+        }
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![3; 80].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        assert!(marks_of(&repo, "main").await.is_empty());
+        assert_eq!(marks_of(&repo, "other").await.len(), 1, "only its own");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_delta_save_leaves_no_mark() {
+        let (_conn, repo) = marks_repo().await;
+        let base = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100].into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![2; 100].into(),
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        let err = repo
+            .save_delta(
+                "sql",
+                "space",
+                "main",
+                vec![3; 12].into(),
+                ArtifactExpectation::Derived {
+                    revision: 2,
+                    checkpoint_content_hash: base.checkpoint_content_hash,
+                },
+            )
+            .await
+            .expect_err("a delta on a superseded checkpoint is refused");
+        assert!(
+            matches!(err, DatabaseArtifactError::StaleLineage),
+            "{err:?}"
+        );
+        assert!(marks_of(&repo, "main").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mark_row_that_cannot_be_read_back_is_not_returned() {
+        let (conn, repo) = marks_repo().await;
+        let row = |revision: i64, wal_end_bytes: i64, wal_prefix_sha256: &str| {
+            sql_wal_mark::ActiveModel {
+                service: Set("sql".into()),
+                space: Set("space".into()),
+                name: Set("main".into()),
+                revision: Set(revision),
+                checkpoint_content_hash: Set("cid".into()),
+                wal_end_bytes: Set(wal_end_bytes),
+                wal_prefix_sha256: Set(wal_prefix_sha256.into()),
+            }
+        };
+        let valid = "ab".repeat(32);
+        for model in [
+            row(1, 10, &valid),
+            row(2, -1, &valid),
+            row(3, 10, "not-hex"),
+            row(4, 10, &"ab".repeat(31)),
+        ] {
+            sql_wal_mark::Entity::insert(model)
+                .exec(&conn)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            marks_of(&repo, "main").await,
+            vec![WalMark {
+                revision: 1,
+                checkpoint_content_hash: "cid".into(),
+                wal_end_bytes: 10,
+                wal_prefix_sha256: [0xab; 32],
+            }]
+        );
     }
 }

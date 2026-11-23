@@ -10,7 +10,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
     sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
-    ConnectionTrait, DbBackend, QueryTrait, Statement,
+    ConnectionTrait, DbBackend, QuerySelect, QueryTrait, Statement,
 };
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
@@ -30,6 +30,9 @@ pub struct Model {
     pub facts: Option<Facts>,
     pub serialization: Vec<u8>,
     pub serialization_format: i16,
+    /// TC-3443: when this node first stored the row. NULL for rows stored
+    /// before the column existed; those count as seen before any retire.
+    pub first_seen_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -145,6 +148,12 @@ pub enum DelegationError {
     InvalidSignature,
     #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
     UnsupportedDidMethod(String),
+    #[error("did_unverifiable: this `did:{0}` identifier is malformed or names a key type this node cannot verify")]
+    UnverifiableDid(String),
+    /// TC-1500: the grant's holder is neither a DID this node can verify
+    /// offline nor a Policy/v3 delegate.
+    #[error("did_holder_unverifiable: the delegate is not a DID this node can verify")]
+    UnverifiableHolder,
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     DidUrlQueryRejected,
     #[error("Unauthorized Delegator: {0}")]
@@ -197,6 +206,10 @@ pub enum DelegationError {
     /// SIWE domain.
     #[error("app_id_not_bound: the app id in a key grant under apps/ is not bound to the signing domain")]
     AppIdNotBound,
+    /// TC-3443: the delegator is a session key its holder signed out, and
+    /// this delegation was not stored before the retire.
+    #[error("session_retired: {0}")]
+    SessionRetired(String),
 }
 
 impl DelegationError {
@@ -248,15 +261,63 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
-    validate_with(
+    let validated = validate_with_encryption(
         db,
         &delegation.0,
         delegated_sql_caveats,
         named_keys,
         renewal_identity,
+        encryption,
     )
-    .await?;
+    .await;
+    if let Err(error) = validated {
+        // TC-3443: a delegation stored before its issuer signed out, and
+        // TC-1500: a grant stored before the holder rule existed, answer as
+        // already registered when resubmitted, as the single-delegation path
+        // does, so batch retries stay idempotent.
+        if matches!(
+            error,
+            Error::InvalidDelegation(
+                DelegationError::SessionRetired(_) | DelegationError::UnverifiableHolder
+            )
+        ) && is_stored(db, delegation).await?
+        {
+            return Ok(DelegationRegistration::Existing(crate::hash::hash(
+                &delegation.1,
+            )));
+        }
+        return Err(error);
+    }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+}
+
+async fn is_stored<C: ConnectionTrait>(db: &C, delegation: &Delegation) -> Result<bool, DbErr> {
+    Ok(Entity::find_by_id(crate::hash::hash(&delegation.1))
+        .select_only()
+        .column(Column::Id)
+        .into_tuple::<Hash>()
+        .one(db)
+        .await?
+        .is_some())
+}
+
+/// TC-3443: refuse a delegation issued by a signed-out session key. Callers
+/// let one stored before the retire answer as already registered.
+async fn refuse_retired_delegator<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+) -> Result<(), Error> {
+    if session_retire::live_retired_at(db, &delegation.delegator, OffsetDateTime::now_utc())
+        .await?
+        .is_some()
+    {
+        return Err(DelegationError::SessionRetired(format!(
+            "delegator {} signed out",
+            delegation.delegator
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Save only the graph portion of a proofless renewal lease. The transaction
@@ -272,18 +333,19 @@ pub(crate) async fn save_owner_renewal_lease<C: ConnectionTrait>(
     if !signature_verified {
         check_signature(&delegation.0.delegation).await?;
     }
-    verify_time(&delegation.0.delegation)?;
-    if !delegation.0.parents.is_empty()
-        || !crate::renewal::lease_original_from_signed(delegation)
-            .is_ok_and(|original| original.is_some())
-    {
-        return Err(DelegationError::MissingParents.into());
+    check_owner_renewal_lease(delegation)?;
+    check_holder(&delegation.0)?;
+    if let Err(error) = refuse_retired_delegator(db, &delegation.0).await {
+        // Stored before the retire: `save` answers it as already registered.
+        if !is_stored(db, delegation).await? {
+            return Err(error);
+        }
     }
     save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
-/// Check a delegation's signature: CPU, or a DID resolution when network
-/// methods are on. Runs before any lock (TC-2986).
+/// Check a delegation's signature: CPU only, no DID is fetched. Runs before
+/// any lock (TC-2986).
 pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ucan) => {
@@ -292,6 +354,9 @@ pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<
                 .map_err(|error| match error {
                     UcanVerifyError::MethodDisabled { method } => {
                         DelegationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::Unverifiable { method } => {
+                        DelegationError::UnverifiableDid(method)
                     }
                     UcanVerifyError::QueryRejected => DelegationError::DidUrlQueryRejected,
                     UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
@@ -309,8 +374,20 @@ pub(crate) async fn check_signature(delegation: &TinyCloudDelegation) -> Result<
     Ok(())
 }
 
+/// TC-1500: a new grant's holder (`aud`) must be a DID the node can verify
+/// offline, or a Policy/v3 delegate, so no grant is issued to a key that could
+/// never sign an invocation the node accepts. CPU only. Stored grants are not
+/// re-checked.
+fn check_holder(delegation: &util::DelegationInfo) -> Result<(), Error> {
+    if crate::did_resolution::check_holder(&delegation.delegate) {
+        Ok(())
+    } else {
+        Err(DelegationError::UnverifiableHolder.into())
+    }
+}
+
 /// Check that a delegation is within its signed time window now.
-fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
+pub(crate) fn verify_time(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     let valid = match delegation {
         TinyCloudDelegation::Ucan(ucan) => ucan.payload().validate_time(None).is_ok(),
         TinyCloudDelegation::Cacao(cacao) => cacao.payload().valid_now(),
@@ -474,6 +551,7 @@ async fn validate<C: ConnectionTrait>(
     validate_with(db, delegation, false, true, None).await
 }
 
+#[cfg(test)]
 async fn validate_with<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
@@ -481,64 +559,63 @@ async fn validate_with<C: ConnectionTrait>(
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
 ) -> Result<(), Error> {
+    validate_with_encryption(
+        db,
+        delegation,
+        delegated_sql_caveats,
+        named_keys,
+        renewal_identity,
+        None,
+    )
+    .await
+}
+
+async fn validate_with_encryption<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewal_identity: Option<(&str, &str, u64)>,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
     if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
     }
-    for parent in &delegation.parents {
-        let parent_id = Hash::from(*parent);
-        let is_renewal_lease = db
-            .query_one(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
-                [sea_orm::sea_query::Value::Bytes(Some(Box::new(
-                    parent_id.as_ref().to_vec(),
-                )))],
-            ))
-            .await?;
-        if is_renewal_lease.is_some() {
-            return Err(DelegationError::MissingParents.into());
-        }
-    }
-    // Without named keys, a capability on a key or key prefix is refused for
-    // every delegation, before the root-authority filter, so a delegation
-    // issued by the key's owner is covered too.
-    if !named_keys
-        && delegation
-            .capabilities
-            .iter()
-            .any(|cap| cap.resource.is_named_key())
-    {
-        return Err(DelegationError::NamedKeysUnavailable.into());
-    }
-    check_app_id_domain_binding(delegation)?;
-    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
-    // before the root-authority filter.
-    for cap in &delegation.capabilities {
-        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
-    }
-    // Key deletion is never delegated, including by the key's owner.
-    if delegation.capabilities.iter().any(|cap| {
-        crate::policy_capability::ability_matches(
-            &cap.ability.to_string(),
-            "tinycloud.encryption/key.delete",
-        )
-    }) {
-        return Err(DelegationError::KeyDeleteNotDelegable.into());
-    }
+    refuse_retired_delegator(db, delegation).await?;
+    refuse_renewal_lease_parents(db, delegation).await?;
+    check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
 
     // get caps which rely on delegated caps
-    let dependant_caps: Vec<_> = delegation
-        .capabilities
-        .iter()
-        .filter(|c| {
-            // remove caps for which the delegator is the root authority
-            !is_root_authority(c, &delegation.delegator)
-        })
-        .collect();
+    let dependant_caps = dependant_capabilities(delegation);
 
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
-        // no dependant caps, no parents needed, must be valid
-        (true, _) => Ok(()),
+        // no dependant caps, no parents cited: root authority alone
+        (true, true) => Ok(()),
+        // no dependant caps, but parents are cited: every cited parent must be
+        // stored (TC-3663), and no cited parent or ancestor may be terminal
+        // (TC-3810), even when the signer holds root authority.
+        (true, false) => {
+            let parent_ids: Vec<Hash> =
+                delegation.parents.iter().copied().map(Hash::from).collect();
+            let graph = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+                db,
+                &parent_ids,
+                encryption,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                    Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+                }
+            })?;
+            check_no_terminal_in_parent_closure(&graph, &parent_ids)?;
+            if parent_ids.iter().all(|id| graph.delegation(id).is_some()) {
+                Ok(())
+            } else {
+                Err(DelegationError::MissingParents.into())
+            }
+        }
         // Policy roots are owner-signed control-plane roots.  They are
         // admitted into the ordinary graph during policy registration, but
         // they are never a usable grant on their own: the route gate rejects
@@ -579,13 +656,14 @@ async fn validate_with<C: ConnectionTrait>(
             let verifier_now = OffsetDateTime::now_utc().unix_timestamp();
             let loaded_graph;
             let graph = if let Some((stable_node_did, renewer_did, epoch)) = renewal_identity {
-                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity(
+                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load_with_renewal_identity_and_encryption(
                     db,
                     &parent_ids,
                     stable_node_did,
                     renewer_did,
                     epoch,
                     verifier_now,
+                    encryption,
                 )
                 .await
                 .map_err(|error| match error {
@@ -596,14 +674,18 @@ async fn validate_with<C: ConnectionTrait>(
                 })?;
                 &loaded_graph
             } else {
-                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &parent_ids)
-                    .await
-                    .map_err(|error| match error {
-                        crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
-                        crate::auth_graph::ChainTraversalError::LimitExceeded => {
-                            Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
-                        }
-                    })?;
+                loaded_graph = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(
+                    db,
+                    &parent_ids,
+                    encryption,
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                    crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                        Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+                    }
+                })?;
                 &loaded_graph
             };
             let mut all_parents = Vec::with_capacity(delegation.parents.len());
@@ -697,15 +779,12 @@ async fn validate_with<C: ConnectionTrait>(
                 }
             }
 
-            // W1 (B): reject any chain that cites a terminal parent. The
-            // marker is persisted on the parent row's `facts` column at
-            // save time and is signed-into the parent's UCAN payload, so a
-            // cooperating holder cannot strip it after the fact.
-            for p in &all_parents {
-                if parent_is_terminal(p) {
-                    return Err(DelegationError::TerminalParentCannotRedelegate.into());
-                }
-            }
+            // W1 (B) + TC-3810: reject any chain that cites a terminal parent
+            // or descends from a terminal ancestor (or a pre-upgrade stored
+            // malformed-mode CACAO). The marker is persisted on the row's
+            // `facts` column at save/reindex time and is signed into the
+            // parent's UCAN/ReCap payload, so a holder cannot strip it.
+            check_no_terminal_in_parent_closure(graph, &parent_ids)?;
 
             // Check time constraints and track failures
             let mut expiry_failed = false;
@@ -846,7 +925,203 @@ async fn validate_with<C: ConnectionTrait>(
     }
 }
 
-fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
+/// A renewal lease is never a parent: a child citing one is refused as if the
+/// parent were missing.
+async fn refuse_renewal_lease_parents<C: ConnectionTrait>(
+    db: &C,
+    delegation: &util::DelegationInfo,
+) -> Result<(), Error> {
+    for parent in &delegation.parents {
+        let parent_id = Hash::from(*parent);
+        let is_renewal_lease = db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT 1 AS lease FROM renewal_lease WHERE lease_cid = $1 LIMIT 1",
+                [sea_orm::sea_query::Value::Bytes(Some(Box::new(
+                    parent_id.as_ref().to_vec(),
+                )))],
+            ))
+            .await?;
+        if is_renewal_lease.is_some() {
+            return Err(DelegationError::MissingParents.into());
+        }
+    }
+    Ok(())
+}
+
+/// The rules on a delegation's own capabilities that hold whoever issues it.
+fn check_capability_rules(
+    delegation: &util::DelegationInfo,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+) -> Result<(), Error> {
+    // Without named keys, a capability on a key or key prefix is refused for
+    // every delegation, before the root-authority filter, so a delegation
+    // issued by the key's owner is covered too.
+    if !named_keys
+        && delegation
+            .capabilities
+            .iter()
+            .any(|cap| cap.resource.is_named_key())
+    {
+        return Err(DelegationError::NamedKeysUnavailable.into());
+    }
+    check_app_id_domain_binding(delegation)?;
+    // TC-1791: SQL and DuckDB caveats are checked for every delegation,
+    // before the root-authority filter.
+    for cap in &delegation.capabilities {
+        check_sql_caveats_supported(cap, delegated_sql_caveats)?;
+    }
+    // Key deletion is never delegated, including by the key's owner.
+    if delegation.capabilities.iter().any(|cap| {
+        crate::policy_capability::ability_matches(
+            &cap.ability.to_string(),
+            "tinycloud.encryption/key.delete",
+        )
+    }) {
+        return Err(DelegationError::KeyDeleteNotDelegable.into());
+    }
+    // After the capability rules, so a refusal specific to the capabilities wins.
+    check_holder(delegation)
+}
+
+/// The capabilities the issuer does not hold as a root authority, which a
+/// parent or an owner revoke grant has to support.
+fn dependant_capabilities(delegation: &util::DelegationInfo) -> Vec<&util::Capability> {
+    delegation
+        .capabilities
+        .iter()
+        .filter(|c| !is_root_authority(c, &delegation.delegator))
+        .collect()
+}
+
+/// The checks of [`process_with`] that need no lock, run on the pool before
+/// a delegation takes any chain guard, space write order or transaction
+/// (TC-3000): its signed time window, and the issuer's standing. A stranger
+/// naming another tenant's space or parent, or an expired delegation, is
+/// refused here instead of queueing behind that tenant's locks.
+///
+/// The issuer has standing when it is the root authority for every
+/// capability, or holds an owner revoke grant on each other capability, or
+/// each cited parent is stored and was granted to it, and no cited parent or
+/// ancestor is terminal (TC-3810). Every check runs again inside the
+/// transaction, which stays the authority. In error order this follows
+/// [`process_with`].
+pub(crate) async fn precheck<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewer_did: Option<&str>,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    verify_time(&delegation.0.delegation)?;
+    precheck_standing_with_encryption(
+        db,
+        delegation,
+        delegated_sql_caveats,
+        named_keys,
+        renewer_did,
+        encryption,
+    )
+    .await
+}
+
+/// [`precheck`] without its time window: the issuer's standing and the
+/// capability rules. Only for TC-3443's sign-out, which covers a carried
+/// root that is not valid yet without storing it.
+#[cfg(test)]
+pub(crate) async fn precheck_standing<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewer_did: Option<&str>,
+) -> Result<(), Error> {
+    precheck_standing_with_encryption(
+        db,
+        delegation,
+        delegated_sql_caveats,
+        named_keys,
+        renewer_did,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn precheck_standing_with_encryption<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewer_did: Option<&str>,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    let delegation = &delegation.0;
+    if renewer_did.is_some_and(|renewer_did| delegation.delegator == renewer_did) {
+        return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
+    }
+    refuse_retired_delegator(db, delegation).await?;
+    refuse_renewal_lease_parents(db, delegation).await?;
+    check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
+    let dependant_caps = dependant_capabilities(delegation);
+    if delegation.parents.is_empty() {
+        if dependant_caps.is_empty() {
+            return Ok(());
+        }
+        if is_policy_root(&delegation.delegation)
+            || revocation::delegator_hands_back_revoke(db, delegation).await?
+        {
+            return Ok(());
+        }
+        for cap in &dependant_caps {
+            if !revocation::owner_controls_target(db, &delegation.delegator, cap).await? {
+                return Err(DelegationError::MissingParents.into());
+            }
+        }
+        return Ok(());
+    }
+    let parent_ids: Vec<Hash> = delegation.parents.iter().copied().map(Hash::from).collect();
+    // TC-3810: refuse any cited terminal parent or ancestor before the
+    // root-authority early return and before taking any chain/space/writer lock,
+    // using pure read-only SQL so `track_writes` never treats precheck as a write.
+    let rows = check_parent_closure_not_terminal_readonly(db, &parent_ids, encryption).await?;
+    if dependant_caps.is_empty() {
+        return if parent_ids.iter().all(|id| rows.contains_key(id)) {
+            Ok(())
+        } else {
+            Err(DelegationError::MissingParents.into())
+        };
+    }
+    let policy_session = is_policy_session(&delegation.delegation);
+    for id in &parent_ids {
+        let Some(delegatee) = rows.get(id) else {
+            return Err(DelegationError::MissingParents.into());
+        };
+        if !policy_session && *delegatee != delegation.delegator {
+            return Err(
+                DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The checks of [`save_owner_renewal_lease`] that need neither the database
+/// nor a lock: the lease's time window, no cited parents, and a signed
+/// original to renew.
+pub(crate) fn check_owner_renewal_lease(delegation: &Delegation) -> Result<(), Error> {
+    verify_time(&delegation.0.delegation)?;
+    if !delegation.0.parents.is_empty()
+        || !crate::renewal::lease_original_from_signed(delegation)
+            .is_ok_and(|original| original.is_some())
+    {
+        return Err(DelegationError::MissingParents.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
     let TinyCloudDelegation::Ucan(ucan) = delegation else {
         return false;
     };
@@ -1164,17 +1439,73 @@ fn extract_sql_caveat(
     None
 }
 
-/// True if the persisted parent row is marked terminal via the
-/// `xyz.tinycloud.policy/delegationMode` fact. The marker is stored in the
-/// `facts` JSON column at save time; absence is treated as attenuable.
-fn parent_is_terminal(p: &Model) -> bool {
-    let Some(Facts(map)) = &p.facts else {
-        return false;
-    };
-    map.get(DelegationMode::FACT_KEY)
-        .and_then(|v| v.as_str())
-        .map(|s| s == "terminal")
-        .unwrap_or(false)
+/// Pure read-only closure check for pre-lock registration preflight (TC-3810):
+/// loads parent edges and side-table `delegation_mode` in one query (no string
+/// literals in SQL, so `db_pool::is_read_only_statement` stays true), refuses
+/// if any cited parent or ancestor is `terminal` or `invalid` (deriving
+/// fail-closed from stored bytes when unmarked), and returns the `delegatee`
+/// map of the direct `parent_ids`. Never reads `delegation.facts` for mode.
+pub(crate) async fn check_parent_closure_not_terminal_readonly<C: ConnectionTrait>(
+    db: &C,
+    parent_ids: &[Hash],
+    encryption: Option<&ColumnEncryption>,
+) -> Result<std::collections::HashMap<Hash, String>, Error> {
+    if parent_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let closure = crate::auth_graph::load_closure_with_modes(db, parent_ids)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    let mut unmarked = Vec::new();
+    for node in &closure.nodes {
+        match closure.modes.get(node) {
+            Some(mode) if mode.is_terminal_or_invalid() => {
+                return Err(DelegationError::TerminalParentCannotRedelegate.into());
+            }
+            Some(_) => {}
+            None => unmarked.push(*node),
+        }
+    }
+    if !unmarked.is_empty() {
+        let derived = delegation_mode::resolve_unmarked_modes(db, &unmarked, encryption).await?;
+        if derived.values().any(|mode| mode.is_terminal_or_invalid()) {
+            return Err(DelegationError::TerminalParentCannotRedelegate.into());
+        }
+    }
+    let rows: Vec<(Hash, String)> = Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .column(Column::Delegatee)
+        .filter(Column::Id.is_in(parent_ids.iter().copied()))
+        .into_tuple::<(Hash, String)>()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Refuse if any directly cited parent or any transitive ancestor in `graph`
+/// is `terminal` or `invalid`. Reads `graph.delegation_mode(...)` (from the
+/// joined `delegation_mode` side table, never `delegation.facts`).
+pub(crate) fn check_no_terminal_in_parent_closure(
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    parent_ids: &[Hash],
+) -> Result<(), DelegationError> {
+    for parent_id in parent_ids {
+        for chain_id in graph.chain_ids_from(parent_id) {
+            if graph
+                .delegation_mode(&chain_id)
+                .is_some_and(delegation_mode::StoredDelegationMode::is_terminal_or_invalid)
+            {
+                return Err(DelegationError::TerminalParentCannotRedelegate);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1236,12 +1567,11 @@ async fn save<C: ConnectionTrait>(
         ),
     );
 
-    // Persist the signed-in `delegationMode` marker. We store ONLY the
-    // marker we recognize natively (not the full UCAN facts), keeping the
-    // serialization column as the source of truth for the bytes the holder
-    // actually signed and the `facts` column as a fast-path lookup index.
+    // Keep `delegation.facts` identical to pre-1.26.22 behavior (only record
+    // `"terminal"` and signed policy facts); the authoritative mode index lives
+    // in the `delegation_mode` side table written atomically below.
     let mut fact_index = BTreeMap::new();
-    if matches!(delegation.delegation_mode, DelegationMode::Terminal) {
+    if delegation.delegation_mode == DelegationMode::Terminal {
         fact_index.insert(
             DelegationMode::FACT_KEY.to_string(),
             serde_json::Value::String(DelegationMode::Terminal.as_str().to_string()),
@@ -1251,17 +1581,40 @@ async fn save<C: ConnectionTrait>(
         fact_index.insert(key.to_string(), value);
     }
     let facts = (!fact_index.is_empty()).then_some(Facts(fact_index));
+    let stored_mode = delegation_mode::StoredDelegationMode::from_live(delegation.delegation_mode);
 
     // Actors are FK prerequisites for the delegation row and must be inserted
     // first. They use ON CONFLICT DO NOTHING so concurrent transactions writing
     // the same actors are safe. This is the only write that precedes the
-    // idempotency gate below.
-    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
+    // idempotency gate below. For a delegation to a `did:key` on PostgreSQL
+    // the same statement takes the key's session-retire lock (TC-3443 N1),
+    // so a concurrent retire either sees this delegation or is seen by the
+    // raise below; it costs no extra round trip.
+    let retire_lock = (db.get_database_backend() == sea_orm::DatabaseBackend::Postgres
+        && session_retire::is_retirable(&delegation.delegate))
+    .then(|| session_retire::lock_key(&delegation.delegate));
+    save_actors(
+        &[&delegation.delegator, &delegation.delegate],
+        retire_lock,
+        db,
+    )
+    .await?;
 
     // The signed row remains the idempotency gate. Persist its alias in the
     // same transaction; PostgreSQL uses a dependent INSERT CTE to keep the
     // existing registration round-trip budget.
     let canonical = delegation_cid_alias::canonical_hash(&serialization)?;
+    let now = session_retire::stored_now();
+    // TC-3443: a new delegation to a retired key extends its live retire row
+    // to outlast it, so the key does not come back when the row expires.
+    // Only a did:key can be retired; others cost nothing.
+    let raise_retire = session_retire::is_retirable(&delegation.delegate).then(|| {
+        session_retire::raise_expiry_statement(
+            &delegation.delegate,
+            session_retire::covering(delegation.expiry),
+            now,
+        )
+    });
     let insert = Entity::insert(ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
@@ -1272,6 +1625,9 @@ async fn save<C: ConnectionTrait>(
         facts,
         serialization: stored_serialization,
         serialization_format: if encryption.is_some() { 2 } else { 0 },
+        // The conflict below does nothing, so a resubmission keeps the first
+        // insert's time.
+        first_seen_at: Some(now),
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned());
     if db.get_database_backend() == DbBackend::Postgres {
@@ -1300,16 +1656,57 @@ async fn save<C: ConnectionTrait>(
                     .column(delegation_cid_alias::Column::Id)
                     .to_owned(),
             )
-            .with_cte(
-                WithClause::new()
-                    .cte(
-                        CommonTableExpression::new()
-                            .table_name(claimed)
-                            .query(delegation_insert)
+            .with_cte({
+                let mut with = WithClause::new();
+                with.cte(
+                    CommonTableExpression::new()
+                        .table_name(claimed.clone())
+                        .query(delegation_insert)
+                        .to_owned(),
+                );
+                // TC-3810: write the `delegation_mode` side-table row in the
+                // exact same statement/transaction (zero extra round trips).
+                let mut mode_insert = Query::insert();
+                mode_insert
+                    .into_table(delegation_mode::Entity)
+                    .columns([
+                        delegation_mode::Column::DelegationId,
+                        delegation_mode::Column::Mode,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(Column::Id)
+                            .expr(Expr::val(stored_mode.as_str()))
+                            .from(claimed.clone())
                             .to_owned(),
                     )
-                    .to_owned(),
-            );
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .on_conflict(
+                        OnConflict::column(delegation_mode::Column::DelegationId)
+                            .do_nothing()
+                            .to_owned(),
+                    );
+                with.cte(
+                    CommonTableExpression::new()
+                        .table_name(Alias::new("registered_delegation_mode"))
+                        .query(mode_insert)
+                        .to_owned(),
+                );
+                // In the same statement, so no extra round trip; it runs
+                // only when the delegation row was inserted.
+                if let Some(mut raise) = raise_retire {
+                    raise.and_where(Expr::exists(
+                        Query::select().expr(Expr::val(1)).from(claimed).to_owned(),
+                    ));
+                    with.cte(
+                        CommonTableExpression::new()
+                            .table_name(Alias::new("raised_session_retire"))
+                            .query(raise)
+                            .to_owned(),
+                    );
+                }
+                with
+            });
         if db
             .query_one(db.get_database_backend().build(&alias_insert))
             .await?
@@ -1331,6 +1728,24 @@ async fn save<C: ConnectionTrait>(
         })
         .exec(db)
         .await?;
+        match delegation_mode::Entity::insert(delegation_mode::ActiveModel {
+            delegation_id: Set(hash),
+            mode: Set(stored_mode.as_str().to_string()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation_mode::Column::DelegationId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        {
+            Ok(_) | Err(DbErr::RecordNotInserted) => {}
+            Err(error) => return Err(Error::Db(error)),
+        }
+        if let Some(raise) = raise_retire {
+            db.execute(db.get_database_backend().build(&raise)).await?;
+        }
     }
 
     // save abilities — persist UCAN caveats with the delegation row. W1
@@ -1365,26 +1780,12 @@ async fn save<C: ConnectionTrait>(
     Ok(DelegationRegistration::New(hash))
 }
 
-async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
-    match actor::Entity::insert_many(actors.iter().map(|a| {
-        actor::ActiveModel::from(actor::Model {
-            id: ToString::to_string(a),
-        })
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
-    Ok(())
+async fn save_actors<C: ConnectionTrait>(
+    actors: &[&str],
+    retire_lock: Option<i64>,
+    db: &C,
+) -> Result<(), DbErr> {
+    crate::space_purge_records::operation_actors_locking(db, actors, retire_lock).await
 }
 
 #[cfg(test)]
@@ -1410,6 +1811,113 @@ mod tests {
             matches!(result, Err(super::Error::InvalidDelegation(super::DelegationError::UnsupportedDidMethod(method))) if method == "web")
         );
         assert_no_connections(&[&listener]).await;
+    }
+
+    /// TC-1500: a new grant's holder must be a DID the node can verify offline, or a
+    /// Policy/v3 delegate. A malformed issuer keeps its issuer code.
+    #[tokio::test]
+    async fn new_grant_holder_must_be_verifiable() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::{
+            authorization::TinyCloudDelegation,
+            ipld_core::cid::multibase,
+            resolver::DID_METHODS,
+            ssi::jwk::{Algorithm, JWK},
+        };
+        let key = JWK::generate_ed25519().unwrap();
+        let issuer = DID_METHODS.generate(&key, "key").unwrap().to_string();
+        let event = |issuer: &str, holder: &str| {
+            let token = signed_ucan_to(issuer, holder, &key, Algorithm::EdDSA, true)
+                .encode()
+                .unwrap();
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap()
+        };
+        let z2d = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, [&[0xed][..], &[9; 32]].concat())
+        );
+        let p384 = format!(
+            "did:key:{}",
+            multibase::encode(
+                multibase::Base::Base58Btc,
+                [&[0x81, 0x24, 0x02][..], &[9; 48]].concat()
+            )
+        );
+        let accepted = [
+            HOLDER.to_owned(),
+            DID_METHODS
+                .generate(&JWK::generate_secp256k1(), "key")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_p256(), "key")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_p256(), "jwk")
+                .unwrap()
+                .to_string(),
+            DID_METHODS
+                .generate(&JWK::generate_secp256k1(), "pkh:eip155:1")
+                .unwrap()
+                .to_string(),
+            format!("did:tinycloud:policy:{}", "ab".repeat(32)),
+        ];
+        for holder in &accepted {
+            assert!(
+                super::check_capability_rules(&event(&issuer, holder).0, false, true).is_ok(),
+                "{holder}"
+            );
+        }
+        for holder in [
+            z2d.as_str(),
+            p384.as_str(),
+            "did:web:example.com",
+            "did:pkh:tezos:NetXdQprcVkpaWU:tz1YwA1FwpgLtc1G8DKbbZ6e6PTb1dQMRn5x",
+            "did:tinycloud:policy:not-a-digest",
+        ] {
+            assert!(
+                matches!(
+                    super::check_capability_rules(&event(&issuer, holder).0, false, true),
+                    Err(super::Error::InvalidDelegation(
+                        super::DelegationError::UnverifiableHolder
+                    ))
+                ),
+                "{holder}"
+            );
+        }
+        // Through `process`, the path a transaction takes without preverification.
+        let result = super::process(&database().await, &event(&issuer, &z2d), None).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::Error::InvalidDelegation(
+                    super::DelegationError::UnverifiableHolder
+                ))
+            ),
+            "{result:?}"
+        );
+        // A grant stored before the holder rule answers as already registered when it is
+        // resubmitted through a batch, as on the single-delegation path.
+        let db = database().await;
+        let token = signed_ucan_to(&issuer, &z2d, &key, Algorithm::EdDSA, false)
+            .encode()
+            .unwrap();
+        let stored =
+            crate::events::Delegation::from_header_ser::<TinyCloudDelegation>(&token).unwrap();
+        super::save(&db, stored.0.clone(), stored.1.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::process(&db, &stored, None).await.unwrap(),
+            super::DelegationRegistration::Existing(stored.content_hash())
+        );
+        // A malformed issuer is refused as the issuer.
+        let result = super::check_signature(&event(&z2d, HOLDER).0.delegation).await;
+        assert!(
+            matches!(result, Err(super::Error::InvalidDelegation(super::DelegationError::UnverifiableDid(ref method))) if method == "key"),
+            "{result:?}"
+        );
     }
     use super::*;
     use crate::migrations::Migrator;
@@ -1443,6 +1951,14 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(id),
+            mode: Set("attenuable".to_string()),
         }
         .insert(db)
         .await
@@ -1481,6 +1997,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(ser_a.clone()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         };
 
         // First insert → row is new.
@@ -1574,6 +2091,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(ser),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             })
             .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
             .exec(&db)
@@ -1926,6 +2444,44 @@ mod tests {
         validate(&db, &info)
             .await
             .expect("owner is root authority for own keys");
+    }
+
+    // test-ruling: TC-3663 tinycloud-core/src/models/delegation.rs new test only (2026-11-22)
+    /// TC-3663: a grant that needs no parent's authority, citing a parent
+    /// that is not stored, is refused as a missing parent by both the
+    /// lock-free precheck and the transaction's validation. Before, it passed
+    /// both, and the edge insert failed on its foreign key: a 500, not a 401.
+    #[tokio::test]
+    async fn root_grant_citing_an_unstored_parent_is_refused_as_missing() {
+        let db = database().await;
+        use crate::events::SerializedEvent;
+        let ability = "tinycloud.encryption/key.create";
+        let unstored = crate::hash::hash(b"tc3663 unstored parent");
+        let info = key_grant_info(KEY_OWNER, KEY_RESOURCE, ability, &[unstored]);
+        assert!(matches!(
+            validate(&db, &info).await,
+            Err(Error::InvalidDelegation(DelegationError::MissingParents))
+        ));
+        // `validate`'s flags: SQL caveats off, named keys on.
+        let prechecked =
+            precheck_standing(&db, &SerializedEvent(info, Vec::new()), false, true, None).await;
+        assert!(
+            matches!(
+                prechecked,
+                Err(Error::InvalidDelegation(DelegationError::MissingParents))
+            ),
+            "{prechecked:?}"
+        );
+
+        let stored = crate::hash::hash(b"tc3663 stored parent");
+        insert_delegation(&db, stored, OTHER_DID, KEY_OWNER).await;
+        let info = key_grant_info(KEY_OWNER, KEY_RESOURCE, ability, &[stored]);
+        validate(&db, &info)
+            .await
+            .expect("a stored parent is accepted as before");
+        precheck_standing(&db, &SerializedEvent(info, Vec::new()), false, true, None)
+            .await
+            .expect("a stored parent passes the precheck as before");
     }
 
     /// A delegator that does not own the key must cite parents.
@@ -2415,6 +2971,7 @@ mod tests {
             )])))),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -2736,7 +3293,7 @@ mod tests {
             domain: domain.parse().unwrap(),
             address: [1; 20],
             statement: None,
-            uri: "did:key:z6MkTestDelegatee".parse().unwrap(),
+            uri: crate::test_support::did_resolution::HOLDER.parse().unwrap(),
             version: Version::V1,
             chain_id: 1,
             nonce: "siwenonce".into(),

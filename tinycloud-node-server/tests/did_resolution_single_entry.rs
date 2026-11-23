@@ -157,6 +157,8 @@ impl Guard {
             | ("tinycloud-node-server/src/node_control/control.rs", "spawn_control_plane", "effective_config . storage . resolve ()")
             | ("tinycloud-node-server/src/node_control/control.rs", "effective_public_config", "config . storage . resolve ()")
             | ("tinycloud-node-server/src/webhook_dispatcher.rs", "pinned_client", "Client :: builder () . timeout (self . timeout) . redirect (Policy :: none ()) . resolve (host , address)")
+            // TC-3554: X.509 signature of the KMS TLS leaf under the pinned KMS CA, not a DID.
+            | ("tinycloud-node-server/src/dstack_kms.rs", "ensure_kms_rpc_cert", "cert . verify_signature (Some (ca . public_key ()))")
         )
     }
 

@@ -1,0 +1,1228 @@
+{
+  "contract": "TC-2481 registry-v2 2026-11-03",
+  "publicTestIdentities": {
+    "owner": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+    "ownerKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+    "box": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+    "hosted": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+    "secrets": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+    "apps": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps"
+  },
+  "records": [
+    {
+      "id": "split-data-and-encryption",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "registered",
+        "routing": {
+          "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets": {
+            "read": [
+              "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH"
+            ],
+            "write": [
+              "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH"
+            ]
+          },
+          "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps": {
+            "read": [
+              "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+              "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV"
+            ],
+            "write": [
+              "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV"
+            ]
+          }
+        },
+        "encryptionDid": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "admission": [
+          {
+            "nodeDid": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "action": "read",
+            "allowed": true
+          },
+          {
+            "nodeDid": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "action": "write",
+            "allowed": true
+          },
+          {
+            "nodeDid": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "action": "read",
+            "allowed": false
+          },
+          {
+            "nodeDid": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "action": "write",
+            "allowed": false
+          },
+          {
+            "nodeDid": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "action": "write",
+            "allowed": false
+          },
+          {
+            "nodeDid": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "action": "write",
+            "allowed": true
+          },
+          {
+            "nodeDid": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "resource": "urn:tinycloud:encryption:did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c:default",
+            "action": "decrypt",
+            "allowed": true
+          },
+          {
+            "nodeDid": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "resource": "urn:tinycloud:encryption:did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c:default",
+            "action": "decrypt",
+            "allowed": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "array-order-independent",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              },
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "registered"
+      }
+    },
+    {
+      "id": "chain-independent-owner-key",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:137:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0xb5d54bbb32de9a49a432e5f3e84d90ef680a664ac6d64f6b5148b9513afc5d712768d41e79bab246fa60c6f1bf2a8a9bbcf21b34a7e5ef048d26ba442a039f4a1c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:137:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "57be314c8b47c0d40523011af89b8d0a748f91fba55826124ac63a474d8d7b2b",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "registered"
+      }
+    },
+    {
+      "id": "empty-registered-entry",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [],
+        "spaces": [],
+        "encryptionNode": null,
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 8,
+        "signature": "0x9e09be82c534f88cdb496e226526da652931d7ba02a6e3e4cb16ec21c4a9b5964baac5bb8e0dc4670d6e47fda5cc0b9f23ad3324ba93b0ffbdccd98038edf6901b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[],\"spaces\":[],\"encryptionNode\":null,\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":8}",
+      "canonicalSha256": "ca7752a725e09636daa848534b4ffb641fd1b31d351bbb6f9cba64e768be1df2",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "registered",
+        "routing": {},
+        "encryptionDid": null
+      }
+    },
+    {
+      "id": "unlisted-space",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "registered",
+        "admission": [
+          {
+            "nodeDid": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "resource": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:unlisted",
+            "action": "write",
+            "allowed": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "rollback",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "rememberedSequence": 8,
+        "reason": "rollback"
+      }
+    },
+    {
+      "id": "membership-tampered-after-signing",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "fb06f0cf56736e14098cdbb9b432d75fc99a5f11390fea605064ccc45e919653",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": false,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "invalid-signature"
+      }
+    },
+    {
+      "id": "wrong-owner-signature",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0xc8bff3c729efa8ec08fdfe778953688c60ad81a91eed6d3da4f41cca5f1ed578227978d8b77a76187b38f747611848a71ec20e1045b9a92ad015aaedc853b1ef1c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": false,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "invalid-signature"
+      }
+    },
+    {
+      "id": "duplicate-node",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x74a8cca5da176246344db4e40bcbb97af98187e539c15b6a9ff154909874d0b873e895254f24f9262ca1e9ff9540856ceef807a43a0aaebd56afe3da467740f41b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "4e6252501f484201a878bd6970393d9166b428f9977d5f8aa527a0d7890eed6a",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "duplicate-space",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x0a230a21e3793c64460a75bc6c303516ff2bd10807cdb0159cff79d3c5a07c4b219a821dc9bac17e1d68d5497a36674af52fa1becff65cf4c7ce032ce3158ec31c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "11e4c76c6e3f4a5b35993aa073a14c00d9c2da30c85448c879410d0986069438",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "duplicate-membership",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              },
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x681d36f83e5ab4d559ae481beb6621c8ce10925ff41aa1ca25f2d338ba86c8dc539c3206784e3d35bc9c7c3f4e08dca917c809e89c7fc0baec13dd72a9d04eb01b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"},{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "ed78dd6486830e19d2aa59570c8110fec97c9508fed7a979b6c4c1a02e93e0d2",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "foreign-owner-space",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0x1563915e194d8cfba1943570603f7606a3115508:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x821017dd74cc725b83d525f1f7f7bb9130163bf5d4686f3bc86216f38143e5cd135ad8c671fb75ceccd5ce5990602c8363f779c3a6f746a97e8ff79ad2eb55281c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0x1563915e194d8cfba1943570603f7606a3115508:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "7c1cdb89a70a3793db89ed7bd3da3b4753615d42e07a443be01c581e0db72d4d",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "unreferenced-membership",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkodJHzY8Bn6PycRu3pon7V3vzfk12nbndWcBz2mxMAsa2",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0xd434cbf60d69d6b0701d43828b6bbaafd63efe5c760d56dcbb527da1e15dce95589e2399414df62553dfc8c03c32bc691bb64550992795fa96e5649a3fb698681c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkodJHzY8Bn6PycRu3pon7V3vzfk12nbndWcBz2mxMAsa2\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "efdefee07ea5e5619b9d1cb627d597d2b7302de9f8e094745d4518c9d02668f2",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "unreferenced-encryption-node",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkodJHzY8Bn6PycRu3pon7V3vzfk12nbndWcBz2mxMAsa2",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x98a18c60131fb624b4b572da77569eea0c82e95ae10237c82cce0fd5b2d34efd66b7ee846c03d33603970179a9baa8d83813277a25f901e5453fd1d983cb37df1c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkodJHzY8Bn6PycRu3pon7V3vzfk12nbndWcBz2mxMAsa2\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "1664e2706317cadc9b46c74d1259e131d729178ef272de0daad6b5d70d043b65",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "invalid-copy-mode",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "primary"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "0x9c2babc9326cb73ab01b15b36b02c61d4984226c538827ed8f86854ca56aa912559da27e5257ec84ee33525df5899bfa0b4bff062a1444a5f83059005747864d1b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"primary\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "ad2384cbaed3f572f13d350bcb08f8e88ae1115e1cbbb5a54f6fb1eed1f1daec",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "unsafe-sequence",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 9007199254740992,
+        "signature": "0x29955feffb2f98ebf88d36bc1f91d462746dae6862f038224755ff27da077e026c0910f942ffbfd3a6eb2501c3bc8b033a3c867ff105005604aecd949386be5b1c"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":9007199254740992}",
+      "canonicalSha256": "f230f5aa39b450b7ce9b5c2fd37a34de2bb6066c34b7ace2dd720b0519253a9e",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "unknown-root-field",
+      "record": {
+        "version": 2,
+        "subject": "did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          },
+          {
+            "space": "tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-only"
+              },
+              {
+                "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "primaryNode": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+        "signature": "0x5808d7ca07e8f44f4990df01c93a21c9fa6c9707728fc034ade5917268f1edf83ebc67e0cbecb3e5b301a51ce0b4a037befa4605602edafe373141b7604898251b"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:apps\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-only\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"mode\":\"read-write\"}]},{\"space\":\"tinycloud:pkh:eip155:1:0xfcad0b19bb29d4674531d6f115237e16afce377c:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "c387be568f14ff250ae72ba9da449de2aaf794d157515e6fd5dcffb6d96af424",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    },
+    {
+      "id": "ed25519-owner-empty-entry",
+      "record": {
+        "version": 2,
+        "subject": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "nodes": [],
+        "spaces": [],
+        "encryptionNode": null,
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 1,
+        "signature": "ujmyF09BcQO62LIaskRl4xUhIhoSdtiBMdFAVG9fiLN_zYAH7uj8Lagkah7AwQfTBfkX-QdJgfXod33PNcMjBA"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3\",\"nodes\":[],\"spaces\":[],\"encryptionNode\":null,\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":1}",
+      "canonicalSha256": "6bf1815a795a8d93acad5864f7d9ceacb455a64ae25ee7fbeda993c59bce4717",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "verdict": "registered"
+      }
+    },
+    {
+      "id": "ed25519-owner-listed-space",
+      "record": {
+        "version": 2,
+        "subject": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "bA2wQg5wZWMAjeih8HND4sfqHn5fpaZ8nRjJJAEh4aN879ZBpEonm9W9kmHnueb5wJ9QP-eIpLAe3LcLgG0pAQ"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "ae191dd65c9c2f06f30e95e499ca2e9460ff0d1643b299040c590e0ed130812a",
+      "expected": {
+        "schemaValid": true,
+        "signatureValid": true,
+        "lookupKey": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "verdict": "registered",
+        "routing": {
+          "tinycloud:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3:secrets": {
+            "read": [
+              "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH"
+            ],
+            "write": [
+              "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "ed25519-owner-foreign-key-space",
+      "record": {
+        "version": 2,
+        "subject": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "nodes": [
+          {
+            "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+            "url": "https://tc2481-box.tinycloud.link"
+          },
+          {
+            "did": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+            "url": "https://tc2481-encryption.tinycloud.link"
+          }
+        ],
+        "spaces": [
+          {
+            "space": "tinycloud:key:z6Mkj1MDZKcfx9AX5CeXHdysiGkRLzBbALyFuShD6wNeY1E3:secrets",
+            "nodes": [
+              {
+                "did": "did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH",
+                "mode": "read-write"
+              }
+            ]
+          }
+        ],
+        "encryptionNode": "did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV",
+        "updated_at": "2026-11-03T20:00:00.000Z",
+        "sequence": 7,
+        "signature": "pw22BiPNtnVrfh2_jvo1c_jlURuKUT62IPESa-qpdfN8F0H7NlLP3Kp9k33pl-24yargsEKvqftuIBXZ1T9HCQ"
+      },
+      "canonicalPayload": "{\"version\":2,\"subject\":\"did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"url\":\"https://tc2481-box.tinycloud.link\"},{\"did\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"url\":\"https://tc2481-encryption.tinycloud.link\"}],\"spaces\":[{\"space\":\"tinycloud:key:z6Mkj1MDZKcfx9AX5CeXHdysiGkRLzBbALyFuShD6wNeY1E3:secrets\",\"nodes\":[{\"did\":\"did:key:z6MkixsGj3MVGKMug2VMC2JbtzX3UjaAcfRs7G1RjbSnZJaH\",\"mode\":\"read-write\"}]}],\"encryptionNode\":\"did:key:z6MkjkxcrsuBXGxVYAZFC1hPUViiRXLC5Kup4G9aBkFoPimV\",\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7}",
+      "canonicalSha256": "297258247efc05cfd2c7d2a719bc8f40cab0b791e45d60a8bd124a923361e994",
+      "expected": {
+        "schemaValid": false,
+        "signatureValid": true,
+        "lookupKey": "did:key:z6MkwVDfCg9LbbY6xjH3EZk8YSFQZujV5Y4y1ZWeER9tDiN3",
+        "verdict": "unavailable",
+        "reason": "malformed-response"
+      }
+    }
+  ],
+  "lookupCases": [
+    {
+      "id": "true-absence",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        },
+        {
+          "namespace": "v1",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unregistered"
+    },
+    {
+      "id": "absent-after-registration",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        }
+      ],
+      "rememberedSequence": 7,
+      "verdict": "unavailable"
+    },
+    {
+      "id": "service-unavailable",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 503,
+          "body": ""
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unavailable"
+    },
+    {
+      "id": "v1-only-registered-owner",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        },
+        {
+          "namespace": "v1",
+          "kind": "http",
+          "status": 200,
+          "body": "{\"record\":{\"version\":1,\"subject\":\"did:pkh:eip155:1:0xFCAd0B19bB29D4674531d6f115237E16AfCE377c\",\"multiaddrs\":[\"/dns4/tc2481-box.tinycloud.link/tcp/443/https\"],\"updated_at\":\"2026-11-03T20:00:00.000Z\",\"sequence\":7,\"signature\":\"0xb4a2345c024db242a7e08cae71d91ec27a8dd2b81c293c3b776b1d4976a70e8434a406a1c39ac5fe2f1c0f312406369a296706f0bf6b244e3f478510ababf3b41c\"}}"
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unavailable"
+    },
+    {
+      "id": "v1-service-unavailable",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        },
+        {
+          "namespace": "v1",
+          "kind": "http",
+          "status": 503,
+          "body": ""
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unavailable"
+    },
+    {
+      "id": "v1-malformed-absence",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        },
+        {
+          "namespace": "v1",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"not found\"}"
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unavailable"
+    },
+    {
+      "id": "v1-malformed-record",
+      "responses": [
+        {
+          "namespace": "v2",
+          "kind": "http",
+          "status": 404,
+          "body": "{\"error\":\"location record not found\"}"
+        },
+        {
+          "namespace": "v1",
+          "kind": "http",
+          "status": 200,
+          "body": "{}"
+        }
+      ],
+      "rememberedSequence": null,
+      "verdict": "unavailable"
+    }
+  ]
+}

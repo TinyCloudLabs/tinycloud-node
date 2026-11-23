@@ -499,12 +499,6 @@ pub async fn spawn_control_plane(
 ) -> Result<ControlPlaneServer> {
     let mut effective_config = config.clone();
     effective_config.storage.resolve();
-    tinycloud_core::did_resolution::configure(
-        tinycloud_core::did_resolution::DidResolutionPolicy {
-            network_methods: effective_config.did_resolution.network_methods,
-        },
-    );
-
     let pid = std::process::id();
     let data_path = effective_config.storage.datadir.clone();
     let runtime_dir = data_path.join("runtime");
@@ -1648,32 +1642,17 @@ async fn write_private_text(
     mode: u32,
     ownership: Option<(u32, u32)>,
 ) -> Result<()> {
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_permissions(path, mode).await?;
-    set_private_ownership(path, ownership).await?;
-    Ok(())
+    let path = path.to_path_buf();
+    let contents = contents.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::private_file::write_file_atomic(&path, &contents, mode, ownership)
+    })
+    .await
+    .context("private file write task failed")?
 }
 
 async fn remove_if_exists(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
-}
-
-async fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(mode);
-        tokio::fs::set_permissions(path, permissions)
-            .await
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
-    Ok(())
 }
 
 async fn set_private_ownership(path: &Path, ownership: Option<(u32, u32)>) -> Result<()> {
@@ -1914,11 +1893,6 @@ mod tests {
         let figment = runtime::serve_config_figment(&base_config_path).unwrap();
         let mut config = figment.extract::<Config>().unwrap();
         config.storage.resolve();
-        tinycloud_core::did_resolution::configure(
-            tinycloud_core::did_resolution::DidResolutionPolicy {
-                network_methods: config.did_resolution.network_methods,
-            },
-        );
         let server = spawn_control_plane(&config, base_config_path, profile)
             .await
             .unwrap();
