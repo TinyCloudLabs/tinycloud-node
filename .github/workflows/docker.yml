@@ -839,7 +839,7 @@ jobs:
           # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
           # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
           # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
-          n0_template_hash = '8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8'
+          n0_template_hash = '6b60a3eede438d1c1c59e1394d8131648f8416c77bfed8d3fdabac2f6b3f304b'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
