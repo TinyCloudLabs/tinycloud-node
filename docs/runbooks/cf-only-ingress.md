@@ -21,17 +21,22 @@ probes. It is **not an installed production control**.
 
 ## What is and is not tested
 
-LOCAL, fakes only: `/usr/bin/env python3 scripts/test-ingress-cf-only.py` and the
-existing `scripts/test-ingress-switch.py` (real switch on temp files, fake
-clients for everything remote). **Not run, ever, by this change:** the real
-Cloudflare reader and the real network probe against any live system, any
-Phala call, any drill. The Cloudflare endpoint shapes (tunnel, configurations,
-DNS records, Worker deployments, routes) are [INFERENCE] from API documentation.
-**The Worker script settings/bindings endpoint
-(`GET /accounts/{id}/workers/scripts/{name}/settings`, a binding named
-`ORIGIN_URL` of type `secret_text`, no value returned) is [INFERENCE] and was not
-run.** If any read does not match (absent or duplicated binding, or any type other
-than `secret_text`), preflight refuses rather than guessing.
+LOCAL, no external network: `/usr/bin/env python3 scripts/test-ingress-cf-only.py` and
+the existing `scripts/test-ingress-switch.py`. The real switch runs on temp files;
+Cloudflare and `/info` clients are fakes; `NetworkProbe`'s signal classifier is run
+against a loopback-only TLS server (throwaway certificate from `openssl`) covering a
+normal node 200, a chunked 200, 404, 502, 421, an unparsed 200, a TLS alert, a TLS
+close with no response, silence (timeout), a closed port and an SSH banner.
+**Not run, ever, by this change:** the real Cloudflare reader and the real network
+probe against any live system or gateway, any Phala call, any drill. The Cloudflare
+endpoint shapes (tunnel, configurations, DNS records, routes) are [INFERENCE] from API
+documentation. **[INFERENCE, not run]:** the Worker deployment list (newest by
+`created_on`, one 100% version) and the version-bound binding read
+(`GET /accounts/{id}/workers/scripts/{name}/versions/{version_id}`, `resources.bindings`
+containing a binding named `ORIGIN_URL` of type `secret_text`, no value returned);
+the script-level `/settings` endpoint is deliberately not used because it may reflect
+an uploaded but not deployed version. If any read does not match (absent or duplicated
+binding, or any type other than `secret_text`), preflight refuses rather than guessing.
 
 ## Honest operating characteristics
 
@@ -67,23 +72,31 @@ Builds the receipt from real reads and writes it `0600`, exclusively. Labelled
 refuses unless **all** hold:
 
 1. the tunnel exists, is the expected id, not deleted, `healthy`, with at least one
-   connection and none pending reconnect (connector authenticated);
-2. its ingress routes the tunnel host to `http://tinycloud:8000`;
+   connection and none pending reconnect. The receipt's `connector_authenticated` is
+   exactly that Cloudflare-API-derived state and says so; it is not an independent
+   authentication test;
+2. its ingress's **first** rule for the tunnel host (no catch-all before it, no path
+   restriction) routes to `http://tinycloud:8000`;
 3. the tunnel host has exactly one proxied CNAME to `<tunnel-id>.cfargotunnel.com`;
-4. the Worker has a readable single 100% version (and `--expect-worker-version` if
-   given); **exactly one** binding named `ORIGIN_URL` of type `secret_text` exists on
-   the deployed script (P3 stores the origin as a Worker secret). **Presence and type
-   only: the Cloudflare API never returns a secret value, so the origin value is not
-   compared.** A `plain_text` `ORIGIN_URL` is refused, not accepted, because the secret
-   is the approved path (redeploy it as a secret); an absent, duplicated or other-type
-   binding is refused. `node.tinycloud.xyz/*` must route to that script. The Worker
-   source is never read and there is no source-constant fallback;
+4. the Worker has a readable single 100% version of the newest deployment (and
+   `--expect-worker-version` if given); **exactly one** binding named `ORIGIN_URL` of
+   type `secret_text` exists on **that deployed version** (P3 stores the origin as a
+   Worker secret). **Presence and type only: the Cloudflare API never returns a secret
+   value, so the origin value is not compared.** A `plain_text` `ORIGIN_URL` is
+   refused, not accepted, because the secret is the approved path (redeploy it as a
+   secret); an absent, duplicated or other-type binding is refused.
+   `node.tinycloud.xyz/*` must route to that script and no more specific
+   `node.tinycloud.xyz/...` route may point at another script. The Worker source is
+   never read and there is no source-constant fallback;
 5. the operator passed `--attest-origin-is-tunnel-host`, attesting that the P3
    set-origin step received exactly `https://<--tunnel-host>`. This is recorded in the
    receipt and in plan/preflight/verify output as **operator-attested, NOT verified**;
 6. `/info` on the tunnel host and on `node.tinycloud.xyz` returns 200 with the same
    non-empty `nodeId`. Before the restriction this does not show which origin the
    Worker uses.
+
+`--account-id` and `--zone-id` must be 32 hex characters and `--worker-script` a plain
+script name; they are validated before any URL is built.
 
 Node ids are printed only as a short SHA-256 fingerprint. The receipt file holds the
 real value (it is private); do not commit it.
@@ -104,70 +117,103 @@ Changes nothing. The receipt it uses is temporary and deleted.
 
 ```sh
 python3 scripts/ingress-cf-only.py apply-patch <shared> <plan inputs> \
-  --confirm <plan-hash> --patch-out restrict.patch.json
+  --confirm <plan-hash> --patch-out restrict.patch.json --receipt-out receipt.json
 ```
 
-Re-runs preflight and the plan; refuses unless `--confirm` equals the fresh hash (any
-evidence, compose or policy change makes the old hash stale). Then stages the local
-compose through the switch (new `0600` snapshot, exclusive), writes the payload file
-and **prints** `phala api /cvms/<cvm> -X PATCH --input restrict.patch.json` for the
-authorized operator. Nothing is sent. It can be used once per snapshot path.
+Checks that the patch file, the receipt file and the snapshot are new paths in
+writable directories **before** staging anything. Re-runs preflight and the plan;
+refuses unless `--confirm` equals the fresh hash (any evidence, compose or policy
+change makes the old hash stale). Then stages the local compose through the switch
+(new `0600` snapshot, exclusive), writes the payload file and the fresh `0600`
+receipt for `verify`, and **prints** `phala api /cvms/<cvm> -X PATCH --input
+restrict.patch.json` for the authorized operator. Nothing is sent. It can be used once
+per snapshot path. The printed `verify` command has quoted placeholders for the
+instance id and gateway domain, which only you know.
 
 ### verify
 
 ```sh
 python3 scripts/ingress-cf-only.py verify --expect restricted --expect-app-id ... \
-  --instance-id ... --gateway-domain ... --management-endpoint HOST:10022 \
-  --tunnel-host ... --snapshot previous-policy.json --receipt receipt.json
+  --instance-id ... --gateway-domain ... --tunnel-host ... \
+  --snapshot previous-policy.json --receipt receipt.json [--accept-closed-signal TOKEN ...]
 ```
 
-Run after the operator has applied the PATCH and the restart finished. Passes only
-if:
+Run after the operator has applied the PATCH and the restart finished. The result is
+`pass` (exit 0), `FAIL` (exit 1, at least one definite failure) or `INDETERMINATE`
+(exit 2). **Only `pass` is evidence; `INDETERMINATE` is never a pass.** It opens
+TLS/TCP connections to Phala **gateway** hostnames (network contact with Phala
+infrastructure, not an API call and not a credentialed one).
+
+Each probe reports a distinct signal, never a bare "closed": `tcp_refused`,
+`tcp_reset`, `tls_rejected` (TLS alert), `closed_after_tls`, `http_<status>`,
+`http_200_unparsed`, `malformed_http`, `node_info`, `ssh_banner`, `non_ssh_data`,
+`timeout`, `no_address`, `error`. A `/info` body is de-chunked before the node id is
+read, so a chunked 200 counts as the node answering.
+
+**Closed signals are an allow-list, default `tcp_refused` only.** The gateway
+hostnames share an SNI-routed IP, so a TCP refusal is probably *not* the real closed
+signal, and the actual TLS/HTTP denial signature has **not been observed** (no
+before/after capture exists) [INFERENCE]. The drill must record it; only then pass it
+with `--accept-closed-signal` (for example `http_421` or `tls_rejected`; `http_200`,
+`node_info`, `timeout` and the like are rejected as tokens). Until then, a correctly
+closed gateway will most likely report `INDETERMINATE`, which is the intended
+outcome. Checks:
 
 - `/info` on `node.tinycloud.xyz` and on the tunnel host is 200 with the receipt's
-  node id (equal ids);
+  node id (equal ids): otherwise FAIL;
 - fresh connections to `tee.node.tinycloud.xyz` and to the app and instance
   gateway hosts `-8000`, `-8000g`, `-443`, `-443s`, `-443g` (plus any
-  `--extra-host`) are **refused over IPv4 and IPv6**. A timeout, error, resolver
-  failure or a node response is a failure. An IPv6 name with no AAAA record fails
-  unless `--allow-no-aaaa`, because the absence of an AAAA answer is a dated DNS
-  observation, not proof that no IPv6 path exists;
-- the management endpoint (`HOST:10022`, supplied by the operator, never guessed) is
-  still TCP-reachable when the snapshot's policy keeps management, or refused if it
-  denies it. This is a connect check only; key-authenticated access is not tested;
-- the receipt is not older than `--max-receipt-age` (default 3600 s) and the snapshot
-  is an owner-only file for the same app.
+  `--extra-host`) over **IPv4 and IPv6**: a node answer is FAIL; an accepted closed
+  signal is a pass; anything else (timeout, 404/502, TLS alert unless accepted,
+  resolver failure) is INDETERMINATE. An IPv6 name with no AAAA record is
+  INDETERMINATE unless `--allow-no-aaaa`, because the absence of an AAAA answer is a
+  dated DNS observation, not proof that no IPv6 path exists;
+- management: **INFERENCE (not run, not observed)** that SSH is reached through the
+  gateway TLS route `<app>-10022.<gateway>:443` (the compose comment, with
+  `port_mappings` required empty), not a host port 10022. The probe does TLS with that
+  SNI on 443 and requires an `SSH-2.0-` banner for "open"; the host is derived from
+  `--expect-app-id` and `--gateway-domain`. Expected open when the snapshot policy
+  keeps 10022: banner = pass, an accepted closed signal = FAIL, anything else
+  INDETERMINATE; expected denied: the reverse. If `phala ssh` actually reaches
+  management another way, this check is wrong and must be corrected from evidence
+  before relying on it. Key-authenticated access is not tested;
+- the receipt (owner-only file) is not older than `--max-receipt-age` (default 3600 s),
+  names the same tunnel host as `--tunnel-host` and the same tunnel id as the
+  snapshot's recorded origin, and the snapshot is an owner-only file for the same app.
 
 What the passing end-to-end checks can show: `node.tinycloud.xyz` answers `/info`
-with the recorded node id **while every probed gateway path refuses**, so the Worker
-reaches the node by some route other than the closed gateway. What they **cannot**
-show: that the Worker's secret equals the tunnel host (another independent origin
-serving the same node would also pass), that no unprobed gateway host or address is
-used, or anything before the restriction (while the gateway is open, `node.*` passes
-even if the secret still points at it). The script prints these limits.
+with the recorded node id **while every probed gateway path shows an accepted closed
+signal**, so the Worker reaches the node by some route other than the closed gateway.
+What they **cannot** show: that the Worker's secret equals the tunnel host (another
+independent origin serving the same node would also pass), that no unprobed gateway
+host or address is used, or anything before the restriction (while the gateway is
+open, `node.*` passes even if the secret still points at it). The script prints these
+limits.
 
 It also lists what it does **not** cover: independent external networks (one vantage),
 cached or literal-IP paths, existing long-lived connections, the provider read-back
 of `/network` and `/compose_file`, streaming/SSE. Do those by hand per the switch
-runbook. Exit status is non-zero on any failure.
+runbook.
 
 ### undo
 
 ```sh
 python3 scripts/ingress-cf-only.py undo --compose app-compose.json --target target.json \
-  --expect-app-id ... <verify inputs> --snapshot previous-policy.json --patch-out undo.patch.json [--apply]
+  --expect-app-id ... --instance-id ... --gateway-domain ... --tunnel-host ... \
+  --receipt receipt.json --snapshot previous-policy.json --patch-out undo.patch.json [--apply]
 ```
 
-Requires the `0600` snapshot from `apply-patch`, runs the switch `--restore`
-(dry-run unless `--apply`, which stages the local restore), writes the reverse
-payload and prints the PATCH command and the `verify --expect restored` command.
-**HTTP first:** keep the tunnel and Worker unchanged; do not point the Worker at the
-public `-8000` origin before `verify --expect restored` passes. Before running the
-PATCH, compare the live provider policy to the snapshot `after` printed by `undo`;
-on drift stop and reconcile (the script cannot read Phala). `restored` expects the
-tee host to serve the same node id over IPv4 and the management check to match the
-previous policy; if the previous policy was restrictive it refuses to automate and
-you check by hand.
+Requires the `0600` snapshot from `apply-patch`, validates every operator value it
+prints back, runs the switch `--restore` (dry-run unless `--apply`, which stages the
+local restore), writes the reverse payload and prints the PATCH command and the
+`verify --expect restored` command with your real receipt path (all values
+shell-quoted). **HTTP first:** keep the tunnel and Worker unchanged; do not point the
+Worker at the public `-8000` origin before `verify --expect restored` passes. Before
+running the PATCH, compare the live provider policy to the snapshot `after` printed by
+`undo`; on drift stop and reconcile (the script cannot read Phala). `restored`
+requires the tee host to serve the same node id over IPv4 (otherwise FAIL) and the
+management check to match the previous policy; if the previous policy was restrictive
+it refuses to automate and you check by hand.
 
 ## Rollback of this change
 

@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Fakes-only contracts for ingress-cf-only.py: no network, no Cloudflare, no Phala.
+"""Contracts for ingress-cf-only.py: no Cloudflare, no Phala, no external network.
 
-The real ingress-switch.py runs as a local subprocess on temporary files; every
-Cloudflare/HTTP/TCP interaction is a fake client defined here.
+The real ingress-switch.py runs as a local subprocess on temporary files. Cloudflare and
+HTTP/probe clients are fakes, except NetworkProbe's classifier, which is exercised against
+a localhost-only TLS server (self-signed certificate generated at run time).
 """
 import contextlib
-import copy
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from urllib.error import HTTPError, URLError
@@ -29,7 +33,10 @@ TUNNEL = "11111111-2222-4333-8444-555555555555"
 HOST = "cf-origin.example.test"
 GATEWAY = "gw.example.test"
 MGMT = f"{APP}-10022.{GATEWAY}"
+ACCT = "c" * 32
+ZONE = "d" * 32
 NODE = "did:key:z6MkCanaryNodeId"
+OTHER_NODE = "did:key:z6MkOtherNode"
 CF_TOKEN = "cf-token-canary-0123"
 SECRET = "secret-marker"
 
@@ -69,13 +76,13 @@ class FakeCf:
 
 
 class FakeHttp:
-    """Models a restricted gateway by default; override per host to model failures."""
+    """Models a restricted gateway by default; override per host to model other signals."""
 
     def __init__(self, restricted=True):
         self.info_map = {HOST: {"status": 200, "node_id": NODE}, "node.tinycloud.xyz": {"status": 200, "node_id": NODE}}
         self.probe_map = {}
         self.restricted = restricted
-        self.mgmt = "open"
+        self.mgmt = {"outcome": "ssh_banner"}
         self.probes = []
 
     def info(self, host):
@@ -85,10 +92,10 @@ class FakeHttp:
         self.probes.append((host, family, port))
         if (host, family) in self.probe_map:
             return self.probe_map[(host, family)]
-        return {"outcome": "refused"} if self.restricted else {"outcome": "node_info", "node_id": NODE}
+        return {"outcome": "tcp_refused"} if self.restricted else {"outcome": "node_info", "node_id": NODE}
 
-    def tcp_probe(self, host, port, family):
-        assert (host, port, family) == (MGMT, 10022, "ipv4")
+    def mgmt_probe(self, host, family="ipv4", port=443):
+        assert (host, family, port) == (MGMT, "ipv4", 443), (host, family, port)
         return self.mgmt
 
 
@@ -102,6 +109,7 @@ class Base(unittest.TestCase):
         self.network = self.root / "network.json"
         self.snapshot = self.root / "previous.json"
         self.receipt = self.root / "receipt.json"
+        self.receipt_out = self.root / "receipt-from-apply.json"
         self.patch = self.root / "restrict.patch.json"
         self.original = {"gateway_enabled": True, "docker_compose_file": f"unchanged: {SECRET}",
                          "port_policy": None}
@@ -120,16 +128,16 @@ class Base(unittest.TestCase):
 
     def cloudflare_args(self):
         return ["--expect-app-id", APP, "--tunnel-id", TUNNEL, "--tunnel-host", HOST,
-                "--account-id", "acct", "--zone-id", "zone", "--attest-origin-is-tunnel-host"]
+                "--account-id", ACCT, "--zone-id", ZONE, "--attest-origin-is-tunnel-host"]
 
     def switch_args(self):
         return ["--compose", str(self.compose), "--target", str(self.target), "--network", str(self.network),
                 "--snapshot", str(self.snapshot)]
 
-    def verify_args(self, *extra, expect="restricted"):
+    def verify_args(self, *extra, expect="restricted", receipt=None):
         return ["--expect", expect, "--expect-app-id", APP, "--instance-id", INSTANCE, "--gateway-domain", GATEWAY,
-                "--management-endpoint", f"{MGMT}:10022", "--tunnel-host", HOST, "--snapshot", str(self.snapshot),
-                "--receipt", str(self.receipt), *extra]
+                "--tunnel-host", HOST, "--snapshot", str(self.snapshot), "--receipt", str(receipt or self.receipt),
+                *extra]
 
     def run_cli(self, argv, now=None):
         out, err = io.StringIO(), io.StringIO()
@@ -145,12 +153,17 @@ class Base(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return json.loads(out)
 
+    def apply_args(self, digest, patch=None, receipt_out=None):
+        return ["apply-patch", *self.cloudflare_args(), *self.switch_args(), "--confirm", digest,
+                "--patch-out", str(patch or self.patch), "--receipt-out", str(receipt_out or self.receipt_out)]
+
     def stage(self):
-        digest = self.plan()["plan_hash"]
-        code, out, err = self.run_cli(["apply-patch", *self.cloudflare_args(), *self.switch_args(),
-                                       "--confirm", digest, "--patch-out", str(self.patch)])
+        code, out, err = self.run_cli(self.apply_args(self.plan()["plan_hash"]))
         self.assertEqual(code, 0, err)
         return json.loads(out)
+
+    def set_node_ids(self, node):
+        self.http.info_map[HOST]["node_id"] = self.http.info_map["node.tinycloud.xyz"]["node_id"] = node
 
 
 class PreflightTest(Base):
@@ -164,17 +177,13 @@ class PreflightTest(Base):
         self.assertEqual((saved["origin_node_id"], saved["public_node_id"], saved["worker_version_id"]),
                          (NODE, NODE, "ver-1"))
         self.assertIs(saved["connector_authenticated"], True)
+        self.assertIn("healthy", saved["connector_authenticated_basis"])
         self.assertEqual((saved["origin_status"], saved["public_status"]), (200, 200))
         self.assertIn("not a cryptographic attestation", saved["evidence_label"])
         self.assertIn("not a cryptographic attestation", out)
         self.assertEqual(sorted(self.cf.calls), ["dns", "ingress", "tunnel", "worker"])
 
     def test_refuses_on_each_mismatch_or_missing_evidence(self):
-        def mutate(fn):
-            def apply(cf, http):
-                fn(cf.state, http)
-            return apply
-
         cases = {
             "other tunnel": lambda s, h: s["tunnel"].update(id="99999999-2222-4333-8444-555555555555"),
             "deleted tunnel": lambda s, h: s["tunnel"].update(deleted_at="2026-01-01T00:00:00Z"),
@@ -183,6 +192,9 @@ class PreflightTest(Base):
             "pending reconnect": lambda s, h: s["tunnel"]["connections"][0].update(is_pending_reconnect=True),
             "ingress wrong service": lambda s, h: s["ingress"][0].update(service="http://elsewhere:80"),
             "ingress missing host": lambda s, h: s["ingress"][0].update(hostname="other.example.test"),
+            "ingress not a list": lambda s, h: s.update(ingress={"hostname": HOST}),
+            "ingress catch-all shadows the host": lambda s, h: s["ingress"].insert(0, {"service": "http_status:404"}),
+            "ingress path-scoped rule": lambda s, h: s["ingress"][0].update(path="^/only"),
             "dns missing": lambda s, h: s.update(dns=[]),
             "dns other tunnel": lambda s, h: s["dns"][0].update(content="x.cfargotunnel.com"),
             "dns not proxied": lambda s, h: s["dns"][0].update(proxied=False),
@@ -192,9 +204,11 @@ class PreflightTest(Base):
             "worker version unreadable": lambda s, h: s["worker"].update(version_id=None),
             "node route missing": lambda s, h: s["worker"].update(routes=[]),
             "node route other script": lambda s, h: s["worker"]["routes"][0].update(script="other"),
+            "more specific node route to another script": lambda s, h: s["worker"]["routes"].append(
+                {"pattern": "node.tinycloud.xyz/admin/*", "script": "other"}),
             "origin info unhealthy": lambda s, h: h.info_map[HOST].update(status=503),
             "public info unreachable": lambda s, h: h.info_map.pop("node.tinycloud.xyz"),
-            "node ids differ": lambda s, h: h.info_map[HOST].update(node_id="did:key:other"),
+            "node ids differ": lambda s, h: h.info_map[HOST].update(node_id=OTHER_NODE),
             "node id missing": lambda s, h: [h.info_map[k].update(node_id=None) for k in list(h.info_map)],
         }
         for name, fn in cases.items():
@@ -205,17 +219,52 @@ class PreflightTest(Base):
                 self.assertEqual(code, 1, out)
                 self.assertFalse(self.receipt.exists())
 
-    def test_refuses_wrong_worker_version_bad_tunnel_id_and_non_independent_host(self):
+    def test_refuses_bad_arguments_before_any_read(self):
         base = self.cloudflare_args()
+
+        def swap(old, new):
+            return [new if a == old else a for a in base]
+
         for name, argv in {
             "version": [*base, "--expect-worker-version", "ver-0"],
-            "tunnel id": [a if a != TUNNEL else "not-a-uuid" for a in base],
-            "phala host": [a if a != HOST else f"{APP}-8000.dstack.phala.network" for a in base],
-            "public host": [a if a != HOST else "node.tinycloud.xyz" for a in base],
+            "tunnel id": swap(TUNNEL, "not-a-uuid"),
+            "phala host": swap(HOST, f"{APP}-8000.dstack.phala.network"),
+            "public host": swap(HOST, "node.tinycloud.xyz"),
+            "tee host": swap(HOST, "tee.node.tinycloud.xyz"),
+            "cfargotunnel host": swap(HOST, f"{TUNNEL}.cfargotunnel.com"),
+            "non-hex app id": swap(APP, "z" * 40),
+            "short account id": swap(ACCT, "acct"),
+            "path-injecting zone id": swap(ZONE, "../" + "d" * 29),
+            "path-injecting script": [*base, "--worker-script", "a/../../b"],
         }.items():
             with self.subTest(name):
+                self.cf = FakeCf()
                 code, out, err = self.run_cli(["preflight", *argv])
                 self.assertEqual(code, 1, out)
+                if name != "version":
+                    self.assertEqual(self.cf.calls, [])
+
+    def test_preflight_requires_the_secret_binding_and_the_operator_attestation(self):
+        for name, kind, message in (("plain_text var", "plain_text", "approved path is a secret"),
+                                    ("absent or duplicated", None, "no single secret_text"),
+                                    ("other type", "json", "no single secret_text")):
+            with self.subTest(name):
+                self.cf.state["worker"]["origin_binding"] = kind
+                code, out, err = self.run_cli(["preflight", *self.cloudflare_args()])
+                self.assertEqual(code, 1, out)
+                self.assertIn(message, err)
+        self.cf.state["worker"]["origin_binding"] = "secret_text"
+        unattested = [a for a in self.cloudflare_args() if a != "--attest-origin-is-tunnel-host"]
+        code, out, err = self.run_cli(["preflight", *unattested])
+        self.assertEqual(code, 1)
+        self.assertIn("attest", err)
+
+    def test_receipt_path_must_be_new_and_writable_before_any_read(self):
+        self.receipt.write_text("{}")
+        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])[0], 1)
+        self.assertEqual(self.receipt.read_text(), "{}")
+        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.root / "no" / "r.json")])[0], 1)
+        self.assertEqual(self.cf.calls, [])
 
 
 class PlanApplyTest(Base):
@@ -230,12 +279,18 @@ class PlanApplyTest(Base):
         self.assertEqual(self.compose.read_bytes(), before)
         self.assertFalse(self.snapshot.exists())
 
-    def test_plan_hash_is_stable_but_tracks_every_input(self):
+    def test_origin_value_is_recorded_as_unverified_operator_attestation(self):
+        evidence = self.plan()["evidence"]
+        self.assertEqual(evidence["worker_origin_binding"], "secret_text")
+        self.assertIn("NOT verified", evidence["worker_origin_value"])
+        self.assertIn("operator-attested", evidence["worker_origin_value"])
+
+    def test_plan_hash_is_stable_and_changes_with_node_id_worker_version_and_compose(self):
         base = self.plan()["plan_hash"]
         self.assertEqual(self.plan()["plan_hash"], base)
-        self.http.info_map[HOST]["node_id"] = self.http.info_map["node.tinycloud.xyz"]["node_id"] = "did:key:z6MkOther"
+        self.set_node_ids(OTHER_NODE)
         self.assertNotEqual(self.plan()["plan_hash"], base)
-        self.http.info_map[HOST]["node_id"] = self.http.info_map["node.tinycloud.xyz"]["node_id"] = NODE
+        self.set_node_ids(NODE)
         self.cf.state["worker"]["version_id"] = "ver-2"
         self.assertNotEqual(self.plan()["plan_hash"], base)
         self.cf.state["worker"]["version_id"] = "ver-1"
@@ -244,12 +299,11 @@ class PlanApplyTest(Base):
 
     def test_apply_patch_requires_matching_confirm_and_never_calls_phala(self):
         digest = self.plan()["plan_hash"]
-        args = ["apply-patch", *self.cloudflare_args(), *self.switch_args(), "--patch-out", str(self.patch)]
         for confirm in ("0" * 64, digest[:-1], ""):
             with self.subTest(confirm=confirm):
-                code, out, err = self.run_cli([*args, "--confirm", confirm])
+                code, out, err = self.run_cli(self.apply_args(confirm))
                 self.assertEqual(code, 1)
-                self.assertFalse(self.snapshot.exists() or self.patch.exists())
+                self.assertFalse(self.snapshot.exists() or self.patch.exists() or self.receipt_out.exists())
                 self.assertEqual(json.loads(self.compose.read_text()), self.original)
         spawned = []
         real_run = subprocess.run
@@ -259,7 +313,7 @@ class PlanApplyTest(Base):
             return real_run(argv, **kwargs)
 
         with mock.patch.object(cf_only.subprocess, "run", record):
-            code, out, err = self.run_cli([*args, "--confirm", digest])
+            code, out, err = self.run_cli(self.apply_args(digest))
         self.assertEqual(code, 0, err)
         self.assertTrue(spawned and all(Path(a[1]).name == "ingress-switch.py" for a in spawned))
         result = json.loads(out)
@@ -268,17 +322,30 @@ class PlanApplyTest(Base):
         self.assertIn("NO Phala call", result["executed_by_this_script"])
         self.assertEqual(json.loads(self.patch.read_text()), result["payload"])
         self.assertEqual(result["payload"]["compose"]["port_policy"]["restrict_mode"], True)
-        self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.patch.stat().st_mode & 0o777, 0o600)
+        for private in (self.snapshot, self.patch, self.receipt_out):
+            self.assertEqual(private.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(self.compose.read_text())["port_policy"]["restrict_mode"], True)
+        # The verify command carries every value quoted, the real receipt path, and quoted placeholders.
+        self.assertIn(f"--receipt {self.receipt_out}", result["then_verify"])
+        self.assertIn("--instance-id '<INSTANCE-ID>'", result["then_verify"])
+        self.assertIn("--gateway-domain '<GATEWAY-DOMAIN>'", result["then_verify"])
 
     def test_confirm_goes_stale_when_evidence_changes_between_plan_and_apply(self):
         digest = self.plan()["plan_hash"]
-        self.http.info_map[HOST]["node_id"] = self.http.info_map["node.tinycloud.xyz"]["node_id"] = "did:key:z6MkOther"
-        code, out, err = self.run_cli(["apply-patch", *self.cloudflare_args(), *self.switch_args(),
-                                       "--confirm", digest, "--patch-out", str(self.patch)])
+        self.set_node_ids(OTHER_NODE)
+        code, out, err = self.run_cli(self.apply_args(digest))
         self.assertEqual(code, 1)
         self.assertFalse(self.snapshot.exists() or self.patch.exists())
+
+    def test_unwritable_output_path_is_refused_before_anything_is_staged(self):
+        digest = self.plan()["plan_hash"]
+        code, out, err = self.run_cli(self.apply_args(digest, patch=self.root / "missing-dir" / "p.json"))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual(json.loads(self.compose.read_text()), self.original)
+        self.receipt_out.write_text("{}")
+        self.assertEqual(self.run_cli(self.apply_args(digest))[0], 1)
+        self.assertFalse(self.snapshot.exists())
 
     def test_plan_and_apply_refuse_when_preflight_refuses(self):
         self.cf.state["tunnel"]["status"] = "down"
@@ -294,80 +361,138 @@ class VerifyTest(Base):
         self.assertEqual(code, 0, err)
         self.stage()
 
-    def verify(self, *extra, expect="restricted", now=None):
-        return self.run_cli(["verify", *self.verify_args(*extra, expect=expect)], now=now)
+    def verify(self, *extra, expect="restricted", now=None, receipt=None):
+        return self.run_cli(["verify", *self.verify_args(*extra, expect=expect, receipt=receipt)], now=now)
 
-    def failed(self, out):
-        return [c["check"] for c in json.loads(out)["checks"] if not c["ok"]]
+    def not_passed(self, out):
+        return [c["check"] for c in json.loads(out)["checks"] if c["status"] != "pass"]
+
+    def all_probe_hosts(self):
+        return cf_only.direct_hosts(mock.Mock(expect_app_id=APP, instance_id=INSTANCE, gateway_domain=GATEWAY,
+                                              extra_host=None))
 
     def test_passes_when_every_condition_holds_over_ipv4_and_ipv6(self):
         code, out, err = self.verify()
         self.assertEqual(code, 0, out)
         result = json.loads(out)
         self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["accepted_closed_signals"], ["tcp_refused"])
         probed = {(h, f) for h, f, p in self.http.probes}
         for host in (cf_only.TEE_HOST, f"{APP}-443s.{GATEWAY}", f"{INSTANCE}-443s.{GATEWAY}",
                      f"{APP}-8000.{GATEWAY}", f"{INSTANCE}-443.{GATEWAY}"):
             for family in ("ipv4", "ipv6"):
                 self.assertIn((host, family), probed)
         self.assertTrue(result["not_covered"])
+        self.assertIn("never a pass", result["closed_signal_note"])
 
-    def test_fails_on_each_condition(self):
+    def test_verify_works_from_the_receipt_written_by_apply_patch(self):
+        self.assertEqual(self.verify(receipt=self.receipt_out)[0], 0)
+
+    def test_fails_or_is_indeterminate_on_each_condition(self):
+        FAIL, INDET = 1, 2
+        node = {"outcome": "node_info", "node_id": NODE}
         cases = {
-            "tee ipv4 still serves": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
-                                      {"outcome": "node_info", "node_id": NODE}}), "tee.node.tinycloud.xyz fresh ipv4"),
-            "instance -443s ipv6 still serves": (lambda h: h.probe_map.update({(f"{INSTANCE}-443s.{GATEWAY}", "ipv6"):
-                                                 {"outcome": "node_info", "node_id": NODE}}), "-443s.gw.example.test fresh ipv6"),
-            "app timeout is not refusal": (lambda h: h.probe_map.update({(f"{APP}-8000.{GATEWAY}", "ipv4"):
-                                           {"outcome": "timeout"}}), f"{APP}-8000"),
-            "ipv4 resolver error is not refusal": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
-                                                   {"outcome": "no_address"}}), f"{APP}-443."),
+            "tee ipv4 still serves": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"): node}), FAIL,
+                                      "tee.node.tinycloud.xyz fresh ipv4"),
+            "instance -443s ipv6 still serves": (lambda h: h.probe_map.update({(f"{INSTANCE}-443s.{GATEWAY}", "ipv6"): node}),
+                                                 FAIL, "-443s.gw.example.test fresh ipv6"),
+            "multi-address answer with one node response": (lambda h: h.probe_map.update({
+                (cf_only.TEE_HOST, "ipv4"): {"outcome": "node_info", "signals": ["tcp_refused", "node_info"]}}), FAIL,
+                "tee.node.tinycloud.xyz fresh ipv4"),
+            "timeout is not a closed signal": (lambda h: h.probe_map.update({(f"{APP}-8000.{GATEWAY}", "ipv4"):
+                                               {"outcome": "timeout"}}), INDET, f"{APP}-8000"),
+            "gateway 502 is not a closed signal": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
+                                                   {"outcome": "http_502"}}), INDET, f"{APP}-443."),
+            "404 is not a closed signal by default": (lambda h: h.probe_map.update({(f"{APP}-443s.{GATEWAY}", "ipv4"):
+                                                      {"outcome": "http_404"}}), INDET, f"{APP}-443s."),
+            "tls alert is not a closed signal by default": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                                                            {"outcome": "tls_rejected"}}), INDET, "tee.node.tinycloud.xyz"),
+            "unparsed 200 is not closed": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                                           {"outcome": "http_200_unparsed"}}), INDET, "tee.node.tinycloud.xyz"),
+            "ipv4 resolver error is not closed": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
+                                                  {"outcome": "no_address"}}), INDET, f"{APP}-443."),
             "ipv6 without AAAA is unverified": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv6"):
-                                                {"outcome": "no_address"}}), "tee.node.tinycloud.xyz fresh ipv6"),
-            "node.* unhealthy": (lambda h: h.info_map["node.tinycloud.xyz"].update(status=502), "node.tinycloud.xyz /info"),
-            "node ids differ": (lambda h: h.info_map[HOST].update(node_id="did:key:z6MkOther"), "tunnel host /info"),
-            "management closed": (lambda h: setattr(h, "mgmt", "refused"), "management port 10022"),
+                                                {"outcome": "no_address"}}), INDET, "tee.node.tinycloud.xyz fresh ipv6"),
+            "node.* unhealthy": (lambda h: h.info_map["node.tinycloud.xyz"].update(status=502), FAIL,
+                                 "node.tinycloud.xyz /info"),
+            "node ids differ": (lambda h: h.info_map[HOST].update(node_id=OTHER_NODE), FAIL, "tunnel host /info"),
+            "management looks closed while it must stay open": (lambda h: setattr(h, "mgmt", {"outcome": "tcp_refused"}),
+                                                                FAIL, "management route"),
+            "management timeout": (lambda h: setattr(h, "mgmt", {"outcome": "timeout"}), INDET, "management route"),
+            "management answers a non-SSH protocol": (lambda h: setattr(h, "mgmt", {"outcome": "non_ssh_data"}), INDET,
+                                                      "management route"),
         }
-        for name, (fn, expected) in cases.items():
+        for name, (fn, code_expected, expected) in cases.items():
             with self.subTest(name):
                 self.http = FakeHttp()
                 fn(self.http)
                 code, out, err = self.verify()
-                self.assertEqual(code, 1, out)
-                self.assertTrue(any(expected in c for c in self.failed(out)), self.failed(out))
+                self.assertEqual(code, code_expected, out)
+                self.assertEqual(json.loads(out)["result"], {1: "FAIL", 2: "INDETERMINATE"}[code_expected])
+                self.assertTrue(any(expected in c for c in self.not_passed(out)), self.not_passed(out))
+
+    def test_a_fail_outranks_indeterminate(self):
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "node_info", "node_id": NODE}
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv6")] = {"outcome": "timeout"}
+        code, out, err = self.verify()
+        self.assertEqual((code, json.loads(out)["result"]), (1, "FAIL"))
+
+    def test_other_closed_signals_pass_only_when_the_operator_accepts_them(self):
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "http_421"}
+        self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv4")] = {"outcome": "tls_rejected"}
+        self.assertEqual(self.verify()[0], 2)
+        self.assertEqual(self.verify("--accept-closed-signal", "http_421")[0], 2)
+        code, out, err = self.verify("--accept-closed-signal", "http_421", "--accept-closed-signal", "tls_rejected")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["accepted_closed_signals"], ["http_421", "tcp_refused", "tls_rejected"])
+        for bad in ("http_200", "node_info", "ssh_banner", "timeout", "http_200_unparsed", "rm -rf"):
+            with self.subTest(bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.verify("--accept-closed-signal", bad)
 
     def test_ipv6_without_aaaa_only_passes_when_explicitly_accepted(self):
-        self.http.probe_map = {(h, "ipv6"): {"outcome": "no_address"} for h in cf_only.direct_hosts(
-            mock.Mock(expect_app_id=APP, instance_id=INSTANCE, gateway_domain=GATEWAY, extra_host=None))}
-        self.assertEqual(self.verify()[0], 1)
+        self.http.probe_map = {(h, "ipv6"): {"outcome": "no_address"} for h in self.all_probe_hosts()}
+        self.assertEqual(self.verify()[0], 2)
         code, out, err = self.verify("--allow-no-aaaa")
         self.assertEqual(code, 0, out)
         self.assertIn("not proof of no IPv6 path", out)
 
-    def test_refuses_stale_receipt_loose_snapshot_and_other_app(self):
+    def test_refuses_stale_receipt_loose_files_other_app_and_mismatched_tunnel(self):
         self.assertEqual(self.verify(now=datetime.now(timezone.utc) + timedelta(hours=2))[0], 1)
         self.snapshot.chmod(0o644)
         self.assertEqual(self.verify()[0], 1)
         self.snapshot.chmod(0o600)
+        self.receipt.chmod(0o644)
+        self.assertEqual(self.verify()[0], 1)
+        self.receipt.chmod(0o600)
         snap = json.loads(self.snapshot.read_text())
         self.save(self.snapshot, dict(snap, app_id="c" * 40))
         self.assertEqual(self.verify()[0], 1)
+        self.save(self.snapshot, dict(snap, verified_origin=dict(snap["verified_origin"], tunnel_id="9" * 8 + TUNNEL[8:])))
+        self.assertEqual(self.verify()[0], 1)
+        self.save(self.snapshot, snap)
+        other = json.loads(self.receipt.read_text())
+        self.save(self.receipt, dict(other, tunnel_hostname="other.example.test"))
+        self.assertEqual(self.verify()[0], 1)
+        self.save(self.receipt, other)
+        self.assertEqual(self.verify()[0], 0)
 
-    def test_management_is_expected_closed_when_the_policy_denies_it(self):
+    def test_management_is_expected_denied_when_the_policy_denies_it(self):
         snap = json.loads(self.snapshot.read_text())
         self.save(self.snapshot, dict(snap, after={"restrict_mode": True, "ports": []}))
-        self.http.mgmt = "refused"
+        self.http.mgmt = {"outcome": "tcp_refused"}
         self.assertEqual(self.verify()[0], 0)
-        self.http.mgmt = "open"
+        self.http.mgmt = {"outcome": "ssh_banner"}
         self.assertEqual(self.verify()[0], 1)
+        self.http.mgmt = {"outcome": "timeout"}
+        self.assertEqual(self.verify()[0], 2)
 
     def test_restored_expectation_needs_tee_to_serve_the_same_node(self):
         self.http = FakeHttp(restricted=False)
         code, out, err = self.verify(expect="restored")
         self.assertEqual(code, 0, out)
-        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "node_info", "node_id": "did:key:z6MkOther"}
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "node_info", "node_id": OTHER_NODE}
         self.assertEqual(self.verify(expect="restored")[0], 1)
-        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "refused"}
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_refused"}
         self.assertEqual(self.verify(expect="restored")[0], 1)
 
 
@@ -378,9 +503,12 @@ class UndoTest(Base):
         self.stage()
         self.undo_patch = self.root / "undo.patch.json"
 
-    def undo(self, *extra):
-        return self.run_cli(["undo", "--compose", str(self.compose), "--target", str(self.target),
-                             "--patch-out", str(self.undo_patch), *self.verify_args(expect="restored")[2:], *extra])
+    def undo(self, *extra, **overrides):
+        argv = ["undo", "--compose", str(self.compose), "--target", str(self.target),
+                "--patch-out", str(self.undo_patch), *self.verify_args(expect="restored")[2:], *extra]
+        for flag, value in overrides.items():
+            argv[argv.index(flag) + 1] = value
+        return self.run_cli(argv)
 
     def test_emits_reverse_patch_and_verify_without_changing_compose_by_default(self):
         staged = self.compose.read_bytes()
@@ -393,8 +521,23 @@ class UndoTest(Base):
         self.assertEqual(result["phala_command_for_authorized_operator"],
                          f"phala api /cvms/cvm_local -X PATCH --input {self.undo_patch}")
         self.assertIn("verify --expect restored", result["then_verify"])
+        self.assertIn(f"--receipt {self.receipt}", result["then_verify"])
+        self.assertNotIn("RECEIPT.json", result["then_verify"])
         self.assertIn("HTTP first", " ".join(result["order"]))
         self.assertEqual(self.compose.read_bytes(), staged)
+
+    def test_printed_verify_command_quotes_values_and_rejects_unvalidated_ones(self):
+        for flag, value in (("--instance-id", "x; rm -rf /"), ("--instance-id", "<$(id)>"),
+                            ("--gateway-domain", "gw.example.test; id"), ("--gateway-domain", "<gw>"),
+                            ("--tunnel-host", "$(id).example.test"), ("--tunnel-host", "node.tinycloud.xyz")):
+            with self.subTest(flag=flag, value=value):
+                self.undo_patch.unlink(missing_ok=True)
+                code, out, err = self.undo(**{flag: value})
+                self.assertEqual(code, 1, out)
+                self.assertFalse(self.undo_patch.exists())
+        self.undo_patch.unlink(missing_ok=True)
+        self.receipt.chmod(0o644)
+        self.assertEqual(self.undo()[0], 1)
 
     def test_apply_stages_local_restore_and_refuses_drift_and_loose_snapshot(self):
         current = json.loads(self.compose.read_text())
@@ -402,13 +545,11 @@ class UndoTest(Base):
         self.save(self.compose, current)
         self.assertEqual(self.undo("--apply")[0], 1)
         self.assertFalse(self.undo_patch.exists())
-        self.undo_patch.unlink(missing_ok=True)
         current["port_policy"] = json.loads(self.snapshot.read_text())["after"]
         self.save(self.compose, current)
         self.snapshot.chmod(0o644)
         self.assertEqual(self.undo("--apply")[0], 1)
         self.snapshot.chmod(0o600)
-        self.undo_patch.unlink(missing_ok=True)
         code, out, err = self.undo("--apply")
         self.assertEqual(code, 0, err)
         self.assertIsNone(json.loads(self.compose.read_text())["port_policy"])
@@ -417,6 +558,21 @@ class UndoTest(Base):
         self.undo_patch.write_text("{}")
         self.assertEqual(self.undo()[0], 1)
         self.assertEqual(self.undo_patch.read_text(), "{}")
+
+
+class UndoAbsentPolicyTest(Base):
+    def test_an_originally_absent_policy_is_removed_again_not_nulled(self):
+        original = {k: v for k, v in self.original.items() if k != "port_policy"}
+        self.save(self.compose, original)
+        self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
+        self.stage()
+        self.assertIn("port_policy", json.loads(self.compose.read_text()))
+        patch = self.root / "undo.json"
+        code, out, err = self.run_cli(["undo", "--compose", str(self.compose), "--target", str(self.target),
+                                       "--patch-out", str(patch), *self.verify_args(expect="restored")[2:], "--apply"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["payload"], {"compose": {"port_policy": None}})
+        self.assertEqual(json.loads(self.compose.read_text()), original)
 
 
 class OutputAndClientTest(Base):
@@ -434,7 +590,7 @@ class OutputAndClientTest(Base):
                                  str(self.root / "other.json")])[1:]
         text = "\n".join(outputs)
         self.assertTrue(text.strip())
-        for secret in (SECRET, NODE, CF_TOKEN):
+        for secret in (SECRET, NODE):
             self.assertNotIn(secret, text)
         self.assertIn(cf_only.fingerprint(NODE), text)
 
@@ -445,123 +601,221 @@ class OutputAndClientTest(Base):
         self.assertIn("CLOUDFLARE_READ_TOKEN", result.stderr)
         self.assertEqual(result.stdout, "")
 
-    def test_cloudflare_reader_is_get_only_and_never_leaks_its_token(self):
-        seen = []
 
-        class Reply(io.BytesIO):
-            def __enter__(self):
-                return self
+class Reply(io.BytesIO):
+    def __enter__(self):
+        return self
 
-            def __exit__(self, *exc):
-                return False
+    def __exit__(self, *exc):
+        return False
+
+
+def cf_reply(result):
+    return Reply(json.dumps({"success": True, "result": result}).encode())
+
+
+class CloudflareReaderTest(unittest.TestCase):
+    def make(self, bindings, versions=None, seen=None, deployments=None):
+        versions = versions if versions is not None else [{"version_id": "v9", "percentage": 100}]
+        deployments = deployments or [{"created_on": "2026-01-02", "versions": versions}]
 
         def opener(request, timeout):
-            seen.append((request.get_method(), request.full_url, request.get_header("Authorization")))
-            if "workers/routes" in request.full_url:
-                return Reply(json.dumps({"success": True, "result": [{"pattern": "node.tinycloud.xyz/*",
-                                                                     "script": "s", "id": "ignored"}]}).encode())
-            if "deployments" in request.full_url:
-                return Reply(json.dumps({"success": True, "result": {"deployments": [
-                    {"versions": [{"version_id": "v9", "percentage": 100}]}]}}).encode())
-            if request.full_url.endswith("/settings"):
-                return Reply(json.dumps({"success": True, "result": {"bindings": [
-                    {"name": "ORIGIN_URL", "type": "secret_text"}]}}).encode())
-            return Reply(json.dumps({"success": True, "result": {"id": TUNNEL}}).encode())
+            url = request.full_url
+            if seen is not None:
+                seen.append((request.get_method(), url, request.get_header("Authorization")))
+            self.assertNotIn("/content", url)  # the Worker source is never read
+            self.assertFalse(url.endswith("/settings"))  # script-level settings are not version-bound
+            if "/versions/" in url:
+                return cf_reply({"resources": {"bindings": bindings}})
+            if url.endswith("/deployments"):
+                return cf_reply({"deployments": deployments})
+            if "workers/routes" in url:
+                return cf_reply([{"pattern": "node.tinycloud.xyz/*", "script": "s", "id": "ignored"}])
+            return cf_reply({"id": TUNNEL})
+        return cf_only.CloudflareReader(CF_TOKEN, ACCT, ZONE, opener=opener)
 
-        reader = cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
-        worker = reader.worker("s")
-        self.assertEqual(worker, {"version_id": "v9", "origin_binding": "secret_text",
-                                  "routes": [{"pattern": "node.tinycloud.xyz/*", "script": "s"}]})
+    def test_is_get_only_binds_the_binding_to_the_deployed_version_and_never_leaks_its_token(self):
+        seen = []
+        reader = self.make([{"name": "ORIGIN_URL", "type": "secret_text"}], seen=seen)
+        self.assertEqual(reader.worker("s"), {"version_id": "v9", "origin_binding": "secret_text",
+                                              "routes": [{"pattern": "node.tinycloud.xyz/*", "script": "s"}]})
         self.assertEqual(reader.tunnel(TUNNEL), {"id": TUNNEL})
+        self.assertTrue(any(f"/scripts/s/versions/v9" in u for m, u, a in seen))
         self.assertTrue(seen and all(m == "GET" and a == f"Bearer {CF_TOKEN}" for m, u, a in seen))
-
-        def split_versions(request, timeout):
-            if "deployments" in request.full_url:
-                return Reply(json.dumps({"success": True, "result": {"deployments": [{"versions": [
-                    {"version_id": "a", "percentage": 50}, {"version_id": "b", "percentage": 50}]}]}}).encode())
-            return opener(request, timeout)
-
-        self.assertIsNone(cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=split_versions).worker("s")["version_id"])
-
         for failure in (HTTPError("u", 403, "denied " + CF_TOKEN, {}, None), URLError("boom " + CF_TOKEN)):
             def failing(request, timeout, failure=failure):
                 raise failure
             with self.assertRaises(cf_only.ClientError) as caught:
-                cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=failing).tunnel(TUNNEL)
+                cf_only.CloudflareReader(CF_TOKEN, ACCT, ZONE, opener=failing).tunnel(TUNNEL)
             self.assertNotIn(CF_TOKEN, str(caught.exception))
 
-    def test_worker_origin_binding_is_read_by_name_and_type_only(self):
-        class Reply(io.BytesIO):
-            def __enter__(self):
-                return self
+    def test_the_newest_deployment_wins_and_a_split_rollout_has_no_version(self):
+        seen = []
+        reader = self.make([{"name": "ORIGIN_URL", "type": "secret_text"}], seen=seen, deployments=[
+            {"created_on": "2026-01-01", "versions": [{"version_id": "old", "percentage": 100}]},
+            {"created_on": "2026-01-03", "versions": [{"version_id": "new", "percentage": 100}]},
+            {"created_on": "2026-01-02", "versions": [{"version_id": "mid", "percentage": 100}]}])
+        self.assertEqual(reader.worker("s")["version_id"], "new")
+        split = self.make([{"name": "ORIGIN_URL", "type": "secret_text"}], versions=[
+            {"version_id": "a", "percentage": 50}, {"version_id": "b", "percentage": 50}])
+        result = split.worker("s")
+        self.assertEqual((result["version_id"], result["origin_binding"]), (None, None))
+        injected = self.make([{"name": "ORIGIN_URL", "type": "secret_text"}], versions=[
+            {"version_id": "../../x", "percentage": 100}])
+        self.assertEqual(injected.worker("s")["origin_binding"], None)
 
-            def __exit__(self, *exc):
-                return False
-
-        def reader_with(bindings):
-            def opener(request, timeout):
-                url = request.full_url
-                self.assertEqual(request.get_method(), "GET")
-                self.assertNotIn("/content", url)  # the source is never read
-                if url.endswith("/settings"):
-                    return Reply(json.dumps({"success": True, "result": {"bindings": bindings}}).encode())
-                if "deployments" in url:
-                    return Reply(json.dumps({"success": True, "result": {"deployments": [
-                        {"versions": [{"version_id": "v9", "percentage": 100}]}]}}).encode())
-                return Reply(json.dumps({"success": True, "result": []}).encode())
-            return cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
-
+    def test_origin_binding_is_read_by_name_and_type_only(self):
         var = {"name": "ORIGIN_URL", "type": "secret_text"}
-        self.assertEqual(reader_with([{"name": "OTHER", "type": "plain_text", "text": "x"}, var]).worker("s")["origin_binding"],
+        self.assertEqual(self.make([{"name": "OTHER", "type": "plain_text", "text": "x"}, var]).worker("s")["origin_binding"],
                          "secret_text")
-        self.assertEqual(reader_with([dict(var, type="plain_text", text="https://x.example.test")]).worker("s")["origin_binding"],
+        self.assertEqual(self.make([dict(var, type="plain_text", text="https://x.example.test")]).worker("s")["origin_binding"],
                          "plain_text")
         for name, bindings in {"absent": [], "other name only": [dict(var, name="PHALA_ORIGIN")],
                                "duplicated": [var, dict(var, type="plain_text")], "no type": [{"name": "ORIGIN_URL"}]}.items():
             with self.subTest(name):
-                self.assertIsNone(reader_with(bindings).worker("s")["origin_binding"])
+                self.assertIsNone(self.make(bindings).worker("s")["origin_binding"])
 
-    def test_preflight_requires_the_secret_binding_and_the_operator_attestation(self):
-        for name, kind, message in (("plain_text var", "plain_text", "approved path is a secret"),
-                                    ("absent or duplicated", None, "no single secret_text"),
-                                    ("other type", "json", "no single secret_text")):
-            with self.subTest(name):
-                self.cf.state["worker"]["origin_binding"] = kind
-                code, out, err = self.run_cli(["preflight", *self.cloudflare_args()])
-                self.assertEqual(code, 1, out)
-                self.assertIn(message, err)
-        self.cf.state["worker"]["origin_binding"] = "secret_text"
-        unattested = [a for a in self.cloudflare_args() if a != "--attest-origin-is-tunnel-host"]
-        code, out, err = self.run_cli(["preflight", *unattested])
-        self.assertEqual(code, 1)
-        self.assertIn("attest", err)
+    def test_ids_are_validated_before_they_reach_a_url_path(self):
+        for account, zone in (("acct", ZONE), (ACCT, "zone"), (ACCT + "/x", ZONE), (ACCT, ZONE[:-1] + "?")):
+            with self.subTest(account=account, zone=zone), self.assertRaises(cf_only.Refusal):
+                cf_only.CloudflareReader(CF_TOKEN, account, zone)
+        for script in ("a/b", "../x", "", "a b", "x" * 80):
+            with self.subTest(script=script), self.assertRaises(cf_only.Refusal):
+                self.make([]).worker(script)
 
-    def test_phala_tunnel_host_is_refused_even_with_a_secret_binding_and_attestation(self):
-        phala = f"{APP}-8000.dstack-pha-prod5.phala.network"
-        args = [phala if a == HOST else a for a in self.cloudflare_args()]
-        code, out, err = self.run_cli(["preflight", *args])
-        self.assertEqual(code, 1)
-        self.assertIn("independent tunnel hostname", err)
-        self.assertEqual(self.cf.calls, [])
 
-    def test_origin_value_is_recorded_as_unverified_operator_attestation(self):
-        code, out, err = self.run_cli(["plan", *self.cloudflare_args(), *self.switch_args()])
-        self.assertEqual(code, 0, err)
-        evidence = json.loads(out)["evidence"]
-        self.assertEqual(evidence["worker_origin_binding"], "secret_text")
-        self.assertIn("NOT verified", evidence["worker_origin_value"])
-        self.assertIn("operator-attested", evidence["worker_origin_value"])
+# ---------------------------------------------------------------- probe classifier, localhost only
 
-    def test_verify_states_what_the_end_to_end_checks_can_and_cannot_show(self):
-        self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
-        self.stage()
-        code, out, err = self.run_cli(["verify", *self.verify_args()])
-        self.assertEqual(code, 0, out)
-        result = json.loads(out)
-        self.assertIn("NOT verified", result["worker_origin_value"])
-        self.assertIn("some route other than the closed gateway", result["what_the_end_to_end_checks_can_show"])
-        self.assertTrue(any("secret equals the tunnel host" in c for c in result["what_they_cannot_show"]))
-        self.assertTrue(any("before the restriction" in c for c in result["what_they_cannot_show"]))
+@unittest.skipUnless(shutil.which("openssl"), "openssl is needed to generate a throwaway localhost certificate")
+class ProbeClassifierTest(unittest.TestCase):
+    """The real NetworkProbe against a loopback TLS server: no external network."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.cert, cls.key = f"{cls.tmp.name}/cert.pem", f"{cls.tmp.name}/key.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", cls.key, "-out", cls.cert,
+                        "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
+        cls.probe = cf_only.NetworkProbe(timeout=0.7)
+
+    def serve(self, behavior):
+        """behavior(conn_after_handshake) for TLS behaviours, or 'alert' / 'silent' for pre-handshake ones."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        stop = threading.Event()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.cert, self.key)
+
+        def loop():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(2)
+                    try:
+                        if behavior == "alert":
+                            conn.recv(1024)
+                            conn.sendall(bytes([21, 3, 3, 0, 2, 2, 40]))  # fatal handshake_failure alert
+                        elif behavior == "silent":
+                            stop.wait(1.5)
+                        else:
+                            with context.wrap_socket(conn, server_side=True) as tls:
+                                behavior(tls)
+                    except (OSError, ssl.SSLError):
+                        pass
+
+        thread = threading.Thread(target=loop, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (stop.set(), listener.close(), thread.join(2)))
+        return listener.getsockname()[1]
+
+    @staticmethod
+    def respond(status, body=b"", headers=(), chunked=False):
+        def handler(tls):
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            head = [f"HTTP/1.1 {status} X", "Connection: close", *headers]
+            if chunked:
+                head.append("Transfer-Encoding: chunked")
+                half = len(body) // 2
+                payload = b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in (body[:half], body[half:]) if p) + b"0\r\n\r\n"
+            else:
+                head.append(f"Content-Length: {len(body)}")
+                payload = body
+            tls.sendall(("\r\n".join(head) + "\r\n\r\n").encode() + payload)
+        return handler
+
+    def result(self, port, banner=False):
+        if banner:
+            return self.probe.mgmt_probe("localhost", "ipv4", port)
+        return self.probe.probe("localhost", "ipv4", port)
+
+    INFO = json.dumps({"nodeId": NODE, "version": "x"}).encode()
+
+    def test_content_length_200_with_a_node_id_is_node_info(self):
+        port = self.serve(self.respond(200, self.INFO))
+        self.assertEqual(self.result(port), {"outcome": "node_info", "signals": ["node_info"], "node_id": NODE})
+
+    def test_a_chunked_200_with_a_node_id_is_node_info_not_closed(self):
+        port = self.serve(self.respond(200, self.INFO, chunked=True))
+        result = self.result(port)
+        self.assertEqual((result["outcome"], result.get("node_id")), ("node_info", NODE))
+        self.assertEqual(cf_only.judge_closed(result, {"tcp_refused", "http_404", "tls_rejected"})[0], "fail")
+
+    def test_each_non_node_response_has_its_own_signal_and_never_passes_by_default(self):
+        cases = {"http_404": self.respond(404, b"nope"), "http_502": self.respond(502, b"bad gateway"),
+                 "http_421": self.respond(421, b""), "http_200_unparsed": self.respond(200, b"<html>ok</html>"),
+                 "http_301": self.respond(301, b"", headers=("Location: https://x.example.test/",)),
+                 "closed_after_tls": lambda tls: None}
+        for signal, handler in cases.items():
+            with self.subTest(signal):
+                result = self.result(self.serve(handler))
+                self.assertEqual(result["signals"], [signal])
+                self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "indeterminate")
+                if signal.startswith("http_4") or signal.startswith("http_5") or signal.startswith("http_3"):
+                    self.assertEqual(cf_only.judge_closed(result, {signal})[0], "pass")
+
+    def test_tls_alert_is_tls_rejected_and_not_tcp_refused(self):
+        result = self.result(self.serve("alert"))
+        self.assertEqual(result["signals"], ["tls_rejected"])
+        self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "indeterminate")
+
+    def test_silence_is_a_timeout_and_indeterminate(self):
+        result = self.result(self.serve("silent"))
+        self.assertEqual(result["signals"], ["timeout"])
+        self.assertEqual(cf_only.judge_closed(result, {"tcp_refused", "tls_rejected"})[0], "indeterminate")
+
+    def test_a_closed_port_is_tcp_refused_and_the_only_default_pass(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.close()
+        result = self.result(port)
+        self.assertEqual(result["signals"], ["tcp_refused"])
+        self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "pass")
+
+    def test_unresolvable_name_is_no_address(self):
+        self.assertEqual(self.probe.probe("no-such-host.invalid", "ipv4", 443)["signals"], ["no_address"])
+
+    def test_management_banner_is_read_after_the_tls_handshake(self):
+        port = self.serve(lambda tls: tls.sendall(b"SSH-2.0-OpenSSH_9.6\r\n"))
+        self.assertEqual(self.result(port, banner=True)["signals"], ["ssh_banner"])
+        port = self.serve(lambda tls: tls.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n"))
+        self.assertEqual(self.result(port, banner=True)["signals"], ["non_ssh_data"])
+        self.assertEqual(self.result(self.serve(lambda tls: None), banner=True)["signals"], ["closed_after_tls"])
+        self.assertEqual(cf_only.judge_management({"signals": ["non_ssh_data"]}, True, {"tcp_refused"})[0], "indeterminate")
+        self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, True, {"tcp_refused"})[0], "pass")
 
 
 if __name__ == "__main__":

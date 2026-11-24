@@ -2,7 +2,7 @@
 """Cloudflare-only ingress wrapper: preflight, plan, apply-patch, verify, undo.
 
 Wraps scripts/ingress-switch.py (run as a subprocess, unmodified). Network access is
-read-only and sits behind injectable clients (Cloudflare GET reads, HTTPS/TCP probes).
+read-only and sits behind injectable clients (Cloudflare GET reads, HTTPS probes).
 This script never calls Phala, holds no Phala credential and never executes the Phala
 port_policy PATCH: apply-patch and undo only EMIT the exact command and payload for an
 authorized operator. See docs/runbooks/cf-only-ingress.md.
@@ -10,9 +10,9 @@ authorized operator. See docs/runbooks/cf-only-ingress.md.
 import argparse
 from collections import namedtuple
 from datetime import datetime, timezone
-import errno
 import hashlib
 import hmac
+import http.client
 import json
 import os
 from pathlib import Path
@@ -37,13 +37,22 @@ GATEWAY_SUFFIXES = ("8000", "8000g", "443", "443s", "443g")
 LABEL = "operator evidence from automated reads, not a cryptographic attestation"
 ORIGIN_ATTESTATION = ("operator-attested, NOT verified: the Worker's ORIGIN_URL is a secret whose value the Cloudflare "
                       "API never returns; it is recorded as the --tunnel-host the operator says the set-origin step received")
-END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path refuses "
-                    "fresh connections, so the Worker reaches the node by some route other than the closed gateway")
+CONNECTOR_BASIS = "tunnel status healthy with active connections and none pending reconnect, as read from the Cloudflare API"
+END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path shows an "
+                    "accepted closed signal, so the Worker reaches the node by some route other than the closed gateway")
 END_TO_END_CANNOT = ["that the secret equals the tunnel host (another independent origin serving the same node would "
                      "also pass)", "that no unprobed gateway host or address is used", "anything before the restriction: "
                      "while the gateway is open the secret may still point at it and node.* would also pass"]
+# Closed signals. The gateway hostnames share an SNI-routed IP, so a TCP refusal is probably NOT the real signal;
+# the actual TLS/HTTP denial signature has not been observed and a drill must record it. Until then only
+# tcp_refused is accepted by default and anything else is INDETERMINATE (never a pass).
+DEFAULT_CLOSED = ("tcp_refused",)
+CLOSED_SIGNAL_RE = re.compile(r"tcp_refused|tcp_reset|tls_rejected|closed_after_tls|http_(?!200)[1-5][0-9]{2}")
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_READ_TOKEN"
 HEX40 = re.compile(r"[0-9a-f]{40}")
+HEX32 = re.compile(r"[0-9a-f]{32}")
+SCRIPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,40}")
 Clients = namedtuple("Clients", "http cf")
 
@@ -78,14 +87,38 @@ def write_private(path, value):
         os.fsync(stream.fileno())
 
 
+def require_new_path(path, what):
+    p = Path(path)
+    require(not p.exists() and not p.is_symlink(), f"{what} must be a new path")
+    require(p.resolve().parent.is_dir() and os.access(p.resolve().parent, os.W_OK), f"{what} parent directory is not writable")
+
+
+def private_file(path, what):
+    p = Path(path)
+    require(p.is_file() and not p.is_symlink(), f"{what} must be an existing regular file")
+    st = p.stat()
+    require(st.st_mode & 0o077 == 0 and st.st_uid == os.getuid(), f"{what} must be owner-only (0600)")
+    return p
+
+
+def validate_cloudflare_ids(account_id, zone_id, script=None):
+    """Values are interpolated into API URL paths: strict shapes only."""
+    require(isinstance(account_id, str) and HEX32.fullmatch(account_id), "Account id must be 32 hex characters")
+    require(isinstance(zone_id, str) and HEX32.fullmatch(zone_id), "Zone id must be 32 hex characters")
+    if script is not None:
+        require(isinstance(script, str) and SCRIPT_RE.fullmatch(script), "Invalid Worker script name")
+
+
 # ---------------------------------------------------------------- real read-only clients
-# Never run against the network by this change; unit tests exercise them with fakes only.
+# Never run against the network by this change; unit tests exercise them with fakes and a
+# localhost server only.
 
 class CloudflareReader:
     """GET-only Cloudflare API reads. The token never appears in any message."""
     API = "https://api.cloudflare.com/client/v4"
 
     def __init__(self, token, account_id, zone_id, opener=urlopen):
+        validate_cloudflare_ids(account_id, zone_id)
         self.token, self.account, self.zone, self.opener = token, account_id, zone_id, opener
 
     def _get(self, path):
@@ -116,22 +149,42 @@ class CloudflareReader:
         return self._get(f"/zones/{self.zone}/dns_records?name={name}")
 
     def worker(self, script):
-        deployments = self._get(f"/accounts/{self.account}/workers/scripts/{script}/deployments")
-        versions = ((deployments or {}).get("deployments") or [{}])[0].get("versions") or []
-        version = versions[0].get("version_id") if len(versions) == 1 and versions[0].get("percentage") == 100 else None
-        settings = self._get(f"/accounts/{self.account}/workers/scripts/{script}/settings")
-        # INFERENCE: exactly one binding named ORIGIN_URL; the approved type is secret_text. The API
-        # returns only its name and type, never a secret value. Absent or duplicated -> None.
-        bindings = [b for b in (settings or {}).get("bindings") or [] if isinstance(b, dict) and b.get("name") == "ORIGIN_URL"]
-        kind = bindings[0].get("type") if len(bindings) == 1 else None
+        validate_cloudflare_ids(self.account, self.zone, script)
+        base = f"/accounts/{self.account}/workers/scripts/{script}"
+        # INFERENCE: the active deployment is the newest by created_on and a single 100% version is live.
+        listed = ((self._get(base + "/deployments") or {}).get("deployments")) or []
+        deployments = sorted((d for d in listed if isinstance(d, dict)), key=lambda d: str(d.get("created_on", "")),
+                             reverse=True)
+        versions = (deployments[0].get("versions") if deployments else None) or []
+        version = versions[0].get("version_id") if len(versions) == 1 and isinstance(versions[0], dict) \
+            and versions[0].get("percentage") == 100 else None
+        kind = None
+        if isinstance(version, str) and VERSION_RE.fullmatch(version):
+            # INFERENCE: the version's own bindings (resources.bindings), not the script-level /settings, which
+            # may reflect an uploaded-but-not-deployed version. Exactly one ORIGIN_URL; the API returns only its
+            # name and type, never a secret value. Absent or duplicated -> None.
+            detail = self._get(f"{base}/versions/{version}")
+            bindings = [b for b in ((detail or {}).get("resources") or {}).get("bindings") or []
+                        if isinstance(b, dict) and b.get("name") == "ORIGIN_URL"]
+            kind = bindings[0].get("type") if len(bindings) == 1 else None
+        else:
+            version = None
         routes = self._get(f"/zones/{self.zone}/workers/routes") or []
         return {"version_id": version, "origin_binding": kind if isinstance(kind, str) else None,
-                "routes": [{"pattern": r.get("pattern"), "script": r.get("script")} for r in routes]}
+                "routes": [{"pattern": r.get("pattern"), "script": r.get("script")} for r in routes if isinstance(r, dict)]}
 
 
 class NetworkProbe:
-    """HTTPS /info reads and fresh-connection probes from this host only (one vantage)."""
+    """HTTPS /info reads and fresh-connection probes from this host only (one vantage).
+
+    Every probe reports a distinct signal token, never a bare "closed": tcp_refused, tcp_reset,
+    tls_rejected, closed_after_tls, http_<status>, http_200_unparsed, malformed_http, node_info,
+    ssh_banner, non_ssh_data, timeout, no_address, error. The caller decides which are acceptable.
+    """
     FAMILIES = {"ipv4": socket.AF_INET, "ipv6": socket.AF_INET6}
+
+    def __init__(self, timeout=8):
+        self.timeout = timeout
 
     def info(self, host):
         try:
@@ -157,58 +210,79 @@ class NetworkProbe:
         except socket.gaierror:
             return []
 
-    @staticmethod
-    def _classify(error):
-        if isinstance(error, (socket.timeout, TimeoutError)):
-            return "timeout"
-        if isinstance(error, (ssl.SSLError, EOFError, ConnectionRefusedError, ConnectionResetError,
-                              ConnectionAbortedError, BrokenPipeError)):
-            return "refused"
-        return "refused" if getattr(error, "errno", None) in (errno.ECONNREFUSED, errno.ECONNRESET) else "error"
+    def _attempt(self, address, host, banner):
+        """One connection attempt -> (signal, node_id or None)."""
+        try:
+            raw = socket.create_connection(address[:2], timeout=self.timeout)
+        except (socket.timeout, TimeoutError):
+            return "timeout", None
+        except ConnectionRefusedError:
+            return "tcp_refused", None
+        except ConnectionError:
+            return "tcp_reset", None
+        except OSError:
+            return "error", None
+        with raw:
+            context = ssl.create_default_context()
+            context.check_hostname, context.verify_mode = False, ssl.CERT_NONE  # reachability only
+            try:
+                stream = context.wrap_socket(raw, server_hostname=host)
+            except (socket.timeout, TimeoutError):
+                return "timeout", None
+            except (ssl.SSLError, EOFError):
+                return "tls_rejected", None
+            except ConnectionError:
+                return "tcp_reset", None
+            except OSError:
+                return "error", None
+            with stream:
+                try:
+                    if banner:
+                        data = stream.recv(255)
+                        if not data:
+                            return "closed_after_tls", None
+                        return ("ssh_banner" if data.startswith(b"SSH-2.0-") else "non_ssh_data"), None
+                    stream.sendall(f"GET /info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+                    response = http.client.HTTPResponse(stream, method="GET")
+                    response.begin()
+                    body = response.read(65536)  # de-chunks and honours Content-Length
+                except (socket.timeout, TimeoutError):
+                    return "timeout", None
+                except (http.client.RemoteDisconnected, ssl.SSLEOFError, EOFError):
+                    return "closed_after_tls", None
+                except (http.client.HTTPException, ValueError):
+                    return "malformed_http", None
+                except ssl.SSLError:
+                    return "tls_rejected", None
+                except ConnectionError:
+                    return "tcp_reset", None
+                except OSError:
+                    return "error", None
+        if response.status != 200:
+            return f"http_{response.status}", None
+        node_id = self._node_id(body)
+        return ("node_info", node_id) if node_id else ("http_200_unparsed", None)
+
+    def _run(self, host, family, port, banner):
+        addresses = self._addresses(host, port, family)
+        if not addresses:
+            return {"outcome": "no_address", "signals": ["no_address"]}
+        attempts = [self._attempt(address, host, banner) for address in addresses]
+        signals = [signal for signal, _ in attempts]
+        result = {"signals": signals, "outcome": signals[0] if len(set(signals)) == 1 else "mixed"}
+        for signal, node_id in attempts:
+            if signal == "node_info":
+                return {"outcome": "node_info", "signals": signals, "node_id": node_id}
+        return result
 
     def probe(self, host, family, port=443):
-        """-> {'outcome': node_info|refused|no_address|timeout|error, 'node_id'?}"""
-        addresses = self._addresses(host, port, family)
-        if not addresses:
-            return {"outcome": "no_address"}
-        worst = "refused"
-        for address in addresses:
-            try:
-                context = ssl.create_default_context()
-                context.check_hostname, context.verify_mode = False, ssl.CERT_NONE  # reachability only
-                with socket.create_connection(address[:2], timeout=8) as raw:
-                    with context.wrap_socket(raw, server_hostname=host) as stream:
-                        stream.sendall(f"GET /info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
-                        data = b""
-                        while len(data) < 65536:
-                            chunk = stream.recv(8192)
-                            if not chunk:
-                                break
-                            data += chunk
-            except (OSError, EOFError) as error:
-                outcome = self._classify(error)
-                worst = outcome if outcome != "refused" else worst
-                continue
-            head, _, body = data.partition(b"\r\n\r\n")
-            node_id = self._node_id(body) if head.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200")) else None
-            if node_id:
-                return {"outcome": "node_info", "node_id": node_id}
-        return {"outcome": worst}
+        """Fresh HTTPS /info request with SNI/Host `host` -> {'outcome', 'signals', 'node_id'?}"""
+        return self._run(host, family, port, banner=False)
 
-    def tcp_probe(self, host, port, family):
-        """-> open|refused|no_address|timeout|error"""
-        addresses = self._addresses(host, port, family)
-        if not addresses:
-            return "no_address"
-        worst = "refused"
-        for address in addresses:
-            try:
-                socket.create_connection(address[:2], timeout=8).close()
-                return "open"
-            except OSError as error:
-                outcome = self._classify(error)
-                worst = outcome if outcome != "refused" else worst
-        return worst
+    def mgmt_probe(self, host, family="ipv4", port=443):
+        """INFERENCE: management is reached through the gateway TLS route <app>-10022.<gw>:443; 'open' means an
+        SSH-2.0 banner is read after the TLS handshake. -> {'outcome', 'signals'}"""
+        return self._run(host, family, port, banner=True)
 
 
 # ---------------------------------------------------------------- preflight
@@ -232,6 +306,7 @@ def preflight(cfg, clients, now):
         UUID(cfg["tunnel_id"])
     except ValueError:
         raise Refusal("Tunnel id is not a UUID") from None
+    validate_cloudflare_ids(cfg["account_id"], cfg["zone_id"], cfg["worker_script"])
     host = cfg["tunnel_host"]
     check_tunnel_host(host)
     http, cf = clients.http, clients.cf
@@ -242,12 +317,14 @@ def preflight(cfg, clients, now):
     connections = tunnel.get("connections")
     require(tunnel.get("status") == "healthy" and isinstance(connections, list) and connections
             and all(isinstance(c, dict) and not c.get("is_pending_reconnect") for c in connections),
-            "Tunnel connector is not healthy with authenticated active connections")
+            "Tunnel connector is not healthy with active connections")
 
     ingress = cf.tunnel_ingress(cfg["tunnel_id"])
-    require(isinstance(ingress, list) and any(
-        isinstance(r, dict) and r.get("hostname") == host and r.get("service") == TUNNEL_SERVICE for r in ingress),
-        "Tunnel ingress does not route the tunnel hostname to the node service")
+    require(isinstance(ingress, list), "Tunnel ingress could not be read")
+    # First match wins in cloudflared: the first rule for the host must be the plain one, and no catch-all may precede it.
+    first = next((r for r in ingress if isinstance(r, dict) and (r.get("hostname") == host or not r.get("hostname"))), None)
+    require(first is not None and first.get("hostname") == host and first.get("service") == TUNNEL_SERVICE
+            and not first.get("path"), "Tunnel ingress does not route the tunnel hostname to the node service")
 
     records = cf.dns_records(host)
     require(isinstance(records, list) and len(records) == 1 and isinstance(records[0], dict)
@@ -258,7 +335,7 @@ def preflight(cfg, clients, now):
     worker = cf.worker(cfg["worker_script"])
     require(isinstance(worker, dict) and isinstance(worker.get("version_id"), str) and worker["version_id"],
             "Worker version could not be read")
-    # The Cloudflare API never returns a secret's value: only its presence and type can be read.
+    # The Cloudflare API never returns a secret's value: only the deployed version's binding name/type can be read.
     require(worker.get("origin_binding") != "plain_text",
             "Worker ORIGIN_URL is a plain_text variable; the approved path is a secret, redeploy it as a secret")
     require(worker.get("origin_binding") == "secret_text",
@@ -267,8 +344,12 @@ def preflight(cfg, clients, now):
             "Pass --attest-origin-is-tunnel-host: the secret's value cannot be read, so the operator must attest it")
     if cfg.get("expect_worker_version"):
         require(worker["version_id"] == cfg["expect_worker_version"], "Worker version differs from the expected version")
-    routes = {r.get("pattern"): r.get("script") for r in worker.get("routes") or [] if isinstance(r, dict)}
-    require(routes.get(f"{PUBLIC_HOST}/*") == cfg["worker_script"], "node.tinycloud.xyz is not routed to the Worker")
+    routes = [r for r in worker.get("routes") or [] if isinstance(r, dict)]
+    require(any(r.get("pattern") == f"{PUBLIC_HOST}/*" and r.get("script") == cfg["worker_script"] for r in routes),
+            "node.tinycloud.xyz is not routed to the Worker")
+    require(all(r.get("script") == cfg["worker_script"] for r in routes
+                if str(r.get("pattern", "")).startswith(f"{PUBLIC_HOST}/")),
+            "A route for node.tinycloud.xyz points at another script")
 
     origin, public = http.info(host), http.info(PUBLIC_HOST)
     require(origin.get("status") == 200 and public.get("status") == 200, "/info is not healthy on both routes")
@@ -276,7 +357,8 @@ def preflight(cfg, clients, now):
             "Node ids differ or are missing between the tunnel host and node.tinycloud.xyz")
     return {"app_id": cfg["app_id"], "public_url": f"https://{PUBLIC_HOST}", "worker_origin": f"https://{host}",
             "tunnel_hostname": host, "tunnel_id": cfg["tunnel_id"], "verified_at_utc": now.isoformat(),
-            "connector_authenticated": True, "origin_status": 200, "public_status": 200,
+            "connector_authenticated": True, "connector_authenticated_basis": CONNECTOR_BASIS,
+            "origin_status": 200, "public_status": 200,
             "origin_node_id": origin["node_id"], "public_node_id": public["node_id"],
             "worker_version_id": worker["version_id"], "worker_origin_binding": "secret_text",
             "worker_origin_value": ORIGIN_ATTESTATION, "tunnel_connections": len(connections),
@@ -288,7 +370,8 @@ def summarize(receipt):
     keys = ("app_id", "worker_origin", "tunnel_id", "worker_version_id", "worker_origin_binding",
             "tunnel_connections", "verified_at_utc")
     return dict({k: receipt[k] for k in keys}, node_id_fingerprint=fingerprint(receipt["origin_node_id"]),
-                worker_origin_value=ORIGIN_ATTESTATION, evidence_label=LABEL)
+                connector_authenticated_basis=CONNECTOR_BASIS, worker_origin_value=ORIGIN_ATTESTATION,
+                evidence_label=LABEL)
 
 
 # ---------------------------------------------------------------- switch wrapper / plan
@@ -335,14 +418,16 @@ def phala_command(cvm_id, patch_file):
     return f"phala api /cvms/{shlex.quote(cvm_id)} -X PATCH --input {shlex.quote(str(patch_file))}"
 
 
-def verify_command(a, expect, receipt_path="RECEIPT.json"):
-    parts = ["python3", "scripts/ingress-cf-only.py", "verify", "--expect", expect,
-             "--expect-app-id", a.expect_app_id, "--snapshot", str(a.snapshot),
-             "--receipt", receipt_path, "--tunnel-host", a.tunnel_host or "TUNNEL_HOST"]
-    for flag, value in (("--instance-id", a.instance_id), ("--gateway-domain", a.gateway_domain),
-                        ("--management-endpoint", a.management_endpoint)):
-        parts += [flag, value or f"<{flag[2:].upper()}>"]
-    return " ".join(shlex.quote(p) if not p.startswith("<") else p for p in parts)
+def verify_command(a, expect, receipt_path):
+    """Every value is shlex-quoted; a value not known yet is printed as a quoted placeholder."""
+    def value(v, placeholder):
+        return shlex.quote(str(v) if v else placeholder)
+
+    return " ".join(["python3", "scripts/ingress-cf-only.py", "verify", "--expect", expect,
+                     "--expect-app-id", value(a.expect_app_id, "APP-ID"), "--snapshot", value(a.snapshot, "SNAPSHOT"),
+                     "--receipt", value(receipt_path, "RECEIPT"), "--tunnel-host", value(a.tunnel_host, "TUNNEL-HOST"),
+                     "--instance-id", value(getattr(a, "instance_id", None), "<INSTANCE-ID>"),
+                     "--gateway-domain", value(getattr(a, "gateway_domain", None), "<GATEWAY-DOMAIN>")])
 
 
 def cmd_plan(a, clients, now, out):
@@ -358,22 +443,30 @@ def cmd_plan(a, clients, now, out):
 
 def cmd_apply_patch(a, clients, now, out):
     require(a.confirm, "--confirm <plan-hash> is required")
+    # Check every output path BEFORE staging so a failure cannot leave a half-applied local state.
+    for path, what in ((a.patch_out, "Patch file"), (a.receipt_out, "Receipt file"), (a.snapshot, "Snapshot")):
+        require_new_path(path, what)
     receipt, sw, digest = build_plan(a, clients, now)
     require(hmac.compare_digest(a.confirm, digest), "Confirm does not match a fresh plan; rerun plan and review it")
-    require(not Path(a.patch_out).exists() and not Path(a.snapshot).exists(), "Patch file and snapshot must be new paths")
     staged = stage(a, receipt, apply=True)
     require(staged["patch"] == sw["patch"], "Staged patch differs from the confirmed plan")
     write_private(a.patch_out, staged["patch"])
+    write_private(a.receipt_out, receipt)
     emit(out, {"command": "apply-patch", "executed_by_this_script": "local staging only; NO Phala call was made",
                "phala_command_for_authorized_operator": phala_command(sw["cvm_id"], a.patch_out),
                "payload": staged["patch"], "patch_file": str(Path(a.patch_out).resolve()),
-               "snapshot": str(Path(a.snapshot).resolve()), "evidence": summarize(receipt),
+               "snapshot": str(Path(a.snapshot).resolve()), "receipt_file": str(Path(a.receipt_out).resolve()),
+               "evidence": summarize(receipt),
                "warning": "Under a GO only. The PATCH restarts the CVM and interrupts both HTTP paths.",
-               "then_verify": verify_command(a, "restricted", "RECEIPT.json"),
+               "then_verify": verify_command(a, "restricted", a.receipt_out),
+               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify is INDETERMINATE, "
+                              "not a pass, unless the observed closed signal is accepted with --accept-closed-signal.",
                "if_bad": "undo --snapshot " + str(Path(a.snapshot).resolve())})
 
 
 def cmd_preflight(a, clients, now, out):
+    if a.out:
+        require_new_path(a.out, "Receipt file")
     receipt = preflight(cfg_of(a), clients, now)
     if a.out:
         write_private(a.out, receipt)
@@ -383,6 +476,7 @@ def cmd_preflight(a, clients, now, out):
 
 def cfg_of(a):
     return {"app_id": a.expect_app_id, "tunnel_id": a.tunnel_id, "tunnel_host": a.tunnel_host,
+            "account_id": a.account_id, "zone_id": a.zone_id,
             "worker_script": a.worker_script, "expect_worker_version": a.expect_worker_version,
             "attested_origin": a.attest_origin_is_tunnel_host}
 
@@ -396,8 +490,13 @@ def direct_hosts(a):
     hosts = [TEE_HOST]
     for ident in (a.expect_app_id, a.instance_id):
         hosts += [f"{ident}-{suffix}.{gateway}" for suffix in GATEWAY_SUFFIXES]
-    hosts += [host_name(h, "extra") for h in a.extra_host or []]
+    hosts += [host_name(h, "extra") for h in getattr(a, "extra_host", None) or []]
     return list(dict.fromkeys(hosts))
+
+
+def management_host(a):
+    """INFERENCE: management is the gateway route <app>-10022.<gateway>:443 (compose comment), not a host port."""
+    return f"{a.expect_app_id}-{MANAGEMENT_PORT}.{host_name(a.gateway_domain, 'gateway')}"
 
 
 def management_allowed(policy):
@@ -408,77 +507,109 @@ def management_allowed(policy):
 
 
 def load_private_snapshot(path):
-    p = Path(path)
-    require(p.is_file() and not p.is_symlink(), "Snapshot must be an existing regular file")
-    st = p.stat()
-    require(st.st_mode & 0o077 == 0 and st.st_uid == os.getuid(), "Snapshot must be owner-only (0600)")
-    snap = json.loads(p.read_text(encoding="utf-8"))
+    snap = json.loads(private_file(path, "Snapshot").read_text(encoding="utf-8"))
     require(isinstance(snap, dict) and isinstance(snap.get("before"), dict) and "after" in snap,
             "Snapshot is not a recorded ingress policy")
     return snap
 
 
-def check(name, ok, detail):
-    return {"check": name, "ok": bool(ok), "detail": detail}
+def check(name, status, detail):
+    assert status in ("pass", "fail", "indeterminate")
+    return {"check": name, "status": status, "ok": status == "pass", "detail": detail}
+
+
+def signals_of(result):
+    return list(result.get("signals") or [result.get("outcome") or "error"])
+
+
+def judge_closed(result, allowed, family=None, allow_no_aaaa=False):
+    """A path that must be closed: pass only on an accepted closed signal; a node answer is a fail."""
+    signals = signals_of(result)
+    if "node_info" in signals:
+        return "fail", "node answered /info: " + ",".join(signals)
+    if all(s in allowed or (s == "no_address" and family == "ipv6" and allow_no_aaaa) for s in signals):
+        note = ",".join(signals)
+        return "pass", note + (" (explicitly accepted: no AAAA is not proof of no IPv6 path)" if "no_address" in signals else "")
+    return "indeterminate", ",".join(signals) + " is not an accepted closed signal"
+
+
+def judge_management(result, expect_open, allowed):
+    signals = signals_of(result)
+    if expect_open:
+        if all(s == "ssh_banner" for s in signals):
+            return "pass", "SSH-2.0 banner read through the gateway route"
+        if any(s in allowed for s in signals):
+            return "fail", "management looks closed: " + ",".join(signals)
+        return "indeterminate", ",".join(signals)
+    if all(s in allowed for s in signals):
+        return "pass", ",".join(signals)
+    if "ssh_banner" in signals:
+        return "fail", "management still answers although the policy denies it"
+    return "indeterminate", ",".join(signals)
 
 
 def verify(a, clients, now):
     snap = load_private_snapshot(a.snapshot)
     require(snap.get("app_id") == a.expect_app_id, "Snapshot belongs to a different app")
-    receipt = json.loads(Path(a.receipt).read_text(encoding="utf-8"))
+    receipt = json.loads(private_file(a.receipt, "Receipt").read_text(encoding="utf-8"))
     require(isinstance(receipt, dict) and receipt.get("app_id") == a.expect_app_id and receipt.get("origin_node_id")
             and receipt.get("origin_node_id") == receipt.get("public_node_id"), "Receipt is missing or inconsistent")
+    require(receipt.get("tunnel_hostname") == a.tunnel_host
+            and (snap.get("verified_origin") or {}).get("tunnel_id") == receipt.get("tunnel_id"),
+            "Receipt, snapshot and --tunnel-host do not describe the same tunnel")
     age = (now - datetime.fromisoformat(receipt["verified_at_utc"].replace("Z", "+00:00"))).total_seconds()
     require(0 <= age <= a.max_receipt_age, "Receipt is stale; rerun preflight")
     check_tunnel_host(a.tunnel_host)
-    host, port = (a.management_endpoint or "").rpartition(":")[::2]
-    require(host and port == str(MANAGEMENT_PORT), "--management-endpoint HOST:10022 is required")
-    host_name(host, "management")
-    hosts = direct_hosts(a)
+    hosts, mgmt = direct_hosts(a), management_host(a)
+    allowed = set(DEFAULT_CLOSED) | set(a.accept_closed_signal or [])
     http = clients.http
     node = receipt["origin_node_id"]
     checks = []
 
     for label, name in (("tunnel host", a.tunnel_host), ("node.tinycloud.xyz", PUBLIC_HOST)):
         info = http.info(name)
-        checks.append(check(f"{label} /info healthy with the recorded node id",
-                            info.get("status") == 200 and info.get("node_id") == node,
+        good = info.get("status") == 200 and info.get("node_id") == node
+        checks.append(check(f"{label} /info healthy with the recorded node id", "pass" if good else "fail",
                             f"status={info.get('status')} node_id_matches={info.get('node_id') == node}"))
 
     if a.expect == "restricted":
         for name in hosts:
             for family in ("ipv4", "ipv6"):
-                result = http.probe(name, family, 443)
-                outcome = result.get("outcome")
-                ok = outcome == "refused" or (outcome == "no_address" and family == "ipv6" and a.allow_no_aaaa)
-                note = outcome + (" (explicitly accepted: no AAAA is not proof of no IPv6 path)" if ok and outcome == "no_address" else "")
-                checks.append(check(f"{name} fresh {family} connection refused", ok, note))
+                status, detail = judge_closed(http.probe(name, family, 443), allowed, family, a.allow_no_aaaa)
+                checks.append(check(f"{name} fresh {family} connection shows a closed signal", status, detail))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
         result = http.probe(TEE_HOST, "ipv4", 443)
-        checks.append(check(f"{TEE_HOST} fresh ipv4 connection reaches the node again",
-                            result.get("outcome") == "node_info" and result.get("node_id") == node,
-                            result.get("outcome", "?")))
+        good = result.get("outcome") == "node_info" and result.get("node_id") == node
+        checks.append(check(f"{TEE_HOST} fresh ipv4 connection reaches the node again", "pass" if good else "fail",
+                            ",".join(signals_of(result))))
 
     policy = snap["after"] if a.expect == "restricted" else snap["before"].get("value")
-    expected = "open" if management_allowed(policy) else "refused"
-    seen = http.tcp_probe(host, MANAGEMENT_PORT, "ipv4")
-    checks.append(check(f"management port {MANAGEMENT_PORT} untouched (expected {expected})", seen == expected, seen))
-    return checks
+    expect_open = management_allowed(policy)
+    status, detail = judge_management(http.mgmt_probe(mgmt, "ipv4"), expect_open, allowed)
+    checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 untouched "
+                        f"(expected {'open' if expect_open else 'denied'})", status, detail))
+    return checks, sorted(allowed)
 
 
 def cmd_verify(a, clients, now, out):
-    checks = verify(a, clients, now)
-    passed = all(c["ok"] for c in checks)
-    emit(out, {"command": "verify", "expect": a.expect, "result": "pass" if passed else "FAIL", "checks": checks,
+    checks, allowed = verify(a, clients, now)
+    statuses = {c["status"] for c in checks}
+    result = "FAIL" if "fail" in statuses else "INDETERMINATE" if "indeterminate" in statuses else "pass"
+    emit(out, {"command": "verify", "expect": a.expect, "result": result, "checks": checks,
+               "accepted_closed_signals": allowed,
+               "closed_signal_note": "Only these signals count as closed. The gateway shares an SNI-routed IP, so a TCP "
+                                     "refusal is probably not the real signal; the actual TLS/HTTP denial signature has not "
+                                     "been observed. Record it in the drill, then pass it with --accept-closed-signal. "
+                                     "Anything else is INDETERMINATE, never a pass.",
                "worker_origin_value": ORIGIN_ATTESTATION,
                "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
                "what_they_cannot_show": END_TO_END_CANNOT,
                "not_covered": ["independent external networks (single vantage)", "cached or literal-IP paths",
                                "existing long-lived connections", "provider read-back of /network and /compose_file",
                                "streaming/SSE behaviour"]})
-    return 0 if passed else 1
+    return {"pass": 0, "FAIL": 1, "INDETERMINATE": 2}[result]
 
 
 # ---------------------------------------------------------------- undo
@@ -486,7 +617,11 @@ def cmd_verify(a, clients, now, out):
 def cmd_undo(a, clients, now, out):
     snap = load_private_snapshot(a.snapshot)
     require(snap.get("app_id") == a.expect_app_id, "Snapshot belongs to a different app")
-    require(not Path(a.patch_out).exists(), "Patch file must be a new path")
+    # Validate every operator value that is printed back in the verify command.
+    direct_hosts(a)
+    check_tunnel_host(a.tunnel_host)
+    private_file(a.receipt, "Receipt")
+    require_new_path(a.patch_out, "Patch file")
     restore = run_switch(["--compose", a.compose, "--target", a.target, "--expect-app-id", a.expect_app_id,
                           "--restore", a.snapshot, "--apply" if a.apply else "--dry-run"])
     write_private(a.patch_out, restore["patch"])
@@ -499,13 +634,20 @@ def cmd_undo(a, clients, now, out):
                "payload": restore["patch"], "patch_file": str(Path(a.patch_out).resolve()),
                "snapshot_after_to_compare": snap["after"],
                "warning": "The PATCH restarts the CVM and interrupts both HTTP paths.",
-               "then_verify": verify_command(a, "restored")})
+               "then_verify": verify_command(a, "restored", a.receipt)})
 
 
 # ---------------------------------------------------------------- CLI
 
 def emit(out, value):
     out.write(json.dumps(value, indent=2) + "\n")
+
+
+def closed_signal(value):
+    if not CLOSED_SIGNAL_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError("not a closed-signal token (tcp_refused, tcp_reset, tls_rejected, "
+                                         "closed_after_tls, http_<non-200 status>)")
+    return value
 
 
 def parser():
@@ -522,8 +664,8 @@ def parser():
     def cloudflare(p):
         p.add_argument("--tunnel-id", required=True)
         p.add_argument("--tunnel-host", required=True)
-        p.add_argument("--account-id", required=True)
-        p.add_argument("--zone-id", required=True)
+        p.add_argument("--account-id", required=True, help="32 hex characters")
+        p.add_argument("--zone-id", required=True, help="32 hex characters")
         p.add_argument("--worker-script", default=DEFAULT_WORKER)
         p.add_argument("--expect-worker-version")
         p.add_argument("--attest-origin-is-tunnel-host", action="store_true",
@@ -538,7 +680,6 @@ def parser():
     def verify_inputs(p):
         p.add_argument("--instance-id", required=True)
         p.add_argument("--gateway-domain", required=True)
-        p.add_argument("--management-endpoint", required=True, help="HOST:10022")
         p.add_argument("--tunnel-host", required=True)
         p.add_argument("--receipt", type=Path, required=True)
 
@@ -547,13 +688,14 @@ def parser():
     p = add("apply-patch", "stage locally and EMIT the Phala PATCH (never executes it)", cloudflare, switch_inputs)
     p.add_argument("--confirm", required=True)
     p.add_argument("--patch-out", type=Path, required=True)
-    for p in (sub.choices["apply-patch"], sub.choices["plan"]):
-        p.set_defaults(instance_id=None, gateway_domain=None, management_endpoint=None)
+    p.add_argument("--receipt-out", type=Path, required=True, help="NEW 0600 receipt file for verify")
     p = add("verify", "post-checks", verify_inputs)
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--expect", choices=("restricted", "restored"), default="restricted")
     p.add_argument("--extra-host", action="append")
     p.add_argument("--allow-no-aaaa", action="store_true", help="accept a missing AAAA record as IPv6 evidence")
+    p.add_argument("--accept-closed-signal", action="append", type=closed_signal,
+                   help="additional signal token recorded by a drill as the real closed signal; default: tcp_refused only")
     p.add_argument("--max-receipt-age", type=int, default=3600)
     p = add("undo", "EMIT the reverse PATCH from the snapshot", verify_inputs)
     p.add_argument("--compose", type=Path, required=True)
