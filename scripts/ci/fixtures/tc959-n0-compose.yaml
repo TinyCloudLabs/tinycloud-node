@@ -180,15 +180,18 @@ services:
 
   # TC-4194 P1: Cloudflare Tunnel connector. Outbound-only: it dials
   # Cloudflare's edge and carries Cloudflare-side routes to tinycloud:8000, so
-  # it publishes NO ports. Network scope: it is on the dedicated cf-edge
-  # network ONLY (not `default`, so dstack-ingress, ssh-gateway and every
-  # other internal port are unreachable from it) and tinycloud is the only
-  # other member. Tunnel ingress rules are remote-managed in Cloudflare, so
-  # this network list, not the tunnel configuration, bounds what the
-  # connector can reach. The ingress service is not joined: the planned
-  # Cloudflare route is the node's HTTP origin (tinycloud:8000), not the
-  # TLS-terminating tee.node nginx. The database is external to this compose
-  # and is reached by the node, never by the connector. The connector
+  # it publishes NO ports. Network scope (defence in depth only): it is on the
+  # dedicated cf-edge network ONLY (not `default`, not `logship`, so
+  # dstack-ingress, ssh-gateway, vector and every other internal port are
+  # unreachable by service name) and tinycloud is the only other member. This
+  # is NOT a boundary for a holder of tunnel-edit rights: ingress rules are
+  # remote-managed in Cloudflare and can still point at the docker host
+  # gateway or at any internet address the connector can dial (INFERENCE),
+  # e.g. the external database host, which would bypass a source-IP
+  # allow-list. Closing that needs a locally-managed tunnel (TC-4224). The
+  # ingress service is not joined: the planned Cloudflare route is the node's
+  # HTTP origin (tinycloud:8000), not the TLS-terminating tee.node nginx. The
+  # database is external to this compose (there is no postgres service). The
   # credential is the sealed CLOUDFLARE_TUNNEL_TOKEN, delivered as an
   # environment variable (the same path as CLOUDFLARE_API_TOKEN above; no
   # compose secrets/configs).

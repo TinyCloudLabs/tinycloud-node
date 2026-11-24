@@ -42,9 +42,9 @@ def deploy(value):
 
 
 def network_violations(compose):
-    """What the connector could reach beyond tinycloud:8000. Its tunnel rules are managed in Cloudflare, so only
-    network membership bounds it: it must be on cf-edge alone (never `default`, never a network postgres or the
-    log shipper uses), and tinycloud must be the only other service on cf-edge."""
+    """Defence-in-depth network scope (it does not bound remote-managed ingress rules aimed at the host gateway
+    or the internet): the connector must be on exactly one network, cf-edge (never `default`, never `logship`,
+    no network_mode), and tinycloud must be the only other service on cf-edge."""
     services = compose["services"]
     networks = lambda service: set(service.get("networks") or ["default"])
     connector = services["cloudflared"]
@@ -102,6 +102,9 @@ class CloudflaredConnectorTests(unittest.TestCase):
     def test_connector_network_scope_is_cf_edge_with_tinycloud_only(self):
         compose = yaml.safe_load(COMPOSE)
         self.assertEqual(network_violations(compose), [])
+        self.assertEqual(compose["services"]["cloudflared"]["networks"], ["cf-edge"])
+        for other in ("default", "logship"):
+            self.assertNotIn(other, compose["services"]["cloudflared"]["networks"])
         self.assertIn("cf-edge", compose["networks"])
 
     def test_network_check_rejects_widened_scope(self):
