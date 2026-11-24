@@ -93,7 +93,8 @@ Guarantees (all tested against fakes):
   needs `--other-host`. `node.tinycloud.xyz` is always protected and can not be
   targeted (nor a parent domain of it); `--protect-host H` (repeatable) adds more
   protected hosts, it never removes `node.*`. A host that a protected host CNAMEs to
-  (in-zone) is refused too. The same target check, id/host/param validation and the
+  (in-zone, ONE level only: a chain node -> a -> target, or an alias in another zone, is
+  not detected) is refused too. The same target check, id/host/param validation and the
   `worker-route` id check run again when a snapshot is loaded (the file is untrusted input).
 - A finished snapshot can not be replayed: `undo` refuses a snapshot whose status is
   `undone` or `aborted` (exit 1, nothing changed), so re-running an old undo from shell
@@ -101,12 +102,14 @@ Guarantees (all tested against fakes):
   `undo_token` (random per apply; printed by `apply` and by the undo dry-run), not the
   plan hash, which is identical for two applies from the same state. A `pending`
   snapshot (failed apply) does not say which apply produced the live state for the
-  single-value levers (security level, route, flip), so its confirm is bound to the
-  LIVE state shown by the dry-run (`undo_confirm`, see Failure recovery), and it should
-  still be undone BEFORE anything else is applied.
+  single-value levers (security level, route, flip), so its undo needs `--force-drift`
+  and its confirm is bound to the LIVE state shown by the dry-run (`undo_confirm`, see
+  Failure recovery).
 - After a `--force-drift` undo, `verify` may exit 4 because other people's changes were
   kept; the output says so ("differs ... by design").
-- Exit codes: 0 ok, 1 refused (nothing changed), 3 Cloudflare/IO failure, 4 verify failed.
+- Exit codes: 0 ok, 1 refused (nothing changed), 3 Cloudflare/IO failure or an apply
+  that was sent but failed or could not be pinned (the zone MAY have changed: see the
+  snapshot and `APPLY FAILED`), 4 verify failed.
 
 ## Failure recovery
 
@@ -116,9 +119,17 @@ first): it restores the prior state, or says there is nothing to undo and marks 
 snapshot `aborted`. For a pending snapshot the dry-run prints the LIVE state read from
 Cloudflare next to the recorded prior state, and the confirm value (`undo_confirm`) is
 bound to that live state: read both, then pass it as `--confirm`. If the live state
-changed since the dry-run the confirm is refused; re-run the dry-run. If undo itself
-fails, restore by hand from the exact values in the snapshot (`before`) in the
-Cloudflare dashboard.
+changed since the dry-run the confirm is refused; re-run the dry-run.
+
+For `security-level`, `worker-route`, `dns-proxy-flip` and `dns-remove` a pending undo REQUIRES
+`--force-drift` (also on the dry-run): the live state may come from a LATER successful
+apply (failed apply A, retry B succeeded, then A's undo would revert B), so the tool
+refuses until you have read the live state it shows and confirmed it is what you want
+reverted. `waf` pending undo needs no force when the created rule id was recorded; an
+unrecorded WAF rule id needs `--force-drift` and exactly one candidate rule.
+
+If undo itself fails, restore by hand from the exact values in the snapshot (`before`)
+in the Cloudflare dashboard.
 
 ## Unverified (check in the first drill, not run)
 

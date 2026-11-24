@@ -173,8 +173,9 @@ class LeverBase:
     created = None  # what apply created (the WAF rule id); persisted in the snapshot
 
     def pinned(self, current, snap):
-        """True if undo may treat the current state as the one this snapshot's apply created."""
-        return True
+        """True if undo may treat the current state as the one this snapshot's apply created. A pending snapshot
+        never is, unless the lever pinned an id: the live state may come from a later apply."""
+        return snap["status"] == "applied"
 
     def gates(self, before):
         """(flag attribute, message) pairs: refused at apply unless the matching --flag is given."""
@@ -251,8 +252,10 @@ class WafLever(LeverBase):
         if len(new) == 1:
             self.created = {"rule_id": new[0]["id"], "ruleset_id": after["id"]}
         elif strict:
-            raise Refused(f"After the write {len(new)} new marker rules are visible (expected exactly 1), so the "
-                          "created rule's id could not be pinned. Inspect the zone's custom rules by hand")
+            # The POST was sent: the zone may have changed, so this is a failure (exit 3), not a refusal (exit 1).
+            raise CfError(f"After the write {len(new)} new marker rules are visible (expected exactly 1); the zone "
+                          "MAY have changed and the created rule's id could not be pinned. Inspect the zone's "
+                          "custom rules by hand (undo will refuse to guess)")
 
     def write(self, state, previous=None):
         """Rule-level writes only: add or delete OUR rule (by the id recorded at apply); no other rule is sent."""
@@ -666,6 +669,9 @@ def load_snapshot(path):
     require(snap.get("status") in STATUSES, "Snapshot status invalid")
     require(isinstance(snap.get("undo_token"), str) and re.fullmatch(r"[0-9a-f]{64}", snap["undo_token"]),
             "Snapshot undo token invalid")
+    require(isinstance(snap.get("plan_hash"), str) and isinstance(snap.get("nonce"), str)
+            and snap["undo_token"] == digest({"plan_hash": snap["plan_hash"], "nonce": snap["nonce"]}),
+            "Snapshot undo token does not match its plan hash and nonce (edited or corrupt)")
     require(isinstance(snap.get("zone_id"), str) and ZONE_RE.fullmatch(snap["zone_id"]), "Snapshot zone id invalid")
     require(isinstance(snap.get("host"), str) and HOST_RE.fullmatch(snap["host"]), "Snapshot host invalid")
     hosts = snap.get("protect_hosts")
@@ -820,9 +826,11 @@ def cmd_apply(args, client):
                 pass
         print(f"APPLY FAILED ({type(error).__name__}). The change may be partial or absent; a snapshot of the "
               f"prior state exists at {args.snapshot} (status pending). Recovery: run "
-              f"`{PROG} undo --snapshot {args.snapshot}` (dry-run: it prints the LIVE state next to the recorded "
-              "prior state and the --confirm value bound to that live state); "
-              "it restores the prior state, or reports nothing to undo.", file=sys.stderr)
+              f"`{PROG} undo --snapshot {args.snapshot} --force-drift` (dry-run: it prints the LIVE state next to "
+              "the recorded prior state and the --confirm value bound to that live state). --force-drift is "
+              "required unless this tool recorded the id of what it created: for security-level/route/flip a "
+              "failed apply can not be told apart from a later successful one, so check the live state shown "
+              "before confirming. Undo restores the prior state, or reports nothing to undo.", file=sys.stderr)
         raise
     snap["created"] = lever.created
     snap["status"] = "applied"
