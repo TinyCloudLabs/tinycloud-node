@@ -43,15 +43,17 @@ SNAPSHOT_NOTE = ("verified_origin.worker_origin is operator-attested via --attes
 ORIGIN_ATTESTATION = ("operator-attested, NOT verified: the Worker's ORIGIN_URL is a secret whose value the Cloudflare "
                       "API never returns; it is recorded as the --tunnel-host the operator says the set-origin step received")
 CONNECTOR_BASIS = "tunnel status healthy with active connections and none pending reconnect, as read from the Cloudflare API"
-END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path shows a "
-                    "positive refusal, so the Worker reaches the node by some route other than the closed gateway")
+END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path shows an "
+                    "accepted closed signature, so the Worker reaches the node by some route other than the closed gateway")
 END_TO_END_CANNOT = ["that the secret equals the tunnel host (another independent origin serving the same node would "
                      "also pass)", "that no unprobed gateway host or address is used", "anything before the restriction: "
                      "while the gateway is open the secret may still point at it and node.* would also pass"]
-# Closed means a POSITIVE refusal by the target: a connect error (refused) or a reset. Anything that completes TLS or
-# HTTP is open or unknown, and both fail verify; so does no_route (the verifier's own network, not the target).
-# There is no operator-extensible allow-list.
-CLOSED_SIGNALS = ("tcp_refused", "tcp_reset")
+# Accepted closed signatures. EMPTY on purpose: on an SNI-routed shared gateway a TCP refusal happens before SNI and can
+# never be app-specific, and the real denial signature has never been observed. verify therefore cannot pass until a
+# drill records the signature and it is added HERE, under review. There is no flag, environment variable or file that
+# widens it; tests inject entries by patching this name.
+ACCEPTED_CLOSED_SIGNALS = ()
+NO_SIGNATURE_NOTICE = "no accepted closed signature yet: drill required"
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_READ_TOKEN"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX32 = re.compile(r"[0-9a-f]{32}")
@@ -496,8 +498,8 @@ def cmd_apply_patch(a, clients, now, out):
                "evidence": summarize(receipt),
                "warning": "Under a GO only. The PATCH restarts the CVM and interrupts both HTTP paths.",
                "then_verify": verify_command(a, "restricted", a.receipt_out),
-               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify passes only on a "
-                              "positive refusal (refused or reset); anything that completes TLS or HTTP, and no route, fails.",
+               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify FAILS until a drill "
+                              "records the real gateway denial signature and it is accepted in code: " + NO_SIGNATURE_NOTICE,
                "if_bad": "undo --snapshot " + str(Path(a.snapshot).resolve())})
 
 
@@ -570,24 +572,31 @@ def signals_of(result):
 
 
 def judge_closed(result, family=None, allow_no_aaaa=False):
-    """A path that must be closed passes only on a POSITIVE refusal signal. Anything that completed TLS or HTTP is
-    open or unknown and fails; so do a timeout, an error, no route and a resolver failure. The one waiver:
-    DNS NODATA for AAAA (no_aaaa), IPv6 only, and only with the operator's explicit flag."""
+    """A path that must be closed passes only on an ACCEPTED closed signature (empty set today: nothing passes), or on
+    the one waiver: DNS NODATA for AAAA (no_aaaa), IPv6 only, with the operator's explicit flag. A node answer, an
+    open, unknown or unaccepted result (incl. tcp_refused, which cannot be app-specific on a shared SNI gateway) FAILs."""
     signals = signals_of(result)
     if "node_info" in signals:
         return "fail", "node answered /info: " + ",".join(signals)
-    if all(s in CLOSED_SIGNALS or (s == "no_aaaa" and family == "ipv6" and allow_no_aaaa) for s in signals):
+    if all(s in ACCEPTED_CLOSED_SIGNALS or (s == "no_aaaa" and family == "ipv6" and allow_no_aaaa) for s in signals):
         note = ",".join(signals)
         return "pass", note + (" (waived by --allow-no-aaaa: DNS NODATA is not proof of no IPv6 path)"
                                if "no_aaaa" in signals else "")
-    return "fail", ",".join(signals) + " is not a positive refusal (open or unknown)"
+    detail = ",".join(signals) + " is not an accepted closed signature"
+    if not ACCEPTED_CLOSED_SIGNALS:
+        detail += f": {NO_SIGNATURE_NOTICE}"
+    if "tcp_refused" in signals:
+        detail += " (a TCP refusal happens before SNI: on a shared gateway it is a local/on-path cause or an outage)"
+    return "fail", detail
 
 
-def judge_management(result, expect_open):
+def judge_management(result, expect_open, family="ipv4", allow_no_aaaa=False):
     signals = signals_of(result)
     if expect_open:
         if all(s == "ssh_banner" for s in signals):
             return "pass", "SSH-2.0 banner read through the gateway route"
+        if family == "ipv6" and allow_no_aaaa and all(s == "no_aaaa" for s in signals):
+            return "pass", "no_aaaa (waived by --allow-no-aaaa: DNS NODATA is not proof of no IPv6 path)"
         return "fail", "no SSH banner: " + ",".join(signals)
     if "ssh_banner" in signals:
         return "fail", "management still answers although the policy denies it"
@@ -647,7 +656,7 @@ def verify(a, clients, now):
                 status, detail = judge_closed(result, family, a.allow_no_aaaa)
                 signals, addresses = signals_of(result), list(result.get("addresses") or [])
                 evidence = {"addresses": addresses, "controls": {}}
-                if status == "pass" and any(s in CLOSED_SIGNALS for s in signals):
+                if status == "pass" and any(s in ACCEPTED_CLOSED_SIGNALS for s in signals):
                     if len(addresses) != len(signals):
                         status, detail = "fail", "no resolved address was recorded for the refusal: " + detail
                     elif not mgmt_open:
@@ -655,7 +664,7 @@ def verify(a, clients, now):
                                                  "known-open SNI exists for a same-address control")
                     else:
                         for address, signal in zip(addresses, signals):
-                            if signal not in CLOSED_SIGNALS:
+                            if signal not in ACCEPTED_CLOSED_SIGNALS:
                                 continue
                             evidence["controls"][address] = control(address, family)
                             if evidence["controls"][address] != "ssh_banner":
@@ -666,8 +675,8 @@ def verify(a, clients, now):
                                 break
                 if status == "pass" and "no_aaaa" in signals:
                     waived.append(name)
-                checks.append(check(f"{name} fresh {family} connection is positively refused, corroborated by a "
-                                    "same-address positive control", status, detail, **evidence))
+                checks.append(check(f"{name} fresh {family} connection shows an accepted closed signature "
+                                    "(same-address positive control)", status, detail, **evidence))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
@@ -678,38 +687,51 @@ def verify(a, clients, now):
 
     policy = snap["after"] if a.expect == "restricted" else snap["before"].get("value")
     expect_open = management_allowed(policy)
-    status, detail = judge_management(http.mgmt_probe(mgmt, "ipv4"), expect_open)
-    checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 untouched "
-                        f"(expected {'open' if expect_open else 'denied'})", status, detail))
+    # Management is probed over IPv6 as well: an AAAA record that exists must answer; NODATA is the same waiver as above.
+    for family in ("ipv4", "ipv6"):
+        result = http.mgmt_probe(mgmt, family)
+        status, detail = judge_management(result, expect_open, family, a.allow_no_aaaa)
+        if status == "pass" and "no_aaaa" in signals_of(result):
+            waived.append(mgmt)
+        checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 over {family} untouched "
+                            f"(expected {'open' if expect_open else 'denied'})", status, detail,
+                            addresses=list(result.get("addresses") or [])))
     return checks, waived
 
 
-def record_waivers(path, waivers, now):
-    """Write the operator's verify waiver into the receipt (atomic replace, still 0600)."""
+def record_verify(path, run, waiver):
+    """Append this run (resolved addresses, controls) and any operator waiver to the receipt: atomic replace, 0600."""
     p = Path(path)
     receipt = json.loads(p.read_text(encoding="utf-8"))
-    entry = {"at_utc": now.isoformat(), "waiver": "allow-no-aaaa",
-             "scope": "IPv6 probes whose DNS answer was NODATA for AAAA on a name that otherwise resolves; nothing else",
-             "hosts_waived": waivers}
-    receipt["verify_waivers"] = list(receipt.get("verify_waivers") or []) + [entry]
-    tmp = p.with_name(p.name + ".waiver")
+    receipt["verify_runs"] = list(receipt.get("verify_runs") or []) + [run]
+    if waiver:
+        receipt["verify_waivers"] = list(receipt.get("verify_waivers") or []) + [waiver]
+    tmp = p.with_name(p.name + ".record")
     write_private(tmp, receipt)
     os.replace(tmp, p)
-    return entry
 
 
 def cmd_verify(a, clients, now, out):
     checks, waived = verify(a, clients, now)
-    waivers = record_waivers(a.receipt, waived, now) if a.allow_no_aaaa else None
     result = "pass" if all(c["status"] == "pass" for c in checks) else "FAIL"
+    waiver = ({"at_utc": now.isoformat(), "waiver": "allow-no-aaaa",
+               "scope": "IPv6 probes whose DNS answer was NODATA for AAAA on a name that otherwise resolves; nothing else",
+               "hosts_waived": list(dict.fromkeys(waived))} if a.allow_no_aaaa else None)
+    record_verify(a.receipt, {"at_utc": now.isoformat(), "expect": a.expect, "result": result,
+                              "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
+                              "checks": [{k: c[k] for k in ("check", "status", "addresses", "controls") if k in c}
+                                         for c in checks]}, waiver)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "checks": checks,
-               "closed_means": list(CLOSED_SIGNALS),
-               "closed_rule": "Closed is a POSITIVE refusal only: a connect error (refused) or a reset. "
-                              "Anything that completes TLS or HTTP is open or unknown, and open or unknown FAILS verify; "
-                              "so does no route (it describes this verifier's network, not the target). "
-                              "On the SNI-shared gateway the real denial may be a TLS/HTTP signature, in which case verify "
-                              "fails until a drill observes what a closed gateway really does; it is never loosened silently.",
-               "waivers": waivers or "none (--allow-no-aaaa not given)",
+               "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
+               "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,
+               "closed_rule": "A path is closed only if it shows an ACCEPTED closed signature, and the accepted set is "
+                              "empty until a drill records the real gateway denial and the signature is added in code "
+                              "under review. A TCP refusal happens before SNI on a shared gateway, so it is never "
+                              "app-specific; it means a local/on-path cause or an outage. Any signature added later also "
+                              "needs a same-address positive control. Open, unknown and unaccepted results FAIL; there is "
+                              "no indeterminate outcome and no flag to widen the set.",
+               "receipt_record": "resolved addresses and control results were appended to the receipt (verify_runs)",
+               "waivers": waiver or "none (--allow-no-aaaa not given)",
                "worker_origin_value": ORIGIN_ATTESTATION,
                "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
                "what_they_cannot_show": END_TO_END_CANNOT,

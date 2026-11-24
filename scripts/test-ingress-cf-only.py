@@ -87,6 +87,8 @@ class FakeHttp:
         self.probe_map = {}
         self.restricted = restricted
         self.mgmt = {"outcome": "ssh_banner"}
+        self.mgmt6 = {"outcome": "ssh_banner"}
+        self.mgmt_calls = []
         self.instance_mgmt = {"outcome": "ssh_banner"}
         self.controls = {}  # address -> signal of the same-address positive control (default: ssh_banner)
         self.control_calls = []
@@ -107,8 +109,11 @@ class FakeHttp:
         return result
 
     def mgmt_probe(self, host, family="ipv4", port=443):
-        assert (family, port) == ("ipv4", 443) and host in (MGMT, INSTANCE_MGMT), (host, family, port)
-        return self.mgmt if host == MGMT else self.instance_mgmt
+        assert port == 443 and (host == MGMT or (host == INSTANCE_MGMT and family == "ipv4")), (host, family, port)
+        self.mgmt_calls.append((host, family))
+        if host == INSTANCE_MGMT:
+            return self.instance_mgmt
+        return self.mgmt if family == "ipv4" else self.mgmt6
 
     def control(self, address, family, sni):
         assert sni == MGMT, sni
@@ -388,6 +393,11 @@ class PlanApplyTest(Base):
 class VerifyTest(Base):
     def setUp(self):
         super().setUp()
+        # TEST-ONLY: inject accepted closed signatures so the control mechanism is exercised. The shipped set is empty
+        # (DefaultClosedSetTest) and nothing on the CLI can reach this name.
+        patcher = mock.patch.object(cf_only, "ACCEPTED_CLOSED_SIGNALS", ("tcp_refused", "tcp_reset"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         code, out, err = self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
         self.assertEqual(code, 0, err)
         self.stage()
@@ -407,14 +417,15 @@ class VerifyTest(Base):
         self.assertEqual(code, 0, out)
         result = json.loads(out)
         self.assertEqual(result["result"], "pass")
-        self.assertEqual(result["closed_means"], ["tcp_refused", "tcp_reset"])
+        self.assertEqual(result["accepted_closed_signals"], ["tcp_refused", "tcp_reset"])
         probed = {(h, f) for h, f, p in self.http.probes}
         for host in (cf_only.TEE_HOST, f"{APP}-443s.{GATEWAY}", f"{INSTANCE}-443s.{GATEWAY}",
                      f"{APP}-8000.{GATEWAY}", f"{INSTANCE}-443.{GATEWAY}"):
             for family in ("ipv4", "ipv6"):
                 self.assertIn((host, family), probed)
         self.assertTrue(result["not_covered"])
-        self.assertIn("POSITIVE refusal", result["closed_rule"])
+        self.assertIn("ACCEPTED closed signature", result["closed_rule"])
+        self.assertIn((MGMT, "ipv6"), self.http.mgmt_calls)  # management is covered over IPv6 too
 
     def test_verify_works_from_the_receipt_written_by_apply_patch(self):
         self.assertEqual(self.verify(receipt=self.receipt_out)[0], 0)
@@ -461,6 +472,11 @@ class VerifyTest(Base):
             "management timeout": (lambda h: setattr(h, "mgmt", {"outcome": "timeout"}), "management route"),
             "management answers a non-SSH protocol": (lambda h: setattr(h, "mgmt", {"outcome": "non_ssh_data"}),
                                                       "management route"),
+            "management ipv6 times out": (lambda h: setattr(h, "mgmt6", {"outcome": "timeout"}), "over ipv6"),
+            "management ipv6 refused": (lambda h: setattr(h, "mgmt6", {"outcome": "tcp_refused"}), "over ipv6"),
+            "management ipv6 no route": (lambda h: setattr(h, "mgmt6", {"outcome": "no_route"}), "over ipv6"),
+            "management ipv6 AAAA missing without the waiver": (lambda h: setattr(h, "mgmt6", {"outcome": "no_aaaa"}),
+                                                                "over ipv6"),
         }
         for name, (fn, expected) in cases.items():
             with self.subTest(name):
@@ -471,12 +487,12 @@ class VerifyTest(Base):
                 self.assertEqual(json.loads(out)["result"], "FAIL")
                 self.assertTrue(any(expected in c for c in self.not_passed(out)), self.not_passed(out))
 
-    def test_only_refused_and_reset_are_closed_and_the_accept_flag_no_longer_exists(self):
+    def test_only_refused_and_reset_are_accepted_in_this_patched_set_and_the_accept_flag_no_longer_exists(self):
         self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_reset"}
         self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv6")] = {"outcome": "tcp_reset"}
         code, out, err = self.verify()
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads(out)["closed_means"], ["tcp_refused", "tcp_reset"])
+        self.assertEqual(json.loads(out)["accepted_closed_signals"], ["tcp_refused", "tcp_reset"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.verify("--accept-closed-signal", "http_421")
 
@@ -489,6 +505,35 @@ class VerifyTest(Base):
                     code, out, err = self.verify(*flags)
                     self.assertEqual(code, 1, out)
                     self.assertTrue(any(f"{APP}-443s." in c and family in c for c in self.not_passed(out)))
+
+    def test_management_ipv6_nodata_is_waived_only_by_the_flag_and_a_present_aaaa_must_answer(self):
+        self.http.mgmt6 = {"outcome": "no_aaaa"}
+        self.assertEqual(self.verify()[0], 1)
+        code, out, err = self.verify("--allow-no-aaaa")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["waivers"]["hosts_waived"], [MGMT])
+        for outcome in ("timeout", "tcp_refused", "no_route", "tls_rejected", "non_ssh_data", "no_address"):
+            with self.subTest(outcome):
+                self.http.mgmt6 = {"outcome": outcome}
+                code, out, err = self.verify("--allow-no-aaaa")
+                self.assertEqual(code, 1, out)
+                self.assertTrue(any("over ipv6" in c and "management" in c for c in self.not_passed(out)))
+        # IPv4 management is never waived.
+        self.http.mgmt6 = {"outcome": "ssh_banner"}
+        self.http.mgmt = {"outcome": "no_aaaa"}
+        self.assertEqual(self.verify("--allow-no-aaaa")[0], 1)
+
+    def test_resolved_addresses_and_controls_are_recorded_per_check_in_the_receipt(self):
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out)
+        runs = json.loads(self.receipt.read_text())["verify_runs"]
+        self.assertEqual(len(runs), 1)
+        closed = [c for c in runs[0]["checks"] if "accepted closed signature" in c["check"]]
+        self.assertTrue(closed)
+        for c in closed:
+            family = "ipv6" if " ipv6 " in c["check"] else "ipv4"
+            self.assertEqual((c["addresses"], c["controls"]), ([ADDR[family]], {ADDR[family]: "ssh_banner"}))
+        self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
 
     def test_allow_no_aaaa_waives_only_dns_nodata_and_records_the_waiver_in_the_receipt(self):
         nodata = {(h, "ipv6"): {"outcome": "no_aaaa"} for h in self.all_probe_hosts()}
@@ -503,7 +548,7 @@ class VerifyTest(Base):
         self.assertEqual(recorded, [printed])
         self.assertEqual((printed["waiver"], sorted(printed["hosts_waived"])), ("allow-no-aaaa", sorted(self.all_probe_hosts())))
         self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
-        self.assertFalse(list(self.root.glob("*.waiver")))
+        self.assertFalse(list(self.root.glob("*.record")))
         self.assertEqual(json.loads(self.verify()[1])["waivers"], "none (--allow-no-aaaa not given)")
 
     def test_the_waiver_does_not_cover_a_present_aaaa_record_or_a_resolver_error(self):
@@ -565,7 +610,7 @@ class VerifyTest(Base):
         code, out, err = self.verify()
         self.assertEqual(code, 0, out)
         checks = {c["check"]: c for c in json.loads(out)["checks"]}
-        refused = [c for c in checks.values() if "positively refused" in c["check"]]
+        refused = [c for c in checks.values() if "accepted closed signature" in c["check"]]
         self.assertTrue(refused)
         for c in refused:
             family = "ipv6" if " ipv6 " in c["check"] else "ipv4"
@@ -631,6 +676,74 @@ class VerifyTest(Base):
         self.assertEqual(self.verify(expect="restored")[0], 1)
         self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_refused"}
         self.assertEqual(self.verify(expect="restored")[0], 1)
+
+
+class DefaultClosedSetTest(Base):
+    """The shipped policy: ACCEPTED_CLOSED_SIGNALS is empty, so verify cannot pass for a restricted gateway."""
+
+    def setUp(self):
+        super().setUp()
+        code, out, err = self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
+        self.assertEqual(code, 0, err)
+        self.stage()
+
+    def verify(self, *extra, expect="restricted"):
+        return self.run_cli(["verify", *self.verify_args(*extra, expect=expect)])
+
+    def closed_checks(self, out):
+        return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]
+
+    def test_the_shipped_set_is_empty_and_the_cli_cannot_widen_it(self):
+        self.assertEqual(cf_only.ACCEPTED_CLOSED_SIGNALS, ())
+        for flag in ("--accept-closed-signal", "--closed-signal"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.verify(flag, "tcp_refused")
+
+    def test_a_refusal_or_reset_alone_fails_and_says_a_drill_is_required(self):
+        hosts = cf_only.direct_hosts(mock.Mock(expect_app_id=APP, instance_id=INSTANCE, gateway_domain=GATEWAY,
+                                               extra_host=None))
+        for signal in ("tcp_refused", "tcp_reset"):
+            with self.subTest(signal):
+                self.http = FakeHttp()
+                self.http.probe_map = {(h, f): {"outcome": signal} for h in hosts for f in ("ipv4", "ipv6")}
+                code, out, err = self.verify()
+                result = json.loads(out)
+                self.assertEqual((code, result["result"]), (1, "FAIL"), out)
+                self.assertEqual(result["blocked"], "no accepted closed signature yet: drill required")
+                self.assertEqual(result["accepted_closed_signals"], [])
+                closed = self.closed_checks(out)
+                self.assertEqual(len(closed), 2 * len(hosts))
+                self.assertTrue(all(c["status"] == "fail" and "drill required" in c["detail"] for c in closed))
+                self.assertEqual(self.http.control_calls, [])  # nothing accepted, so no control can rescue a refusal
+
+    def test_an_open_gateway_fails_and_the_aaaa_waiver_cannot_rescue_ipv4(self):
+        self.http = FakeHttp(restricted=False)
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out)
+        self.assertFalse([c for c in self.closed_checks(out) if c["status"] == "pass"])
+        self.http = FakeHttp()
+        self.http.probe_map = {(h, "ipv6"): {"outcome": "no_aaaa"} for h in (cf_only.TEE_HOST, f"{APP}-443s.{GATEWAY}")}
+        self.assertEqual(self.verify("--allow-no-aaaa")[0], 1)
+
+    def test_an_instance_id_typo_cannot_pass(self):
+        self.http = FakeHttp()
+        self.http.instance_mgmt = {"outcome": "tcp_refused"}
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out)
+        failed = [c["check"] for c in json.loads(out)["checks"] if c["status"] != "pass"]
+        self.assertTrue(any("--instance-id is a real gateway host" in c for c in failed), failed)
+
+    def test_the_block_applies_to_restricted_only_and_every_failed_run_is_recorded_with_its_addresses(self):
+        code, out, err = self.verify()
+        self.assertEqual(code, 1)
+        run = json.loads(self.receipt.read_text())["verify_runs"][-1]
+        self.assertEqual((run["result"], run["accepted_closed_signals"]), ("FAIL", []))
+        recorded = [c for c in run["checks"] if "accepted closed signature" in c["check"]]
+        self.assertTrue(recorded and all(c["addresses"] in ([ADDR["ipv4"]], [ADDR["ipv6"]]) for c in recorded))
+        self.http = FakeHttp(restricted=False)
+        code, out, err = self.verify(expect="restored")
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(json.loads(out)["blocked"])
 
 
 class UndoTest(Base):
@@ -932,14 +1045,16 @@ class ProbeClassifierTest(unittest.TestCase):
         self.assertEqual(result["signals"], ["timeout"])
         self.assertEqual(cf_only.judge_closed(result)[0], "fail")
 
-    def test_a_closed_port_is_tcp_refused_and_passes(self):
+    def test_a_closed_port_is_tcp_refused_which_is_not_accepted_as_closed_by_default(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         listener.close()
         result = self.result(port)
         self.assertEqual(result["signals"], ["tcp_refused"])
-        self.assertEqual(cf_only.judge_closed(result)[0], "pass")
+        self.assertEqual(cf_only.judge_closed(result)[0], "fail")  # shipped set is empty: a refusal alone never passes
+        with mock.patch.object(cf_only, "ACCEPTED_CLOSED_SIGNALS", ("tcp_refused", "tcp_reset")):  # TEST-ONLY
+            self.assertEqual(cf_only.judge_closed(result)[0], "pass")
 
     def test_probe_records_resolved_addresses_and_control_uses_the_same_exact_address(self):
         listener = socket.socket()
@@ -990,7 +1105,8 @@ class ProbeClassifierTest(unittest.TestCase):
                 result = self.probe._attempt(("127.0.0.1", 443), "x.example.test", False)
                 self.assertEqual(result[0], signal)
                 for family in ("ipv4", "ipv6"):
-                    self.assertEqual(cf_only.judge_closed({"signals": [result[0]]}, family, True)[0], verdict)
+                    with mock.patch.object(cf_only, "ACCEPTED_CLOSED_SIGNALS", ("tcp_refused", "tcp_reset")):  # TEST-ONLY
+                        self.assertEqual(cf_only.judge_closed({"signals": [result[0]]}, family, True)[0], verdict)
 
     def test_management_banner_is_read_after_the_tls_handshake(self):
         port = self.serve(lambda tls: tls.sendall(b"SSH-2.0-OpenSSH_9.6\r\n"))
