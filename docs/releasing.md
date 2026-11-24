@@ -662,9 +662,11 @@ its branch policy before any workflow that names it runs.
      buffers to `4 32k`, TC-4249 to `4 256k`). A ~93 KB and a ~200 KB
      `Authorization` header must get the node's own `401 Unauthorized` page,
      not an nginx `400 Request Header Or Cookie Too Large` or a reset
-     connection. curl 7.81 stalled sending a 200 KB header line over TLS, and
-     one `-H` argument is capped at 128 KiB (HTTP/2: 64 KiB), so write the
-     request raw over HTTP/1.1:
+     connection. curl 7.81 over TLS stops sending after 128 KiB (131,072 B) of
+     one request header, so a header line of 131,000 B or more hangs (exit 28)
+     against any server, nginx or not (TC-4263; plain HTTP is fine). One `-H`
+     argument is also capped at 128 KiB (HTTP/2: 64 KiB). Use Node `fetch`
+     or write the request raw over HTTP/1.1:
 
      ```sh
      for n in 93000 200000; do
