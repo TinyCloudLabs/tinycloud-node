@@ -763,8 +763,9 @@ pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
                 && resolved.storage.sql.chunked_account_max_bytes <= i64::MAX as u64,
             "chunked artifacts require explicit positive capacities within int64"
         );
-        // A DuckDB write's save copies the database once more, outside the
-        // write's reservation, so the floor must hold one artifact ceiling.
+        // A DuckDB write's reservation is its database's size when it starts.
+        // The save then copies the database as the write left it, which can be
+        // larger, so the floor must hold one artifact ceiling for that copy.
         #[cfg(feature = "duckdb")]
         anyhow::ensure!(
             resolved.storage.duckdb.effective_min_free_bytes(true)

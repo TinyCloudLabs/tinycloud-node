@@ -166,6 +166,35 @@ impl DiskBudget {
         }
     }
 
+    /// What `key` holds for the write in flight.
+    pub fn inflight(&self, key: &str) -> u64 {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map_or(0, |held| held.inflight)
+    }
+
+    /// Set what `key` holds for the write in flight to `bytes`, with no
+    /// free-space check: the bytes are either already on the disk (so they
+    /// are in the free-space reading and must not be counted again) or a
+    /// need that follows from a write that is already done. Only an existing
+    /// reservation changes, and it stays until [`DiskBudget::release`].
+    pub fn set_inflight(&self, key: &str, bytes: u64) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = held.get_mut(key) {
+            entry.inflight = bytes;
+        }
+    }
+
+    /// `bytes` of what `key` holds for the write in flight are now on disk.
+    pub fn consume(&self, key: &str, bytes: u64) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = held.get_mut(key) {
+            entry.inflight = entry.inflight.saturating_sub(bytes);
+        }
+    }
+
     /// Drop everything held for `key`: a checkpoint has run, or the
     /// database's connection is gone, and what is on disk is on disk.
     pub fn forget(&self, key: &str) {

@@ -1454,7 +1454,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         // Parts stream in bounded statements: the whole-artifact read cap and
         // the large-transfer permit below are for the single-row layout.
         if self
-            .read_chunk_layout(service, space, name, meta, sink)
+            .read_chunk_layout(service, space, name, meta, None, sink)
             .await?
         {
             return Ok(());
@@ -1526,11 +1526,11 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         sink: &mut dyn ArtifactSink,
     ) -> Result<(), DatabaseArtifactError> {
         self.check_space_read(space).await?;
-        // The chunked layout carries only a checkpoint (never a delta).
-        if part == ArtifactPart::Checkpoint
-            && self
-                .read_chunk_layout(service, space, name, meta, sink)
-                .await?
+        // The chunked layout streams one part on its own: the shadow source
+        // reads the checkpoint and the WAL separately, even of a row that has both.
+        if self
+            .read_chunk_layout(service, space, name, meta, Some(part), sink)
+            .await?
         {
             return Ok(());
         }

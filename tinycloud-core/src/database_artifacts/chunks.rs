@@ -469,12 +469,16 @@ FROM ready ON CONFLICT DO NOTHING"#
         })
     }
 
+    /// Streams the parts row. `only` limits the read to one part (the shadow
+    /// source reads the checkpoint and the WAL separately); `None` delivers the
+    /// checkpoint and then the WAL, if any.
     pub(super) async fn read_chunk_layout(
         &self,
         service: &str,
         space: &str,
         name: &str,
         meta: &ArtifactMeta,
+        only: Option<ArtifactPart>,
         sink: &mut dyn ArtifactSink,
     ) -> Result<bool, DatabaseArtifactError> {
         if self.conn.get_database_backend() != DbBackend::Postgres
@@ -486,12 +490,15 @@ FROM ready ON CONFLICT DO NOTHING"#
         // not apply. A sink that keeps the whole artifact in memory still
         // holds it all at once, like a single-row read (TC-2961).
         let _large = if sink.buffers_in_memory() {
-            let total = u64::try_from(
-                meta.checkpoint_size_bytes
+            let total = match only {
+                Some(ArtifactPart::Checkpoint) => meta.checkpoint_size_bytes,
+                Some(ArtifactPart::Wal) => meta.delta_size_bytes,
+                None => meta
+                    .checkpoint_size_bytes
                     .saturating_add(meta.delta_size_bytes),
-            )
-            .unwrap_or(0);
-            self.large_transfer_permit(total).await
+            };
+            self.large_transfer_permit(u64::try_from(total).unwrap_or(0))
+                .await
         } else {
             None
         };
@@ -529,6 +536,14 @@ FROM ready ON CONFLICT DO NOTHING"#
                     .clone()
                     .ok_or(DatabaseArtifactError::ArtifactChanged)?,
             ));
+        }
+        if let Some(only) = only {
+            parts.retain(|(kind, ..)| *kind == only);
+            if parts.is_empty() {
+                return Err(DatabaseArtifactError::Sink(
+                    "the artifact has no WAL delta".into(),
+                ));
+            }
         }
         for (kind, part, size, cid) in parts {
             let manifest=self.conn.query_one(statement(
@@ -2078,7 +2093,7 @@ mod tests {
             "sql",
             space,
             "fb",
-            vec![7; size],
+            vec![7; size].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -2684,7 +2699,7 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
                 "sql",
                 space,
                 "main",
-                vec![1; 128],
+                vec![1; 128].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -2693,7 +2708,7 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
             "sql",
             space,
             "main",
-            vec![2; 128],
+            vec![2; 128].into(),
             ArtifactExpectation::Derived {
                 revision: first.revision,
                 checkpoint_content_hash: first.checkpoint_content_hash,
@@ -2701,5 +2716,180 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
         )
         .await
         .unwrap();
+    }
+
+    /// A WAL publish is a fenced write, like a checkpoint publish (TC-2871):
+    /// a purge that fences the space while the WAL part uploads wins. The
+    /// publish then leaves the row on the WAL it had, and the new part is
+    /// reaped, so the purge's reap never finds a part the row points at. A
+    /// publish ahead of the fence drops the marks of the WAL it replaces.
+    #[tokio::test]
+    async fn postgres_chunked_wal_publish_races_a_purge_fence() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_chunked_wal_publish_races_a_purge_fence",
+        )
+        .await
+        else {
+            return;
+        };
+        use sea_orm::TransactionTrait;
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:wal-fence"
+            .parse::<SpaceId>()
+            .unwrap()
+            .to_string();
+        let space = space.as_str();
+        let keys = std::sync::Arc::new(
+            crate::space_purge_ledger::LedgerKeys::new(
+                "test".into(),
+                std::collections::BTreeMap::from([("test".into(), vec![7; 32])]),
+            )
+            .unwrap(),
+        );
+        let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
+            keys.clone(),
+        ));
+        fence.set_serving_ready(true);
+        let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
+            .with_chunk_limits(Some(ChunkLimits {
+                artifact_bytes: 8 * CHUNK_BYTES as u64,
+                account_bytes: 8 * CHUNK_BYTES as u64,
+            }))
+            .with_space_purge_fence(Some(fence.clone()));
+        let expectation = |meta: &ArtifactMeta| ArtifactExpectation::Derived {
+            revision: meta.revision,
+            checkpoint_content_hash: meta.checkpoint_content_hash.clone(),
+        };
+        let first = repo
+            .save_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[1; 64]),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        // A mark of the WAL the next one replaces.
+        fixture
+            .conn
+            .execute(statement(
+                "INSERT INTO sql_wal_mark(service,space,name,revision,checkpoint_content_hash,wal_end_bytes,wal_prefix_sha256) VALUES($1,$2,$3,$4,$5,$6,$7)",
+                vec![
+                    "sql".into(),
+                    space.into(),
+                    "main".into(),
+                    first.revision.into(),
+                    first.checkpoint_content_hash.clone().into(),
+                    1i64.into(),
+                    "ab".repeat(32).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let marks = || async {
+            fixture
+                .conn
+                .query_one(statement(
+                    "SELECT count(*) AS marks FROM sql_wal_mark WHERE space=$1",
+                    vec![space.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "marks")
+                .unwrap()
+        };
+        assert_eq!(marks().await, 1);
+        let second = repo
+            .save_wal_snapshot("sql", space, "main", snapshot(&[2; 32]), expectation(&first))
+            .await
+            .unwrap();
+        assert_eq!(marks().await, 0, "the publish drops the replaced WAL's marks");
+
+        // The next WAL is uploaded and sealed; before it publishes, the purge
+        // fences the space, as its accept transaction does.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut blocked = repo.clone();
+        blocked.chunk_publish_barrier = Some(barrier.clone());
+        let expected = expectation(&second);
+        let owned_space = space.to_string();
+        let racing = tokio::spawn(async move {
+            blocked
+                .save_wal_snapshot("sql", &owned_space, "main", snapshot(&[3; 48]), expected)
+                .await
+        });
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if fixture
+                .conn
+                .query_one(statement(
+                    "SELECT 1 AS sealed FROM artifact_part WHERE state='sealed'",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < bound, "the WAL part never sealed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let tx = fixture.conn.begin().await.unwrap();
+        fence
+            .fence_hmac(
+                &tx,
+                "space",
+                "test",
+                &keys.target_hmac("test", "space", space).unwrap(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        barrier.wait().await;
+        let outcome = racing.await.unwrap();
+        assert!(
+            matches!(outcome, Err(DatabaseArtifactError::SpaceDeleted)),
+            "{outcome:?}"
+        );
+
+        let row = fixture
+            .conn
+            .query_one(statement(
+                "SELECT revision,delta_content_hash FROM database_artifact WHERE space=$1 AND name='main'",
+                vec![space.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "revision").unwrap(), second.revision);
+        assert_eq!(
+            row.try_get::<Option<String>>("", "delta_content_hash")
+                .unwrap(),
+            second.delta_content_hash
+        );
+        // The part the refused publish uploaded is nobody's: it is reaped.
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let unreferenced = fixture
+                .conn
+                .query_one(statement(
+                    "SELECT count(*) AS parts FROM artifact_part p WHERE NOT EXISTS (SELECT 1 FROM database_artifact d WHERE d.checkpoint_part_id=p.part_id OR d.delta_part_id=p.part_id)",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "parts")
+                .unwrap();
+            if unreferenced == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < bound,
+                "{unreferenced} unreferenced parts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

@@ -147,7 +147,7 @@ impl DuckDbDiskPolicy {
     pub(crate) fn watch<T>(
         &self,
         key: &str,
-        dir: &Path,
+        file: &Path,
         conn: &duckdb::Connection,
         write: bool,
         statement: impl FnOnce() -> Result<T, DuckDbError>,
@@ -157,7 +157,13 @@ impl DuckDbDiskPolicy {
         }
         let interrupt = conn.interrupt_handle();
         let tripped = AtomicBool::new(false);
-        let dir = existing_ancestor(dir);
+        // What this write claims, and the local bytes it starts from. Bytes it
+        // writes are in the free-space reading from then on, so they leave its
+        // claim: counting them in both would make another write's floor
+        // (this claim plus the floor) trip inside room the gate admitted.
+        let claim = self.budget.inflight(key);
+        let baseline = local_bytes(file);
+        let dir = existing_ancestor(file);
         let result = std::thread::scope(|scope| {
             let (stop, stopped) = mpsc::channel::<()>();
             let (tripped, dir) = (&tripped, &dir);
@@ -165,6 +171,8 @@ impl DuckDbDiskPolicy {
                 while let Err(mpsc::RecvTimeoutError::Timeout) =
                     stopped.recv_timeout(WATCH_INTERVAL)
                 {
+                    let written = local_bytes(file).saturating_sub(baseline);
+                    self.budget.set_inflight(key, claim.saturating_sub(written));
                     let floor = self
                         .budget
                         .reserved_excluding(key)
@@ -190,6 +198,19 @@ impl DuckDbDiskPolicy {
         }
     }
 
+    /// `bytes` the operation of `key` held are now on the disk (a staged file,
+    /// a snapshot copy): they are in the free-space reading, so they leave its
+    /// claim.
+    pub(crate) fn consumed(&self, key: &str, bytes: u64) {
+        self.budget.consume(key, bytes);
+    }
+
+    /// The write of `key` is over: what its save still needs on the disk (the
+    /// snapshot copy) replaces what the statement could have written.
+    pub(crate) fn hand_off(&self, key: &str, bytes: u64) {
+        self.budget.set_inflight(key, bytes);
+    }
+
     /// A statement that ran past the spill limit is the disk, not the caller.
     fn classify(&self, error: DuckDbError) -> DuckDbError {
         let spill_limit = self.max_temp_directory_bytes > 0
@@ -204,6 +225,24 @@ impl DuckDbDiskPolicy {
             error
         }
     }
+}
+
+/// The bytes a database's local files hold: the main file, its WAL and the
+/// spill directory (flat files). Missing files count as 0.
+pub(crate) fn local_bytes(path: &Path) -> u64 {
+    let [main, wal, spill] = super::database::cache_file_paths(path);
+    let mut total = [main, wal]
+        .iter()
+        .filter_map(|file| std::fs::metadata(file).ok())
+        .fold(0u64, |sum, metadata| sum.saturating_add(metadata.len()));
+    if let Ok(entries) = std::fs::read_dir(spill) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how

@@ -16,7 +16,10 @@ use crate::request_telemetry::{self, QueryTimer};
 
 use super::{
     caveats::DuckDbCaveats,
-    database::{cache_file_paths, remove_cache_entry, spawn_actor_with_disk, DatabaseHandle},
+    database::{
+        cache_file_paths, remove_cache_entry, snapshot_file, spawn_actor_with_disk, DatabaseHandle,
+        SNAPSHOT_PREFIX,
+    },
     disk::{self, DuckDbDiskPolicy},
     storage,
     types::*,
@@ -212,9 +215,11 @@ impl DuckDbService {
         let handle = self.handle(space, db_name).await?;
 
         // Room for this write and for the snapshot copy its save can take,
-        // which is at most the local database files.
+        // which is at most the local database files. Once the statement has
+        // written them, they are on the disk and leave the claim (see
+        // `DuckDbDiskPolicy::watch`), so no other write counts them twice.
         let writes = self.disk.active() && disk::writes(&request, &caveats, &ability);
-        let _reservation = if writes {
+        let reservation = if writes {
             let cache_path = self.cache_path(space, db_name);
             let local_bytes = local_file_bytes(&cache_path).await;
             self.disk
@@ -243,6 +248,16 @@ impl DuckDbService {
         let result = result?;
 
         if !result.write_targets.is_empty() {
+            // The statement is over and what it wrote is on the disk, in the
+            // free-space reading. What the save still needs is the snapshot
+            // copy, which the local files bound.
+            if reservation.is_some() {
+                let cache_path = self.cache_path(space, db_name);
+                self.disk.hand_off(
+                    &disk::budget_key(&key.0, &key.1),
+                    local_file_bytes(&cache_path).await,
+                );
+            }
             if without_growth && self.expectation(&key) == ArtifactExpectation::Absent {
                 // The actor permits only shrinking/no-op writes on an empty
                 // database. Its serialized header is still nonempty, so leave
@@ -344,9 +359,11 @@ impl DuckDbService {
         .await;
         let _operation = operation_lock.lock().await;
         // An import holds the staged file and, when saved in parts, a snapshot
-        // copy of it: twice its size on disk.
+        // copy of it: twice its size on disk. Each leaves the claim once it is
+        // written, so it is not counted again beside the free space it used.
+        let budget_key = disk::budget_key(&space.to_string(), db_name);
         let _reservation = self.disk.reserve(
-            &disk::budget_key(&space.to_string(), db_name),
+            &budget_key,
             (data.len() as u64).saturating_mul(2),
             &PathBuf::from(&self.base_path).join(space.to_string()),
         )?;
@@ -367,6 +384,8 @@ impl DuckDbService {
             tokio::fs::write(&temp_path, data)
                 .await
                 .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+            // The staged file is on the disk, in the free-space reading.
+            self.disk.consumed(&budget_key, data.len() as u64);
 
             // Validate with the same locked native policy as live and export connections.
             let temp_path_clone = temp_path.clone();
@@ -418,11 +437,13 @@ impl DuckDbService {
                 .artifact_repository
                 .chunked_checkpoints("duckdb", &key.0, db_name)
             {
-                let snapshot = tempfile::NamedTempFile::new()
+                let snapshot = snapshot_file(&final_path)
                     .map_err(|e| DuckDbError::Internal(e.to_string()))?;
                 tokio::fs::write(snapshot.path(), data)
                     .await
                     .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
+                // The copy is on the disk, in the free-space reading.
+                self.disk.consumed(&budget_key, data.len() as u64);
                 self.artifact_repository
                     .save_snapshot(
                         "duckdb",
@@ -440,7 +461,7 @@ impl DuckDbService {
                         "duckdb",
                         &key.0,
                         db_name,
-                        data.to_vec(),
+                        data.to_vec().into(),
                         ArtifactExpectation::Any,
                     )
                     .await
@@ -596,6 +617,15 @@ impl DuckDbService {
             .join(format!("{}.duckdb", db_name))
     }
 
+    /// A snapshot copy now exists on the disk: it is in the free-space
+    /// reading, so the write that took it no longer claims it.
+    fn snapshot_written(&self, key: &(String, String), snapshot: &tempfile::NamedTempFile) {
+        if let Ok(metadata) = snapshot.as_file().metadata() {
+            self.disk
+                .consumed(&disk::budget_key(&key.0, &key.1), metadata.len());
+        }
+    }
+
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), DuckDbError> {
         if let Some((_, handle)) = self.databases.remove(key) {
             // DuckDB can flush on connection close. Await it before deleting
@@ -662,6 +692,7 @@ impl DuckDbService {
                     None
                 };
                 if let Some(wal) = wal {
+                    self.snapshot_written(&key, &wal);
                     let saved = match self
                         .artifact_repository
                         .save_wal_snapshot("duckdb", &key.0, db_name, wal, expected)
@@ -763,6 +794,7 @@ impl DuckDbService {
             .chunked_checkpoints("duckdb", &key.0, db_name)
         {
             let snapshot = handle.snapshot().await?;
+            self.snapshot_written(&key, &snapshot);
             if without_growth {
                 let size = snapshot
                     .as_file()
@@ -903,7 +935,7 @@ async fn local_file_bytes(path: &Path) -> u64 {
 /// name (`<db>.duckdb.tmp.<pid>.<n>`, `<db>.duckdb.wal.tmp.<pid>.<n>`): never
 /// live once the process that made it has stopped.
 fn is_stale_cache_name(name: &str) -> bool {
-    if name.ends_with(".duckdb.tmp") {
+    if name.ends_with(".duckdb.tmp") || name.starts_with(SNAPSHOT_PREFIX) {
         return true;
     }
     let Some((_, suffix)) = name
@@ -3608,6 +3640,143 @@ mod tests {
             assert!(
                 matches!(result, Err(DuckDbError::DiskHeadroom)),
                 "{result:?}"
+            );
+        }
+
+        /// The free space of a directory the test fills itself: `capacity`
+        /// less the bytes of the files in `root`, as a real disk reports.
+        struct DirDisk {
+            root: std::path::PathBuf,
+            capacity: u64,
+        }
+
+        impl crate::sql::durability::FreeSpace for DirDisk {
+            fn free_bytes(&self, _: &Path) -> std::io::Result<u64> {
+                let mut used = 0u64;
+                for entry in std::fs::read_dir(&self.root)? {
+                    used += entry?.metadata()?.len();
+                }
+                Ok(self.capacity.saturating_sub(used))
+            }
+        }
+
+        /// Grow `file` by `bytes`, wait until both writers have grown theirs
+        /// and the watchers have read the disk a few times, then run a query
+        /// long enough for a tripped watcher to interrupt it. Returns the
+        /// claim the write still holds at that point.
+        fn grow_then_query(
+            policy: &DuckDbDiskPolicy,
+            key: &str,
+            file: &Path,
+            bytes: u64,
+            both_grown: &std::sync::Barrier,
+        ) -> Result<u64, DuckDbError> {
+            use std::io::Write;
+            let conn = storage::open_connection(None, "512MB").unwrap();
+            policy.watch(key, file, &conn, true, || {
+                let mut grown = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(file)
+                    .unwrap();
+                grown.write_all(&vec![0u8; bytes as usize]).unwrap();
+                grown.sync_all().unwrap();
+                both_grown.wait();
+                std::thread::sleep(Duration::from_millis(250));
+                let claim = policy.budget.inflight(key);
+                conn.execute_batch("SELECT count(*) FROM range(10000) a, range(100000) b")
+                    .map_err(|error| DuckDbError::DuckDb(error.to_string()))?;
+                Ok(claim)
+            })
+        }
+
+        /// Two writes on two databases, each admitted with room for its own
+        /// claim, each growing within it. The bytes one has written are on
+        /// the disk and in the free-space reading; counting them again in its
+        /// claim would put the other's floor above the room the gate gave it
+        /// (TC-2917). Neither is stopped, and each claim shrank by what its
+        /// write wrote. A write that outgrows its claim is still stopped.
+        #[test]
+        fn duckdb_concurrent_writes_within_their_claims_do_not_stop_each_other() {
+            const CLAIM: u64 = 4 << 20;
+            // More than half the claim: with the claims held whole, the two
+            // writes together leave less than the other's claim plus the floor.
+            const GROWTH: u64 = 3 << 20;
+            const SLACK: u64 = 64 << 10;
+            let dir = TempDir::new().unwrap();
+            let disk = Arc::new(DirDisk {
+                root: dir.path().to_path_buf(),
+                capacity: 2 * CLAIM + MIN + SLACK,
+            });
+            let policy = DuckDbDiskPolicy {
+                min_free_bytes: MIN,
+                free_space: disk,
+                ..Default::default()
+            };
+            let keys = ["duckdb:space/a", "duckdb:space/b"];
+            let files = [dir.path().join("a.duckdb"), dir.path().join("b.duckdb")];
+            let guards: Vec<_> = keys
+                .iter()
+                .zip(&files)
+                .map(|(key, file)| {
+                    policy
+                        .reserve(key, CLAIM, file)
+                        .unwrap()
+                        .expect("the headroom check is on")
+                })
+                .collect();
+            assert_eq!(policy.budget.reserved(), 2 * CLAIM);
+
+            let both_grown = std::sync::Barrier::new(2);
+            let outcomes: Vec<_> = std::thread::scope(|scope| {
+                let writers: Vec<_> = keys
+                    .iter()
+                    .zip(&files)
+                    .map(|(key, file)| {
+                        let (policy, both_grown) = (&policy, &both_grown);
+                        scope.spawn(move || grow_then_query(policy, key, file, GROWTH, both_grown))
+                    })
+                    .collect();
+                writers
+                    .into_iter()
+                    .map(|writer| writer.join().unwrap())
+                    .collect()
+            });
+            for outcome in &outcomes {
+                assert_eq!(
+                    outcome.as_ref().ok(),
+                    Some(&(CLAIM - GROWTH)),
+                    "{outcomes:?}"
+                );
+            }
+            drop(guards);
+            assert_eq!(policy.budget.reserved(), 0);
+
+            // One write alone, outgrowing its claim: the floor still holds.
+            let lone = TempDir::new().unwrap();
+            let policy = DuckDbDiskPolicy {
+                min_free_bytes: MIN,
+                free_space: Arc::new(DirDisk {
+                    root: lone.path().to_path_buf(),
+                    capacity: CLAIM + MIN + SLACK,
+                }),
+                ..Default::default()
+            };
+            let file = lone.path().join("a.duckdb");
+            let _guard = policy
+                .reserve("duckdb:space/a", CLAIM, &file)
+                .unwrap()
+                .expect("the headroom check is on");
+            let stopped = grow_then_query(
+                &policy,
+                "duckdb:space/a",
+                &file,
+                2 * CLAIM,
+                &std::sync::Barrier::new(1),
+            );
+            assert!(
+                matches!(stopped, Err(DuckDbError::DiskHeadroom)),
+                "{stopped:?}"
             );
         }
 

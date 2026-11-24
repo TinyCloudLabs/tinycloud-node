@@ -623,15 +623,32 @@ fn handle_wal_snapshot_for_checkpoint(
         return Ok(None);
     }
     let mut snapshot =
-        tempfile::NamedTempFile::new().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+        snapshot_file(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
     std::io::copy(&mut source, snapshot.as_file_mut())
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
     Ok(Some(snapshot))
 }
 
-fn copy_snapshot(path: &Path) -> Result<tempfile::NamedTempFile, DuckDbError> {
+/// Name prefix of the snapshot copies a save takes. They are made beside the
+/// cache files, on the filesystem whose headroom the disk budget measures
+/// (`$TMPDIR` can be another one), and the startup sweep removes the ones a
+/// stopped process left.
+pub(crate) const SNAPSHOT_PREFIX: &str = ".duckdb-snapshot-";
+
+/// A new empty snapshot file in the cache directory of the database at
+/// `cache_file`.
+pub(crate) fn snapshot_file(cache_file: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let dir = cache_file.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempfile_in(dir)
+}
+
+/// Copy `path` into a snapshot file beside the cache file `cache_file`.
+fn copy_snapshot(path: &Path, cache_file: &Path) -> Result<tempfile::NamedTempFile, DuckDbError> {
     let mut snapshot =
-        tempfile::NamedTempFile::new().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+        snapshot_file(cache_file).map_err(|e| DuckDbError::Internal(e.to_string()))?;
     let mut source = std::fs::File::open(path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
     std::io::copy(&mut source, snapshot.as_file_mut())
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -651,7 +668,7 @@ fn handle_snapshot(
                 conn.execute_batch("CHECKPOINT;")
                     .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             }
-            copy_snapshot(file_path)
+            copy_snapshot(file_path, file_path)
         }
         StorageMode::InMemory => {
             let dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
@@ -659,7 +676,7 @@ fn handle_snapshot(
             let dest = storage::open_connection(Some(&path), max_memory)?;
             storage::copy_tables(conn, &dest)?;
             drop(dest);
-            copy_snapshot(&path)
+            copy_snapshot(&path, file_path)
         }
     }
 }
