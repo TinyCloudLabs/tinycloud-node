@@ -731,7 +731,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`**
+  **`0d9f299592c7abeac31a425982f71be30e24122c6d75881588e169417bb0f296`**
+  (raw `70b3ee6ea659f01d52630764f5b9e379733655e149340e98ef6cfa4ad97bf2ce` normalized). Before the TC-4177 deletion ledger start line (`deletion_ledger_start`) and the TC-4190 `duckdb_cache_cleanup_failed` code in the Vector config the template was `8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`
   (raw `7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e` normalized). Before TC-3973 startup diagnostics and reindex counts in the Vector config the template was `e0f99bcca6f220c65d81cad15504790099d634243ea701350a509e995b672aa0`
   (raw `a8fb25f7c3608cbf69911d054825fd4dd0da0a9a78fc5c8ff7701bf346693b6b` normalized). Before the TC-3284 named node diagnostics (every node warning and error message mapped to its own `event_code`) in the Vector config the template was `97a180a43ec70c7950e717417c5455b13ede1a3adab5a196f65b5aa21dcc5271`
   (raw `bced82d3f0e975c176cf35b72cea0bc26c9aa4acf5212304b946c068db1d6394` normalized); before the TC-3284 deletion ledger error events (`deletion_ledger_open_failed`, `deletion_ledger_replay_failed`, `deletion_ledger_unrepaired`) in the Vector config the template was `db348152c6b7a03beb42373299400b35bc0badf8b188988d9406192b4b88a540`
@@ -946,8 +947,8 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e`
-(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code`, TC-3284 deletion ledger error event and TC-3284 named node diagnostics and TC-3973 startup events in the Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
+`70b3ee6ea659f01d52630764f5b9e379733655e149340e98ef6cfa4ad97bf2ce`
+(the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code`, TC-3284 deletion ledger error event and TC-3284 named node diagnostics and TC-3973 startup events and TC-4177 `deletion_ledger_start` and TC-4190 `duckdb_cache_cleanup_failed` in the Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**
 1.26.14 needs the sidecar this compose lacks,

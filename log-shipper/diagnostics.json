@@ -95,6 +95,7 @@
     "Failed to promote database to file": "database_promote_failed",
     "Not enough free disk to promote a database; keeping it in memory": "database_promote_no_disk",
     "failed to copy view during table copy": "duckdb_view_copy_failed",
+    "Database cache cleanup failed": "duckdb_cache_cleanup_failed",
     "sql ddl allowed without schema ability (ddl_requires_schema = log)": "sql_ddl_without_schema",
     "Local SQL commit failed": "sql_commit_failed",
     "Dead SQL actor detected, respawning": "sql_actor_respawned",
