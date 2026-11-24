@@ -76,10 +76,15 @@ class CloudflaredConnectorTests(unittest.TestCase):
         self.assertEqual(result["env_names"].count("CLOUDFLARE_TUNNEL_TOKEN"), 1)
         self.assertNotIn(TOKEN, result["logs"] + result["summary"])
 
-    def test_multiline_secret_is_refused_before_any_mutation(self):
-        result = deploy(TOKEN + "\nextra")
-        self.assertFalse(result["success"])
-        self.assertNotIn("cvm-deploy", result["events"])
+    def test_multiline_secret_is_refused_by_the_single_line_guard_before_the_sealed_file(self):
+        for name, value in (("newline", TOKEN + "\nextra"), ("carriage return", TOKEN + "\rextra")):
+            with self.subTest(name):
+                result = deploy(value)
+                self.assertFalse(result["success"])
+                self.assertIn("::error::Phala deploy inputs must be single-line values", result["logs"])
+                self.assertNotIn("cvm-deploy", result["events"])
+                self.assertNotIn("whitelist-check", result["events"], "The sealed file must not be written first")
+                self.assertEqual(result["env_names"], [])
 
     def test_connector_has_no_published_port_and_a_digest_pin(self):
         service = re.search(r"(?ms)^  cloudflared:\n(.*?)(?=^  \S|^\S|\Z)", COMPOSE)
@@ -88,6 +93,11 @@ class CloudflaredConnectorTests(unittest.TestCase):
         self.assertNotRegex(body, r"(?m)^    (ports|expose|network_mode|privileged):")
         self.assertRegex(body, r"(?m)^    image: cloudflare/cloudflared:[0-9.]+@sha256:[0-9a-f]{64}$")
         self.assertIn('TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"', body)
+        # Metrics/pprof default to 0.0.0.0 in containers: keep them on loopback.
+        self.assertIn('"--metrics", "127.0.0.1:20241"', body)
+        # No label and no logging driver: the log shipper would count every line as unexpected_label.
+        self.assertNotIn("tc.logship", body)
+        self.assertRegex(body, r"(?m)^    logging:\n      driver: none$")
 
     def test_connector_network_scope_is_cf_edge_with_tinycloud_only(self):
         compose = yaml.safe_load(COMPOSE)
