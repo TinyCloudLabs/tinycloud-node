@@ -284,6 +284,24 @@ jobs:
       timeout-minutes: 25
       run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin --test duckdb_production_state
 
+    # TC-4193 guard: dropping `--features duckdb` from the lib step below would
+    # leave it green with the DuckDB-gated tests gone (13 of them exist; the
+    # lib has 1160 tests without the feature, 1173 with it). Without the
+    # feature only 3 test names contain "duckdb", so fewer than 13 means the
+    # gated tests were not compiled in. Raise or lower the 13 deliberately.
+    - name: Assert the DuckDB-gated node lib tests are compiled in
+      if: matrix.group == 'duckdb'
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        cargo test -p tinycloud-node --features duckdb --lib -- --list > "${RUNNER_TEMP}/node-lib-tests.txt"
+        count="$(grep -cE 'duckdb.*: test$' "${RUNNER_TEMP}/node-lib-tests.txt" || true)"
+        echo "DuckDB-named node lib tests discovered: ${count}"
+        if [ "${count}" -lt 13 ]; then
+          echo "::error::expected at least 13 DuckDB-named tests in the tinycloud-node lib, found ${count}. The duckdb feature was dropped or the tests were renamed or deleted; restore them, or update this guard deliberately (TC-4193)."
+          exit 1
+        fi
+
     # Integration targets do not compile the library's cfg(test) modules.
     # Cover DuckDB replacement-busy, disk-headroom and config-floor unit tests.
     - name: Run DuckDB-gated node lib unit tests

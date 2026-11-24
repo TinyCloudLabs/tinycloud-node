@@ -10394,15 +10394,13 @@ mod tests {
         #[cfg(feature = "duckdb")]
         let duckdb_dir = tempfile::TempDir::new()?;
         #[cfg(feature = "duckdb")]
-        let rocket = rocket
-            .manage(tinycloud_core::duckdb::DuckDbService::new(
-                duckdb_dir.path().to_string_lossy().to_string(),
-                u64::MAX,
-                300,
-                "256MB".into(),
-                Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
-            ))
-            .manage(duckdb_dir);
+        let rocket = rocket.manage(tinycloud_core::duckdb::DuckDbService::new(
+            duckdb_dir.path().to_string_lossy().to_string(),
+            u64::MAX,
+            300,
+            "256MB".into(),
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+        ));
         let client = Client::tracked(rocket).await?;
 
         // The sender independently hosts and writes the sender-owned content
