@@ -4,7 +4,7 @@
 # credentials and identifiers from a separate client container, and check that
 # none of them, nor the client address, reaches the ingress container's
 # stdout/stderr or any file under /var/log/nginx. Also re-checks the TC-910
-# 32 KB header buffers and the production compose's body limit (95 MiB, TC-1012).
+# 256 KB header buffers and the production compose's body limit (95 MiB, TC-1012).
 #
 # Usage: deploy/ingress/test-redacted-logging.sh
 #   IMAGE=<ref>   test an existing image instead of building deploy/ingress
@@ -134,15 +134,34 @@ expect_status 200 "https://$DOMAIN/admin/stats?token=$STATS_TOKEN"
 expect_status 502 "https://$DOMAIN/public/$SPACE/kv/$KEY"
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
 # HTTP/1.1, a client-chosen method, and a 400 raised before routing (a header
-# line over the 32 KB buffers) with the ticket in the request line.
+# line over the 256 KB buffers) with the ticket in the request line.
 expect_status 401 --http1.1 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 401 --http1.1 -X "$METHOD" "https://$DOMAIN/signed/kv/$TICKET"
-expect_status 400 --http1.1 -H "X-Large: $(head -c 40000 /dev/zero | tr '\0' a)" \
-    "https://$DOMAIN/signed/kv/$TICKET"
 
-# TC-910: a single header line of about 30 KB fits the 32 KB buffers.
-LARGE_HEADER="X-Large: $(head -c 30000 /dev/zero | tr '\0' a)"
-expect_status 200 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
+# TC-4249: a single header line of 93 KB (a delegation of about 140 keys) and
+# of 200 KB (about 300 keys) fits the 256 KB buffers; 280 KB does not and gets
+# 400 before routing. curl cannot send these (one argv string is capped at
+# 128 KiB, and its HTTP/2 stack caps an outbound header block at 64 KiB), so
+# the request is written raw over TLS 1.x from the client container.
+raw_status() {
+    $DOCKER exec "$CLIENT" sh -c '
+        {
+            printf "GET %s HTTP/1.1\r\nHost: %s\r\nX-Large: " "$2" "$3"
+            head -c "$1" /dev/zero | tr "\0" a
+            printf "\r\nConnection: close\r\n\r\n"
+            sleep 2
+        } | openssl s_client -quiet -connect "$4:443" -servername "$3" 2>/dev/null \
+            | head -n 1 | cut -d" " -f2
+    ' sh "$1" "$2" "$DOMAIN" "$INGRESS_IP"
+}
+expect_raw() {
+    local want=$1 got
+    got=$(raw_status "$2" "$3")
+    [ "$got" = "$want" ] || fail "expected $want, got ${got:-none} for a $2-byte header line on $3"
+}
+expect_raw 200 93000 /delegate
+expect_raw 200 200000 /delegate
+expect_raw 400 280000 "/signed/kv/$TICKET"
 
 # TC-1012: CLIENT_MAX_BODY_SIZE=95m admits exactly 95 MiB (99,614,720 bytes)
 # and refuses one byte more, declared or chunked.
@@ -215,4 +234,4 @@ expect_line POST "/invoke" 413
 
 echo "ingress container output:"
 sed 's/^/  /' <<<"$LOGS"
-echo "PASS: no ticket, identifier or client address in the ingress logs; 32 KB headers and 95 MiB bodies accepted, larger bodies refused"
+echo "PASS: no ticket, identifier or client address in the ingress logs; 200 KB headers and 95 MiB bodies accepted, larger bodies refused"

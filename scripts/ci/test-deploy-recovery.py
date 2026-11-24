@@ -612,7 +612,7 @@ class RecoveryTests(unittest.TestCase):
     def test_n0_template_drift_refuses_release_digest(self):
         node_line = b"    image: ghcr.io/tinycloudlabs/tinycloud-node@" + DIGEST.encode() + b"\n"
         for name, compose in (("profile", N0.replace(b":-errors_slow}", b":-all_requests}")),
-                              ("ingress", N0.replace(b"63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744", b"e" * 64)),
+                              ("ingress", N0.replace(b"7e5dc37a04ad45a900b5da2761368ddad28b2c126a7240e1f50a813e2e875e9d", b"e" * 64)),
                               ("approved pre-cap bytes", N0.replace(b"CLIENT_MAX_BODY_SIZE=95m", b"CLIENT_MAX_BODY_SIZE=32m")),
                               ("crlf", N0.replace(b"\n", b"\r\n")),
                               ("duplicate node", N0.replace(node_line, node_line * 2)),

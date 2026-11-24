@@ -26,6 +26,11 @@ services:
         cache-disabled: "true"
     ports:
       - "8000:8000"
+    # TC-4194: default (ingress, host-published port) plus cf-edge, the only
+    # network the cloudflared connector is on.
+    networks:
+      - default
+      - cf-edge
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
@@ -137,7 +142,7 @@ services:
       ROCKET_MAX_BLOCKING: "1024"
 
   dstack-ingress:
-    image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744
+    image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:7e5dc37a04ad45a900b5da2761368ddad28b2c126a7240e1f50a813e2e875e9d
     ports:
       - "443:443"
     depends_on:
@@ -172,6 +177,67 @@ services:
         mode: non-blocking
         max-buffer-size: 4m
         cache-disabled: "true"
+
+  # TC-4194 P1: Cloudflare Tunnel connector. Outbound-only: it dials
+  # Cloudflare's edge and carries Cloudflare-side routes to tinycloud:8000, so
+  # it publishes NO ports. Network scope (defence in depth only): it is on the
+  # dedicated cf-edge network ONLY (not `default`, not `logship`, so
+  # dstack-ingress, ssh-gateway, vector and every other internal port are
+  # unreachable by service name) and tinycloud is the only other member. This
+  # is NOT a boundary for a holder of tunnel-edit rights: ingress rules are
+  # remote-managed in Cloudflare and can still point at the docker host
+  # gateway or at any internet address the connector can dial (INFERENCE),
+  # e.g. the external database host, which would bypass a source-IP
+  # allow-list. Closing that needs a locally-managed tunnel (TC-4224). The
+  # ingress service is not joined: the planned Cloudflare route is the node's
+  # HTTP origin (tinycloud:8000), not the TLS-terminating tee.node nginx. The
+  # database is external to this compose (there is no postgres service). The
+  # credential is the sealed CLOUDFLARE_TUNNEL_TOKEN, delivered as an
+  # environment variable (the same path as CLOUDFLARE_API_TOKEN above; no
+  # compose secrets/configs).
+  #
+  # Empty-secret behaviour: the token is optional (`:-`, not `:?`), so a deploy
+  # that has no tunnel yet still renders and starts the rest of the stack.
+  # docker.yml writes the variable only when the GitHub secret is set. With the
+  # token empty this container is expected to exit at startup (`tunnel run`
+  # has no credential) and Docker restarts it with backoff; it never takes the
+  # node, ingress or log shipper down and carries no traffic. That is
+  # deliberate: a compose profile would need COMPOSE_PROFILES delivered through
+  # the same sealed environment, and the guest's profile handling is not
+  # verified here.
+  #
+  # Logs: `driver: none`. The log shipper only admits tinycloud-node and
+  # tinycloud-ingress, so a labelled cloudflared would be counted and dropped as
+  # reason unexpected_label (~1 line/min while the token is empty), which would
+  # keep that counter non-zero and mask a real mislabel. Nothing is shipped or
+  # readable either way (raw cache is off for the gelf services too); connector
+  # health comes from the Cloudflare tunnel status.
+  cloudflared:
+    # Digest provenance (UNVERIFIED against a Cloudflare-signed source):
+    # sha256 of the multi-arch index for tag 2026.11.2 from an anonymous Docker
+    # Hub registry GET on 2026-11-24 ~12:00Z; the same digest answers by-digest
+    # and `latest`. Cloudflare's GitHub release for 2026.11.2 publishes no
+    # container digest, and the image's cloudflared binary is not byte-identical
+    # to the release assets (it embeds the version string 2026.11.2 only), so
+    # the pin could not be cross-checked beyond Docker Hub.
+    image: cloudflare/cloudflared:2026.11.2@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6
+    # --metrics: cloudflared's metrics/pprof server defaults to 0.0.0.0:20241 in
+    # containers (Cloudflare docs, "Default metrics server address"), reachable
+    # by every container on cf-edge; keep it on loopback.
+    command: ["tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:20241", "run"]
+    # The image's configured user (config blob of the pinned amd64 manifest).
+    user: "65532:65532"
+    networks:
+      - cf-edge
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: none
 
   # The dstack gateway's TLS-terminating routes (<app>-<port>.<domain>:443)
   # only forward to compose-published ports, so guest sshd on :22 is
@@ -226,4 +292,8 @@ volumes:
 
 networks:
   logship:
+    driver: bridge
+  # TC-4194: connector <-> tinycloud only. Outbound access is needed, so it is
+  # not `internal`.
+  cf-edge:
     driver: bridge

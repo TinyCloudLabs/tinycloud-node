@@ -72,6 +72,10 @@ run is green. Add `cargo-deny (workspace)` only after the lockfile PR
 ctutils advisories`) has landed and `cargo-deny (workspace)` has passed on
 main.
 
+`clippy (workspace, duckdb)` (TC-4193) is proposed as a required check, not yet
+required: the default-feature `clippy (workspace)` build never compiles the
+DuckDB-gated code. Amos adds it only after it has passed once on `main`.
+
 After (create; `integration_id` 15368 is GitHub Actions, so another app cannot
 satisfy the check):
 
@@ -161,6 +165,10 @@ Repository-level production secrets used only by `environment: production` jobs:
 | `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN` | deploy-phala | no |
 | `PROD_TINYCLOUD_QUOTA_URL` | deploy-phala | no |
 | `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64` | deploy-phala | no |
+
+`PROD_TINYCLOUD_CLOUDFLARE_TUNNEL_TOKEN` (TC-4194, used by deploy-phala) is not
+part of the list above: it is optional and does not exist yet. Create it only
+in the `production` environment, never at repository level.
 
 Repository secrets no workflow references: `AWS_DEPLOY_ROLE_ARN`,
 `GH_PACKAGE_PUSH_TOKEN`, `TINYCLOUD_AWS_ACCESS_KEY_ID`,

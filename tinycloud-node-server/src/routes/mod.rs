@@ -5041,6 +5041,40 @@ mod tests {
             .manage(LedgerDir(ledger_dir))
     }
 
+    /// Keeps a test rocket's DuckDB cache directory alive.
+    #[cfg(feature = "duckdb")]
+    #[allow(dead_code)]
+    struct DuckDbCacheDir(TempDir);
+
+    /// The `DuckDbService` state that `invoke` requires under the `duckdb`
+    /// feature, built as `lib.rs` builds it. Without the feature the route
+    /// takes no such state and this is the identity.
+    #[cfg(feature = "duckdb")]
+    fn manage_duckdb_test_state(
+        rocket: rocket::Rocket<rocket::Build>,
+        conn: tinycloud_core::sea_orm::DatabaseConnection,
+    ) -> rocket::Rocket<rocket::Build> {
+        let cache_dir = TempDir::new().expect("duckdb cache directory");
+        let service = DuckDbService::new(
+            cache_dir.path().to_string_lossy().to_string(),
+            u64::MAX,
+            300,
+            "256MB".into(),
+            std::sync::Arc::new(
+                tinycloud_core::database_artifacts::SeaOrmDatabaseArtifactRepository::new(conn),
+            ),
+        );
+        rocket.manage(service).manage(DuckDbCacheDir(cache_dir))
+    }
+
+    #[cfg(not(feature = "duckdb"))]
+    fn manage_duckdb_test_state(
+        rocket: rocket::Rocket<rocket::Build>,
+        _conn: tinycloud_core::sea_orm::DatabaseConnection,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket
+    }
+
     #[derive(Debug)]
     struct TestDatabaseError {
         code: &'static str,
@@ -6565,6 +6599,7 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_duckdb_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -6826,6 +6861,7 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_duckdb_test_state(rocket, conn.clone());
         let client = Client::tracked(rocket).await?;
 
         let response = client
@@ -7803,6 +7839,7 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_duckdb_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -11917,6 +11954,7 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         let rocket = manage_tc405_test_state(rocket, replay_db.clone());
+        let rocket = manage_duckdb_test_state(rocket, replay_db.clone());
         Ok((vec![storage_dir, sql_cache], rocket, replay_db))
     }
 
