@@ -668,14 +668,20 @@ its branch policy before any workflow that names it runs.
      `sockets_configured` means the pool connected to a target the vendored
      sqlx-core was not told about, so its connections run without keepalive.
    - Large headers still reach the node (TC-910 raised the ingress header
-     buffers to `4 32k`). A ~30 KB `Authorization` header must get the node's
-     own `401 Unauthorized` page, not an nginx `400 Request Header Or Cookie
-     Too Large` or a reset connection:
+     buffers to `4 32k`, TC-4249 to `4 256k`). A ~93 KB and a ~200 KB
+     `Authorization` header must get the node's own `401 Unauthorized` page,
+     not an nginx `400 Request Header Or Cookie Too Large` or a reset
+     connection. curl 7.81 stalled sending a 200 KB header line over TLS, and
+     one `-H` argument is capped at 128 KiB (HTTP/2: 64 KiB), so write the
+     request raw over HTTP/1.1:
 
      ```sh
-     H="$(head -c 30000 /dev/zero | tr '\0' a)"
-     curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: ${H}" \
-       https://tee.node.tinycloud.xyz/delegate   # expect 401
+     for n in 93000 200000; do
+       { printf 'POST /delegate HTTP/1.1\r\nHost: tee.node.tinycloud.xyz\r\nContent-Length: 0\r\nConnection: close\r\nAuthorization: '
+         head -c "$n" /dev/zero | tr '\0' a; printf '\r\n\r\n'; sleep 3; } \
+         | openssl s_client -quiet -connect tee.node.tinycloud.xyz:443 \
+             -servername tee.node.tinycloud.xyz 2>/dev/null | head -n 1   # expect HTTP/1.1 401
+     done
      ```
    - Login, KV and SQL work end to end with a throwaway key, not a real
      account: create a key-only `tc` profile (`tc init --key-only`), then

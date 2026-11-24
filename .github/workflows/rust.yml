@@ -103,7 +103,7 @@ jobs:
   test:
     name: test (workspace, PostgreSQL-backed, ${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -278,11 +278,36 @@ jobs:
 
     # The node feature graph rebuilds bundled DuckDB from cold: in PR #582 that
     # compile took about 14.5m, and the 15m cap stopped the step while its tests ran.
-    # The job's 75m cap covers this step after the 30m core step and setup.
+    # The job's 90m cap also covers the DuckDB-enabled node lib harness below.
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 25
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin --test duckdb_production_state
+
+    # TC-4193 guard: dropping `--features duckdb` from the lib step below would
+    # leave it green with the DuckDB-gated tests gone (13 of them exist; the
+    # lib has 1160 tests without the feature, 1173 with it). Without the
+    # feature only 3 test names contain "duckdb", so fewer than 13 means the
+    # gated tests were not compiled in. Raise or lower the 13 deliberately.
+    - name: Assert the DuckDB-gated node lib tests are compiled in
+      if: matrix.group == 'duckdb'
+      timeout-minutes: 20
+      run: |
+        set -euo pipefail
+        cargo test -p tinycloud-node --features duckdb --lib -- --list > "${RUNNER_TEMP}/node-lib-tests.txt"
+        count="$(grep -cE 'duckdb.*: test$' "${RUNNER_TEMP}/node-lib-tests.txt" || true)"
+        echo "DuckDB-named node lib tests discovered: ${count}"
+        if [ "${count}" -lt 13 ]; then
+          echo "::error::expected at least 13 DuckDB-named tests in the tinycloud-node lib, found ${count}. The duckdb feature was dropped or the tests were renamed or deleted; restore them, or update this guard deliberately (TC-4193)."
+          exit 1
+        fi
+
+    # Integration targets do not compile the library's cfg(test) modules.
+    # Cover DuckDB replacement-busy, disk-headroom and config-floor unit tests.
+    - name: Run DuckDB-gated node lib unit tests
+      if: matrix.group == 'duckdb'
+      timeout-minutes: 20
+      run: cargo test -p tinycloud-node --features duckdb --lib
 
     # A hung PostgreSQL test holds row locks until its step is killed by the
     # timeout above. This dumps the sessions and what blocks them, so the
@@ -336,6 +361,32 @@ jobs:
     # --all-targets so test and bench targets are linted too, not just lib/bin.
     - name: Clippy
       run: RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
+
+  # TC-4193: the job above builds without the duckdb feature, so the
+  # DuckDB-gated code in tinycloud-core and tinycloud-node was never linted.
+  # A separate job keeps `clippy (workspace)` unchanged. New check: not
+  # required until the ruleset lists it.
+  clippy-duckdb:
+    name: clippy (workspace, duckdb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
+      with:
+        components: clippy
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-clippy-duckdb
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Clippy (DuckDB core and node)
+      run: cargo clippy -p tinycloud-core -p tinycloud-node --all-targets --features duckdb -- -D warnings
 
   fmt:
     name: fmt (workspace)
