@@ -24,7 +24,6 @@ import subprocess
 import sys
 import tempfile
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from uuid import UUID
 
@@ -36,6 +35,13 @@ DEFAULT_WORKER = "tinycloud-tee-proxy"
 MANAGEMENT_PORT = 10022
 GATEWAY_SUFFIXES = ("8000", "8000g", "443", "443s", "443g")
 LABEL = "operator evidence from automated reads, not a cryptographic attestation"
+ORIGIN_ATTESTATION = ("operator-attested, NOT verified: the Worker's ORIGIN_URL is a secret whose value the Cloudflare "
+                      "API never returns; it is recorded as the --tunnel-host the operator says the set-origin step received")
+END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path refuses "
+                    "fresh connections, so the Worker reaches the node by some route other than the closed gateway")
+END_TO_END_CANNOT = ["that the secret equals the tunnel host (another independent origin serving the same node would "
+                     "also pass)", "that no unprobed gateway host or address is used", "anything before the restriction: "
+                     "while the gateway is open the secret may still point at it and node.* would also pass"]
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_READ_TOKEN"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,40}")
@@ -114,12 +120,12 @@ class CloudflareReader:
         versions = ((deployments or {}).get("deployments") or [{}])[0].get("versions") or []
         version = versions[0].get("version_id") if len(versions) == 1 and versions[0].get("percentage") == 100 else None
         settings = self._get(f"/accounts/{self.account}/workers/scripts/{script}/settings")
-        # INFERENCE: the deployed variable is a plain_text binding named ORIGIN_URL (set with
-        # `wrangler deploy --var`). Anything else (absent, duplicated, secret, other type) -> None.
+        # INFERENCE: exactly one binding named ORIGIN_URL; the approved type is secret_text. The API
+        # returns only its name and type, never a secret value. Absent or duplicated -> None.
         bindings = [b for b in (settings or {}).get("bindings") or [] if isinstance(b, dict) and b.get("name") == "ORIGIN_URL"]
-        origin = bindings[0].get("text") if len(bindings) == 1 and bindings[0].get("type") == "plain_text" else None
+        kind = bindings[0].get("type") if len(bindings) == 1 else None
         routes = self._get(f"/zones/{self.zone}/workers/routes") or []
-        return {"version_id": version, "origin": origin if isinstance(origin, str) else None,
+        return {"version_id": version, "origin_binding": kind if isinstance(kind, str) else None,
                 "routes": [{"pattern": r.get("pattern"), "script": r.get("script")} for r in routes]}
 
 
@@ -252,9 +258,13 @@ def preflight(cfg, clients, now):
     worker = cf.worker(cfg["worker_script"])
     require(isinstance(worker, dict) and isinstance(worker.get("version_id"), str) and worker["version_id"],
             "Worker version could not be read")
-    require(isinstance(worker.get("origin"), str) and not (urlsplit(worker["origin"]).hostname or "").endswith(".phala.network"),
-            "Deployed Worker ORIGIN_URL is missing or is a Phala gateway host; not Cloudflare-only")
-    require(worker.get("origin") == f"https://{host}", "Worker origin is not the tunnel hostname")
+    # The Cloudflare API never returns a secret's value: only its presence and type can be read.
+    require(worker.get("origin_binding") != "plain_text",
+            "Worker ORIGIN_URL is a plain_text variable; the approved path is a secret, redeploy it as a secret")
+    require(worker.get("origin_binding") == "secret_text",
+            "Worker has no single secret_text ORIGIN_URL binding")
+    require(cfg.get("attested_origin") is True,
+            "Pass --attest-origin-is-tunnel-host: the secret's value cannot be read, so the operator must attest it")
     if cfg.get("expect_worker_version"):
         require(worker["version_id"] == cfg["expect_worker_version"], "Worker version differs from the expected version")
     routes = {r.get("pattern"): r.get("script") for r in worker.get("routes") or [] if isinstance(r, dict)}
@@ -268,15 +278,17 @@ def preflight(cfg, clients, now):
             "tunnel_hostname": host, "tunnel_id": cfg["tunnel_id"], "verified_at_utc": now.isoformat(),
             "connector_authenticated": True, "origin_status": 200, "public_status": 200,
             "origin_node_id": origin["node_id"], "public_node_id": public["node_id"],
-            "worker_version_id": worker["version_id"], "tunnel_connections": len(connections),
+            "worker_version_id": worker["version_id"], "worker_origin_binding": "secret_text",
+            "worker_origin_value": ORIGIN_ATTESTATION, "tunnel_connections": len(connections),
             "evidence_label": LABEL}
 
 
 def summarize(receipt):
     """Receipt fields safe to print: node ids appear only as short fingerprints."""
-    keys = ("app_id", "worker_origin", "tunnel_id", "worker_version_id", "tunnel_connections", "verified_at_utc")
+    keys = ("app_id", "worker_origin", "tunnel_id", "worker_version_id", "worker_origin_binding",
+            "tunnel_connections", "verified_at_utc")
     return dict({k: receipt[k] for k in keys}, node_id_fingerprint=fingerprint(receipt["origin_node_id"]),
-                evidence_label=LABEL)
+                worker_origin_value=ORIGIN_ATTESTATION, evidence_label=LABEL)
 
 
 # ---------------------------------------------------------------- switch wrapper / plan
@@ -371,7 +383,8 @@ def cmd_preflight(a, clients, now, out):
 
 def cfg_of(a):
     return {"app_id": a.expect_app_id, "tunnel_id": a.tunnel_id, "tunnel_host": a.tunnel_host,
-            "worker_script": a.worker_script, "expect_worker_version": a.expect_worker_version}
+            "worker_script": a.worker_script, "expect_worker_version": a.expect_worker_version,
+            "attested_origin": a.attest_origin_is_tunnel_host}
 
 
 # ---------------------------------------------------------------- verify
@@ -459,6 +472,9 @@ def cmd_verify(a, clients, now, out):
     checks = verify(a, clients, now)
     passed = all(c["ok"] for c in checks)
     emit(out, {"command": "verify", "expect": a.expect, "result": "pass" if passed else "FAIL", "checks": checks,
+               "worker_origin_value": ORIGIN_ATTESTATION,
+               "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
+               "what_they_cannot_show": END_TO_END_CANNOT,
                "not_covered": ["independent external networks (single vantage)", "cached or literal-IP paths",
                                "existing long-lived connections", "provider read-back of /network and /compose_file",
                                "streaming/SSE behaviour"]})
@@ -510,6 +526,8 @@ def parser():
         p.add_argument("--zone-id", required=True)
         p.add_argument("--worker-script", default=DEFAULT_WORKER)
         p.add_argument("--expect-worker-version")
+        p.add_argument("--attest-origin-is-tunnel-host", action="store_true",
+                       help="operator attests the P3 set-origin step was given exactly https://<--tunnel-host>")
 
     def switch_inputs(p):
         p.add_argument("--compose", type=Path, required=True)

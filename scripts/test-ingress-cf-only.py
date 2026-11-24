@@ -40,7 +40,7 @@ def good_cf():
                    "connections": [{"id": "c1", "is_pending_reconnect": False}]},
         "ingress": [{"hostname": HOST, "service": "http://tinycloud:8000"}, {"service": "http_status:404"}],
         "dns": [{"type": "CNAME", "proxied": True, "content": f"{TUNNEL}.cfargotunnel.com"}],
-        "worker": {"version_id": "ver-1", "origin": f"https://{HOST}",
+        "worker": {"version_id": "ver-1", "origin_binding": "secret_text",
                    "routes": [{"pattern": "node.tinycloud.xyz/*", "script": "tinycloud-tee-proxy"},
                               {"pattern": "tee.node.tinycloud.xyz/*", "script": "tinycloud-tee-proxy"}]},
     }
@@ -120,7 +120,7 @@ class Base(unittest.TestCase):
 
     def cloudflare_args(self):
         return ["--expect-app-id", APP, "--tunnel-id", TUNNEL, "--tunnel-host", HOST,
-                "--account-id", "acct", "--zone-id", "zone"]
+                "--account-id", "acct", "--zone-id", "zone", "--attest-origin-is-tunnel-host"]
 
     def switch_args(self):
         return ["--compose", str(self.compose), "--target", str(self.target), "--network", str(self.network),
@@ -187,8 +187,8 @@ class PreflightTest(Base):
             "dns other tunnel": lambda s, h: s["dns"][0].update(content="x.cfargotunnel.com"),
             "dns not proxied": lambda s, h: s["dns"][0].update(proxied=False),
             "dns duplicated": lambda s, h: s["dns"].append(dict(s["dns"][0])),
-            "worker public phala origin": lambda s, h: s["worker"].update(origin="https://x-8000.dstack.phala.network"),
-            "worker origin unreadable": lambda s, h: s["worker"].update(origin=None),
+            "worker origin is a plain_text var": lambda s, h: s["worker"].update(origin_binding="plain_text"),
+            "worker origin binding absent": lambda s, h: s["worker"].update(origin_binding=None),
             "worker version unreadable": lambda s, h: s["worker"].update(version_id=None),
             "node route missing": lambda s, h: s["worker"].update(routes=[]),
             "node route other script": lambda s, h: s["worker"]["routes"][0].update(script="other"),
@@ -465,12 +465,12 @@ class OutputAndClientTest(Base):
                     {"versions": [{"version_id": "v9", "percentage": 100}]}]}}).encode())
             if request.full_url.endswith("/settings"):
                 return Reply(json.dumps({"success": True, "result": {"bindings": [
-                    {"name": "ORIGIN_URL", "type": "plain_text", "text": "https://cf-origin.example.test"}]}}).encode())
+                    {"name": "ORIGIN_URL", "type": "secret_text"}]}}).encode())
             return Reply(json.dumps({"success": True, "result": {"id": TUNNEL}}).encode())
 
         reader = cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
         worker = reader.worker("s")
-        self.assertEqual(worker, {"version_id": "v9", "origin": "https://cf-origin.example.test",
+        self.assertEqual(worker, {"version_id": "v9", "origin_binding": "secret_text",
                                   "routes": [{"pattern": "node.tinycloud.xyz/*", "script": "s"}]})
         self.assertEqual(reader.tunnel(TUNNEL), {"id": TUNNEL})
         self.assertTrue(seen and all(m == "GET" and a == f"Bearer {CF_TOKEN}" for m, u, a in seen))
@@ -490,7 +490,7 @@ class OutputAndClientTest(Base):
                 cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=failing).tunnel(TUNNEL)
             self.assertNotIn(CF_TOKEN, str(caught.exception))
 
-    def test_worker_origin_comes_from_the_deployed_variable_only(self):
+    def test_worker_origin_binding_is_read_by_name_and_type_only(self):
         class Reply(io.BytesIO):
             def __enter__(self):
                 return self
@@ -511,25 +511,57 @@ class OutputAndClientTest(Base):
                 return Reply(json.dumps({"success": True, "result": []}).encode())
             return cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
 
-        var = {"name": "ORIGIN_URL", "type": "plain_text", "text": f"https://{HOST}"}
-        self.assertEqual(reader_with([{"name": "OTHER", "type": "plain_text", "text": "x"}, var]).worker("s")["origin"],
-                         f"https://{HOST}")
-        for name, bindings in {"absent": [], "other var only": [dict(var, name="PHALA_ORIGIN")],
-                               "secret not a var": [dict(var, type="secret_text")],
-                               "duplicated": [var, dict(var, text="https://x.example.test")],
-                               "no text": [{"name": "ORIGIN_URL", "type": "plain_text"}]}.items():
+        var = {"name": "ORIGIN_URL", "type": "secret_text"}
+        self.assertEqual(reader_with([{"name": "OTHER", "type": "plain_text", "text": "x"}, var]).worker("s")["origin_binding"],
+                         "secret_text")
+        self.assertEqual(reader_with([dict(var, type="plain_text", text="https://x.example.test")]).worker("s")["origin_binding"],
+                         "plain_text")
+        for name, bindings in {"absent": [], "other name only": [dict(var, name="PHALA_ORIGIN")],
+                               "duplicated": [var, dict(var, type="plain_text")], "no type": [{"name": "ORIGIN_URL"}]}.items():
             with self.subTest(name):
-                self.assertIsNone(reader_with(bindings).worker("s")["origin"])
+                self.assertIsNone(reader_with(bindings).worker("s")["origin_binding"])
 
-    def test_preflight_refuses_a_phala_origin_variable_and_a_missing_one(self):
-        for origin in (f"https://{APP}-8000.dstack-pha-prod5.phala.network", None, "http://" + HOST,
-                       f"https://{HOST}/path"):
-            with self.subTest(origin=origin):
-                self.cf.state["worker"]["origin"] = origin
+    def test_preflight_requires_the_secret_binding_and_the_operator_attestation(self):
+        for name, kind, message in (("plain_text var", "plain_text", "approved path is a secret"),
+                                    ("absent or duplicated", None, "no single secret_text"),
+                                    ("other type", "json", "no single secret_text")):
+            with self.subTest(name):
+                self.cf.state["worker"]["origin_binding"] = kind
                 code, out, err = self.run_cli(["preflight", *self.cloudflare_args()])
                 self.assertEqual(code, 1, out)
-        self.cf.state["worker"]["origin"] = f"https://{APP}-8000.dstack-pha-prod5.phala.network"
-        self.assertIn("Phala gateway", self.run_cli(["preflight", *self.cloudflare_args()])[2])
+                self.assertIn(message, err)
+        self.cf.state["worker"]["origin_binding"] = "secret_text"
+        unattested = [a for a in self.cloudflare_args() if a != "--attest-origin-is-tunnel-host"]
+        code, out, err = self.run_cli(["preflight", *unattested])
+        self.assertEqual(code, 1)
+        self.assertIn("attest", err)
+
+    def test_phala_tunnel_host_is_refused_even_with_a_secret_binding_and_attestation(self):
+        phala = f"{APP}-8000.dstack-pha-prod5.phala.network"
+        args = [phala if a == HOST else a for a in self.cloudflare_args()]
+        code, out, err = self.run_cli(["preflight", *args])
+        self.assertEqual(code, 1)
+        self.assertIn("independent tunnel hostname", err)
+        self.assertEqual(self.cf.calls, [])
+
+    def test_origin_value_is_recorded_as_unverified_operator_attestation(self):
+        code, out, err = self.run_cli(["plan", *self.cloudflare_args(), *self.switch_args()])
+        self.assertEqual(code, 0, err)
+        evidence = json.loads(out)["evidence"]
+        self.assertEqual(evidence["worker_origin_binding"], "secret_text")
+        self.assertIn("NOT verified", evidence["worker_origin_value"])
+        self.assertIn("operator-attested", evidence["worker_origin_value"])
+
+    def test_verify_states_what_the_end_to_end_checks_can_and_cannot_show(self):
+        self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
+        self.stage()
+        code, out, err = self.run_cli(["verify", *self.verify_args()])
+        self.assertEqual(code, 0, out)
+        result = json.loads(out)
+        self.assertIn("NOT verified", result["worker_origin_value"])
+        self.assertIn("some route other than the closed gateway", result["what_the_end_to_end_checks_can_show"])
+        self.assertTrue(any("secret equals the tunnel host" in c for c in result["what_they_cannot_show"]))
+        self.assertTrue(any("before the restriction" in c for c in result["what_they_cannot_show"]))
 
 
 if __name__ == "__main__":

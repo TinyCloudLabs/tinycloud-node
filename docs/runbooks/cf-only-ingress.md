@@ -28,9 +28,10 @@ Cloudflare reader and the real network probe against any live system, any
 Phala call, any drill. The Cloudflare endpoint shapes (tunnel, configurations,
 DNS records, Worker deployments, routes) are [INFERENCE] from API documentation.
 **The Worker script settings/bindings endpoint
-(`GET /accounts/{id}/workers/scripts/{name}/settings`, a `plain_text` binding named
-`ORIGIN_URL`) is [INFERENCE] and was not run.** If any read does not match
-(absent, duplicated, secret or other type), preflight refuses rather than guessing.
+(`GET /accounts/{id}/workers/scripts/{name}/settings`, a binding named
+`ORIGIN_URL` of type `secret_text`, no value returned) is [INFERENCE] and was not
+run.** If any read does not match (absent or duplicated binding, or any type other
+than `secret_text`), preflight refuses rather than guessing.
 
 ## Honest operating characteristics
 
@@ -51,7 +52,8 @@ DNS records, Worker deployments, routes) are [INFERENCE] from API documentation.
 Shared inputs: `--expect-app-id`, `--tunnel-id`, `--tunnel-host` (an independent
 tunnel hostname, never `node.*`, `tee.node.*`, `*.phala.network`,
 `*.cfargotunnel.com`), `--account-id`, `--zone-id`, `--worker-script` (default
-`tinycloud-tee-proxy`), optional `--expect-worker-version`. Capture
+`tinycloud-tee-proxy`), optional `--expect-worker-version`, and
+`--attest-origin-is-tunnel-host` (required, see preflight item 5). Capture
 `target.json`, `app-compose.json` and `network.json` as in the switch runbook.
 
 ### preflight
@@ -69,13 +71,19 @@ refuses unless **all** hold:
 2. its ingress routes the tunnel host to `http://tinycloud:8000`;
 3. the tunnel host has exactly one proxied CNAME to `<tunnel-id>.cfargotunnel.com`;
 4. the Worker has a readable single 100% version (and `--expect-worker-version` if
-   given), its **deployed** variable `ORIGIN_URL` (plain-text binding read from the
-   script settings, set with `wrangler deploy --var ORIGIN_URL:<origin>`) is exactly
-   `https://<tunnel-host>` and not a `*.phala.network` host, and
-   `node.tinycloud.xyz/*` routes to that script. The Worker source is never read, and
-   there is no source-constant fallback;
-5. `/info` on the tunnel host and on `node.tinycloud.xyz` returns 200 with the same
-   non-empty `nodeId`.
+   given); **exactly one** binding named `ORIGIN_URL` of type `secret_text` exists on
+   the deployed script (P3 stores the origin as a Worker secret). **Presence and type
+   only: the Cloudflare API never returns a secret value, so the origin value is not
+   compared.** A `plain_text` `ORIGIN_URL` is refused, not accepted, because the secret
+   is the approved path (redeploy it as a secret); an absent, duplicated or other-type
+   binding is refused. `node.tinycloud.xyz/*` must route to that script. The Worker
+   source is never read and there is no source-constant fallback;
+5. the operator passed `--attest-origin-is-tunnel-host`, attesting that the P3
+   set-origin step received exactly `https://<--tunnel-host>`. This is recorded in the
+   receipt and in plan/preflight/verify output as **operator-attested, NOT verified**;
+6. `/info` on the tunnel host and on `node.tinycloud.xyz` returns 200 with the same
+   non-empty `nodeId`. Before the restriction this does not show which origin the
+   Worker uses.
 
 Node ids are printed only as a short SHA-256 fingerprint. The receipt file holds the
 real value (it is private); do not commit it.
@@ -130,7 +138,15 @@ if:
 - the receipt is not older than `--max-receipt-age` (default 3600 s) and the snapshot
   is an owner-only file for the same app.
 
-It lists what it does **not** cover: independent external networks (one vantage),
+What the passing end-to-end checks can show: `node.tinycloud.xyz` answers `/info`
+with the recorded node id **while every probed gateway path refuses**, so the Worker
+reaches the node by some route other than the closed gateway. What they **cannot**
+show: that the Worker's secret equals the tunnel host (another independent origin
+serving the same node would also pass), that no unprobed gateway host or address is
+used, or anything before the restriction (while the gateway is open, `node.*` passes
+even if the secret still points at it). The script prints these limits.
+
+It also lists what it does **not** cover: independent external networks (one vantage),
 cached or literal-IP paths, existing long-lived connections, the provider read-back
 of `/network` and `/compose_file`, streaming/SSE. Do those by hand per the switch
 runbook. Exit status is non-zero on any failure.
