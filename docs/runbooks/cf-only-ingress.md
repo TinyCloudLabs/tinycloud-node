@@ -175,11 +175,11 @@ contact with Phala infrastructure, not an API call and not a credentialed one).
 | exit | verdict | meaning | action |
 |---|---|---|---|
 | 0 | `pass` | every check proven; **unreachable for `--expect restricted` until a drill signature is accepted** | continue |
-| 1 | `open`, `--expect restricted` | a probed gateway path answered 2xx (the node or not), management answered although the policy denies it, expected-open management was reached but gave no SSH banner, or `node.*` or the tunnel host is unhealthy | **undo** (restore). If the only failing check is a transport failure of `/info` (no HTTP status, seen from this vantage only), **confirm from a second network before undo** |
+| 1 | `open`, `--expect restricted` | a probed gateway path answered 2xx (the node or not), management answered although the policy denies it, expected-open management accepted the connection but gave no SSH banner (not a connect-time refusal or reset), or `node.*` or the tunnel host is unhealthy | **undo** (restore). If the only failing check is a transport failure of `/info` (no HTTP status, seen from this vantage only), **confirm from a second network before undo** |
 | 1 | `open`, `--expect restored` | the node path is broken after the restore (tee not serving the node, `/info` or management unhealthy) | **do NOT undo again** (the restore is already applied); investigate the tunnel, the Worker secret and the connector, confirm from a second network |
-| 3 | `not_proven_closed`, `--expect restricted` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, non-2xx HTTP, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits on management) | **hold; do NOT undo and do NOT restart on this alone.** From a **second, IPv6-capable network** check that the `-8000` hosts and `tee.node.tinycloud.xyz` `/info` do not return the node, then run the drill. With the empty set a **correct** restriction reads `not_proven_closed` today |
+| 3 | `not_proven_closed`, `--expect restricted` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, non-2xx HTTP, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits and connect-time refusals/resets on management) | **hold; do NOT undo and do NOT restart on this alone.** From a **second, IPv6-capable network** check that the `-8000` hosts and `tee.node.tinycloud.xyz` `/info` do not return the node **and that the management route (`<app-id>-10022` on the gateway) still answers an `SSH-2.0` banner**, then run the drill. With the empty set a **correct** restriction reads `not_proven_closed` today |
 | 3 | `not_proven_closed`, `--expect restored` | restored not proven from this vantage (typically an IPv4-only vantage while management has an AAAA record) | re-run from a second IPv6-capable network; do NOT undo again; no drill needed |
-| 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed, an IO or parse error, an unexpected exception. **No verdict.** Nothing was changed or judged | **fix the input and re-run; never undo on exit 4** |
+| 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed, an IO or parse error, an unexpected exception (stderr: "No verdict was computed: do NOT treat this as closed and do NOT undo on this alone; rerun"). **No verdict.** Nothing was changed or judged. A failed **receipt write** after the checks ran is NOT exit 4: the verdict keeps its own exit code (1/3), `receipt_record` says `FAILED` and stderr warns | **fix the input and re-run; never undo on exit 4** |
 
 **A stale receipt is likely**: the receipt's default max age is 3600 s and the restart
 time is unmeasured, so a verify run after a slow restart is refused (exit 4, stderr
@@ -218,6 +218,10 @@ from a restricted path is `open` (exit 1) even when the body is not the node's**
 stay exit 3. A `/info` body is de-chunked before the node id is read, so a chunked 200
 counts as the node answering. Open and not-proven-closed results FAIL, never
 "indeterminate".
+
+**S9 caveat [INFERENCE].** A 2xx from a restricted path is `open`. If the gateway's real
+status for a denied port is 2xx, or a TLS-intercepting proxy answers 200, that is a
+false positive (exit 1). **The drill must record the real denied-port status.**
 
 **Inherent one-vantage limits (documented, not fixable by this script).** (B) A local
 REJECT rule or an on-path reset produces the same `tcp_refused` as a closed gateway;
@@ -291,11 +295,15 @@ probes it. Checks:
   banner, a TLS alert, HTTP or a timeout fail too). If `phala ssh` actually reaches
   management another way, this check and the controls are wrong and must be corrected
   from evidence before relying on them. Key-authenticated access is not tested.
-  **Class of a management FAIL:** expected-open management that was reached but gave no
-  banner (refused, reset, TLS alert, close, non-SSH data, HTTP) is class `open`
-  (exit 1); a timeout, `no_route`, `no_aaaa`, `no_address` or other error is a vantage or
-  DNS limit and stays `not_proven_closed` (exit 3), never an undo signal. Management
-  expected denied and answering a banner is class `open`.
+  **Class of a management FAIL:** expected-open management that **accepted the connection**
+  but gave no banner (reset after connect, TLS alert, close, non-SSH data, HTTP) is class
+  `open` (exit 1). A `tcp_refused` or connect-time `tcp_reset` is pre-SNI, and management
+  is the same gateway IP:443, so it cannot be about this app (a gateway-wide outage, a
+  local REJECT): it stays `not_proven_closed` (exit 3), like a timeout, `no_route`,
+  `no_aaaa`, `no_address` or other error, never an undo signal. Blackholed management
+  can therefore hide at exit 3 (harm is limited to SSH); the exit-3 checklist above
+  includes the management banner check. Management expected denied and answering a
+  banner is class `open`.
   **`--expect restored` and IPv6 (decision):** restored keeps the IPv6 management
   probe, because an AAAA that exists must be probed. So restored needs a vantage with
   IPv6 when management has an AAAA record; from an IPv4-only vantage the probe is

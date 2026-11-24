@@ -625,11 +625,13 @@ def answered_as_success(signals):
                or (s.startswith("http_") and s[5:].isdigit() and 200 <= int(s[5:]) < 300) for s in signals)
 
 
-# Signals that mean the gateway route was reached but did not give the SSH banner. For a management route that must stay
-# open this is a broken service (class open, exit 1). Verifier-side or DNS limits (timeout, no_route, no_aaaa, no_address,
-# error) are not proof of anything and stay not_proven_closed (exit 3): a vantage limit must never read as "undo".
-MANAGEMENT_REACHED_NO_BANNER = {"tcp_refused", "tcp_reset", "reset_after_connect", "tls_rejected", "closed_after_tls",
-                                "non_ssh_data", "malformed_http", "http_200_unparsed"}
+# Signals that mean the gateway answered on the route but not with the SSH banner AFTER the connection was accepted. For a
+# management route that must stay open this is a broken service (class open, exit 1). tcp_refused and tcp_reset are
+# CONNECT-time and therefore pre-SNI: management is the same gateway IP:443, so they cannot be about this app (a
+# gateway-wide outage, a local REJECT) and stay not_proven_closed (exit 3), like timeout, no_route, no_aaaa, no_address
+# and error: a vantage limit must never read as "undo".
+MANAGEMENT_REACHED_NO_BANNER = {"reset_after_connect", "tls_rejected", "closed_after_tls", "non_ssh_data", "malformed_http",
+                                "http_200_unparsed"}
 
 
 def management_kind(signals, expect_open):
@@ -796,7 +798,8 @@ def next_action(verdict, expect, checks):
         return text
     return ("NOT PROVEN CLOSED (verdict not_proven_closed), and nothing was seen open. Do NOT undo and do NOT restart on "
             "this result. From a SECOND, IPv6-capable network check that the -8000 hosts and tee.node.tinycloud.xyz /info "
-            "do not return the node, then run the drill. With the empty accepted-signature set a correct restriction also "
+            "do not return the node and that the management route (<app-id>-10022 on the gateway) still answers an "
+            "SSH-2.0 banner, then run the drill. With the empty accepted-signature set a correct restriction also "
             "reads like this (see the runbook).")
 
 
@@ -807,10 +810,18 @@ def cmd_verify(a, clients, now, out):
     waiver = ({"at_utc": now.isoformat(), "waiver": "allow-no-aaaa",
                "scope": "IPv6 probes whose DNS answer was NODATA for AAAA on a name that otherwise resolves; nothing else",
                "hosts_waived": list(dict.fromkeys(waived))} if a.allow_no_aaaa else None)
-    record_verify(a.receipt, {"at_utc": now.isoformat(), "expect": a.expect, "result": result, "verdict": verdict,
-                              "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
-                              "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
-                                         for c in checks]}, waiver)
+    try:
+        record_verify(a.receipt, {"at_utc": now.isoformat(), "expect": a.expect, "result": result, "verdict": verdict,
+                                  "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
+                                  "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
+                                             for c in checks]}, waiver)
+        receipt_record = "resolved addresses and control results were appended to the receipt (verify_runs)"
+    except Exception:
+        # S10: a failed receipt write (leftover .record, disk full, permissions) must never turn a computed verdict, e.g.
+        # open, into exit 4. The verdict is emitted with its own exit code and the failure is stated.
+        receipt_record = ("FAILED: the receipt could not be updated; this run's addresses and controls were NOT recorded. "
+                          "The verdict and exit code above are unaffected")
+        print("Warning: " + receipt_record, file=sys.stderr)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
                "exit_codes": EXIT_CODES[a.expect],
                "next_action": next_action(verdict, a.expect, checks), "checks": checks,
@@ -822,7 +833,7 @@ def cmd_verify(a, clients, now, out):
                               "app-specific; it means a local/on-path cause or an outage. Any signature added later also "
                               "needs a same-address positive control, and a reset counts only at connect. Open, unknown "
                               "and unaccepted results never pass; there is no flag to widen the set.",
-               "receipt_record": "resolved addresses and control results were appended to the receipt (verify_runs)",
+               "receipt_record": receipt_record,
                "waivers": waiver or "none (--allow-no-aaaa not given)",
                "worker_origin_value": ORIGIN_ATTESTATION,
                "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
@@ -954,14 +965,16 @@ def main(argv=None, clients=None, now=None, out=None, env=None):
 
 
 def cli(argv=None):
-    """Process entry: exit code only. Any exception main() did not map (IO, parse, record_verify failure, a bug) is exit 4:
-    an uncaught traceback would exit 1, which means 'open: undo'. argparse's SystemExit(2) passes through."""
+    """Process entry: exit code only. Any exception main() did not map (IO, parse, a bug) is exit 4: an uncaught traceback
+    would exit 1, which means 'open: undo'. A failed receipt write is handled in cmd_verify and keeps the verdict's own
+    code. argparse's SystemExit(2) passes through."""
     try:
         return main(argv)
     except Exception:
         # Parser/IO diagnostics can embed input content; report none of it.
-        print("Refused: check inputs, files and permissions. No Phala or provider action was performed. "
-              f"Exit {EXIT_REFUSED}: nothing was changed or judged; never undo on this exit.", file=sys.stderr)
+        print("Error: an unexpected failure stopped the run. No verdict was computed: do NOT treat this as closed and do "
+              f"NOT undo on this alone; rerun. Exit {EXIT_REFUSED}: nothing was changed. No Phala or provider action was "
+              "performed.", file=sys.stderr)
         return EXIT_REFUSED
 
 

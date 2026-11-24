@@ -493,8 +493,8 @@ class VerifyTest(Base):
                 fn(self.http)
                 code, out, err = self.verify()
                 open_class = ("tee ipv4 still serves", "instance -443s ipv6 still serves", "multi-address answer with one node "
-                              "response", "node.* unhealthy", "node ids differ", "management looks closed while it must "
-                              "stay open", "management answers a non-SSH protocol", "management ipv6 refused", "unparsed 200")
+                              "response", "node.* unhealthy", "node ids differ", "management answers a non-SSH protocol",
+                              "unparsed 200")
                 self.assertEqual(code, 1 if name in open_class else 3, out)
                 self.assertEqual(json.loads(out)["verdict"], "open" if name in open_class else "not_proven_closed")
                 self.assertEqual(json.loads(out)["result"], "FAIL")
@@ -529,7 +529,7 @@ class VerifyTest(Base):
             with self.subTest(outcome):
                 self.http.mgmt6 = {"outcome": outcome}
                 code, out, err = self.verify("--allow-no-aaaa")
-                self.assertEqual(code, 1 if outcome in ("tcp_refused", "tls_rejected", "non_ssh_data") else 3, out)
+                self.assertEqual(code, 1 if outcome in ("tls_rejected", "non_ssh_data") else 3, out)
                 self.assertTrue(any("over ipv6" in c and "management" in c for c in self.not_passed(out)))
         # IPv4 management is never waived.
         self.http.mgmt6 = {"outcome": "ssh_banner"}
@@ -706,7 +706,7 @@ class VerifyTest(Base):
 
     def test_a_vantage_or_dns_limit_on_management_is_never_an_undo_signal(self):
         for expect in ("restricted", "restored"):
-            for outcome in ("timeout", "no_route", "no_aaaa", "no_address", "error"):
+            for outcome in ("timeout", "no_route", "no_aaaa", "no_address", "error", "tcp_refused", "tcp_reset"):
                 for family in ("ipv4", "ipv6"):
                     with self.subTest(expect=expect, outcome=outcome, family=family):
                         self.http = FakeHttp(restricted=expect == "restricted")
@@ -786,14 +786,8 @@ class DefaultClosedSetTest(Base):
         with contextlib.redirect_stderr(err), mock.patch.object(cf_only, "main", side_effect=RuntimeError("boom-detail")):
             self.assertEqual(cf_only.cli([]), 4)
         self.assertNotIn("boom-detail", err.getvalue())
-        # a record_verify failure (disk full, permissions) is an error, not an open verdict
-        err, out = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out), \
-                mock.patch.object(cf_only, "real_clients", lambda a, env: self.clients()), \
-                mock.patch.object(cf_only, "record_verify", side_effect=OSError("disk-full-detail")):
-            code = cf_only.cli(["verify", *self.verify_args(expect="restricted")])
-        self.assertEqual((code, out.getvalue()), (4, ""))
-        self.assertNotIn("disk-full-detail", err.getvalue())
+        self.assertIn("do NOT treat this as closed", err.getvalue())
+        self.assertIn("do NOT undo on this alone", err.getvalue())
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             cf_only.cli(["verify"])
         self.assertEqual(raised.exception.code, 2)
@@ -848,6 +842,51 @@ class DefaultClosedSetTest(Base):
         self.http = FakeHttp()
         self.http.info_map["node.tinycloud.xyz"] = {"status": 502, "node_id": None}  # an HTTP answer: no such hedge
         self.assertNotIn("second network before undo", json.loads(self.verify()[1])["next_action"])
+
+    def test_management_refused_or_reset_at_connect_is_pre_sni_and_exit_3_but_post_accept_failures_are_open(self):
+        # M6: same gateway IP:443, so a connect-time refusal/reset cannot be about this app (M1 gateway-wide outage, M2 mgmt
+        # refused, B local REJECT), even with a CORRECT restriction in place. Post-accept failures stay open.
+        for family in ("ipv4", "ipv6"):
+            for outcome in ("tcp_refused", "tcp_reset"):
+                with self.subTest(family=family, outcome=outcome):
+                    self.http = FakeHttp()
+                    setattr(self.http, "mgmt" if family == "ipv4" else "mgmt6", {"outcome": outcome})
+                    code, out, err = self.verify()
+                    self.assertEqual((code, json.loads(out)["verdict"]), (3, "not_proven_closed"), out)
+            for outcome in ("reset_after_connect", "tls_rejected", "closed_after_tls", "non_ssh_data", "malformed_http",
+                            "http_200_unparsed", "http_502"):
+                with self.subTest(family=family, outcome=outcome):
+                    self.http = FakeHttp()
+                    setattr(self.http, "mgmt" if family == "ipv4" else "mgmt6", {"outcome": outcome})
+                    code, out, err = self.verify()
+                    self.assertEqual((code, json.loads(out)["verdict"]), (1, "open"), out)
+        # whole gateway down (M1): every probe and management refused, correct restriction: still hold, not undo
+        self.http = FakeHttp()
+        self.http.mgmt = self.http.mgmt6 = {"outcome": "tcp_refused"}
+        code, out, err = self.verify()
+        self.assertEqual(code, 3, out)
+        self.assertIn("SSH-2.0 banner", json.loads(out)["next_action"])  # the exit-3 checklist names the management check
+
+    def test_a_receipt_write_failure_never_turns_a_verdict_into_exit_4(self):
+        # S10: record_verify runs before emit; a leftover .record, a full disk or bad permissions must not mask OPEN.
+        leftover = self.receipt.with_name(self.receipt.name + ".record")
+        leftover.write_text("{}")
+        for restricted, expected in ((False, (1, "open")), (True, (3, "not_proven_closed"))):
+            with self.subTest(restricted=restricted):
+                self.http = FakeHttp(restricted=restricted)
+                before = self.receipt.read_text()
+                code, out, err = self.verify()
+                result = json.loads(out)
+                self.assertEqual((code, result["verdict"]), expected, out)
+                self.assertTrue(result["receipt_record"].startswith("FAILED"), result["receipt_record"])
+                self.assertIn("Warning", err)
+                self.assertEqual(self.receipt.read_text(), before)
+        leftover.unlink()
+        self.http = FakeHttp(restricted=False)
+        with mock.patch.object(cf_only, "record_verify", side_effect=OSError("disk-full-detail")):
+            code, out, err = self.verify()
+        self.assertEqual((code, json.loads(out)["verdict"]), (1, "open"))
+        self.assertNotIn("disk-full-detail", err + out)
 
     def closed_checks(self, out):
         return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]
