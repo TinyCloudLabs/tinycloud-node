@@ -173,6 +173,48 @@ services:
         max-buffer-size: 4m
         cache-disabled: "true"
 
+  # TC-4194 P1: Cloudflare Tunnel connector. Outbound-only: it dials
+  # Cloudflare's edge and carries Cloudflare-side routes to the node over the
+  # default compose network, so it publishes NO ports. The tunnel's ingress
+  # rules are remote-managed in Cloudflare; the connector credential is the
+  # sealed CLOUDFLARE_TUNNEL_TOKEN, delivered as an environment variable
+  # (the same path as CLOUDFLARE_API_TOKEN above; no compose secrets/configs).
+  #
+  # Empty-secret behaviour: the token is optional (`:-`, not `:?`), so a deploy
+  # that has no tunnel yet still renders and starts the rest of the stack.
+  # docker.yml writes the variable only when the GitHub secret is set. With the
+  # token empty this container is expected to exit at startup (`tunnel run`
+  # has no credential) and Docker restarts it with backoff; it never takes the
+  # node, ingress or log shipper down and carries no traffic. That is
+  # deliberate: a compose profile would need COMPOSE_PROFILES delivered through
+  # the same sealed environment, and the guest's profile handling is not
+  # verified here.
+  #
+  # Logs: labelled for the log shipper, which only admits tinycloud-node and
+  # tinycloud-ingress. cloudflared lines are therefore counted and dropped
+  # (reason unexpected_label), never shipped, until a sanitizer exists.
+  cloudflared:
+    image: cloudflare/cloudflared:2026.11.2@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    labels:
+      tc.logship: tinycloud-cloudflared
+    logging:
+      driver: gelf
+      options:
+        gelf-address: udp://127.0.0.1:12201
+        gelf-compression-type: none
+        labels: tc.logship
+        mode: non-blocking
+        max-buffer-size: 4m
+        cache-disabled: "true"
+
   # The dstack gateway's TLS-terminating routes (<app>-<port>.<domain>:443)
   # only forward to compose-published ports, so guest sshd on :22 is
   # unreachable via `phala ssh` even with authorized_keys installed.

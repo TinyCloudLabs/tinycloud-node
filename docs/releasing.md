@@ -423,6 +423,15 @@ Environment settings (Settings → Environments → `production`):
   reviewed compose hash). Its value must be at least 32 bytes (generate it with
   `openssl rand -hex 32`; a shorter value disables the route) and must differ from
   `PROD_TINYCLOUD_ADMIN_SECRET`; the node disables the route if they are equal.
+- `PROD_TINYCLOUD_CLOUDFLARE_TUNNEL_TOKEN` (TC-4194) is the connector token of
+  the Cloudflare Tunnel run by the `cloudflared` compose service. It is
+  optional and deliberately not in the required list: `docker.yml` passes it
+  as `PHALA_ENV_CLOUDFLARE_TUNNEL_TOKEN` and writes `CLOUDFLARE_TUNNEL_TOKEN`
+  into the sealed env only when it is set and single-line. Unset, the node,
+  ingress and log shipper deploy unchanged and the connector (no published
+  ports) cannot authenticate. After a deploy has sealed it, the CVM's
+  `allowed_envs` contains the name and `sync.mjs` refuses any later deploy
+  that omits the secret, so the tunnel cannot be dropped by accident.
 
 What this blocks: a dispatch on an unlocked branch fails the environment's
 branch policy, even if that branch edits `docker.yml` to name the environment.
@@ -731,7 +740,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`**
+  **`d90637f302d6870eeab320718431d71a7e00392480872b4598621b150b1d7160`**
+  (raw `3a29eb8625694506f4fd3277a6d29390a5e5898ed8bd05e3b6d25b852d772ffa` normalized). Before the TC-4194 `cloudflared` connector service (pinned by digest, no published ports, optional sealed `CLOUDFLARE_TUNNEL_TOKEN`) the template was `8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`
   (raw `7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e` normalized). Before TC-3973 startup diagnostics and reindex counts in the Vector config the template was `e0f99bcca6f220c65d81cad15504790099d634243ea701350a509e995b672aa0`
   (raw `a8fb25f7c3608cbf69911d054825fd4dd0da0a9a78fc5c8ff7701bf346693b6b` normalized). Before the TC-3284 named node diagnostics (every node warning and error message mapped to its own `event_code`) in the Vector config the template was `97a180a43ec70c7950e717417c5455b13ede1a3adab5a196f65b5aa21dcc5271`
   (raw `bced82d3f0e975c176cf35b72cea0bc26c9aa4acf5212304b946c068db1d6394` normalized); before the TC-3284 deletion ledger error events (`deletion_ledger_open_failed`, `deletion_ledger_replay_failed`, `deletion_ledger_unrepaired`) in the Vector config the template was `db348152c6b7a03beb42373299400b35bc0badf8b188988d9406192b4b88a540`
@@ -946,7 +956,7 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e`
+`3a29eb8625694506f4fd3277a6d29390a5e5898ed8bd05e3b6d25b852d772ffa`
 (the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code`, TC-3284 deletion ledger error event and TC-3284 named node diagnostics and TC-3973 startup events in the Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**

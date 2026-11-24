@@ -159,6 +159,7 @@ Repository-level production secrets used only by `environment: production` jobs:
 | `PROD_TINYCLOUD_AWS_ACCESS_KEY_ID`, `PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY`, `PROD_TINYCLOUD_AWS_REGION` | deploy-phala | no |
 | `PROD_TINYCLOUD_S3_BUCKET`, `PROD_TINYCLOUD_S3_ENDPOINT` | deploy-phala | no |
 | `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN` | deploy-phala | no |
+| `PROD_TINYCLOUD_CLOUDFLARE_TUNNEL_TOKEN` (TC-4194, optional) | deploy-phala | not created yet; create it in the `production` environment, not at repository level |
 | `PROD_TINYCLOUD_QUOTA_URL` | deploy-phala | no |
 | `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64` | deploy-phala | no |
 
