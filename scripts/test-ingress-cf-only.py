@@ -75,6 +75,10 @@ class FakeCf:
         return self.state["worker"]
 
 
+ADDR = {"ipv4": "192.0.2.10", "ipv6": "2001:db8::10"}  # one SNI-routed gateway address per family, shared by every host
+INSTANCE_MGMT = f"{INSTANCE}-10022.{GATEWAY}"
+
+
 class FakeHttp:
     """Models a restricted gateway by default; override per host to model other signals."""
 
@@ -83,6 +87,9 @@ class FakeHttp:
         self.probe_map = {}
         self.restricted = restricted
         self.mgmt = {"outcome": "ssh_banner"}
+        self.instance_mgmt = {"outcome": "ssh_banner"}
+        self.controls = {}  # address -> signal of the same-address positive control (default: ssh_banner)
+        self.control_calls = []
         self.probes = []
 
     def info(self, host):
@@ -91,12 +98,22 @@ class FakeHttp:
     def probe(self, host, family, port=443):
         self.probes.append((host, family, port))
         if (host, family) in self.probe_map:
-            return self.probe_map[(host, family)]
-        return {"outcome": "tcp_refused"} if self.restricted else {"outcome": "node_info", "node_id": NODE}
+            result = self.probe_map[(host, family)]
+        else:
+            result = {"outcome": "tcp_refused"} if self.restricted else {"outcome": "node_info", "node_id": NODE}
+        if "addresses" not in result and result["outcome"] not in ("no_address", "no_aaaa"):
+            signals = result.get("signals") or [result["outcome"]]
+            result = dict(result, addresses=[ADDR[family]] * len(signals))
+        return result
 
     def mgmt_probe(self, host, family="ipv4", port=443):
-        assert (host, family, port) == (MGMT, "ipv4", 443), (host, family, port)
-        return self.mgmt
+        assert (family, port) == ("ipv4", 443) and host in (MGMT, INSTANCE_MGMT), (host, family, port)
+        return self.mgmt if host == MGMT else self.instance_mgmt
+
+    def control(self, address, family, sni):
+        assert sni == MGMT, sni
+        self.control_calls.append((address, family))
+        return self.controls.get(address, "ssh_banner")
 
 
 class Base(unittest.TestCase):
@@ -530,15 +547,81 @@ class VerifyTest(Base):
         self.save(self.receipt, other)
         self.assertEqual(self.verify()[0], 0)
 
-    def test_management_is_expected_denied_when_the_policy_denies_it(self):
+    def test_management_denied_by_the_policy_cannot_be_corroborated_so_verify_fails(self):
         snap = json.loads(self.snapshot.read_text())
         self.save(self.snapshot, dict(snap, after={"restrict_mode": True, "ports": []}))
-        self.http.mgmt = {"outcome": "tcp_refused"}
-        self.assertEqual(self.verify()[0], 0)
-        for outcome in ("ssh_banner", "timeout", "tls_rejected", "http_404"):
+        for outcome in ("tcp_refused", "ssh_banner", "timeout", "tls_rejected", "http_404"):
             with self.subTest(outcome):
+                self.http = FakeHttp()
                 self.http.mgmt = {"outcome": outcome}
-                self.assertEqual(self.verify()[0], 1)
+                code, out, err = self.verify()
+                self.assertEqual(code, 1, out)
+                failed = " ".join(self.not_passed(out))
+                self.assertIn("management route", failed)
+                self.assertIn("--instance-id", failed)  # no known-open SNI exists to bind it either
+        self.assertEqual(self.http.control_calls, [])
+
+    def test_a_refusal_counts_only_with_a_same_address_positive_control_and_addresses_are_recorded(self):
+        code, out, err = self.verify()
+        self.assertEqual(code, 0, out)
+        checks = {c["check"]: c for c in json.loads(out)["checks"]}
+        refused = [c for c in checks.values() if "positively refused" in c["check"]]
+        self.assertTrue(refused)
+        for c in refused:
+            family = "ipv6" if " ipv6 " in c["check"] else "ipv4"
+            self.assertEqual(c["addresses"], [ADDR[family]])
+            self.assertEqual(c["controls"], {ADDR[family]: "ssh_banner"})
+        # One control per distinct address, over both families, with the real app's management host.
+        self.assertEqual(sorted(set(self.http.control_calls)), sorted({(ADDR["ipv4"], "ipv4"), (ADDR["ipv6"], "ipv6")}))
+        self.assertEqual(len(self.http.control_calls), 2)
+
+    def test_a_refusal_the_gateway_cannot_have_produced_fails_when_the_control_fails(self):
+        # Open gateway plus a local or on-path REJECT: every refusal looks closed, but the same address does not
+        # complete a TLS/SNI connect for the known-open host either, or does not answer SSH.
+        for control_signal in ("tcp_refused", "timeout", "tls_rejected", "no_route", "non_ssh_data", "http_404"):
+            for family in ("ipv4", "ipv6"):
+                with self.subTest(control=control_signal, family=family):
+                    self.http = FakeHttp()
+                    self.http.controls[ADDR[family]] = control_signal
+                    code, out, err = self.verify()
+                    self.assertEqual(code, 1, out)
+                    bad = [c for c in json.loads(out)["checks"] if c["status"] != "pass"]
+                    self.assertTrue(bad and all(family in c["check"] and "positive control" in c["detail"] for c in bad), bad)
+                    self.assertTrue(all(c["controls"] == {ADDR[family]: control_signal} for c in bad))
+
+    def test_a_reset_is_closed_only_with_the_control_and_a_missing_address_never_passes(self):
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_reset"}
+        self.assertEqual(self.verify()[0], 0)
+        self.http.controls[ADDR["ipv4"]] = "timeout"
+        self.assertEqual(self.verify()[0], 1)
+        self.http = FakeHttp()
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_refused", "signals": ["tcp_refused"],
+                                                           "addresses": []}
+        code, out, err = self.verify()
+        self.assertEqual(code, 1, out)
+        self.assertIn("no resolved address", out)
+
+    def test_an_instance_id_typo_cannot_read_as_closed(self):
+        # The gateway answers an unknown instance SNI like a closed one; the typo'd instance has no management route.
+        for outcome in ("tcp_refused", "tcp_reset", "tls_rejected", "closed_after_tls", "timeout", "http_404"):
+            with self.subTest(outcome):
+                self.http = FakeHttp()
+                self.http.instance_mgmt = {"outcome": outcome}
+                code, out, err = self.verify()
+                self.assertEqual(code, 1, out)
+                self.assertTrue(any("--instance-id is a real gateway host" in c for c in self.not_passed(out)))
+
+    def test_extra_hosts_must_belong_to_the_app_or_instance(self):
+        good = f"{APP}-9999.{GATEWAY}"
+        code, out, err = self.verify("--extra-host", good)
+        self.assertEqual(code, 0, out)
+        self.assertIn(good, [h for h, f, p in self.http.probes])
+        for bad in (f"{'c' * 40}-8000.{GATEWAY}", "other.example.test", f"{APP}-8000.elsewhere.example.test"):
+            with self.subTest(bad):
+                self.http = FakeHttp()
+                code, out, err = self.verify("--extra-host", bad)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.http.probes, [])
 
     def test_restored_expectation_needs_tee_to_serve_the_same_node(self):
         self.http = FakeHttp(restricted=False)
@@ -819,7 +902,8 @@ class ProbeClassifierTest(unittest.TestCase):
 
     def test_content_length_200_with_a_node_id_is_node_info(self):
         port = self.serve(self.respond(200, self.INFO))
-        self.assertEqual(self.result(port), {"outcome": "node_info", "signals": ["node_info"], "node_id": NODE})
+        self.assertEqual(self.result(port), {"outcome": "node_info", "signals": ["node_info"], "node_id": NODE,
+                                              "addresses": ["127.0.0.1"]})
 
     def test_a_chunked_200_with_a_node_id_is_node_info_not_closed(self):
         port = self.serve(self.respond(200, self.INFO, chunked=True))
@@ -856,6 +940,18 @@ class ProbeClassifierTest(unittest.TestCase):
         result = self.result(port)
         self.assertEqual(result["signals"], ["tcp_refused"])
         self.assertEqual(cf_only.judge_closed(result)[0], "pass")
+
+    def test_probe_records_resolved_addresses_and_control_uses_the_same_exact_address(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.close()
+        result = self.result(port)
+        self.assertEqual((result["signals"], result["addresses"]), (["tcp_refused"], ["127.0.0.1"]))
+        banner_port = self.serve(lambda tls: tls.sendall(b"SSH-2.0-OpenSSH_9.6\r\n"))
+        self.assertEqual(self.probe.control("127.0.0.1", "ipv4", "known-open.example.test", port=banner_port), "ssh_banner")
+        self.assertEqual(self.probe.control("127.0.0.1", "ipv4", "known-open.example.test", port=port), "tcp_refused")
+        self.assertEqual(self.probe.control("127.0.0.1", "ipv4", "x.example.test", port=self.serve("alert")), "tls_rejected")
 
     def test_unresolvable_name_is_no_address(self):
         self.assertEqual(self.probe.probe("no-such-host.invalid", "ipv4", 443)["signals"], ["no_address"])
@@ -904,7 +1000,7 @@ class ProbeClassifierTest(unittest.TestCase):
         self.assertEqual(self.result(self.serve(lambda tls: None), banner=True)["signals"], ["closed_after_tls"])
         self.assertEqual(cf_only.judge_management({"signals": ["non_ssh_data"]}, True)[0], "fail")
         self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, True)[0], "pass")
-        self.assertEqual(cf_only.judge_management({"signals": ["tcp_refused"]}, False)[0], "pass")
+        self.assertEqual(cf_only.judge_management({"signals": ["tcp_refused"]}, False)[0], "fail")  # not corroborable
         self.assertEqual(cf_only.judge_management({"signals": ["tls_rejected"]}, False)[0], "fail")
         self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, False)[0], "fail")
 

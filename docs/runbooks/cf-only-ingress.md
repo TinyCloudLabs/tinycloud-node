@@ -183,6 +183,32 @@ operator flag. Checks:
 
 - `/info` on `node.tinycloud.xyz` and on the tunnel host is 200 with the receipt's
   node id (equal ids): otherwise FAIL;
+- **`--instance-id` and `--extra-host` are bound to evidence.** The gateway probably
+  answers an unknown SNI (a typo) like a closed one, so a typo could read as "closed".
+  The instance id passes only if its own route `<instance>-10022.<gateway>:443` answers an
+  `SSH-2.0-` banner [INFERENCE: that the instance has this route]; otherwise FAIL (always
+  FAIL when management is denied). An `--extra-host` must be
+  `<app-id|instance-id>-<port>.<gateway-domain>` or the command is refused before any
+  probe. There is no `--accept-closed-signal` flag; it was removed;
+- **A refusal counts only with a same-address positive control (M3).** A TCP refusal on a
+  shared SNI-routed IP cannot be app-specific: it is also what a local or on-path
+  REJECT or ICMP port-unreachable, a wrong `/etc/hosts` or split-horizon/stale/DNS64
+  answer, or a gateway-wide outage produces. So for every address a probe resolved and
+  found refused or reset, `verify` connects to **that exact IP** (same family) with TLS
+  SNI `<app-id>-10022.<gateway>` and requires an `SSH-2.0-` banner. If that control
+  fails (refused, timeout, TLS alert, HTTP, anything else) the check **FAILs**, never
+  passes. The resolved addresses and the control result are printed per check
+  (`addresses`, `controls`). A refusal with no recorded address fails. IPv6 addresses
+  get the same control over IPv6 (the control dials the address the probe resolved, so
+  it does not depend on the management name having an AAAA record). **What this still
+  cannot exclude [INFERENCE]:** a path that selectively rejects only the app's SNI after
+  the handshake begins, and a gateway that was open for the control at one instant and
+  closed for the probe at another; the control and the probe are separate connections
+  seconds apart, from one vantage. Also, a plain TCP `tcp_refused` for a host whose IP
+  completes TLS for the control is self-contradictory on a shared IP, so on a shared IP
+  the check will normally pass only on a reset or equivalent after the SNI is seen
+  (`tcp_reset`); what a closed gateway really returns is **unobserved**, so expect FAIL
+  until a drill records it;
 - fresh connections to `tee.node.tinycloud.xyz` and to the app and instance
   gateway hosts `-8000`, `-8000g`, `-443`, `-443s`, `-443g` (plus any
   `--extra-host`) over **IPv4 and IPv6** must each be positively refused. An IPv6
@@ -201,10 +227,12 @@ operator flag. Checks:
   `port_mappings` required empty), not a host port 10022. The probe does TLS with that
   SNI on 443 and requires an `SSH-2.0-` banner for "open"; the host is derived from
   `--expect-app-id` and `--gateway-domain`. Expected open (the snapshot policy keeps
-  10022): only a banner passes. Expected denied: only a positive refusal passes (a
-  banner, a TLS alert, HTTP or a timeout fail). If `phala ssh` actually reaches
-  management another way, this check is wrong and must be corrected from evidence
-  before relying on it. Key-authenticated access is not tested;
+  10022): only a banner passes. Expected denied: **always FAIL**, because with
+  management denied no known-open SNI exists for the positive control above, so a
+  refusal cannot be corroborated (a banner, a TLS alert, HTTP or a timeout fail too). If
+  `phala ssh` actually reaches management another way, this check and the controls are
+  wrong and must be corrected from evidence before relying on them. Key-authenticated
+  access is not tested;
 - the receipt (owner-only file) is not older than `--max-receipt-age` (default 3600 s),
   names the same tunnel host as `--tunnel-host` and the same tunnel id as the
   snapshot's recorded origin, and the snapshot is an owner-only file for the same app.

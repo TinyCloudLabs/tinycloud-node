@@ -283,11 +283,17 @@ class NetworkProbe:
             return {"outcome": failure, "signals": [failure]}
         attempts = [self._attempt(address, host, banner) for address in addresses]
         signals = [signal for signal, _ in attempts]
-        result = {"signals": signals, "outcome": signals[0] if len(set(signals)) == 1 else "mixed"}
+        result = {"signals": signals, "outcome": signals[0] if len(set(signals)) == 1 else "mixed",
+                  "addresses": [address[0] for address in addresses]}
         for signal, node_id in attempts:
             if signal == "node_info":
-                return {"outcome": "node_info", "signals": signals, "node_id": node_id}
+                return dict(result, outcome="node_info", node_id=node_id)
         return result
+
+    def control(self, address, family, sni, port=443):
+        """Positive control: a TLS/SNI connection to this exact address with a known-open SNI. -> signal token.
+        A refusal counts as the gateway closing an app only if this completes (ssh_banner)."""
+        return self._attempt((address, port), sni, True)[0]
 
     def probe(self, host, family, port=443):
         """Fresh HTTPS /info request with SNI/Host `host` -> {'outcome', 'signals', 'node_id'?}"""
@@ -521,13 +527,23 @@ def direct_hosts(a):
     hosts = [TEE_HOST]
     for ident in (a.expect_app_id, a.instance_id):
         hosts += [f"{ident}-{suffix}.{gateway}" for suffix in GATEWAY_SUFFIXES]
-    hosts += [host_name(h, "extra") for h in getattr(a, "extra_host", None) or []]
+    for extra in getattr(a, "extra_host", None) or []:
+        # An extra host must belong to the app or the instance, so a typo cannot name an unknown SNI.
+        require(host_name(extra, "extra").endswith("." + gateway)
+                and extra.startswith((a.expect_app_id + "-", a.instance_id + "-")),
+                "--extra-host must be <app-id|instance-id>-<port>.<gateway-domain>")
+        hosts.append(extra)
     return list(dict.fromkeys(hosts))
 
 
 def management_host(a):
     """INFERENCE: management is the gateway route <app>-10022.<gateway>:443 (compose comment), not a host port."""
     return f"{a.expect_app_id}-{MANAGEMENT_PORT}.{host_name(a.gateway_domain, 'gateway')}"
+
+
+def instance_management_host(a):
+    """INFERENCE: the instance id has the same -10022 route as the app id."""
+    return f"{a.instance_id}-{MANAGEMENT_PORT}.{host_name(a.gateway_domain, 'gateway')}"
 
 
 def management_allowed(policy):
@@ -544,9 +560,9 @@ def load_private_snapshot(path):
     return snap
 
 
-def check(name, status, detail):
+def check(name, status, detail, **evidence):
     assert status in ("pass", "fail")
-    return {"check": name, "status": status, "ok": status == "pass", "detail": detail}
+    return dict({"check": name, "status": status, "ok": status == "pass", "detail": detail}, **evidence)
 
 
 def signals_of(result):
@@ -573,9 +589,10 @@ def judge_management(result, expect_open):
         if all(s == "ssh_banner" for s in signals):
             return "pass", "SSH-2.0 banner read through the gateway route"
         return "fail", "no SSH banner: " + ",".join(signals)
-    if all(s in CLOSED_SIGNALS for s in signals):
-        return "pass", ",".join(signals)
-    return "fail", ",".join(signals) + " is not a positive refusal (open or unknown)"
+    if "ssh_banner" in signals:
+        return "fail", "management still answers although the policy denies it"
+    return "fail", ",".join(signals) + (": a refusal of the management route cannot be corroborated, because no "
+                                        "known-open SNI exists on the gateway when management is denied")
 
 
 def verify(a, clients, now):
@@ -604,14 +621,53 @@ def verify(a, clients, now):
                             f"status={info.get('status')} node_id_matches={info.get('node_id') == node}"))
 
     waived = []
+    mgmt_open = management_allowed(snap["after"]) if a.expect == "restricted" else None
+    controls = {}
+
+    def control(address, family):
+        """Same-address positive control: TLS/SNI to this very IP with the REAL app's management host."""
+        if address not in controls:
+            controls[address] = http.control(address, family, mgmt)
+        return controls[address]
+
     if a.expect == "restricted":
+        # The instance id is operator input; bind it to evidence by requiring its own management route to answer.
+        inst = instance_management_host(a)
+        if mgmt_open:
+            res = http.mgmt_probe(inst, "ipv4")
+            ok = all(s == "ssh_banner" for s in signals_of(res))
+            detail = "SSH-2.0 banner through the instance route" if ok else "no SSH banner: " + ",".join(signals_of(res))
+        else:
+            ok, detail = False, "no known-open SNI exists when the policy denies management"
+        checks.append(check(f"--instance-id is a real gateway host (positive control {inst}:443) [INFERENCE: route]",
+                            "pass" if ok else "fail", detail))
         for name in hosts:
             for family in ("ipv4", "ipv6"):
                 result = http.probe(name, family, 443)
                 status, detail = judge_closed(result, family, a.allow_no_aaaa)
-                if status == "pass" and "no_aaaa" in signals_of(result):
+                signals, addresses = signals_of(result), list(result.get("addresses") or [])
+                evidence = {"addresses": addresses, "controls": {}}
+                if status == "pass" and any(s in CLOSED_SIGNALS for s in signals):
+                    if len(addresses) != len(signals):
+                        status, detail = "fail", "no resolved address was recorded for the refusal: " + detail
+                    elif not mgmt_open:
+                        status, detail = "fail", ("a refusal cannot be corroborated: the policy denies management, so no "
+                                                 "known-open SNI exists for a same-address control")
+                    else:
+                        for address, signal in zip(addresses, signals):
+                            if signal not in CLOSED_SIGNALS:
+                                continue
+                            evidence["controls"][address] = control(address, family)
+                            if evidence["controls"][address] != "ssh_banner":
+                                status, detail = "fail", (f"positive control to {address} with SNI {mgmt} returned "
+                                                          f"{evidence['controls'][address]}: the refusal is not shown to come "
+                                                          "from the gateway closing this app (local/on-path reject, wrong "
+                                                          "address or a gateway-wide outage)")
+                                break
+                if status == "pass" and "no_aaaa" in signals:
                     waived.append(name)
-                checks.append(check(f"{name} fresh {family} connection is positively refused", status, detail))
+                checks.append(check(f"{name} fresh {family} connection is positively refused, corroborated by a "
+                                    "same-address positive control", status, detail, **evidence))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
