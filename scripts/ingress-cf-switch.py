@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -29,6 +30,8 @@ SNAPSHOT_FORMAT = 2
 VOLATILE_RULE_KEYS = {"id", "version", "last_updated", "ref"}
 HOST_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
 ZONE_RE = re.compile(r"[0-9a-f]{32}")
+ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+STATUSES = ("pending", "applied", "undone", "aborted")
 DEFAULT_HOST = "tee.node.tinycloud.xyz"
 ALWAYS_PROTECTED = "node.tinycloud.xyz"  # may not be targeted, whatever other flags say
 LIMITS = [
@@ -157,6 +160,11 @@ def norm_rule(rule):
 class LeverBase:
     needs_proxied = True  # lever is inert unless the host is proxied through Cloudflare
     zone_wide = False
+    created = None  # what apply created (the WAF rule id); persisted in the snapshot
+
+    def pinned(self, current, snap):
+        """True if undo may treat the current state as the one this snapshot's apply created."""
+        return True
 
     def gates(self, before):
         """(flag attribute, message) pairs: refused at apply unless the matching --flag is given."""
@@ -216,21 +224,59 @@ class WafLever(LeverBase):
     def rest_equal(self, current, before):
         return self._others(current) == self._others(before)
 
+    def pinned(self, current, snap):
+        """Undo owns the marker rule only if its id was recorded at apply and that rule is still present."""
+        rid = (snap.get("created") or {}).get("rule_id")
+        return bool(rid) and any(r.get("id") == rid for r in current["rules"])
+
+    def _pin(self, known, strict):
+        """Record the id of the one new marker rule (the POST result is not trusted to carry it)."""
+        try:
+            after = self.read()
+        except Exception:
+            if strict:
+                raise
+            return
+        new = [r for r in self._ours(after["rules"]) if r.get("id") and r["id"] not in known]
+        if len(new) == 1:
+            self.created = {"rule_id": new[0]["id"], "ruleset_id": after["id"]}
+        elif strict:
+            raise Refused(f"After the write {len(new)} new marker rules are visible (expected exactly 1), so the "
+                          "created rule's id could not be pinned. Inspect the zone's custom rules by hand")
+
     def write(self, state, previous=None):
-        """Rule-level writes only: add or delete OUR rule; no other rule is ever sent."""
+        """Rule-level writes only: add or delete OUR rule (by the id recorded at apply); no other rule is sent."""
         current = self.read()
         if self._ours(state["rules"]):  # apply
             require(not self._ours(current["rules"]), "Our rule appeared since the plan; re-run plan")
             if previous is not None and previous["exists"]:
                 require(current["exists"] and current["id"] == previous["id"],
                         "The custom-rules ruleset changed identity since the plan; re-run plan")
-            if current["exists"]:
-                self.client.add_rule(self.zone, current["id"], self.rule(), 1)
-            else:
-                self.client.create_entrypoint(self.zone, [self.rule()])
-        else:  # restore: delete exactly the rule(s) carrying our marker
-            for rule in self._ours(current["rules"]):
-                self.client.delete_rule(self.zone, current["id"], rule["id"])
+            known = {r.get("id") for r in current["rules"]}
+            try:
+                if current["exists"]:
+                    self.client.add_rule(self.zone, current["id"], self.rule(), 1)
+                else:
+                    self.client.create_entrypoint(self.zone, [self.rule()])
+            except Exception:
+                self._pin(known, strict=False)  # a timed-out POST may still have created the rule
+                raise
+            self._pin(known, strict=True)
+            return
+        rid = (self.created or {}).get("rule_id")  # restore
+        ours = self._ours(current["rules"])
+        if rid:
+            require(any(r.get("id") == rid for r in ours),
+                    f"The rule this snapshot created ({tail(rid)}) is not present; nothing was deleted. A marker "
+                    "rule that is present belongs to another apply: undo it with that apply's snapshot")
+            self.client.delete_rule(self.zone, current["id"], rid)
+            return
+        known = {r.get("id") for r in state["rules"]}  # apply never recorded an id (it did not finish)
+        found = [r for r in ours if r.get("id") not in known]
+        require(len(found) <= 1, "No rule id was recorded and several marker rules exist; refusing to guess. "
+                "Delete them by hand")
+        for rule in found:
+            self.client.delete_rule(self.zone, current["id"], rule["id"])
 
     def describe(self, before, after):
         others = self._others(before)
@@ -241,8 +287,9 @@ class WafLever(LeverBase):
                  "existing_rules": {"count": len(others), "sha256": digest(others)},
                  "entrypoint_existed": before["exists"],
                  "api_shape": "[INFERENCE: not run]"},
-                {"call": "DELETE zones/<zone>/rulesets/<id>/rules/<id of the rule carrying the marker>",
-                 "removes": "only the rule carrying this tool's marker; no other rule is written",
+                {"call": "DELETE zones/<zone>/rulesets/<id>/rules/<the rule id recorded in the snapshot at apply>",
+                 "removes": "only the rule this apply created (its id is recorded in the snapshot); no other rule "
+                            "is written",
                  "expected_remaining_rules": {"count": len(before["rules"]), "sha256": digest(before["rules"])},
                  "note": "an entrypoint that did not exist stays as an empty ruleset",
                  "api_shape": "[INFERENCE: not run]"})
@@ -389,7 +436,9 @@ class DnsBase(LeverBase):
         current = self.read_lenient()
         if previous is not None and previous["present"]:
             require(current["present"] and current["record"]["id"] == previous["record"]["id"],
-                    "The DNS record is not the one that was planned (id changed or gone); re-run plan")
+                    "The DNS record is not the one that was planned or recorded (its id changed, or it is gone). "
+                    "Nothing was written. Next step: run `plan` against the current record and use that run's "
+                    "snapshot, or set proxied/ttl by hand from `before` in this snapshot")
         self._send(state, current)
 
     def _send(self, state, current):
@@ -556,6 +605,45 @@ def replace_private(path, value):
         raise
 
 
+def check_target(host, protect):
+    for protected in protect:
+        require(host != protected and not protected.endswith("." + host),
+                f"The target host must not be, or be a parent of, a protected host ({protected})")
+
+
+def _id_ok(value, optional=False):
+    return (optional and value is None) or (isinstance(value, str) and ID_RE.fullmatch(value) is not None)
+
+
+def validate_snapshot_state(snap):
+    """Everything that ends up in a URL path or a request body is re-validated: the file is untrusted input."""
+    lever, host, params = snap["lever"], snap["host"], snap.get("params")
+    require(isinstance(params, dict), "Snapshot params invalid")
+    before, after = snap.get("before"), snap.get("after")
+    require(isinstance(before, dict) and isinstance(after, dict), "Snapshot states invalid")
+    if lever == "waf":
+        require(params.get("action") in WAF_ACTIONS, "Snapshot action invalid")
+        for state in (before, after):
+            require(_id_ok(state.get("id"), True) and isinstance(state.get("rules"), list), "Snapshot rules invalid")
+        created = snap.get("created")
+        require(created is None or (isinstance(created, dict) and _id_ok(created.get("rule_id"))
+                                    and _id_ok(created.get("ruleset_id"))), "Snapshot created-rule id invalid")
+    elif lever == "worker-route":
+        for state in (before, after):
+            require(_id_ok(state.get("id")) and state.get("pattern") == f"{host}/*", "Snapshot route invalid")
+    elif lever == "security-level":
+        for state in (before, after):
+            require(isinstance(state.get("value"), str) and re.fullmatch(r"[a-z_]{1,32}", state["value"]),
+                    "Snapshot security level invalid")
+    else:
+        require(params.get("expect_type") in DNS_TYPES, "Snapshot expected record type invalid")
+        for state in (before, after):
+            record = state.get("record")
+            require(isinstance(state.get("present"), bool) and (record is None or (
+                isinstance(record, dict) and _id_ok(record.get("id")) and record.get("name") == host
+                and record.get("type") in DNS_TYPES)), "Snapshot DNS record invalid")
+
+
 def load_snapshot(path):
     info = os.lstat(path)
     require(stat.S_ISREG(info.st_mode), "Snapshot must be a regular file (symlinks refused)")
@@ -565,16 +653,23 @@ def load_snapshot(path):
     require(isinstance(snap, dict) and snap.get("format") == SNAPSHOT_FORMAT and snap.get("lever") in LEVERS,
             "Unrecognised snapshot")
     # The snapshot is trusted input only after the same validation as command-line input (ids go into URLs).
+    require(snap.get("status") in STATUSES, "Snapshot status invalid")
+    require(isinstance(snap.get("undo_token"), str) and re.fullmatch(r"[0-9a-f]{64}", snap["undo_token"]),
+            "Snapshot undo token invalid")
     require(isinstance(snap.get("zone_id"), str) and ZONE_RE.fullmatch(snap["zone_id"]), "Snapshot zone id invalid")
     require(isinstance(snap.get("host"), str) and HOST_RE.fullmatch(snap["host"]), "Snapshot host invalid")
     hosts = snap.get("protect_hosts")
     require(isinstance(hosts, list) and ALWAYS_PROTECTED in hosts
             and all(isinstance(h, str) and HOST_RE.fullmatch(h) for h in hosts), "Snapshot protected hosts invalid")
+    check_target(snap["host"], hosts)
+    validate_snapshot_state(snap)
     return snap
 
 
 def make_lever(client, snap):
-    return LEVERS[snap["lever"]](client, snap["zone_id"], snap["host"], snap["params"])
+    lever = LEVERS[snap["lever"]](client, snap["zone_id"], snap["host"], snap["params"])
+    lever.created = snap.get("created")
+    return lever
 
 
 def load_token(args):
@@ -601,9 +696,12 @@ def build_plan(client, args):
     protect = sorted({ALWAYS_PROTECTED, *(args.protect_host or [])})
     require(all(HOST_RE.fullmatch(h) for h in protect), "Invalid protected hostname")
     require(ZONE_RE.fullmatch(args.zone_id), "Expected a 32-hex zone id")
-    for protected in protect:
-        require(args.host != protected and not protected.endswith("." + args.host),
-                f"The target host must not be, or be a parent of, a protected host ({protected})")
+    check_target(args.host, protect)
+    for protected in protect:  # an in-zone CNAME target of a protected host is part of that host
+        for record in client.dns_records(args.zone_id, protected):
+            content = str(record.get("content") or "").rstrip(".").lower()
+            require(not (record.get("type") == "CNAME" and content == args.host),
+                    f"{protected} is a CNAME to {args.host}; changing that host would affect the protected host")
     params = {"action": args.action} if args.lever == "waf" else {}
     if args.lever in DNS_LEVERS:
         require(args.expect_type, "--expect-type {A,AAAA,CNAME} is required for DNS levers "
@@ -633,7 +731,7 @@ def build_plan(client, args):
            "limits": LIMITS,
            "plan_hash": plan_hash,
            "apply_command": f"{PROG} apply --snapshot <new-0600-file> --confirm {plan_hash} <same flags as plan>",
-           "undo_command": f"{PROG} undo --snapshot <that-file> --confirm {plan_hash}"}
+           "undo_command": f"{PROG} undo --snapshot <that-file> --confirm <undo_token printed by apply>"}
     return lever, before, after, params, doc, plan_hash, open_blockers, already, protect
 
 
@@ -691,9 +789,12 @@ def cmd_apply(args, client):
             "plan, or wrong hash); re-run plan")
     require(not blockers, "; ".join(blockers) + ". Re-run with the matching --allow-* flag if intended")
     guard = node_guard(client, args.zone_id, protect)
+    nonce = secrets.token_hex(16)
     snap = {"format": SNAPSHOT_FORMAT, "status": "pending", "created_at_utc": now(), "plan_hash": plan_hash,
+            "nonce": nonce, "undo_token": digest({"plan_hash": plan_hash, "nonce": nonce}), "created": None,
             "lever": args.lever, "zone_id": args.zone_id, "host": args.host, "protect_hosts": protect,
             "params": params, "before": before, "after": after, "guard": guard}
+    undo_command = f"{PROG} undo --snapshot {args.snapshot} --confirm {snap['undo_token']}"
     try:
         write_new_private(args.snapshot, snap)  # BEFORE any change
     except FileExistsError:
@@ -701,15 +802,23 @@ def cmd_apply(args, client):
     try:
         lever.write(after, before)
     except Exception as error:
+        if lever.created:  # the write may have landed (e.g. a timed-out POST): pin what it created
+            snap["created"] = lever.created
+            try:
+                replace_private(args.snapshot, snap)
+            except OSError:
+                pass
         print(f"APPLY FAILED ({type(error).__name__}). The change may be partial or absent; a snapshot of the "
               f"prior state exists at {args.snapshot} (status pending). Recovery: run "
-              f"`{PROG} undo --snapshot {args.snapshot} --confirm {plan_hash}` (dry-run first without --confirm); "
+              f"`{undo_command}` (dry-run first, without --confirm); "
               "it restores the prior state, or reports nothing to undo.", file=sys.stderr)
         raise
+    snap["created"] = lever.created
     snap["status"] = "applied"
     snap["applied_at_utc"] = now()
     replace_private(args.snapshot, snap)
     doc["result"] = "applied; snapshot written at " + str(args.snapshot)
+    doc["undo_command"] = undo_command
     emit(doc)
     report = run_verify(client, snap, "applied")
     emit(report)
@@ -720,6 +829,9 @@ def cmd_apply(args, client):
 
 def cmd_undo(args, client):
     snap = load_snapshot(args.snapshot)
+    require(snap["status"] not in ("undone", "aborted"),
+            f"This snapshot is already {snap['status']} and can not be replayed. If the lever was applied again, "
+            "undo with the snapshot (and undo token) written by THAT apply. Nothing was changed")
     lever = make_lever(client, snap)
     current = lever.read_lenient()
     out = {"command": "undo", "lever": snap["lever"], "zone": tail(snap["zone_id"]), "host": snap["host"],
@@ -735,19 +847,23 @@ def cmd_undo(args, client):
         out["result"] = "already at the recorded prior state; nothing to undo"
         emit(out)
         return 0
-    at_after = lever.is_applied(current) and lever.rest_equal(current, snap["before"])
+    at_after = (lever.is_applied(current) and lever.rest_equal(current, snap["before"])
+                and lever.pinned(current, snap))
     drift = not at_after
     out["drift"] = drift
     if drift and not args.force_drift:
-        out["result"] = ("REFUSED: current state is neither the recorded prior state nor the state this tool "
-                         "applied (someone changed it). Inspect; use --force-drift to overwrite")
+        out["result"] = ("REFUSED: current state is neither the recorded prior state nor the state this "
+                         "snapshot's apply created (someone changed it, or the created object is not recorded or "
+                         "gone). Inspect; use --force-drift to proceed")
         emit(out)
         return 1
     if args.confirm is None:
-        out["result"] = "dry-run: nothing changed; pass --confirm <plan_hash> to execute"
+        out["result"] = "dry-run: nothing changed; pass --confirm <undo_token> to execute"
+        out["undo_token"] = snap["undo_token"]
         emit(out)
         return 0
-    require(args.confirm == snap["plan_hash"], "--confirm does not match the snapshot's plan hash")
+    require(args.confirm == snap["undo_token"], "--confirm does not match this snapshot's undo token (printed "
+            "by apply and by the undo dry-run)")
     if drift:
         snap.setdefault("forced_undo", []).append({"at_utc": now(), "overwrote": current})
         replace_private(args.snapshot, snap)  # record what is about to be overwritten
@@ -758,6 +874,9 @@ def cmd_undo(args, client):
     out["result"] = "restored"
     emit(out)
     report = run_verify(client, snap, "undone")
+    if drift and not report["ok"]:
+        report["note"] = ("--force-drift removed only this tool's change; other changes were kept, so the state "
+                          "differs from the recorded prior state by design (exit 4 is expected here)")
     emit(report)
     return 0 if report["ok"] else 4
 

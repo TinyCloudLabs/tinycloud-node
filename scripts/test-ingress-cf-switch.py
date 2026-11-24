@@ -172,6 +172,10 @@ class Base(unittest.TestCase):
     def undo(self, *extra):
         return self.run_cli("undo", "--snapshot", str(self.snap), *extra)
 
+    def token(self, snap=None):
+        """The undo token apply wrote into the snapshot (it is also printed by apply and the undo dry-run)."""
+        return json.loads(Path(snap or self.snap).read_text())["undo_token"]
+
     def applied(self):
         h = self.plan()["plan_hash"]
         code, out, err = self.apply(h)
@@ -189,7 +193,7 @@ class WafLeverTest(Base):
                                                  "description": sw.MARKER, "enabled": True})
         self.assertEqual(doc["change"]["call"], f"POST zones/…{ZONE[-4:]}/rulesets/…7777/rules (position index 1)")
         self.assertEqual(doc["undo"]["expected_remaining_rules"]["count"], 2)
-        self.assertIn("only the rule carrying this tool's marker", doc["undo"]["removes"])
+        self.assertIn("only the rule this apply created", doc["undo"]["removes"])
         self.assertEqual(doc["blockers"], [])
         self.assertRegex(doc["plan_hash"], r"^[0-9a-f]{64}$")
         self.assertEqual(doc["zone"], "…" + ZONE[-4:])
@@ -275,7 +279,7 @@ class WafLeverTest(Base):
         self.assertEqual(code, 0)
         self.assertIn("dry-run", self.docs(out)[0]["result"])
         self.assertNotEqual(json.dumps(self.fake.rules), original)
-        code, out, err = self.undo("--confirm", h)
+        code, out, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.rules), original)
         self.assertEqual(self.fake.calls[-1][0], "dns_records")
@@ -284,15 +288,15 @@ class WafLeverTest(Base):
         self.assertEqual(deletes[0][3], "r-new0001")
         self.assertTrue(self.docs(out)[-1]["ok"])
         self.assertEqual(json.loads(self.snap.read_text())["status"], "undone")
-        code, out, _ = self.undo("--confirm", h)  # already restored
-        self.assertEqual(code, 0)
-        self.assertIn("nothing to undo", self.docs(out)[0]["result"])
+        code, _, err = self.undo("--confirm", self.token())  # a finished snapshot can not be replayed
+        self.assertEqual(code, 1)
+        self.assertIn("already undone", err)
 
     def test_undo_restores_absent_entrypoint_as_empty_rules(self):
         self.fake.rules = None  # entrypoint ruleset does not exist yet
         h = self.applied()
         self.assertEqual(len(self.fake.rules), 1)
-        code, _, err = self.undo("--confirm", h)
+        code, _, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertEqual(self.fake.rules, [])
 
@@ -302,22 +306,23 @@ class WafLeverTest(Base):
                  "description": "added by someone else", "enabled": True}
         self.fake.rules.append(added)
         snapshot_before = self.snap.read_bytes()
-        code, out, _ = self.undo("--confirm", h)
+        code, out, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 1)
         self.assertIn("REFUSED", self.docs(out)[0]["result"])
         self.assertIn(added, self.fake.rules)
         self.assertEqual(self.snap.read_bytes(), snapshot_before)
-        code, out, err = self.undo("--confirm", h, "--force-drift")
+        code, out, err = self.undo("--confirm", self.token(), "--force-drift")
         self.assertEqual(code, 4, err)  # ours removed; verify says the list still differs from the recorded one
         self.assertEqual([r["id"] for r in self.fake.rules], ["r-aaaa1111", "r-bbbb2222", "r-dddd4444"])
         forced = json.loads(self.snap.read_text())["forced_undo"]
         self.assertEqual(len(forced), 1)
         self.assertIn(added, forced[0]["overwrote"]["rules"])  # the state at the time is recorded
+        self.assertIn("by design", self.docs(out)[-1]["note"])  # exit 4 here is expected, and says so
 
     def test_edited_lever_rule_counts_as_drift(self):
         h = self.applied()
         self.fake.rules[0]["action"] = "log"
-        code, _, _ = self.undo("--confirm", h)
+        code, _, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 1)
         self.assertEqual(self.fake.rules[0]["action"], "log")
 
@@ -335,7 +340,7 @@ class WafLeverTest(Base):
         self.assertIn(f"undo --snapshot {self.snap}", err)
         self.assertIn("prior state", err)
         self.fake.fail_put = False
-        code, out, _ = self.undo("--confirm", h)
+        code, out, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 0)
         self.assertIn("nothing to undo", self.docs(out)[0]["result"])
         self.assertEqual(json.loads(self.snap.read_text())["status"], "aborted")
@@ -347,7 +352,7 @@ class WafLeverTest(Base):
         self.fake.fail_put = False
         self.snap.unlink()
         self.applied()
-        self.undo("--confirm", h)
+        self.undo("--confirm", self.token())
         self.run_cli("verify", "--snapshot", str(self.snap), "--expect", "undone")
         for text in self.outputs:
             self.assertNotIn(TOKEN, text)
@@ -421,7 +426,7 @@ class OtherLeversTest(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.fake.level, "under_attack")
         self.assertIn("zone-wide", self.docs(out)[-1]["note"])
-        code, _, err = self.undo("--confirm", doc["plan_hash"])
+        code, _, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertEqual(self.fake.level, "medium")
         self.assertEqual([c for c in self.fake.calls if c[0] == "set_security_level"],
@@ -439,7 +444,7 @@ class OtherLeversTest(Base):
         self.assertIsNone(self.fake.routes[1]["script"])
         self.assertEqual(self.fake.routes[0], before[0])  # node.* route untouched
         self.assertEqual([c[2] for c in self.fake.writes()], ["route-tee-8888"])
-        code, _, err = self.undo("--confirm", doc["plan_hash"])
+        code, _, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.routes), json.dumps(before))
 
@@ -493,7 +498,7 @@ class DnsLeversTest(Base):
                                  "ttl": 300, "proxied": False, "comment": "managed by dstack-ingress",
                                  "tags": ["env:prod"]})
         self.assertEqual(self.fake.dns[0], self.node_record)
-        code, _, err = self.undo("--confirm", h)
+        code, _, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.dns), self.original)  # byte-identical
         updates = [c[3] for c in self.fake.calls if c[0] == "update_dns_record"]
@@ -515,7 +520,7 @@ class DnsLeversTest(Base):
         self.apply(h, *self.FLIP, "--accept-tls-change")
         self.fake.dns[1]["content"] = "someone-else.example.test"  # e.g. dstack-ingress rewrote the target
         self.fake.dns[1]["comment"] = "rewritten"
-        code, out, err = self.undo("--confirm", h)  # not drift: only proxied/ttl are judged
+        code, out, err = self.undo("--confirm", self.token())  # not drift: only proxied/ttl are judged
         self.assertEqual(code, 0, err)
         self.assertEqual(self.docs(out)[0]["unmanaged_changes_reported_not_written"], ["content", "comment"])
         self.assertEqual(self.docs(out)[-1]["unmanaged_changes_reported_not_written"], ["content", "comment"])
@@ -529,10 +534,10 @@ class DnsLeversTest(Base):
         h = self.plan(*self.FLIP)["plan_hash"]
         self.apply(h, *self.FLIP, "--accept-tls-change")
         self.fake.dns[1].update(proxied=False, ttl=120)  # someone flipped it back with another ttl
-        code, out, _ = self.undo("--confirm", h)
+        code, out, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 1)
         self.assertEqual(self.fake.dns[1]["ttl"], 120)
-        code, _, err = self.undo("--confirm", h, "--force-drift")
+        code, _, err = self.undo("--confirm", self.token(), "--force-drift")
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.dns), self.original)
         forced = json.loads(self.snap.read_text())["forced_undo"]
@@ -543,8 +548,9 @@ class DnsLeversTest(Base):
         planned = lever.read()
         after = lever.desired(planned)
         self.fake.dns[1]["id"] = "dns-replaced-by-someone"
-        with self.assertRaises(sw.Refused):
+        with self.assertRaises(sw.Refused) as raised:
             lever.write(after, planned)
+        self.assertIn("Next step", str(raised.exception))
         self.assertEqual(self.dns_writes(), [])
 
     def test_record_settings_are_snapshotted_and_recreated(self):
@@ -552,7 +558,7 @@ class DnsLeversTest(Base):
         h = self.plan(*self.REMOVE)["plan_hash"]
         self.apply(h, *self.REMOVE, "--i-understand-ttl")
         self.assertEqual(json.loads(self.snap.read_text())["before"]["record"]["settings"], {"flatten_cname": True})
-        self.undo("--confirm", h)
+        self.undo("--confirm", self.token())
         self.assertEqual(self.tee()[0]["settings"], {"flatten_cname": True})
 
     def test_remove_plan_states_ttl_and_that_it_is_not_instant(self):
@@ -591,7 +597,7 @@ class DnsLeversTest(Base):
         self.assertEqual(self.tee(), [])
         self.assertEqual(self.fake.dns, [self.node_record])  # node.* record untouched
         self.assertTrue(self.docs(out)[-1]["ok"])
-        code, out, err = self.undo("--confirm", h)
+        code, out, err = self.undo("--confirm", self.token())
         self.assertEqual(code, 0, err)
         self.assertTrue(self.docs(out)[-1]["ok"])
         created = [c for c in self.fake.calls if c[0] == "create_dns_record"][-1][2]
@@ -603,9 +609,9 @@ class DnsLeversTest(Base):
         self.assertEqual({k: v for k, v in restored.items() if k != "id"},
                          {k: v for k, v in original.items() if k not in ("id", "modified_on")})
         self.assertEqual(self.fake.dns[0], self.node_record)
-        code, out, _ = self.undo("--confirm", h)
-        self.assertEqual(code, 0)
-        self.assertIn("nothing to undo", self.docs(out)[0]["result"])
+        code, _, err = self.undo("--confirm", self.token())  # a finished snapshot can not be replayed
+        self.assertEqual(code, 1)
+        self.assertIn("already undone", err)
 
     def test_remove_second_apply_is_refused_without_changes(self):
         h = self.plan(*self.REMOVE)["plan_hash"]
@@ -621,10 +627,10 @@ class DnsLeversTest(Base):
         self.apply(h, *self.REMOVE, "--i-understand-ttl")
         self.fake.dns.append({"id": "dns-other", "type": "CNAME", "name": HOST, "content": "elsewhere.example.test",
                               "proxied": False, "ttl": 60, "comment": None, "tags": []})
-        code, out, _ = self.undo("--confirm", h)
+        code, out, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 1)
         self.assertEqual(self.tee()[0]["content"], "elsewhere.example.test")
-        code, _, err = self.undo("--confirm", h, "--force-drift")
+        code, _, err = self.undo("--confirm", self.token(), "--force-drift")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.tee()[0]["content"], "y.example.test")
         self.assertEqual(self.tee()[0]["id"], "dns-other")  # overwritten in place, no duplicate
@@ -667,7 +673,7 @@ class DnsLeversTest(Base):
         self.assertNotIn(TOKEN, err)
         self.assertEqual(json.loads(self.snap.read_text())["status"], "pending")
         self.assertEqual(json.dumps(self.fake.dns), self.original)
-        code, out, _ = self.undo("--confirm", h)
+        code, out, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 0)
         self.assertIn("nothing to undo", self.docs(out)[0]["result"])
 
@@ -708,9 +714,9 @@ class ReviewFixesTest(Base):
         self.assertIn(theirs, self.fake.rules)
         self.assertEqual(self.fake.rules[0]["description"], sw.MARKER)
         self.fake.before_put = None
-        code, _, _ = self.undo("--confirm", h)
+        code, _, _ = self.undo("--confirm", self.token())
         self.assertEqual(code, 1)  # drift: refused
-        code, out, err = self.undo("--confirm", h, "--force-drift")
+        code, out, err = self.undo("--confirm", self.token(), "--force-drift")
         self.assertEqual(code, 4, err)  # ours is gone, but verify says the list is not the recorded one
         self.assertFalse(self.docs(out)[-1]["checks"]["restored_to_recorded_prior_state"])
         self.assertIn(theirs, self.fake.rules)  # rule-level delete: only ours was removed
@@ -741,6 +747,127 @@ class ReviewFixesTest(Base):
         opener = sw.CloudflareClient(TOKEN)._opener.__self__
         self.assertTrue(any(isinstance(h, sw._NoRedirect) for h in opener.handlers))
         self.assertFalse(any(type(h) is urllib.request.HTTPRedirectHandler for h in opener.handlers))
+
+    def test_a_host_that_node_cnames_to_is_protected(self):
+        self.fake.dns[0]["content"] = HOST.upper() + "."  # node.* -> tee.node (in-zone target)
+        code, _, err = self.run_cli("plan", *self.target())
+        self.assertEqual(code, 1)
+        self.assertIn("CNAME to", err)
+        self.assertEqual(self.fake.writes(), [])
+
+    def test_undo_needs_this_snapshots_token_not_the_plan_hash(self):
+        h = self.applied()
+        code, _, err = self.undo("--confirm", h)
+        self.assertEqual(code, 1)
+        self.assertIn("undo token", err)
+        self.assertEqual([c[0] for c in self.fake.writes()], ["add_rule"])
+        code, out, _ = self.undo()  # dry-run prints the token to confirm with
+        self.assertEqual(self.docs(out)[0]["undo_token"], self.token())
+        self.assertNotEqual(self.token(), h)
+
+    def test_replayed_undo_of_a_finished_snapshot_never_reverts_a_newer_apply(self):
+        cases = (("waf", ()),
+                 ("security-level", ("--lever", "security-level", "--allow-zone-wide")),
+                 ("worker-route", ("--lever", "worker-route", "--allow-no-block")),
+                 ("dns-proxy-flip", ("--lever", "dns-proxy-flip", "--expect-type", "CNAME", "--accept-tls-change")),
+                 ("dns-remove", ("--lever", "dns-remove", "--expect-type", "CNAME", "--i-understand-ttl")))
+        for name, flags in cases:
+            with self.subTest(lever=name):
+                self.fake = FakeCF()
+                if name.startswith("dns-"):
+                    self.fake.dns[1].update(proxied=False, ttl=300)
+                first, second = self.dir / f"{name}-a.json", self.dir / f"{name}-b.json"
+                h1 = self.plan(*flags)["plan_hash"]
+                self.assertEqual(self.apply(h1, *flags, snap=first)[0], 0)
+                token_a = self.token(first)
+                code, _, err = self.run_cli("undo", "--snapshot", str(first), "--confirm", token_a)
+                self.assertEqual(code, 0, err)
+                h2 = self.plan(*flags)["plan_hash"]
+                if name == "waf":
+                    self.assertEqual(h1, h2)  # the plan hash alone can not tell the two applies apart
+                self.assertEqual(self.apply(h2, *flags, snap=second)[0], 0)
+                self.assertNotEqual(self.token(second), token_a)
+                state = copy.deepcopy((self.fake.rules, self.fake.level, self.fake.routes, self.fake.dns))
+                code, _, err = self.run_cli("undo", "--snapshot", str(first), "--confirm", token_a)  # replay
+                self.assertEqual(code, 1)
+                self.assertIn("already undone", err)
+                self.assertEqual((self.fake.rules, self.fake.level, self.fake.routes, self.fake.dns), state)
+                self.assertEqual(json.loads(first.read_text())["status"], "undone")
+                self.assertEqual(json.loads(second.read_text())["status"], "applied")
+
+    def test_waf_undo_deletes_only_the_recorded_rule_id(self):
+        h = self.applied()
+        created = json.loads(self.snap.read_text())["created"]
+        self.assertEqual(created, {"rule_id": "r-new0001", "ruleset_id": "rs-7777"})
+        self.fake.rules = [r for r in self.fake.rules if r["id"] != created["rule_id"]]  # ours removed by hand
+        self.assertEqual(self.plan()["plan_hash"], h)
+        self.assertEqual(self.apply(h, snap=self.dir / "b.json")[0], 0)  # a new apply: same marker, new id
+        newer = copy.deepcopy(self.fake.rules)
+        code, _, _ = self.undo("--confirm", self.token())
+        self.assertEqual(code, 1)  # the recorded rule is gone: drift, refused
+        code, _, err = self.undo("--confirm", self.token(), "--force-drift")
+        self.assertEqual(code, 1)  # even forced, a recorded id that is absent is never replaced by a guess
+        self.assertIn("nothing was deleted", err)
+        self.assertEqual(self.fake.rules, newer)
+        self.assertEqual(json.loads(self.snap.read_text())["status"], "applied")
+
+    def test_unpinnable_rule_id_fails_apply_and_undo_refuses_to_guess(self):
+        h = self.plan()["plan_hash"]
+        stray = {"id": "r-9999aaaa", "action": "log", "expression": "(true)", "description": sw.MARKER,
+                 "enabled": True}
+        self.fake.before_put = lambda: self.fake.rules.append(copy.deepcopy(stray))  # a second marker rule
+        code, _, err = self.apply(h)
+        self.assertEqual(code, 1)
+        self.assertIn("could not be pinned", err)
+        self.assertIn("APPLY FAILED", err)
+        saved = json.loads(self.snap.read_text())
+        self.assertEqual((saved["status"], saved["created"]), ("pending", None))
+        self.fake.before_put = None
+        rules = copy.deepcopy(self.fake.rules)
+        for extra in ((), ("--force-drift",)):
+            code, _, _ = self.undo("--confirm", self.token(), *extra)
+            self.assertEqual(code, 1)  # drift refused / forced but ambiguous: refuses to guess
+            self.assertEqual(self.fake.rules, rules)
+
+    def test_lost_post_reply_still_pins_the_created_rule_for_undo(self):
+        class LostReply(FakeCF):
+            def add_rule(self, *args):
+                super().add_rule(*args)
+                raise sw.CfError("add_rule: timed out waiting for the reply")  # the rule was created
+
+        self.fake = LostReply()
+        original = copy.deepcopy(self.fake.rules)
+        code, _, err = self.apply(self.plan()["plan_hash"])
+        self.assertEqual(code, 3)
+        saved = json.loads(self.snap.read_text())
+        self.assertEqual((saved["status"], saved["created"]["rule_id"]), ("pending", "r-new0001"))
+        self.assertIn(f"--confirm {saved['undo_token']}", err)
+        code, _, err = self.undo("--confirm", self.token())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.rules, original)
+
+    def test_snapshot_targets_ids_and_params_are_revalidated_on_load(self):
+        self.applied()
+        waf = json.loads(self.snap.read_text())
+        route_snap = self.dir / "route.json"
+        flags = ("--lever", "worker-route", "--allow-no-block")
+        self.assertEqual(self.apply(self.plan(*flags)["plan_hash"], *flags, snap=route_snap)[0], 0)
+        route = json.loads(route_snap.read_text())
+        bad_route = dict(route, before=dict(route["before"], id="../../accounts/x"))
+        cases = ((self.snap, dict(waf, host=NODE)),
+                 (self.snap, dict(waf, params={"action": "allow"})),
+                 (self.snap, dict(waf, created={"rule_id": "../x", "ruleset_id": "rs-7777"})),
+                 (self.snap, dict(waf, status="exploded")),
+                 (self.snap, dict(waf, undo_token="x")),
+                 (route_snap, bad_route))
+        for path, broken in cases:
+            with self.subTest(broken=sorted(k for k in broken if broken[k] != (waf if path == self.snap else route)[k])):
+                path.write_text(json.dumps(broken))
+                calls = len(self.fake.calls)
+                for command in (("verify",), ("undo", "--confirm", "x")):
+                    code, _, _ = self.run_cli(command[0], "--snapshot", str(path), *command[1:])
+                    self.assertEqual(code, 1)
+                self.assertEqual(len(self.fake.calls), calls)  # refused before any API call
 
 
 class TokenAndClientTest(Base):

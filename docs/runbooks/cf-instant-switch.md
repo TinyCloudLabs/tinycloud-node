@@ -35,7 +35,7 @@ be seconds [INFERENCE: not measured; measure it in the first drill].
 | `waf` (**default**) | A rule inserted first in the zone custom-rules entrypoint (rule-level POST; undo is a rule-level DELETE of only that rule): `http.host eq "<host>"`, action `block` (or `--action managed_challenge\|js_challenge\|challenge`) | Yes, at the edge, before the Worker runs | Only that host. A challenge action breaks API/native clients; `block` stops all tee.* clients (intended) | none | Zone WAF: Edit |
 | `security-level` | Zone `security_level` to `under_attack` | Challenges browsers; API clients fail | **Whole zone, including node.*** | `--allow-zone-wide` | Zone Settings: Edit |
 | `worker-route` | Route `<host>/*` gets `script: null` (route id kept) | **No.** Proxied requests go straight to the DNS origin, i.e. more exposure | That pattern only | `--allow-no-block` | Workers Routes: Edit |
-| `dns-proxy-flip` | PATCH the host's DNS record with only `{"proxied": true}` (ttl becomes automatic, set by Cloudflare [INFERENCE]); undo PATCHes only `{"proxied": false, "ttl": <recorded>}`. Other fields are recorded and reported, never written | **No, it is the enabler**: makes the Worker route and the WAF rule live so Cloudflare fronts the host. Follow with `waf` | That record only. **TLS trust changes**: Cloudflare terminates TLS instead of passthrough to the TEE cert; the existing `tee.node/*` Worker route goes live and forwards to the Worker's configured origin, bypassing the in-CVM ingress (nginx limits/CORS). **Edge-certificate prerequisite**: Universal SSL covers only `*.tinycloud.xyz` [INFERENCE], so a host below `tee.node` needs ACM/Total TLS/a custom certificate first, or every tee.node TLS handshake FAILS | `--accept-tls-change`, `--expect-type` | Zone DNS: Edit (+ Read) |
+| `dns-proxy-flip` | PATCH the host's DNS record with only `{"proxied": true}` (ttl becomes automatic, set by Cloudflare [INFERENCE]); undo PATCHes only `{"proxied": false, "ttl": <recorded>}`. Other fields are recorded and reported, never written | **No, it is the enabler**: makes the Worker route and the WAF rule live so Cloudflare fronts the host. Follow with `waf` | That record only. **TLS trust changes**: Cloudflare terminates TLS instead of passthrough to the TEE cert; the existing `tee.node/*` Worker route goes live and forwards to the Worker's configured origin, bypassing the in-CVM ingress (nginx limits/CORS). **Edge-certificate prerequisite**: Universal SSL covers only `*.tinycloud.xyz` [INFERENCE], so `tee.node.tinycloud.xyz` itself (two levels below the apex) needs ACM/Total TLS/a custom certificate first, or every tee.node TLS handshake FAILS | `--accept-tls-change`, `--expect-type` | Zone DNS: Edit (+ Read) |
 | `dns-remove` | DELETE the host's A/AAAA/CNAME record; the full record (type, name, content, ttl, proxied, comment, tags) is snapshotted and undo re-creates it | Yes, but **in minutes, NOT instantly**: resolvers keep the old answer until the recorded TTL expires (plan prints it; TTL 1 = automatic, about 300 s [INFERENCE]). Anyone with a cached answer or the literal origin address is unaffected | tee.node becomes unresolvable after caches expire; node.* record untouched. Undo restores every field except the record id (Cloudflare allocates a new one) | `--i-understand-ttl`, `--expect-type` | Zone DNS: Edit (+ Read) |
 
 DNS levers refuse a missing record, a record of a different type than `--expect-type`, and more than one A/AAAA/CNAME record at the name. The write also refuses if the record id is no longer the planned one. `dstack-ingress` holds a Cloudflare DNS token and may re-write or re-create the tee.node record when the CVM restarts [INFERENCE: not read]; re-run `verify` after any restart. A Worker-side kill switch is not implemented: the Worker has no bindings, so it needs a separate reviewed Worker change and deploy first.
@@ -68,8 +68,8 @@ python3 $S apply --token-env CF_TOKEN_VAR --zone-id <zone> [same flags] \
     --snapshot /private/dir/cf-switch-<utc>.json --confirm <plan_hash>
 # 3. Re-check any time
 python3 $S verify --token-env CF_TOKEN_VAR --snapshot /private/dir/cf-switch-<utc>.json
-# 4. Undo (dry-run first, then with --confirm <plan_hash from the snapshot>)
-python3 $S undo --token-env CF_TOKEN_VAR --snapshot /private/dir/cf-switch-<utc>.json --confirm <plan_hash>
+# 4. Undo (dry-run first: it prints the undo_token; then --confirm <undo_token>)
+python3 $S undo --token-env CF_TOKEN_VAR --snapshot /private/dir/cf-switch-<utc>.json --confirm <undo_token>
 python3 $S verify --token-env CF_TOKEN_VAR --snapshot ... --expect undone
 ```
 
@@ -83,15 +83,28 @@ Guarantees (all tested against fakes):
   nothing (and creates no new snapshot; undo with the snapshot of the run that applied it).
 - `undo` restores the recorded prior state. If the current state is neither that nor
   what `apply` produced, it refuses; `--force-drift` proceeds and records what it
-  found under `forced_undo` in the snapshot. WAF undo deletes only our rule (never
-  rewrites the list). `dns-proxy-flip` undo sends only `proxied` and `ttl`; if
+  found under `forced_undo` in the snapshot. WAF undo deletes only the rule id recorded
+  at apply (never rewrites the list; a recorded id that is gone is never replaced by a
+  guess, even with `--force-drift`). `dns-proxy-flip` undo sends only `proxied` and `ttl`; if
   `type`/`name`/`content`/`comment`/`tags` changed meanwhile (for example
   `dstack-ingress` rewrote the target) they are reported as
   `unmanaged_changes_reported_not_written` and never written back.
 - Targets are pinned: the default `--host` is `tee.node.tinycloud.xyz`; any other host
   needs `--other-host`. `node.tinycloud.xyz` is always protected and can not be
   targeted (nor a parent domain of it); `--protect-host H` (repeatable) adds more
-  protected hosts, it never removes `node.*`.
+  protected hosts, it never removes `node.*`. A host that a protected host CNAMEs to
+  (in-zone) is refused too. The same target check, id/host/param validation and the
+  `worker-route` id check run again when a snapshot is loaded (the file is untrusted input).
+- A finished snapshot can not be replayed: `undo` refuses a snapshot whose status is
+  `undone` or `aborted` (exit 1, nothing changed), so re-running an old undo from shell
+  history can not revert a newer apply. The undo confirm value is the snapshot's
+  `undo_token` (random per apply; printed by `apply` and by the undo dry-run), not the
+  plan hash, which is identical for two applies from the same state. A `pending`
+  snapshot (failed apply) should be undone BEFORE anything else is applied: for the
+  single-value levers (security level, route, flip) the applied state does not say which
+  apply produced it.
+- After a `--force-drift` undo, `verify` may exit 4 because other people's changes were
+  kept; the output says so ("differs ... by design").
 - Exit codes: 0 ok, 1 refused (nothing changed), 3 Cloudflare/IO failure, 4 verify failed.
 
 ## Failure recovery
@@ -109,9 +122,12 @@ Nothing in this tool has run against Cloudflare. Everything below is from API do
 - WAF rule-level endpoints: `POST /zones/{z}/rulesets/{id}/rules` with
   `position.index` (insert first), `DELETE /zones/{z}/rulesets/{id}/rules/{rule_id}`,
   and `PUT .../phases/http_request_firewall_custom/entrypoint` only when the ruleset
-  does not exist yet. `undo` only deletes the rule carrying this tool's marker; other
-  rules are never written, so a rule someone else adds between our read and write
-  survives (`verify` then reports the list differs and exits 4; nothing is lost).
+  does not exist yet. The POST reply is not relied on: `apply` re-reads the ruleset and
+  records the id of the ONE new marker rule (zero or several: apply fails, nothing is
+  guessed). `undo` deletes only that id; other rules are never written, so a rule
+  someone else adds between our read and write survives (`verify` then reports the list
+  differs and exits 4; nothing is lost). Whether a re-read right after the POST shows
+  the new rule (read-after-write) is UNVERIFIED.
 - A missing entrypoint ruleset is restored as an empty rule list, not deleted.
 - DNS: that PATCH `{"proxied": true}` forces `ttl=1`, and that `{"proxied": false,
   "ttl": N}` restores the prior state; that the DNS record has a `settings` object that
