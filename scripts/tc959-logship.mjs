@@ -8,7 +8,7 @@ import { LEDGER_EVENTS, LEDGER_ERROR_KINDS, LEDGER_TARGETS } from '../log-shippe
 const root = fileURLToPath(new URL('../', import.meta.url));
 const load = name => JSON.parse(readFileSync(resolve(root, 'log-shipper', name), 'utf8'));
 export const nodeImage = 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f';
-export const ingressImage = 'ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744';
+export const ingressImage = 'ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:7e5dc37a04ad45a900b5da2761368ddad28b2c126a7240e1f50a813e2e875e9d';
 export const vectorImage = 'timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a';
 const remap = (inputs, source, options = {}) => ({ type: 'remap', inputs, source, drop_on_error: true, drop_on_abort: true, ...options });
 const status4xx = '((int(.status) ?? 0) >= 400 && (int(.status) ?? 0) < 500)';
