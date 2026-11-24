@@ -409,8 +409,11 @@ still refuses `enabled`).
   checkpoint_content_hash, wal_end_bytes, wal_prefix_sha256)`, atomically with
   the WAL it stores. A new checkpoint (`save`, or a chunked snapshot publish)
   deletes every mark of the database atomically with the checkpoint, because
-  a checkpoint truncates the WAL; a space purge deletes them too. A rejected
-  save leaves no mark. "Atomically" is one transaction on SQLite and with a
+  a checkpoint truncates the WAL; a space purge deletes them too. A chunked
+  WAL part (`artifact_part` kind WAL) replaces the stored WAL the same way
+  but writes no mark, so a chunked database never gets `wal-delta-v1`: shadow
+  reads use the whole-WAL `wal-cum-v1` format (safe, but not incremental). A
+  rejected save leaves no mark. "Atomically" is one transaction on SQLite and with a
   purge fence. On the PostgreSQL pool without a fence it is ONE autocommit
   statement (a data-modifying CTE): the pool's statement timeout, its retry
   classification and its did-the-write-apply tracking are defined over a

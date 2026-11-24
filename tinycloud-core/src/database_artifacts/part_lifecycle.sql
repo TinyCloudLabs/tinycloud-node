@@ -1,4 +1,4 @@
-CREATE INDEX artifact_part_reap_database ON artifact_part(service,space,name,lease_until) WHERE state<>'published';
+CREATE INDEX IF NOT EXISTS artifact_part_reap_database ON artifact_part(service,space,name,lease_until) WHERE state<>'published';
 CREATE OR REPLACE FUNCTION artifact_reserve_part(p_service text,p_space text,p_name text,p_id text,p_owner text,
  p_size bigint,p_count integer,p_revision bigint,p_hash text,p_wal boolean)
 RETURNS boolean LANGUAGE plpgsql SET lock_timeout='50ms' AS $$

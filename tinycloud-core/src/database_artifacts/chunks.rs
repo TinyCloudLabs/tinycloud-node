@@ -438,7 +438,10 @@ FROM ready ON CONFLICT DO NOTHING"#
         if scope.execute(statement(sql, values)).await?.rows_affected() != 1 {
             return Err(DatabaseArtifactError::StaleLineage);
         }
-        // A new checkpoint truncates the WAL, so the marks of the old one go.
+        // Either publish replaces the stored WAL, so the old WAL's marks go. A checkpoint
+        // truncates the WAL; a chunked WAL part is cumulative and writes no mark of its own,
+        // so shadow reads of a chunked database use the whole-WAL `wal-cum-v1` format
+        // (safe, but uploads the whole WAL each time).
         drop_wal_marks(&scope, service, space, name).await?;
         scope.commit().await?;
         cleanup.armed = false;

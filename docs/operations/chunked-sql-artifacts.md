@@ -128,7 +128,10 @@ its final chunk is removed, so a partially collected pair stays accounted.
 
 Roll out WAL-capable readers to every instance before enabling the switch.
 Checkpoint-only part readers fail closed on WAL layouts. Schema changes are
-forward-only; switching the feature off keeps existing layouts readable and
+forward-only (the two PostgreSQL migrations' `down` refuses; a deregister-only
+rollback is safe because their `up` is re-runnable: delete both
+`seaql_migrations` rows before booting the old image). Switching the feature off
+keeps existing layouts readable and
 writable by the current binary, and does not downgrade their format.
 
 New DuckDB databases with parts enabled start file-backed under the existing
@@ -156,8 +159,8 @@ provisional until the `storage_headroom` event shows real headroom on
 production nodes; operators tune it by config. With chunked artifacts on, the
 node refuses to start unless the floor is at least
 `storage.sql.chunked_artifact_max_bytes`, so the floor cannot be turned off
-(0) while they are on: a write's save copies the database once more, outside
-the write's reservation. Leave a margin above that.
+(0) while they are on: a write's save copies the database once more, and the
+write's claim is kept until that copy is on disk. Leave a margin above that.
 
 - A write is any request that can change the database: executes, batches,
   imports, and any query that is not purely plain `SELECT`-style queries and

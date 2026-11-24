@@ -1,6 +1,13 @@
-ALTER TABLE artifact_part ADD COLUMN replaces_delta_part_id text;
-ALTER TABLE artifact_part ADD CONSTRAINT artifact_part_replaced_delta_fk
- FOREIGN KEY(service,space,name,replaces_delta_part_id) REFERENCES artifact_part(service,space,name,part_id);
+-- Re-runnable (TC-3755): a deregister-only rollback deletes this migration's seaql row and leaves
+-- the schema, so every statement here must tolerate having already run.
+ALTER TABLE artifact_part ADD COLUMN IF NOT EXISTS replaces_delta_part_id text;
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='artifact_part_replaced_delta_fk'
+   AND conrelid='artifact_part'::regclass) THEN
+   ALTER TABLE artifact_part ADD CONSTRAINT artifact_part_replaced_delta_fk
+    FOREIGN KEY(service,space,name,replaces_delta_part_id) REFERENCES artifact_part(service,space,name,part_id);
+ END IF;
+END $$;
 CREATE OR REPLACE FUNCTION artifact_layout_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF TG_OP='UPDATE' AND OLD.checkpoint_part_id IS NOT NULL THEN
@@ -21,7 +28,7 @@ BEGIN
  END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END $$;
-CREATE FUNCTION artifact_reserve_part(p_service text,p_space text,p_name text,p_id text,p_owner text,
+CREATE OR REPLACE FUNCTION artifact_reserve_part(p_service text,p_space text,p_name text,p_id text,p_owner text,
  p_size bigint,p_count integer,p_revision bigint,p_hash text,p_wal boolean)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE base record; existing boolean; credit bigint:=0; cap bigint; part_cap bigint; replaced bigint:=0;

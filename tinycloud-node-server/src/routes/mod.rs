@@ -4497,7 +4497,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         }
         DuckDbError::DiskHeadroom => {
             crate::prometheus::observe_disk_headroom_refusal("duckdb");
-            note_error_code(ErrorCode::SizeLimit);
+            note_error_code(ErrorCode::DiskHeadroom);
             Status::new(507)
         }
         DuckDbError::Unavailable => Status::ServiceUnavailable,
