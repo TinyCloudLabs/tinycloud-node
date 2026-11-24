@@ -9,7 +9,7 @@ import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { buildConfig, nodeImage, ingressImage, vectorImage } from './tc959-logship.mjs';
+import { buildConfig, nodeImage, ingressImage, vectorImage, cloudflaredImage } from './tc959-logship.mjs';
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
 import { LEDGER_EVENTS, LEDGER_ERROR_KINDS } from '../log-shipper/ledger.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
@@ -379,7 +379,7 @@ export async function main(args = process.argv.slice(2)) {
   const disposableVolumeArgs = image => (declaredVolumes.get(image) ?? []).flatMap(path => ['--tmpfs', `${path}:rw,noexec,nosuid,size=8388608,mode=1777`]);
   try {
     phase = 'immutable_images';
-    for (const image of [nodeImage, ingressImage, vectorImage]) {
+    for (const image of [nodeImage, ingressImage, vectorImage, cloudflaredImage]) {
       assert.match(image, /@sha256:[a-f0-9]{64}$/);
       command('docker', ['pull', image], { timeout: 150000 });
       const metadata = JSON.parse(docker('image', 'inspect', image))[0];
@@ -401,6 +401,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.equal(production.tinycloud.image, nodeImage);
     assert.equal(production['dstack-ingress'].image, ingressImage);
     assert.equal(production.vector.image, vectorImage);
+    assert.equal(production.cloudflared.image, cloudflaredImage);
     phase = 'compose_fields';
     // Refuse silently ignored compose fields: this is a projection with explicit substitutions, not a mirror.
     const supported = new Set(['image', 'restart', 'labels', 'logging', 'ports', 'volumes', 'environment', 'networks', 'depends_on', 'entrypoint', 'command', 'init', 'user', 'read_only', 'cap_drop', 'security_opt', 'mem_limit', 'memswap_limit', 'cpus', 'tmpfs', 'privileged']);
@@ -420,7 +421,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger']]);
     assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
     phase = 'compose_networks';
-    assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
+    assert.deepEqual(Object.keys(production.tinycloud.networks).sort(), ['cf-edge', 'default']); // TC-4194
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);
     assert.deepEqual(Object.keys(production.vector.networks), ['logship']);
     const networkFields = ['name', 'driver', 'internal', 'external', 'attachable', 'enable_ipv4', 'enable_ipv6', 'driver_opts', 'labels', 'ipam'];

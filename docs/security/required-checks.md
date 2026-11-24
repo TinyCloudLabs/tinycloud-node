@@ -166,6 +166,10 @@ Repository-level production secrets used only by `environment: production` jobs:
 | `PROD_TINYCLOUD_QUOTA_URL` | deploy-phala | no |
 | `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64` | deploy-phala | no |
 
+`PROD_TINYCLOUD_CLOUDFLARE_TUNNEL_TOKEN` (TC-4194, used by deploy-phala) is not
+part of the list above: it is optional and does not exist yet. Create it only
+in the `production` environment, never at repository level.
+
 Repository secrets no workflow references: `AWS_DEPLOY_ROLE_ARN`,
 `GH_PACKAGE_PUSH_TOKEN`, `TINYCLOUD_AWS_ACCESS_KEY_ID`,
 `TINYCLOUD_AWS_SECRET_ACCESS_KEY`.
