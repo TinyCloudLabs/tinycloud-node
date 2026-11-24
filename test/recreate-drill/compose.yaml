@@ -1,0 +1,52 @@
+# TC-1491 P4.2b part 1: the node as production runs it, in the layout of
+# today: Postgres is the master copy, the SQL working copy (/data/sql) is in
+# the container's writable layer. compose.volume.yaml adds the named volume.
+#
+# Run it through drill.sh, on an isolated CI runner only. Nothing here is
+# published beyond 127.0.0.1 and nothing is a production secret: the keys are
+# generated per run by drill.sh, S3 is LocalStack, Postgres has no volume.
+name: tcdrill
+services:
+  tinycloud:
+    image: ${DRILL_NODE_IMAGE:?build the node image and set DRILL_NODE_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DRILL_PORT:-18000}:8000"
+    environment:
+      TINYCLOUD_STORAGE_BLOCKS_BUCKET: "tinycloud-blocks"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
+      TINYCLOUD_STORAGE_BLOCKS_ENDPOINT: "http://localstack:4566"
+      TINYCLOUD_STORAGE_DATABASE: "postgres://postgres:${DRILL_PG_PASSWORD:?set by drill.sh}@postgres:5432/postgres"
+      TINYCLOUD_KEYS_TYPE: "Static"
+      TINYCLOUD_KEYS_SECRET: "${DRILL_KEYS_SECRET:?set by drill.sh}"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  localstack:
+    # The same pin as test/docker-compose.yml.
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health && awslocal s3api head-bucket --bucket tinycloud-blocks"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    environment:
+      SERVICES: "s3"
+    volumes:
+      - "../setup.sh:/etc/localstack/init/ready.d/setup.sh:ro,z"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: "${DRILL_PG_PASSWORD:?set by drill.sh}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

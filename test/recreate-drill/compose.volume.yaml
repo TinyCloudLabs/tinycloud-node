@@ -1,0 +1,14 @@
+# The layout P4.2b proposes: the SQL datadir on a named volume that outlives
+# the container. The volume is created and given to uid 1000 by drill.sh,
+# which stands in for the pre-created, chown'd directory the image will need
+# (the deletion ledger does the same in the Dockerfile): the image is
+# FROM scratch and runs as 1000, and a new named volume is root-owned.
+services:
+  tinycloud:
+    volumes:
+      - sql-data:/data/sql
+
+volumes:
+  sql-data:
+    external: true
+    name: ${DRILL_SQL_VOLUME:?set by drill.sh}
