@@ -22,7 +22,7 @@ const services = compose.services;
 assert.equal(services.tinycloud.image, nodeImage, 'N0 must use unchanged production node digest');
 assert.equal(services['dstack-ingress'].image, ingressImage, 'N0 must use unchanged ingress digest');
 assert.equal(services.tinycloud.environment.TINYCLOUD_LOG__FORMAT, 'Json');
-assert.deepEqual(Object.keys(services.tinycloud.networks), ['default']);
+assert.deepEqual(Object.keys(services.tinycloud.networks).sort(), ['cf-edge', 'default']); // TC-4194: cf-edge is shared only with the cloudflared connector
 assert.deepEqual(Object.keys(services['dstack-ingress'].networks), ['default']);
 for (const [name, label] of [['tinycloud', 'tinycloud-node'], ['dstack-ingress', 'tinycloud-ingress']]) {
   const service = services[name];

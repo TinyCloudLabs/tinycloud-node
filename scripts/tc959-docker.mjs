@@ -420,7 +420,7 @@ export async function main(args = process.argv.slice(2)) {
     assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger']]);
     assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
     phase = 'compose_networks';
-    assert.deepEqual(Object.keys(production.tinycloud.networks), ['default']);
+    assert.deepEqual(Object.keys(production.tinycloud.networks).sort(), ['cf-edge', 'default']); // TC-4194
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);
     assert.deepEqual(Object.keys(production.vector.networks), ['logship']);
     const networkFields = ['name', 'driver', 'internal', 'external', 'attachable', 'enable_ipv4', 'enable_ipv6', 'driver_opts', 'labels', 'ipam'];

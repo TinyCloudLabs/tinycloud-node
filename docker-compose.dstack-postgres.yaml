@@ -26,6 +26,11 @@ services:
         cache-disabled: "true"
     ports:
       - "8000:8000"
+    # TC-4194: default (ingress, host-published port) plus cf-edge, the only
+    # network the cloudflared connector is on.
+    networks:
+      - default
+      - cf-edge
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - deletion-ledger:/var/lib/tinycloud/ledger
@@ -174,11 +179,19 @@ services:
         cache-disabled: "true"
 
   # TC-4194 P1: Cloudflare Tunnel connector. Outbound-only: it dials
-  # Cloudflare's edge and carries Cloudflare-side routes to the node over the
-  # default compose network, so it publishes NO ports. The tunnel's ingress
-  # rules are remote-managed in Cloudflare; the connector credential is the
-  # sealed CLOUDFLARE_TUNNEL_TOKEN, delivered as an environment variable
-  # (the same path as CLOUDFLARE_API_TOKEN above; no compose secrets/configs).
+  # Cloudflare's edge and carries Cloudflare-side routes to tinycloud:8000, so
+  # it publishes NO ports. Network scope: it is on the dedicated cf-edge
+  # network ONLY (not `default`, so dstack-ingress, ssh-gateway and every
+  # other internal port are unreachable from it) and tinycloud is the only
+  # other member. Tunnel ingress rules are remote-managed in Cloudflare, so
+  # this network list, not the tunnel configuration, bounds what the
+  # connector can reach. The ingress service is not joined: the planned
+  # Cloudflare route is the node's HTTP origin (tinycloud:8000), not the
+  # TLS-terminating tee.node nginx. The database is external to this compose
+  # and is reached by the node, never by the connector. The connector
+  # credential is the sealed CLOUDFLARE_TUNNEL_TOKEN, delivered as an
+  # environment variable (the same path as CLOUDFLARE_API_TOKEN above; no
+  # compose secrets/configs).
   #
   # Empty-secret behaviour: the token is optional (`:-`, not `:?`), so a deploy
   # that has no tunnel yet still renders and starts the rest of the stack.
@@ -194,8 +207,17 @@ services:
   # tinycloud-ingress. cloudflared lines are therefore counted and dropped
   # (reason unexpected_label), never shipped, until a sanitizer exists.
   cloudflared:
+    # Digest provenance (UNVERIFIED against a Cloudflare-signed source):
+    # sha256 of the multi-arch index for tag 2026.11.2 from an anonymous Docker
+    # Hub registry GET on 2026-11-24 ~12:00Z; the same digest answers by-digest
+    # and `latest`. Cloudflare's GitHub release for 2026.11.2 publishes no
+    # container digest, and the image's cloudflared binary is not byte-identical
+    # to the release assets (it embeds the version string 2026.11.2 only), so
+    # the pin could not be cross-checked beyond Docker Hub.
     image: cloudflare/cloudflared:2026.11.2@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6
     command: ["tunnel", "--no-autoupdate", "run"]
+    networks:
+      - cf-edge
     environment:
       TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
     cap_drop:
@@ -268,4 +290,8 @@ volumes:
 
 networks:
   logship:
+    driver: bridge
+  # TC-4194: connector <-> tinycloud only. Outbound access is needed, so it is
+  # not `internal`.
+  cf-edge:
     driver: bridge
