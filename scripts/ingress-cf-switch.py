@@ -122,6 +122,15 @@ class CloudflareClient:
     def dns_records(self, zone, name):
         return self._call("dns_records", "GET", f"/zones/{zone}/dns_records?per_page=100&name={quote(name)}")
 
+    def update_dns_record(self, zone, record_id, body):
+        self._call("update_dns_record", "PATCH", f"/zones/{zone}/dns_records/{record_id}", body)
+
+    def create_dns_record(self, zone, body):
+        self._call("create_dns_record", "POST", f"/zones/{zone}/dns_records", body)
+
+    def delete_dns_record(self, zone, record_id):
+        self._call("delete_dns_record", "DELETE", f"/zones/{zone}/dns_records/{record_id}")
+
 
 # ---- levers: read / desired / is_applied / same / rest_equal / write / describe ----
 
@@ -129,10 +138,26 @@ def norm_rule(rule):
     return {k: v for k, v in rule.items() if k not in VOLATILE_RULE_KEYS}
 
 
-class WafLever:
-    name = "waf"
+class LeverBase:
+    needs_proxied = True  # lever is inert unless the host is proxied through Cloudflare
     zone_wide = False
-    blocks = True
+
+    def gates(self, before):
+        """(flag attribute, message) pairs: refused at apply unless the matching --flag is given."""
+        return []
+
+    def warnings(self, before):
+        return []
+
+    def verify_note(self, snapshot):
+        return None
+
+    def read_lenient(self):
+        return self.read()
+
+
+class WafLever(LeverBase):
+    name = "waf"
 
     def __init__(self, client, zone, host, params):
         self.client, self.zone, self.host, self.params = client, zone, host, params
@@ -190,13 +215,20 @@ class WafLever:
         return {"our_rule_does_not_match_protected_host": f'"{snapshot["protect_host"]}"' not in expression}
 
 
-class SecurityLevelLever:
+class SecurityLevelLever(LeverBase):
     name = "security-level"
     zone_wide = True
-    blocks = True
 
     def __init__(self, client, zone, host, params):
         self.client, self.zone, self.host = client, zone, host
+
+    def gates(self, before):
+        return [("allow_zone_wide", "ZONE-WIDE: every proxied hostname in the zone, including the protected "
+                 "host, is challenged; API clients fail the challenge")]
+
+    def verify_note(self, snapshot):
+        return (f"zone-wide lever: {snapshot['protect_host']} is challenged by design; "
+                "its routes/DNS being unchanged does not mean it is unaffected")
 
     def read(self):
         return {"value": self.client.security_level(self.zone)}
@@ -225,13 +257,15 @@ class SecurityLevelLever:
         return {}
 
 
-class RouteLever:
+class RouteLever(LeverBase):
     name = "worker-route"
-    zone_wide = False
-    blocks = False
 
     def __init__(self, client, zone, host, params):
         self.client, self.zone, self.host = client, zone, host
+
+    def gates(self, before):
+        return [("allow_no_block", "DOES NOT BLOCK: proxied requests pass straight to the DNS origin "
+                 "(more exposure, not less)")]
 
     def read(self):
         pattern = f"{self.host}/*"
@@ -263,7 +297,139 @@ class RouteLever:
         return {}
 
 
-LEVERS = {c.name: c for c in (WafLever, SecurityLevelLever, RouteLever)}
+DNS_TYPES = ("A", "AAAA", "CNAME")
+
+
+def dns_record(raw):
+    return {"id": raw.get("id"), "type": raw.get("type"), "name": raw.get("name"), "content": raw.get("content"),
+            "ttl": raw.get("ttl"), "proxied": bool(raw.get("proxied")), "comment": raw.get("comment"),
+            "tags": list(raw.get("tags") or [])}
+
+
+def without_id(record):
+    return {k: v for k, v in record.items() if k != "id"}
+
+
+class DnsBase(LeverBase):
+    """DNS record levers. State is {present, record}; the record is recorded in full."""
+    needs_proxied = False
+
+    def __init__(self, client, zone, host, params):
+        self.client, self.zone, self.host = client, zone, host
+        self.expect = params.get("expect_type")
+
+    def read_lenient(self):
+        found = [dns_record(r) for r in self.client.dns_records(self.zone, self.host) if r.get("type") in DNS_TYPES]
+        require(len(found) <= 1, f"Expected at most one A/AAAA/CNAME record for {self.host}; found {len(found)}")
+        return {"present": bool(found), "record": found[0] if found else None}
+
+    def read(self):
+        state = self.read_lenient()
+        require(state["present"], f"No A/AAAA/CNAME record for {self.host}: nothing to act on "
+                "(if this tool removed it earlier, restore with that run's snapshot)")
+        kind = state["record"]["type"]
+        require(kind == self.expect, f"DNS record type is {kind}, expected {self.expect}; refusing")
+        return state
+
+    def same(self, a, b):
+        if a["present"] != b["present"]:
+            return False
+        return not a["present"] or without_id(a["record"]) == without_id(b["record"])
+
+    def rest_equal(self, current, before):
+        return True
+
+    def write(self, state):
+        """Make the record look like `state`: update in place, create (new id) or delete."""
+        current = self.read_lenient()
+        if state["present"]:
+            body = without_id(state["record"])
+            if current["present"]:
+                self.client.update_dns_record(self.zone, current["record"]["id"], body)
+            else:
+                self.client.create_dns_record(self.zone, body)
+        elif current["present"]:
+            self.client.delete_dns_record(self.zone, current["record"]["id"])
+
+    def extra_guard(self, current, snapshot):
+        return {}
+
+
+class DnsProxyFlipLever(DnsBase):
+    name = "dns-proxy-flip"
+
+    def gates(self, before):
+        return [("accept_tls_change", "TLS TRUST CHANGE: Cloudflare terminates TLS instead of passing it through to "
+                 "the TEE, and the existing tee.node Worker route goes LIVE, forwarding to the Phala -8000 origin "
+                 "instead of the in-CVM ingress (nginx limits/CORS no longer in the path)")]
+
+    def is_applied(self, state):
+        return state["present"] and state["record"]["proxied"] is True
+
+    def desired(self, state):
+        # Cloudflare forces ttl to 1 (automatic) on a proxied record [INFERENCE].
+        return {"present": True, "record": dict(state["record"], proxied=True, ttl=1)}
+
+    def rest_equal(self, current, before):
+        keys = ("type", "name", "content", "comment", "tags")
+        return current["present"] and all(current["record"][k] == before["record"][k] for k in keys)
+
+    def warnings(self, before):
+        return ["Does not stop traffic by itself: it makes the WAF rule / Worker route live. Follow with the `waf` "
+                "lever to block.", "Changes TLS trust and the serving path (see gate); verify clients and "
+                "attestation flows that rely on the TEE certificate first.",
+                "dstack-ingress holds a Cloudflare DNS token and may rewrite this record when it restarts "
+                "[INFERENCE]; re-run verify after any CVM restart."]
+
+    def describe(self, before, after):
+        rec, new = before["record"], after["record"]
+        call = f"PATCH zones/{tail(self.zone)}/dns_records/{tail(rec['id'])}"
+        return ({"call": call, "type": rec["type"], "proxied": {"from": rec["proxied"], "to": new["proxied"]},
+                 "ttl": {"from": rec["ttl"], "to": new["ttl"]}, "content": rec["content"]},
+                {"call": call, "restore": {"proxied": rec["proxied"], "ttl": rec["ttl"], "content": rec["content"]}})
+
+    def verify_note(self, snapshot):
+        return "TLS is now terminated by Cloudflare; tee.node is served by the Worker, not the in-CVM ingress"
+
+
+class DnsRemoveLever(DnsBase):
+    name = "dns-remove"
+
+    @staticmethod
+    def ttl_text(record):
+        ttl = record["ttl"]
+        if ttl == 1:
+            return ("recorded TTL is 1 (automatic; typically about 300 s, 300 s for proxied records) "
+                    "[INFERENCE]")
+        return f"recorded TTL is {ttl} s"
+
+    def gates(self, before):
+        return [("i_understand_ttl", "NOT INSTANT: resolvers keep serving the old answer until their cache "
+                 f"expires ({self.ttl_text(before['record'])}), so this takes minutes, not seconds")]
+
+    def warnings(self, before):
+        return [f"'Instant' does not apply: {self.ttl_text(before['record'])}; clients with a cached answer keep "
+                "reaching the old target until it expires, and clients with the literal origin address are "
+                "unaffected.",
+                "tee.node becomes unresolvable for everyone once caches expire; node.* is not touched.",
+                "dstack-ingress holds a Cloudflare DNS token and may re-create this record on restart [INFERENCE]."]
+
+    def is_applied(self, state):
+        return not state["present"]
+
+    def desired(self, state):
+        return {"present": False, "record": None}
+
+    def describe(self, before, after):
+        rec = before["record"]
+        return ({"call": f"DELETE zones/{tail(self.zone)}/dns_records/{tail(rec['id'])}",
+                 "record": without_id(rec), "recorded_ttl": rec["ttl"]},
+                {"call": f"POST zones/{tail(self.zone)}/dns_records", "recreate": without_id(rec),
+                 "note": "the re-created record gets a NEW id; every other field is identical"})
+
+
+LEVERS = {c.name: c for c in (WafLever, SecurityLevelLever, RouteLever, DnsProxyFlipLever, DnsRemoveLever)}
+DNS_LEVERS = {DnsProxyFlipLever.name, DnsRemoveLever.name}
 
 
 # ---- shared reads and snapshot handling ----
@@ -348,29 +514,29 @@ def build_plan(client, args):
     require(args.host != args.protect_host and not args.protect_host.endswith("." + args.host),
             "The target host must not be, or be a parent of, the protected host")
     params = {"action": args.action} if args.lever == "waf" else {}
+    if args.lever in DNS_LEVERS:
+        require(args.expect_type, "--expect-type {A,AAAA,CNAME} is required for DNS levers "
+                "(refuses if the record has another type)")
+        params = {"expect_type": args.expect_type}
     lever = LEVERS[args.lever](client, args.zone_id, args.host, params)
     before = lever.read()
     already = lever.is_applied(before)
     after = lever.desired(before)
     proxied = host_proxied(client, args.zone_id, args.host)
     blockers = []
-    if proxied is not True:
+    if lever.needs_proxied and proxied is not True:
         blockers.append(("allow_inert", "INERT: " + args.host + " is "
                          + ("DNS-only (grey cloud)" if proxied is False else "not found in DNS")
                          + "; Cloudflare never sees its traffic, so this lever would do nothing for it"))
-    if lever.zone_wide:
-        blockers.append(("allow_zone_wide", "ZONE-WIDE: every proxied hostname in the zone, including "
-                         + args.protect_host + ", is challenged; API clients fail the challenge"))
-    if not lever.blocks:
-        blockers.append(("allow_no_block", "DOES NOT BLOCK: proxied requests pass straight to the DNS origin "
-                         "(more exposure, not less)"))
+    blockers += lever.gates(before)
     open_blockers = [m for flag, m in blockers if not getattr(args, flag)]
     change, undo = lever.describe(before, after)
     plan_hash = digest({"v": SNAPSHOT_FORMAT, "lever": args.lever, "zone": args.zone_id, "host": args.host,
                         "protect_host": args.protect_host, "params": params, "before": before, "after": after})
     doc = {"command": "plan", "lever": args.lever, "zone": tail(args.zone_id), "host": args.host,
            "protected_host": args.protect_host, "host_proxied": proxied, "already_applied": already,
-           "change": change, "undo": undo, "blockers": open_blockers, "limits": LIMITS,
+           "change": change, "undo": undo, "blockers": open_blockers, "warnings": lever.warnings(before),
+           "limits": LIMITS,
            "plan_hash": plan_hash,
            "apply_command": f"{PROG} apply --snapshot <new-0600-file> --confirm {plan_hash} <same flags as plan>",
            "undo_command": f"{PROG} undo --snapshot <that-file> --confirm {plan_hash}"}
@@ -387,7 +553,7 @@ def cmd_plan(args, client):
 
 def run_verify(client, snap, expect):
     lever = make_lever(client, snap)
-    current = lever.read()
+    current = lever.read_lenient()
     guard_now = node_guard(client, snap["zone_id"], snap["protect_host"])
     if expect == "applied":
         checks = {"lever_applied": lever.is_applied(current),
@@ -398,9 +564,9 @@ def run_verify(client, snap, expect):
     checks["node_routes_and_dns_untouched"] = guard_now == snap["guard"]
     report = {"command": "verify", "expect": expect, "lever": snap["lever"], "zone": tail(snap["zone_id"]),
               "host": snap["host"], "checks": checks, "ok": all(checks.values())}
-    if lever.zone_wide and expect == "applied":
-        report["note"] = (f"zone-wide lever: {snap['protect_host']} is challenged by design; "
-                          "its routes/DNS being unchanged does not mean it is unaffected")
+    note = lever.verify_note(snap)
+    if note and expect == "applied":
+        report["note"] = note
     return report
 
 
@@ -458,7 +624,7 @@ def cmd_apply(args, client):
 def cmd_undo(args, client):
     snap = load_snapshot(args.snapshot)
     lever = make_lever(client, snap)
-    current = lever.read()
+    current = lever.read_lenient()
     out = {"command": "undo", "lever": snap["lever"], "zone": tail(snap["zone_id"]), "host": snap["host"],
            "plan_hash": snap["plan_hash"]}
     out["restore"] = lever.describe(snap["before"], snap["after"])[1]
@@ -513,6 +679,9 @@ def build_parser():
     target.add_argument("--allow-inert", action="store_true", help="Apply even if the host is not proxied (drills)")
     target.add_argument("--allow-zone-wide", action="store_true", help="Required for the security-level lever")
     target.add_argument("--allow-no-block", action="store_true", help="Required for the worker-route lever")
+    target.add_argument("--accept-tls-change", action="store_true", help="Required for the dns-proxy-flip lever")
+    target.add_argument("--i-understand-ttl", action="store_true", help="Required for the dns-remove lever (not instant)")
+    target.add_argument("--expect-type", choices=DNS_TYPES, help="DNS levers: the record type that must be found")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("plan", parents=[common, target], help="Read-only: print exact change, undo and plan hash")
     apply = sub.add_parser("apply", parents=[common, target], help="Dry-run unless --confirm <plan-hash>")

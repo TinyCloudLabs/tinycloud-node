@@ -35,9 +35,10 @@ be seconds [INFERENCE: not measured; measure it in the first drill].
 | `waf` (**default**) | First rule in the zone custom-rules entrypoint: `http.host eq "<host>"`, action `block` (or `--action managed_challenge\|js_challenge\|challenge`) | Yes, at the edge, before the Worker runs | Only that host. A challenge action breaks API/native clients; `block` stops all tee.* clients (intended) | none | Zone WAF: Edit |
 | `security-level` | Zone `security_level` to `under_attack` | Challenges browsers; API clients fail | **Whole zone, including node.*** | `--allow-zone-wide` | Zone Settings: Edit |
 | `worker-route` | Route `<host>/*` gets `script: null` (route id kept) | **No.** Proxied requests go straight to the DNS origin, i.e. more exposure | That pattern only | `--allow-no-block` | Workers Routes: Edit |
+| `dns-proxy-flip` | PATCH the host's DNS record `proxied=true` (ttl becomes automatic; prior `proxied`/`ttl`/`content` recorded) | **No, it is the enabler**: makes the Worker route and the WAF rule live so Cloudflare fronts the host. Follow with `waf` | That record only. **TLS trust changes**: Cloudflare terminates TLS instead of passthrough to the TEE cert; the existing `tee.node/*` Worker route goes live and forwards to the Phala `-8000` origin, bypassing the in-CVM ingress (nginx limits/CORS) | `--accept-tls-change`, `--expect-type` | Zone DNS: Edit (+ Read) |
+| `dns-remove` | DELETE the host's A/AAAA/CNAME record; the full record (type, name, content, ttl, proxied, comment, tags) is snapshotted and undo re-creates it | Yes, but **in minutes, NOT instantly**: resolvers keep the old answer until the recorded TTL expires (plan prints it; TTL 1 = automatic, about 300 s [INFERENCE]). Anyone with a cached answer or the literal origin address is unaffected | tee.node becomes unresolvable after caches expire; node.* record untouched. Undo restores every field except the record id (Cloudflare allocates a new one) | `--i-understand-ttl`, `--expect-type` | Zone DNS: Edit (+ Read) |
 
-A Worker-side kill switch is not implemented: the Worker has no bindings, so it needs a
-separate reviewed Worker change and deploy first.
+DNS levers refuse a missing record, a record of a different type than `--expect-type`, and more than one A/AAAA/CNAME record at the name. `dstack-ingress` holds a Cloudflare DNS token and may re-write or re-create the tee.node record when the CVM restarts [INFERENCE: not read]; re-run `verify` after any restart. A Worker-side kill switch is not implemented: the Worker has no bindings, so it needs a separate reviewed Worker change and deploy first.
 
 ## Tokens
 
@@ -97,6 +98,10 @@ snapshot (`before`) in the Cloudflare dashboard.
 
 - Cloudflare accepting back rules that carry `version`/`last_updated` in the WAF
   `PUT` (the undo sends the recorded list verbatim; semantics from API docs only).
+- DNS: that a PATCH of `proxied`/`ttl`/`content` restores a record exactly, that
+  setting `proxied=true` forces `ttl=1`, that `comment: null`/`tags: []` are accepted on
+  create and PATCH, and how Cloudflare proxying behaves in front of the Phala TLS
+  passthrough gateway (SSL mode, SNI to origin).
 - A missing entrypoint ruleset is restored as an empty rule list, not deleted.
 - `script: null` on a Workers route meaning "no Worker".
 - Propagation time of a custom rule, and that the rule applies before the Worker.

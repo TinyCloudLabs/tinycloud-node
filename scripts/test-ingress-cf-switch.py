@@ -92,6 +92,21 @@ class FakeCF:
         self.calls.append(("dns_records", zone, name))
         return [copy.deepcopy(r) for r in self.dns if r["name"] == name]
 
+    def update_dns_record(self, zone, record_id, body):
+        self.calls.append(("update_dns_record", zone, record_id, copy.deepcopy(body)))
+        for record in self.dns:
+            if record["id"] == record_id:
+                record.update(copy.deepcopy(body))
+
+    def create_dns_record(self, zone, body):
+        self.calls.append(("create_dns_record", zone, copy.deepcopy(body)))
+        self._n += 1
+        self.dns.append(dict(copy.deepcopy(body), id=f"dns-new-{self._n}"))
+
+    def delete_dns_record(self, zone, record_id):
+        self.calls.append(("delete_dns_record", zone, record_id))
+        self.dns = [r for r in self.dns if r["id"] != record_id]
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -408,6 +423,200 @@ class OtherLeversTest(Base):
         self.assertEqual(json.dumps(self.fake.routes), json.dumps(before))
 
 
+class DnsLeversTest(Base):
+    FLIP = ("--lever", "dns-proxy-flip", "--expect-type", "CNAME")
+    REMOVE = ("--lever", "dns-remove", "--expect-type", "CNAME")
+
+    def setUp(self):
+        super().setUp()
+        self.fake.dns[1].update(proxied=False, ttl=300, comment="managed by dstack-ingress", tags=["env:prod"],
+                                modified_on="2026-11-03T00:00:00Z")
+        self.original = json.dumps(self.fake.dns)
+        self.node_record = copy.deepcopy(self.fake.dns[0])
+
+    def tee(self):
+        return [r for r in self.fake.dns if r["name"] == HOST]
+
+    def dns_writes(self):
+        return [c for c in self.fake.calls if c[0] in ("update_dns_record", "create_dns_record", "delete_dns_record")]
+
+    def test_flip_plan_is_read_only_exact_and_warns_about_tls(self):
+        doc = self.plan(*self.FLIP)
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(self.dns_writes(), [])
+        self.assertEqual(doc["change"]["proxied"], {"from": False, "to": True})
+        self.assertEqual(doc["change"]["ttl"], {"from": 300, "to": 1})
+        self.assertEqual(doc["undo"]["restore"], {"proxied": False, "ttl": 300, "content": "y.example.test"})
+        self.assertEqual(len(doc["blockers"]), 1)
+        self.assertIn("TLS TRUST CHANGE", doc["blockers"][0])
+        self.assertIn("Cloudflare terminates TLS", doc["blockers"][0])
+        self.assertTrue(any("Does not stop traffic" in w for w in doc["warnings"]))
+        self.assertNotIn("INERT", json.dumps(doc["blockers"]))  # DNS-only is the precondition here
+
+    def test_flip_apply_gated_then_exact_undo(self):
+        h = self.plan(*self.FLIP)["plan_hash"]
+        code, _, err = self.apply(h, *self.FLIP)
+        self.assertEqual(code, 1)
+        self.assertIn("TLS TRUST CHANGE", err)
+        self.assertEqual(self.dns_writes(), [])
+        self.assertFalse(self.snap.exists())
+        code, out, err = self.apply(h, *self.FLIP, "--accept-tls-change")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.docs(out)[-1]["ok"])
+        self.assertEqual((self.tee()[0]["proxied"], self.tee()[0]["ttl"]), (True, 1))
+        saved = json.loads(self.snap.read_text())["before"]["record"]
+        self.assertEqual(saved, {"id": "dns-tee-2", "type": "CNAME", "name": HOST, "content": "y.example.test",
+                                 "ttl": 300, "proxied": False, "comment": "managed by dstack-ingress",
+                                 "tags": ["env:prod"]})
+        self.assertEqual(self.fake.dns[0], self.node_record)
+        code, _, err = self.undo("--confirm", h)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.dumps(self.fake.dns), self.original)  # byte-identical
+        update = [c for c in self.fake.calls if c[0] == "update_dns_record"][-1]
+        self.assertEqual(update[3], {"type": "CNAME", "name": HOST, "content": "y.example.test", "ttl": 300,
+                                     "proxied": False, "comment": "managed by dstack-ingress", "tags": ["env:prod"]})
+
+    def test_flip_apply_twice_is_idempotent(self):
+        h = self.plan(*self.FLIP)["plan_hash"]
+        self.apply(h, *self.FLIP, "--accept-tls-change")
+        writes = len(self.dns_writes())
+        second = self.dir / "second.json"
+        code, out, _ = self.apply(self.plan(*self.FLIP)["plan_hash"], *self.FLIP, "--accept-tls-change", snap=second)
+        self.assertEqual(code, 0)
+        self.assertIn("already applied", self.docs(out)[0]["result"])
+        self.assertEqual(len(self.dns_writes()), writes)
+        self.assertFalse(second.exists())
+
+    def test_flip_drift_refused_then_forced_and_recorded(self):
+        h = self.plan(*self.FLIP)["plan_hash"]
+        self.apply(h, *self.FLIP, "--accept-tls-change")
+        self.fake.dns[1]["content"] = "someone-else.example.test"
+        code, out, _ = self.undo("--confirm", h)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.dns[1]["content"], "someone-else.example.test")
+        code, _, err = self.undo("--confirm", h, "--force-drift")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.dumps(self.fake.dns), self.original)
+        forced = json.loads(self.snap.read_text())["forced_undo"]
+        self.assertEqual(forced[0]["overwrote"]["record"]["content"], "someone-else.example.test")
+
+    def test_remove_plan_states_ttl_and_that_it_is_not_instant(self):
+        doc = self.plan(*self.REMOVE)
+        self.assertEqual(doc["change"]["recorded_ttl"], 300)
+        self.assertIn("recorded TTL is 300 s", doc["blockers"][0])
+        self.assertIn("minutes, not seconds", doc["blockers"][0])
+        self.assertTrue(any("'Instant' does not apply" in w and "300 s" in w for w in doc["warnings"]))
+        self.assertEqual(doc["undo"]["recreate"]["comment"], "managed by dstack-ingress")
+        self.assertEqual(self.dns_writes(), [])
+        self.fake.dns[1]["ttl"] = 1
+        self.assertIn("automatic", self.plan(*self.REMOVE)["blockers"][0])
+
+    def test_remove_requires_ttl_acknowledgement(self):
+        h = self.plan(*self.REMOVE)["plan_hash"]
+        code, _, err = self.apply(h, *self.REMOVE)
+        self.assertEqual(code, 1)
+        self.assertIn("NOT INSTANT", err)
+        self.assertEqual(self.dns_writes(), [])
+        self.assertFalse(self.snap.exists())
+
+    def test_remove_snapshots_full_record_and_undo_recreates_it_identically(self):
+        h = self.plan(*self.REMOVE)["plan_hash"]
+        seen = {}
+        orig_delete = self.fake.delete_dns_record
+
+        def delete(zone, record_id):
+            seen["snapshot_first"] = json.loads(self.snap.read_text())["before"]["record"]
+            orig_delete(zone, record_id)
+
+        self.fake.delete_dns_record = delete
+        code, out, err = self.apply(h, *self.REMOVE, "--i-understand-ttl")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen["snapshot_first"]["tags"], ["env:prod"])
+        self.assertEqual(seen["snapshot_first"]["comment"], "managed by dstack-ingress")
+        self.assertEqual(self.tee(), [])
+        self.assertEqual(self.fake.dns, [self.node_record])  # node.* record untouched
+        self.assertTrue(self.docs(out)[-1]["ok"])
+        code, out, err = self.undo("--confirm", h)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.docs(out)[-1]["ok"])
+        created = [c for c in self.fake.calls if c[0] == "create_dns_record"][-1][2]
+        self.assertEqual(created, {"type": "CNAME", "name": HOST, "content": "y.example.test", "ttl": 300,
+                                   "proxied": False, "comment": "managed by dstack-ingress", "tags": ["env:prod"]})
+        restored = self.tee()[0]
+        self.assertNotEqual(restored["id"], "dns-tee-2")  # documented: re-creation allocates a new id
+        original = json.loads(self.original)[1]
+        self.assertEqual({k: v for k, v in restored.items() if k != "id"},
+                         {k: v for k, v in original.items() if k not in ("id", "modified_on")})
+        self.assertEqual(self.fake.dns[0], self.node_record)
+        code, out, _ = self.undo("--confirm", h)
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to undo", self.docs(out)[0]["result"])
+
+    def test_remove_second_apply_is_refused_without_changes(self):
+        h = self.plan(*self.REMOVE)["plan_hash"]
+        self.apply(h, *self.REMOVE, "--i-understand-ttl")
+        writes = len(self.dns_writes())
+        code, _, err = self.run_cli("plan", *self.target(*self.REMOVE))
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to act on", err)
+        self.assertEqual(len(self.dns_writes()), writes)
+
+    def test_remove_drift_when_a_different_record_appears(self):
+        h = self.plan(*self.REMOVE)["plan_hash"]
+        self.apply(h, *self.REMOVE, "--i-understand-ttl")
+        self.fake.dns.append({"id": "dns-other", "type": "CNAME", "name": HOST, "content": "elsewhere.example.test",
+                              "proxied": False, "ttl": 60, "comment": None, "tags": []})
+        code, out, _ = self.undo("--confirm", h)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.tee()[0]["content"], "elsewhere.example.test")
+        code, _, err = self.undo("--confirm", h, "--force-drift")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.tee()[0]["content"], "y.example.test")
+        self.assertEqual(self.tee()[0]["id"], "dns-other")  # overwritten in place, no duplicate
+        self.assertEqual(len(self.tee()), 1)
+        self.assertEqual(json.loads(self.snap.read_text())["forced_undo"][0]["overwrote"]["record"]["ttl"], 60)
+
+    def test_dns_levers_refuse_missing_record_wrong_type_and_ambiguity(self):
+        for lever in (self.FLIP, self.REMOVE):
+            with self.subTest(lever=lever[1], case="wrong type"):
+                code, _, err = self.run_cli("plan", *self.target("--lever", lever[1], "--expect-type", "A"))
+                self.assertEqual(code, 1)
+                self.assertIn("type is CNAME, expected A", err)
+            with self.subTest(lever=lever[1], case="no expected type"):
+                code, _, err = self.run_cli("plan", *self.target("--lever", lever[1]))
+                self.assertEqual(code, 1)
+                self.assertIn("--expect-type", err)
+        duplicate = dict(self.fake.dns[1], id="dns-dup", type="A", content="192.0.2.1")
+        self.fake.dns.append(duplicate)
+        code, _, err = self.run_cli("plan", *self.target(*self.REMOVE))
+        self.assertEqual(code, 1)
+        self.assertIn("at most one", err)
+        self.fake.dns = [r for r in self.fake.dns if r["name"] != HOST]
+        for lever in (self.FLIP, self.REMOVE):
+            code, _, err = self.run_cli("plan", *self.target(*lever))
+            self.assertEqual(code, 1)
+            self.assertIn("nothing to act on", err)
+        self.assertEqual(self.dns_writes(), [])
+        self.assertEqual(self.fake.writes(), [])
+
+    def test_failed_dns_write_leaves_snapshot_and_recovery(self):
+        h = self.plan(*self.REMOVE)["plan_hash"]
+
+        def boom(zone, record_id):
+            raise sw.CfError(f"delete_dns_record: HTTP 500 {TOKEN}")
+
+        self.fake.delete_dns_record = boom
+        code, _, err = self.apply(h, *self.REMOVE, "--i-understand-ttl")
+        self.assertEqual(code, 3)
+        self.assertIn("APPLY FAILED", err)
+        self.assertNotIn(TOKEN, err)
+        self.assertEqual(json.loads(self.snap.read_text())["status"], "pending")
+        self.assertEqual(json.dumps(self.fake.dns), self.original)
+        code, out, _ = self.undo("--confirm", h)
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to undo", self.docs(out)[0]["result"])
+
+
 class TokenAndClientTest(Base):
     def test_token_file_must_be_private_regular_file(self):
         token_file = self.dir / "token"
@@ -468,6 +677,16 @@ class TokenAndClientTest(Base):
         self.assertEqual(sent[-1][2], b'{"value": "under_attack"}')
         client.put_entrypoint_rules(ZONE, [{"a": 1}])
         self.assertEqual((sent[-1][0], sent[-1][2]), ("PUT", b'{"rules": [{"a": 1}]}'))
+        body = {"type": "CNAME", "name": HOST, "content": "y.example.test", "ttl": 300, "proxied": False,
+                "comment": None, "tags": []}
+        client.update_dns_record(ZONE, "dns-tee-2", body)
+        self.assertEqual((sent[-1][0], sent[-1][1]), ("PATCH", f"{sw.API}/zones/{ZONE}/dns_records/dns-tee-2"))
+        self.assertEqual(json.loads(sent[-1][2]), body)
+        client.create_dns_record(ZONE, body)
+        self.assertEqual((sent[-1][0], sent[-1][1]), ("POST", f"{sw.API}/zones/{ZONE}/dns_records"))
+        client.delete_dns_record(ZONE, "dns-tee-2")
+        self.assertEqual((sent[-1][0], sent[-1][1], sent[-1][2]),
+                         ("DELETE", f"{sw.API}/zones/{ZONE}/dns_records/dns-tee-2", None))
 
 
 if __name__ == "__main__":
