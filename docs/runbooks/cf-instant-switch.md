@@ -95,7 +95,10 @@ Guarantees (all tested against fakes):
   protected hosts, it never removes `node.*`. A host that a protected host CNAMEs to
   (in-zone, ONE level only: a chain node -> a -> target, or an alias in another zone, is
   not detected) is refused too. The same target check, id/host/param validation and the
-  `worker-route` id check run again when a snapshot is loaded (the file is untrusted input).
+  `worker-route` id check run again when a snapshot is loaded (the file is untrusted input:
+  malformed values are refused). The undo-token consistency check on load is unkeyed, so
+  it catches corruption, not a deliberate edit: the snapshot is a 0600 file, and anyone who
+  can write it can rewrite it. Protect the directory, not the digest.
 - A finished snapshot can not be replayed: `undo` refuses a snapshot whose status is
   `undone` or `aborted` (exit 1, nothing changed), so re-running an old undo from shell
   history can not revert a newer apply. The undo confirm value is the snapshot's

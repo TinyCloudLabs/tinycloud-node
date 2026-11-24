@@ -671,7 +671,7 @@ def load_snapshot(path):
             "Snapshot undo token invalid")
     require(isinstance(snap.get("plan_hash"), str) and isinstance(snap.get("nonce"), str)
             and snap["undo_token"] == digest({"plan_hash": snap["plan_hash"], "nonce": snap["nonce"]}),
-            "Snapshot undo token does not match its plan hash and nonce (edited or corrupt)")
+            "Snapshot undo token does not match its plan hash and nonce (corrupt or inconsistent)")
     require(isinstance(snap.get("zone_id"), str) and ZONE_RE.fullmatch(snap["zone_id"]), "Snapshot zone id invalid")
     require(isinstance(snap.get("host"), str) and HOST_RE.fullmatch(snap["host"]), "Snapshot host invalid")
     hosts = snap.get("protect_hosts")
