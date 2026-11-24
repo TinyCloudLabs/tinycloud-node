@@ -175,11 +175,26 @@ contact with Phala infrastructure, not an API call and not a credentialed one).
 | exit | verdict | meaning | action |
 |---|---|---|---|
 | 0 | `pass` | every check proven; **unreachable for `--expect restricted` until a drill signature is accepted** | continue |
-| 1 | `open`, `--expect restricted` | a probed gateway path answered 2xx (the node or not), management answered although the policy denies it, expected-open management accepted the connection but gave no SSH banner (not a connect-time refusal or reset), or `node.*` or the tunnel host is unhealthy | **undo** (restore). If the only failing check is a transport failure of `/info` (no HTTP status, seen from this vantage only), **confirm from a second network before undo** |
+| 1 | `open`, `--expect restricted` | a probed gateway path answered 2xx (the node or not), management answered although the policy denies it, expected-open management accepted the connection but gave no SSH banner (not a connect-time refusal or reset), or `node.*` or the tunnel host is unhealthy | **undo** (restore) when `confirm_before_undo` is `false`. When it is `true` (only `/info` transport failures from this vantage, or only the management route failing after accept) **confirm from a second network or another app first, then undo** |
 | 1 | `open`, `--expect restored` | the node path is broken after the restore (tee not serving the node, `/info` or management unhealthy) | **do NOT undo again** (the restore is already applied); investigate the tunnel, the Worker secret and the connector, confirm from a second network |
 | 3 | `not_proven_closed`, `--expect restricted` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, non-2xx HTTP, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits and connect-time refusals/resets on management) | **hold; do NOT undo and do NOT restart on this alone.** From a **second, IPv6-capable network** check that the `-8000` hosts and `tee.node.tinycloud.xyz` `/info` do not return the node **and that the management route (`<app-id>-10022` on the gateway) still answers an `SSH-2.0` banner**, then run the drill. With the empty set a **correct** restriction reads `not_proven_closed` today |
 | 3 | `not_proven_closed`, `--expect restored` | restored not proven from this vantage (typically an IPv4-only vantage while management has an AAAA record) | re-run from a second IPv6-capable network; do NOT undo again; no drill needed |
 | 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed, an IO or parse error, an unexpected exception (stderr: "No verdict was computed: do NOT treat this as closed and do NOT undo on this alone; rerun"). **No verdict.** Nothing was changed or judged. A failed **receipt write** after the checks ran is NOT exit 4: the verdict keeps its own exit code (1/3), `receipt_record` says `FAILED` and stderr warns | **fix the input and re-run; never undo on exit 4** |
+
+**`confirm_before_undo` (machine-readable, in the `verify` JSON).** `true` whenever an
+exit 1 carries a hedge: every failing check is an `/info` transport failure seen from this
+vantage, or every failing check is on the management route after the connection was
+accepted (TLS alert, close, 502; the same signature as "the PATCH broke management", so
+undo stays defensible, but confirm first). `false` for every other result: an exit 1
+where a gateway path answered 2xx or management answers although denied (undo needs no
+extra confirmation), restored exit 1 (never an undo), and exits 0 and 3. Exit 4 prints no
+JSON. **A wrapper must not undo on exit 1 and `verdict=open` alone: undo only when
+`confirm_before_undo` is `false`, otherwise confirm from a second network (or another
+app) first.**
+
+When a receipt write fails after the checks ran, stderr warns first (naming the leftover
+`<receipt>.record` path), then the verdict JSON follows on stdout; the JSON's
+`receipt_record` says `FAILED`.
 
 **A stale receipt is likely**: the receipt's default max age is 3600 s and the restart
 time is unmeasured, so a verify run after a slow restart is refused (exit 4, stderr

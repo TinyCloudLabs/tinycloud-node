@@ -735,7 +735,7 @@ def verify(a, clients, now):
         checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 over {family} untouched "
                             f"(expected {'open' if expect_open else 'denied'})", status, detail,
                             kind=management_kind(signals_of(result), expect_open),
-                            addresses=list(result.get("addresses") or [])))
+                            addresses=list(result.get("addresses") or []), management=True))
     return checks, waived
 
 
@@ -775,6 +775,30 @@ EXIT_CODES = {
 }
 
 
+def undo_hedge(verdict, expect, checks):
+    """Why an exit 1 (restricted) needs confirmation before undo, or None. Hedged: (a) every failing check is a /info
+    transport failure seen from this vantage; (b) every failing check is on the management route (accepted the connection,
+    no banner after accept): the same signature as 'the PATCH broke management', so undo stays defensible, but confirm
+    first. Management answering although denied (kind open) and any other open check carry no hedge."""
+    if verdict != "open" or expect != "restricted":
+        return None
+    seen = [c for c in checks if c["status"] != "pass" and c.get("kind") in ("open", "broken")]
+    if seen and all(c.get("transport_failure") for c in seen):
+        return ("Every failing check is a transport failure of /info seen from this vantage only (no HTTP answer): "
+                "confirm from a second network before undo.")
+    if seen and all(c.get("management") and c.get("kind") == "broken" for c in seen):
+        return ("Every failing check is on the management route (it accepted the connection but gave no SSH banner), the "
+                "same signature as 'the PATCH broke management' and also as a single-app or vantage problem: confirm from "
+                "a second network or another app first before undo.")
+    return None
+
+
+def confirm_before_undo(verdict, expect, checks):
+    """Machine-readable: True whenever an exit 1 carries a hedge, so a wrapper never undoes on exit 1 + verdict open alone.
+    False for every other result (restored exit 1 is never an undo; exit 0 and 3 are not undo cases)."""
+    return undo_hedge(verdict, expect, checks) is not None
+
+
 def next_action(verdict, expect, checks):
     """Text per mode: after an undo (restored) 'undo' is never the advice. Decision table: exit AND verdict."""
     if verdict == "pass":
@@ -791,11 +815,8 @@ def next_action(verdict, expect, checks):
     if verdict == "open":
         text = ("OPEN (verdict open): a probed path answered as the node, or the service or management is unhealthy. Follow "
                 "the runbook decision table: undo (restore) if the path is open or the service is down.")
-        seen = [c for c in failed if c.get("kind") in ("open", "broken")]
-        if seen and all(c.get("transport_failure") for c in seen):
-            text += (" Every failing check is a transport failure of /info seen from this vantage only (no HTTP answer): "
-                     "confirm from a second network before undo.")
-        return text
+        hedge = undo_hedge(verdict, expect, checks)
+        return text + (" " + hedge if hedge else "")
     return ("NOT PROVEN CLOSED (verdict not_proven_closed), and nothing was seen open. Do NOT undo and do NOT restart on "
             "this result. From a SECOND, IPv6-capable network check that the -8000 hosts and tee.node.tinycloud.xyz /info "
             "do not return the node and that the management route (<app-id>-10022 on the gateway) still answers an "
@@ -820,10 +841,13 @@ def cmd_verify(a, clients, now, out):
         # S10: a failed receipt write (leftover .record, disk full, permissions) must never turn a computed verdict, e.g.
         # open, into exit 4. The verdict is emitted with its own exit code and the failure is stated.
         receipt_record = ("FAILED: the receipt could not be updated; this run's addresses and controls were NOT recorded. "
-                          "The verdict and exit code above are unaffected")
-        print("Warning: " + receipt_record, file=sys.stderr)
+                          "The verdict and exit code in this output are unaffected")
+        leftover = Path(a.receipt).with_name(Path(a.receipt).name + ".record")
+        print(f"Warning: {receipt_record}. Check for a leftover {leftover}. The verdict is in the JSON printed next on "
+              "stdout.", file=sys.stderr)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
                "exit_codes": EXIT_CODES[a.expect],
+               "confirm_before_undo": confirm_before_undo(verdict, a.expect, checks),
                "next_action": next_action(verdict, a.expect, checks), "checks": checks,
                "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
                "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,

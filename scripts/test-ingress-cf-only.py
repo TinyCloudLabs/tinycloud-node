@@ -880,6 +880,9 @@ class DefaultClosedSetTest(Base):
                 self.assertEqual((code, result["verdict"]), expected, out)
                 self.assertTrue(result["receipt_record"].startswith("FAILED"), result["receipt_record"])
                 self.assertIn("Warning", err)
+                self.assertIn(str(leftover), err)  # the leftover <receipt>.record is named, path only
+                self.assertNotIn("above", err)
+                self.assertIn("this output", result["receipt_record"])
                 self.assertEqual(self.receipt.read_text(), before)
         leftover.unlink()
         self.http = FakeHttp(restricted=False)
@@ -887,6 +890,54 @@ class DefaultClosedSetTest(Base):
             code, out, err = self.verify()
         self.assertEqual((code, json.loads(out)["verdict"]), (1, "open"))
         self.assertNotIn("disk-full-detail", err + out)
+
+    def test_confirm_before_undo_is_true_only_where_exit_1_carries_a_hedge(self):
+        def run(http, expect="restricted"):
+            self.http = http
+            code, out, err = self.verify(expect=expect)
+            return code, (json.loads(out) if out else None)
+
+        code, result = run(FakeHttp())  # correct restriction, nothing proven: exit 3, never confirm-then-undo
+        self.assertEqual((code, result["confirm_before_undo"]), (3, False))
+        code, result = run(FakeHttp(restricted=False))  # open gateway: undo needs no extra confirmation
+        self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", False))
+        self.assertNotIn("confirm from", result["next_action"])
+        http = FakeHttp()  # transport failure of /info only (seen from this vantage)
+        http.info_map["node.tinycloud.xyz"] = {"status": None, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["confirm_before_undo"]), (1, True))
+        self.assertIn("second network before undo", result["next_action"])
+        # S12: only the management route failed, after the connection was accepted: hedged
+        for family in ("mgmt", "mgmt6"):
+            for outcome in ("tls_rejected", "closed_after_tls", "http_502"):
+                with self.subTest(family=family, outcome=outcome):
+                    http = FakeHttp()
+                    setattr(http, family, {"outcome": outcome})
+                    code, result = run(http)
+                    self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", True))
+                    self.assertIn("second network or another app first before undo", result["next_action"])
+        http = FakeHttp(restricted=False)  # management broken AND a gateway path open: no hedge
+        http.mgmt = {"outcome": "tls_rejected"}
+        code, result = run(http)
+        self.assertEqual((code, result["confirm_before_undo"]), (1, False))
+        # restored: exit 1 is never an undo, exit 3 neither
+        http = FakeHttp(restricted=False)
+        http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_refused"}
+        code, result = run(http, "restored")
+        self.assertEqual((code, result["confirm_before_undo"]), (1, False))
+        http = FakeHttp(restricted=False)
+        http.mgmt6 = {"outcome": "no_route"}
+        code, result = run(http, "restored")
+        self.assertEqual((code, result["confirm_before_undo"]), (3, False))
+        # exit 4 prints no JSON, so no field to misread
+        code, out, err = self.run_cli(["verify", *self.verify_args(expect="restricted"), "--max-receipt-age", "0"])
+        self.assertEqual((code, out), (4, ""))
+        # management answering although the policy denies it is open with no hedge
+        snap = json.loads(self.snapshot.read_text())
+        self.save(self.snapshot, dict(snap, after={"restrict_mode": True, "ports": []}))
+        code, result = run(FakeHttp())
+        self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", False))
+        self.save(self.snapshot, snap)
 
     def closed_checks(self, out):
         return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]
