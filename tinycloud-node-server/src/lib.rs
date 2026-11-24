@@ -906,11 +906,12 @@ fn ledger_failure_consequence(named_keys_v1: bool) -> &'static str {
 
 /// The one line a node logs per start about its deletion ledger, after replay
 /// (TC-4177): the file's state (`missing` means this start created it),
-/// size, delete operations, key entries, `committed` and `aborted` lines, and
-/// the newest `deletedAt` (`none` with no operation). Counts and a timestamp
-/// only, so two starts can be compared across an OS move or deploy. It is
-/// info level: a missing or empty ledger is normal on a first start, so this
-/// line states a fact and does not alarm.
+/// size, delete operations, key entries, `committed` and `aborted` lines, the
+/// newest `deletedAt` (`none` with no operation) and whether the final line
+/// is not a whole record. Counts and a timestamp only, so two starts can be
+/// compared across an OS move or deploy. It is info level: a missing or empty
+/// ledger is normal on a first start, so this line states a fact and does not
+/// alarm.
 fn log_deletion_ledger_start(path: &std::path::Path, existed_before_open: bool) {
     use tinycloud_core::encryption_network::deletion_ledger::summarize;
     match summarize(path, existed_before_open) {
@@ -923,6 +924,7 @@ fn log_deletion_ledger_start(path: &std::path::Path, existed_before_open: bool) 
             committed = summary.committed,
             aborted = summary.aborted,
             newest_deleted_at = summary.newest_deleted_at.as_deref().unwrap_or("none"),
+            torn_tail = summary.torn_tail,
             "deletion ledger at start"
         ),
         Err(error) => ::tracing::info!(

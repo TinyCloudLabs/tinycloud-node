@@ -260,7 +260,8 @@ After a successful replay, every start logs one info line, `deletion_ledger_star
 `ledger_file` (`missing` when this start found no file and created an empty one,
 `empty`, or `present`; decided before the open creates the file), `bytes`,
 `operations` (delete operations), `key_entries` (keys they name), `committed`,
-`aborted` and `newest_deleted_at` (`none` with no operation). Counts and one
+`aborted`, `newest_deleted_at` (`none` with no operation) and `torn_tail` (the
+final line is not a whole record). Counts, flags and one
 timestamp: no operation id, network id or key path. This release only logs it:
 it ships to Better Stack after the shipper follow-up (TC-4177 follow-up). Until
 then the log shipper drops it (`filtered_level`).
