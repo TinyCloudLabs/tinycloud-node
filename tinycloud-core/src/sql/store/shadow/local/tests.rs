@@ -683,18 +683,18 @@ async fn a_database_over_the_cap_still_has_its_wal_rotated() {
     assert!(std::fs::metadata(rig.main_path()).unwrap().len() > PILOT_CAP_BYTES);
 
     // The database cannot be published, but its WAL must not pile up: the
-    // next full WAL is folded in even though the cap refuses the database.
+    // next WAL that reaches the rotation size for this checkpoint is folded
+    // in even though the cap refuses the database.
+    let main = std::fs::metadata(rig.main_path()).unwrap().len();
+    let full = rotation_threshold(main) + 1024 * 1024;
     run(
         &service,
         &rig.space,
-        &format!(
-            "INSERT INTO items (v) VALUES (zeroblob({}))",
-            WINDOW_BYTES + 1024 * 1024
-        ),
+        &format!("INSERT INTO items (v) VALUES (zeroblob({full}))"),
     )
     .await
     .unwrap();
-    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= WINDOW_BYTES);
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= rotation_threshold(main));
     assert!(matches!(source.head(&db).await, Err(SourceError::TooLarge)));
     assert_eq!(std::fs::metadata(rig.wal_path()).unwrap().len(), 0);
     assert_eq!(count(&service, &rig.space).await, 2);
@@ -752,4 +752,240 @@ async fn a_rolled_back_write_is_not_published_and_the_restore_still_equals_the_l
     frontier_at(&rig, 12).await;
     assert_restore_equals_local(&rig, source, store, scratch.path()).await;
     uploader.drain(Duration::from_secs(5)).await;
+}
+
+// ---- the mode is read under the operation lock ----------------------------------
+
+/// Says `store_master` for the first read and `not` for every one after it:
+/// the router's read, then a cutover or rollback that moved the mode before
+/// the source took the lock.
+#[derive(Default)]
+struct FlipsAfterTheFirstRead {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl StoreMasterGate for FlipsAfterTheFirstRead {
+    async fn is_store_master(
+        &self,
+        _db: &DbRef<'_>,
+    ) -> Result<bool, crate::sql::store::mode::ModeError> {
+        Ok(self.reads.fetch_add(1, Ordering::SeqCst) == 0)
+    }
+    async fn store_master_databases(
+        &self,
+    ) -> Result<Vec<crate::sql::store::shadow::DbKey>, crate::sql::store::mode::ModeError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn a_database_whose_mode_moved_after_the_routing_read_is_not_read_as_store_master() {
+    let rig = Rig::new("mode-under-lock").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), DurabilityPolicy::default());
+    insert(&service, &rig.space, "a").await.unwrap();
+    let source = Arc::new(LocalFileSource::new(
+        service.clone(),
+        Arc::new(FlipsAfterTheFirstRead::default()),
+    ));
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+
+    // What the router saw, without the lock.
+    assert!(source.is_local(&db).await.unwrap());
+    // What the source sees once it holds the lock: the mode moved, so it
+    // reads nothing from the working copy.
+    assert!(matches!(source.head(&db).await, Err(SourceError::MovedOn)));
+    let scratch = tempfile::tempdir().unwrap();
+    let mut file = tokio::fs::File::create(scratch.path().join("out"))
+        .await
+        .unwrap();
+    let cid = hash_file(&rig.main_path()).unwrap();
+    assert!(matches!(
+        source.checkpoint_to(&db, &cid, &mut file).await,
+        Err(SourceError::MovedOn)
+    ));
+    assert_eq!(
+        file.metadata().await.unwrap().len(),
+        0,
+        "nothing was copied"
+    );
+}
+
+// ---- upload amplification ----------------------------------------------------------
+
+/// Counts the bytes of every object the store accepts.
+struct CountingStore {
+    inner: MemorySqlObjectStore,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl SqlObjectStore for CountingStore {
+    async fn put_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        size: u64,
+    ) -> Result<PutOutcome, SqlStoreError> {
+        let outcome = self.inner.put_file(key, path, size).await?;
+        if matches!(outcome, PutOutcome::Created) {
+            self.bytes.fetch_add(size, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+    async fn get_to_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        self.inner.get_to_file(key, path, max_bytes).await
+    }
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRangeSpec,
+    ) -> Result<Option<ObjectRange>, SqlStoreError> {
+        self.inner.get_range(key, range).await
+    }
+    async fn head(&self, key: &ObjectKey) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        self.inner.head(key).await
+    }
+}
+
+fn local_seq(rig: &Rig) -> u64 {
+    crate::sql::store::local::read_seq(&Connection::open(rig.main_path()).unwrap()).unwrap()
+}
+
+/// Waits until the frontier has reached the counter and the counter holds
+/// still (the uploader's own rotations move it).
+async fn published_up_to_the_counter(rig: &Rig) {
+    loop {
+        let frontier = frontier_at(rig, local_seq(rig)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if frontier.last_seq == local_seq(rig) {
+            return;
+        }
+    }
+}
+
+/// Bytes the store accepted per byte written, for a database whose checkpoint
+/// is `main_mib` when the writes start and which then takes `write_mib` of
+/// 1 MiB commits, uploaded by the real scheduler as they arrive.
+async fn upload_amplification(main_mib: u64, write_mib: u64) -> f64 {
+    let rig = Rig::new("amplification").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let store = Arc::new(CountingStore {
+        inner: MemorySqlObjectStore::default(),
+        bytes: Default::default(),
+    });
+    let scratch = tempfile::tempdir().unwrap();
+    let uploader = start(
+        &rig,
+        source(&rig, &service),
+        store.clone(),
+        board,
+        scratch.path(),
+        Duration::ZERO,
+    );
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            main_mib * 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    published_up_to_the_counter(&rig).await;
+
+    store.bytes.store(0, Ordering::SeqCst);
+    for _ in 0..write_mib {
+        run(
+            &service,
+            &rig.space,
+            "INSERT INTO items (v) VALUES (zeroblob(1048576))",
+        )
+        .await
+        .unwrap();
+    }
+    published_up_to_the_counter(&rig).await;
+    uploader.drain(Duration::from_secs(5)).await;
+    store.bytes.load(Ordering::SeqCst) as f64 / (write_mib * 1024 * 1024) as f64
+}
+
+#[tokio::test]
+async fn the_bytes_uploaded_per_byte_written_stay_within_the_cap() {
+    // A 24 MiB checkpoint taking 32 MiB of writes (it stays under the 64 MiB
+    // cap throughout): with a rotation every 8 MiB (the window) each rotation
+    // would upload the whole checkpoint again.
+    let measured = upload_amplification(24, 32).await;
+    eprintln!("MEASURED upload amplification, 24 MiB checkpoint, 32 MiB written: {measured:.2}x");
+    // A rotation folds in at least `main / 2` of WAL and uploads `main + WAL`,
+    // at most 3x that WAL; the WAL itself is uploaded once more as deltas.
+    assert!(measured <= 4.5, "{measured:.2}x");
+}
+
+#[tokio::test]
+async fn a_large_checkpoint_waits_for_proportionally_more_wal_before_it_is_rotated() {
+    let rig = Rig::new("rotation-size").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+    let mib = 1024 * 1024;
+    let write = |mib_count: u64| {
+        let (service, space) = (service.clone(), rig.space.clone());
+        async move {
+            run(
+                &service,
+                &space,
+                &format!(
+                    "INSERT INTO items (v) VALUES (zeroblob({}))",
+                    mib_count * 1024 * 1024
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    };
+
+    // Grow the checkpoint to about 24 MiB: one rotation, as for any database.
+    write(24).await;
+    let base = source.head(&db).await.unwrap().unwrap();
+    assert!(!base.has_delta && base.checkpoint_bytes > 24 * mib);
+    let threshold = rotation_threshold(base.checkpoint_bytes);
+    assert!(threshold > 12 * mib && threshold < 13 * mib, "{threshold}");
+
+    // 10 MiB is past the 8 MiB window, but a snapshot of this checkpoint
+    // would be 3x what was written: not yet. The delta is published instead.
+    write(10).await;
+    let before = source.head(&db).await.unwrap().unwrap();
+    assert_eq!(before.revision, base.revision + 1, "no rotation");
+    assert!(before.has_delta && before.delta_bytes > 10 * mib);
+
+    // Past half the checkpoint it is.
+    write(4).await;
+    let after = source.head(&db).await.unwrap().unwrap();
+    assert_eq!(
+        after.revision,
+        before.revision + 2,
+        "the write and a rotation"
+    );
+    assert!(!after.has_delta);
 }

@@ -66,6 +66,28 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 /// over the cap). It bounds the disk a stalled database can take.
 pub const WAL_REFUSE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// A rotation is also taken by the commit path, not only by the uploader, once
+/// the WAL holds this many bytes. It is the backstop for a database nobody
+/// uploads (a space that is not allowlisted, or whose checkpoint is over the
+/// cap): its WAL is folded in and truncated instead of growing to the refusal
+/// above. The uploader rotates far earlier ([`rotation_threshold`]).
+pub const WAL_BACKSTOP_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Every rotation publishes the whole main file as a snapshot, so the upload
+/// cost of a write is the WAL it carries plus, once per rotation, the main
+/// file. A rotation therefore waits until the WAL is at least
+/// `main / SNAPSHOT_AMPLIFICATION_CAP`, which keeps the snapshot bytes at or
+/// under that many times the bytes written (measured in the shadow tests).
+pub const SNAPSHOT_AMPLIFICATION_CAP: u64 = 2;
+
+/// The WAL size at which the uploader rotates a database whose main file is
+/// `main_bytes`: the 8 MiB window for a small database, growing with the main
+/// file up to half the pilot cap.
+pub fn rotation_threshold(main_bytes: u64) -> u64 {
+    (main_bytes / SNAPSHOT_AMPLIFICATION_CAP)
+        .clamp(WINDOW_BYTES, PILOT_CAP_BYTES / SNAPSHOT_AMPLIFICATION_CAP)
+}
+
 /// The reserved counter table.
 pub const SEQ_TABLE: &str = "tinycloud_internal_store_seq";
 
@@ -193,6 +215,23 @@ pub fn init_seq(conn: &Connection, start_seq: u64) -> Result<(), SqlError> {
         .filter(|seq| *seq >= 1)
         .ok_or_else(|| SqlError::Internal("store-master seq must start at 1 or more".into()))?;
     let table = seq_table();
+    // A Postgres-mode database may already hold a table of this name (the
+    // prefix is reserved only once a database is store-master), or be the
+    // import of an export of one. Cutover must stop there, and say why: an
+    // existing table is never adopted as the counter.
+    let taken: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+            [SEQ_TABLE],
+            |r| r.get(0),
+        )
+        .map_err(sqlite)?;
+    if taken != 0 {
+        return Err(SqlError::Internal(format!(
+            "the database already has a table named {SEQ_TABLE} (a user table, or an export of a \
+             store-master database); drop it before cutover"
+        )));
+    }
     conn.execute_batch(&format!(
         "CREATE TABLE {table} (\
            id INTEGER PRIMARY KEY CHECK (id = 1), \
@@ -224,23 +263,50 @@ pub fn read_seq(conn: &Connection) -> Result<u64, SqlError> {
 /// with no authorizer installed. At `i64::MAX` it refuses (the transaction is
 /// rolled back by the caller) instead of overflowing.
 pub fn bump_seq(conn: &Connection) -> Result<(), SqlError> {
-    let changed = conn
-        .execute(
+    bump(conn, None)
+}
+
+/// As [`bump_seq`], for a write whose counter was read as `expected` before
+/// the user's SQL ran: it refuses unless the row still holds `expected`, so a
+/// change to the counter by anything inside the transaction, whatever path it
+/// took, fails the write instead of being counted.
+pub fn bump_seq_from(conn: &Connection, expected: u64) -> Result<(), SqlError> {
+    bump(conn, Some(expected))
+}
+
+fn bump(conn: &Connection, expected: Option<u64>) -> Result<(), SqlError> {
+    let table = seq_table();
+    let changed = match expected {
+        None => conn.execute(
             &format!(
-                "UPDATE {} SET seq = seq + 1 WHERE id = 1 AND seq < {}",
-                seq_table(),
+                "UPDATE {table} SET seq = seq + 1 WHERE id = 1 AND seq < {}",
                 i64::MAX
             ),
             [],
-        )
-        .map_err(sqlite)?;
+        ),
+        Some(expected) => {
+            let expected = i64::try_from(expected)
+                .map_err(|_| SqlError::Internal("store-master seq is out of range".into()))?;
+            conn.execute(
+                &format!(
+                    "UPDATE {table} SET seq = seq + 1 WHERE id = 1 AND seq = ?1 AND seq < {}",
+                    i64::MAX
+                ),
+                [expected],
+            )
+        }
+    }
+    .map_err(sqlite)?;
     if changed == 1 {
         return Ok(());
     }
-    match read_seq(conn) {
-        Ok(seq) if i64::try_from(seq) == Ok(i64::MAX) => {
+    match (read_seq(conn), expected) {
+        (Ok(seq), _) if i64::try_from(seq) == Ok(i64::MAX) => {
             Err(SqlError::Internal("store-master seq is exhausted".into()))
         }
+        (Ok(seq), Some(expected)) if seq != expected => Err(SqlError::Internal(
+            "store-master seq changed during the write".into(),
+        )),
         _ => Err(SqlError::Internal("store-master seq row is missing".into())),
     }
 }
@@ -445,6 +511,26 @@ impl LocalFiles {
     /// replaced).
     pub fn invalidate(&self, key: &DbKey) {
         self.with(key, |e| e.cid = None);
+    }
+
+    /// Forget everything known about the databases of `space`: its working
+    /// copies were deleted (a purge), and a space of the same id created later
+    /// must not inherit a hash, a WAL mark or a published position.
+    pub fn forget_space(&self, space: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|key, _| key.0 != space);
+    }
+
+    /// Whether anything is remembered about the databases of `space`.
+    #[cfg(test)]
+    pub fn knows_space(&self, space: &str) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|key| key.0 == space)
     }
 
     /// Remember where the WAL of `mark.revision` ended.

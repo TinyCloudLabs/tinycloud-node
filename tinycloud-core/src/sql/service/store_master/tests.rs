@@ -1,21 +1,30 @@
 //! TC-1491 P4.2a: the store-master half of the SQL service.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use rusqlite::Connection;
 
 use crate::sql::authority::DdlPolicy;
+use crate::sql::database::{spawn_actor, GrowthPolicy};
 use crate::sql::durability::{CommitSeams, DurabilityPolicy};
 use crate::sql::service::SqlService;
+use crate::sql::store::key::DbRef;
 use crate::sql::store::local::rig::{count, insert, query, run, ProbeSink, Rig, DB};
 use crate::sql::store::local::{
-    hash_file, read_seq, validate_working_copy, WAL_REFUSE_BYTES, WINDOW_BYTES,
+    hash_file, read_seq, validate_working_copy, StoreMasterGate, PILOT_CAP_BYTES,
+    WAL_BACKSTOP_BYTES, WAL_REFUSE_BYTES, WINDOW_BYTES,
 };
+use crate::sql::store::mode::ModeError;
 use crate::sql::store::policy::SpaceAllowlist;
 use crate::sql::store::shadow::metrics::NoopMetrics;
 use crate::sql::store::shadow::NoticeBoard;
+use crate::sql::types::SqlRequest;
 use crate::sql::types::{SqlError, SqlValue};
 
 fn plain() -> DurabilityPolicy {
@@ -459,7 +468,14 @@ async fn a_write_is_refused_once_the_wal_holds_64_mib_and_resumes_after_a_rotati
     rig.make_store_master().await;
     let service = rig.service(Arc::new(ProbeSink::default()), plain());
 
-    // Nothing drains this WAL: no uploader runs.
+    // A reader holding an old snapshot keeps the checkpoint busy, so the
+    // commit path's backstop rotation cannot truncate (and does not fail the
+    // write that asked for it). Nothing else drains this WAL: no uploader.
+    insert(&service, &rig.space, "first").await.unwrap();
+    let reader = Connection::open(rig.main_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM items")
+        .unwrap();
     let big = (WAL_REFUSE_BYTES + 1024 * 1024) as i64;
     run(
         &service,
@@ -475,11 +491,268 @@ async fn a_write_is_refused_once_the_wal_holds_64_mib_and_resumes_after_a_rotati
         matches!(refused, Err(SqlError::DiskHeadroom)),
         "{refused:?}"
     );
-    assert_eq!(count(&service, &rig.space).await, 1, "reads still work");
-    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 11);
+    assert_eq!(count(&service, &rig.space).await, 2, "reads still work");
+    let refused_at = validate_working_copy(&rig.main_path()).unwrap();
 
+    drop(reader);
     let handle = service.local_handle(&rig.space, DB).await.unwrap();
     handle.rotate().await.unwrap();
     insert(&service, &rig.space, "after").await.unwrap();
+    assert_eq!(count(&service, &rig.space).await, 3);
+    assert!(
+        validate_working_copy(&rig.main_path()).unwrap() > refused_at,
+        "the refused write did not count"
+    );
+}
+
+/// A gate with a mode per database name, and a switch that makes every read
+/// of it fail.
+#[derive(Default)]
+struct SwitchGate {
+    modes: Mutex<HashMap<String, bool>>,
+    down: AtomicBool,
+}
+
+impl SwitchGate {
+    fn with(modes: &[(&str, bool)]) -> Arc<Self> {
+        Arc::new(Self {
+            modes: Mutex::new(modes.iter().map(|(n, m)| (n.to_string(), *m)).collect()),
+            down: AtomicBool::new(false),
+        })
+    }
+    fn set(&self, name: &str, mode: bool) {
+        self.modes.lock().unwrap().insert(name.to_string(), mode);
+    }
+    fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StoreMasterGate for SwitchGate {
+    async fn is_store_master(&self, db: &DbRef<'_>) -> Result<bool, ModeError> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(ModeError::Db("the control database is down".into()));
+        }
+        Ok(*self.modes.lock().unwrap().get(db.db_id).unwrap_or(&false))
+    }
+    async fn store_master_databases(
+        &self,
+    ) -> Result<Vec<crate::sql::store::shadow::DbKey>, ModeError> {
+        Ok(Vec::new())
+    }
+}
+
+fn switched(rig: &Rig, sink: Arc<ProbeSink>, gate: Arc<SwitchGate>) -> SqlService {
+    SqlService::new(rig.base(), 0, rig.repo.clone())
+        .with_ddl_policy(DdlPolicy::Log)
+        .with_shadow(sink)
+        .with_store_master_gate(gate)
+}
+
+async fn run_on(service: &SqlService, rig: &Rig, db: &str, sql: &str) -> Result<(), SqlError> {
+    service
+        .execute(
+            &rig.space,
+            db,
+            SqlRequest::Execute {
+                sql: sql.to_owned(),
+                params: vec![],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".into(),
+        )
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn a_write_path_truncates_the_wal_of_a_database_nobody_uploads() {
+    // No uploader and no allowlist entry: nothing but the commit path can
+    // shrink this WAL. The checkpoint ends past the pilot cap, so the same
+    // run is the over-the-cap case: such a database is not published, and
+    // must not take the disk either.
+    let rig = Rig::new("backstop").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = rig.service(sink.clone(), plain());
+
+    let blob = 25 * 1024 * 1024;
+    let mut max_wal = 0;
+    for n in 1..=4 {
+        run(
+            &service,
+            &rig.space,
+            &format!("INSERT INTO items (v) VALUES (zeroblob({blob}))"),
+        )
+        .await
+        .unwrap();
+        let wal = std::fs::metadata(rig.wal_path()).map_or(0, |m| m.len());
+        max_wal = max_wal.max(wal);
+        if n % 2 == 0 {
+            assert_eq!(wal, 0, "write {n}: the WAL was folded in and truncated");
+        } else {
+            assert!(wal > 0 && wal < WAL_BACKSTOP_BYTES, "write {n}: {wal}");
+        }
+    }
+    assert!(max_wal < WAL_BACKSTOP_BYTES);
+    let main = std::fs::metadata(rig.main_path()).unwrap().len();
+    assert!(main > PILOT_CAP_BYTES, "over the cap: {main}");
+    assert_eq!(count(&service, &rig.space).await, 4, "nothing was lost");
+    // Two writes per rotation: 10 -> 11, 12, rotation 13 -> 14, 15, 16.
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 16);
+    // What the uploader is told follows the rotation, not the stale WAL.
+    let last = sink.notices().pop().unwrap();
+    assert_eq!((last.seq, last.ahead_bytes), (16, main));
+}
+
+#[tokio::test]
+async fn a_database_with_a_live_actor_is_still_served_when_the_mode_cannot_be_read() {
+    let rig = Rig::new("gate-down").await;
+    rig.create_working_copy(10);
+    let gate = SwitchGate::with(&[(DB, true), ("pg", false)]);
+    let service = switched(&rig, Arc::new(ProbeSink::default()), gate.clone());
+
+    // One database of each mode, both warm.
+    insert(&service, &rig.space, "a").await.unwrap();
+    run_on(&service, &rig, "pg", "CREATE TABLE t (a INTEGER)")
+        .await
+        .unwrap();
+    run_on(&service, &rig, "pg", "INSERT INTO t (a) VALUES (1)")
+        .await
+        .unwrap();
+
+    gate.set_down(true);
+    insert(&service, &rig.space, "b").await.unwrap();
     assert_eq!(count(&service, &rig.space).await, 2);
+    run_on(&service, &rig, "pg", "INSERT INTO t (a) VALUES (2)")
+        .await
+        .unwrap();
+
+    // A database with no actor would have to be opened without knowing its
+    // mode: refused, retryable, and nothing is created for it.
+    let cold = run_on(&service, &rig, "cold", "CREATE TABLE t (a INTEGER)").await;
+    assert!(matches!(cold, Err(SqlError::Unavailable)), "{cold:?}");
+    assert!(!rig.main_path().with_file_name("cold.db").exists());
+
+    gate.set_down(false);
+    run_on(&service, &rig, "cold", "CREATE TABLE t (a INTEGER)")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_publication_command_on_a_store_master_database_is_refused_not_saved_to_postgres() {
+    use crate::database_artifacts::DatabaseArtifactRepository;
+    use crate::sql::publication::DATABASE as PUBLICATION;
+
+    let rig = Rig::new("publication").await;
+    let gate = SwitchGate::with(&[(PUBLICATION, true)]);
+    let service = switched(&rig, Arc::new(ProbeSink::default()), gate);
+    let space = rig.space.to_string();
+
+    for operation in ["activate", "reserve", "stage", "publish", "delete", "purge"] {
+        let refused = service
+            .meeting_publication(
+                &rig.space,
+                serde_json::json!({"contractVersion": 3, "operation": operation}),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(SqlError::InvalidStatement(_))),
+            "{operation}: {refused:?}"
+        );
+    }
+    assert!(
+        rig.repo
+            .load_meta("sql", &space, PUBLICATION)
+            .await
+            .unwrap()
+            .is_none(),
+        "no artifact was written for it"
+    );
+    assert!(
+        !service
+            .databases
+            .contains_key(&(space, PUBLICATION.to_string())),
+        "no actor was opened for it"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_deletes_the_working_copy_and_everything_the_uploader_remembers_of_it() {
+    let rig = Rig::new("purge").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+    let space = rig.space.to_string();
+    assert!(service.local_files().knows_space(&space));
+    assert!(service.databases.contains_key(&key(&rig)));
+
+    service.drain_and_evict_space(&rig.space).await.unwrap();
+
+    assert!(!rig.main_path().exists() && !rig.wal_path().exists());
+    assert!(!service.databases.contains_key(&key(&rig)), "actor closed");
+    assert!(
+        !service.local_files().knows_space(&space),
+        "a space created later under this id inherits no hash, mark or position"
+    );
+    // Nothing brings it back: a request is unavailable and creates no file.
+    let after = insert(&service, &rig.space, "b").await;
+    assert!(matches!(after, Err(SqlError::Unavailable)), "{after:?}");
+    assert!(!rig.main_path().exists());
+}
+
+#[tokio::test]
+async fn replacing_an_actor_that_checkpoints_on_close_moves_the_counter_past_what_it_changed() {
+    let rig = Rig::new("replace").await;
+    rig.create_working_copy(10);
+    let gate = SwitchGate::with(&[(DB, false)]);
+    let sink = Arc::new(ProbeSink::default());
+    let service = switched(&rig, sink.clone(), gate.clone());
+
+    // The cutover left the counter in the file, but an actor opened while
+    // Postgres was master is still serving it (P4.4 closes it first; this is
+    // the order it must not be able to get wrong). It writes, and on close it
+    // will fold its WAL into the main file with no counter bump.
+    let old = spawn_actor(
+        rig.space.to_string(),
+        DB.to_string(),
+        rig.base(),
+        0,
+        service.databases.clone(),
+    );
+    service.databases.insert(key(&rig), old.clone());
+    old.execute_authorized(
+        SqlRequest::Execute {
+            sql: "INSERT INTO items (v) VALUES ('old')".into(),
+            params: vec![],
+            schema: None,
+        },
+        None,
+        "tinycloud.sql/admin".into(),
+        GrowthPolicy::Allow,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_seq_of(&rig.main_path()), 10, "it does not count");
+
+    gate.set(DB, true);
+    insert(&service, &rig.space, "new").await.unwrap();
+
+    assert_eq!(count(&service, &rig.space).await, 2, "nothing was lost");
+    assert!(service.databases.get(&key(&rig)).unwrap().is_store_master());
+    // 10: the old actor's close changed the file; 11: the settle that
+    // accounts for it; 12: the write.
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 12);
+    assert_eq!(sink.notices().last().unwrap().seq, 12);
+    let wal = std::fs::metadata(rig.wal_path()).map_or(0, |m| m.len());
+    assert!(wal > 0, "the write after the settle is in the WAL");
+}
+
+fn read_seq_of(path: &Path) -> u64 {
+    read_seq(&Connection::open(path).unwrap()).unwrap()
 }

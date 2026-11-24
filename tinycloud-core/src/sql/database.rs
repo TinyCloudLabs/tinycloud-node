@@ -661,12 +661,33 @@ fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// The counter as it stands when a store-master request's transaction begins,
+/// before any of the user's SQL runs; `None` for every other database. On a
+/// failure the transaction is rolled back, as the caller expects none open.
+fn seq_before_request(
+    conn: &rusqlite::Connection,
+    authority: &SqlAuthority,
+) -> Result<Option<u64>, SqlError> {
+    if !authority.store_master() {
+        return Ok(None);
+    }
+    local_copy::read_seq(conn).map(Some).inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK");
+    })
+}
+
 /// Count one write on a store-master working copy, in the write's own
 /// transaction, or refuse it. Refused (retryably, nothing applied) when the
 /// WAL already holds [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates
 /// at a far smaller size, so reaching it means nothing is draining this WAL
-/// and the next write would only grow the shared disk.
-fn count_store_master_write(conn: &rusqlite::Connection, file: &Path) -> Result<(), SqlError> {
+/// and the next write would only grow the shared disk. `seq_before` is the
+/// counter from [`seq_before_request`]: if the row is no longer that value
+/// the write is refused, however the change was made.
+fn count_store_master_write(
+    conn: &rusqlite::Connection,
+    file: &Path,
+    seq_before: Option<u64>,
+) -> Result<(), SqlError> {
     let wal = match std::fs::metadata(format!("{}-wal", file.display())) {
         Ok(meta) => meta.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -675,7 +696,10 @@ fn count_store_master_write(conn: &rusqlite::Connection, file: &Path) -> Result<
     if wal >= local_copy::WAL_REFUSE_BYTES {
         return Err(SqlError::DiskHeadroom);
     }
-    local_copy::bump_seq(conn)
+    match seq_before {
+        Some(seq) => local_copy::bump_seq_from(conn, seq),
+        None => local_copy::bump_seq(conn),
+    }
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
@@ -825,6 +849,7 @@ fn handle_message_without_growth_ctx(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
+    let seq_before = seq_before_request(conn, authority)?;
     let result = handle_message_ctx(conn, request, caveats, authority, pragmas, ctx);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -835,7 +860,7 @@ fn handle_message_without_growth_ctx(
     // Store-master: count the write in the same transaction (TC-1491 P4.2a).
     let result = match result {
         Ok(ok) if authority.store_master() && WriteProbe::of(conn).writing() => {
-            count_store_master_write(conn, ctx.file).map(|()| ok)
+            count_store_master_write(conn, ctx.file, seq_before).map(|()| ok)
         }
         other => other,
     };
@@ -1324,6 +1349,7 @@ fn run_transaction(
         conn.execute_batch(REQUEST_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
+    let seq_before = seq_before_request(conn, authority)?;
     let result = handle_request_authorized(conn, request, caveats, authority, pragmas);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -1337,7 +1363,7 @@ fn run_transaction(
             // crash can never leave data without its seq or a seq without
             // data (TC-1491 P4.2a).
             if authority.store_master() {
-                count_store_master_write(conn, ctx.file)?;
+                count_store_master_write(conn, ctx.file, seq_before)?;
             }
             precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
         } else {

@@ -784,6 +784,14 @@ impl SqlService {
     ) -> Result<SqlExecutionResult, SqlError> {
         let db_name = super::publication::DATABASE;
         let key = (space.to_string(), db_name.to_string());
+        // A publication write is saved to the Postgres artifact below, which a
+        // store-master database never touches (its working copy is the only
+        // copy): refuse it there rather than write a second, divergent one.
+        if command["operation"] != "capabilities" && self.is_store_master(space, db_name).await? {
+            return Err(SqlError::InvalidStatement(
+                "publication commands are not available on a store-master database".into(),
+            ));
+        }
         let handle = self.handle(space, db_name).await?;
         if command["operation"] != "capabilities" && self.checkpoint_over_save_limit(&key) {
             return Err(SqlError::DatabaseReadOnlySizeLimit);

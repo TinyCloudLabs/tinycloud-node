@@ -21,7 +21,9 @@ use tokio::sync::OwnedMutexGuard;
 use super::{begin_write, sql_wal_path, ReservationGuard, SqlService};
 use crate::sql::database::{spawn_store_master_actor, DatabaseHandle, GrowthPolicy};
 use crate::sql::store::key::DbRef;
-use crate::sql::store::local::{validate_working_copy, LocalFiles, StoreMasterGate};
+use crate::sql::store::local::{
+    validate_working_copy, LocalFiles, StoreMasterGate, WAL_BACKSTOP_BYTES,
+};
 use crate::sql::store::shadow::LocalNotice;
 use crate::sql::types::{SqlError, SqlExecutionResult, SqlRequest};
 use crate::sql::{authority::SqlAuthority, caveats::SqlCaveats};
@@ -40,8 +42,15 @@ impl SqlService {
         self.local.clone()
     }
 
-    /// Whether the mode row says `store_master`. A mode that cannot be read
-    /// refuses the request (retryable): a node never guesses a mode.
+    /// Whether the mode row says `store_master`.
+    ///
+    /// A mode that cannot be read never makes the node guess. But the failure
+    /// is scoped to the database asked about: one with a live actor is served
+    /// in the mode its actor was opened in (a mode change replaces the actor
+    /// under the operation lock), so a control-database blip does not stop
+    /// every database that is already warm. Only a database with no actor,
+    /// which would have to be hydrated or opened without knowing its mode, is
+    /// refused (retryable).
     pub(super) async fn is_store_master(
         &self,
         space: &SpaceId,
@@ -50,16 +59,32 @@ impl SqlService {
         let Some(gate) = &self.store_gate else {
             return Ok(false);
         };
-        let space = space.to_string();
-        gate.is_store_master(&DbRef {
-            space: &space,
-            db_id: db_name,
-        })
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "sql store mode unreadable; refusing the request");
-            SqlError::Unavailable
-        })
+        let space_text = space.to_string();
+        match gate
+            .is_store_master(&DbRef {
+                space: &space_text,
+                db_id: db_name,
+            })
+            .await
+        {
+            Ok(mode) => Ok(mode),
+            Err(error) => {
+                let key = (space_text, db_name.to_string());
+                match self.databases.get(&key).map(|h| h.is_store_master()) {
+                    Some(mode) => {
+                        tracing::warn!(
+                            %error,
+                            "sql store mode unreadable; serving the live actor in its own mode"
+                        );
+                        Ok(mode)
+                    }
+                    None => {
+                        tracing::warn!(%error, "sql store mode unreadable; refusing the request");
+                        Err(SqlError::Unavailable)
+                    }
+                }
+            }
+        }
     }
 
     /// The main file and the WAL of a working copy.
@@ -88,23 +113,29 @@ impl SqlService {
         db_name: &str,
     ) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        let mut replaced = false;
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
             if handle.is_store_master() {
                 return Ok(handle);
             }
             // An actor opened while Postgres was master. Its files stay; it
-            // is replaced by one that does not checkpoint on close.
+            // is replaced by one that does not checkpoint on close. Its own
+            // close does checkpoint, folding the WAL into the main file with
+            // no seq bump: the settle below makes the next store-master seq
+            // account for that change.
             self.databases.remove(&key);
+            self.lineage.remove(&key);
             handle.shutdown().await?;
+            replaced = true;
         }
         let (main, _) = self.local_paths(space, db_name);
         // The counter must be there: a file without it was never cut over.
         tokio::task::spawn_blocking(move || validate_working_copy(&main))
             .await
             .map_err(|error| SqlError::Internal(error.to_string()))??;
-        Ok(self
+        let handle = self
             .databases
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| {
                 spawn_store_master_actor(
                     space.to_string(),
@@ -114,7 +145,20 @@ impl SqlService {
                     self.durability.clone(),
                 )
             })
-            .clone())
+            .clone();
+        if replaced {
+            // The previous actor's close changed the main file at an
+            // unchanged seq, which the uploader would read as a foreign write
+            // (cid_conflict). A rotation bumps the seq and truncates the WAL
+            // in one step, so the file and the counter move together. If it
+            // fails the request fails; the next write's bump gives the file a
+            // new seq anyway, so this self-heals, loudly, rather than
+            // publishing a wrong lineage.
+            self.local.invalidate(&key);
+            handle.rotate().await?;
+            self.local.invalidate(&key);
+        }
+        Ok(handle)
     }
 
     /// An execute on a store-master working copy, under the operation lock.
@@ -159,13 +203,35 @@ impl SqlService {
     /// write is durable locally, and a missed notice is found again by the
     /// uploader's recovery scan.
     async fn after_local_commit(&self, space: &SpaceId, db_name: &str, handle: &DatabaseHandle) {
-        let state = match handle.local_state().await {
+        let mut state = match handle.local_state().await {
             Ok(state) => state,
             Err(error) => {
                 tracing::warn!(%error, "store-master commit: local state unreadable");
                 return;
             }
         };
+        // The backstop for a database the uploader does not serve (not
+        // allowlisted, over the cap): fold the WAL in and truncate it here,
+        // under the operation lock this request still holds, before it grows
+        // to the write refusal.
+        if state.wal_bytes >= WAL_BACKSTOP_BYTES {
+            let key = (space.to_string(), db_name.to_string());
+            match handle.rotate().await {
+                Ok(()) => {
+                    self.local.invalidate(&key);
+                    match handle.local_state().await {
+                        Ok(after) => state = after,
+                        Err(error) => {
+                            tracing::warn!(%error, "store-master backstop: local state unreadable");
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "store-master backstop rotation failed");
+                }
+            }
+        }
         let key = (space.to_string(), db_name.to_string());
         let (main, _) = self.local_paths(space, db_name);
         let files = self.local.clone();

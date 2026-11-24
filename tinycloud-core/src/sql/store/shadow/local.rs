@@ -16,8 +16,9 @@
 //!   actor wrote in the write's own transaction.
 //! - **The WAL cannot be reset behind the uploader's back.** Auto-checkpoint
 //!   is off and the working copy does not checkpoint on close. The only
-//!   checkpoint is [`LocalFileSource::head`]'s rotation, which runs when the
-//!   WAL reaches [`WINDOW_BYTES`]: it counts one revision, folds the WAL into
+//!   checkpoints are rotations: [`LocalFileSource::head`]'s, which runs when
+//!   the WAL reaches [`rotation_threshold`] (and, for a database nobody
+//!   uploads, the commit path's at `WAL_BACKSTOP_BYTES`). A rotation counts one revision, folds the WAL into
 //!   the main file, and the new main file is published as a snapshot at that
 //!   revision. If anything else did reset the WAL, the marks' prefix hashes no
 //!   longer match, the upload falls back to a cumulative segment, and a
@@ -50,7 +51,7 @@ use crate::sql::database::DatabaseHandle;
 use crate::sql::service::SqlService;
 use crate::sql::store::key::DbRef;
 use crate::sql::store::local::{
-    hash_prefix, within_pilot_cap, LocalFiles, LocalState, StoreMasterGate, WINDOW_BYTES,
+    hash_prefix, rotation_threshold, within_pilot_cap, LocalFiles, LocalState, StoreMasterGate,
 };
 use crate::sql::store::Frontier;
 use crate::sql::types::SqlError;
@@ -157,6 +158,13 @@ impl LocalFileSource {
         db: &DbRef<'_>,
         mode: Mode,
     ) -> Result<Option<(DatabaseHandle, View)>, SourceError> {
+        // The mode is read again here, under the operation lock every caller
+        // holds: the router's read was taken without it, and a cutover or a
+        // rollback holds this lock while it moves the mode. A database that
+        // is no longer store-master is not opened as one.
+        if !self.is_local(db).await? {
+            return Err(SourceError::MovedOn);
+        }
         let handle = match self.service.local_handle(space, db.db_id).await {
             Ok(handle) => handle,
             Err(SqlError::Unavailable) => return Ok(None),
@@ -168,7 +176,9 @@ impl LocalFileSource {
         // Rotate before the cap is judged: a database over the cap still has a
         // WAL, and only a rotation shrinks it. Skipping it here would let the
         // WAL of a database that cannot be published grow without bound.
-        if mode == Mode::Publish && state.wal_bytes >= WINDOW_BYTES {
+        // How much WAL a rotation waits for grows with the main file, so the
+        // snapshot it publishes stays a bounded multiple of the bytes written.
+        if mode == Mode::Publish && state.wal_bytes >= rotation_threshold(state.main_bytes) {
             handle.rotate().await.map_err(sql_error)?;
             self.files.invalidate(&key);
             state = handle.local_state().await.map_err(sql_error)?;

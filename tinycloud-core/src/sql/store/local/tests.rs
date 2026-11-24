@@ -361,3 +361,116 @@ fn a_counter_at_the_top_refuses_the_next_write_instead_of_overflowing() {
     drop(conn);
     assert_eq!(validate_working_copy(&path).unwrap(), top, "it still opens");
 }
+
+#[test]
+fn a_write_whose_counter_was_changed_inside_its_transaction_is_refused() {
+    let (_dir, path) = working_copy(10);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+
+    // The counter as the request saw it at BEGIN: the bump is exactly +1.
+    let before = read_seq(&conn).unwrap();
+    bump_seq_from(&conn, before).unwrap();
+    assert_eq!(read_seq(&conn).unwrap(), before + 1);
+
+    // Something moved the row between BEGIN and the bump, by any path: the
+    // write is refused, and the row is left as it was found.
+    conn.execute_batch("BEGIN").unwrap();
+    let before = read_seq(&conn).unwrap();
+    conn.execute(&format!("UPDATE main.{SEQ_TABLE} SET seq = seq + 5"), [])
+        .unwrap();
+    let error = bump_seq_from(&conn, before).unwrap_err();
+    assert!(error.to_string().contains("changed during"), "{error}");
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(read_seq(&conn).unwrap(), before, "the rollback undoes it");
+
+    // A deleted row is its own error, not a silent success.
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute(&format!("DELETE FROM main.{SEQ_TABLE}"), [])
+        .unwrap();
+    assert!(bump_seq_from(&conn, before).is_err());
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_space_that_is_forgotten_takes_every_database_of_it_and_no_other() {
+    let files = LocalFiles::default();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    std::fs::write(&path, b"x").unwrap();
+    let purged: DbKey = ("purged".into(), "a".into());
+    let purged_too: DbKey = ("purged".into(), "b".into());
+    let kept: DbKey = ("kept".into(), "a".into());
+    for key in [&purged, &purged_too, &kept] {
+        files.checkpoint_cid(key, &path).unwrap();
+        files.record_mark(
+            key,
+            WalMark {
+                revision: 1,
+                checkpoint_content_hash: "c".into(),
+                wal_end_bytes: 1,
+                wal_prefix_sha256: [0; 32],
+            },
+        );
+    }
+    assert!(files.knows_space("purged") && files.knows_space("kept"));
+
+    files.forget_space("purged");
+    assert!(!files.knows_space("purged"));
+    assert!(files.marks(&purged, &[1]).is_empty());
+    assert!(files.marks(&purged_too, &[1]).is_empty());
+    assert_eq!(
+        files.marks(&kept, &[1]).len(),
+        1,
+        "a neighbour is untouched"
+    );
+}
+
+#[test]
+fn a_rotation_waits_for_a_wal_in_proportion_to_the_main_file_within_bounds() {
+    // Small databases keep the 8 MiB window.
+    assert_eq!(rotation_threshold(0), WINDOW_BYTES);
+    assert_eq!(rotation_threshold(10 * 1024 * 1024), WINDOW_BYTES);
+    // Then half the main file, so a snapshot is at most 2x what was written.
+    assert_eq!(rotation_threshold(30 * 1024 * 1024), 15 * 1024 * 1024);
+    // And never more than half the cap, so the backstop and the refusal
+    // above it stay out of the uploader's way.
+    assert_eq!(rotation_threshold(PILOT_CAP_BYTES), PILOT_CAP_BYTES / 2);
+    assert_eq!(rotation_threshold(u64::MAX), PILOT_CAP_BYTES / 2);
+    assert!(rotation_threshold(u64::MAX) < WAL_BACKSTOP_BYTES);
+    const { assert!(WAL_BACKSTOP_BYTES < WAL_REFUSE_BYTES) };
+}
+
+#[test]
+fn a_database_that_already_has_a_table_of_the_counters_name_is_not_cut_over() {
+    // A Postgres-mode database can hold such a table (the prefix is reserved
+    // only for store-master), or be the import of an export of one.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "wal").unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE \"{}\" (id INTEGER PRIMARY KEY, seq INTEGER); \
+             INSERT INTO \"{}\" VALUES (1, 999)",
+            SEQ_TABLE.to_uppercase(),
+            SEQ_TABLE.to_uppercase()
+        ))
+        .unwrap();
+    }
+    let error = init_working_copy(&path, 10).unwrap_err();
+    assert!(
+        error.to_string().contains("already has a table named"),
+        "{error}"
+    );
+    // Nothing was adopted or touched.
+    let conn = Connection::open(&path).unwrap();
+    let planted: i64 = conn
+        .query_row(
+            &format!("SELECT seq FROM \"{}\"", SEQ_TABLE.to_uppercase()),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(planted, 999);
+}
