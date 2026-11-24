@@ -20,7 +20,7 @@ probes. It is **not an installed production control**.
   empty: on a shared SNI gateway a TCP refusal can never be app-specific, and the real
   denial signature has not been observed. Output says "no accepted closed signature
   yet: drill required". A drill must record the signature; it is then added in code under
-  review. `--expect restored` is unaffected.
+  review. `--expect restored` does not depend on the set (IPv6 management note below).
 - The tunnel, the Worker change and the connector deploy (P1 to P4) are
   prerequisites, not done by this script. Closing `-8000` before they hold breaks both
   HTTP routes. `preflight` observes the tunnel, DNS, ingress, Worker version, the
@@ -175,12 +175,13 @@ contact with Phala infrastructure, not an API call and not a credentialed one).
 | exit | verdict | meaning | action |
 |---|---|---|---|
 | 0 | `pass` | every check proven; **unreachable until a drill signature is accepted** | continue |
-| 1 | `open_or_broken` | a probed gateway path answered as the node, management answered although the policy denies it, `node.*` or the tunnel host is unhealthy, or `--expect restored` did not reach the node | **undo** (restore) if the path is open or the service is down |
-| 3 | `unknown` | not proven closed, nothing seen open (timeouts, TLS alerts, HTTP statuses, refusals, resets, no route, resolver failures, a failed control or instance binding) | **hold, do NOT undo on this alone**; investigate; run the drill. With the empty set a **correct** restriction reads `unknown` today |
+| 1 | `open` | a probed gateway path answered as the node, management answered although the policy denies it, expected-open management was reached but gave no SSH banner, `node.*` or the tunnel host is unhealthy, or `--expect restored` did not reach the node | **undo** (restore) if the path is open or the service is down |
+| 3 | `not_proven_closed` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, HTTP statuses, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits on management) | **hold: run the drill; do NOT undo and do NOT restart on this alone.** With the empty set a **correct** restriction reads `not_proven_closed` today |
 
 Exit 1 is also used for refusals of bad operator input (stale receipt, loose file
 modes, wrong app); those are not verdicts. `apply-patch` prints the same table under
-`after_verify` (no `if_bad`: it used to say "undo", which is wrong for `unknown`).
+`after_verify` (no `if_bad`: it used to say "undo", which is wrong for
+`not_proven_closed`).
 
 **The accepted closed-signature set is EMPTY, so `verify --expect restricted` cannot
 pass yet: no accepted closed signature yet: drill required.** Reason: on an SNI-routed
@@ -194,12 +195,12 @@ never eligible. The real denial signature of a restricted gateway has
 never been observed [INFERENCE]; the drill must record it and the signature is then
 added to `ACCEPTED_CLOSED_SIGNALS` in code, under review. No flag, environment variable
 or file widens the set (`--accept-closed-signal` was removed). The output says so
-(`blocked`). `--expect restored` is not affected. Everything else FAILs as well:
+(`blocked`). `--expect restored` does not depend on the set, but see the IPv6 management note below. Everything else FAILs as well:
 `no_route` (it describes this verifier's network, not the target), anything that
 completes TLS or HTTP (a TLS alert `tls_rejected`, `closed_after_tls`, any HTTP status,
 `http_200_unparsed`, `malformed_http`), a node answer (`node_info`), a timeout, a
 resolver failure and any other error. A `/info` body is de-chunked before the node id is
-read, so a chunked 200 counts as the node answering. Open and unknown results FAIL,
+read, so a chunked 200 counts as the node answering. Open and not-proven-closed results FAIL,
 never "indeterminate". Checks:
 
 - `/info` on `node.tinycloud.xyz` and on the tunnel host is 200 with the receipt's
@@ -225,7 +226,14 @@ never "indeterminate". Checks:
   replace, still `0600`), pass or FAIL. **What a control cannot exclude [INFERENCE]:** a
   path that rejects only the app's SNI after the handshake begins, and a gateway that
   changes between the control and the probe (separate connections seconds apart, one
-  vantage);
+  vantage). **Limit of the control [INFERENCE, tested only with a test-injected set]:**
+  the control uses a different SNI (the management host) than the probe, so it cannot
+  exclude SNI-based filtering or an RST on the app's ClientHello: with a test set that
+  contains `tcp_reset`, an RST-at-hello would pass the control. Never add `tcp_reset`
+  (or any signature) to `ACCEPTED_CLOSED_SIGNALS` without drill proof that the real
+  gateway emits it only for a closed app. The `--allow-no-aaaa` waiver skips IPv6 for
+  that name entirely; a stronger control (later, not built) would probe the control
+  host's own IPv6 addresses with the app SNI;
 - fresh connections to `tee.node.tinycloud.xyz` and to the app and instance
   gateway hosts `-8000`, `-8000g`, `-443`, `-443s`, `-443g` (plus any
   `--extra-host`) over **IPv4 and IPv6** must each show an accepted closed signature
@@ -257,7 +265,17 @@ never "indeterminate". Checks:
   known-open SNI exists for any positive control, so a refusal cannot be corroborated (a
   banner, a TLS alert, HTTP or a timeout fail too). If `phala ssh` actually reaches
   management another way, this check and the controls are wrong and must be corrected
-  from evidence before relying on them. Key-authenticated access is not tested;
+  from evidence before relying on them. Key-authenticated access is not tested.
+  **Class of a management FAIL:** expected-open management that was reached but gave no
+  banner (refused, reset, TLS alert, close, non-SSH data, HTTP) is class `open`
+  (exit 1); a timeout, `no_route`, `no_aaaa`, `no_address` or other error is a vantage or
+  DNS limit and stays `not_proven_closed` (exit 3), never an undo signal. Management
+  expected denied and answering a banner is class `open`.
+  **`--expect restored` and IPv6 (decision):** restored keeps the IPv6 management
+  probe, because an AAAA that exists must be probed. So restored needs a vantage with
+  IPv6 when management has an AAAA record; from an IPv4-only vantage the probe is
+  `no_route`, restored reports exit 3 (hold, re-run from an IPv6 vantage), not exit 1.
+  NODATA is waived only by `--allow-no-aaaa`;
 - the receipt (owner-only file) is not older than `--max-receipt-age` (default 3600 s),
   names the same tunnel host as `--tunnel-host` and the same tunnel id as the
   snapshot's recorded origin, and the snapshot is an owner-only file for the same app.

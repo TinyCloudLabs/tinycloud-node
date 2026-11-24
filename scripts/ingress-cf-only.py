@@ -501,12 +501,13 @@ def cmd_apply_patch(a, clients, now, out):
                "then_verify": verify_command(a, "restricted", a.receipt_out),
                "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify cannot pass until a drill "
                               "records the real gateway denial signature and it is accepted in code: "
-                              + NO_SIGNATURE_NOTICE + ". A correct restriction therefore reads as UNKNOWN today.",
+                              + NO_SIGNATURE_NOTICE + ". A correct restriction therefore reads as NOT PROVEN CLOSED today.",
                "after_verify": {"exit 0": "pass (unreachable until a drill signature is accepted)",
-                                "exit 1": "OPEN or BROKEN (a path answers as the node, management answers although denied, "
-                                          "or node.* is unhealthy): undo --snapshot " + str(Path(a.snapshot).resolve()),
-                                "exit 3": "UNKNOWN (not proven closed, nothing seen open): do NOT undo on this alone; "
-                                          "hold, investigate and run the drill"}})
+                                "exit 1": "OPEN (a path answers as the node, management answers although denied or is "
+                                          "reached without a banner, or node.* is unhealthy): undo --snapshot "
+                                          + str(Path(a.snapshot).resolve()),
+                                "exit 3": "NOT PROVEN CLOSED (nothing seen open): do NOT undo and do NOT restart; hold "
+                                          "and run the drill"}})
 
 
 def cmd_preflight(a, clients, now, out):
@@ -569,12 +570,12 @@ def load_private_snapshot(path):
 
 
 def check(name, status, detail, kind=None, **evidence):
-    """kind classifies a FAIL for verdict_of: 'open' (answered as the node), 'broken' (service unhealthy) or 'unknown'
-    (default: not proven closed, nothing seen open)."""
+    """kind classifies a FAIL for verdict_of: 'open' (answered as the node), 'broken' (service or management unhealthy)
+    or 'not_proven_closed' (default: not proven closed, nothing seen open)."""
     assert status in ("pass", "fail")
     item = dict({"check": name, "status": status, "ok": status == "pass", "detail": detail}, **evidence)
     if status == "fail":
-        item["kind"] = kind or "unknown"
+        item["kind"] = kind or "not_proven_closed"
     return item
 
 
@@ -613,6 +614,20 @@ def judge_management(result, expect_open, family="ipv4", allow_no_aaaa=False):
         return "fail", "management still answers although the policy denies it"
     return "fail", ",".join(signals) + (": a refusal of the management route cannot be corroborated, because no "
                                         "known-open SNI exists on the gateway when management is denied")
+
+
+# Signals that mean the gateway route was reached but did not give the SSH banner. For a management route that must stay
+# open this is a broken service (class open, exit 1). Verifier-side or DNS limits (timeout, no_route, no_aaaa, no_address,
+# error) are not proof of anything and stay not_proven_closed (exit 3): a vantage limit must never read as "undo".
+MANAGEMENT_REACHED_NO_BANNER = {"tcp_refused", "tcp_reset", "reset_after_connect", "tls_rejected", "closed_after_tls",
+                                "non_ssh_data", "malformed_http", "http_200_unparsed"}
+
+
+def management_kind(signals, expect_open):
+    if not expect_open:
+        return "open" if "ssh_banner" in signals else "not_proven_closed"
+    reached = any(s in MANAGEMENT_REACHED_NO_BANNER or s.startswith("http_") for s in signals)
+    return "broken" if reached else "not_proven_closed"
 
 
 def verify(a, clients, now):
@@ -660,7 +675,7 @@ def verify(a, clients, now):
         else:
             ok, detail = False, "no known-open SNI exists when the policy denies management"
         checks.append(check(f"--instance-id is a real gateway host (positive control {inst}:443) [INFERENCE: route]",
-                            "pass" if ok else "fail", detail, kind="unknown"))
+                            "pass" if ok else "fail", detail, kind="not_proven_closed"))
         for name in hosts:
             for family in ("ipv4", "ipv6"):
                 result = http.probe(name, family, 443)
@@ -688,7 +703,7 @@ def verify(a, clients, now):
                     waived.append(name)
                 checks.append(check(f"{name} fresh {family} connection shows an accepted closed signature "
                                     "(same-address positive control)", status, detail,
-                                    kind="open" if "node_info" in signals else "unknown", **evidence))
+                                    kind="open" if "node_info" in signals else "not_proven_closed", **evidence))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
@@ -705,10 +720,9 @@ def verify(a, clients, now):
         status, detail = judge_management(result, expect_open, family, a.allow_no_aaaa)
         if status == "pass" and "no_aaaa" in signals_of(result):
             waived.append(mgmt)
-        denied_but_answers = not expect_open and "ssh_banner" in signals_of(result)
         checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 over {family} untouched "
                             f"(expected {'open' if expect_open else 'denied'})", status, detail,
-                            kind="open" if denied_but_answers else "unknown",
+                            kind=management_kind(signals_of(result), expect_open),
                             addresses=list(result.get("addresses") or [])))
     return checks, waived
 
@@ -726,24 +740,26 @@ def record_verify(path, run, waiver):
 
 
 def verdict_of(checks):
-    """-> (verdict, exit code). 'open_or_broken' (1): a probed path answered as the node, management answered although
-    denied, or the service is unhealthy: undo territory. 'unknown' (3): nothing was proven closed but nothing was seen
-    open either: HOLD, do not undo on this alone. pass (0) is unreachable while the accepted signature set is empty."""
+    """-> (class, exit code). 'open' (1): a probed path answered as the node, management answered although denied, expected-
+    open management reached but gave no SSH banner, or node.*/tunnel/restored is unhealthy: undo territory.
+    'not_proven_closed' (3): nothing was proven closed but nothing was seen open (and no verifier-side limit such as no
+    route or a resolver failure): HOLD and run the drill; do NOT undo and do NOT restart. pass (0) is unreachable for
+    restricted while the accepted signature set is empty."""
     failed = [c for c in checks if c["status"] != "pass"]
     if not failed:
         return "pass", 0
     if any(c.get("kind") in ("open", "broken") for c in failed):
-        return "open_or_broken", 1
-    return "unknown", 3
+        return "open", 1
+    return "not_proven_closed", 3
 
 
 NEXT_ACTION = {
     "pass": "none",
-    "open_or_broken": "OPEN or BROKEN: a probed path answered as the node or the service is unhealthy. Follow the runbook "
-                      "decision table: undo (restore) if the path is open or the service is down.",
-    "unknown": "UNKNOWN, not proven closed and nothing was seen open. Do NOT undo on this result alone: hold and "
-               "investigate; with the empty accepted-signature set a correct restriction also reads like this "
-               "(drill required, see the runbook).",
+    "open": "OPEN: a probed path answered as the node, or the service or management is unhealthy. Follow the runbook "
+            "decision table: undo (restore) if the path is open or the service is down.",
+    "not_proven_closed": "NOT PROVEN CLOSED, and nothing was seen open. Do NOT undo and do NOT restart on this result: hold "
+                         "and run the drill. With the empty accepted-signature set a correct restriction also reads like "
+                         "this (see the runbook).",
 }
 
 
@@ -759,7 +775,7 @@ def cmd_verify(a, clients, now, out):
                               "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
                                          for c in checks]}, waiver)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
-               "exit_codes": {"0": "pass", "1": "open_or_broken: undo", "3": "unknown: hold, do not undo"},
+               "exit_codes": {"0": "pass", "1": "open: undo", "3": "not_proven_closed: hold, run the drill, do not undo"},
                "next_action": NEXT_ACTION[verdict], "checks": checks,
                "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
                "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,
