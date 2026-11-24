@@ -210,7 +210,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
+            interval: super::super::local::WINDOW,
             backoff_base: Duration::from_secs(5),
             backoff_max: Duration::from_secs(15 * 60),
         }

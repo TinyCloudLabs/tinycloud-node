@@ -42,6 +42,7 @@ use tinycloud_auth::resource::SpaceId;
 use tokio::io::AsyncReadExt;
 
 use super::machine::{ArtifactHead, DeltaPlan, Head};
+use super::restore::committed_wal_len;
 use super::source::{Copied, FileSink, PgArtifactSource, RangeSink, ShadowSource, SourceError};
 use super::DbKey;
 use crate::database_artifacts::{ArtifactPart, ArtifactSink, DatabaseArtifactError, WalMark};
@@ -101,20 +102,27 @@ fn sink_failure(error: DatabaseArtifactError) -> SourceError {
     SourceError::Transient(error.to_string())
 }
 
-/// Stream `path` into `sink` as the one part `part`.
+/// Stream the first `limit` bytes of `path` into `sink` as the one part
+/// `part`. A file shorter than `limit` is streamed as far as it goes.
 async fn stream(
     path: &Path,
     part: ArtifactPart,
+    limit: u64,
     sink: &mut dyn ArtifactSink,
 ) -> Result<(), SourceError> {
     let mut file = tokio::fs::File::open(path).await.map_err(io_error)?;
     sink.begin_part(part).await.map_err(sink_failure)?;
     let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let read = file.read(&mut buffer).await.map_err(io_error)?;
+    let mut remaining = limit;
+    while remaining > 0 {
+        let want = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let read = file.read(&mut buffer[..want]).await.map_err(io_error)?;
         if read == 0 {
             break;
         }
+        remaining -= read as u64;
         sink.write(&buffer[..read]).await.map_err(sink_failure)?;
     }
     sink.finish_part().await.map_err(sink_failure)
@@ -157,16 +165,26 @@ impl LocalFileSource {
         let (main, wal) = self.service.local_paths(space, db.db_id);
         let key = key_of(db);
         let mut state = handle.local_state().await.map_err(sql_error)?;
-        if !within_pilot_cap(state.main_bytes) {
-            return Err(SourceError::TooLarge);
-        }
+        // Rotate before the cap is judged: a database over the cap still has a
+        // WAL, and only a rotation shrinks it. Skipping it here would let the
+        // WAL of a database that cannot be published grow without bound.
         if mode == Mode::Publish && state.wal_bytes >= WINDOW_BYTES {
             handle.rotate().await.map_err(sql_error)?;
             self.files.invalidate(&key);
             state = handle.local_state().await.map_err(sql_error)?;
-            if !within_pilot_cap(state.main_bytes) {
-                return Err(SourceError::TooLarge);
-            }
+        }
+        // The WAL file can be longer than what SQLite would replay (frames of
+        // a write that spilled and rolled back). Everything below, the hash
+        // prefix, the mark and the delta, uses the committed length only.
+        if state.wal_bytes > 0 {
+            let wal = wal.clone();
+            state.wal_bytes = tokio::task::spawn_blocking(move || committed_wal_len(&wal))
+                .await
+                .map_err(join_error)?
+                .map_err(io_error)?;
+        }
+        if !within_pilot_cap(state.main_bytes) {
+            return Err(SourceError::TooLarge);
         }
         let cid = {
             let (files, key, main) = (self.files.clone(), key.clone(), main);
@@ -260,7 +278,13 @@ impl ShadowSource for LocalFileSource {
         let (main, _) = self.service.local_paths(&space, db.db_id);
         let mut sink = FileSink::new(file);
         sink.truncate().await.map_err(super::source::sink_error)?;
-        stream(&main, ArtifactPart::Checkpoint, &mut sink).await?;
+        stream(
+            &main,
+            ArtifactPart::Checkpoint,
+            view.state.main_bytes,
+            &mut sink,
+        )
+        .await?;
         let copied = sink.done().await?;
         // The cached hash may not describe these bytes (a file replaced
         // behind it): never publish a checkpoint under a hash it lacks.
@@ -283,11 +307,11 @@ impl ShadowSource for LocalFileSource {
             .lock_local(&space, db.db_id)
             .await
             .map_err(sql_error)?;
-        self.at_head(&space, db, head).await?;
+        let state = self.at_head(&space, db, head).await?;
         let (_, wal) = self.service.local_paths(&space, db.db_id);
         let mut sink = FileSink::new(file);
         sink.truncate().await.map_err(super::source::sink_error)?;
-        stream(&wal, ArtifactPart::Wal, &mut sink).await?;
+        stream(&wal, ArtifactPart::Wal, state.wal_bytes, &mut sink).await?;
         sink.done().await
     }
 
@@ -312,11 +336,11 @@ impl ShadowSource for LocalFileSource {
             .lock_local(&space, db.db_id)
             .await
             .map_err(sql_error)?;
-        self.at_head(&space, db, head).await?;
+        let state = self.at_head(&space, db, head).await?;
         let (_, wal) = self.service.local_paths(&space, db.db_id);
         let mut sink = RangeSink::new(file, delta);
         sink.truncate().await.map_err(super::source::sink_error)?;
-        stream(&wal, ArtifactPart::Wal, &mut sink).await?;
+        stream(&wal, ArtifactPart::Wal, state.wal_bytes, &mut sink).await?;
         sink.done().await
     }
 

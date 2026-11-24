@@ -642,6 +642,12 @@ fn handle_local_state(
 /// The counter moves because the checkpoint changes: the new main file is a
 /// new snapshot, published at the new revision, and a revision is never
 /// reissued with different bytes. The content a reader sees is unchanged.
+///
+/// The bump is its own transaction, before the checkpoint, so a rotation
+/// whose checkpoint is busy (a reader) fails and the retry bumps again. That
+/// is harmless: the counter is a monotonic revision, not a count, and a
+/// revision that was never published leaves a gap. What matters is that a
+/// published revision is never reused, and a retry only moves it forward.
 fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     local_copy::bump_seq(conn)?;
@@ -653,6 +659,23 @@ fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
         return Err(SqlError::Internal("Database checkpoint is busy".into()));
     }
     Ok(())
+}
+
+/// Count one write on a store-master working copy, in the write's own
+/// transaction, or refuse it. Refused (retryably, nothing applied) when the
+/// WAL already holds [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates
+/// at a far smaller size, so reaching it means nothing is draining this WAL
+/// and the next write would only grow the shared disk.
+fn count_store_master_write(conn: &rusqlite::Connection, file: &Path) -> Result<(), SqlError> {
+    let wal = match std::fs::metadata(format!("{}-wal", file.display())) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(SqlError::Internal(error.to_string())),
+    };
+    if wal >= local_copy::WAL_REFUSE_BYTES {
+        return Err(SqlError::DiskHeadroom);
+    }
+    local_copy::bump_seq(conn)
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
@@ -812,7 +835,7 @@ fn handle_message_without_growth_ctx(
     // Store-master: count the write in the same transaction (TC-1491 P4.2a).
     let result = match result {
         Ok(ok) if authority.store_master() && WriteProbe::of(conn).writing() => {
-            local_copy::bump_seq(conn).map(|()| ok)
+            count_store_master_write(conn, ctx.file).map(|()| ok)
         }
         other => other,
     };
@@ -1314,7 +1337,7 @@ fn run_transaction(
             // crash can never leave data without its seq or a seq without
             // data (TC-1491 P4.2a).
             if authority.store_master() {
-                local_copy::bump_seq(conn)?;
+                count_store_master_write(conn, ctx.file)?;
             }
             precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
         } else {

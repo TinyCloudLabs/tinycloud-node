@@ -10,7 +10,9 @@ use crate::sql::authority::DdlPolicy;
 use crate::sql::durability::{CommitSeams, DurabilityPolicy};
 use crate::sql::service::SqlService;
 use crate::sql::store::local::rig::{count, insert, query, run, ProbeSink, Rig, DB};
-use crate::sql::store::local::{hash_file, read_seq, validate_working_copy, WINDOW_BYTES};
+use crate::sql::store::local::{
+    hash_file, read_seq, validate_working_copy, WAL_REFUSE_BYTES, WINDOW_BYTES,
+};
 use crate::sql::store::policy::SpaceAllowlist;
 use crate::sql::store::shadow::metrics::NoopMetrics;
 use crate::sql::store::shadow::NoticeBoard;
@@ -386,4 +388,98 @@ async fn the_byte_window_is_reported_with_each_commit_and_marks_the_database_urg
     .unwrap();
     assert!(board.take_urgent().contains(&key(&rig)));
     assert_eq!(board.take().remove(&key(&rig)).unwrap().revision, 12);
+}
+
+#[tokio::test]
+async fn a_temp_table_cannot_stand_in_for_the_counter() {
+    let rig = Rig::new("temp-shadow").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = rig.service(sink.clone(), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+
+    // The exact statements of the review: temp.x holds a made-up seq of 3 and
+    // is renamed to the counter's name, so an unqualified lookup would find it.
+    let _ = run(
+        &service,
+        &rig.space,
+        "CREATE TEMP TABLE x(id INTEGER PRIMARY KEY, seq INTEGER)",
+    )
+    .await;
+    let _ = run(&service, &rig.space, "INSERT INTO temp.x VALUES(1,3)").await;
+    assert!(
+        run(
+            &service,
+            &rig.space,
+            "ALTER TABLE temp.x RENAME TO tinycloud_internal_store_seq"
+        )
+        .await
+        .is_err(),
+        "a rename to a reserved name is refused"
+    );
+    insert(&service, &rig.space, "b").await.unwrap();
+
+    // Statements that only touch temp tables are not counted, so a notice can
+    // repeat a seq; none may carry temp's 3, and the last is the second write.
+    let seqs: Vec<i64> = sink.notices().iter().map(|n| n.seq).collect();
+    assert!(seqs.iter().all(|s| (11..=12).contains(s)), "{seqs:?}");
+    assert_eq!(
+        seqs.last(),
+        Some(&12),
+        "the file's counter, whatever temp holds"
+    );
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 12);
+}
+
+#[tokio::test]
+async fn a_write_at_the_top_of_the_counter_is_refused_and_the_file_still_opens() {
+    let rig = Rig::new("seq-top").await;
+    rig.create_working_copy(i64::MAX as u64 - 1);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+
+    insert(&service, &rig.space, "a").await.unwrap();
+    assert!(insert(&service, &rig.space, "b").await.is_err());
+    assert_eq!(
+        count(&service, &rig.space).await,
+        1,
+        "the refused write left no row"
+    );
+    assert_eq!(
+        validate_working_copy(&rig.main_path()).unwrap(),
+        i64::MAX as u64
+    );
+}
+
+#[tokio::test]
+async fn a_write_is_refused_once_the_wal_holds_64_mib_and_resumes_after_a_rotation() {
+    let rig = Rig::new("wal-refuse").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+
+    // Nothing drains this WAL: no uploader runs.
+    let big = (WAL_REFUSE_BYTES + 1024 * 1024) as i64;
+    run(
+        &service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({big}))"),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= WAL_REFUSE_BYTES);
+
+    let refused = insert(&service, &rig.space, "more").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(count(&service, &rig.space).await, 1, "reads still work");
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 11);
+
+    let handle = service.local_handle(&rig.space, DB).await.unwrap();
+    handle.rotate().await.unwrap();
+    insert(&service, &rig.space, "after").await.unwrap();
+    assert_eq!(count(&service, &rig.space).await, 2);
 }

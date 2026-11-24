@@ -60,6 +60,12 @@ pub const WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 /// ... or by this long, whichever comes first.
 pub const WINDOW: Duration = Duration::from_secs(60);
 
+/// A write is refused (retryable, nothing applied) once the WAL holds this
+/// many bytes. The uploader rotates at [`WINDOW_BYTES`]; reaching this means
+/// it is not keeping up, or never runs for this database (not allowlisted,
+/// over the cap). It bounds the disk a stalled database can take.
+pub const WAL_REFUSE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The reserved counter table.
 pub const SEQ_TABLE: &str = "tinycloud_internal_store_seq";
 
@@ -149,23 +155,53 @@ fn sqlite(error: rusqlite::Error) -> SqlError {
     SqlError::Internal(error.to_string())
 }
 
+/// Whether any statement renames a table to a reserved name. SQLite's
+/// authorizer sees only the OLD name of `ALTER TABLE .. RENAME TO ..`, so the
+/// new name is judged here, on the parsed statement. (`temp.x` renamed to the
+/// counter's name was accepted before this check.)
+pub fn renames_to_reserved(statements: &[sqlparser::ast::Statement]) -> bool {
+    use sqlparser::ast::{AlterTableOperation, Statement};
+    statements.iter().any(|statement| match statement {
+        Statement::AlterTable { operations, .. } => operations.iter().any(|op| match op {
+            AlterTableOperation::RenameTable { table_name } => table_name
+                .0
+                .last()
+                .is_some_and(|ident| is_reserved_name(&ident.value)),
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
+/// Every statement below names the counter in the `main` schema. An
+/// unqualified name resolves to a TEMP table of the same name first, and a
+/// connection's user SQL can create TEMP tables.
+fn seq_table() -> String {
+    format!("main.{SEQ_TABLE}")
+}
+
 /// Create the counter at `start_seq` (at cutover: the frozen Postgres
 /// revision). Refuses to run twice and refuses `0`: the uploader's revisions
 /// start at 1.
+///
+/// The column is checked to hold an integer. SQLite turns an overflowing
+/// `seq + 1` into a REAL, which a later open could not read as the counter;
+/// the check makes that update fail instead, and the write is rolled back.
 pub fn init_seq(conn: &Connection, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
         .filter(|seq| *seq >= 1)
         .ok_or_else(|| SqlError::Internal("store-master seq must start at 1 or more".into()))?;
+    let table = seq_table();
     conn.execute_batch(&format!(
-        "CREATE TABLE {SEQ_TABLE} (\
+        "CREATE TABLE {table} (\
            id INTEGER PRIMARY KEY CHECK (id = 1), \
-           seq INTEGER NOT NULL CHECK (seq >= 1)\
+           seq INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1)\
          )"
     ))
     .map_err(sqlite)?;
     conn.execute(
-        &format!("INSERT INTO {SEQ_TABLE} (id, seq) VALUES (1, ?1)"),
+        &format!("INSERT INTO {table} (id, seq) VALUES (1, ?1)"),
         [start],
     )
     .map_err(sqlite)?;
@@ -176,7 +212,7 @@ pub fn init_seq(conn: &Connection, start_seq: u64) -> Result<(), SqlError> {
 pub fn read_seq(conn: &Connection) -> Result<u64, SqlError> {
     let seq: i64 = conn
         .query_row(
-            &format!("SELECT seq FROM {SEQ_TABLE} WHERE id = 1"),
+            &format!("SELECT seq FROM {} WHERE id = 1", seq_table()),
             [],
             |r| r.get(0),
         )
@@ -185,18 +221,27 @@ pub fn read_seq(conn: &Connection) -> Result<u64, SqlError> {
 }
 
 /// Count one more write. Runs inside the write's transaction, before COMMIT,
-/// with no authorizer installed.
+/// with no authorizer installed. At `i64::MAX` it refuses (the transaction is
+/// rolled back by the caller) instead of overflowing.
 pub fn bump_seq(conn: &Connection) -> Result<(), SqlError> {
     let changed = conn
         .execute(
-            &format!("UPDATE {SEQ_TABLE} SET seq = seq + 1 WHERE id = 1"),
+            &format!(
+                "UPDATE {} SET seq = seq + 1 WHERE id = 1 AND seq < {}",
+                seq_table(),
+                i64::MAX
+            ),
             [],
         )
         .map_err(sqlite)?;
     if changed == 1 {
-        Ok(())
-    } else {
-        Err(SqlError::Internal("store-master seq row is missing".into()))
+        return Ok(());
+    }
+    match read_seq(conn) {
+        Ok(seq) if i64::try_from(seq) == Ok(i64::MAX) => {
+            Err(SqlError::Internal("store-master seq is exhausted".into()))
+        }
+        _ => Err(SqlError::Internal("store-master seq row is missing".into())),
     }
 }
 

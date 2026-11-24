@@ -292,3 +292,72 @@ fn marks_are_kept_per_revision_and_bounded() {
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].wal_end_bytes, 99);
 }
+
+#[test]
+fn a_temp_table_named_like_the_counter_does_not_shadow_it() {
+    let (_dir, path) = working_copy(10);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE {SEQ_TABLE} (id INTEGER PRIMARY KEY, seq INTEGER); \
+         INSERT INTO temp.{SEQ_TABLE} VALUES (1, 3);"
+    ))
+    .unwrap();
+    assert_eq!(
+        read_seq(&conn).unwrap(),
+        10,
+        "the file's counter, not temp's"
+    );
+    bump_seq(&conn).unwrap();
+    assert_eq!(read_seq(&conn).unwrap(), 11);
+    let temp: i64 = conn
+        .query_row(&format!("SELECT seq FROM temp.{SEQ_TABLE}"), [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(temp, 3, "the temp table is the user's and is left alone");
+    assert_eq!(read_seq(&Connection::open(&path).unwrap()).unwrap(), 11);
+}
+
+#[test]
+fn a_rename_to_a_reserved_name_is_found_in_the_statement() {
+    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::parser::Parser;
+    let parse = |sql: &str| Parser::parse_sql(&SQLiteDialect {}, sql).unwrap();
+    for sql in [
+        "ALTER TABLE temp.x RENAME TO tinycloud_internal_store_seq",
+        "ALTER TABLE x RENAME TO TinyCloud_Internal_mine",
+        "ALTER TABLE x RENAME TO \"tinycloud_internal_a\"",
+        "ALTER TABLE main.x RENAME TO `TINYCLOUD_INTERNAL_b`",
+    ] {
+        assert!(renames_to_reserved(&parse(sql)), "{sql}");
+    }
+    for sql in [
+        "ALTER TABLE x RENAME TO y",
+        "ALTER TABLE x RENAME TO tinycloud_mine",
+        "ALTER TABLE x ADD COLUMN tinycloud_internal_c INTEGER",
+        "SELECT 1",
+    ] {
+        assert!(!renames_to_reserved(&parse(sql)), "{sql}");
+    }
+}
+
+#[test]
+fn a_counter_at_the_top_refuses_the_next_write_instead_of_overflowing() {
+    let top = i64::MAX as u64;
+    let (_dir, path) = working_copy(top - 1);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    bump_seq(&conn).unwrap();
+    assert_eq!(read_seq(&conn).unwrap(), top);
+
+    let error = bump_seq(&conn).unwrap_err();
+    assert!(error.to_string().contains("exhausted"), "{error}");
+    assert_eq!(read_seq(&conn).unwrap(), top, "still an integer, unchanged");
+    // Nothing, not even a hand-written update, can turn it into a REAL.
+    assert!(conn
+        .execute(&format!("UPDATE main.{SEQ_TABLE} SET seq = seq + 1"), [])
+        .is_err());
+    drop(conn);
+    assert_eq!(validate_working_copy(&path).unwrap(), top, "it still opens");
+}

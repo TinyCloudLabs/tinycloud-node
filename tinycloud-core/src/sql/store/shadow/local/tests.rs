@@ -651,3 +651,105 @@ async fn no_operation_lock_is_held_while_the_store_is_written() {
     );
     uploader.drain(Duration::from_secs(5)).await;
 }
+
+// ---- a WAL that cannot be published still stays bounded ---------------------
+
+#[tokio::test]
+async fn a_database_over_the_cap_still_has_its_wal_rotated() {
+    let rig = Rig::new("over-cap-rotates").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+
+    // One write takes the checkpoint over the cap once it is rotated in.
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            PILOT_CAP_BYTES + 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(source.head(&db).await, Err(SourceError::TooLarge)));
+    assert_eq!(std::fs::metadata(rig.wal_path()).unwrap().len(), 0);
+    assert!(std::fs::metadata(rig.main_path()).unwrap().len() > PILOT_CAP_BYTES);
+
+    // The database cannot be published, but its WAL must not pile up: the
+    // next full WAL is folded in even though the cap refuses the database.
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            WINDOW_BYTES + 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= WINDOW_BYTES);
+    assert!(matches!(source.head(&db).await, Err(SourceError::TooLarge)));
+    assert_eq!(std::fs::metadata(rig.wal_path()).unwrap().len(), 0);
+    assert_eq!(count(&service, &rig.space).await, 2);
+}
+
+#[tokio::test]
+async fn a_rolled_back_write_is_not_published_and_the_restore_still_equals_the_local_file() {
+    let rig = Rig::new("rolled-back").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let source = source(&rig, &service);
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+    insert(&service, &rig.space, "a").await.unwrap();
+    let before = source.head(&db).await.unwrap().unwrap();
+
+    // A write that spills past SQLite's page cache (about 2 MiB) and then
+    // fails on its second row: dirty pages are written into the WAL file
+    // before the rollback. It stays under the 8 MiB window, so no rotation.
+    assert!(run(
+        &service,
+        &rig.space,
+        "INSERT INTO items (v) VALUES (zeroblob(4194304)), (NULL)",
+    )
+    .await
+    .is_err());
+    let raw = std::fs::metadata(rig.wal_path()).unwrap().len();
+    assert!(
+        raw > before.delta_bytes + 1024 * 1024,
+        "the rolled-back frames are in the file ({raw} bytes)"
+    );
+
+    // None of it is committed, so none of it is the delta.
+    let after = source.head(&db).await.unwrap().unwrap();
+    assert_eq!(after.revision, before.revision, "nothing was committed");
+    assert_eq!(after.delta_bytes, before.delta_bytes);
+    assert_eq!(count(&service, &rig.space).await, 1);
+
+    let uploader = start(
+        &rig,
+        source.clone(),
+        store.clone(),
+        board,
+        scratch.path(),
+        Duration::ZERO,
+    );
+    insert(&service, &rig.space, "b").await.unwrap();
+    frontier_at(&rig, 12).await;
+    assert_restore_equals_local(&rig, source, store, scratch.path()).await;
+    uploader.drain(Duration::from_secs(5)).await;
+}
