@@ -971,6 +971,70 @@ pub fn check_wal(path: &Path, db_page_size: u32) -> Result<u64, MaterialiseError
     Ok(frames)
 }
 
+/// The length of the WAL at `path` through its last commit frame (TC-1491
+/// P4.2a), or 0 when it has none or does not exist.
+///
+/// A WAL file can be longer than what SQLite would replay. A write that
+/// outgrows the page cache puts frames into the WAL before its COMMIT, and if
+/// it rolls back, those frames stay in the file until a later write overwrites
+/// them; whatever the later write does not reach is a tail that fails the
+/// checksum chain. [`check_wal`] refuses such a file, so a store-master
+/// upload must send only the committed prefix, never the file's length.
+///
+/// Reads the whole file once (the same conditions as [`check_wal`], but where
+/// that refuses, this stops): header magic, page size and checksum, then
+/// frames while salts and the cumulative checksum hold.
+pub fn committed_wal_len(path: &Path) -> std::io::Result<u64> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len < WAL_HEADER as u64 {
+        return Ok(0);
+    }
+    let mut reader = BufReader::with_capacity(1 << 16, file);
+    let mut header = [0u8; WAL_HEADER];
+    reader.read_exact(&mut header)?;
+    let big_endian = match be32(&header, 0) {
+        WAL_MAGIC_LE => false,
+        WAL_MAGIC_BE => true,
+        _ => return Ok(0),
+    };
+    let page_size = be32(&header, 8);
+    if !valid_page_size(page_size) {
+        return Ok(0);
+    }
+    let mut sum = wal_checksum(big_endian, &header[..24], (0, 0));
+    if sum != (be32(&header, 24), be32(&header, 28)) {
+        return Ok(0);
+    }
+    let salts = (be32(&header, 16), be32(&header, 20));
+    let frame_size = FRAME_HEADER as u64 + u64::from(page_size);
+    let frames = (len - WAL_HEADER as u64) / frame_size;
+    let mut frame = vec![0u8; frame_size as usize];
+    let mut last_commit = 0u64;
+    for n in 1..=frames {
+        reader.read_exact(&mut frame)?;
+        if (be32(&frame, 8), be32(&frame, 12)) != salts || be32(&frame, 0) == 0 {
+            break;
+        }
+        sum = wal_checksum(big_endian, &frame[..8], sum);
+        sum = wal_checksum(big_endian, &frame[FRAME_HEADER..], sum);
+        if sum != (be32(&frame, 16), be32(&frame, 20)) {
+            break;
+        }
+        if be32(&frame, 4) != 0 {
+            last_commit = n;
+        }
+    }
+    Ok(match last_commit {
+        0 => 0,
+        n => WAL_HEADER as u64 + n * frame_size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

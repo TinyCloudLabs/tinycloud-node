@@ -113,19 +113,35 @@ fn restore(checkpoint: &[u8], wal: &[u8]) -> Result<Vec<String>, String> {
     Ok(rows)
 }
 
-fn assert_restores_committed_rows(published: &Published) {
+/// The size of the actor's own `-wal` file under `cache`.
+fn raw_wal_bytes(cache: &std::path::Path) -> u64 {
+    let mut stack = vec![cache.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with("-wal") {
+                return std::fs::metadata(path).unwrap().len();
+            }
+        }
+    }
+    0
+}
+
+fn assert_restores_committed_rows(published: &Published, cache: &std::path::Path) {
     let checkpoint = published.checkpoint.as_deref().expect("a checkpoint");
-    let wal = published.wal.as_deref().expect("a WAL");
-    // The spill is in the file the route copies: the raw WAL is well past the
-    // committed data, and still inside the delta route's 8 MiB bound.
+    let wal = published.wal.as_deref().expect("a WAL delta");
+    // The spill is in the file the route copies from: the raw WAL is well past
+    // the committed data, and still inside the delta route's 8 MiB bound.
+    let raw = raw_wal_bytes(cache);
     assert!(
-        wal.len() > 2 * 1024 * 1024 && wal.len() < MAX_WAL_DELTA_BYTES,
-        "the rolled-back write must leave a WAL tail under the delta bound; wal bytes = {}",
-        wal.len()
+        raw > 2 * 1024 * 1024 && raw < MAX_WAL_DELTA_BYTES as u64,
+        "the rolled-back write must leave a WAL tail under the delta bound; raw wal bytes = {raw}"
     );
-    let rows = restore(checkpoint, wal).unwrap_or_else(|error| {
-        panic!("the published checkpoint + WAL do not restore: {error}")
-    });
+    assert!(wal.len() < MAX_WAL_DELTA_BYTES);
+    let rows = restore(checkpoint, wal)
+        .unwrap_or_else(|error| panic!("the published checkpoint + WAL do not restore: {error}"));
     // Only the two committed rows; nothing of the rolled-back blobs.
     assert_eq!(rows, vec!["4".to_string(), "5".to_string()]);
 }
@@ -328,7 +344,7 @@ async fn tc4290_delta_route_does_not_publish_a_rolled_back_wal_tail() {
     );
     let space = space_id("tc4290-delta");
     spill_then_small_commit(&service, &space).await;
-    assert_restores_committed_rows(&published.lock().unwrap());
+    assert_restores_committed_rows(&published.lock().unwrap(), cache.path());
 }
 
 #[tokio::test]
@@ -344,5 +360,5 @@ async fn tc4290_chunked_route_does_not_publish_a_rolled_back_wal_tail() {
     );
     let space = space_id("tc4290-chunked");
     spill_then_small_commit(&service, &space).await;
-    assert_restores_committed_rows(&published.lock().unwrap());
+    assert_restores_committed_rows(&published.lock().unwrap(), cache.path());
 }

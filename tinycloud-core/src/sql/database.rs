@@ -26,6 +26,7 @@ use super::{
     },
     parser,
     storage::{self, StorageMode},
+    store::shadow::restore,
     types::*,
 };
 
@@ -516,6 +517,30 @@ fn existing_ancestor(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// The committed prefix of the actor's WAL, as a delta may carry it: through
+/// the last commit frame, never the raw file (TC-4290). A transaction that
+/// spilled past the page cache and rolled back leaves frames in the file that
+/// a later, smaller commit does not overwrite; they fail the checksum chain
+/// and a restore refuses the artifact that carries them.
+///
+/// `None` makes the caller save a whole checkpoint instead: no WAL, no commit
+/// frame, or a WAL whose header or first commit does not verify.
+fn committed_wal(file_path: &Path, raw_len: u64) -> Result<Option<u64>, SqlError> {
+    let wal = restore::wal_path(file_path);
+    let committed =
+        restore::committed_wal_len(&wal).map_err(|e| SqlError::Internal(e.to_string()))?;
+    if committed == 0 {
+        if raw_len > 0 {
+            tracing::warn!(
+                wal_bytes = raw_len,
+                "WAL has no verifiable committed frame; saving a whole checkpoint"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(committed.min(raw_len)))
+}
+
 fn handle_wal_snapshot(
     mode: &StorageMode,
     file_path: &Path,
@@ -524,7 +549,7 @@ fn handle_wal_snapshot(
     if !matches!(mode, StorageMode::File(_)) {
         return Ok(None);
     }
-    let mut source = match std::fs::File::open(format!("{}-wal", file_path.display())) {
+    let source = match std::fs::File::open(restore::wal_path(file_path)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SqlError::Internal(error.to_string())),
@@ -533,13 +558,20 @@ fn handle_wal_snapshot(
         .metadata()
         .map_err(|e| SqlError::Internal(e.to_string()))?
         .len();
+    // The raw size gates the work: the committed prefix is never longer.
     if size == 0 || size >= max_bytes {
         return Ok(None);
     }
+    let Some(committed) = committed_wal(file_path, size)? else {
+        return Ok(None);
+    };
     let mut snapshot =
         tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
-    std::io::copy(&mut source, snapshot.as_file_mut())
-        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    std::io::copy(
+        &mut std::io::Read::take(source, committed),
+        snapshot.as_file_mut(),
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
     Ok(Some(snapshot))
 }
 
@@ -547,12 +579,17 @@ fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, S
     if !matches!(mode, StorageMode::File(_)) {
         return Ok(None);
     }
-    match std::fs::read(format!("{}-wal", file_path.display())) {
-        Ok(wal) if !wal.is_empty() => Ok(Some(wal)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(SqlError::Internal(error.to_string())),
-    }
+    let mut wal = match std::fs::read(restore::wal_path(file_path)) {
+        Ok(wal) if !wal.is_empty() => wal,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SqlError::Internal(error.to_string())),
+    };
+    let Some(committed) = committed_wal(file_path, wal.len() as u64)? else {
+        return Ok(None);
+    };
+    wal.truncate(committed as usize);
+    Ok(Some(wal))
 }
 
 fn handle_export(
@@ -3311,3 +3348,6 @@ mod ddl_authority_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod committed_wal_tests;
