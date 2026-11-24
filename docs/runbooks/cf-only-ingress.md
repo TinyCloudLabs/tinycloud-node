@@ -165,16 +165,32 @@ python3 scripts/ingress-cf-only.py verify --expect restricted --expect-app-id ..
 ```
 
 Run after the operator has applied the PATCH and the restart finished. The result is
-`pass` (exit 0) or `FAIL` (exit 1). **There is no "indeterminate" outcome: only `pass`
-is evidence.** It opens TLS/TCP connections to Phala **gateway** hostnames (network
+`result: pass` (exit 0) or `result: FAIL`, and a FAIL carries a **verdict** with a
+distinct exit code. Only `pass` is evidence, and there is no "indeterminate" pass.
+It opens TLS/TCP connections to Phala **gateway** hostnames (network
 contact with Phala infrastructure, not an API call and not a credentialed one).
+
+**Decision table (the output prints `verdict`, `exit_code` and `next_action`):**
+
+| exit | verdict | meaning | action |
+|---|---|---|---|
+| 0 | `pass` | every check proven; **unreachable until a drill signature is accepted** | continue |
+| 1 | `open_or_broken` | a probed gateway path answered as the node, management answered although the policy denies it, `node.*` or the tunnel host is unhealthy, or `--expect restored` did not reach the node | **undo** (restore) if the path is open or the service is down |
+| 3 | `unknown` | not proven closed, nothing seen open (timeouts, TLS alerts, HTTP statuses, refusals, resets, no route, resolver failures, a failed control or instance binding) | **hold, do NOT undo on this alone**; investigate; run the drill. With the empty set a **correct** restriction reads `unknown` today |
+
+Exit 1 is also used for refusals of bad operator input (stale receipt, loose file
+modes, wrong app); those are not verdicts. `apply-patch` prints the same table under
+`after_verify` (no `if_bad`: it used to say "undo", which is wrong for `unknown`).
 
 **The accepted closed-signature set is EMPTY, so `verify --expect restricted` cannot
 pass yet: no accepted closed signature yet: drill required.** Reason: on an SNI-routed
 shared gateway a TCP refusal happens before the SNI is seen, so it can never be
 app-specific. `tcp_refused` means a local or on-path cause (a REJECT rule, wrong DNS,
 a stale or split-horizon answer) or a gateway-wide outage, so it is not accepted.
-`tcp_reset` is not accepted either. The real denial signature of a restricted gateway has
+`tcp_reset` is not accepted either, and if a reset is ever accepted it will count only
+when the connect itself is reset: a reset after the TCP connect succeeded (during TLS
+or HTTP, e.g. an RST on the ClientHello) is recorded as `reset_after_connect` and is
+never eligible. The real denial signature of a restricted gateway has
 never been observed [INFERENCE]; the drill must record it and the signature is then
 added to `ACCEPTED_CLOSED_SIGNALS` in code, under review. No flag, environment variable
 or file widens the set (`--accept-closed-signal` was removed). The output says so
@@ -221,7 +237,12 @@ never "indeterminate". Checks:
   timeouts (`no_address`) are never waived. A DNS answer is a dated observation, not
   proof that no IPv6 path exists. When the flag is given, the waiver (UTC time, scope,
   hosts waived) is appended to the receipt's `verify_waivers` (atomic replace, still
-  `0600`) and printed under `waivers` in the output. NODATA is told apart from
+  `0600`) and printed under `waivers` in the output. Only a resolver answer of NONAME
+  or NODATA for the AAAA lookup, **with the IPv4 lookup of the same name succeeding**,
+  counts as NODATA; every other resolver failure (EAI_AGAIN, SERVFAIL, EAI_FAIL, any
+  other `gaierror`) is `no_address` and FAILs, never waived. A resolver that filters
+  AAAA answers is indistinguishable from NODATA, which is exactly what the flag
+  accepts (INFERENCE). NODATA is told apart from
   NXDOMAIN by a second IPv4 lookup of the same name (resolver error codes differ by
   platform) [INFERENCE: not run against real DNS];
 - management: **INFERENCE (not run, not observed)** that SSH is reached through the

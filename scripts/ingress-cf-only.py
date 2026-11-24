@@ -183,9 +183,10 @@ class CloudflareReader:
 class NetworkProbe:
     """HTTPS /info reads and fresh-connection probes from this host only (one vantage).
 
-    Every probe reports a distinct signal token, never a bare "closed": tcp_refused, tcp_reset,
-    tls_rejected, closed_after_tls, http_<status>, http_200_unparsed, malformed_http, node_info,
-    ssh_banner, non_ssh_data, timeout, no_route, no_aaaa, no_address, error. The caller decides which are acceptable.
+    Every probe reports a distinct signal token, never a bare "closed": tcp_refused and tcp_reset (both ONLY at connect),
+    reset_after_connect (a reset once connected: during TLS or HTTP), tls_rejected, closed_after_tls, http_<status>,
+    http_200_unparsed, malformed_http, node_info, ssh_banner, non_ssh_data, timeout, no_route, no_aaaa, no_address,
+    error. The caller decides which are acceptable; reset_after_connect is never eligible.
     """
     FAMILIES = {"ipv4": socket.AF_INET, "ipv6": socket.AF_INET6}
 
@@ -248,7 +249,7 @@ class NetworkProbe:
             except (ssl.SSLError, EOFError):
                 return "tls_rejected", None
             except ConnectionError:
-                return "tcp_reset", None
+                return "reset_after_connect", None
             except OSError:
                 return "error", None
             with stream:
@@ -271,7 +272,7 @@ class NetworkProbe:
                 except ssl.SSLError:
                     return "tls_rejected", None
                 except ConnectionError:
-                    return "tcp_reset", None
+                    return "reset_after_connect", None
                 except OSError:
                     return "error", None
         if response.status != 200:
@@ -498,9 +499,14 @@ def cmd_apply_patch(a, clients, now, out):
                "evidence": summarize(receipt),
                "warning": "Under a GO only. The PATCH restarts the CVM and interrupts both HTTP paths.",
                "then_verify": verify_command(a, "restricted", a.receipt_out),
-               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify FAILS until a drill "
-                              "records the real gateway denial signature and it is accepted in code: " + NO_SIGNATURE_NOTICE,
-               "if_bad": "undo --snapshot " + str(Path(a.snapshot).resolve())})
+               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify cannot pass until a drill "
+                              "records the real gateway denial signature and it is accepted in code: "
+                              + NO_SIGNATURE_NOTICE + ". A correct restriction therefore reads as UNKNOWN today.",
+               "after_verify": {"exit 0": "pass (unreachable until a drill signature is accepted)",
+                                "exit 1": "OPEN or BROKEN (a path answers as the node, management answers although denied, "
+                                          "or node.* is unhealthy): undo --snapshot " + str(Path(a.snapshot).resolve()),
+                                "exit 3": "UNKNOWN (not proven closed, nothing seen open): do NOT undo on this alone; "
+                                          "hold, investigate and run the drill"}})
 
 
 def cmd_preflight(a, clients, now, out):
@@ -562,9 +568,14 @@ def load_private_snapshot(path):
     return snap
 
 
-def check(name, status, detail, **evidence):
+def check(name, status, detail, kind=None, **evidence):
+    """kind classifies a FAIL for verdict_of: 'open' (answered as the node), 'broken' (service unhealthy) or 'unknown'
+    (default: not proven closed, nothing seen open)."""
     assert status in ("pass", "fail")
-    return dict({"check": name, "status": status, "ok": status == "pass", "detail": detail}, **evidence)
+    item = dict({"check": name, "status": status, "ok": status == "pass", "detail": detail}, **evidence)
+    if status == "fail":
+        item["kind"] = kind or "unknown"
+    return item
 
 
 def signals_of(result):
@@ -627,7 +638,7 @@ def verify(a, clients, now):
         info = http.info(name)
         good = info.get("status") == 200 and info.get("node_id") == node
         checks.append(check(f"{label} /info healthy with the recorded node id", "pass" if good else "fail",
-                            f"status={info.get('status')} node_id_matches={info.get('node_id') == node}"))
+                            f"status={info.get('status')} node_id_matches={info.get('node_id') == node}", kind="broken"))
 
     waived = []
     mgmt_open = management_allowed(snap["after"]) if a.expect == "restricted" else None
@@ -649,7 +660,7 @@ def verify(a, clients, now):
         else:
             ok, detail = False, "no known-open SNI exists when the policy denies management"
         checks.append(check(f"--instance-id is a real gateway host (positive control {inst}:443) [INFERENCE: route]",
-                            "pass" if ok else "fail", detail))
+                            "pass" if ok else "fail", detail, kind="unknown"))
         for name in hosts:
             for family in ("ipv4", "ipv6"):
                 result = http.probe(name, family, 443)
@@ -676,14 +687,15 @@ def verify(a, clients, now):
                 if status == "pass" and "no_aaaa" in signals:
                     waived.append(name)
                 checks.append(check(f"{name} fresh {family} connection shows an accepted closed signature "
-                                    "(same-address positive control)", status, detail, **evidence))
+                                    "(same-address positive control)", status, detail,
+                                    kind="open" if "node_info" in signals else "unknown", **evidence))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
         result = http.probe(TEE_HOST, "ipv4", 443)
         good = result.get("outcome") == "node_info" and result.get("node_id") == node
         checks.append(check(f"{TEE_HOST} fresh ipv4 connection reaches the node again", "pass" if good else "fail",
-                            ",".join(signals_of(result))))
+                            ",".join(signals_of(result)), kind="broken"))
 
     policy = snap["after"] if a.expect == "restricted" else snap["before"].get("value")
     expect_open = management_allowed(policy)
@@ -693,8 +705,10 @@ def verify(a, clients, now):
         status, detail = judge_management(result, expect_open, family, a.allow_no_aaaa)
         if status == "pass" and "no_aaaa" in signals_of(result):
             waived.append(mgmt)
+        denied_but_answers = not expect_open and "ssh_banner" in signals_of(result)
         checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 over {family} untouched "
                             f"(expected {'open' if expect_open else 'denied'})", status, detail,
+                            kind="open" if denied_but_answers else "unknown",
                             addresses=list(result.get("addresses") or [])))
     return checks, waived
 
@@ -711,25 +725,50 @@ def record_verify(path, run, waiver):
     os.replace(tmp, p)
 
 
+def verdict_of(checks):
+    """-> (verdict, exit code). 'open_or_broken' (1): a probed path answered as the node, management answered although
+    denied, or the service is unhealthy: undo territory. 'unknown' (3): nothing was proven closed but nothing was seen
+    open either: HOLD, do not undo on this alone. pass (0) is unreachable while the accepted signature set is empty."""
+    failed = [c for c in checks if c["status"] != "pass"]
+    if not failed:
+        return "pass", 0
+    if any(c.get("kind") in ("open", "broken") for c in failed):
+        return "open_or_broken", 1
+    return "unknown", 3
+
+
+NEXT_ACTION = {
+    "pass": "none",
+    "open_or_broken": "OPEN or BROKEN: a probed path answered as the node or the service is unhealthy. Follow the runbook "
+                      "decision table: undo (restore) if the path is open or the service is down.",
+    "unknown": "UNKNOWN, not proven closed and nothing was seen open. Do NOT undo on this result alone: hold and "
+               "investigate; with the empty accepted-signature set a correct restriction also reads like this "
+               "(drill required, see the runbook).",
+}
+
+
 def cmd_verify(a, clients, now, out):
     checks, waived = verify(a, clients, now)
-    result = "pass" if all(c["status"] == "pass" for c in checks) else "FAIL"
+    verdict, code = verdict_of(checks)
+    result = "pass" if verdict == "pass" else "FAIL"
     waiver = ({"at_utc": now.isoformat(), "waiver": "allow-no-aaaa",
                "scope": "IPv6 probes whose DNS answer was NODATA for AAAA on a name that otherwise resolves; nothing else",
                "hosts_waived": list(dict.fromkeys(waived))} if a.allow_no_aaaa else None)
-    record_verify(a.receipt, {"at_utc": now.isoformat(), "expect": a.expect, "result": result,
+    record_verify(a.receipt, {"at_utc": now.isoformat(), "expect": a.expect, "result": result, "verdict": verdict,
                               "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
-                              "checks": [{k: c[k] for k in ("check", "status", "addresses", "controls") if k in c}
+                              "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
                                          for c in checks]}, waiver)
-    emit(out, {"command": "verify", "expect": a.expect, "result": result, "checks": checks,
+    emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
+               "exit_codes": {"0": "pass", "1": "open_or_broken: undo", "3": "unknown: hold, do not undo"},
+               "next_action": NEXT_ACTION[verdict], "checks": checks,
                "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
                "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,
                "closed_rule": "A path is closed only if it shows an ACCEPTED closed signature, and the accepted set is "
                               "empty until a drill records the real gateway denial and the signature is added in code "
                               "under review. A TCP refusal happens before SNI on a shared gateway, so it is never "
                               "app-specific; it means a local/on-path cause or an outage. Any signature added later also "
-                              "needs a same-address positive control. Open, unknown and unaccepted results FAIL; there is "
-                              "no indeterminate outcome and no flag to widen the set.",
+                              "needs a same-address positive control, and a reset counts only at connect. Open, unknown "
+                              "and unaccepted results never pass; there is no flag to widen the set.",
                "receipt_record": "resolved addresses and control results were appended to the receipt (verify_runs)",
                "waivers": waiver or "none (--allow-no-aaaa not given)",
                "worker_origin_value": ORIGIN_ATTESTATION,
@@ -738,7 +777,7 @@ def cmd_verify(a, clients, now, out):
                "not_covered": ["independent external networks (single vantage)", "cached or literal-IP paths",
                                "existing long-lived connections", "provider read-back of /network and /compose_file",
                                "streaming/SSE behaviour"]})
-    return 0 if result == "pass" else 1
+    return code
 
 
 # ---------------------------------------------------------------- undo
