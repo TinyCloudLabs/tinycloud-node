@@ -261,10 +261,9 @@ After a successful replay, every start logs one info line, `deletion_ledger_star
 `empty`, or `present`; decided before the open creates the file), `bytes`,
 `operations` (delete operations), `key_entries` (keys they name), `committed`,
 `aborted` and `newest_deleted_at` (`none` with no operation). Counts and one
-timestamp: no operation id, network id or key path. The log shipper drops info
-lines from this target (`filtered_level`) until a shipper route and its schema
-entry are deployed, so on a node with log shipping the line does not yet reach
-Better Stack.
+timestamp: no operation id, network id or key path. This release only logs it:
+it ships to Better Stack after the shipper follow-up (TC-4177 follow-up). Until
+then the log shipper drops it (`filtered_level`).
 
 The log shipper sends `deletion_ledger_open_failed`, `deletion_ledger_replay_failed`
 and `deletion_ledger_unrepaired` to Better Stack as individual events with only
