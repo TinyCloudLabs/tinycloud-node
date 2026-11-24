@@ -665,7 +665,8 @@ def verify(a, clients, now):
         good = info.get("status") == 200 and info.get("node_id") == node
         checks.append(check(f"{label} /info healthy with the recorded node id", "pass" if good else "fail",
                             f"status={info.get('status')} node_id_matches={info.get('node_id') == node}", kind="broken",
-                            transport_failure=info.get("status") is None))
+                            transport_failure=info.get("status") is None,
+                            info_role="tunnel" if name == a.tunnel_host else "public"))
 
     waived = []
     mgmt_open = management_allowed(snap["after"]) if a.expect == "restricted" else None
@@ -775,22 +776,41 @@ EXIT_CODES = {
 }
 
 
+HEDGES = {
+    "transport": ("A failing /info check is a transport failure seen from this vantage only (no HTTP answer): confirm from "
+                  "a second network before undo."),
+    "management": ("A failing management check accepted the connection but gave no SSH banner, the same signature as 'the "
+                   "PATCH broke management' and also as a single-app or vantage problem: confirm from a second network or "
+                   "another app first before undo."),
+    "tunnel": ("The tunnel host /info also fails: undo only restores the port policy and leaves the Worker on the tunnel, "
+               "so it cannot fix this: check the connector/Cloudflare first before undo."),
+}
+
+
 def undo_hedge(verdict, expect, checks):
-    """Why an exit 1 (restricted) needs confirmation before undo, or None. Hedged: (a) every failing check is a /info
-    transport failure seen from this vantage; (b) every failing check is on the management route (accepted the connection,
-    no banner after accept): the same signature as 'the PATCH broke management', so undo stays defensible, but confirm
-    first. Management answering although denied (kind open) and any other open check carry no hedge."""
+    """Why an exit 1 (restricted) needs confirmation before undo, or None. Hedged (cbu true) when EVERY failing open/broken
+    check is one of: (a) a /info transport failure seen from this vantage, (b) a management-route failure after accept
+    (same signature as 'the PATCH broke management'), (c) a tunnel-host /info failure, or node.* /info failing together
+    with the tunnel host (undo restores only the port policy; the Worker stays on the tunnel). A mix of hedgeable kinds is
+    hedged. Any unhedged open path wins: management answering although denied, a gateway path answering, node.* failing
+    while the tunnel host is fine (the wrong-attestation signature) carry no hedge."""
     if verdict != "open" or expect != "restricted":
         return None
     seen = [c for c in checks if c["status"] != "pass" and c.get("kind") in ("open", "broken")]
-    if seen and all(c.get("transport_failure") for c in seen):
-        return ("Every failing check is a transport failure of /info seen from this vantage only (no HTTP answer): "
-                "confirm from a second network before undo.")
-    if seen and all(c.get("management") and c.get("kind") == "broken" for c in seen):
-        return ("Every failing check is on the management route (it accepted the connection but gave no SSH banner), the "
-                "same signature as 'the PATCH broke management' and also as a single-app or vantage problem: confirm from "
-                "a second network or another app first before undo.")
-    return None
+    tunnel_down = any(c.get("info_role") == "tunnel" for c in seen)
+    reasons = []
+    for c in seen:
+        if c.get("transport_failure"):
+            reason = "transport"
+        elif c.get("management") and c.get("kind") == "broken":
+            reason = "management"
+        elif c.get("info_role") == "tunnel" or (c.get("info_role") == "public" and tunnel_down):
+            reason = "tunnel"
+        else:
+            return None
+        if reason not in reasons:
+            reasons.append(reason)
+    return " ".join(HEDGES[r] for r in reasons) if reasons else None
 
 
 def confirm_before_undo(verdict, expect, checks):

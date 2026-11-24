@@ -939,6 +939,50 @@ class DefaultClosedSetTest(Base):
         self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", False))
         self.save(self.snapshot, snap)
 
+    def test_mixed_hedgeable_failures_and_a_down_tunnel_host_are_hedged_but_an_unhedged_open_path_wins(self):
+        def run(http):
+            self.http = http
+            code, out, err = self.verify()
+            return code, json.loads(out)
+
+        # M7: management TLS alert after accept PLUS a /info transport failure: both hedgeable, so a mix is hedged
+        http = FakeHttp()
+        http.mgmt = {"outcome": "tls_rejected"}
+        http.info_map["node.tinycloud.xyz"] = {"status": None, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", True))
+        self.assertIn("second network or another app first before undo", result["next_action"])
+        self.assertIn("second network before undo", result["next_action"])
+        # the same mix with a gateway path answering 2xx: the unhedged open path wins
+        http = FakeHttp(restricted=False)
+        http.mgmt = {"outcome": "tls_rejected"}
+        http.info_map["node.tinycloud.xyz"] = {"status": None, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["confirm_before_undo"]), (1, False))
+        # S14: node.* AND the tunnel host both failing (Cloudflare 530/5xx): undo cannot fix the tunnel
+        http = FakeHttp()
+        http.info_map["node.tinycloud.xyz"] = {"status": 530, "node_id": None}
+        http.info_map[HOST] = {"status": 530, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", True))
+        self.assertIn("check the connector/Cloudflare first before undo", result["next_action"])
+        # the tunnel host failing with an HTTP answer, node.* fine: still undo cannot fix it
+        http = FakeHttp()
+        http.info_map[HOST] = {"status": 530, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["confirm_before_undo"]), (1, True))
+        # node.* failing while the tunnel host is fine (wrong-attestation signature): no hedge
+        http = FakeHttp()
+        http.info_map["node.tinycloud.xyz"] = {"status": 502, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["verdict"], result["confirm_before_undo"]), (1, "open", False))
+        self.assertNotIn("connector/Cloudflare", result["next_action"])
+        # tunnel host down plus a gateway path open: the open path wins
+        http = FakeHttp(restricted=False)
+        http.info_map[HOST] = {"status": 530, "node_id": None}
+        code, result = run(http)
+        self.assertEqual((code, result["confirm_before_undo"]), (1, False))
+
     def closed_checks(self, out):
         return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]
 
