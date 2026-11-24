@@ -100,9 +100,10 @@ Guarantees (all tested against fakes):
   history can not revert a newer apply. The undo confirm value is the snapshot's
   `undo_token` (random per apply; printed by `apply` and by the undo dry-run), not the
   plan hash, which is identical for two applies from the same state. A `pending`
-  snapshot (failed apply) should be undone BEFORE anything else is applied: for the
-  single-value levers (security level, route, flip) the applied state does not say which
-  apply produced it.
+  snapshot (failed apply) does not say which apply produced the live state for the
+  single-value levers (security level, route, flip), so its confirm is bound to the
+  LIVE state shown by the dry-run (`undo_confirm`, see Failure recovery), and it should
+  still be undone BEFORE anything else is applied.
 - After a `--force-drift` undo, `verify` may exit 4 because other people's changes were
   kept; the output says so ("differs ... by design").
 - Exit codes: 0 ok, 1 refused (nothing changed), 3 Cloudflare/IO failure, 4 verify failed.
@@ -112,8 +113,12 @@ Guarantees (all tested against fakes):
 If `apply` fails mid-way it prints `APPLY FAILED` and the snapshot path (status
 `pending`). The state may be unchanged or changed. Run `undo` on that snapshot (dry-run
 first): it restores the prior state, or says there is nothing to undo and marks the
-snapshot `aborted`. If undo itself fails, restore by hand from the exact values in the
-snapshot (`before`) in the Cloudflare dashboard.
+snapshot `aborted`. For a pending snapshot the dry-run prints the LIVE state read from
+Cloudflare next to the recorded prior state, and the confirm value (`undo_confirm`) is
+bound to that live state: read both, then pass it as `--confirm`. If the live state
+changed since the dry-run the confirm is refused; re-run the dry-run. If undo itself
+fails, restore by hand from the exact values in the snapshot (`before`) in the
+Cloudflare dashboard.
 
 ## Unverified (check in the first drill, not run)
 

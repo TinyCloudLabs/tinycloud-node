@@ -176,6 +176,11 @@ class Base(unittest.TestCase):
         """The undo token apply wrote into the snapshot (it is also printed by apply and the undo dry-run)."""
         return json.loads(Path(snap or self.snap).read_text())["undo_token"]
 
+    def undo_dry_run(self, snap=None):
+        code, out, err = self.run_cli("undo", "--snapshot", str(snap or self.snap))
+        self.assertEqual(code, 0, err)
+        return self.docs(out)[0]
+
     def applied(self):
         h = self.plan()["plan_hash"]
         code, out, err = self.apply(h)
@@ -841,8 +846,10 @@ class ReviewFixesTest(Base):
         self.assertEqual(code, 3)
         saved = json.loads(self.snap.read_text())
         self.assertEqual((saved["status"], saved["created"]["rule_id"]), ("pending", "r-new0001"))
-        self.assertIn(f"--confirm {saved['undo_token']}", err)
-        code, _, err = self.undo("--confirm", self.token())
+        self.assertNotIn(saved["undo_token"], err)  # a pending snapshot's confirm value comes from the undo dry-run
+        dry = self.undo_dry_run()
+        self.assertEqual(dry["live_state"]["rules"][0]["id"], "…0001")
+        code, _, err = self.undo("--confirm", dry["undo_confirm"])
         self.assertEqual(code, 0, err)
         self.assertEqual(self.fake.rules, original)
 
@@ -868,6 +875,83 @@ class ReviewFixesTest(Base):
                     code, _, _ = self.run_cli(command[0], "--snapshot", str(path), *command[1:])
                     self.assertEqual(code, 1)
                 self.assertEqual(len(self.fake.calls), calls)  # refused before any API call
+
+    def test_pending_undo_binds_its_confirm_to_the_live_state_waf(self):
+        class LostReply(FakeCF):
+            def add_rule(self, *args):
+                super().add_rule(*args)
+                raise sw.CfError("add_rule: reply lost")
+
+        self.fake = LostReply()
+        self.assertEqual(self.apply(self.plan()["plan_hash"])[0], 3)
+        dry = self.undo_dry_run()
+        self.assertEqual([r["description"] for r in dry["live_state"]["rules"]], [sw.MARKER, "allow monitor", "legacy"])
+        self.assertEqual([r["description"] for r in dry["recorded_before_state"]["rules"]], ["allow monitor", "legacy"])
+        self.assertNotIn("undo_token", dry)
+        self.assertNotIn("r-new0001", json.dumps(dry))  # ids are …last4 on stdout
+        self.fake.rules[1]["version"] = "99"  # live state moves after the dry-run (still "our" state)
+        before_calls = len(self.fake.writes())
+        code, _, err = self.undo("--confirm", dry["undo_confirm"])
+        self.assertEqual(code, 1)
+        self.assertIn("live state", err)
+        self.assertEqual(len(self.fake.writes()), before_calls)
+        self.assertEqual(json.loads(self.snap.read_text())["status"], "pending")
+        fresh = self.undo_dry_run()
+        self.assertNotEqual(fresh["undo_confirm"], dry["undo_confirm"])
+        code, _, err = self.undo("--confirm", fresh["undo_confirm"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r["id"] for r in self.fake.rules], ["r-aaaa1111", "r-bbbb2222"])
+
+    def test_pending_undo_binds_its_confirm_to_the_live_state_flip(self):
+        class LostReply(FakeCF):
+            armed = True
+
+            def update_dns_record(self, *args):
+                super().update_dns_record(*args)
+                if self.armed:
+                    raise sw.CfError("update_dns_record: reply lost")
+
+        self.fake = LostReply()
+        self.fake.dns[1].update(proxied=False, ttl=300)
+        flags = ("--lever", "dns-proxy-flip", "--expect-type", "CNAME", "--accept-tls-change")
+        self.assertEqual(self.apply(self.plan(*flags)["plan_hash"], *flags)[0], 3)
+        self.fake.armed = False  # only the apply loses its reply
+        dry = self.undo_dry_run()
+        self.assertEqual((dry["live_state"]["record"]["proxied"], dry["recorded_before_state"]["record"]["proxied"]),
+                         (True, False))
+        self.assertEqual(self.undo("--confirm", self.token())[0], 1)  # the undo token alone is not enough
+        self.fake.dns[1]["content"] = "rewritten.example.test"  # e.g. dstack-ingress, after the dry-run
+        updates = len([c for c in self.fake.calls if c[0] == "update_dns_record"])
+        code, _, err = self.undo("--confirm", dry["undo_confirm"])
+        self.assertEqual(code, 1)
+        self.assertIn("live state", err)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "update_dns_record"]), updates)
+        code, _, err = self.undo("--confirm", self.undo_dry_run()["undo_confirm"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.fake.dns[1]["proxied"], self.fake.dns[1]["ttl"]), (False, 300))
+        self.assertEqual(self.fake.dns[1]["content"], "rewritten.example.test")  # never written back
+
+    def test_pending_undo_security_level_shows_live_next_to_recorded(self):
+        class LostReply(FakeCF):
+            armed = True
+
+            def set_security_level(self, zone, value):
+                super().set_security_level(zone, value)
+                if self.armed:
+                    raise sw.CfError("set_security_level: reply lost")
+
+        self.fake = LostReply()
+        flags = ("--lever", "security-level", "--allow-zone-wide")
+        self.assertEqual(self.apply(self.plan(*flags)["plan_hash"], *flags)[0], 3)
+        self.fake.armed = False  # only the apply loses its reply
+        dry = self.undo_dry_run()
+        self.assertEqual((dry["live_state"], dry["recorded_before_state"]),
+                         ({"value": "under_attack"}, {"value": "medium"}))
+        self.assertEqual(self.undo("--confirm", self.token())[0], 1)
+        self.assertEqual(self.fake.level, "under_attack")
+        code, _, err = self.undo("--confirm", dry["undo_confirm"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.level, "medium")
 
 
 class TokenAndClientTest(Base):

@@ -61,6 +61,16 @@ def tail(value):
     return "…" + str(value)[-4:]
 
 
+def redact_ids(value):
+    """Same convention as everywhere else on stdout: ids are shown as …last4 (full ids live in the snapshot)."""
+    if isinstance(value, dict):
+        return {k: tail(v) if k in ("id", "rule_id", "ruleset_id") and isinstance(v, str) else redact_ids(v)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_ids(v) for v in value]
+    return value
+
+
 def canon(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -810,7 +820,8 @@ def cmd_apply(args, client):
                 pass
         print(f"APPLY FAILED ({type(error).__name__}). The change may be partial or absent; a snapshot of the "
               f"prior state exists at {args.snapshot} (status pending). Recovery: run "
-              f"`{undo_command}` (dry-run first, without --confirm); "
+              f"`{PROG} undo --snapshot {args.snapshot}` (dry-run: it prints the LIVE state next to the recorded "
+              "prior state and the --confirm value bound to that live state); "
               "it restores the prior state, or reports nothing to undo.", file=sys.stderr)
         raise
     snap["created"] = lever.created
@@ -840,6 +851,14 @@ def cmd_undo(args, client):
     unmanaged = lever.unmanaged(current, snap["before"])
     if unmanaged:
         out["unmanaged_changes_reported_not_written"] = unmanaged
+    pending = snap["status"] == "pending"
+    # A pending snapshot says nothing about which apply produced the live state, so the operator confirms the
+    # LIVE state: the confirm value is bound to it and a state that changed since the dry-run is refused.
+    expected_confirm = (digest({"undo_token": snap["undo_token"], "live_state": current}) if pending
+                        else snap["undo_token"])
+    if pending:
+        out["live_state"] = redact_ids(current)
+        out["recorded_before_state"] = redact_ids(snap["before"])
     if lever.same(current, snap["before"]):
         if snap["status"] == "pending":
             snap["status"] = "aborted"
@@ -858,12 +877,20 @@ def cmd_undo(args, client):
         emit(out)
         return 1
     if args.confirm is None:
-        out["result"] = "dry-run: nothing changed; pass --confirm <undo_token> to execute"
-        out["undo_token"] = snap["undo_token"]
+        if pending:
+            out["result"] = ("dry-run: nothing changed; PENDING snapshot (apply did not finish): compare live_state "
+                             "with recorded_before_state, then pass --confirm <undo_confirm>. The value is bound to "
+                             "the live state shown; if it changes, re-run this dry-run")
+            out["undo_confirm"] = expected_confirm
+        else:
+            out["result"] = "dry-run: nothing changed; pass --confirm <undo_token> to execute"
+            out["undo_token"] = snap["undo_token"]
         emit(out)
         return 0
-    require(args.confirm == snap["undo_token"], "--confirm does not match this snapshot's undo token (printed "
-            "by apply and by the undo dry-run)")
+    require(args.confirm == expected_confirm,
+            "--confirm does not match the live state shown by the undo dry-run (a pending snapshot's confirm is "
+            "bound to the live state; it changed since, or the value is wrong). Re-run the dry-run" if pending else
+            "--confirm does not match this snapshot's undo token (printed by apply and by the undo dry-run)")
     if drift:
         snap.setdefault("forced_undo", []).append({"at_utc": now(), "overwrote": current})
         replace_private(args.snapshot, snap)  # record what is about to be overwritten
