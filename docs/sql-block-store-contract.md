@@ -754,9 +754,11 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   later re-upgrade inherit stale rows (which `base_checkpoint_cid` also
   guards against). The release note says so.
   The same holds for `m20261124_000000_sql_wal_mark` (P3): rolling back past
-  it means `DROP TABLE IF EXISTS sql_wal_mark` as the table owner and
-  `DELETE FROM seaql_migrations WHERE version =
-  'm20261124_000000_sql_wal_mark'`. Leftover `wal-delta-v1` object rows only
+  it means `DELETE FROM seaql_migrations WHERE version =
+  'm20261124_000000_sql_wal_mark'`; the table stays (the node's own role owns it, so an
+  operator role cannot drop it: `docs/releasing.md`, TC-3755). Marks are derived data and
+  are written by ordinary SQL saves even with the shadow off; stale marks only cause the
+  cumulative-segment fallback. Leftover `wal-delta-v1` object rows only
   matter to an older restore-check, and only if shadow was ever enabled.
   The same holds for `m20261125_000000_sql_store_mode` (P4.1). An image-only
   rollback to node 1.26.23 fails on it: that binary refuses to start on a
@@ -767,6 +769,8 @@ versions; none touches these tables. Rules from #341 / #343 / #374:
   `DELETE FROM seaql_migrations WHERE version IN
   ('m20261125_000000_revocation_tombstone','m20261125_000000_sql_store_mode');`.
   An optional `DROP TABLE IF EXISTS sql_store_mode;` may follow.
+  Both rollbacks are proposed only: the postgres-role `DELETE` has not been
+  exercised against the production provider, and the default is fix-forward.
   The `DELETE` needs only `postgres` and is enough for the older image to
   boot. The `DROP` needs the table owner, the node's own role
   (`docs/releasing.md`, TC-3755). A table left behind is harmless: `up` is
