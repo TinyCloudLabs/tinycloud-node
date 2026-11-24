@@ -58,6 +58,8 @@ pub(crate) enum Operation {
         value: Hash,
         generation: i64,
         metadata: Metadata,
+        /// The value's size in bytes. Not part of the epoch's operation hash.
+        size: i64,
     },
     KvDelete {
         space: SpaceId,
@@ -75,12 +77,14 @@ impl Operation {
                 value,
                 generation,
                 metadata,
+                size,
             } => VersionedOperation::KvWrite {
                 space,
                 key,
                 value,
                 generation,
                 metadata,
+                size,
                 seq,
                 epoch,
                 epoch_seq,
@@ -116,6 +120,7 @@ pub(crate) enum VersionedOperation {
         value: Hash,
         generation: i64,
         metadata: Metadata,
+        size: i64,
         seq: i64,
         epoch: Hash,
         epoch_seq: i64,
@@ -345,5 +350,36 @@ mod signature_encoding_tests {
                 canonical_cid = Some(cid);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod epoch_hash_tests {
+    use super::*;
+
+    /// TC-2492: a write's recorded size is not part of the epoch hash, so
+    /// commit hashes don't depend on whether a node records sizes.
+    #[test]
+    fn kv_write_size_does_not_change_the_epoch_hash() {
+        let space: SpaceId = "tinycloud:key:test:epoch-size".parse().unwrap();
+        let invocation = hash(b"invocation");
+        let write = |value: &[u8], size: i64| Operation::KvWrite {
+            space: space.clone(),
+            key: "docs/report.txt".parse().unwrap(),
+            value: hash(value),
+            generation: 0,
+            metadata: Metadata(Default::default()),
+            size,
+        };
+        let epoch = |op: Operation| {
+            serde_ipld_dagcbor::to_vec(&hash_inv(&invocation, &space, &[op]).unwrap()).unwrap()
+        };
+
+        assert_eq!(epoch(write(b"value", 0)), epoch(write(b"value", 21)));
+        assert_ne!(
+            epoch(write(b"value", 21)),
+            epoch(write(b"other", 21)),
+            "the write itself is hashed"
+        );
     }
 }

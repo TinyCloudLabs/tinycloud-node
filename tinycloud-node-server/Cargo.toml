@@ -1,7 +1,7 @@
 [package]
 name = "tinycloud-node"
 build = "build.rs"
-version = "1.26.11"
+version = "1.26.24"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
@@ -17,6 +17,7 @@ name = "tinycloud"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 anyhow = "1"
 # Canonical-point check for pinned issuer keys (issuer_set.rs).
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
@@ -64,7 +65,7 @@ toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util", "fs"] }
 tokio-stream = { version = "0.1", features = ["fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
@@ -72,6 +73,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# TC-3554 historical KMS epoch fetch (src/dstack_kms.rs), `dstack` builds only.
+hkdf = { version = "0.12", optional = true }
+k256 = { version = "0.13.4", features = ["ecdsa"], optional = true }
+sha3 = { version = "0.10", optional = true }
+x509-parser = { version = "0.16", features = ["verify"], optional = true }
+zeroize = { version = "1", optional = true }
 rsa = "0.9"
 if-addrs = "0.13"
 tracing = "0.1"
@@ -119,6 +126,7 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook", "test-util"]
 
 [dev-dependencies]
+serde_jcs = "0.1"
 # Parse production Rust items in the DID resolver source guard (tests only).
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
@@ -143,7 +151,9 @@ tinycloud-sdk-wasm = { path = "../tinycloud-sdk-wasm" }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 pem = "3"
-x509-parser = "0.16"
+# `verify`: the stand-in KMS in tests/kms_epoch_identity.rs checks that the
+# RA-TLS client certificate is signed by its temp CA (TC-3554).
+x509-parser = { version = "0.16", features = ["verify"] }
 
 [features]
 renewal-test-clock = ["tinycloud-core/renewal-test-clock"]
@@ -152,7 +162,14 @@ default = ["jemalloc"]
 # above). A no-op on targets where the dependency isn't in the graph (e.g.
 # macOS dev hosts, glibc Linux).
 jemalloc = ["dep:tikv-jemallocator"]
-dstack = []
+dstack = [
+    "dep:hkdf",
+    "dep:k256",
+    "dep:sha3",
+    "dep:x509-parser",
+    "dep:zeroize",
+    "rcgen/x509-parser",
+]
 duckdb = ["tinycloud-core/duckdb"]
 tc-bench-v1 = []
 # Enables only the hermetic mounted fixture's placeholder trust identities.

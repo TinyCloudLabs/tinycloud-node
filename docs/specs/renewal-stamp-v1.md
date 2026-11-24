@@ -11,6 +11,8 @@ A renewal lease is an existing owner-authorized UCAN/CACAO delegation. This spec
 
 The CIDs named `originalCid` and `leaseCid` in the known-answer fixture are generated from synthetic DAG-CBOR placeholder artifacts. They test stamp encoding and the non-null root link only; they are not signed UCAN/CACAO delegation records and do not freeze the lease's actual bytes.
 
+A space purge deletes the `renewal_lease` and `renewal_stamp` rows of every lease or original delegation it deletes, so a lease does not survive its records (TC-4092). A revocation of a lease, its original or an ancestor is remembered across a purge by a `revocation_tombstone` row keyed by the canonical hash, and after a purge `/delegate` refuses the same lease again with `delegation_revoked` (401). A stored lease posted again while it, its original or an ancestor is revoked answers 401 `renewal lease is revoked`. A lease whose original was never revoked registers again after a purge as a new lease with no stamp history.
+
 ## Signed stamp bytes
 
 The signed byte sequence is the deterministic DAG-CBOR encoding of exactly this two-entry map:
@@ -33,6 +35,8 @@ The signed byte sequence is the deterministic DAG-CBOR encoding of exactly this 
 ```
 
 `previousStampCid` is non-null. The first stamp sets it to that lease's CID. `leaseGeneration` records the issuance generation; it is not a use-time equality check. `renewerEpoch` is the current renewer identity epoch. `newEnd` is serialized as a UTC RFC3339 string. The domain value has no NUL terminator; there is no additional domain prefix outside the encoded map.
+
+**`leaseGeneration` is constant within a lease.** Every stamp carries its lease's generation (today always `1`), and every stamp under one lease carries the same value, so a history of two or more stamps has equal `leaseGeneration` values. Verifiers must not require it to increase from one stamp to the next. Stamp order comes from the `previousStampCid` link (each stamp names its predecessor, the first names the lease CID) and the strictly increasing `newEnd`. Verifiers may require the value to be a positive safe integer that does not decrease along the chain. The `/delegation/status` history is returned ordered by lease CID and generation, so the order of stamps within one lease in that array is unspecified; follow the `previousStampCid` links. Details: TC-3997.
 
 Encode with the repository's deterministic `serde_ipld_dagcbor` representation. The detached Ed25519 signature is over the exact encoded bytes above; it is not embedded in those bytes. The stamp CID is CIDv1 with raw codec `0x55` and Blake3-256 over those exact bytes; the detached signature is excluded from the CID input.
 

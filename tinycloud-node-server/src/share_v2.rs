@@ -975,6 +975,9 @@ pub async fn register_policy(
         .begin()
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    tinycloud_core::space_purge_records::operation(&transaction)
+        .await
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
     model
         .insert(&transaction)
         .await
@@ -1309,8 +1312,10 @@ async fn verify_owner_delegation(
     let delegation = TinyCloudDelegation::from_bytes(&bytes).map_err(|_| ())?;
     verify_delegation_signature(&delegation).await?;
     let info = DelegationInfo::try_from(delegation).map_err(|_| ())?;
-    if info.delegation_mode == DelegationMode::Terminal
-        || !did_principal_matches(&info.delegator, &policy.owner_did)
+    if matches!(
+        info.delegation_mode,
+        DelegationMode::Terminal | DelegationMode::Invalid
+    ) || !did_principal_matches(&info.delegator, &policy.owner_did)
         || !did_principal_matches(&info.delegate, &policy.share_key_did)
         || row
             .expiry
@@ -2841,6 +2846,9 @@ pub async fn policy_session_v2(
         .begin()
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    tinycloud_core::space_purge_records::operation(&transaction)
+        .await
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
     let consumed = share_anonymous_challenge::Entity::update_many()
         .col_expr(
             share_anonymous_challenge::Column::ConsumedAt,
@@ -4090,6 +4098,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db)
             .await
@@ -4535,6 +4544,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(delegation_id.as_ref().to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&conn)
         .await

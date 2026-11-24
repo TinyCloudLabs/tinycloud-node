@@ -1,3 +1,5 @@
+mod purge_inventory;
+
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3::config::{
     RequestChecksumCalculation, ResponseChecksumValidation, SharedHttpClient,
@@ -54,7 +56,7 @@ pub fn http_client() -> SharedHttpClient {
         .build_https()
 }
 
-async fn aws_config() -> SdkConfig {
+pub(crate) async fn aws_config() -> SdkConfig {
     aws_config::defaults(behavior_version())
         .http_client(http_client())
         .load()
@@ -206,6 +208,80 @@ impl S3BlockStore {
             #[cfg(test)]
             after_put_head: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn purge_prefix(space: &SpaceId) -> Result<String, S3StoreError> {
+        let prefix = format!("{space}/");
+        if space.to_string().contains('/') {
+            return Err(
+                IoError::new(std::io::ErrorKind::InvalidInput, "invalid space path").into(),
+            );
+        }
+        Ok(prefix)
+    }
+
+    /// Read-only KV-byte probe; callers must separately verify other storage.
+    /// Completion callers must hold the exclusive space drain guard.
+    pub async fn space_is_empty(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+        let prefix = Self::purge_prefix(space)?;
+        let page = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        for item in page.contents() {
+            if !item.key().is_some_and(|key| key.starts_with(&prefix)) {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    "object outside space prefix",
+                )
+                .into());
+            }
+        }
+        Ok(page.contents().is_empty() && !page.is_truncated().unwrap_or(false))
+    }
+
+    /// Delete one bounded batch. Caller must hold the space drain fence.
+    /// An empty result verifies absence; subsequent calls always re-list.
+    pub async fn purge_space_batch(&self, space: &SpaceId) -> Result<bool, S3StoreError> {
+        let prefix = Self::purge_prefix(space)?;
+        let page = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(256)
+            .send()
+            .await
+            .map_err(S3Error::from)?;
+        let objects = page.contents();
+        if objects.is_empty() {
+            return Ok(!page.is_truncated().unwrap_or(false));
+        }
+        for object in objects {
+            let key = object.key().ok_or_else(|| {
+                IoError::new(std::io::ErrorKind::InvalidData, "missing object key")
+            })?;
+            if !key.starts_with(&prefix) {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    "object outside space prefix",
+                )
+                .into());
+            }
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(S3Error::from)?;
+        }
+        Ok(false)
     }
 
     pub(crate) fn key_for(space: &SpaceId, id: &Hash, generation: i64) -> String {
@@ -397,6 +473,30 @@ impl ImmutableReadStore for S3BlockStore {
             start.elapsed(),
         );
         result
+    }
+
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(space, id, generation))
+            .send()
+            .await
+        {
+            Ok(object) => Ok(object
+                .content_length()
+                .and_then(|length| u64::try_from(length).ok())),
+            Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
+                Ok(None)
+            }
+            Err(e) => Err(S3Error::from(e).into()),
+        }
     }
 
     async fn read_range(
@@ -1228,3 +1328,11 @@ mod tests {
         assert!(parse_content_range("bytes */67108864").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "space_purge_s3_tests.rs"]
+mod space_purge_tests;
+
+#[cfg(test)]
+#[path = "space_purge_probe_s3_tests.rs"]
+mod space_purge_probe_tests;

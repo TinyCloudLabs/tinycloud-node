@@ -91,7 +91,7 @@ async fn validate_encryption<C: ConnectionTrait>(
     Ok(())
 }
 
-fn stored_plaintext<'a>(
+pub(crate) fn stored_plaintext<'a>(
     encryption: Option<&ColumnEncryption>,
     id: Hash,
     stored: &'a [u8],
@@ -238,6 +238,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(serialization),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await

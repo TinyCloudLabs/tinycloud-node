@@ -301,6 +301,14 @@ mod tests {
                     facts: Set(None),
                     serialization: Set(vec![]),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
+                }
+                .insert(db)
+                .await
+                .unwrap();
+                crate::models::delegation_mode::ActiveModel {
+                    delegation_id: Set(parent_id),
+                    mode: Set("attenuable".to_string()),
                 }
                 .insert(db)
                 .await
@@ -340,6 +348,7 @@ mod tests {
                 })),
                 serialization: Set(vec![]),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(db)
             .await

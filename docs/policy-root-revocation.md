@@ -10,9 +10,11 @@ The root is an ordinary delegation in the graph, so the core revocation rules
 apply. These principals may revoke it:
 
 - the root's signer (its delegator, `ownerDid`);
-- the owner of a space that the root's abilities touch, for example the
-  wallet (did:pkh, over SIWE) that owns the content space of an agent-signed
-  root;
+- the owner of a space or encryption network that the root's abilities
+  touch, for example the wallet (did:pkh, over SIWE) that owns the content
+  space or the encryption network of an agent-signed root. The network's
+  owner is the owner DID in its URN; a key or key-prefix URN counts as its
+  network (TC-3858);
 - the holder of a revoke control that one of them granted. A
   `<space>/delegation` control covers the root's kv rows. The root's
   `encryption/decrypt` row needs a control that names that exact encryption

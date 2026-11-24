@@ -80,6 +80,8 @@ pub enum GrowthPolicy {
     /// [`SqlError::StorageWouldGrow`] if the database grew. No-op DDL,
     /// `DELETE` and `DROP` free pages instead of adding them, so they pass.
     Forbid,
+    /// The stored checkpoint exceeds the save cap: admit only read-only SQL.
+    ReadOnlySaveLimit,
 }
 
 /// Distinguishes one actor from its replacement for the same (space, db); see
@@ -355,6 +357,9 @@ pub fn spawn_actor_with_policy(
                         ),
                         GrowthPolicy::Forbid => handle_message_without_growth_ctx(
                             &conn, &request, &caveats, &authority, &pragmas, &ctx,
+                        ),
+                        GrowthPolicy::ReadOnlySaveLimit => handle_read_only_request(
+                            &conn, &request, &caveats, &authority, &pragmas,
                         ),
                     };
                     // A statement the authorizer refused for a caveat fails the
@@ -1210,6 +1215,65 @@ fn commit_error(error: &rusqlite::Error) -> SqlError {
             SqlError::CommitFailed
         }
     }
+}
+
+/// Preflight every statement before running any of the request. The existing
+/// authorization classification covers DML/DDL; SQLite's own readonly flag
+/// additionally catches writable PRAGMAs, which the parser treats as reports.
+fn handle_read_only_request(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    authority: &SqlAuthority,
+    pragmas: &PragmaTracker,
+) -> Result<SqlExecutionResult, SqlError> {
+    let check = |sql: &str| -> Result<(), SqlError> {
+        let parsed = parser::validate_sql_authorized(sql, caveats, authority)?;
+        if !parsed.is_read_only {
+            return Err(SqlError::DatabaseReadOnlySizeLimit);
+        }
+        conn.authorizer(Some(super::authorizer::create_authorizer_tracked(
+            caveats.clone(),
+            authority,
+            StatementScope::of(&parsed),
+            pragmas.clone(),
+        )));
+        let result = conn
+            .prepare(sql)
+            .map_err(|e| SqlError::Sqlite(e.to_string()))
+            .and_then(|stmt| {
+                if stmt.readonly() {
+                    Ok(())
+                } else {
+                    Err(SqlError::DatabaseReadOnlySizeLimit)
+                }
+            });
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    };
+    match request {
+        SqlRequest::Query { sql, .. } => check(sql)?,
+        SqlRequest::Execute { sql, schema, .. } => {
+            if let Some(schema) = schema {
+                for sql in schema {
+                    check(sql)?;
+                }
+            }
+            check(sql)?;
+        }
+        SqlRequest::Batch { statements } => {
+            for statement in statements {
+                check(&statement.sql)?;
+            }
+        }
+        SqlRequest::ExecuteStatement { name, .. } => {
+            if let Some(statement) = caveats.as_ref().and_then(|c| c.find_statement(name)) {
+                check(&statement.sql)?;
+            }
+        }
+        SqlRequest::Export => {}
+    }
+    handle_request_authorized(conn, request, caveats, authority, pragmas)
 }
 
 fn handle_request_authorized(

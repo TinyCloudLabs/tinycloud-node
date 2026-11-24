@@ -7,8 +7,11 @@
 //! reconstructs the same snapshot and performs all chain checks in memory
 //! against that consistent view.
 
+use crate::encryption::ColumnEncryption;
 use crate::hash::Hash;
-use crate::models::{abilities, delegation, delegation_cid_alias, revocation};
+use crate::models::{
+    abilities, delegation, delegation_cid_alias, delegation_mode, revocation, session_retire,
+};
 use crate::relationships::parent_delegations;
 use sea_orm::{
     entity::prelude::*,
@@ -33,23 +36,58 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
 ) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
-    load_closure(db, roots, false).await
+    let loaded = load_closure(db, roots, false, false).await?;
+    Ok((loaded.nodes, loaded.edges))
 }
 
-/// Resolve the same bounded closure to canonical lock identities. Signed graph
+/// Resolve the bounded closure to canonical lock identities. Signed graph
 /// IDs stay untouched; indexed alias joins share the closure's one round trip.
 pub(crate) async fn load_chain_lock_ids<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
 ) -> Result<Vec<Hash>, ChainTraversalError> {
-    load_closure(db, roots, true).await.map(|(ids, _)| ids)
+    load_closure(db, roots, true, false)
+        .await
+        .map(|loaded| loaded.nodes)
+}
+
+/// Result of a single-query closure load that also joins `delegation_mode`.
+pub(crate) struct ClosureWithModes {
+    /// Canonical lock IDs (when `canonical_locks = true`) or raw node IDs.
+    pub(crate) nodes: Vec<Hash>,
+    /// Parent edges (`child -> [parents]`) in the bounded closure.
+    pub(crate) edges: HashMap<Hash, Vec<Hash>>,
+    /// Side-table modes observed for nodes in the closure; any stored node
+    /// absent from this map is unmarked and must be derived fail-closed from
+    /// its signed serialization.
+    pub(crate) modes: HashMap<Hash, delegation_mode::StoredDelegationMode>,
+}
+
+/// Single-query closure load that resolves canonical lock IDs AND joins
+/// `delegation_mode` (TC-3810), costing zero extra round trips over
+/// [`load_chain_lock_ids`]. Pure read-only SQL (no string literals).
+pub(crate) async fn load_chain_lock_ids_and_modes<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<ClosureWithModes, ChainTraversalError> {
+    load_closure(db, roots, true, true).await
+}
+
+/// Single-query closure load with `delegation_mode` (without lock alias
+/// remapping), for pre-lock registration and `/delegation/status` checks.
+pub(crate) async fn load_closure_with_modes<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<ClosureWithModes, ChainTraversalError> {
+    load_closure(db, roots, false, true).await
 }
 
 async fn load_closure<C: ConnectionTrait>(
     db: &C,
     roots: &[Hash],
     canonical_locks: bool,
-) -> Result<(Vec<Hash>, HashMap<Hash, Vec<Hash>>), ChainTraversalError> {
+    include_modes: bool,
+) -> Result<ClosureWithModes, ChainTraversalError> {
     let mut nodes = roots.to_vec();
     nodes.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
     nodes.dedup();
@@ -57,7 +95,11 @@ async fn load_closure<C: ConnectionTrait>(
         return Err(ChainTraversalError::LimitExceeded);
     }
     if nodes.is_empty() {
-        return Ok((nodes, HashMap::new()));
+        return Ok(ClosureWithModes {
+            nodes,
+            edges: HashMap::new(),
+            modes: HashMap::new(),
+        });
     }
 
     let closure = Alias::new("authorization_edges");
@@ -94,14 +136,30 @@ async fn load_closure<C: ConnectionTrait>(
         )
         .to_owned();
     let mut closure_query = base;
+    let seed_rows = canonical_locks || include_modes;
     if canonical_locks {
-        // Parentless stored roots otherwise produce no edge row. Seed them
-        // only for locking; roots without a persisted alias retain their ID.
+        // Parentless roots with aliases need a row to resolve their lock IDs.
         let seed = Query::select()
             .expr_as(Expr::col(delegation_cid_alias::Column::Id), child.clone())
             .expr_as(Expr::val(Option::<Hash>::None), parent.clone())
             .from(delegation_cid_alias::Entity)
             .and_where(Expr::col(delegation_cid_alias::Column::Id).is_in(nodes.iter().copied()))
+            .to_owned();
+        closure_query.union(UnionType::Distinct, seed);
+    }
+    if include_modes {
+        // Parentless roots have no `parent_delegation` row; seed them from
+        // `delegation_mode` so one query fetches both edges and root modes.
+        let seed = Query::select()
+            .expr_as(
+                Expr::col(delegation_mode::Column::DelegationId),
+                child.clone(),
+            )
+            .expr_as(Expr::val(Option::<Hash>::None), parent.clone())
+            .from(delegation_mode::Entity)
+            .and_where(
+                Expr::col(delegation_mode::Column::DelegationId).is_in(nodes.iter().copied()),
+            )
             .to_owned();
         closure_query.union(UnionType::Distinct, seed);
     }
@@ -119,7 +177,7 @@ async fn load_closure<C: ConnectionTrait>(
             (closure.clone(), parent.clone()),
         ])
         .from(closure.clone())
-        .limit((edge_cap + if canonical_locks { nodes.len() } else { 0 } + 1) as u64);
+        .limit((edge_cap + if seed_rows { nodes.len() } else { 0 } + 1) as u64);
     if canonical_locks {
         for (column, alias, output) in [
             (
@@ -147,16 +205,44 @@ async fn load_closure<C: ConnectionTrait>(
                 );
         }
     }
+    if include_modes {
+        for (column, alias, output) in [
+            (
+                child.clone(),
+                Alias::new("child_mode_row"),
+                Alias::new("child_mode"),
+            ),
+            (
+                parent.clone(),
+                Alias::new("parent_mode_row"),
+                Alias::new("parent_mode"),
+            ),
+        ] {
+            query
+                .expr_as(
+                    Expr::col((alias.clone(), delegation_mode::Column::Mode)),
+                    output,
+                )
+                .join_as(
+                    JoinType::LeftJoin,
+                    delegation_mode::Entity,
+                    alias.clone(),
+                    Expr::col((alias, delegation_mode::Column::DelegationId))
+                        .equals((closure.clone(), column)),
+                );
+        }
+    }
     let query = query.with(WithClause::new().recursive(true).cte(cte).to_owned());
     let rows = db
         .query_all(db.get_database_backend().build(&query))
         .await?;
-    if rows.len() > edge_cap + if canonical_locks { nodes.len() } else { 0 } {
+    if rows.len() > edge_cap + if seed_rows { nodes.len() } else { 0 } {
         return Err(ChainTraversalError::LimitExceeded);
     }
 
     let mut edges: HashMap<Hash, Vec<Hash>> = HashMap::new();
     let mut lock_aliases = HashMap::new();
+    let mut modes = HashMap::new();
     for row in rows {
         let edge_child: Hash = row.try_get("", "child")?;
         let edge_parent: Option<Hash> = row.try_get("", "parent")?;
@@ -172,6 +258,23 @@ async fn load_closure<C: ConnectionTrait>(
                 if canonical != parent {
                     lock_aliases.insert(parent, canonical);
                 }
+            }
+        }
+        if include_modes {
+            if let Some(mode_str) = row.try_get::<Option<String>>("", "child_mode")? {
+                modes.insert(
+                    edge_child,
+                    delegation_mode::StoredDelegationMode::from_db_str(&mode_str),
+                );
+            }
+            if let (Some(parent), Some(mode_str)) = (
+                edge_parent,
+                row.try_get::<Option<String>>("", "parent_mode")?,
+            ) {
+                modes.insert(
+                    parent,
+                    delegation_mode::StoredDelegationMode::from_db_str(&mode_str),
+                );
             }
         }
         let Some(edge_parent) = edge_parent else {
@@ -205,7 +308,11 @@ async fn load_closure<C: ConnectionTrait>(
         }
     }
 
-    Ok((nodes, edges))
+    Ok(ClosureWithModes {
+        nodes,
+        edges,
+        modes,
+    })
 }
 
 /// Each branch projects the same columns, with a distinct slot for each
@@ -292,6 +399,22 @@ fn snapshot_branch<const N: usize>(kind: i32, fields: [SimpleExpr; N]) -> Select
             query.expr_as(expr, Alias::new(*name));
         }
     }
+    // TC-3443: every branch ends with the delegation's first-seen time; only
+    // the anchor and delegation rows carry one.
+    let first_seen_at: SimpleExpr = if matches!(kind, 1 | 4) {
+        Expr::col((delegation::Entity, delegation::Column::FirstSeenAt)).into()
+    } else {
+        Expr::cust("NULL")
+    };
+    query.expr_as(first_seen_at, Alias::new("first_seen_at"));
+    // TC-3810: side-table delegation mode rides the same single-round-trip
+    // snapshot (`LEFT JOIN delegation_mode` on branch 1; type-anchored on 4).
+    let delegation_mode_col: SimpleExpr = if matches!(kind, 1 | 4) {
+        Expr::col((delegation_mode::Entity, delegation_mode::Column::Mode)).into()
+    } else {
+        Expr::cust("NULL")
+    };
+    query.expr_as(delegation_mode_col, Alias::new("delegation_mode"));
     query
 }
 
@@ -453,6 +576,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
     );
     query
         .from(delegation::Entity)
+        .from(delegation_mode::Entity)
         .from(parent_delegations::Entity)
         .from(abilities::Entity)
         .from(Alias::new("renewal_lease"))
@@ -505,6 +629,15 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             lookup_name.clone(),
             Expr::col((delegation::Entity, delegation::Column::Id))
                 .equals((lookup_name.clone(), id.clone())),
+        )
+        .join(
+            JoinType::LeftJoin,
+            delegation_mode::Entity,
+            Expr::col((
+                delegation_mode::Entity,
+                delegation_mode::Column::DelegationId,
+            ))
+            .equals((delegation::Entity, delegation::Column::Id)),
         )
         .and_where(within_budget());
     query.union(UnionType::All, delegations);
@@ -582,6 +715,75 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
         )
         .and_where(within_budget());
     query.union(UnionType::All, aliased_revocations);
+    let mut renewal_rows = renewal_rows_query();
+    renewal_rows
+        .join(
+            JoinType::InnerJoin,
+            lookup_name.clone(),
+            Expr::col((
+                Alias::new("renewal_original_alias"),
+                delegation_cid_alias::Column::Id,
+            ))
+            .equals((lookup_name.clone(), id.clone())),
+        )
+        .and_where(within_budget());
+    query.union(UnionType::All, renewal_rows);
+    // TC-3443: the retire row, if any, of every delegator and delegatee in
+    // the closure. `delegator` carries the retired DID, `expiry` the retire
+    // time and `issued_at` the row's expiry; Rust ignores expired rows. It
+    // rides the snapshot's one round trip over the `session_retire` key.
+    let mut retired_rows = snapshot_branch(
+        6,
+        [
+            node(lookup_name.clone()),
+            null(),
+            Expr::col((session_retire::Entity, session_retire::Column::Did)).into(),
+            null(),
+            Expr::col((session_retire::Entity, session_retire::Column::RetiredAt)).into(),
+            Expr::col((session_retire::Entity, session_retire::Column::ExpiresAt)).into(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+            null(),
+        ],
+    );
+    retired_rows
+        .from(lookup_name.clone())
+        .join(
+            JoinType::InnerJoin,
+            delegation::Entity,
+            Expr::col((delegation::Entity, delegation::Column::Id))
+                .equals((lookup_name.clone(), id.clone())),
+        )
+        .join(
+            JoinType::InnerJoin,
+            session_retire::Entity,
+            Expr::col((session_retire::Entity, session_retire::Column::Did))
+                .equals((delegation::Entity, delegation::Column::Delegator))
+                .or(
+                    Expr::col((session_retire::Entity, session_retire::Column::Did))
+                        .equals((delegation::Entity, delegation::Column::Delegatee)),
+                ),
+        )
+        .and_where(within_budget());
+    query.union(UnionType::All, retired_rows);
+    query.with(
+        WithClause::new()
+            .recursive(true)
+            .cte(roots_cte)
+            .cte(edges_cte)
+            .cte(bounded_cte)
+            .cte(nodes_cte)
+            .cte(lookup_cte)
+            .to_owned(),
+    )
+}
+
+fn renewal_rows_query() -> SelectStatement {
+    let null = || Expr::cust("NULL");
     let lease = Alias::new("renewal_lease");
     let stamp = Alias::new("renewal_stamp");
     let original_alias = Alias::new("renewal_original_alias");
@@ -591,7 +793,7 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
     let mut renewal_rows = snapshot_branch(
         5,
         [
-            node(lookup_name.clone()),
+            Expr::col((original_alias.clone(), delegation_cid_alias::Column::Id)).into(),
             null(),
             null(),
             null(),
@@ -646,27 +848,33 @@ fn snapshot_query(roots: &[Hash]) -> WithQuery {
             ))
             .equals((lease.clone(), Alias::new("original_canonical"))),
         )
-        .join(
-            JoinType::InnerJoin,
-            lookup_name.clone(),
-            Expr::col((original_alias, delegation_cid_alias::Column::Id))
-                .equals((lookup_name.clone(), id.clone())),
-        )
-        .and_where(within_budget())
         .and_where(Expr::cust(
             "renewal_lease.lease_cid = renewal_stamp.lease_cid",
         ));
-    query.union(UnionType::All, renewal_rows);
-    query.with(
-        WithClause::new()
-            .recursive(true)
-            .cte(roots_cte)
-            .cte(edges_cte)
-            .cte(bounded_cte)
-            .cte(nodes_cte)
-            .cte(lookup_cte)
-            .to_owned(),
-    )
+    renewal_rows
+}
+
+/// Push down only predicates that `renewal_candidate` already ignores.
+/// Keep predecessor history and unverifiable chains for fail-closed resolution.
+fn account_renewal_rows_query(
+    identity: &crate::renewal::RenewalNodeIdentity,
+    now: time::PrimitiveDateTime,
+) -> SelectStatement {
+    Query::select()
+        .column(sea_orm::sea_query::Asterisk)
+        .from_subquery(
+            renewal_rows_query(),
+            Alias::new("account_renewal_candidates"),
+        )
+        .and_where(Expr::col(Alias::new("lease_state")).is_in(["active", "stopped"]))
+        .and_where(Expr::col(Alias::new("lease_expiry")).gt(now))
+        .and_where(Expr::col(Alias::new("lease_revoked")).eq(false))
+        .and_where(Expr::col(Alias::new("renewer_did")).eq(identity.renewer_did.as_str()))
+        .and_where(Expr::col(Alias::new("renewer_epoch")).eq(identity.epoch as i64))
+        .and_where(Expr::col(Alias::new("stamp_epoch")).eq(identity.epoch as i64))
+        .and_where(Expr::col(Alias::new("stamp_generation")).gte(0))
+        .and_where(Expr::col(Alias::new("lease_period")).gt(0))
+        .to_owned()
 }
 
 // The old metadata query had no ORDER BY. Authorization accepts any matching
@@ -682,11 +890,9 @@ fn sort_abilities(abilities: &mut HashMap<Hash, Vec<abilities::Model>>) {
         });
     }
 }
-#[derive(Clone)]
 struct RenewalCandidate {
     node: Hash,
     original: String,
-    state: String,
     lease: String,
     stamp: String,
     previous: String,
@@ -702,6 +908,135 @@ struct RenewalCandidate {
     lease_expiry: i64,
     original_expiry: i64,
 }
+
+fn renewal_candidate(
+    row: &sea_orm::QueryResult,
+    (stable_node_did, renewer_did, epoch, verifier_now): (&str, &str, u64, i64),
+) -> Result<Option<RenewalCandidate>, DbErr> {
+    let state: String = row.try_get("", "lease_state")?;
+    let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
+    if !matches!(state.as_str(), "active" | "stopped")
+        || lease_expiry.unix_timestamp() <= verifier_now
+        || row.try_get::<bool>("", "lease_revoked")?
+        || row.try_get::<String>("", "renewer_did")? != renewer_did
+    {
+        return Ok(None);
+    }
+    let renewer_epoch: i64 = row.try_get("", "renewer_epoch")?;
+    let stamp_epoch: i64 = row.try_get("", "stamp_epoch")?;
+    let stamp_generation: i64 = row.try_get("", "stamp_generation")?;
+    let period: i64 = row.try_get("", "lease_period")?;
+    if renewer_epoch as u64 != epoch
+        || stamp_epoch as u64 != epoch
+        || stamp_generation < 0
+        || period <= 0
+    {
+        return Ok(None);
+    }
+    let cid = |name: &str| -> Result<String, DbErr> {
+        Ok(Hash::try_from(row.try_get::<Vec<u8>>("", name)?)
+            .map_err(DbErr::from)?
+            .to_cid(0x55)
+            .to_string())
+    };
+    let audience: Vec<u8> = row.try_get("", "audience_key")?;
+    let Ok(audience): Result<[u8; 32], _> = audience.try_into() else {
+        return Ok(None);
+    };
+    let end: time::OffsetDateTime = row.try_get("", "stamp_end")?;
+    let original_expiry: time::OffsetDateTime = row.try_get("", "lease_original_expiry")?;
+    Ok(Some(RenewalCandidate {
+        node: row.try_get("", "node")?,
+        original: cid("renewal_original")?,
+        lease: cid("lease_cid")?,
+        stamp: cid("stamp_cid")?,
+        previous: cid("previous_stamp_cid")?,
+        generation: stamp_generation as u64,
+        end: end.unix_timestamp(),
+        signed_bytes: row.try_get("", "signed_bytes")?,
+        signature: row.try_get("", "signature")?,
+        did: stable_node_did.to_owned(),
+        epoch,
+        audience,
+        now: verifier_now,
+        period,
+        lease_expiry: lease_expiry.unix_timestamp(),
+        original_expiry: original_expiry.unix_timestamp(),
+    }))
+}
+
+fn effective_ends(
+    parents: &HashMap<Hash, Vec<Hash>>,
+    delegations: &HashMap<Hash, delegation::Model>,
+    revoked: &HashSet<Hash>,
+    candidates: Vec<RenewalCandidate>,
+) -> HashMap<Hash, i64> {
+    let mut grouped: HashMap<Hash, HashMap<String, Vec<RenewalCandidate>>> = HashMap::new();
+    for candidate in candidates {
+        grouped
+            .entry(candidate.node)
+            .or_default()
+            .entry(candidate.lease.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let candidate_map = grouped
+        .into_iter()
+        .filter(|(_, leases)| leases.len() == 1)
+        .filter_map(|(node, leases)| leases.into_values().next().map(|rows| (node, rows)))
+        .collect();
+    let mut resolved = HashMap::new();
+    let mut visiting = HashSet::new();
+    for id in delegations.keys().copied() {
+        let _ = resolve_effective_end(
+            id,
+            parents,
+            delegations,
+            &candidate_map,
+            revoked,
+            &mut resolved,
+            &mut visiting,
+        );
+    }
+    resolved
+}
+
+/// Reuse account-query metadata rather than loading a second authorization
+/// graph with its smaller (64-node) admission budget.
+pub(crate) async fn account_effective_ends<C: ConnectionTrait>(
+    db: &C,
+    parents: &HashMap<Hash, Vec<Hash>>,
+    delegations: &HashMap<Hash, delegation::Model>,
+    revoked: &HashSet<Hash>,
+    identity: Option<&crate::renewal::RenewalNodeIdentity>,
+    verifier_now: i64,
+) -> Result<HashMap<Hash, i64>, DbErr> {
+    let mut candidates = Vec::new();
+    if let Some(identity) = identity.filter(|_| !delegations.is_empty()) {
+        let now = time::OffsetDateTime::from_unix_timestamp(verifier_now)
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+        let mut query = account_renewal_rows_query(identity, now.date().with_time(now.time()));
+        query.and_where(Expr::col(Alias::new("node")).is_in(delegations.keys().copied()));
+        for row in db
+            .query_all(db.get_database_backend().build(&query))
+            .await?
+        {
+            if let Some(candidate) = renewal_candidate(
+                &row,
+                (
+                    &identity.stable_node_did,
+                    &identity.renewer_did,
+                    identity.epoch,
+                    verifier_now,
+                ),
+            )? {
+                candidates.push(candidate);
+            }
+        }
+    }
+    Ok(effective_ends(parents, delegations, revoked, candidates))
+}
+
 fn cap_effective_end(signed_end: i64, renewed_end: Option<i64>, ancestor_ends: &[i64]) -> i64 {
     let own_end = renewed_end.map_or(signed_end, |end| signed_end.max(end));
     ancestor_ends
@@ -745,26 +1080,25 @@ fn resolve_effective_end(
         }
         let mut renewed_end = None;
         if let Some(rows) = candidates.get(&id) {
-            let mut expected_previous = rows.first()?.lease.clone();
-            let mut used = HashSet::new();
-            loop {
-                let matching = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.previous == expected_previous)
-                    .collect::<Vec<_>>();
-                if matching.is_empty() {
-                    break;
-                }
-                if matching.len() != 1 {
+            let mut by_previous = HashMap::with_capacity(rows.len());
+            for candidate in rows {
+                if by_previous
+                    .insert(candidate.previous.as_str(), candidate)
+                    .is_some()
+                {
                     return None;
                 }
-                let (index, candidate) = matching[0];
+            }
+            let mut expected_previous = rows.first()?.lease.as_str();
+            let mut used = 0;
+            while let Some(candidate) = by_previous.get(expected_previous) {
+                if used == rows.len() {
+                    return None;
+                }
                 let latest_allowed = candidate.now.checked_add(candidate.period)?;
                 let stamp_verifier_now = candidate.end.checked_sub(1)?;
                 if candidate.original_expiry != signed_end
                     || candidate.end > latest_allowed
-                    || used.contains(&index)
                     || crate::renewal::verify_snapshot_stamp(
                         crate::renewal::SnapshotStampVerification {
                             signed_bytes: &candidate.signed_bytes,
@@ -788,12 +1122,12 @@ fn resolve_effective_end(
                 {
                     return None;
                 }
-                used.insert(index);
-                expected_previous = candidate.stamp.clone();
+                used += 1;
+                expected_previous = candidate.stamp.as_str();
                 renewed_end =
                     Some(renewed_end.map_or(candidate.end, |end: i64| end.max(candidate.end)));
             }
-            if used.len() != rows.len() {
+            if used != rows.len() {
                 return None;
             }
         }
@@ -812,6 +1146,12 @@ pub(crate) struct AuthGraphSnapshot {
     abilities: HashMap<Hash, Vec<abilities::Model>>,
     revoked: HashSet<Hash>,
     renewal_effective_ends: HashMap<Hash, i64>,
+    /// TC-3443: retire time and row expiry of each retired DID among the
+    /// closure's delegators and delegatees, expired rows included.
+    retired: HashMap<String, (time::OffsetDateTime, time::OffsetDateTime)>,
+    /// TC-3810: delegation mode from `delegation_mode` (or fail-closed derived
+    /// from stored signed bytes when unmarked).
+    modes: HashMap<Hash, delegation_mode::StoredDelegationMode>,
 }
 
 impl AuthGraphSnapshot {
@@ -821,7 +1161,15 @@ impl AuthGraphSnapshot {
         db: &C,
         roots: &[Hash],
     ) -> Result<Self, ChainTraversalError> {
-        Self::load_inner(db, roots, None).await
+        Self::load_inner(db, roots, None, None).await
+    }
+
+    pub(crate) async fn load_with_encryption<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        encryption: Option<&ColumnEncryption>,
+    ) -> Result<Self, ChainTraversalError> {
+        Self::load_inner(db, roots, None, encryption).await
     }
 
     pub(crate) async fn load_with_renewal_identity<C: ConnectionTrait>(
@@ -836,6 +1184,25 @@ impl AuthGraphSnapshot {
             db,
             roots,
             Some((stable_node_did, renewer_did, epoch, verifier_now)),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_with_renewal_identity_and_encryption<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        stable_node_did: &str,
+        renewer_did: &str,
+        epoch: u64,
+        verifier_now: i64,
+        encryption: Option<&ColumnEncryption>,
+    ) -> Result<Self, ChainTraversalError> {
+        Self::load_inner(
+            db,
+            roots,
+            Some((stable_node_did, renewer_did, epoch, verifier_now)),
+            encryption,
         )
         .await
     }
@@ -844,6 +1211,7 @@ impl AuthGraphSnapshot {
         db: &C,
         roots: &[Hash],
         identity: Option<(&str, &str, u64, i64)>,
+        encryption: Option<&ColumnEncryption>,
     ) -> Result<Self, ChainTraversalError> {
         let mut nodes = roots.to_vec();
         nodes.dedup();
@@ -857,6 +1225,8 @@ impl AuthGraphSnapshot {
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
                 renewal_effective_ends: HashMap::new(),
+                retired: HashMap::new(),
+                modes: HashMap::new(),
             });
         }
 
@@ -868,6 +1238,8 @@ impl AuthGraphSnapshot {
         let mut abilities: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         let mut revoked = HashSet::new();
         let mut renewal_candidates = Vec::new();
+        let mut retired = HashMap::new();
+        let mut modes = HashMap::new();
         let mut edge_count = 0;
         for row in rows {
             let node: Hash = row.try_get("", "node")?;
@@ -883,6 +1255,19 @@ impl AuthGraphSnapshot {
                         .push(row.try_get("", "parent")?);
                 }
                 1 => {
+                    let serialization: Vec<u8> = row.try_get("", "serialization")?;
+                    let serialization_format: i16 = row.try_get("", "serialization_format")?;
+                    let mode_col: Option<String> = row.try_get("", "delegation_mode")?;
+                    let resolved_mode = match mode_col.as_deref() {
+                        Some(value) => delegation_mode::StoredDelegationMode::from_db_str(value),
+                        None => delegation_mode::derive_when_unmarked(
+                            node,
+                            &serialization,
+                            serialization_format,
+                            encryption,
+                        ),
+                    };
+                    modes.insert(node, resolved_mode);
                     delegations.insert(
                         node,
                         delegation::Model {
@@ -893,8 +1278,9 @@ impl AuthGraphSnapshot {
                             issued_at: row.try_get("", "issued_at")?,
                             not_before: row.try_get("", "not_before")?,
                             facts: row.try_get("", "facts")?,
-                            serialization: row.try_get("", "serialization")?,
-                            serialization_format: row.try_get("", "serialization_format")?,
+                            serialization,
+                            serialization_format,
+                            first_seen_at: row.try_get("", "first_seen_at")?,
                         },
                     );
                 }
@@ -910,61 +1296,17 @@ impl AuthGraphSnapshot {
                     revoked.insert(node);
                 }
                 5 => {
-                    let Some((stable_node_did, renewer_did, epoch, verifier_now)) = identity else {
-                        continue;
-                    };
-                    let state: String = row.try_get("", "lease_state")?;
-                    let lease_expiry: time::OffsetDateTime = row.try_get("", "lease_expiry")?;
-                    if !matches!(state.as_str(), "active" | "stopped")
-                        || lease_expiry.unix_timestamp() <= verifier_now
-                        || row.try_get::<bool>("", "lease_revoked")?
-                        || row.try_get::<String>("", "renewer_did")? != renewer_did
-                    {
-                        continue;
+                    if let Some(identity) = identity {
+                        if let Some(candidate) = renewal_candidate(&row, identity)? {
+                            renewal_candidates.push(candidate);
+                        }
                     }
-                    let renewer_epoch: i64 = row.try_get("", "renewer_epoch")?;
-                    let stamp_epoch: i64 = row.try_get("", "stamp_epoch")?;
-                    let stamp_generation: i64 = row.try_get("", "stamp_generation")?;
-                    let period: i64 = row.try_get("", "lease_period")?;
-                    if renewer_epoch as u64 != epoch
-                        || stamp_epoch as u64 != epoch
-                        || stamp_generation < 0
-                        || period <= 0
-                    {
-                        continue;
-                    }
-                    let cid = |name: &str| -> Result<String, ChainTraversalError> {
-                        Ok(Hash::try_from(row.try_get::<Vec<u8>>("", name)?)
-                            .map_err(DbErr::from)?
-                            .to_cid(0x55)
-                            .to_string())
-                    };
-                    let audience: Vec<u8> = row.try_get("", "audience_key")?;
-                    let Ok(audience): Result<[u8; 32], _> = audience.try_into() else {
-                        continue;
-                    };
-                    let end: time::OffsetDateTime = row.try_get("", "stamp_end")?;
-                    let original_expiry: time::OffsetDateTime =
-                        row.try_get("", "lease_original_expiry")?;
-                    renewal_candidates.push(RenewalCandidate {
-                        node,
-                        state,
-                        original: cid("renewal_original")?,
-                        lease: cid("lease_cid")?,
-                        stamp: cid("stamp_cid")?,
-                        previous: cid("previous_stamp_cid")?,
-                        generation: stamp_generation as u64,
-                        end: end.unix_timestamp(),
-                        signed_bytes: row.try_get("", "signed_bytes")?,
-                        signature: row.try_get("", "signature")?,
-                        did: stable_node_did.to_owned(),
-                        epoch,
-                        audience,
-                        now: verifier_now,
-                        period,
-                        lease_expiry: lease_expiry.unix_timestamp(),
-                        original_expiry: original_expiry.unix_timestamp(),
-                    });
+                }
+                6 => {
+                    retired.insert(
+                        row.try_get::<String>("", "delegator")?,
+                        (row.try_get("", "expiry")?, row.try_get("", "issued_at")?),
+                    );
                 }
                 _ => return Err(DbErr::Type("unknown authorization graph row".into()).into()),
             }
@@ -988,46 +1330,40 @@ impl AuthGraphSnapshot {
             }
         }
 
-        let mut grouped: HashMap<Hash, HashMap<String, Vec<RenewalCandidate>>> = HashMap::new();
-        for candidate in renewal_candidates {
-            grouped
-                .entry(candidate.node)
-                .or_default()
-                .entry(candidate.lease.clone())
-                .or_default()
-                .push(candidate);
-        }
-        let mut candidate_map: HashMap<Hash, Vec<RenewalCandidate>> = HashMap::new();
-        for (node, leases) in grouped {
-            let active: Vec<_> = leases
-                .values()
-                .filter(|rows| matches!(rows[0].state.as_str(), "active" | "stopped"))
-                .collect();
-            if active.len() == 1 {
-                candidate_map.insert(node, active[0].clone());
-            }
-        }
-        let mut renewal_effective_ends = HashMap::new();
-        let mut resolving = HashSet::new();
-        for id in nodes.iter().copied() {
-            let _ = resolve_effective_end(
-                id,
-                &parents,
-                &delegations,
-                &candidate_map,
-                &revoked,
-                &mut renewal_effective_ends,
-                &mut resolving,
-            );
-        }
+        let renewal_effective_ends =
+            effective_ends(&parents, &delegations, &revoked, renewal_candidates);
         Ok(Self {
             parents,
             delegations,
             abilities,
             revoked,
             renewal_effective_ends,
+            retired,
+            modes,
         })
     }
+
+    /// TC-3810: side-table delegation mode for any delegation in the loaded
+    /// closure (or fail-closed derived from stored bytes when unmarked).
+    pub(crate) fn delegation_mode(
+        &self,
+        id: &Hash,
+    ) -> Option<delegation_mode::StoredDelegationMode> {
+        self.modes.get(id).copied()
+    }
+
+    /// TC-3443: when `did` was retired, if its retire row is live at `now`.
+    pub(crate) fn retired_at(
+        &self,
+        did: &str,
+        now: time::OffsetDateTime,
+    ) -> Option<time::OffsetDateTime> {
+        self.retired
+            .get(did)
+            .filter(|(_, expires_at)| *expires_at > now)
+            .map(|(retired_at, _)| *retired_at)
+    }
+
     pub(crate) fn effective_expiry(&self, id: &Hash) -> Option<i64> {
         self.renewal_effective_ends.get(id).copied()
     }
@@ -1041,7 +1377,17 @@ impl AuthGraphSnapshot {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Whether one cited proof reaches a parentless or owner-issued authority
+    pub(crate) fn is_parentless(&self, id: &Hash) -> bool {
+        self.delegations.contains_key(id) && self.parents.get(id).is_none_or(Vec::is_empty)
+    }
+
+    /// Every proof's ability rows, moved out of a graph that is done with
+    /// authorization (TC-3739).
+    pub(crate) fn into_abilities(self) -> HashMap<Hash, Vec<abilities::Model>> {
+        self.abilities
+    }
+
+    /// Whether one cited proof reaches an explicitly recognized authority
     /// through nodes whose abilities all cover the invoked capability.
     /// Results are memoized across branches and cited proofs; cycles, missing
     /// rows and budget overflow fail closed.
@@ -1069,11 +1415,10 @@ impl AuthGraphSnapshot {
             let valid = if let Some(row) = graph.delegation(&id) {
                 graph.abilities(&id).iter().any(covers)
                     && (is_authority(row)
-                        || graph.parents.get(&id).is_none_or(|parents| {
-                            parents.is_empty()
-                                || parents.iter().any(|parent| {
-                                    visit(graph, *parent, covers, is_authority, memo, visiting)
-                                })
+                        || graph.parents.get(&id).is_some_and(|parents| {
+                            parents.iter().any(|parent| {
+                                visit(graph, *parent, covers, is_authority, memo, visiting)
+                            })
                         }))
             } else {
                 false
@@ -1088,6 +1433,72 @@ impl AuthGraphSnapshot {
         starts
             .into_iter()
             .any(|id| visit(self, id, &covers, &is_authority, &mut memo, &mut visiting))
+    }
+
+    /// Require an explicit positive endpoint; parentless authority is not an
+    /// outside-reader proof. Every selected node must be covered and allowed.
+    pub(crate) fn has_covering_path_to(
+        &self,
+        starts: impl IntoIterator<Item = Hash>,
+        covers: impl Fn(&abilities::Model) -> bool,
+        allowed: impl Fn(&delegation::Model) -> bool,
+        endpoint: impl Fn(&delegation::Model) -> bool,
+    ) -> bool {
+        fn visit<
+            F: Fn(&abilities::Model) -> bool,
+            A: Fn(&delegation::Model) -> bool,
+            E: Fn(&delegation::Model) -> bool,
+        >(
+            graph: &AuthGraphSnapshot,
+            id: Hash,
+            covers: &F,
+            allowed: &A,
+            endpoint: &E,
+            memo: &mut HashMap<Hash, bool>,
+            visiting: &mut HashSet<Hash>,
+        ) -> Option<bool> {
+            if visiting.contains(&id) || memo.len() + visiting.len() >= MAX_CHAIN_TRAVERSAL_NODES {
+                return None;
+            }
+            if let Some(result) = memo.get(&id) {
+                return Some(*result);
+            }
+            let row = graph.delegation(&id)?;
+            if graph.is_revoked(&id) || !allowed(row) || !graph.abilities(&id).iter().any(covers) {
+                return Some(false);
+            }
+            if endpoint(row) {
+                return Some(true);
+            }
+            visiting.insert(id);
+            let mut found = false;
+            for parent in graph.parents.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+                // Evaluate every eligible branch so a cycle cannot be hidden
+                // by an earlier successful branch.
+                found |= visit(graph, *parent, covers, allowed, endpoint, memo, visiting)?;
+            }
+            visiting.remove(&id);
+            memo.insert(id, found);
+            Some(found)
+        }
+        let mut memo = HashMap::new();
+        let mut visiting = HashSet::new();
+        let mut found = false;
+        for start in starts {
+            match visit(
+                self,
+                start,
+                &covers,
+                &allowed,
+                &endpoint,
+                &mut memo,
+                &mut visiting,
+            ) {
+                Some(result) => found |= result,
+                None => return false,
+            }
+        }
+        found
     }
 
     pub(crate) fn is_revoked(&self, id: &Hash) -> bool {
@@ -1247,6 +1658,13 @@ mod tests {
             ))
             .await
             .unwrap();
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO delegation_mode (delegation_id, mode) VALUES ($1,'attenuable')",
+                [Value::Bytes(Some(Box::new(Vec::<u8>::from(id))))],
+            ))
+            .await
+            .unwrap();
         }
         for child in [original, lease] {
             db.execute(Statement::from_sql_and_values(
@@ -1314,6 +1732,120 @@ mod tests {
         }
         (stable_node_did, renewer_did, epoch)
     }
+    #[tokio::test]
+    async fn account_candidate_sql_keeps_history_and_excludes_ineligible_leases() {
+        let (db, _) = counted_database().await;
+        let mut roots = Vec::new();
+        let mut identity = None;
+        for case in [
+            "valid",
+            "stopped",
+            "generation",
+            "expired",
+            "renewer",
+            "epoch",
+            "parent",
+            "signature",
+        ] {
+            let original = hash(format!("tc4046-{case}-original").as_bytes());
+            let lease = hash(format!("tc4046-{case}-lease").as_bytes());
+            let ancestor = hash(format!("tc4046-{case}-parent").as_bytes());
+            let (stable_node_did, renewer_did, epoch) =
+                insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
+                    .await;
+            identity = Some(crate::renewal::RenewalNodeIdentity {
+                stable_node_did,
+                renewer_did,
+                epoch,
+            });
+            roots.push(original);
+            let change = match case {
+                "stopped" => Some("state = 'stopped'"),
+                "generation" => Some("generation = 2"),
+                "expired" => Some("lease_expiry = '1970-01-01 00:35:50'"),
+                "renewer" => Some("renewer_did = 'did:key:old-renewer'"),
+                "epoch" => Some("renewer_epoch = 2"),
+                _ => None,
+            };
+            if let Some(change) = change {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("UPDATE renewal_lease SET {change} WHERE lease_cid = $1"),
+                    [Value::Bytes(Some(Box::new(Vec::<u8>::from(lease))))],
+                ))
+                .await
+                .unwrap();
+            }
+            if case == "parent" {
+                revocation::ActiveModel {
+                    id: Set(hash(b"tc4046-revoked-lease-parent")),
+                    revoker: Set("did:key:actor".to_owned()),
+                    revoked: Set(ancestor),
+                    serialization: Set(vec![1]),
+                    revoked_at: Set(None),
+                }
+                .insert(&db)
+                .await
+                .unwrap();
+            }
+            if case == "signature" {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE renewal_stamp SET signature = $1 WHERE lease_cid = $2",
+                    [
+                        Value::Bytes(Some(Box::new(vec![0; 64]))),
+                        Value::Bytes(Some(Box::new(Vec::<u8>::from(lease)))),
+                    ],
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        let identity = identity.unwrap();
+        let rows = db
+            .query_all(
+                DbBackend::Sqlite.build(&account_renewal_rows_query(&identity, db_datetime(2_150))),
+            )
+            .await
+            .unwrap();
+        // Includes the expired predecessor of every eligible lease, stopped
+        // leases, old generations, and invalid signatures (fail closed later).
+        assert_eq!(rows.len(), 8);
+        let snapshot = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &roots,
+            &identity.stable_node_did,
+            &identity.renewer_did,
+            identity.epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        let ends = account_effective_ends(
+            &db,
+            &snapshot.parents,
+            &snapshot.delegations,
+            &snapshot.revoked,
+            Some(&identity),
+            2_150,
+        )
+        .await
+        .unwrap();
+        for root in &roots {
+            assert_eq!(
+                ends.get(root).copied(),
+                snapshot.effective_expiry(root),
+                "{root:?}"
+            );
+        }
+        assert_eq!(ends.get(&roots[0]), Some(&2_200));
+        assert_eq!(
+            ends.get(&roots[7]),
+            None,
+            "invalid signature must not fall back to signed expiry"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_verifies_stamp_history_caps_expiry_and_fails_closed() {
         let (db, counter) = counted_database().await;
@@ -1487,14 +2019,27 @@ mod tests {
                 abilities: HashMap::new(),
                 revoked: HashSet::new(),
                 renewal_effective_ends: HashMap::new(),
+                retired: HashMap::new(),
+                modes: HashMap::new(),
             });
         }
-        let delegations = delegation::Entity::find()
+        let delegations: HashMap<Hash, delegation::Model> = delegation::Entity::find()
             .filter(delegation::Column::Id.is_in(nodes.iter().copied()))
             .all(db)
             .await?
             .into_iter()
             .map(|row| (row.id, row))
+            .collect();
+        let principals: HashSet<String> = delegations
+            .values()
+            .flat_map(|row| [row.delegator.clone(), row.delegatee.clone()])
+            .collect();
+        let retired = session_retire::Entity::find()
+            .filter(session_retire::Column::Did.is_in(principals))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| (row.did, (row.retired_at, row.expires_at)))
             .collect();
         let mut ability_rows: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         for row in abilities::Entity::find()
@@ -1514,12 +2059,41 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
+        let stored_modes: HashMap<Hash, delegation_mode::StoredDelegationMode> =
+            delegation_mode::Entity::find()
+                .filter(delegation_mode::Column::DelegationId.is_in(nodes.iter().copied()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.delegation_id,
+                        delegation_mode::StoredDelegationMode::from_db_str(&row.mode),
+                    )
+                })
+                .collect();
+        let modes: HashMap<Hash, delegation_mode::StoredDelegationMode> = delegations
+            .iter()
+            .map(|(id, row)| {
+                let mode = stored_modes.get(id).copied().unwrap_or_else(|| {
+                    delegation_mode::derive_when_unmarked(
+                        *id,
+                        &row.serialization,
+                        row.serialization_format,
+                        None,
+                    )
+                });
+                (*id, mode)
+            })
+            .collect();
         Ok(AuthGraphSnapshot {
             parents,
             delegations,
             abilities: ability_rows,
             revoked,
             renewal_effective_ends: HashMap::new(),
+            retired,
+            modes,
         })
     }
 
@@ -1586,7 +2160,7 @@ mod tests {
                 for suffix in ["z", "b", "a"] {
                     abilities::ActiveModel {
                         delegation: Set(id),
-                        resource: Set(format!("tinycloud:did:key:actor:files/kv/{suffix}")
+                        resource: Set(format!("tinycloud:key:actor:files/kv/{suffix}")
                             .parse()
                             .unwrap()),
                         ability: Set(format!("tinycloud.kv/{action}").try_into().unwrap()),
@@ -1638,6 +2212,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -1657,10 +2232,10 @@ mod tests {
         );
         for (resource, caveats) in [
             (
-                "tinycloud:did:key:actor:files/kv",
+                "tinycloud:key:actor:files/kv",
                 Caveats([("tenant".to_string(), serde_json::json!("a"))].into()),
             ),
-            ("tinycloud:did:key:actor:files/kv/doc", sql_caveats.clone()),
+            ("tinycloud:key:actor:files/kv/doc", sql_caveats.clone()),
         ] {
             abilities::ActiveModel {
                 delegation: Set(id),
@@ -1681,7 +2256,7 @@ mod tests {
         );
 
         let capability = crate::util::Capability {
-            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
             ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
             caveats: Caveats::default(),
         };
@@ -1807,7 +2382,7 @@ mod tests {
         use rand::{rngs::StdRng, Rng, SeedableRng};
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let capability = crate::util::Capability {
-            resource: "tinycloud:did:key:actor:files/kv/doc".parse().unwrap(),
+            resource: "tinycloud:key:actor:files/kv/doc".parse().unwrap(),
             ability: "tinycloud.kv/get".to_string().try_into().unwrap(),
             caveats: Caveats::default(),
         };
@@ -1840,13 +2415,14 @@ mod tests {
                     facts: Set(None),
                     serialization: Set(id.as_ref().to_vec()),
                     serialization_format: Set(0),
+                    first_seen_at: Default::default(),
                 }
                 .insert(db)
                 .await
                 .unwrap();
                 abilities::ActiveModel {
                     delegation: Set(*id),
-                    resource: Set("tinycloud:did:key:actor:files/kv".parse().unwrap()),
+                    resource: Set("tinycloud:key:actor:files/kv".parse().unwrap()),
                     ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
                     caveats: Set(Caveats::default()),
                 }
@@ -2031,6 +2607,7 @@ mod tests {
             "CREATE TABLE ability (resource VARCHAR(255) NOT NULL, ability VARCHAR(255) NOT NULL, delegation VARBINARY(34) NOT NULL, caveats JSON NOT NULL, PRIMARY KEY (resource, ability, delegation))",
             "CREATE TABLE revocation (id VARBINARY(34) PRIMARY KEY, revoker VARCHAR(191) NOT NULL, revoked VARBINARY(34) NOT NULL, serialization BLOB NOT NULL, revoked_at DATETIME NULL)",
             "CREATE TABLE delegation_cid_alias (id VARBINARY(64) PRIMARY KEY, canonical VARBINARY(64) NOT NULL, encrypted BOOLEAN NOT NULL, INDEX idx_delegation_cid_alias_canonical (canonical, id))",
+            "CREATE TABLE delegation_mode (delegation_id VARBINARY(64) PRIMARY KEY, mode VARCHAR(16) NOT NULL)",
         ] {
             db.execute(Statement::from_string(DbBackend::MySql, ddl.to_string()))
                 .await
@@ -2056,6 +2633,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -2084,6 +2662,163 @@ mod tests {
             insert_edge(db, pair[0], pair[1]).await;
         }
         ids
+    }
+
+    #[tokio::test]
+    async fn tc3952_parentless_mode_row_seeds_lock_closure_without_alias() {
+        let (db, _) = counted_database().await;
+        assert_parentless_mode_row_seeds_lock_closure(&db).await;
+        if let Some(fixture) =
+            crate::test_support::PostgresTestSchema::new("tc3952_parentless_mode_row").await
+        {
+            actor::ActiveModel {
+                id: Set("did:key:actor".to_owned()),
+            }
+            .insert(&fixture.conn)
+            .await
+            .unwrap();
+            assert_parentless_mode_row_seeds_lock_closure(&fixture.conn).await;
+        }
+    }
+
+    async fn assert_parentless_mode_row_seeds_lock_closure(db: &DatabaseConnection) {
+        let root = hash(b"mode-only parentless delegation");
+        insert_delegation(db, root).await;
+        delegation_mode::ActiveModel {
+            delegation_id: Set(root),
+            mode: Set("invalid".to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        let closure = load_chain_lock_ids_and_modes(db, &[root]).await.unwrap();
+        assert_eq!(closure.nodes, vec![root]);
+        assert!(closure.edges.is_empty());
+        assert_eq!(
+            closure.modes.get(&root),
+            Some(&delegation_mode::StoredDelegationMode::Invalid),
+        );
+    }
+
+    #[tokio::test]
+    async fn tc3952_parentless_alias_and_mode_rows_seed_once() {
+        let (mut db, _) = counted_database().await;
+        assert_parentless_alias_and_mode_rows_seed_once(&mut db).await;
+        if let Some(mut fixture) =
+            crate::test_support::PostgresTestSchema::new("tc3952_parentless_alias_and_mode").await
+        {
+            actor::ActiveModel {
+                id: Set("did:key:actor".to_owned()),
+            }
+            .insert(&fixture.conn)
+            .await
+            .unwrap();
+            assert_parentless_alias_and_mode_rows_seed_once(&mut fixture.conn).await;
+        }
+    }
+
+    async fn assert_parentless_alias_and_mode_rows_seed_once(db: &mut DatabaseConnection) {
+        let root = hash(b"parentless delegation with an alias and mode");
+        let canonical = hash(b"canonical parentless delegation");
+        insert_delegation(db, root).await;
+        delegation_cid_alias::ActiveModel {
+            id: Set(root),
+            canonical: Set(canonical),
+            encrypted: Set(false),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(root),
+            mode: Set("terminal".to_owned()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+
+        let statement = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&statement);
+        db.set_metric_callback(move |info| {
+            *captured.lock().unwrap() = Some(info.statement.clone());
+        });
+
+        let closure = load_chain_lock_ids_and_modes(db, &[root]).await.unwrap();
+        assert_eq!(closure.nodes, vec![canonical]);
+        assert!(closure.edges.is_empty());
+        assert_eq!(
+            closure.modes.get(&root),
+            Some(&delegation_mode::StoredDelegationMode::Terminal),
+        );
+        // Replay the read to check the SQL row count before the maps deduplicate.
+        let query = statement.lock().unwrap().take().unwrap();
+        let rows = db.query_all(query).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tc3952_retention_grant_requires_attenuable_ancestors() {
+        use crate::kv_sync::{retention_until, KvSyncRetentionError, KV_RETAIN_ACTION};
+        use sea_orm::IntoActiveModel;
+
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "kv-retention-mode", 1).await;
+        let (grant, ancestor) = (ids[0], ids[1]);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let expiry = now + time::Duration::hours(1);
+        let mut leaf = delegation::Entity::find_by_id(grant)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        leaf.expiry = Set(Some(expiry));
+        leaf.update(&db).await.unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(grant),
+            mode: Set("attenuable".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let resource: crate::types::Resource =
+            "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:default/kv/docs"
+                .parse()
+                .unwrap();
+        abilities::ActiveModel {
+            delegation: Set(grant),
+            resource: Set(resource.clone()),
+            ability: Set(KV_RETAIN_ACTION.to_owned().try_into().unwrap()),
+            caveats: Set(Caveats::default()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for (mode, expected) in [
+            ("attenuable", Ok(Some(expiry))),
+            ("terminal", Err(KvSyncRetentionError::InvalidMode)),
+            ("invalid", Err(KvSyncRetentionError::InvalidMode)),
+        ] {
+            delegation_mode::Entity::delete_by_id(ancestor)
+                .exec(&db)
+                .await
+                .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(ancestor),
+                mode: Set(mode.to_owned()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let graph = AuthGraphSnapshot::load(&db, &[grant]).await.unwrap();
+            assert_eq!(
+                retention_until(&graph, &grant, "did:key:actor", &resource, now),
+                expected,
+                "ancestor mode {mode}",
+            );
+        }
     }
 
     #[tokio::test]
@@ -2232,3 +2967,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod retirement_path_tests;

@@ -805,3 +805,45 @@ async fn delivery_holds_a_session_to_its_conditions(backend: Backend) -> anyhow:
     Ok(())
 }
 on_both_backends!(delivery_holds_a_session_to_its_conditions);
+
+/// TC-3000 (F6): `/delegate` checks the request's own signature before the
+/// policy admission reads anything. A delegation citing a registered root is
+/// refused by the admission when it is well signed, and as badly signed,
+/// before the admission, when its signature does not verify.
+async fn delegate_checks_the_signature_before_policy_admission(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::KeySession,
+        "delegate_checks_the_signature_before_policy_admission",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(policy_window()).await?;
+    let policy = h.register_ok(policy_window()).await?;
+    let root: Cid = policy.policy_root_cid.parse()?;
+    let grant = [(h.content_resource.to_string(), "tinycloud.kv/get")];
+    let signed = h
+        .enforcer
+        .delegate(h.enforcer.did(), &grant, policy_window(), &[root])?;
+    assert_eq!(
+        h.delegate(signed.clone()).await,
+        (
+            Status::Forbidden,
+            "policy-root-cannot-be-ordinary-parent".to_owned()
+        )
+    );
+
+    // The same claims under another key's signature.
+    let (claims, _) = signed.rsplit_once('.').expect("a JWT");
+    let other = Signer::key().delegate(h.enforcer.did(), &grant, policy_window(), &[root])?;
+    let (_, signature) = other.rsplit_once('.').expect("a JWT");
+    let (status, body) = h.delegate(format!("{claims}.{signature}")).await;
+    assert_eq!(status, Status::Unauthorized, "{body}");
+    assert!(body.contains("Failed to verify signature"), "{body}");
+    Ok(())
+}
+on_both_backends!(delegate_checks_the_signature_before_policy_admission);

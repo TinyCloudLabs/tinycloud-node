@@ -1110,6 +1110,7 @@ async fn grant_owner_to_device(
         facts: Set(None),
         serialization: Set(label.as_bytes().to_vec()),
         serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+        first_seen_at: Default::default(),
     }
     .insert(&fixture.conn)
     .await?;
@@ -2425,7 +2426,7 @@ async fn apps_key_paths_follow_the_shared_depth_vectors_on_the_create_route() ->
     for case in cases {
         let path = case["keyPath"].as_str().unwrap();
         let accepted = case["accepted"].as_bool().unwrap();
-        let deletable = path.split('/').next() == Some("apps");
+        let deletable = matches!(path.split('/').next(), Some("apps" | "secrets"));
         if accepted {
             let (status, text) = create(&fixture, &network, path, deletable).await?;
             assert_eq!(status, Status::Ok, "{path}: {text}");

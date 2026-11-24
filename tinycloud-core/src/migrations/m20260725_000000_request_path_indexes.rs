@@ -444,6 +444,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Default::default(),
+                first_seen_at: Default::default(),
             })
             .exec(db)
             .await?;
@@ -487,6 +488,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(target_delegation.as_ref().to_vec()),
             serialization_format: Default::default(),
+            first_seen_at: Default::default(),
         })
         .exec(db)
         .await?;
@@ -548,6 +550,7 @@ mod tests {
                 // The column is omitted; it defaults to zero.
                 generation: sea_orm::ActiveValue::NotSet,
                 metadata: Set(Metadata(BTreeMap::new())),
+                size: sea_orm::ActiveValue::NotSet,
             }
             .insert(db)
             .await?;

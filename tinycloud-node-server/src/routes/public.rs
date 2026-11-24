@@ -55,10 +55,15 @@ struct TokenBucket {
 
 impl RateLimiter {
     pub fn new(config: &PublicSpacesConfig) -> Self {
+        Self::with_rate(config.rate_limit_per_minute, config.rate_limit_burst)
+    }
+
+    /// A limiter refilling `per_minute` requests a minute, holding `burst`.
+    pub fn with_rate(per_minute: u32, burst: u32) -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
-            tokens_per_second: config.rate_limit_per_minute as f64 / 60.0,
-            burst: config.rate_limit_burst,
+            tokens_per_second: per_minute as f64 / 60.0,
+            burst,
         }
     }
 
@@ -229,6 +234,10 @@ pub async fn public_kv_get(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let key: Path = key
         .0
@@ -277,6 +286,10 @@ pub async fn public_kv_head(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let key: Path = key
         .0
@@ -324,6 +337,10 @@ pub async fn public_kv_list(
         return Err((Status::Forbidden, "Not a public space".to_string()));
     }
     tinycloud_core::request_telemetry::observe_space(&space_id);
+    tinycloud
+        .check_registry_space(&space_id, false)
+        .await
+        .map_err(super::registry_failure)?;
 
     let prefix_path: Path = prefix
         .unwrap_or("")

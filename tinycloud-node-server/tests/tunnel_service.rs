@@ -162,7 +162,7 @@ async fn spawn_tunnel_client(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let ctx = TunnelContext {
         data_root: data_root.to_path_buf(),
-        keys: Some(Keys::Auto),
+        keys: Some(Keys::Auto.into()),
         upstream_addr,
     };
     let handle = tokio::spawn(run_tunnel(ctx, shutdown_rx));

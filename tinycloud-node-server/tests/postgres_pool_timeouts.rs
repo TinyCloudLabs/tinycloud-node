@@ -732,7 +732,7 @@ async fn postgres_checkpoint_saves_send_no_begin() {
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -742,7 +742,7 @@ async fn postgres_checkpoint_saves_send_no_begin() {
             "sql",
             "space",
             "main",
-            vec![2; large],
+            vec![2; large].into(),
             ArtifactExpectation::Derived {
                 revision: created.revision,
                 checkpoint_content_hash: created.checkpoint_content_hash,
@@ -790,7 +790,7 @@ async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
@@ -809,12 +809,15 @@ async fn postgres_a_checkpoint_save_after_a_concurrent_delta_is_refused() {
         let (repository, expected) = (repository.clone(), derived(&seed));
         tokio::spawn(async move {
             repository
-                .save("sql", "space", "main", vec![9; large], expected)
+                .save("sql", "space", "main", vec![9; large].into(), expected)
                 .await
         })
     };
     schema
-        .wait_for_sessions("wait_event_type = 'Lock' AND query LIKE 'UPDATE%'", 1)
+        .wait_for_sessions(
+            "wait_event_type = 'Lock' AND (query LIKE 'UPDATE%' OR query LIKE 'WITH%UPDATE%')",
+            1,
+        )
         .await;
     // What a delta save does to the row: the next revision, same checkpoint.
     holder
@@ -867,15 +870,21 @@ async fn postgres_a_timed_out_checkpoint_update_is_refused_once_and_not_applied(
             "sql",
             "space",
             "main",
-            vec![1; large],
+            vec![1; large].into(),
             ArtifactExpectation::Absent,
         )
         .await
         .unwrap();
     schema.slow_updates(1.5).await;
 
-    let (result, applied) =
-        track_writes(repository.save("sql", "space", "main", vec![2; large], derived(&seed))).await;
+    let (result, applied) = track_writes(repository.save(
+        "sql",
+        "space",
+        "main",
+        vec![2; large].into(),
+        derived(&seed),
+    ))
+    .await;
     let class = match &result {
         Err(DatabaseArtifactError::Db(error)) => transient_error_class(error),
         _ => None,
@@ -1320,10 +1329,11 @@ async fn blackhole_idle_connections_fail_fast_and_recover() {
 
 /// (b, c) A connection that dies mid-hydration, while the request holds its
 /// database's operation lock (TC-1054 exp 4; 1.20.4 hung 156 s). Every
-/// connection streaming the large artifact is black-holed. The first attempt
-/// fails within the retry window (test keepalive detects in about 3 s, the
-/// default window is 10 s), so the read is retried once; the retry is cut
-/// too, and the request ends with a retryable `Unavailable`. The lock is
+/// connection streaming the large artifact is black-holed. The attempt
+/// fails after one detection (test keepalive detects in about 3 s) and is not
+/// retried: only the metadata read of a hydration has a retry owner, and the
+/// payload reads do not. The request ends with a retryable `Unavailable`.
+/// The lock is
 /// released, so the next request on the database hydrates and succeeds;
 /// another database is served throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1332,8 +1342,8 @@ async fn blackhole_mid_hydration_releases_the_database_lock() {
         return;
     };
     let (elapsed, cut) = mid_hydration_blackhole(&url, "bhlock", |_| {}).await;
-    assert_eq!(cut, 2, "the attempt and its one retry were each cut");
-    // Two detections (about 3 s each), never a third from a nested retry.
+    assert_eq!(cut, 1, "the attempt was cut once and not retried");
+    // One detection (about 3 s), never a second.
     assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
 }
 

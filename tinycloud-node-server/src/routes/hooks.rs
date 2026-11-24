@@ -336,6 +336,17 @@ pub async fn hook_events<'r>(
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
+    if let Some(registry) = tinycloud.registry_admission() {
+        for scope in &claims.scopes {
+            let space = scope.space.parse().map_err(|_| {
+                super::registry_failure(tinycloud_core::registry_admission::RegistryError::Denied)
+            })?;
+            registry
+                .authorize_space(&space, false)
+                .await
+                .map_err(super::registry_failure)?;
+        }
+    }
     for scope in &claims.scopes {
         if let Ok(space) = scope.space.parse() {
             tinycloud_core::request_telemetry::observe_space(&space);
@@ -420,6 +431,12 @@ pub async fn hook_events<'r>(
                     match message {
                         Ok(event) => {
                             if claims.scopes.iter().any(|scope| matches_scope(&event, scope)) {
+                                if let Some(registry) = tinycloud.registry_admission() {
+                                    let Ok(space) = event.space.parse() else { break };
+                                    if registry.authorize_space(&space, false).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 yield Event::json(&event)
                                     .id(event.id.clone())
                                     .event("write");
@@ -1024,10 +1041,9 @@ async fn find_parent_expiry(
         return Ok(None);
     }
 
-    let tx = tinycloud
-        .readable()
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let tx = tinycloud.readable().await.map_err(super::internal_error(
+        tinycloud_core::failure_diagnostic::ErrorCode::ReadTxError,
+    ))?;
 
     let parent_ids: Vec<Hash> = parents.iter().map(|cid| Hash::from(*cid)).collect();
 
@@ -2595,6 +2611,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(b"hooks-session".to_vec()),
             serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db)
         .await?;
@@ -3466,6 +3483,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: tinycloud_core::sea_orm::ActiveValue::Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&fixture.db)
             .await?;

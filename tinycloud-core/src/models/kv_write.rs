@@ -19,6 +19,10 @@ pub struct Model {
     #[sea_orm(default_value = 0)]
     pub generation: i64,
     pub metadata: Metadata,
+    /// The stored value's size in bytes; `None` for writes recorded before
+    /// sizes were (TC-2492).
+    #[sea_orm(nullable)]
+    pub size: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

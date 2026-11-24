@@ -32,6 +32,10 @@ const DUCKDB_MAGIC_OFFSET: usize = 8;
 type DatabaseLock = tokio::sync::Mutex<()>;
 type DatabaseLockRegistry = Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<DatabaseLock>>>>;
 
+/// Clones share all state: every mutable field is behind an `Arc` and the rest
+/// is immutable configuration. The space-purge worker uses a clone of the
+/// instance Rocket manages, so its evictions reach the live actors.
+#[derive(Clone)]
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     hydration_locks: DatabaseLockRegistry,
@@ -710,7 +714,13 @@ impl DuckDbService {
         if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
                 .artifact_repository
-                .save_delta("duckdb", &space.to_string(), db_name, wal, expected.clone())
+                .save_delta(
+                    "duckdb",
+                    &space.to_string(),
+                    db_name,
+                    wal.into(),
+                    expected.clone(),
+                )
                 .await
             {
                 Ok(saved) => {
@@ -798,7 +808,13 @@ impl DuckDbService {
         }
         let saved = self
             .artifact_repository
-            .save("duckdb", &space.to_string(), db_name, payload, expected)
+            .save(
+                "duckdb",
+                &space.to_string(),
+                db_name,
+                payload.into(),
+                expected,
+            )
             .await
             .map_err(artifact_error_to_duckdb)?;
         self.lineage.insert(
@@ -916,6 +932,8 @@ fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
         }
         DatabaseArtifactError::ReadLimitExceeded { .. } => DuckDbError::DatabaseTooLargeToLoad,
         DatabaseArtifactError::ReplacementBusy => DuckDbError::Unavailable,
+        DatabaseArtifactError::SpaceDeleted => DuckDbError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => DuckDbError::LifecycleUnavailable,
         err => DuckDbError::Internal(err.to_string()),
     }
 }
@@ -3648,3 +3666,5 @@ mod tests {
         }
     }
 }
+
+mod space_purge;

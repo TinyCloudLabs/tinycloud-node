@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tempfile::tempdir;
 use tinycloud::{
-    config::Keys,
+    config::{Keys, KeysConfig},
     link::{
         client::LinkClient,
         commands::{disable, enable, EnableArgs},
@@ -297,7 +297,7 @@ async fn run_enable(
     keys: Keys,
     args: EnableArgs,
 ) -> anyhow::Result<tinycloud::link::commands::LinkStatusReport> {
-    tokio::task::spawn_blocking(move || enable(&data_root, Some(&keys), args))
+    tokio::task::spawn_blocking(move || enable(&data_root, Some(&KeysConfig::from(keys)), args))
         .await
         .unwrap()
 }
@@ -554,7 +554,10 @@ async fn failed_cert_then_disable_succeeds_despite_bumped_service_sequence() {
     let keys_for_disable = keys.clone();
     let data_root_for_disable = data_root_path.clone();
     let report = tokio::task::spawn_blocking(move || {
-        disable(&data_root_for_disable, Some(&keys_for_disable))
+        disable(
+            &data_root_for_disable,
+            Some(&KeysConfig::from(keys_for_disable)),
+        )
     })
     .await
     .unwrap()
@@ -601,10 +604,12 @@ async fn disable_recovers_from_desynced_local_sequence_via_resync_retry() {
     stale_state.sequence = 1;
     state::write_state(&paths, &stale_state).unwrap();
 
-    let report = tokio::task::spawn_blocking(move || disable(&data_root_path, Some(&keys)))
-        .await
-        .unwrap()
-        .expect("disable should recover from a stale-sequence 409 via the resync-jump retry");
+    let report = tokio::task::spawn_blocking(move || {
+        disable(&data_root_path, Some(&KeysConfig::from(keys)))
+    })
+    .await
+    .unwrap()
+    .expect("disable should recover from a stale-sequence 409 via the resync-jump retry");
     assert!(!report.enabled);
     assert!(
         service.lock().unwrap().stored.is_none(),

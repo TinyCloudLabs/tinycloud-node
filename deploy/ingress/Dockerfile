@@ -19,3 +19,26 @@ RUN sed -i \
     && grep -q '^error_log  /dev/stderr notice;$' /etc/nginx/nginx.conf \
     && mkdir -p /var/log/nginx \
     && ln -sf /dev/stderr /var/log/nginx/error.log
+
+# The base entrypoint generates the nginx server block with
+# `ssl_ecdh_curve secp384r1;`, so X25519-first clients (browsers, curl, Bun)
+# pay a HelloRetryRequest round trip on every new connection. Offer X25519 and
+# P-256 first; P-384 stays allowed, so this is not a security downgrade. The
+# checks fail the build if the base image changes this line.
+RUN test "$(grep -cF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh)" = 1 \
+    && sed -i 's#ssl_ecdh_curve secp384r1;#ssl_ecdh_curve X25519:prime256v1:secp384r1;#' /scripts/entrypoint.sh \
+    && test "$(grep -cF 'ssl_ecdh_curve X25519:prime256v1:secp384r1;' /scripts/entrypoint.sh)" = 1 \
+    && ! grep -qF 'ssl_ecdh_curve secp384r1;' /scripts/entrypoint.sh
+
+# TC-3972: only a locally generated 502 with no upstream connect becomes 503.
+# Keep proxy_intercept_errors off: node responses, especially typed 503s, pass
+# through untouched. Scope error_page to the generated proxy location; the
+# named location preserves the original URI for redacted route classification.
+COPY upstream-unavailable.conf /etc/nginx/tinycloud-upstream-unavailable.conf
+RUN test "$(grep -cFx '    location / {' /scripts/entrypoint.sh)" = 1 \
+    && test "$(grep -cFx '        ${PROXY_CMD}_pass ${TARGET_ENDPOINT};' /scripts/entrypoint.sh)" = 1 \
+    && ! grep -Eq 'proxy_intercept_errors|proxy_next_upstream|error_page' /scripts/entrypoint.sh \
+    && sed -i '/^    location \/ {$/i\    include /etc/nginx/tinycloud-upstream-unavailable.conf;\n' /scripts/entrypoint.sh \
+    && sed -i '/^    location \/ {$/a\        error_page 502 = @tc_upstream_unavailable;' /scripts/entrypoint.sh \
+    && test "$(grep -cFx '    include /etc/nginx/tinycloud-upstream-unavailable.conf;' /scripts/entrypoint.sh)" = 1 \
+    && test "$(grep -cFx '        error_page 502 = @tc_upstream_unavailable;' /scripts/entrypoint.sh)" = 1

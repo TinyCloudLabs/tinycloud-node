@@ -7,6 +7,7 @@ pub mod database_identity;
 pub mod database_migration;
 pub mod db;
 pub mod db_pool;
+pub mod db_retry;
 pub mod did_resolution;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
@@ -26,10 +27,13 @@ pub mod models;
 pub mod policy_authority;
 pub mod policy_capability;
 mod read_audit;
+pub mod registry_admission;
 pub mod relationships;
 pub mod renewal;
 pub mod request_cancel;
 pub mod request_telemetry;
+pub mod resource_review;
+pub mod root_wrap;
 pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;
@@ -44,8 +48,8 @@ pub mod write_hooks;
 pub use admission::{AdmissionError, AdmittedInput, AdmittedInvocation};
 pub use db::{
     kv_mixes_writes_and_reads, kv_mutation_keys, Commit, DelegationStatus, InvocationOutcome,
-    KvBatchReadItem, KvBatchReadValue, KvInvokeOptions, KvPrecondition, SpaceDatabase,
-    TransactResult, TxError, TxStoreError,
+    KvBatchReadItem, KvBatchReadValue, KvInvokeOptions, KvPrecondition, KvValueDetails,
+    SpaceDatabase, TransactResult, TxError, TxStoreError,
 };
 pub use db_pool::RecoveringConnection;
 pub use encryption::{ColumnEncryption, RowBinding};
@@ -54,3 +58,16 @@ pub use read_audit::{ReadAuditError, ReadAuditHealth, DEFAULT_READ_AUDIT_WAIT};
 pub use sea_orm;
 pub use sea_orm_migration;
 pub use sql_sizes::{SizeTrackingArtifactRepository, SqlSizes};
+
+pub mod resource_purge_dependencies;
+pub mod resource_purge_fence;
+pub mod resource_retirement_snapshot;
+pub mod space_purge_auth;
+mod space_purge_cache;
+pub mod space_purge_database;
+pub mod space_purge_fence;
+pub mod space_purge_ledger;
+pub mod space_purge_ledger_copy;
+pub mod space_purge_prefix_repair;
+pub mod space_purge_records;
+pub mod space_purge_worker;

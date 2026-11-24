@@ -299,6 +299,8 @@ impl CaveatArm {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
+    #[error("space_deleted")]
+    SpaceDeleted,
     /// A delegated caveat refused the request. The text is fixed: it names the
     /// arm and nothing from the request.
     #[error("sql_caveat_violation: {}", .0.as_str())]
@@ -356,6 +358,9 @@ pub enum SqlError {
     /// (TC-2961).
     #[error("sql_database_size_limit: the write would exceed the database size limit; no change was applied")]
     DatabaseSizeLimit,
+    /// The hydrated checkpoint cannot be saved within the artifact write cap.
+    #[error("sql_database_size_limit: the database is read-only because its stored checkpoint exceeds the save size limit; no change was applied")]
+    DatabaseReadOnlySizeLimit,
     /// The database is larger than the node loads (TC-2961): its stored
     /// checkpoint or WAL delta exceeds the artifact read limit, so it was
     /// not loaded and nothing ran.

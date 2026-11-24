@@ -131,6 +131,12 @@ impl PostgresTestSchema {
             .max_connections(max_connections)
             .sqlx_logging(false)
             .set_schema_search_path(self.schema.clone());
+        #[cfg(feature = "postgres")]
+        {
+            let application_name = self.schema.clone();
+            options
+                .map_sqlx_postgres_opts(move |options| options.application_name(&application_name));
+        }
         sea_orm::Database::connect(options)
             .await
             .expect("connect to isolated test schema")
@@ -192,9 +198,10 @@ impl Drop for PostgresTestSchema {
                     // transaction the test dropped without commit or rollback
                     // is rolled back by a task sqlx spawned on the test's
                     // runtime, which cannot run while this thread is joined:
-                    // end the sessions still holding locks in the schema
-                    // first, as `DROP DATABASE ... WITH (FORCE)` does for
-                    // `PostgresTestDatabase`.
+                    // end this fixture's sessions still holding locks first.
+                    // A relation lock is not ownership: unqualified ANALYZE
+                    // visits other schemas regardless of search_path. Only
+                    // terminate pools tagged by this fixture's connect().
                     // Best effort: a terminate that fails (for example on a
                     // session that already exited) must not stop the schema
                     // from being dropped below.
@@ -210,6 +217,7 @@ impl Drop for PostgresTestSchema {
                                WHERE l.database = (SELECT oid FROM pg_database \
                                                    WHERE datname = current_database()) \
                                  AND n.nspname = $1 AND l.pid <> pg_backend_pid() \
+                                 AND a.application_name = $1 \
                              ) holders",
                             [schema.clone().into()],
                         ))
@@ -552,5 +560,84 @@ mod postgres_schema_fixture_tests {
         dropped.recv_timeout(Duration::from_secs(30)).expect(
             "dropping the schema fixture waits on a transaction left to drop-time rollback",
         );
+    }
+
+    // ANALYZE without a table list visits every schema, regardless of
+    // search_path. A lock in our schema does not make its backend ours.
+    #[tokio::test]
+    async fn postgres_schema_drop_preserves_a_foreign_session_holding_a_schema_lock() {
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+
+        let Some(fixture) = PostgresTestSchema::new(
+            "postgres_schema_drop_preserves_a_foreign_session_holding_a_schema_lock",
+        )
+        .await
+        else {
+            return;
+        };
+        let schema = fixture.schema.clone();
+        let mut options = ConnectOptions::new(fixture.url.clone());
+        options.max_connections(2).sqlx_logging(false);
+        let foreign = Database::connect(options).await.unwrap();
+        let tx = foreign.begin().await.unwrap();
+        tx.execute_unprepared(&format!("SELECT 1 FROM {schema}.encryption_network"))
+            .await
+            .unwrap();
+
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(fixture);
+            let _ = done.send(());
+        });
+
+        // Wait until cleanup either finishes (the bug kills our transaction)
+        // or reaches DROP SCHEMA, which must wait for our live transaction.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let reached_drop: bool = foreign
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1) \
+                     OR EXISTS (SELECT 1 FROM pg_stat_activity \
+                                WHERE query = $2 AND wait_event_type = 'Lock')",
+                    [
+                        schema.clone().into(),
+                        format!("DROP SCHEMA IF EXISTS {schema} CASCADE").into(),
+                    ],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            if reached_drop {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schema cleanup stalled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let still_connected = tx.execute_unprepared("SELECT 1").await;
+        let rollback = tx.rollback().await;
+        dropped
+            .recv_timeout(Duration::from_secs(30))
+            .expect("schema cleanup must finish after the foreign lock is released");
+        still_connected.expect("schema cleanup terminated another test's session");
+        rollback.unwrap();
+        let remaining: i64 = foreign
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) FROM pg_namespace WHERE nspname = $1",
+                [schema.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        assert_eq!(remaining, 0, "schema cleanup left its schema behind");
+        foreign.close().await.unwrap();
     }
 }

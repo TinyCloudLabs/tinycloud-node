@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import dgram from 'node:dgram';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -11,8 +11,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { buildConfig, nodeImage, ingressImage, vectorImage } from './tc959-logship.mjs';
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
+import { LEDGER_EVENTS, LEDGER_ERROR_KINDS } from '../log-shipper/ledger.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
-import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
@@ -73,6 +74,8 @@ export function assertCapture(events, fields) {
           if (key in event) { assert.equal(typeof event[key], 'string'); assert.match(event[key], new RegExp(pattern)); allowed.push(key); }
         }
         if ('request_id_replaced' in event) { assert.equal(typeof event.request_id_replaced, 'boolean'); allowed.push('request_id_replaced'); }
+        // TC-3834: the 5xx origin code; optional, status 500 and above only, one of the declared codes.
+        if ('error_code' in event) { assert.ok(event.status >= 500); assert.ok(fields?.error_code?.values.includes(event.error_code)); allowed.push('error_code'); }
       }
     } else if (event.event === 'node_warning' || event.event === 'node_error') {
       assert.equal(event.svc, 'api');
@@ -99,6 +102,12 @@ export function assertCapture(events, fields) {
         assert.ok(Number.isSafeInteger(event.event_count) && event.event_count > 0);
         allowed = [...base, 'event_code', 'event_count'];
       }
+    } else if (LEDGER_EVENTS.includes(event.event)) {
+      // TC-3284: a deletion ledger error event; exactly its fixed error_kind beyond the common fields.
+      assert.equal(event.svc, 'api');
+      assert.equal(event.level, 'error');
+      assert.ok(LEDGER_ERROR_KINDS.includes(event.error_kind));
+      allowed = [...base, 'error_kind'];
     } else {
       assert.equal(event.event, 'logship_gate_summary_total');
       assert.equal(event.svc, 'logship');
@@ -204,14 +213,23 @@ export async function main(args = process.argv.slice(2)) {
     const allowed = new Set(['usage_usec', 'user_usec', 'system_usec', 'nr_periods', 'nr_throttled', 'throttled_usec']);
     return Object.fromEntries((result.stdout ?? '').split('\n').map(line => line.trim().split(/\s+/)).filter(([key, value]) => allowed.has(key) && /^\d+$/.test(value ?? '')).map(([key, value]) => [key, Number(value)]));
   };
+  // TC-3741: loss before Vector's socket (its drops stay 0) is located on the host side of the published port.
+  const hostUdp = () => {
+    const text = path => { try { return readFileSync(path, 'utf8'); } catch { return ''; } };
+    const proxies = command('pgrep', ['-c', '-f', 'docker-proxy.*-proto udp.*-host-port 12201'], { final: true, optional: true }).stdout ?? '';
+    return { ...hostUdpEvidence(text('/proc/net/snmp'), [text('/proc/net/udp'), text('/proc/net/udp6')], 12201), docker_proxy_processes: /^\d+\s*$/.test(proxies) ? Number(proxies.trim()) : null };
+  };
+  const hostUdpKeys = ['in_datagrams', 'in_errors', 'rcvbuf_errors', 'sndbuf_errors', 'port_sockets', 'port_drops', 'docker_proxy_processes'];
   const samples = [];
   let startedAt = Date.now();
   let schema;
   let burstSent = null;
   let socketBefore = null;
   let cpuBefore = null;
+  let hostUdpBefore = null;
   let socketAfterBurst = null;
   let cpuAfterBurst = null;
+  let hostUdpAfterBurst = null;
   let diagnosticBaseline = null;
   let diagnosticInjected = null;
   let schemaChecked = 0;
@@ -233,7 +251,7 @@ export async function main(args = process.argv.slice(2)) {
       burst_capture: burstEvidence(values.events, burstFirst, burstSize).received };
     samples.push(point);
     // Only synthetic numeric evidence is persisted for an outer step timeout's always() diagnostic.
-    try { writeFileSync(join(scratch, 'evidence-state.json'), JSON.stringify({ startedAt, burstSent, socketBefore, cpuBefore, socketAfterBurst, cpuAfterBurst, diagnosticBaseline, diagnosticInjected, samples })); } catch { /* Live-resource diagnostics remain available if the snapshot write fails. */ }
+    try { writeFileSync(join(scratch, 'evidence-state.json'), JSON.stringify({ startedAt, burstSent, socketBefore, cpuBefore, hostUdpBefore, socketAfterBurst, cpuAfterBurst, hostUdpAfterBurst, diagnosticBaseline, diagnosticInjected, samples })); } catch { /* Live-resource diagnostics remain available if the snapshot write fails. */ }
     return { point, hops, metrics: numericMetrics(metrics), values };
   };
   const diagnostics = async () => {
@@ -251,13 +269,17 @@ export async function main(args = process.argv.slice(2)) {
     const burst = burstEvidence(last.values.events, burstFirst, burstSize);
     const socketAfter = sockets();
     const cpuAfter = cpu();
+    const hostUdpAfter = hostUdp();
     const delta = (before, after) => Number.isFinite(before) && Number.isFinite(after) ? after - before : null;
     return { emitted_burst: count, burst: { ...burst, received_markers: Array.from({ length: burstSize }, (_, index) => burstFirst + index).filter(marker => !burst.missing.includes(marker)) }, capture: validateCapture(last.values), hops: last.hops,
       diagnostic_controls: { baseline: diagnosticBaseline, injected: diagnosticInjected, observed: diagnosticCounts(last.values.events) },
       progress: progressEvidence(samples), socket_before: socketBefore, socket_after_healthy_burst: socketAfterBurst, socket_after_all_controls: socketAfter,
       healthy_burst_socket_drops_delta: delta(socketBefore?.socket_drops, socketAfterBurst?.socket_drops), overall_socket_drops_delta: delta(socketBefore?.socket_drops, socketAfter.socket_drops),
       cpu_before: cpuBefore, cpu_after_healthy_burst: cpuAfterBurst, cpu_after_all_controls: cpuAfter,
-      healthy_burst_cpu_throttled_periods_delta: delta(cpuBefore?.nr_throttled, cpuAfterBurst?.nr_throttled), overall_cpu_throttled_periods_delta: delta(cpuBefore?.nr_throttled, cpuAfter.nr_throttled), buffer_backpressure_errors: last.metrics, states, startup };
+      healthy_burst_cpu_throttled_periods_delta: delta(cpuBefore?.nr_throttled, cpuAfterBurst?.nr_throttled), overall_cpu_throttled_periods_delta: delta(cpuBefore?.nr_throttled, cpuAfter.nr_throttled),
+      host_udp_before: hostUdpBefore, host_udp_after_healthy_burst: hostUdpAfterBurst, host_udp_after_all_controls: hostUdpAfter,
+      healthy_burst_host_udp_deltas: Object.fromEntries(['in_datagrams', 'in_errors', 'rcvbuf_errors', 'sndbuf_errors', 'port_drops'].map(key => [key, delta(hostUdpBefore?.[key], hostUdpAfterBurst?.[key])])),
+      buffer_backpressure_errors: last.metrics, states, startup };
   };
   const cleanup = () => {
     const owned = inventory();
@@ -294,8 +316,10 @@ export async function main(args = process.argv.slice(2)) {
           burstSent = numeric(state.burstSent);
           socketBefore = pick(state.socketBefore, ['requested_receive_buffer_bytes', 'rmem_max', 'effective_so_rcvbuf', 'socket_drops']);
           cpuBefore = pick(state.cpuBefore, ['usage_usec', 'user_usec', 'system_usec', 'nr_periods', 'nr_throttled', 'throttled_usec']);
+          hostUdpBefore = pick(state.hostUdpBefore, hostUdpKeys);
           socketAfterBurst = pick(state.socketAfterBurst, ['requested_receive_buffer_bytes', 'rmem_max', 'effective_so_rcvbuf', 'socket_drops']);
           cpuAfterBurst = pick(state.cpuAfterBurst, ['usage_usec', 'user_usec', 'system_usec', 'nr_periods', 'nr_throttled', 'throttled_usec']);
+          hostUdpAfterBurst = pick(state.hostUdpAfterBurst, hostUdpKeys);
           if (state.diagnosticBaseline) diagnosticBaseline = pick(state.diagnosticBaseline, ['warn', 'unclassified', 'error', 'dependency_error', 'total']);
           if (state.diagnosticInjected) diagnosticInjected = pick(state.diagnosticInjected, ['warn', 'unclassified', 'error', 'dependency_error', 'total']);
           if (Array.isArray(state.samples)) for (const point of state.samples.slice(-32)) samples.push(pick(point, ['elapsed_ms', 'source', 'gate', 'admitted', 'sink', 'capture', 'burst_capture']));
@@ -550,16 +574,24 @@ export async function main(args = process.argv.slice(2)) {
     phase = 'healthy_burst';
     socketBefore = sockets();
     cpuBefore = cpu();
+    hostUdpBefore = hostUdp();
     startedAt = Date.now();
     sample();
     // Status 200 with a latency above the slow threshold: errors_slow forwards it, and it is outside the per-minute caps on
     // request events with status >= 400 (TC-1843), so the burst still measures transport loss.
     const payload = JSON.stringify(nodeRequest({ route: '/healthz', status: 200, latency_us: '__MARKER__', authorization: canary, uri: canary }));
     const [prefix, suffix] = payload.split('"__MARKER__"');
-    // One exec; 500 distinct slow-success lines, no sleeps, no pacing, no emission reduction.
-    const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
+    // TC-3948: paced at >= 720 lines/s, 10x production's observed ~72 host UDP datagrams/s (Amos, node CVM, 6.5 h to 2026-11-23 03:1xZ).
+    // Unpaced, docker-proxy's host socket (rmem_default 212992, as in production) drops lines; that burst is TC-3949's done-when.
+    // One exec; 500 distinct slow-success lines in 50 batches of 10, 5 ms apart (at most 2000 lines/s); no emission reduction.
+    const burstStart = Date.now();
+    const emitted = docker('exec', names.emitter, '/bin/sh', '-ec', 'i=0; while [ "$i" -lt 500 ]; do printf "%s%s%s\\n" "$1" "$(($3+i))" "$2" || exit 71; i=$((i+1)); [ $((i % 10)) -ne 0 ] || sleep 0.005; done > /proc/1/fd/1; printf "%s\\n" "$i" > /tmp/tc959-emitted-count; printf "%s\\n" "$i"', 'burst', prefix, suffix, String(burstFirst));
+    const burstRate = burstSize / ((Date.now() - burstStart) / 1000);
     assert.match(emitted, /^500$/);
     burstSent = Number(emitted);
+    report.healthy_burst_lines_per_second = Math.floor(burstRate);
+    // Wall time includes docker exec overhead, so the measured rate is a lower bound on the true rate.
+    assert.ok(burstRate >= 720, 'healthy_burst_below_10x_production_rate');
     // Fixed bounded sampling persists the exact subset even if loss is static; never retry the burst.
     for (const offset of [0, 1000, 3000, 6000, 10000, 15000]) {
       const delay = offset - (Date.now() - startedAt);
@@ -569,6 +601,7 @@ export async function main(args = process.argv.slice(2)) {
     // Scope kernel/cgroup deltas to the healthy burst, before accepted outage-loss controls.
     socketAfterBurst = sockets();
     cpuAfterBurst = cpu();
+    hostUdpAfterBurst = hostUdp();
     sample();
     report.healthy_burst_progress = progressEvidence(samples.slice());
     phase = 'continuity';
@@ -617,6 +650,7 @@ export async function main(args = process.argv.slice(2)) {
     for (const key of Object.keys(diagnosticInjected)) assert.equal(observed[key] - baseline[key], diagnosticInjected[key]);
     Object.assign(report, { synthetic_warning_occurrences: diagnosticInjected.warn, unclassified_warning_occurrences: diagnosticInjected.unclassified, synthetic_error_occurrences: diagnosticInjected.error, dependency_error_occurrences: diagnosticInjected.dependency_error, synthetic_diagnostic_occurrences: diagnosticInjected.total });
     // Final gate is exact set equality. A duplicate cannot compensate for a missing marker.
+    phase = 'healthy_burst_gate';
     assertHealthyBurst(events, burstFirst, burstSize, burstSent);
     phase = 'completed';
     report.status = 'passed';

@@ -59,6 +59,37 @@ if label == "tinycloud-node" {
       }
     }
   }
+  # TC-3973: ship the boot summary with exactly the seven bounded counters.
+  backfill = null
+  if target == "tinycloud_core::models::delegation_mode" && level == "info" && length(f) == 8 {
+    backfill_code = get(__BOOT_REINDEX_CODES__, [msg]) ?? null
+    if is_string(backfill_code) {
+      counters = {}
+      for_each(["scanned", "reindexed_terminal", "marked_attenuable", "marked_invalid", "skipped_locked_pages", "skipped_decrypt_failed", "elapsed_ms"]) -> |_index, field| {
+        value = int(get(f, [field]) ?? null) ?? -1
+        if value >= 0 && value <= 9007199254740991 {
+          counters = set!(counters, [field], value)
+        }
+      }
+      if length(counters) == 7 {
+        backfill = merge(counters, {"event": "delegation_mode_boot_reindex", "svc": "api", "level": "info", "event_code": backfill_code})
+      }
+    }
+  }
+  # TC-3284: the deletion ledger's three error events (open and replay at start from target `tinycloud`, an unrepaired
+  # append from the ledger module) ship individually as their event name and `error_kind`. The input must be an error
+  # from that event's own target with exactly the message, `event` and `error_kind` keys, and `error_kind` exactly one
+  # of the ledger's fixed kinds. The message is never copied. Anything else leaves ledger null and the line falls back
+  # to the unclassified count below.
+  ledger = null
+  l_event = string(f.event) ?? ""
+  if level == "error" && includes(__LEDGER_EVENTS__, l_event) && exists(f.message) && length(f) == 3 {
+    l_target = get(__LEDGER_TARGETS__, [l_event]) ?? ""
+    l_kind = string(f.error_kind) ?? ""
+    if target == l_target && includes(__LEDGER_ERROR_KINDS__, l_kind) {
+      ledger = {"event": l_event, "svc": "api", "level": "error", "error_kind": l_kind}
+    }
+  }
   if target == "tinycloud::request" && level == "info" && msg == "request" {
     method = string!(f.method)
     if includes(["TRACE", "CONNECT"], method) { method = "<other>" }
@@ -83,10 +114,40 @@ if label == "tinycloud-node" {
     if match(account, r'^[0-9a-f]{64}$') { out.account_hash = account }
     space = string(f.space_hash) ?? ""
     if match(space, r'^[0-9a-f]{64}$') { out.space_hash = space }
+    # TC-3834: the 5xx origin, on status 500 and above only, and only when it is exactly one of the declared codes;
+    # anything else is dropped (the event still ships). A closed vocabulary, never error text.
+    if status >= 500 {
+      error_code = string(f.error_code) ?? ""
+      if includes(__ERROR_CODES__, error_code) { out.error_code = error_code }
+    }
+    # TC-3739: per-request DB accounting, on status below 400 only (4xx/5xx are the capped classes; DB-caused 5xx
+    # already carry elapsed_ms on db_failure_5xx). Copied only as plain numbers inside the canonical bounds; anything
+    # else is dropped (the event still ships). They are driver wall times and an attempt count, never identifiers.
+    if status < 400 {
+      pool_wait = f.pool_wait_ms
+      if is_float(pool_wait) || is_integer(pool_wait) {
+        pool_wait = to_float!(pool_wait)
+        if pool_wait >= 0.0 && pool_wait <= 86400000.0 { out.pool_wait_ms = pool_wait }
+      }
+      query_time = f.query_time_ms
+      if is_float(query_time) || is_integer(query_time) {
+        query_time = to_float!(query_time)
+        if query_time >= 0.0 && query_time <= 86400000.0 { out.query_time_ms = query_time }
+      }
+      query_count = f.query_count
+      if is_integer(query_count) {
+        query_count = int!(query_count)
+        if query_count >= 0 && query_count <= 9007199254740991 { out.query_count = query_count }
+      }
+    }
   } else if is_object(db_event) {
     out = db_event
   } else if is_object(headroom) {
     out = headroom
+  } else if is_object(backfill) {
+    out = backfill
+  } else if is_object(ledger) {
+    out = ledger
   } else {
     if !includes(["warn", "error"], level) { abort }
     code = "unclassified"
@@ -95,7 +156,14 @@ if label == "tinycloud-node" {
       known = get(codes, [msg]) ?? null
       if is_string(known) { code = known }
       __PREFIX_DIAGNOSTICS__
+      # TC-3284: a line with no message is named by its constant `event` field, only when that event is listed.
+      if msg == "" && !exists(f.message) {
+        events = __EVENT_DIAGNOSTICS__
+        named = get(events, [string(f.event) ?? ""]) ?? null
+        if is_string(named) { code = named }
+      }
     }
+    __SCOPED_DIAGNOSTICS__
     event = if level == "warn" { "node_warning" } else { "node_error" }
     out = {"event": event, "svc": "api", "level": level, "event_code": code, "event_count": 1}
   }

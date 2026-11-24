@@ -5,15 +5,21 @@
 //! created at most once and never replaced. A key names its content (it ends
 //! in the SHA-256 of the bytes), so a second creator of the same key either
 //! stores identical bytes (`AlreadyPresent`) or finds different ones
-//! (`Conflict`); nothing is ever overwritten.
+//! (`Conflict`); nothing is ever overwritten. Bodies move as files
+//! ([`SqlObjectStore::put_file`], [`SqlObjectStore::get_to_file`]) in
+//! bounded chunks, never as whole in-memory buffers.
 //!
 //! * [`S3SqlObjectStore`] writes into the block store's bucket, key as is,
 //!   with a conditional create (`If-None-Match: *`). [`S3SqlObjectStore::probe`]
 //!   checks at startup whether the provider honours the header and selects
-//!   the write mode; without it the store checks, then creates.
-//! * [`FsSqlObjectStore`] writes below `{datadir}/sql-store`: the body goes to
-//!   a temporary file in the target directory, is fsynced, and is published
-//!   with a hard link, which fails instead of replacing an existing file.
+//!   the write mode; without it the store checks, then creates. The file is
+//!   hashed once before any request and streamed from disk per request.
+//! * [`FsSqlObjectStore`] writes below `{datadir}/sql-store`: the body is
+//!   copied (and hashed while it is copied) to a temporary file in the target
+//!   directory, is fsynced, and is published with a hard link, which fails
+//!   instead of replacing an existing file.
+
+pub mod purge;
 
 use std::{
     collections::HashMap,
@@ -38,18 +44,20 @@ use aws_sdk_s3::{
 use sha2::{Digest, Sha256};
 use tinycloud_core::{
     sql::store::{
-        key::KEY_ROOT, object::sha256, ObjectKey, ObjectMeta, ObjectRange, PutOutcome,
-        SqlObjectStore, SqlStoreError,
+        key::KEY_ROOT,
+        object::{check_body_file, discard_download, private_file_options, sha256},
+        ObjectKey, ObjectMeta, ObjectRange, PutOutcome, SqlObjectStore, SqlStoreError,
     },
     storage::ByteRangeSpec,
 };
+use tokio::io::AsyncWriteExt;
 
 use super::s3::{new_client, S3BlockConfig};
 
 /// Tracing target of everything the SQL store logs.
 const LOG_TARGET: &str = "tinycloud::sql_store";
 
-/// How `put_if_absent` creates an object on S3.
+/// How `put_file` creates an object on S3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
     /// One conditional PUT (`If-None-Match: *`); the provider refuses to
@@ -214,20 +222,33 @@ fn classify_put<T>(result: Result<T, SdkError<PutObjectError>>) -> PutResult {
     }
 }
 
+/// A PUT body streamed from the file at `path`; one per request, so a retry
+/// re-reads the file.
+async fn file_stream(path: &Path) -> Result<ByteStream, SqlStoreError> {
+    ByteStream::from_path(path)
+        .await
+        .map_err(|_| SqlStoreError::File("open body file failed".into()))
+}
+
 async fn put_object(
     client: &Client,
     bucket: &str,
     key: &str,
-    body: Vec<u8>,
+    body: ByteStream,
+    sha: &[u8; 32],
+    len: u64,
     conditional: bool,
 ) -> PutResult {
-    let sha = hex::encode(sha256(&body));
+    let Ok(len) = i64::try_from(len) else {
+        return PutResult::Failed(SqlStoreError::Invalid("body is too large"));
+    };
     let request = client
         .put_object()
         .bucket(bucket)
         .key(key)
-        .metadata("sha256", sha)
-        .body(ByteStream::from(body));
+        .metadata("sha256", hex::encode(sha))
+        .content_length(len)
+        .body(body);
     let request = if conditional {
         request.if_none_match("*")
     } else {
@@ -353,8 +374,19 @@ impl S3SqlObjectStore {
     /// fallback. The object stays. The mode and the deciding answer's status
     /// and code are logged once.
     pub async fn probe(client: &Client, bucket: &str) -> Result<WriteMode, SqlStoreError> {
-        let (mode, answer) =
-            probe_with(|| put_object(client, bucket, PROBE_KEY, PROBE_BODY.to_vec(), true)).await?;
+        let sha = sha256(PROBE_BODY);
+        let (mode, answer) = probe_with(|| {
+            put_object(
+                client,
+                bucket,
+                PROBE_KEY,
+                ByteStream::from_static(PROBE_BODY),
+                &sha,
+                PROBE_BODY.len() as u64,
+                true,
+            )
+        })
+        .await?;
         tracing::info!(
             target: LOG_TARGET,
             mode = mode.as_str(),
@@ -380,11 +412,22 @@ impl S3SqlObjectStore {
     async fn create_conditionally(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        len: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
-        let len = body.len() as u64;
         for attempt in 0..=CONFLICT_RETRIES {
-            match put_object(&self.client, &self.bucket, key.as_str(), body.clone(), true).await {
+            let body = file_stream(path).await?;
+            match put_object(
+                &self.client,
+                &self.bucket,
+                key.as_str(),
+                body,
+                key.sha256(),
+                len,
+                true,
+            )
+            .await
+            {
                 PutResult::Created => return Ok(PutOutcome::Created),
                 PutResult::PreconditionFailed(_) => return self.existing_matches(key, len).await,
                 PutResult::InFlight(_) => {
@@ -404,37 +447,120 @@ impl S3SqlObjectStore {
     async fn check_then_create(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        len: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
-        let len = body.len() as u64;
         match self.head(key).await? {
             Some(meta) => same_object(&meta, key, len),
-            None => match put_object(&self.client, &self.bucket, key.as_str(), body, false).await {
-                PutResult::Created => Ok(PutOutcome::Created),
-                PutResult::Failed(error) => Err(error),
-                _ => Err(SqlStoreError::Backend("s3 put was refused".into())),
-            },
+            None => {
+                let body = file_stream(path).await?;
+                match put_object(
+                    &self.client,
+                    &self.bucket,
+                    key.as_str(),
+                    body,
+                    key.sha256(),
+                    len,
+                    false,
+                )
+                .await
+                {
+                    PutResult::Created => Ok(PutOutcome::Created),
+                    PutResult::Failed(error) => Err(error),
+                    _ => Err(SqlStoreError::Backend("s3 put was refused".into())),
+                }
+            }
         }
     }
 }
 
 #[async_trait]
 impl SqlObjectStore for S3SqlObjectStore {
-    async fn put_if_absent(
+    async fn put_file(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        size: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
-        if &sha256(&body) != key.sha256() {
-            return Err(SqlStoreError::BodyMismatch);
-        }
+        // One hashing pass over the file before any request: the SHA-256
+        // travels as metadata, and a wrong body never reaches the bucket.
+        check_body_file(key, path, size).await?;
         // Creators of one key in this process go one at a time.
         let gate = GateGuard::new(&self.gates, key.as_str());
         let _held = gate.lock().await;
         match self.mode {
-            WriteMode::Conditional => self.create_conditionally(key, body).await,
-            WriteMode::CheckThenWrite => self.check_then_create(key, body).await,
+            WriteMode::Conditional => self.create_conditionally(key, path, size).await,
+            WriteMode::CheckThenWrite => self.check_then_create(key, path, size).await,
         }
+    }
+
+    async fn get_to_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if matches!(error.as_service_error(), Some(GetObjectError::NoSuchKey(_))) {
+                    return Ok(None);
+                }
+                return Err(backend("get", &error));
+            }
+        };
+        // A larger announced length is refused before a byte is streamed.
+        if output
+            .content_length
+            .is_some_and(|len| u64::try_from(len).map_or(true, |len| len > max_bytes))
+        {
+            discard_download(path);
+            return Err(SqlStoreError::Oversize);
+        }
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::from(private_file_options())
+                .open(path)
+                .await
+                .map_err(|e| SqlStoreError::file("create", &e))?;
+            let mut body = output.body;
+            let mut hasher = Sha256::new();
+            let mut bytes = 0u64;
+            while let Some(chunk) = body
+                .try_next()
+                .await
+                .map_err(|_| SqlStoreError::Backend("s3 get body failed".into()))?
+            {
+                bytes += chunk.len() as u64;
+                // The body may run past its announced length; stop at the cap.
+                if bytes > max_bytes {
+                    return Err(SqlStoreError::Oversize);
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| SqlStoreError::file("write", &e))?;
+            }
+            file.flush()
+                .await
+                .map_err(|e| SqlStoreError::file("write", &e))?;
+            let sha: [u8; 32] = hasher.finalize().into();
+            if &sha != key.sha256() {
+                return Err(SqlStoreError::BodyMismatch);
+            }
+            Ok(Some(ObjectMeta { bytes, sha256: sha }))
+        }
+        .await;
+        if result.is_err() {
+            discard_download(path);
+        }
+        result
     }
 
     async fn get_range(
@@ -695,12 +821,53 @@ fn fs_head(path: &Path) -> Result<Option<ObjectMeta>, SqlStoreError> {
     }))
 }
 
+type IoErr = fn(&str, &std::io::Error) -> SqlStoreError;
+
+/// Copy `source` into `target` in bounded chunks; the length and SHA-256 of
+/// what was copied. More than `limit` bytes is [`SqlStoreError::Oversize`],
+/// stopped before the excess is written. `read` and `write` name whose side
+/// failed: the caller's file ([`SqlStoreError::file`]) or the store's
+/// ([`io_error`]).
+fn copy_hashed(
+    source: &mut File,
+    target: &mut File,
+    limit: u64,
+    read: IoErr,
+    write: IoErr,
+) -> Result<ObjectMeta, SqlStoreError> {
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; HASH_CHUNK];
+    let mut bytes = 0u64;
+    loop {
+        let n = source.read(&mut chunk).map_err(|e| read("read", &e))?;
+        if n == 0 {
+            return Ok(ObjectMeta {
+                bytes,
+                sha256: hasher.finalize().into(),
+            });
+        }
+        bytes += n as u64;
+        if bytes > limit {
+            return Err(SqlStoreError::Oversize);
+        }
+        hasher.update(&chunk[..n]);
+        target
+            .write_all(&chunk[..n])
+            .map_err(|e| write("write", &e))?;
+    }
+}
+
+/// Create the object at `path` from the `size`-byte file at `source`. The
+/// body is copied into a temporary file next to `path` and checked against
+/// `sha` and `size` while it is copied; only a matching body is linked.
 fn fs_put(
     path: &Path,
     root: &Path,
     sha: &[u8; 32],
-    body: &[u8],
+    source: &Path,
+    size: u64,
 ) -> Result<PutOutcome, SqlStoreError> {
+    let mut source = File::open(source).map_err(|e| SqlStoreError::file("open", &e))?;
     let dir = path
         .parent()
         .ok_or(SqlStoreError::Invalid("key is not a valid store path"))?;
@@ -715,14 +882,26 @@ fn fs_put(
             .create_new(true)
             .open(&temp.0)
             .map_err(|e| io_error("create temp file", &e))?;
-        file.write_all(body)
-            .and_then(|()| file.sync_all())
+        let copied = copy_hashed(
+            &mut source,
+            &mut file,
+            u64::MAX,
+            SqlStoreError::file,
+            io_error,
+        )?;
+        if copied.bytes != size {
+            return Err(SqlStoreError::Invalid("body file size does not match"));
+        }
+        if &copied.sha256 != sha {
+            return Err(SqlStoreError::BodyMismatch);
+        }
+        file.sync_all()
             .map_err(|e| io_error("write temp file", &e))?;
     }
     let outcome = match std::fs::hard_link(&temp.0, path) {
         Ok(()) => Ok(PutOutcome::Created),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => match fs_head(path)? {
-            Some(meta) if meta.bytes == body.len() as u64 && &meta.sha256 == sha => {
+            Some(meta) if meta.bytes == size && &meta.sha256 == sha => {
                 Ok(PutOutcome::AlreadyPresent)
             }
             Some(_) => Err(SqlStoreError::Conflict),
@@ -738,6 +917,50 @@ fn fs_put(
         Ok(outcome) => synced.map(|()| outcome),
         Err(error) => Err(error),
     }
+}
+
+/// Copy the object at `path` into `target`, checked against `sha` and capped
+/// at `max_bytes`. On any error `target` is emptied.
+fn fs_get_to_file(
+    path: &Path,
+    target: &Path,
+    sha: &[u8; 32],
+    max_bytes: u64,
+) -> Result<Option<ObjectMeta>, SqlStoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error("open", &e)),
+    };
+    let result = (|| {
+        let metadata = file.metadata().map_err(|e| io_error("stat", &e))?;
+        if !metadata.is_file() {
+            return Err(SqlStoreError::Backend(
+                "filesystem entry is not a file".into(),
+            ));
+        }
+        if metadata.len() > max_bytes {
+            return Err(SqlStoreError::Oversize);
+        }
+        let mut out = private_file_options()
+            .open(target)
+            .map_err(|e| SqlStoreError::file("create", &e))?;
+        let meta = copy_hashed(
+            &mut file,
+            &mut out,
+            max_bytes,
+            io_error,
+            SqlStoreError::file,
+        )?;
+        if &meta.sha256 != sha {
+            return Err(SqlStoreError::BodyMismatch);
+        }
+        Ok(Some(meta))
+    })();
+    if result.is_err() {
+        discard_download(target);
+    }
+    result
 }
 
 fn fs_get_range(path: &Path, range: ByteRangeSpec) -> Result<Option<ObjectRange>, SqlStoreError> {
@@ -805,18 +1028,29 @@ impl FsSqlObjectStore {
 
 #[async_trait]
 impl SqlObjectStore for FsSqlObjectStore {
-    async fn put_if_absent(
+    async fn put_file(
         &self,
         key: &ObjectKey,
-        body: Vec<u8>,
+        path: &Path,
+        size: u64,
     ) -> Result<PutOutcome, SqlStoreError> {
-        if &sha256(&body) != key.sha256() {
-            return Err(SqlStoreError::BodyMismatch);
-        }
-        let path = self.path_for(key)?;
+        let target = self.path_for(key)?;
         let root = self.root.clone();
         let sha = *key.sha256();
-        blocking(move || fs_put(&path, &root, &sha, &body)).await
+        let source = path.to_path_buf();
+        blocking(move || fs_put(&target, &root, &sha, &source, size)).await
+    }
+
+    async fn get_to_file(
+        &self,
+        key: &ObjectKey,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<ObjectMeta>, SqlStoreError> {
+        let source = self.path_for(key)?;
+        let target = path.to_path_buf();
+        let sha = *key.sha256();
+        blocking(move || fs_get_to_file(&source, &target, &sha, max_bytes)).await
     }
 
     async fn get_range(
@@ -1070,6 +1304,8 @@ mod tests {
                 .build(),
         );
         let body = b"abc".to_vec();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &body).unwrap();
         let key = ObjectKey::snapshot(
             &tinycloud_core::sql::store::DbRef {
                 space: "tinycloud:s",
@@ -1087,11 +1323,11 @@ mod tests {
                 // both are dropped by their timeouts.
                 let first = tokio::time::timeout(
                     Duration::from_millis(300),
-                    store.put_if_absent(&key, body.clone()),
+                    store.put_file(&key, file.path(), 3),
                 );
                 let second = tokio::time::timeout(
                     Duration::from_millis(300),
-                    store.put_if_absent(&key, body.clone()),
+                    store.put_file(&key, file.path(), 3),
                 );
                 let (first, second) = tokio::join!(first, second);
                 assert!(

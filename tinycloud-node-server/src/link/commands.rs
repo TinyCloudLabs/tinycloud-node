@@ -20,7 +20,7 @@
 //! /v1/names/:name` doesn't expose the service's stored sequence, so an
 //! exact resync isn't possible — see docs/specs/node-control-plane-v1.md
 //! §3.9).
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::path::Path;
 
@@ -76,7 +76,7 @@ pub enum LinkListenerState {
 
 pub fn enable(
     data_root: &Path,
-    keys: Option<&crate::config::Keys>,
+    keys: Option<&crate::config::KeysConfig>,
     args: EnableArgs,
 ) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
@@ -139,7 +139,10 @@ pub fn enable(
     build_status(&paths, &link_state, Some(&issuance))
 }
 
-pub fn disable(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
+pub fn disable(
+    data_root: &Path,
+    keys: Option<&crate::config::KeysConfig>,
+) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
     let _lock = StateLock::acquire(&paths)?;
     let Some(mut link_state) = state::read_state(&paths)? else {
@@ -217,7 +220,10 @@ pub fn status(data_root: &Path) -> Result<LinkStatusReport> {
     build_status(&paths, &link_state, None)
 }
 
-pub fn renew(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
+pub fn renew(
+    data_root: &Path,
+    keys: Option<&crate::config::KeysConfig>,
+) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
     let _lock = StateLock::acquire(&paths)?;
     let mut link_state = state::read_state(&paths)?
@@ -396,10 +402,7 @@ pub fn load_tls_material(data_root: &Path) -> Result<Option<(LinkState, String, 
     let Some(link_state) = state::read_state(&paths)? else {
         return Ok(None);
     };
-    let key_pem = std::fs::read_to_string(&paths.key_path)
-        .with_context(|| format!("failed to read {}", paths.key_path.display()))?;
-    let cert_pem = std::fs::read_to_string(&paths.cert_path)
-        .with_context(|| format!("failed to read {}", paths.cert_path.display()))?;
+    let (key_pem, cert_pem) = state::read_tls_material(&paths)?;
     Ok(Some((link_state, key_pem, cert_pem)))
 }
 

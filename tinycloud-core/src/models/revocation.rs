@@ -22,7 +22,9 @@ use tinycloud_auth::{
 /// this instead of matching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationCode {
-    /// The delegation the invocation cites is itself revoked.
+    /// The delegation the invocation cites is itself revoked, or a delegation
+    /// posted to `/delegate` was revoked and its revocation row since purged
+    /// (a `revocation_tombstone` remembers it, TC-4092).
     DelegationRevoked,
     /// A direct parent of the delegation being invoked or registered is
     /// revoked.
@@ -504,7 +506,7 @@ impl ScopedControl {
         // Its issuer must still have direct authority over an exact-CID target.
         if self.has_cid_scope()
             && (self.directly_authorizes_cid(target, delegation)
-                || self.grantor_owns_a_target_space(target_abilities))
+                || self.grantor_owns_a_target_resource(target_abilities))
         {
             return true;
         }
@@ -512,7 +514,7 @@ impl ScopedControl {
     }
 
     /// Whether the control authorizes `target` only because its grantor is
-    /// the target's delegator: the grantor owns no space of the target and
+    /// the target's delegator: the grantor owns no resource of the target and
     /// the typed scopes do not cover every target row.
     pub(crate) fn rests_only_on_party_authority(
         &self,
@@ -521,17 +523,16 @@ impl ScopedControl {
         target_abilities: &[abilities::Model],
     ) -> bool {
         self.directly_authorizes_cid(target, delegation)
-            && !self.grantor_owns_a_target_space(target_abilities)
+            && !self.grantor_owns_a_target_resource(target_abilities)
             && !self.scopes_cover_every_row(target_abilities)
     }
 
-    fn grantor_owns_a_target_space(&self, target_abilities: &[abilities::Model]) -> bool {
-        target_abilities.iter().any(|ability| {
-            ability
-                .resource
-                .space()
-                .is_some_and(|space| did_principal_matches(space.did().as_str(), &self.grantor))
-        })
+    /// Whether the grantor owns a space or encryption network one of the
+    /// target's rows names ([`Resource::owned_by`]).
+    fn grantor_owns_a_target_resource(&self, target_abilities: &[abilities::Model]) -> bool {
+        target_abilities
+            .iter()
+            .any(|ability| ability.resource.owned_by(&self.grantor))
     }
 
     fn scopes_cover_every_row(&self, target_abilities: &[abilities::Model]) -> bool {
@@ -554,24 +555,37 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     action: ControlAction,
     target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
-    control_proof_decision_at(
+    control_proof_decision_with_encryption(db, signer, proofs, action, target, None).await
+}
+
+pub(crate) async fn control_proof_decision_with_encryption<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+    action: ControlAction,
+    target: &Hash,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
+) -> Result<ControlProofDecision, DbErr> {
+    control_proof_decision_at_with_encryption(
         db,
         signer,
         proofs,
         action,
         target,
         OffsetDateTime::now_utc(),
+        encryption,
     )
     .await
 }
 
-pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
+pub(crate) async fn control_proof_decision_at_with_encryption<C: ConnectionTrait>(
     db: &C,
     signer: &str,
     proofs: &[Cid],
     action: ControlAction,
     target: &Hash,
     now: OffsetDateTime,
+    encryption: Option<&crate::encryption::ColumnEncryption>,
 ) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
         return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
@@ -604,6 +618,18 @@ pub(crate) async fn control_proof_decision_at<C: ConnectionTrait>(
             .unwrap_or(false)
     {
         return Ok(ControlProofDecision::Denied);
+    }
+
+    if matches!(action, ControlAction::Status | ControlAction::Renew) {
+        match crate::models::invocation::preflight_terminal_ancestors(db, &[proofs[0]], encryption)
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::models::invocation::Error::Db(error)) => return Err(error),
+            Err(crate::models::invocation::Error::InvalidInvocation(_)) => {
+                return Ok(ControlProofDecision::Denied);
+            }
+        }
     }
 
     let chain_nodes = match ancestor_chain_ids(db, &proof_id).await {
@@ -706,7 +732,7 @@ fn exact_cid_revoke_target(cap: &crate::util::Capability) -> Option<Hash> {
 
 /// Whether `owner` may issue a parentless `tinycloud.delegation/revoke` grant
 /// on exactly `urn:cid:<target>`: the target is stored and one of its
-/// persisted abilities names a space `owner` owns.
+/// persisted abilities names a space or encryption network `owner` owns.
 pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
     db: &C,
     owner: &str,
@@ -723,11 +749,7 @@ pub(crate) async fn owner_controls_target<C: ConnectionTrait>(
         .all(db)
         .await?
         .iter()
-        .any(|row| {
-            row.resource
-                .space()
-                .is_some_and(|space| did_principal_matches(space.did().as_str(), owner))
-        }))
+        .any(|row| row.resource.owned_by(owner)))
 }
 
 /// TC-3150: whether parentless `grant` is a delegator handing its own
@@ -796,6 +818,8 @@ pub enum RevocationError {
     InvalidSignature,
     #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
     UnsupportedDidMethod(String),
+    #[error("did_unverifiable: this `did:{0}` identifier is malformed or names a key type this node cannot verify")]
+    UnverifiableDid(String),
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     DidUrlQueryRejected,
     #[error("Unauthorized Revoker")]
@@ -822,8 +846,6 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
 ) -> Result<Hash, Error> {
     let (r, serialization) = (revocation.0, revocation.1);
 
-    let t = OffsetDateTime::now_utc();
-
     // W1 (audit P0 finding 5): verify both CACAO and did:key/UCAN format
     // revocations. The route accepts either suite so the Policy Engine
     // active_cutoff loop can rely on a single endpoint regardless of
@@ -831,32 +853,11 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     if !signature_verified {
         check_signature(&r.revocation).await?;
     }
-    let in_window = match &r.revocation {
-        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
-        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
-    };
-    if !in_window {
-        return Err(RevocationError::InvalidTime.into());
-    }
-
+    // TC-2871: the shared purge lock comes before the standing reads, so GC
+    // cannot retire the target between the check and the insert.
+    crate::space_purge_records::operation(db).await?;
+    let delegation = check_standing(db, &r).await?;
     let hash: Hash = hash(&serialization);
-    let requested = Hash::from(r.revoked);
-    let delegation = target_for_cid(db, requested)
-        .await?
-        .ok_or(RevocationError::MissingParents)?;
-
-    // W1 (audit P0 finding 5) and TC-1436: authorized revokers are
-    //   1. the delegator that issued this delegation (an intermediate
-    //      delegator revokes the descendants it issued), or
-    //   2. the owner of a space the delegation's persisted abilities
-    //      target (owner-authorized active_cutoff), or
-    //   3. the holder of a current revoke control grant issued by one of
-    //      the above.
-    // The delegatee alone is never authorized: it may hold a key that
-    // others share, and revoking would cut them off as well.
-    if !revoker_is_authorized(db, &delegation, &requested, &r.revoker, &r.parents).await? {
-        return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
-    };
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
@@ -886,7 +887,56 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
         .await?;
     }
 
+    crate::space_purge_records::request_for_records(db, &[delegation.id]).await?;
     Ok(hash)
+}
+
+/// The checks of [`process_with`] after the signature: the revocation's time
+/// window now, its target is stored, and the revoker may revoke it. Returns
+/// the stored target.
+async fn check_standing<C: ConnectionTrait>(
+    db: &C,
+    r: &crate::util::RevocationInfo,
+) -> Result<delegation::Model, Error> {
+    let t = OffsetDateTime::now_utc();
+    let in_window = match &r.revocation {
+        TinyCloudRevocation::Cacao(c) => c.payload().valid_at(&t),
+        TinyCloudRevocation::Ucan(u) => u.payload().validate_time(None).is_ok(),
+    };
+    if !in_window {
+        return Err(RevocationError::InvalidTime.into());
+    }
+
+    let requested = Hash::from(r.revoked);
+    let delegation = target_for_cid(db, requested)
+        .await?
+        .ok_or(RevocationError::MissingParents)?;
+
+    // W1 (audit P0 finding 5) and TC-1436: authorized revokers are
+    //   1. the delegator that issued this delegation (an intermediate
+    //      delegator revokes the descendants it issued), or
+    //   2. the owner of a space or encryption network the delegation's
+    //      persisted abilities target (owner-authorized active_cutoff), or
+    //   3. the holder of a current revoke control grant issued by one of
+    //      the above.
+    // The delegatee alone is never authorized: it may hold a key that
+    // others share, and revoking would cut them off as well.
+    if !revoker_is_authorized(db, &delegation, &requested, &r.revoker, &r.parents).await? {
+        return Err(RevocationError::UnauthorizedRevoker(r.revoker.clone()).into());
+    }
+    Ok(delegation)
+}
+
+/// The checks of [`process_with`] after the signature, run on the pool
+/// before a revocation takes any chain guard, space write order or
+/// transaction (TC-3000): a stranger or an expired revocation is refused here
+/// instead of queueing behind the target's locks. They run again inside the
+/// transaction, which stays the authority.
+pub(crate) async fn precheck<C: ConnectionTrait>(
+    db: &C,
+    revocation: &Revocation,
+) -> Result<(), Error> {
+    check_standing(db, &revocation.0).await.map(|_| ())
 }
 
 /// Check a revocation's signature: CPU, or a DID resolution when network
@@ -905,6 +955,9 @@ pub(crate) async fn check_signature(revocation: &TinyCloudRevocation) -> Result<
                     UcanVerifyError::MethodDisabled { method } => {
                         RevocationError::UnsupportedDidMethod(method)
                     }
+                    UcanVerifyError::Unverifiable { method } => {
+                        RevocationError::UnverifiableDid(method)
+                    }
                     UcanVerifyError::QueryRejected => RevocationError::DidUrlQueryRejected,
                     UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
                         RevocationError::InvalidSignature
@@ -919,10 +972,11 @@ pub(crate) async fn check_signature(revocation: &TinyCloudRevocation) -> Result<
 ///
 /// Accepted paths:
 ///   * direct delegator match: the issuer revokes what it issued
-///   * owner-authorized — the revoker is the owner of a space that the
+///   * owner-authorized — the revoker is the owner of a space or encryption
+///     network (a network, key or key-prefix URN, TC-3858) that the
 ///     delegation's persisted abilities target. This is what unlocks
 ///     `active_cutoff`: the data owner can revoke any grant against their
-///     own space without needing to be the original SIWE signer.
+///     own space or network without needing to be the original signer.
 ///   * a target-bound revoke control grant from either of the above
 ///
 /// The delegatee is not a revoker (TC-1436).
@@ -977,11 +1031,9 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
         .filter(abilities::Column::Delegation.eq(delegation.id))
         .all(db)
         .await?;
-    let authorized = ability_rows.iter().any(|row| {
-        row.resource
-            .space()
-            .is_some_and(|space| did_principal_matches(space.did().as_str(), &principal))
-    });
+    let authorized = ability_rows
+        .iter()
+        .any(|row| row.resource.owned_by(&principal));
     if authorized {
         // Observe every affected resource, not just the owner-match witness.
         for row in &ability_rows {
@@ -1055,6 +1107,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -1278,6 +1331,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(db)
         .await
@@ -1437,6 +1491,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tc3952_renew_checks_ancestor_modes_and_revoke_remains_available() {
+        use crate::models::delegation_mode;
+
+        let db = database().await;
+        for did in ["did:key:owner", "did:key:session", "did:key:recipient"] {
+            insert_actor(&db, did).await;
+        }
+        let ancestor = hash(b"control proof ancestor");
+        let proof = hash(b"control proof leaf");
+        let target = hash(b"control target");
+        insert_delegation_between(&db, ancestor, "did:key:owner", "did:key:owner").await;
+        insert_delegation_between(&db, proof, "did:key:owner", "did:key:session").await;
+        insert_delegation_between(&db, target, "did:key:owner", "did:key:recipient").await;
+        insert_link(&db, proof, ancestor).await;
+        for action in [ControlAction::Renew, ControlAction::Revoke] {
+            insert_ability(
+                &db,
+                proof,
+                &format!("urn:cid:{}", target.to_cid(0x55)),
+                action.ability(),
+            )
+            .await;
+        }
+        delegation_mode::ActiveModel {
+            delegation_id: Set(proof),
+            mode: Set("attenuable".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let target_row = target_for_cid(&db, target).await.unwrap().unwrap();
+
+        for mode in ["attenuable", "terminal", "invalid"] {
+            delegation_mode::Entity::delete_by_id(ancestor)
+                .exec(&db)
+                .await
+                .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(ancestor),
+                mode: Set(mode.to_owned()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            let decision = control_proof_decision(
+                &db,
+                "did:key:session",
+                &[proof.to_cid(0x55)],
+                ControlAction::Renew,
+                &target,
+            )
+            .await
+            .unwrap();
+            match mode {
+                "attenuable" => assert!(matches!(
+                    decision,
+                    ControlProofDecision::Scoped(control)
+                        if control.directly_authorizes_cid(&target, &target_row)
+                )),
+                _ => assert!(matches!(decision, ControlProofDecision::Denied)),
+            }
+            assert!(revoker_may_revoke(&db, target, "did:key:session", proof).await);
+        }
+    }
+
     async fn insert_ability<C: ConnectionTrait>(
         db: &C,
         delegation: Hash,
@@ -1530,4 +1650,110 @@ mod tests {
 
         assert!(!revoker_may_revoke(&db, target, OTHER_DID, proof).await);
     }
+
+    // One wallet in both spellings, and the same address on another chain.
+    const WALLET: &str = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    const WALLET_LOWER: &str = "did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    const WALLET_OTHER_CHAIN: &str =
+        "did:pkh:eip155:137:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    /// `revoker` signs directly, citing no proof.
+    async fn signer_may_revoke(db: &sea_orm::DbConn, target: Hash, revoker: &str) -> bool {
+        let target_row = delegation::Entity::find_by_id(target)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        super::revoker_is_authorized(db, &target_row, &target, revoker, &[])
+            .await
+            .unwrap()
+    }
+
+    // TC-3858: session S delegates decrypt on the wallet's network, on one of
+    // its keys, or on a key prefix to X. The wallet is not S, but it owns the
+    // network each URN names, so it revokes; nobody else who is not S does.
+    #[tokio::test]
+    async fn the_network_owner_revokes_grants_on_its_network_keys_and_prefixes() {
+        let db = database().await;
+        for did in [SESSION_DID, RECIPIENT_DID] {
+            insert_actor(&db, did).await;
+        }
+        let network = format!("urn:tinycloud:encryption:{WALLET}:default");
+        for (label, resource) in [
+            ("network", network.clone()),
+            ("key", format!("{network}/secrets/x")),
+            ("prefix", format!("{network}/secrets/")),
+        ] {
+            let target = hash(label.as_bytes());
+            insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+            insert_ability(&db, target, &resource, "tinycloud.encryption/decrypt").await;
+            for owner in [WALLET, WALLET_LOWER] {
+                assert!(
+                    signer_may_revoke(&db, target, owner).await,
+                    "{label} by {owner}"
+                );
+            }
+            for refused in [WALLET_OTHER_CHAIN, OTHER_DID, RECIPIENT_DID] {
+                assert!(
+                    !signer_may_revoke(&db, target, refused).await,
+                    "{label} by {refused}"
+                );
+            }
+        }
+    }
+
+    // A URI that is not an encryption URN names no owner, even when the
+    // wallet's DID appears in it.
+    #[tokio::test]
+    async fn a_wallet_named_in_another_uri_does_not_own_it() {
+        let db = database().await;
+        for did in [SESSION_DID, RECIPIENT_DID] {
+            insert_actor(&db, did).await;
+        }
+        let target = hash(b"other-uri");
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &format!("urn:example:{WALLET}:default"),
+            "tinycloud.encryption/decrypt",
+        )
+        .await;
+
+        assert!(!signer_may_revoke(&db, target, WALLET).await);
+    }
+
+    // A grant over another owner's space and the wallet's network: owning
+    // either row is owner authority, as owning one of several spaces is.
+    #[tokio::test]
+    async fn either_owner_revokes_a_grant_over_a_space_and_a_network() {
+        let db = database().await;
+        for did in [SESSION_DID, RECIPIENT_DID] {
+            insert_actor(&db, did).await;
+        }
+        let target = hash(b"mixed");
+        insert_delegation_between(&db, target, SESSION_DID, RECIPIENT_DID).await;
+        insert_ability(
+            &db,
+            target,
+            &space_resource(OWNER_DID, "kv/a"),
+            "tinycloud.kv/get",
+        )
+        .await;
+        insert_ability(
+            &db,
+            target,
+            &format!("urn:tinycloud:encryption:{WALLET}:default"),
+            "tinycloud.encryption/decrypt",
+        )
+        .await;
+
+        assert!(signer_may_revoke(&db, target, OWNER_DID).await);
+        assert!(signer_may_revoke(&db, target, WALLET).await);
+        assert!(!signer_may_revoke(&db, target, OTHER_DID).await);
+    }
 }
+
+#[cfg(test)]
+#[path = "revocation/invocation_terminal_tests.rs"]
+mod invocation_terminal_tests;

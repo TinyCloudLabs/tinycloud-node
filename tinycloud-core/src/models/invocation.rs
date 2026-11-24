@@ -89,6 +89,8 @@ pub enum InvocationError {
     InvalidSignature,
     #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
     UnsupportedDidMethod(String),
+    #[error("did_unverifiable: this `did:{0}` identifier is malformed or names a key type this node cannot verify")]
+    UnverifiableDid(String),
     #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
     DidUrlQueryRejected,
     #[error("Unauthorized Invoker")]
@@ -129,6 +131,23 @@ pub enum InvocationError {
     /// Code: `encryption-prefix-not-invocable`.
     #[error("encryption-prefix-not-invocable")]
     EncryptionPrefixNotInvocable,
+    /// TC-3443: the invoker is a session key its holder signed out, or a
+    /// delegation in the chain was issued by one and first seen after the
+    /// retire.
+    #[error("session_retired: {0}")]
+    SessionRetired(String),
+    /// TC-3810: a strict ancestor of a cited delegation is terminal (or carries
+    /// a malformed stored delegation mode) and cannot authorize descendant
+    /// delegations.
+    #[error("terminal-parent-cannot-redelegate")]
+    TerminalParentCannotRedelegate,
+    /// TC-3810: a cited delegation row was marked unusable during boot
+    /// reindexing because its signed bytes carried a malformed or duplicate
+    /// delegation mode.
+    #[error("invalid-delegation-mode")]
+    InvalidDelegationMode,
+    #[error(transparent)]
+    Registry(#[from] crate::registry_admission::RegistryError),
 }
 
 impl InvocationError {
@@ -256,6 +275,7 @@ pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), E
             UcanVerifyError::MethodDisabled { method } => {
                 InvocationError::UnsupportedDidMethod(method)
             }
+            UcanVerifyError::Unverifiable { method } => InvocationError::UnverifiableDid(method),
             UcanVerifyError::QueryRejected => InvocationError::DidUrlQueryRejected,
             UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
                 InvocationError::InvalidSignature
@@ -376,8 +396,9 @@ pub(crate) async fn authorize_holder_with_setting<C: ConnectionTrait>(
     .await
 }
 
-/// Test oracle: `authorize_holder`'s checks against a caller-built snapshot.
-#[cfg(test)]
+/// `authorize_holder`'s checks against a caller-loaded snapshot from the
+/// caller's same transaction: the per-key read check for KV value details
+/// (TC-2492), and a test oracle.
 pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
     db: &C,
     holder: &str,
@@ -396,6 +417,129 @@ pub(crate) async fn authorize_holder_with_graph<C: ConnectionTrait>(
         false,
     )
     .await
+}
+
+/// TC-3810: refuse an invocation if any cited delegation leaf is marked
+/// `invalid` (or fails closed when unmarked), or if any strict ancestor of a
+/// cited leaf is `terminal` or `invalid`. Reads `graph.delegation_mode(...)`
+/// (from the joined `delegation_mode` side table, never `delegation.facts`).
+/// Direct use of a valid terminal leaf is allowed: invocation is not
+/// redelegation.
+pub(crate) fn check_no_terminal_strict_ancestor(
+    graph: &crate::auth_graph::AuthGraphSnapshot,
+    leaf_ids: &[Hash],
+) -> Result<(), InvocationError> {
+    for leaf_id in leaf_ids {
+        if graph
+            .delegation_mode(leaf_id)
+            .is_some_and(delegation_mode::StoredDelegationMode::is_invalid)
+        {
+            return Err(InvocationError::InvalidDelegationMode);
+        }
+        for ancestor_id in graph.chain_ids_from(leaf_id).into_iter().skip(1) {
+            if graph
+                .delegation_mode(&ancestor_id)
+                .is_some_and(delegation_mode::StoredDelegationMode::is_terminal_or_invalid)
+            {
+                return Err(InvocationError::TerminalParentCannotRedelegate);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate leaf (`invalid`) and strict-ancestor (`terminal`/`invalid`) modes
+/// against an already-loaded [`crate::auth_graph::ClosureWithModes`] with zero
+/// extra queries when every node has a `delegation_mode` row. Any unmarked
+/// node falls back to fail-closed derivation from its stored signed bytes.
+pub(crate) async fn check_closure_modes<C: ConnectionTrait>(
+    db: &C,
+    root_ids: &[Hash],
+    closure: &crate::auth_graph::ClosureWithModes,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    if root_ids.is_empty() {
+        return Ok(());
+    }
+    let mut strict_ancestors: Vec<Hash> = Vec::new();
+    let mut unmarked: Vec<Hash> = Vec::new();
+    for leaf_id in root_ids {
+        match closure.modes.get(leaf_id) {
+            Some(mode) if mode.is_invalid() => {
+                return Err(InvocationError::InvalidDelegationMode.into());
+            }
+            Some(_) => {}
+            None => unmarked.push(*leaf_id),
+        }
+        let mut visited = std::collections::HashSet::from([*leaf_id]);
+        let mut frontier: Vec<Hash> = closure.edges.get(leaf_id).cloned().unwrap_or_default();
+        while let Some(ancestor_id) = frontier.pop() {
+            if !visited.insert(ancestor_id) {
+                continue;
+            }
+            match closure.modes.get(&ancestor_id) {
+                Some(mode) if mode.is_terminal_or_invalid() => {
+                    return Err(InvocationError::TerminalParentCannotRedelegate.into());
+                }
+                Some(_) => {}
+                None => {
+                    strict_ancestors.push(ancestor_id);
+                    unmarked.push(ancestor_id);
+                }
+            }
+            if let Some(next_parents) = closure.edges.get(&ancestor_id) {
+                for parent in next_parents {
+                    if !visited.contains(parent) {
+                        frontier.push(*parent);
+                    }
+                }
+            }
+        }
+    }
+    if unmarked.is_empty() {
+        return Ok(());
+    }
+    unmarked.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    unmarked.dedup();
+    let derived = delegation_mode::resolve_unmarked_modes(db, &unmarked, encryption).await?;
+    for leaf_id in root_ids {
+        if derived.get(leaf_id).is_some_and(|mode| mode.is_invalid()) {
+            return Err(InvocationError::InvalidDelegationMode.into());
+        }
+    }
+    for ancestor_id in &strict_ancestors {
+        if derived
+            .get(ancestor_id)
+            .is_some_and(|mode| mode.is_terminal_or_invalid())
+        {
+            return Err(InvocationError::TerminalParentCannotRedelegate.into());
+        }
+    }
+    Ok(())
+}
+
+/// Lock-free, single-query preflight check for terminal strict ancestors and
+/// quarantined `invalid` leaves (used by `/delegation/status` and
+/// proof-bearing Renew). Pure read-only SQL, never reads
+/// `delegation.facts`.
+pub(crate) async fn preflight_terminal_ancestors<C: ConnectionTrait>(
+    db: &C,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
+    let closure = crate::auth_graph::load_closure_with_modes(db, &root_ids)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    check_closure_modes(db, &root_ids, &closure, encryption).await
 }
 
 async fn validate_capabilities<C: ConnectionTrait>(
@@ -427,8 +571,33 @@ async fn validate_capabilities<C: ConnectionTrait>(
         .collect();
 
     match (dependant_caps.is_empty(), parents.is_empty()) {
-        // no dependant caps, no parents needed, must be valid
-        (true, _) => Ok(()),
+        // no dependant caps, no parents cited: root authority alone
+        (true, true) => Ok(()),
+        // no dependant caps, but parents are cited: refuse any cited invalid
+        // graph (terminal strict ancestor or malformed leaf) before the
+        // root-authority shortcut (TC-3810).
+        (true, false) => {
+            let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
+            let loaded_graph;
+            let graph = match auth_graph {
+                Some(graph) => graph,
+                None => {
+                    loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &root_ids)
+                        .await
+                        .map_err(|error| match error {
+                            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                                Error::InvalidInvocation(
+                                    InvocationError::ChainTraversalLimitExceeded,
+                                )
+                            }
+                        })?;
+                    &loaded_graph
+                }
+            };
+            check_no_terminal_strict_ancestor(graph, &root_ids)?;
+            Ok(())
+        }
         // dependant caps, no parents, invalid
         (false, true) => Err(InvocationError::MissingParents.into()),
         // dependant caps, parents, check parents
@@ -457,6 +626,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 }
             };
 
+            // TC-3810: refuse any cited chain descending from a terminal
+            // ancestor or citing a boot-marked malformed-mode leaf. Direct use
+            // of a valid terminal leaf is allowed.
+            check_no_terminal_strict_ancestor(graph, &root_ids)?;
+
             // every cited CID must name a delegation row that is already persisted.
             // Rows are written only by the delegation registration path
             // (`Database::delegate` -> `delegation::process`), so a delegation that
@@ -475,6 +649,20 @@ async fn validate_capabilities<C: ConnectionTrait>(
             for (p, _) in &parents {
                 if !did_principal_matches(&p.delegatee, invoker) {
                     return Err(InvocationError::UnauthorizedInvoker(invoker.to_owned()).into());
+                }
+            }
+
+            // TC-3443: a signed-out session key uses no delegated authority
+            // (root authority, checked above, is not delegated). Each cited
+            // parent's delegatee is the invoker, and the snapshot carries the
+            // live retire rows of every chain delegator and delegatee.
+            let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
+            for (p, _) in &parents {
+                if graph.retired_at(&p.delegatee, chain_now).is_some() {
+                    return Err(InvocationError::SessionRetired(format!(
+                        "invoker {invoker} signed out"
+                    ))
+                    .into());
                 }
             }
 
@@ -503,11 +691,26 @@ async fn validate_capabilities<C: ConnectionTrait>(
                 // chain window, not only the directly cited leaf. A chain
                 // node without a persisted delegation row (malformed graph)
                 // fails closed as a missing parent.
-                let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
                 for chain_id in graph.chain_ids_from(&p.id) {
                     let Some(ancestor) = graph.delegation(&chain_id) else {
                         return Err(InvocationError::MissingParents.into());
                     };
+                    // TC-3443: a delegation its signed-out issuer made after the
+                    // retire (one that raced it) authorizes nothing. NULL
+                    // `first_seen_at` predates the column, so predates the retire.
+                    if let Some(retired_at) = graph.retired_at(&ancestor.delegator, chain_now) {
+                        if ancestor
+                            .first_seen_at
+                            .is_some_and(|first_seen| first_seen > retired_at)
+                        {
+                            return Err(InvocationError::SessionRetired(format!(
+                                "delegation {} from {} was first seen after its issuer signed out",
+                                chain_id.to_cid(0x55),
+                                ancestor.delegator
+                            ))
+                            .into());
+                        }
+                    }
                     let effective_expiry = graph
                         .effective_expiry(&chain_id)
                         .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
@@ -554,6 +757,23 @@ async fn validate_capabilities<C: ConnectionTrait>(
             // are NOT trusted on their own — they are only authorized when
             // the persisted chain ability row already has a matching or
             // stricter caveat.
+            let mut terminal_cids = std::collections::HashSet::new();
+            for id in root_ids.iter().flat_map(|id| graph.chain_ids_from(id)) {
+                if graph.is_parentless(&id)
+                    && graph.delegation(&id).is_some_and(|row| {
+                        dependant_caps
+                            .iter()
+                            .any(|cap| !is_root_authority(cap, &row.delegator))
+                    })
+                {
+                    terminal_cids.insert(id.to_cid(0x55).to_string());
+                }
+            }
+            let registered_policy_roots = if terminal_cids.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                Box::pin(live_policy_roots(db, terminal_cids)).await?
+            };
             for c in &dependant_caps {
                 // TC-119: ability containment is registry-aware. A parent
                 // ability supports the invoked ability when it is equal OR a
@@ -604,64 +824,75 @@ async fn validate_capabilities<C: ConnectionTrait>(
                     return Err(InvocationError::CaveatsNotContained(reason).into());
                 }
 
-                // A pre-N2 SQL/DuckDB child may have been stored under the
-                // old descendant rule. At least one cited proof chain must
-                // contain this invocation at every ancestor up to the space
-                // owner; an owner-issued delegation is the authority
-                // boundary, as at registration. Do not require unrelated
-                // parallel proofs to cover it, and do not combine a valid
-                // ancestor from one proof with caveats from another proof.
-                if matches!(
-                    &c.resource,
-                    Resource::TinyCloud(resource)
-                        if matches!(resource.service().as_str(), "sql" | "duckdb")
+                // Every delegated invocation needs one covering chain ending
+                // at the resource owner or a live registered policy root.
+                // TC-1791: the invocation's own SQL/DuckDB caveats must be
+                // accepted, and a stored row whose caveats are not accepted
+                // does not cover the invocation.
+                if let Some(reason) = crate::models::delegation::unsupported_sql_caveat(
+                    c.ability.as_ref().as_ref(),
+                    &c.caveats,
                 ) {
-                    // TC-1791: the invocation's own SQL/DuckDB caveats must be
-                    // accepted, and a stored row whose caveats are not accepted
-                    // does not cover the invocation.
-                    if let Some(reason) = crate::models::delegation::unsupported_sql_caveat(
-                        c.ability.as_ref().as_ref(),
-                        &c.caveats,
-                    ) {
-                        return Err(InvocationError::UnsupportedCaveat(reason).into());
-                    }
-                    let covers = |ability: &abilities::Model| {
-                        c.resource.extends(&ability.resource)
-                            && crate::policy_capability::ability_matches(
-                                ability.ability.as_ref().as_ref(),
-                                c.ability.as_ref().as_ref(),
-                            )
-                            && ability_caveats_contain_child(
-                                c.ability.as_ref().as_ref(),
-                                &ability.caveats,
-                                &c.caveats,
-                                delegated_sql_caveats,
-                            )
-                            .is_ok()
-                            && crate::models::delegation::unsupported_stored_sql_caveat(
-                                ability.ability.as_ref().as_ref(),
-                                &ability.caveats,
-                                delegated_sql_caveats,
-                            )
-                            .is_none()
-                    };
-                    let valid_chain = graph.has_covering_chain(
-                        parents.iter().map(|(parent, _)| parent.id),
-                        covers,
-                        |row| is_root_authority(c, &row.delegator),
-                    );
-                    if !valid_chain {
-                        return Err(InvocationError::UnauthorizedAction(
-                            Box::new(c.resource.clone()),
-                            c.ability.clone(),
+                    return Err(InvocationError::UnsupportedCaveat(reason).into());
+                }
+                let covers = |ability: &abilities::Model| {
+                    c.resource.extends(&ability.resource)
+                        && crate::policy_capability::ability_matches(
+                            ability.ability.as_ref().as_ref(),
+                            c.ability.as_ref().as_ref(),
                         )
-                        .into());
-                    }
+                        && ability_caveats_contain_child(
+                            c.ability.as_ref().as_ref(),
+                            &ability.caveats,
+                            &c.caveats,
+                            delegated_sql_caveats,
+                        )
+                        .is_ok()
+                        && crate::models::delegation::unsupported_stored_sql_caveat(
+                            ability.ability.as_ref().as_ref(),
+                            &ability.caveats,
+                            delegated_sql_caveats,
+                        )
+                        .is_none()
+                };
+                let valid_chain = graph.has_covering_chain(
+                    parents.iter().map(|(parent, _)| parent.id),
+                    covers,
+                    |row| {
+                        is_root_authority(c, &row.delegator)
+                            || registered_policy_roots.contains(&row.id.to_cid(0x55).to_string())
+                    },
+                );
+                if !valid_chain {
+                    return Err(InvocationError::UnauthorizedAction(
+                        Box::new(c.resource.clone()),
+                        c.ability.clone(),
+                    )
+                    .into());
                 }
             }
             Ok(())
         }
     }
+}
+
+/// The live registered policy roots among `root_cids`. Its own function and
+/// boxed at the call site: the sea-orm select held across this await is 1.7 KB
+/// that every `validate_capabilities` caller's future (and, unoptimized, every
+/// poll frame up to the request handler) would otherwise carry.
+async fn live_policy_roots<C: ConnectionTrait>(
+    db: &C,
+    root_cids: std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>, DbErr> {
+    Ok(policy_v3_root::Entity::find()
+        .filter(policy_v3_root::Column::RootCid.is_in(root_cids))
+        .filter(policy_v3_root::Column::RevokedAt.is_null())
+        .filter(policy_v3_root::Column::RevocationBytes.is_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.root_cid)
+        .collect())
 }
 
 /// W1 (audit P0 finding 1): same containment helper as the delegation path,
@@ -778,22 +1009,7 @@ async fn save<C: ConnectionTrait>(
     );
 
     // Ensure the invoker actor exists before inserting the invocation
-    match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
-        id: invocation.invoker.clone(),
-    }))
-    .on_conflict(
-        OnConflict::column(actor::Column::Id)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    {
-        Err(DbErr::RecordNotInserted) => (),
-        r => {
-            r?;
-        }
-    };
+    crate::space_purge_records::operation_actors(db, &[&invocation.invoker]).await?;
 
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
@@ -844,6 +1060,7 @@ async fn save<C: ConnectionTrait>(
                 value,
                 generation,
                 metadata,
+                size,
                 space,
                 seq,
                 epoch,
@@ -856,6 +1073,7 @@ async fn save<C: ConnectionTrait>(
                     generation: *generation,
                     space: space.clone().into(),
                     metadata: metadata.clone(),
+                    size: Some(*size),
                     seq: *seq,
                     epoch: *epoch,
                     epoch_seq: *epoch_seq,
@@ -997,6 +1215,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
         value: write.value,
         generation: write.generation,
         metadata: write.metadata,
+        size: write.size,
         deleted: false,
     };
     let mut conflict = OnConflict::columns([current_kv::Column::Space, current_kv::Column::Key]);
@@ -1012,6 +1231,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
             (current_kv::Column::Generation, "generation"),
             (current_kv::Column::Value, "value"),
             (current_kv::Column::Metadata, "metadata"),
+            (current_kv::Column::Size, "size"),
             (current_kv::Column::Deleted, "deleted"),
             (current_kv::Column::EpochSeq, "epoch_seq"),
             (current_kv::Column::Epoch, "epoch"),
@@ -1034,6 +1254,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
                 current_kv::Column::Value,
                 current_kv::Column::Generation,
                 current_kv::Column::Metadata,
+                current_kv::Column::Size,
                 current_kv::Column::Deleted,
             ])
             .action_cond_where(incoming_supersedes(
@@ -1293,6 +1514,7 @@ mod tests {
                 "label".to_string(),
                 label.to_string(),
             )])),
+            size: None,
         }
     }
 
@@ -1534,6 +1756,7 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
             }
             .insert(&db)
             .await
@@ -1715,6 +1938,7 @@ mod tests {
             facts: Set(None),
             serialization: Set(id.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db)
         .await
@@ -1743,6 +1967,335 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn signed_invocations_require_registered_policy_terminals() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        assert_signed_policy_terminals(&db).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_signed_invocations_require_registered_policy_terminals() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_signed_invocations_require_registered_policy_terminals",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_signed_policy_terminals(&fixture.conn).await;
+    }
+
+    async fn assert_signed_policy_terminals(db: &DatabaseConnection) {
+        use crate::events::{Delegation, SerializedEvent, TinyCloudDelegation};
+        use tinycloud_auth::{
+            ssi::{claims::jwt::NumericDate, jwk::Algorithm, ucan::Payload},
+            ucan_capabilities_object::Capabilities,
+        };
+        fn identity() -> (JWK, String) {
+            let key = JWK::generate_ed25519().unwrap();
+            let did = DID_METHODS.generate(&key, "key").unwrap().to_string();
+            (key, did)
+        }
+        fn token(
+            (key, issuer): (&JWK, &str),
+            audience: &str,
+            resource: &str,
+            ability: &str,
+            proof: Vec<tinycloud_auth::ipld_core::cid::Cid>,
+            facts: Option<Vec<serde_json::Value>>,
+            now: i64,
+        ) -> String {
+            let mut caps = Capabilities::<serde_json::Value>::new();
+            caps.with_action(
+                resource.parse().unwrap(),
+                ability.parse().unwrap(),
+                [BTreeMap::new()],
+            );
+            Payload {
+                issuer: issuer.parse().unwrap(),
+                audience: audience.parse().unwrap(),
+                expiration: NumericDate::try_from_seconds((now + 300) as f64).unwrap(),
+                not_before: Some(NumericDate::try_from_seconds((now - 1) as f64).unwrap()),
+                nonce: None,
+                facts,
+                proof,
+                attenuation: caps,
+            }
+            .sign(Algorithm::EdDSA, key)
+            .unwrap()
+            .encode()
+            .unwrap()
+        }
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        };
+        let registry_queries = Arc::new(AtomicUsize::new(0));
+        let registry_nanos = Arc::new(AtomicU64::new(0));
+        let (queries, nanos) = (registry_queries.clone(), registry_nanos.clone());
+        let mut measured_db = db.clone();
+        measured_db.set_metric_callback(move |info| {
+            if info.statement.sql.starts_with("SELECT")
+                && info.statement.sql.contains("\"policy_v3_root\"")
+            {
+                queries.fetch_add(1, Ordering::Relaxed);
+                nanos.fetch_add(info.elapsed.as_nanos() as u64, Ordering::Relaxed);
+            }
+        });
+        let db = &measured_db;
+        for (service, action) in [
+            ("sql", "read"),
+            ("duckdb", "read"),
+            ("kv", "get"),
+            ("kv", "put"),
+            ("kv", "del"),
+            ("kv", "delete"),
+            ("kv", "list"),
+            ("kv", "metadata"),
+            ("capabilities", "read"),
+            ("encryption", "decrypt"),
+            ("encryption", "key.create"),
+        ] {
+            let (owner_key, owner) = identity();
+            let (holder_key, holder) = identity();
+            let (child_key, child) = identity();
+            let space = SpaceId::new(owner.parse().unwrap(), "files".parse().unwrap()).unwrap();
+            let resource = if service == "encryption" {
+                format!("urn:tinycloud:encryption:{owner}:default/docs/key")
+            } else {
+                format!(
+                    "{space}/{service}/{}",
+                    if service == "capabilities" {
+                        "all"
+                    } else {
+                        "db"
+                    }
+                )
+            };
+            let ability = format!("tinycloud.{service}/{action}");
+            let now = OffsetDateTime::now_utc();
+            let invoke = |key: &JWK, issuer: &str, parents: Vec<_>| {
+                let encoded = token(
+                    (key, issuer),
+                    &owner,
+                    &resource,
+                    &ability,
+                    parents,
+                    None,
+                    now.unix_timestamp(),
+                );
+                util::InvocationInfo::try_from(TinyCloudInvocation::decode(&encoded).unwrap())
+                    .unwrap()
+            };
+            assert!(
+                verify_and_authorize(db, &invoke(&holder_key, &holder, vec![]), now)
+                    .await
+                    .is_err()
+            );
+            let ordinary = token(
+                (&holder_key, &holder),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                None,
+                now.unix_timestamp(),
+            );
+            let ordinary = Delegation::from_header_ser::<TinyCloudDelegation>(&ordinary).unwrap();
+            assert!(delegation::process(db, &ordinary, None).await.is_err());
+            let grant = token(
+                (&owner_key, &owner),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                None,
+                now.unix_timestamp(),
+            );
+            let grant = Delegation::from_header_ser::<TinyCloudDelegation>(&grant).unwrap();
+            let grant_cid = grant.content_hash().to_cid(0x55);
+            assert!(
+                verify_and_authorize(db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+                    .await
+                    .is_err()
+            );
+            delegation::process(db, &grant, None).await.unwrap();
+            verify_and_authorize(db, &invoke(&holder_key, &holder, vec![grant_cid]), now)
+                .await
+                .unwrap();
+            let child_grant = token(
+                (&holder_key, &holder),
+                &child,
+                &resource,
+                &ability,
+                vec![grant_cid],
+                None,
+                now.unix_timestamp(),
+            );
+            let child_grant =
+                Delegation::from_header_ser::<TinyCloudDelegation>(&child_grant).unwrap();
+            delegation::process(db, &child_grant, None).await.unwrap();
+            verify_and_authorize(
+                db,
+                &invoke(
+                    &child_key,
+                    &child,
+                    vec![child_grant.content_hash().to_cid(0x55)],
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+            let facts = serde_json::json!({
+                "role": "policy-authority", "mode": "policy-source", "ownerDid": holder,
+                "policyId": "test-policy", "policyDigestHex": "test-digest", "policyCid": "test-policy-cid",
+                "contentSourceDigestHex": "test-source", "capabilityCeilingHashHex": "test-ceiling",
+                "nativeProjectionHashHex": "test-projection", "nodeAudience": owner,
+            });
+            let root = token(
+                (&holder_key, &holder),
+                &holder,
+                &resource,
+                &ability,
+                vec![],
+                Some(vec![facts]),
+                now.unix_timestamp() - 180,
+            );
+            let root = SerializedEvent::<util::DelegationInfo>::from_header_ser::<
+                TinyCloudDelegation,
+            >(&root)
+            .unwrap();
+            assert!(root.0.parents.is_empty());
+            assert!(!is_root_authority(
+                &root.0.capabilities[0],
+                &root.0.delegator
+            ));
+            delegation::process(db, &root, None).await.unwrap();
+            let root_cid = root.content_hash().to_cid(0x55);
+            let invocation = invoke(&holder_key, &holder, vec![root_cid]);
+            assert!(matches!(
+                verify_and_authorize(db, &invocation, now).await,
+                Err(Error::InvalidInvocation(
+                    InvocationError::UnauthorizedAction(_, _)
+                ))
+            ));
+            // The holder has a valid owner grant before this registry fixture is inserted.
+            authorize_holder(db, &holder, &root.0.capabilities, &[grant_cid], now)
+                .await
+                .unwrap();
+            policy_v3_root::ActiveModel {
+                root_cid: Set(root_cid.to_string()),
+                policy_cid: Set("test-policy-cid".into()),
+                role: Set("policy-authority".into()),
+                authorization_bytes: Set(vec![]),
+                status_checkpoint_bytes: Set(None),
+                previous_checkpoint_digest_hex: Set(None),
+                status_sequence: Set(1),
+                admission_epoch: Set(0),
+                status_checked_at: Set(None),
+                status_fresh_until: Set(None),
+                revoked_at: Set(None),
+                revocation_bytes: Set(None),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+            verify_and_authorize(db, &invocation, now).await.unwrap();
+            let batch = (0..100)
+                .map(|index| {
+                    let mut capability = root.0.capabilities[0].clone();
+                    if service == "kv" {
+                        capability.resource = format!("{resource}/key{index}").parse().unwrap();
+                    }
+                    capability
+                })
+                .collect::<Vec<_>>();
+            let before = registry_queries.load(Ordering::Relaxed);
+            authorize_holder(db, &holder, &batch, &[grant_cid], now)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry_queries.load(Ordering::Relaxed),
+                before,
+                "owner-only chain must not look up registry"
+            );
+            let before = registry_queries.load(Ordering::Relaxed);
+            let nanos_before = registry_nanos.load(Ordering::Relaxed);
+            authorize_holder(db, &holder, &batch, &[root_cid], now)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry_queries.load(Ordering::Relaxed) - before,
+                1,
+                "batch must look up registry once"
+            );
+            eprintln!(
+                "{:?} {ability}: registry lookups owner=0, registered batch100=1, elapsed={}ns",
+                db.get_database_backend(),
+                registry_nanos.load(Ordering::Relaxed) - nanos_before
+            );
+
+            for (revoked_at, revocation_bytes) in [
+                (Some("2026-01-01T00:00:00Z".to_owned()), None),
+                (None, Some(vec![1_u8])),
+                (Some("2026-01-01T00:00:00Z".to_owned()), Some(vec![1_u8])),
+            ] {
+                policy_v3_root::Entity::update_many()
+                    .col_expr(policy_v3_root::Column::RevokedAt, Expr::value(revoked_at))
+                    .col_expr(
+                        policy_v3_root::Column::RevocationBytes,
+                        Expr::value(revocation_bytes),
+                    )
+                    .filter(policy_v3_root::Column::RootCid.eq(root_cid.to_string()))
+                    .exec(db)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    verify_and_authorize(db, &invocation, now).await,
+                    Err(Error::InvalidInvocation(
+                        InvocationError::UnauthorizedAction(_, _)
+                    ))
+                ));
+            }
+            policy_v3_root::Entity::update_many()
+                .col_expr(
+                    policy_v3_root::Column::RevokedAt,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    policy_v3_root::Column::RevocationBytes,
+                    Expr::value(Option::<Vec<u8>>::None),
+                )
+                .filter(policy_v3_root::Column::RootCid.eq(root_cid.to_string()))
+                .exec(db)
+                .await
+                .unwrap();
+            // The signed root expires at now + 120; the invocation and owner grant at now + 300.
+            assert!(matches!(
+                verify_and_authorize(db, &invocation, now + time::Duration::seconds(121)).await,
+                Err(Error::InvalidInvocation(
+                    InvocationError::UnauthorizedAction(_, _)
+                ))
+            ));
+            db.execute_unprepared(
+                "ALTER TABLE policy_v3_root RENAME TO policy_v3_root_unavailable",
+            )
+            .await
+            .unwrap();
+            let result = verify_and_authorize(db, &invocation, now).await;
+            db.execute_unprepared(
+                "ALTER TABLE policy_v3_root_unavailable RENAME TO policy_v3_root",
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Err(Error::Db(_))),
+                "registry query failure must refuse: {result:?}"
+            );
+        }
+    }
+
     fn tables_caveat() -> Caveats {
         Caveats(BTreeMap::from([(
             "tables".to_string(),
@@ -1760,7 +2313,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_invocation_with_unsupported_caveat_is_refused() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.sql/read", Caveats::default()).await;
         let capability = caveat_capability(resource, "tinycloud.sql/read", tables_caveat());
@@ -1784,7 +2337,7 @@ mod tests {
 
     #[tokio::test]
     async fn stored_unsupported_sql_row_does_not_cover_invocation() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.sql/read", mixed_sql_caveat()).await;
         let capability = caveat_capability(
@@ -1812,7 +2365,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_constrained_profile_grant_authorizes_invocation() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let caveats = make_sql_constrained_caveat("get", "SELECT 1");
         let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", caveats.clone()).await;
         crate::models::invocation::authorize_holder(
@@ -1836,7 +2389,7 @@ mod tests {
         own: Caveats,
         setting: bool,
     ) -> Result<(), Error> {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         crate::models::invocation::authorize_holder_with_setting(
             db,
             "did:key:alias",
@@ -1863,7 +2416,7 @@ mod tests {
     /// as any non-profile caveat is.
     #[tokio::test]
     async fn stored_delegated_form_covers_an_invocation_only_with_the_setting_on() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let stored = delegated_form_caveat(serde_json::json!({"tables": ["a"]}));
         let (db, parent) = caveat_chain_db(resource, "tinycloud.sql/read", stored).await;
         holder_under(&db, parent, Caveats::default(), true)
@@ -1909,7 +2462,7 @@ mod tests {
     /// imposes nothing; with it off it is refused.
     #[tokio::test]
     async fn stored_grant_of_only_empty_entries_covers_any_invocation_only_with_the_setting_on() {
-        let resource = "tinycloud:did:key:owner/sql/db";
+        let resource = "tinycloud:key:owner:files/sql/db";
         let stored = Caveats(BTreeMap::from([
             ("0".to_string(), serde_json::json!({})),
             ("1".to_string(), serde_json::json!({})),
@@ -1929,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn duckdb_invocation_with_caveat_is_refused() {
-        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let resource = "tinycloud:key:owner:files/duckdb/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
         let capability = caveat_capability(resource, "tinycloud.duckdb/read", tables_caveat());
@@ -1953,7 +2506,7 @@ mod tests {
 
     #[tokio::test]
     async fn duckdb_empty_caveat_grant_authorizes_invocation() {
-        let resource = "tinycloud:did:key:owner/duckdb/db";
+        let resource = "tinycloud:key:owner:files/duckdb/db";
         let (db, parent) =
             caveat_chain_db(resource, "tinycloud.duckdb/read", Caveats::default()).await;
         crate::models::invocation::authorize_holder(
@@ -2134,6 +2687,14 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&db)
             .await
@@ -2302,6 +2863,14 @@ mod tests {
                 facts: Set(None),
                 serialization: Set(id.as_ref().to_vec()),
                 serialization_format: Set(0),
+                first_seen_at: Default::default(),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            delegation_mode::ActiveModel {
+                delegation_id: Set(id),
+                mode: Set("attenuable".to_string()),
             }
             .insert(&db)
             .await
@@ -2390,6 +2959,7 @@ mod tests {
             )))),
             serialization: Set(parent.as_ref().to_vec()),
             serialization_format: Set(0),
+            first_seen_at: Default::default(),
         }
         .insert(&db)
         .await

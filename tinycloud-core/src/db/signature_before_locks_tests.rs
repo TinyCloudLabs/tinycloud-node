@@ -707,4 +707,584 @@ mod binding {
         );
         lock.rollback().await.unwrap();
     }
+
+    // TC-3000 (F1): a validly signed request without standing, or out of its
+    // time window, is refused before it takes any lock. Bobbie's #595
+    // residual probes, inverted.
+
+    const QUICK: std::time::Duration = std::time::Duration::from_secs(5);
+    const BRIEF: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// A stranger's root grant on another tenant's space.
+    #[tokio::test]
+    async fn a_stranger_signed_delegation_is_refused_without_waiting_for_the_victim_space() {
+        let f = sqlite_fx().await;
+        let stranger = JWK::generate_ed25519().unwrap();
+        let token = ucan(
+            &stranger,
+            &stranger,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        let held =
+            f.db.acquire_space_sequence_guards(std::slice::from_ref(&f.space))
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&token)))
+            .await
+            .expect("a stranger's delegation must not wait for the victim's write order");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::MissingParents
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+    }
+
+    /// A stranger's revocation of another tenant's delegation.
+    #[tokio::test]
+    async fn a_stranger_signed_revocation_is_refused_without_waiting_for_the_victim_space() {
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let stranger = JWK::generate_ed25519().unwrap();
+        let (node, _) = did_vm(&JWK::generate_ed25519().unwrap());
+        let token = ucan(
+            &stranger,
+            &stranger,
+            &node,
+            &format!("urn:cid:{}", cid_of(&g)),
+            "tinycloud.delegation/revoke",
+        );
+        let held =
+            f.db.acquire_space_sequence_guards(std::slice::from_ref(&f.space))
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.revoke(revoc(&token)))
+            .await
+            .expect("a stranger's revocation must not wait for the victim's write order");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidRevocation(
+                    revocation::RevocationError::UnauthorizedRevoker(_)
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+    }
+
+    /// The owner's own delegation, signed but already expired.
+    #[tokio::test]
+    async fn an_expired_delegation_is_refused_without_waiting_for_its_space() {
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 7200,
+            now() - 3600,
+        );
+        let held =
+            f.db.acquire_space_sequence_guards(std::slice::from_ref(&f.space))
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&token)))
+            .await
+            .expect("an expired delegation must not wait for its space's write order");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::InvalidTime
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+    }
+
+    /// The owner's own revocation, signed but already expired.
+    #[tokio::test]
+    async fn an_expired_revocation_is_refused_without_waiting_for_its_target() {
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let victim = cid_of(&g);
+        let (node, _) = did_vm(&JWK::generate_ed25519().unwrap());
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &node,
+            &format!("urn:cid:{victim}"),
+            "tinycloud.delegation/revoke",
+            vec![],
+            now() - 7200,
+            now() - 3600,
+        );
+        let held =
+            f.db.acquire_chain_guards(&[Hash::from(victim)])
+                .await
+                .ok()
+                .expect("guard");
+        let r = tokio::time::timeout(QUICK, f.db.revoke(revoc(&token)))
+            .await
+            .expect("an expired revocation must not wait for its target's chain guard");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidRevocation(
+                    revocation::RevocationError::InvalidTime
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+    }
+
+    /// A child citing a stored grant made to someone else, while that
+    /// grant's chain guard is held, and a child citing a parent that is not
+    /// stored, while its space's write order is held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_child_without_a_parent_granted_to_its_issuer_is_refused_without_waiting() {
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let victim = cid_of(&g);
+        let stranger = JWK::generate_ed25519().unwrap();
+        let audience = did_vm(&JWK::generate_ed25519().unwrap()).0;
+        let not_granted = ucan_full(
+            &stranger,
+            &stranger,
+            &audience,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![victim],
+            now() - 30,
+            now() + 300,
+        );
+        let held =
+            f.db.acquire_chain_guards(&[Hash::from(victim)])
+                .await
+                .ok()
+                .expect("guard");
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&not_granted)))
+            .await
+            .expect("a child of a grant to someone else must not wait for its chain guard");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::UnauthorizedDelegator(_)
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+
+        let missing = ucan_full(
+            &stranger,
+            &stranger,
+            &audience,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![cid_of("tc3000-not-stored")],
+            now() - 30,
+            now() + 300,
+        );
+        let held =
+            f.db.acquire_space_sequence_guards(std::slice::from_ref(&f.space))
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&missing)))
+            .await
+            .expect("a child of a missing parent must not wait for its space's write order");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::MissingParents
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        drop(held);
+    }
+
+    /// The pre-check refuses only what has no standing: the owner's grant and
+    /// its holder's child still queue for their locks and are admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delegations_with_standing_still_wait_for_their_locks_and_are_admitted() {
+        let f = sqlite_fx().await;
+        let holder = did_vm(&f.holder).0;
+        let grant = ucan(
+            &f.owner,
+            &f.owner,
+            &holder,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        let held =
+            f.db.acquire_space_sequence_guards(std::slice::from_ref(&f.space))
+                .await;
+        let db = f.db.clone();
+        let pending = {
+            let grant = grant.clone();
+            tokio::spawn(async move { short(&db.delegate(deleg(&grant)).await) })
+        };
+        tokio::time::sleep(BRIEF).await;
+        assert!(
+            !pending.is_finished(),
+            "the owner's grant must wait for its space's write order"
+        );
+        drop(held);
+        assert_eq!(pending.await.unwrap(), "Ok");
+
+        let parent = cid_of(&grant);
+        let child = ucan_full(
+            &f.holder,
+            &f.holder,
+            &did_vm(&JWK::generate_ed25519().unwrap()).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![parent],
+            now() - 30,
+            now() + 300,
+        );
+        let held =
+            f.db.acquire_chain_guards(&[Hash::from(parent)])
+                .await
+                .ok()
+                .expect("guard");
+        let db = f.db.clone();
+        let pending = tokio::spawn(async move { short(&db.delegate(deleg(&child)).await) });
+        tokio::time::sleep(BRIEF).await;
+        assert!(
+            !pending.is_finished(),
+            "the holder's child must wait for its parent's chain guard"
+        );
+        drop(held);
+        assert_eq!(pending.await.unwrap(), "Ok");
+    }
+
+    /// A delegation already stored answers as registered when posted again,
+    /// even after it has expired, as it did before the pre-check.
+    #[tokio::test]
+    async fn a_stored_delegation_posted_again_after_it_expired_is_still_registered() {
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 30,
+            now() + 2,
+        );
+        f.db.delegate(deleg(&token))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = f.db.delegate(deleg(&token)).await;
+        assert_eq!(short(&r), "Ok");
+        assert_eq!(
+            r.ok().map(|result| result.delegation_cids),
+            Some(vec![crate::hash::hash(token.as_bytes())])
+        );
+    }
+
+    /// TC-2871: in a space being purged, a stored delegation posted again
+    /// after it expired gets the purge refusal, not "already registered".
+    #[tokio::test]
+    async fn a_stored_delegation_posted_again_after_it_expired_into_a_purged_space_is_refused() {
+        use sea_orm::TransactionTrait;
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 30,
+            now() + 2,
+        );
+        f.db.delegate(deleg(&token))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let keys = Arc::new(
+            crate::space_purge_ledger::LedgerKeys::new(
+                "test".into(),
+                std::collections::BTreeMap::from([("test".into(), vec![7; 32])]),
+            )
+            .unwrap(),
+        );
+        let fence = Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
+        fence.set_serving_ready(true);
+        let tx = f.db.conn.begin().await.unwrap();
+        fence
+            .fence_hmac(
+                &tx,
+                "space",
+                "test",
+                &keys
+                    .target_hmac("test", "space", &f.space.to_string())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let db = f.db.clone().with_space_purge_fence(fence);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = db.delegate(deleg(&token)).await;
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::ParentRevoked(_)
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
+
+    /// TC-3000 on PostgreSQL: a stranger's delegation does not open a
+    /// transaction to wait for the database-side space lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_stranger_signed_delegation_is_refused_while_the_database_space_lock_is_held(
+    ) {
+        let Some(f) = pg_fx(
+            "postgres_a_stranger_signed_delegation_is_refused_while_the_database_space_lock_is_held",
+        )
+        .await
+        else {
+            return;
+        };
+        let stranger = JWK::generate_ed25519().unwrap();
+        let token = ucan(
+            &stranger,
+            &stranger,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        let lock = hold_pg_space_lock(&f).await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&token)))
+            .await
+            .expect("a stranger's delegation must not wait for the DB space lock");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::MissingParents
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+        lock.rollback().await.unwrap();
+    }
+
+    /// TC-3000 (Bobbie's #610 review, R4): the transaction decides the
+    /// revoker's standing. A revocation authorized by a revoke control grant
+    /// passes the pre-check and waits for its target's chain guard; the
+    /// control grant is revoked meanwhile, and the transaction refuses it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revocation_whose_control_grant_is_revoked_while_it_waits_is_refused() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let device = JWK::generate_ed25519().unwrap();
+        let target = format!("urn:cid:{}", cid_of(&g));
+        let control = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&device).0,
+            &target,
+            "tinycloud.delegation/revoke",
+        );
+        f.db.delegate(deleg(&control))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let (node, _) = did_vm(&JWK::generate_ed25519().unwrap());
+        let revocation = ucan_full(
+            &device,
+            &device,
+            &node,
+            &target,
+            "tinycloud.delegation/revoke",
+            vec![cid_of(&control)],
+            now() - 30,
+            now() + 300,
+        );
+        let held =
+            f.db.acquire_chain_guards(&[Hash::from(cid_of(&g))])
+                .await
+                .ok()
+                .expect("guard");
+        let db = f.db.clone();
+        let pending = tokio::spawn(async move { short(&db.revoke(revoc(&revocation)).await) });
+        tokio::time::sleep(BRIEF).await;
+        assert!(
+            !pending.is_finished(),
+            "the revocation must pass the pre-check and wait for its target's chain guard"
+        );
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"tc3000-control-revocation")),
+            revoker: Set(did_vm(&f.owner).0),
+            revoked: Set(Hash::from(cid_of(&control))),
+            serialization: Set(b"tc3000-control-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&f.db.conn)
+        .await
+        .unwrap();
+        drop(held);
+        let out = pending.await.unwrap();
+        assert!(
+            out.starts_with("Err(") && out.contains("Unauthorized Revoker"),
+            "revocation admitted on a revoked control grant: {out}"
+        );
+    }
+
+    /// TC-3000 (Bobbie's #610 review, R2): a stranger's renewal lease of a
+    /// stored original is refused before its own chain guard and the SQLite
+    /// writer lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stranger_renewal_lease_is_refused_before_its_locks() {
+        let f = sqlite_fx().await;
+        let g = ucan(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+        );
+        f.db.delegate(deleg(&g))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let stranger = JWK::generate_ed25519().unwrap();
+        let lease = ucan_full(
+            &stranger,
+            &stranger,
+            &did_vm(&JWK::generate_ed25519().unwrap()).0,
+            &format!("urn:cid:{}", cid_of(&g)),
+            "tinycloud.delegation/renew",
+            vec![],
+            now() - 30,
+            now() + 300,
+        );
+        assert!(crate::renewal::lease_original_from_signed(&deleg(&lease))
+            .unwrap()
+            .is_some());
+        let held_guard =
+            f.db.acquire_chain_guards(&[crate::hash::hash(lease.as_bytes())])
+                .await
+                .ok()
+                .expect("guard");
+        let held_writer =
+            f.db.writer_lock
+                .as_ref()
+                .expect("SQLite writer lock")
+                .clone()
+                .lock_owned()
+                .await;
+        let r = tokio::time::timeout(QUICK, f.db.delegate(deleg(&lease))).await;
+        drop(held_writer);
+        drop(held_guard);
+        let r = r.expect("a stranger's lease must not wait for its chain guard or the writer lock");
+        assert!(
+            matches!(
+                r,
+                Err(TxError::Renewal(
+                    crate::renewal::RenewalStoreError::Unauthorized
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
+
+    /// TC-3000 (Bobbie's #610 review): a path with no pre-check (a policy
+    /// registration's `delegate_batch`) is held to the delegation's time
+    /// window by the transaction itself.
+    #[tokio::test]
+    async fn an_expired_delegation_is_refused_without_a_pre_check() {
+        let f = sqlite_fx().await;
+        let token = ucan_full(
+            &f.owner,
+            &f.owner,
+            &did_vm(&f.holder).0,
+            &kv(&f.space),
+            "tinycloud.kv/get",
+            vec![],
+            now() - 7200,
+            now() - 3600,
+        );
+        let r = f.db.delegate_batch(vec![deleg(&token)]).await;
+        assert!(
+            matches!(
+                r,
+                Err(TxError::InvalidDelegation(
+                    delegation::DelegationError::InvalidTime
+                ))
+            ),
+            "{}",
+            short(&r)
+        );
+    }
 }

@@ -1,31 +1,37 @@
 //! Named-key rows: create, block/unblock, public-key derivation, and the
 //! state-checked unwrap used by the decrypt release guard.
 //!
-//! A key's kind follows from its path: a path under `apps/` is a deletable
-//! key (derived from the network secret, the path and a per-key random seed),
-//! every other path is a deterministic key (no seed). The create, block and
-//! unblock writes all run under the network row lock.
+//! A key's kind follows from its path: a path under `apps/` or `secrets/` is
+//! a deletable key (derived from the network secret, the path and a per-key
+//! random seed), every other path is a deterministic key (no seed). The
+//! create, block and unblock writes all run under the network row lock.
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
-    DatabaseTransaction, DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+    sea_query::{Alias, Expr, Func, SimpleExpr},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter, QuerySelect,
 };
 
 use crate::db::begin_write_transaction;
-use crate::models::{encryption_network, encryption_network_key};
+use crate::models::{encryption_network, encryption_network_key, encryption_network_member};
 
 use super::backend::{KeyBackendError, KeySeed, KeyWrapContext, KeyWrapPurpose};
-use super::key_id::{app_id_of, is_apps_path, EncryptionResource, KeyKind, KeyLocation};
+use super::key_id::{app_id_of, is_secrets_path, EncryptionResource, KeyKind, KeyLocation};
 use super::network_id::NetworkId;
 use super::service::{is_unique_violation, now_rfc3339, EncryptionService, EncryptionServiceError};
 use super::types::{NetworkState, ALG_X25519_AES256GCM};
 
-/// Interim hard cap per network. Counts every key row per network, deleted
-/// rows included. Placeholder value pending the node-config owner.
+/// Default cap on live keys per network outside `secrets`. Deleted rows do
+/// not count; keys at or under `secrets` count against their own cap.
 pub const DEFAULT_KEY_CAP_PER_NETWORK: u64 = 1000;
-/// Interim hard cap per `apps/<app id>/` prefix. Counts every key row under
-/// the prefix, deleted rows included, until a deleted row is reused.
+/// Default cap on live keys under one `apps/<app id>/` prefix. Deleted rows
+/// do not count.
 pub const DEFAULT_KEY_CAP_PER_APP_PREFIX: u64 = 100;
+/// Default cap on live keys at or under `secrets` per network. Deleted rows
+/// do not count; these keys do not count against the per-network cap.
+pub const DEFAULT_KEY_CAP_SECRETS: u64 = 1000;
 const KEY_VERSION_INITIAL: i64 = 1;
 
 /// Key row state. Any stored state other than `active`, `blocked` or `deleted`
@@ -147,6 +153,14 @@ async fn load_active_network<C: ConnectionTrait>(
     if row.state != NetworkState::Active.as_str() {
         return Err(EncryptionServiceError::NetworkNotActive(row.state));
     }
+    let members = encryption_network_member::Entity::find()
+        .filter(encryption_network_member::Column::NetworkId.eq(network.to_string()))
+        .count(db)
+        .await?;
+    if members == 0 {
+        // Half-created by an older create: it answers as a missing network.
+        return Err(EncryptionServiceError::NetworkNotFound);
+    }
     Ok(row)
 }
 
@@ -209,8 +223,8 @@ enum CreateStep {
 
 impl EncryptionService {
     /// `key.create`. `deletable` must equal what the path implies (true under
-    /// `apps/`, false elsewhere). Idempotent for an identical ACTIVE
-    /// deterministic key (returns the existing descriptor). A `deleted`
+    /// `apps/` and `secrets/`, false elsewhere). Idempotent for an identical
+    /// ACTIVE deterministic key (returns the existing descriptor). A `deleted`
     /// deletable row is reused with a fresh seed, state `active` and the next
     /// key version; any other existing row is `key_exists`, and a deleted
     /// deterministic row is `key_deleted`. The existence check and the write
@@ -222,7 +236,8 @@ impl EncryptionService {
     ) -> Result<KeyDescriptor, EncryptionServiceError> {
         if deletable != (loc.kind() == KeyKind::Deletable) {
             return Err(EncryptionServiceError::KeyPathInvalid(
-                "deletable must be true for key paths under apps/ and false elsewhere".to_string(),
+                "deletable must be true for key paths under apps/ or secrets/ and false elsewhere"
+                    .to_string(),
             ));
         }
         let _writer = match &self.sqlite_writer_lock {
@@ -302,6 +317,9 @@ impl EncryptionService {
         if let Some(row) = find_key_row(tx, network, loc.path()).await? {
             let checked = check_row(row)?;
             if checked.state == KeyState::Deleted && checked.kind == KeyKind::Deletable {
+                // A deleted row is not counted, so its reinstall is checked
+                // like a new row.
+                self.check_key_caps(tx, network, loc).await?;
                 return self.reinstall_key_in(tx, &net, loc, checked.row).await;
             }
             return Ok(CreateStep::Existing(checked.row));
@@ -358,31 +376,45 @@ impl EncryptionService {
         }
     }
 
-    /// The per-network and per-app-prefix caps for a new row.
+    /// The caps a new or reinstalled row must fit under. Only live rows
+    /// count (`state <> 'deleted'`; blocked rows count). A key at or under
+    /// `secrets` counts against the secrets cap and not the per-network cap.
+    /// Every other key counts against the per-network cap, and one under
+    /// `apps/<app id>/` also against that prefix's cap, `apps/<app id>/secrets/`
+    /// included.
     async fn check_key_caps(
         &self,
         tx: &DatabaseTransaction,
         network: &NetworkId,
         loc: &KeyLocation,
     ) -> Result<(), EncryptionServiceError> {
-        let count = encryption_network_key::Entity::find()
-            .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-            .count(tx)
-            .await?;
-        if count >= self.key_cap_per_network {
+        let live = || {
+            encryption_network_key::Entity::find()
+                .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
+                .filter(encryption_network_key::Column::State.ne(KeyState::Deleted.as_str()))
+        };
+        let in_secrets = encryption_network_key::Column::KeyPath
+            .eq("secrets")
+            .or(path_starts_with("secrets/"));
+        let (count, cap) = if is_secrets_path(loc.path()) {
+            (
+                live().filter(in_secrets).count(tx).await?,
+                self.key_cap_secrets,
+            )
+        } else {
+            (
+                live().filter(in_secrets.not()).count(tx).await?,
+                self.key_cap_per_network,
+            )
+        };
+        if count >= cap {
             return Err(EncryptionServiceError::KeyLimitExceeded);
         }
         if let Some(app_id) = app_id_of(loc.path()) {
-            let prefix = format!("apps/{app_id}/");
-            // Compared as bytes here, never with a LIKE pattern or a range.
-            let paths: Vec<String> = encryption_network_key::Entity::find()
-                .select_only()
-                .column(encryption_network_key::Column::KeyPath)
-                .filter(encryption_network_key::Column::NetworkId.eq(network.to_string()))
-                .into_tuple()
-                .all(tx)
+            let under_prefix = live()
+                .filter(path_starts_with(&format!("apps/{app_id}/")))
+                .count(tx)
                 .await?;
-            let under_prefix = paths.iter().filter(|p| p.starts_with(&prefix)).count() as u64;
             if under_prefix >= self.key_cap_per_app_prefix {
                 return Err(EncryptionServiceError::KeyLimitExceeded);
             }
@@ -535,14 +567,15 @@ impl EncryptionService {
         descriptor(row)
     }
 
-    /// Unauthenticated public GET. Under `apps/` every path answers
-    /// `key_not_found` without reading anything. Elsewhere it requires an
-    /// ACTIVE network and always derives from the network secret, never from
-    /// the stored row, so missing, blocked and active keys return identical
-    /// output. Writes nothing and never reports key state or absence outside
-    /// `apps/`.
+    /// Unauthenticated public GET. A deletable key (under `apps/` or
+    /// `secrets/`) always answers `key_not_found` without reading anything:
+    /// its public key comes only from the authenticated descriptor. Elsewhere
+    /// it requires an ACTIVE network and always derives from the network
+    /// secret, never from the stored row, so missing, blocked and active keys
+    /// return identical output. Writes nothing and never reports key state or
+    /// absence of a deterministic key.
     pub async fn public_key(&self, loc: &KeyLocation) -> Result<KeyPublic, EncryptionServiceError> {
-        if is_apps_path(loc.path()) {
+        if loc.kind() == KeyKind::Deletable {
             return Err(EncryptionServiceError::KeyNotFound);
         }
         let network = network_of(loc)?;
@@ -632,21 +665,65 @@ impl EncryptionService {
     }
 }
 
-/// Startup check: no key row under `apps/` (or at the path `apps`) may be
-/// anything other than a deletable key. Such a row cannot be read as a key,
-/// and a path under `apps/` is only ever deletable.
+/// Startup check: no key row under a deletable segment (`apps/` or
+/// `secrets/`, or at the bare path `apps` or `secrets`) may be anything other
+/// than a deletable key. Such a row cannot be read as a key, and a path under
+/// those segments is only ever deletable. Rows under `apps/` are reported as
+/// [`EncryptionServiceError::StrayAppKeyRows`], rows under `secrets/` as
+/// [`EncryptionServiceError::StraySecretKeyRows`].
 pub async fn ensure_no_deterministic_app_keys<C: ConnectionTrait>(
     db: &C,
 ) -> Result<(), EncryptionServiceError> {
-    let stray = encryption_network_key::Entity::find()
+    let apps = non_deletable_rows_under(db, "apps").await?;
+    if apps > 0 {
+        return Err(EncryptionServiceError::StrayAppKeyRows(apps));
+    }
+    let secrets = non_deletable_rows_under(db, "secrets").await?;
+    if secrets > 0 {
+        return Err(EncryptionServiceError::StraySecretKeyRows(secrets));
+    }
+    Ok(())
+}
+
+/// `substr(key_path, 1, n) = prefix`: an exact comparison of the first n
+/// characters, the same SQL on SQLite and PostgreSQL. Never `LIKE` (it treats
+/// `_` and `%` as wildcards, and SQLite's ignores case) and never a range
+/// (collation dependent). Key paths are ASCII, so characters are bytes.
+///
+/// `prefix` is a directory: the keys *under* it, never a sibling that merely
+/// shares its leading characters. A prefix without a trailing `/` gets one
+/// before matching, so `apps/ab` selects `apps/ab/x` and not `apps/abc/x`,
+/// and `secrets` behaves like `secrets/`. The `/` is added before the length
+/// is taken, so the substring and the compared text always agree.
+pub(super) fn path_starts_with(prefix: &str) -> SimpleExpr {
+    let directory = if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    };
+    Expr::expr(Func::cust(Alias::new("substr")).args([
+        Expr::col(encryption_network_key::Column::KeyPath).into(),
+        SimpleExpr::from(1i32),
+        SimpleExpr::from(directory.len() as i32),
+    ]))
+    .eq(directory)
+}
+
+/// Rows at the path `segment` or under `segment/` whose kind is not
+/// deletable. `segment` is a fixed literal, never input.
+async fn non_deletable_rows_under<C: ConnectionTrait>(
+    db: &C,
+    segment: &'static str,
+) -> Result<u64, DbErr> {
+    let under = format!(
+        "(key_path = '{segment}' OR substr(key_path, 1, {}) = '{segment}/')",
+        segment.len() + 1
+    );
+    encryption_network_key::Entity::find()
         .filter(
-            Expr::cust("(key_path = 'apps' OR substr(key_path, 1, 5) = 'apps/')")
+            Expr::cust(under)
                 .and(encryption_network_key::Column::Kind.ne(KeyKind::Deletable.as_str())),
         )
         .count(db)
-        .await?;
-    if stray == 0 {
-        return Ok(());
-    }
-    Err(EncryptionServiceError::StrayAppKeyRows(stray))
+        .await
 }

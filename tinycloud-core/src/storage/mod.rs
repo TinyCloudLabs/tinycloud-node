@@ -136,6 +136,17 @@ pub trait ImmutableReadStore: Send + Sync {
         id: &Hash,
         generation: i64,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error>;
+    /// The stored object's length in bytes, when the store can learn it
+    /// without reading the object (a file stat, an S3 HEAD). `Ok(None)` when
+    /// the object is missing or the store has no such probe.
+    async fn size(
+        &self,
+        _space: &SpaceId,
+        _id: &Hash,
+        _generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
     async fn read_range(
         &self,
         space: &SpaceId,
@@ -258,6 +269,14 @@ where
         generation: i64,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         (**self).read(space, id, generation).await
+    }
+    async fn size(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        generation: i64,
+    ) -> Result<Option<u64>, Self::Error> {
+        (**self).size(space, id, generation).await
     }
     async fn read_range(
         &self,

@@ -48,12 +48,105 @@ type OperationLockRegistry =
 /// How a hydration ended, as every caller that joined it sees it.
 #[derive(Clone, Debug)]
 enum HydrationOutcome {
+    SpaceDeleted,
     Ready,
     Unavailable(&'static str),
     Failed(String),
     TimedOut,
     /// The stored database exceeds the artifact read limit (TC-2961).
     TooLarge,
+}
+
+use crate::database_artifacts::{ArtifactSink, DatabaseArtifact, DeltaSave};
+use crate::db_retry::{retry_owner, Replay, RetryPolicy};
+use async_trait::async_trait;
+
+/// The artifact repository with its metadata read run by the retry owner
+/// ([`retry_owner`]): one cancel-safe database read that writes nothing and
+/// spawns nothing. The payload reads and the saves are not retried here: a
+/// payload read streams into the staging sink and a save writes.
+struct MetaRetry<'a> {
+    inner: &'a dyn DatabaseArtifactRepository,
+    policy: Option<RetryPolicy>,
+}
+
+#[async_trait]
+impl DatabaseArtifactRepository for MetaRetry<'_> {
+    async fn load_meta(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+    ) -> Result<Option<ArtifactMeta>, DatabaseArtifactError> {
+        retry_owner(
+            "sql_hydration_meta",
+            self.policy.clone(),
+            Replay::Never,
+            || self.inner.load_meta(service, space, name),
+            |error: &DatabaseArtifactError| match error {
+                DatabaseArtifactError::Db(error) => Some(error),
+                _ => None,
+            },
+        )
+        .await
+        .0
+    }
+
+    async fn read_chunks(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        meta: &ArtifactMeta,
+        sink: &mut dyn ArtifactSink,
+    ) -> Result<(), DatabaseArtifactError> {
+        self.inner
+            .read_chunks(service, space, name, meta, sink)
+            .await
+    }
+
+    fn chunked_checkpoints(&self, service: &str, space: &str, name: &str) -> bool {
+        self.inner.chunked_checkpoints(service, space, name)
+    }
+
+    async fn save_snapshot(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        snapshot: tempfile::NamedTempFile,
+        expected: ArtifactExpectation,
+    ) -> Result<ArtifactMeta, DatabaseArtifactError> {
+        self.inner
+            .save_snapshot(service, space, name, snapshot, expected)
+            .await
+    }
+
+    async fn save(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        payload: ::bytes::Bytes,
+        expected: ArtifactExpectation,
+    ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+        self.inner
+            .save(service, space, name, payload, expected)
+            .await
+    }
+
+    async fn save_delta(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        payload: ::bytes::Bytes,
+        expected: ArtifactExpectation,
+    ) -> Result<DeltaSave, DatabaseArtifactError> {
+        self.inner
+            .save_delta(service, space, name, payload, expected)
+            .await
+    }
 }
 
 const PHASE_LOADING: u8 = 0;
@@ -163,6 +256,12 @@ struct CheckpointBackoff {
     refused: bool,
 }
 
+/// Hydration metadata kept for exactly as long as its actor's lineage.
+struct LoadedLineage {
+    expectation: ArtifactExpectation,
+    checkpoint_size_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
@@ -176,17 +275,26 @@ pub struct SqlService {
     /// durable save so a stale actor is rejected instead of clobbering. Written
     /// on hydration (the only path that creates an actor) and after each
     /// successful save, cleared alongside the actor by `discard_local_state`.
-    lineage: Arc<DashMap<(String, String), ArtifactExpectation>>,
+    lineage: Arc<DashMap<(String, String), LoadedLineage>>,
     base_path: String,
     memory_threshold: u64,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
     bounds: SqlWaitBounds,
     durability: DurabilityPolicy,
     ddl_policy: DdlPolicy,
+    retry_policy: Option<RetryPolicy>,
     /// See [`CheckpointBackoff`]; kept across `discard_local_state`.
     checkpoint_backoff: Arc<DashMap<(String, String), CheckpointBackoff>>,
     /// The first back-off and its cap.
     checkpoint_backoff_bounds: (Duration, Duration),
+    /// The shadow uploader's save hook (TC-1491).
+    ///
+    /// Defaults to [`NoopSink`](crate::sql::store::NoopSink). After a save
+    /// succeeds, `persist_write` hands it the revision and checkpoint cid:
+    /// metadata only, no bytes, never fails. The node runtime replaces it via
+    /// [`SqlService::with_shadow`] only when `[sql_store] enabled` and the
+    /// space allowlist is non-empty.
+    shadow: Arc<dyn crate::sql::store::ShadowSink>,
 }
 
 impl SqlService {
@@ -206,8 +314,10 @@ impl SqlService {
             bounds: SqlWaitBounds::default(),
             durability: DurabilityPolicy::default(),
             ddl_policy: DdlPolicy::default(),
+            retry_policy: None,
             checkpoint_backoff: Arc::new(DashMap::new()),
             checkpoint_backoff_bounds: (CHECKPOINT_BACKOFF, CHECKPOINT_BACKOFF_MAX),
+            shadow: Arc::new(crate::sql::store::NoopSink),
         }
     }
 
@@ -215,6 +325,14 @@ impl SqlService {
     /// per-database size cap and the disk headroom.
     pub fn with_durability(mut self, durability: DurabilityPolicy) -> Self {
         self.durability = durability;
+        self
+    }
+
+    /// The budget for retrying a hydration's artifact read after a lost
+    /// connection ([`crate::db_retry::retry_owner`]). Without it a hydration
+    /// is not retried.
+    pub fn with_retry_policy(mut self, policy: Option<RetryPolicy>) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -228,6 +346,25 @@ impl SqlService {
     pub fn with_wait_bounds(mut self, bounds: SqlWaitBounds) -> Self {
         self.bounds = bounds;
         self
+    }
+    /// Wire the shadow uploader's save hook (TC-1491). The default is
+    /// [`NoopSink`](crate::sql::store::NoopSink); the node runtime calls this
+    /// after [`SqlService::new`] when `[sql_store]` is enabled with a
+    /// non-empty allowlist.
+    pub fn with_shadow(mut self, shadow: Arc<dyn crate::sql::store::ShadowSink>) -> Self {
+        self.shadow = shadow;
+        self
+    }
+
+    /// Tell the shadow uploader a save landed. Synchronous and infallible:
+    /// the sink only records the head.
+    fn notify_shadow(&self, space: &SpaceId, db_name: &str, revision: i64, cid: &str) {
+        self.shadow.notify(crate::sql::store::Notice {
+            space: space.to_string(),
+            db_id: db_name.to_string(),
+            revision,
+            cid: cid.to_string(),
+        });
     }
 
     /// The checkpoint back-off (TC-2961): `first` after a failed or refused
@@ -418,7 +555,12 @@ impl SqlService {
         begin_write()?;
 
         let result = match handle
-            .execute_authorized(request.clone(), caveats.clone(), authority.clone(), growth)
+            .execute_authorized(
+                request.clone(),
+                caveats.clone(),
+                authority.clone(),
+                self.admitted_growth(&key, growth),
+            )
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -427,7 +569,12 @@ impl SqlService {
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
                 handle
-                    .execute_authorized(request, caveats, authority, growth)
+                    .execute_authorized(
+                        request,
+                        caveats,
+                        authority,
+                        self.admitted_growth(&key, growth),
+                    )
                     .await
             }
             other => other,
@@ -436,7 +583,7 @@ impl SqlService {
             Ok(result) => result,
             Err(error) => {
                 if (growth == GrowthPolicy::Forbid
-                    && self.expectation(&key) == ArtifactExpectation::Absent)
+                    && self.expectation(&key).await? == ArtifactExpectation::Absent)
                     // The disk failed the commit: its WAL is not to be trusted
                     // (Postgres never saw the write), so start over from it.
                     || matches!(error, SqlError::CommitFailed)
@@ -449,7 +596,7 @@ impl SqlService {
 
         if !result.write_targets.is_empty() {
             if growth == GrowthPolicy::Forbid
-                && self.expectation(&key) == ArtifactExpectation::Absent
+                && self.expectation(&key).await? == ArtifactExpectation::Absent
             {
                 // The actor's guard admitted no new pages. Serializing this
                 // empty database would nevertheless create a charged header.
@@ -527,11 +674,21 @@ impl SqlService {
         F: FnOnce(SqlService) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, SqlError>> + Send + 'static,
     {
+        // The operation task outlives this future if it is dropped, so it
+        // never runs inside a retry attempt (TC-2610).
+        crate::db_retry::refuse_in_retry_attempt("sql_operation_task")
+            .map_err(|error| SqlError::Internal(error.to_string()))?;
         let service = self.clone();
-        let task = request_cancel::within(request_cancel::current(), async move {
-            let _guard = guard;
-            operation(service).await
-        })
+        // The operation task does not inherit task-locals: carry the
+        // overload signal across the spawn.
+        let overload = crate::db_retry::overload();
+        let task = crate::db_retry::within_overload(
+            overload,
+            request_cancel::within(request_cancel::current(), async move {
+                let _guard = guard;
+                operation(service).await
+            }),
+        )
         .instrument(tracing::Span::current());
         let joined = match request_telemetry::current() {
             Some(context) => tokio::spawn(request_telemetry::scope(context, task)).await,
@@ -614,6 +771,9 @@ impl SqlService {
         let db_name = super::publication::DATABASE;
         let key = (space.to_string(), db_name.to_string());
         let handle = self.handle(space, db_name).await?;
+        if command["operation"] != "capabilities" && self.checkpoint_over_save_limit(&key) {
+            return Err(SqlError::DatabaseReadOnlySizeLimit);
+        }
         begin_write()?;
         let result = handle.publication(command).await?;
         if !result.write_targets.is_empty() {
@@ -702,6 +862,10 @@ impl SqlService {
             if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
                 return Ok(handle);
             }
+            // A cold hydration runs on its own task, which a retry owner's
+            // budget could not stop (TC-2610).
+            crate::db_retry::refuse_in_retry_attempt("sql_hydration_task")
+                .map_err(|error| SqlError::Internal(error.to_string()))?;
             let (flight, start) = {
                 let mut flights = self
                     .hydrations
@@ -729,6 +893,7 @@ impl SqlService {
             }
             match self.join_hydration(flight, space, db_name).await? {
                 HydrationOutcome::Ready => continue,
+                HydrationOutcome::SpaceDeleted => return Err(SqlError::SpaceDeleted),
                 HydrationOutcome::Unavailable(kind) => {
                     note_unavailable(kind, space, db_name);
                     return Err(SqlError::Unavailable);
@@ -796,10 +961,13 @@ impl SqlService {
         };
         let service = self.clone();
         let (space, db_name) = (space.clone(), db_name.to_string());
-        let task = async move {
+        // The flight task does not inherit the caller's task-locals: carry
+        // the overload signal across the spawn.
+        let overload = crate::db_retry::overload();
+        let task = crate::db_retry::within_overload(overload, async move {
             let ended = service.hydrate(&space, &db_name, &retire.phase).await;
             retire.finish(ended);
-        }
+        })
         .instrument(tracing::Span::current());
         let telemetry = request_telemetry::current();
         let start = move || match telemetry {
@@ -824,15 +992,16 @@ impl SqlService {
             is_sqlite_database,
             is_sqlite_wal,
         );
+        // The metadata read, the first statement of a cold hydration, is
+        // retried once by the owner when its pooled connection was lost; the
+        // payload reads that follow are not.
+        let repository = MetaRetry {
+            inner: self.artifact_repository.as_ref(),
+            policy: self.retry_policy.clone(),
+        };
         let loaded = tokio::time::timeout(
             self.bounds.hydration_max,
-            read_artifact(
-                self.artifact_repository.as_ref(),
-                "sql",
-                &space.to_string(),
-                db_name,
-                &mut sink,
-            ),
+            read_artifact(&repository, "sql", &space.to_string(), db_name, &mut sink),
         )
         .await;
         let meta = match loaded {
@@ -900,9 +1069,12 @@ impl SqlService {
                     .map_err(|e| SqlError::Internal(e.to_string()))?;
                 self.lineage.insert(
                     key,
-                    ArtifactExpectation::Derived {
-                        revision: meta.revision,
-                        checkpoint_content_hash: meta.checkpoint_content_hash,
+                    LoadedLineage {
+                        checkpoint_size_bytes: meta.checkpoint_size_bytes.max(0) as u64,
+                        expectation: ArtifactExpectation::Derived {
+                            revision: meta.revision,
+                            checkpoint_content_hash: meta.checkpoint_content_hash,
+                        },
                     },
                 );
                 Ok(())
@@ -913,7 +1085,13 @@ impl SqlService {
                     "No durable database artifact; starting from an empty database"
                 );
                 remove_sql_cache_files(&cache_path).await?;
-                self.lineage.insert(key, ArtifactExpectation::Absent);
+                self.lineage.insert(
+                    key,
+                    LoadedLineage {
+                        expectation: ArtifactExpectation::Absent,
+                        checkpoint_size_bytes: 0,
+                    },
+                );
                 Ok(())
             }
         }
@@ -926,12 +1104,16 @@ impl SqlService {
     }
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), SqlError> {
-        if let Some((_, handle)) = self.databases.remove(key) {
+        // The actor and its lineage leave together: both entries are dropped
+        // before shutdown is awaited, so a failing shutdown cannot leave a
+        // lineage without an actor (or an actor without a lineage).
+        let handle = self.databases.remove(key).map(|(_, handle)| handle);
+        self.lineage.remove(key);
+        if let Some(handle) = handle {
             // Wait for the connection to close before unlinking its cache:
             // an exit-time flush must not race the next durable hydration.
             handle.shutdown().await?;
         }
-        self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
             .join(format!("{}.db", key.1));
@@ -942,17 +1124,36 @@ impl SqlService {
     ///
     /// Every actor is created by `handle`, which records this during hydration,
     /// so a live actor always has an entry. A missing one means the actor
-    /// outlived its record and there is nothing to assert against.
-    fn expectation(&self, key: &(String, String)) -> ArtifactExpectation {
-        match self.lineage.get(key).map(|entry| entry.clone()) {
-            Some(expectation) => expectation,
-            None => {
-                tracing::warn!(
-                    service = "sql",
-                    "No recorded artifact lineage for a live database; saving without a lineage assertion"
-                );
-                ArtifactExpectation::Any
-            }
+    /// outlived its record: its state cannot be asserted against the durable
+    /// artifact, so it is discarded and the request fails.
+    async fn expectation(&self, key: &(String, String)) -> Result<ArtifactExpectation, SqlError> {
+        if let Some(expectation) = self.lineage.get(key).map(|entry| entry.expectation.clone()) {
+            return Ok(expectation);
+        }
+        tracing::error!(
+            service = "sql",
+            "No recorded artifact lineage for a live database; discarding the actor"
+        );
+        self.discard_local_state(key).await?;
+        Err(SqlError::Internal(
+            "Database lineage missing for live actor".into(),
+        ))
+    }
+
+    fn checkpoint_over_save_limit(&self, key: &(String, String)) -> bool {
+        let limit = self.artifact_repository.max_write_bytes();
+        limit != 0
+            && self
+                .lineage
+                .get(key)
+                .is_some_and(|entry| entry.checkpoint_size_bytes > limit)
+    }
+
+    fn admitted_growth(&self, key: &(String, String), growth: GrowthPolicy) -> GrowthPolicy {
+        if self.checkpoint_over_save_limit(key) {
+            GrowthPolicy::ReadOnlySaveLimit
+        } else {
+            growth
         }
     }
 
@@ -1007,7 +1208,7 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
-        let expected = self.expectation(&key);
+        let expected = self.expectation(&key).await?;
 
         if self
             .artifact_repository
@@ -1105,10 +1306,20 @@ impl SqlService {
             self.checkpoint_backoff.remove(&key);
             self.lineage.insert(
                 key,
-                ArtifactExpectation::Derived {
-                    revision: saved.revision,
-                    checkpoint_content_hash: saved.checkpoint_content_hash,
+                LoadedLineage {
+                    checkpoint_size_bytes: saved.checkpoint_size_bytes.max(0) as u64,
+                    expectation: ArtifactExpectation::Derived {
+                        revision: saved.revision,
+                        checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+                    },
                 },
+            );
+            // Shadow hook (TC-1491): metadata only, on the Ok arm only.
+            self.notify_shadow(
+                space,
+                db_name,
+                saved.revision,
+                &saved.checkpoint_content_hash,
             );
             return Ok(());
         }
@@ -1132,7 +1343,7 @@ impl SqlService {
                         "sql",
                         &space.to_string(),
                         db_name,
-                        wal,
+                        wal.into(),
                         expected.clone(),
                     ),
                 )
@@ -1141,8 +1352,18 @@ impl SqlService {
                 Ok(saved) => {
                     // The delta rides on the same checkpoint, so only the
                     // revision this actor is caught up to moves.
-                    self.lineage
-                        .insert(key, expected.advanced_to(saved.revision));
+                    if let Some(mut lineage) = self.lineage.get_mut(&key) {
+                        lineage.expectation = expected.advanced_to(saved.revision);
+                    }
+                    // Shadow hook (TC-1491), delta branch: the WAL rides on
+                    // the checkpoint this actor derives from.
+                    if let ArtifactExpectation::Derived {
+                        checkpoint_content_hash,
+                        ..
+                    } = &expected
+                    {
+                        self.notify_shadow(space, db_name, saved.revision, checkpoint_content_hash);
+                    }
                     tracing::info!(
                         service = "sql",
                         mode = "wal",
@@ -1187,7 +1408,7 @@ impl SqlService {
                     "sql",
                     &space.to_string(),
                     db_name,
-                    payload,
+                    payload.into(),
                     expected,
                 ),
             ))
@@ -1216,10 +1437,20 @@ impl SqlService {
         self.checkpoint_backoff.remove(&key);
         self.lineage.insert(
             key,
-            ArtifactExpectation::Derived {
-                revision: saved.revision,
-                checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+            LoadedLineage {
+                checkpoint_size_bytes: bytes as u64,
+                expectation: ArtifactExpectation::Derived {
+                    revision: saved.revision,
+                    checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+                },
             },
+        );
+        // Shadow hook (TC-1491): metadata only, on the Ok arm only.
+        self.notify_shadow(
+            space,
+            db_name,
+            saved.revision,
+            &saved.checkpoint_content_hash,
         );
         tracing::info!(
             service = "sql",
@@ -1316,6 +1547,8 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
     match err {
         DatabaseArtifactError::StorageLimit => SqlError::DatabaseSizeLimit,
         DatabaseArtifactError::ReplacementBusy => SqlError::ReplacementBusy,
+        DatabaseArtifactError::SpaceDeleted => SqlError::SpaceDeleted,
+        DatabaseArtifactError::LifecycleUnavailable => SqlError::Unavailable,
         DatabaseArtifactError::Db(ref error) if is_transient_error(error) => {
             tracing::warn!(
                 service = "sql",
@@ -1380,6 +1613,7 @@ fn begin_write() -> Result<(), SqlError> {
 fn hydration_failure(error: SqlError, kind: &'static str) -> HydrationOutcome {
     match error {
         SqlError::Unavailable => HydrationOutcome::Unavailable(kind),
+        SqlError::SpaceDeleted => HydrationOutcome::SpaceDeleted,
         SqlError::Internal(message) => HydrationOutcome::Failed(message),
         SqlError::DatabaseTooLargeToLoad => HydrationOutcome::TooLarge,
         error => HydrationOutcome::Failed(error.to_string()),
@@ -1464,6 +1698,469 @@ mod tests {
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         Arc::new(SeaOrmDatabaseArtifactRepository::new(db))
+    }
+
+    #[tokio::test]
+    async fn tc1491_oversized_checkpoint_is_read_only_across_reload() {
+        use super::super::caveats::PreparedStatement;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let writer = SeaOrmDatabaseArtifactRepository::new(db.clone());
+        let space = test_space_id("oversized-read-only");
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(fixture.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(v TEXT); INSERT INTO items VALUES ('original');
+             CREATE TABLE padding(v BLOB); INSERT INTO padding VALUES (zeroblob(262144));",
+        )
+        .unwrap();
+        drop(conn);
+        let payload = std::fs::read(fixture.path()).unwrap();
+        // An UPDATE's WAL fits this ceiling, but the stored checkpoint does not.
+        let limit = 64 * 1024;
+        assert!(payload.len() > limit);
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                "main",
+                payload.clone().into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                super::super::publication::DATABASE,
+                payload.clone().into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(db)
+                .with_max_write_bytes(limit as u64)
+                .with_max_read_bytes(payload.len() as u64),
+        );
+        let repo = Arc::new(SizeTrackingArtifactRepository::new(repo, SqlSizes::new()));
+        let before = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        let caveats = Some(SqlCaveats {
+            statements: Some(vec![PreparedStatement {
+                name: "update".into(),
+                sql: "UPDATE items SET v = 'changed'".into(),
+            }]),
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            let cache = TempDir::new().unwrap();
+            let service =
+                SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+            for reload in 0..2 {
+                let read = service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "SELECT v FROM items".into(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/read".into(),
+                    )
+                    .await
+                    .unwrap();
+                let SqlResponse::Query(read) = read.response else {
+                    panic!("expected rows")
+                };
+                assert_eq!(read.rows, vec![vec![SqlValue::Text("original".into())]]);
+                let path = service.cache_path(&space, "main");
+                let local_before = std::fs::read(&path).unwrap();
+                for request in [
+                    SqlRequest::Execute {
+                        sql: "UPDATE items SET v = 'changed'".into(),
+                        params: vec![],
+                        schema: None,
+                    },
+                    SqlRequest::Query {
+                        sql: "WITH c AS (SELECT 1) UPDATE items SET v = 'changed' RETURNING v"
+                            .into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    SqlRequest::Batch {
+                        statements: vec![SqlStatement {
+                            sql: "DELETE FROM items".into(),
+                            params: vec![],
+                        }],
+                    },
+                    SqlRequest::ExecuteStatement {
+                        name: "update".into(),
+                        params: vec![],
+                    },
+                    SqlRequest::Execute {
+                        sql: "SELECT 1".into(),
+                        params: vec![],
+                        schema: Some(vec!["CREATE TABLE forbidden(v)".into()]),
+                    },
+                    SqlRequest::Execute {
+                        sql: "DROP TABLE items".into(),
+                        params: vec![],
+                        schema: None,
+                    },
+                    SqlRequest::Query {
+                        sql: "PRAGMA user_version = 7".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                ] {
+                    let error = service
+                        .execute(
+                            &space,
+                            "main",
+                            request,
+                            caveats.clone(),
+                            "tinycloud.sql/admin".into(),
+                        )
+                        .await
+                        .expect_err("oversized checkpoint admitted a mutation");
+                    assert!(
+                        error.to_string().contains("sql_database_size_limit"),
+                        "{error}"
+                    );
+                    assert!(error.to_string().contains("read-only"), "{error}");
+                    assert_eq!(std::fs::read(&path).unwrap(), local_before);
+                    assert_eq!(std::fs::metadata(sql_wal_path(&path)).unwrap().len(), 0);
+                }
+                let version = service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "PRAGMA user_version".into(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/admin".into(),
+                    )
+                    .await
+                    .unwrap();
+                let SqlResponse::Query(version) = version.response else {
+                    panic!("expected version")
+                };
+                assert_eq!(version.rows, vec![vec![SqlValue::Integer(0)]]);
+                // Export remains available and contains the unchanged rows.
+                let exported = service.export(&space, "main").await.unwrap();
+                let exported_file = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(exported_file.path(), exported).unwrap();
+                let conn = rusqlite::Connection::open(exported_file.path()).unwrap();
+                assert_eq!(
+                    conn.query_row("SELECT v FROM items", [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    "original"
+                );
+                drop(conn);
+                service
+                    .discard_local_state(&(space.to_string(), "main".into()))
+                    .await
+                    .unwrap();
+                assert!(
+                    !service
+                        .lineage
+                        .contains_key(&(space.to_string(), "main".into())),
+                    "reload {reload}"
+                );
+            }
+            let caps = service
+                .meeting_publication(
+                    &space,
+                    serde_json::json!({"contractVersion":3,"operation":"capabilities"}),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(caps.response, SqlResponse::Query(_)));
+            for operation in ["activate", "reserve", "stage", "publish", "delete", "purge"] {
+                let error = service
+                    .meeting_publication(
+                        &space,
+                        serde_json::json!({"contractVersion":3,"operation":operation}),
+                    )
+                    .await
+                    .expect_err("oversized publication mutation admitted");
+                assert!(
+                    error.to_string().contains("sql_database_size_limit"),
+                    "{error}"
+                );
+            }
+            service
+                .discard_local_state(&(
+                    space.to_string(),
+                    super::super::publication::DATABASE.into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let after = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(after.delta_payload, before.delta_payload);
+        assert_eq!(after.content_hash, before.content_hash);
+    }
+
+    #[tokio::test]
+    async fn tc1491_checkpoint_at_write_limit_still_accepts_wal_writes() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let writer = SeaOrmDatabaseArtifactRepository::new(db.clone());
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let conn = rusqlite::Connection::open(fixture.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items(v); INSERT INTO items VALUES (1);
+            CREATE TABLE padding(v); INSERT INTO padding VALUES (zeroblob(65536));",
+        )
+        .unwrap();
+        drop(conn);
+        let payload = std::fs::read(fixture.path()).unwrap();
+        let limit = payload.len() as u64;
+        let space = test_space_id("within-save-limit");
+        writer
+            .save(
+                "sql",
+                &space.to_string(),
+                "main",
+                payload.into(),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(db).with_max_write_bytes(limit));
+        let cache = TempDir::new().unwrap();
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone());
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    sql: "UPDATE items SET v = 2".into(),
+                    params: vec![],
+                    schema: None,
+                },
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        let stored = repo
+            .read_all("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.delta_payload.is_some(),
+            "small write should use WAL persistence"
+        );
+        service
+            .discard_local_state(&(space.to_string(), "main".into()))
+            .await
+            .unwrap();
+    }
+
+    /// A recording `ShadowSink` for the save-hook tests below. (TC-1491.)
+    #[derive(Debug, Default)]
+    struct ProbeSink {
+        notices: std::sync::Mutex<Vec<crate::sql::store::Notice>>,
+    }
+
+    impl ProbeSink {
+        fn notices(&self) -> Vec<crate::sql::store::Notice> {
+            self.notices.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::sql::store::ShadowSink for ProbeSink {
+        fn notify(&self, notice: crate::sql::store::Notice) {
+            // Runs inside the per-DB operation lock: sync, never awaits.
+            self.notices.lock().unwrap().push(notice);
+        }
+    }
+
+    async fn execute_insert(service: &SqlService, space: &SpaceId, value: &str) {
+        service
+            .execute(
+                space,
+                "main",
+                SqlRequest::Execute {
+                    sql: format!("INSERT INTO items (v) VALUES ('{value}')"),
+                    params: vec![],
+                    schema: Some(vec!["CREATE TABLE IF NOT EXISTS items (v TEXT)".into()]),
+                },
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tc1491_save_hook_checkpoint_path_notifies_revision_and_cid() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("tc1491-notice-checkpoint");
+        let sink = Arc::new(ProbeSink::default());
+        let repo = artifact_repository().await;
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
+        execute_insert(&service, &space, "first").await;
+        let meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!meta.has_delta(), "the first save is a checkpoint");
+        assert_eq!(
+            sink.notices(),
+            vec![crate::sql::store::Notice {
+                space: space.to_string(),
+                db_id: "main".into(),
+                revision: 1,
+                cid: meta.checkpoint_content_hash,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn tc1491_save_hook_delta_path_notifies_the_checkpoint_the_wal_rides_on() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("tc1491-notice-delta");
+        let sink = Arc::new(ProbeSink::default());
+        let repo = artifact_repository().await;
+        let service = SqlService::new(cache.path().to_string_lossy().into_owned(), 0, repo.clone())
+            .with_ddl_policy(DdlPolicy::Log)
+            .with_shadow(sink.clone());
+        execute_insert(&service, &space, "first").await;
+        execute_insert(&service, &space, "second").await;
+        let meta = repo
+            .load_meta("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(meta.has_delta(), "the second save is a WAL delta");
+        let notices = sink.notices();
+        assert_eq!(notices.len(), 2, "one notice per save");
+        assert_eq!(
+            notices.iter().map(|n| n.revision).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // Both name the checkpoint the artifact still rides on.
+        assert!(notices
+            .iter()
+            .all(|n| n.cid == meta.checkpoint_content_hash && n.db_id == "main"));
+    }
+
+    #[tokio::test]
+    async fn tc1491_notice_board_drops_notices_for_spaces_outside_the_allowlist() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("tc1491-notice-disallowed");
+        let board = Arc::new(crate::sql::store::shadow::NoticeBoard::new(
+            crate::sql::store::SpaceAllowlist::default(),
+            Arc::new(crate::sql::store::shadow::metrics::NoopMetrics),
+        ));
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            artifact_repository().await,
+        )
+        .with_ddl_policy(DdlPolicy::Log)
+        .with_shadow(board.clone());
+        execute_insert(&service, &space, "x").await;
+        assert!(
+            board.take().is_empty(),
+            "an empty allowlist records nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc1491_default_noop_sink_leaves_the_persist_path_working() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("tc1491-noop-default");
+        // No `with_shadow`: service defaults to NoopSink.
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            0,
+            artifact_repository().await,
+        )
+        .with_ddl_policy(DdlPolicy::Log);
+        execute_insert(&service, &space, "x").await;
+        // Trivially, no panic; the hook is one call into `NoopSink::notify`.
+    }
+
+    #[tokio::test]
+    async fn tc2612_failed_shutdown_still_removes_actor_and_lineage() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-shutdown-failure");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        let handle = service.handle(&space, "a").await.unwrap();
+        assert!(service.lineage.contains_key(&key));
+        // Kill the actor, then re-register its dead handle so shutdown fails.
+        handle.shutdown().await.unwrap();
+        service.databases.insert(key.clone(), handle);
+
+        let result = service.discard_local_state(&key).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn tc2612_missing_lineage_is_an_error_and_discards_the_actor() {
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-missing-lineage");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            artifact_repository().await,
+        );
+        let key = (space.to_string(), "a".to_string());
+        service.handle(&space, "a").await.unwrap();
+        service.lineage.remove(&key);
+
+        let result = service
+            .execute_without_growth(
+                &space,
+                "a",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE t (id INTEGER)".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await;
+        assert!(matches!(result, Err(SqlError::Internal(_))), "{result:?}");
+        assert!(!service.databases.contains_key(&key));
+        assert!(!service.lineage.contains_key(&key));
     }
 
     #[tokio::test]
@@ -3378,7 +4075,7 @@ mod tests {
             "sql",
             &space.to_string(),
             "main",
-            vec![0x37, 0x7f, 0x06, 0x82, 0, 0, 0, 0],
+            vec![0x37, 0x7f, 0x06, 0x82, 0, 0, 0, 0].into(),
             ArtifactExpectation::Any,
         )
         .await
@@ -3451,7 +4148,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -3464,7 +4161,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -3720,7 +4417,7 @@ mod tests {
                 "sql",
                 "other-tenant",
                 name,
-                vec![1; large],
+                vec![1; large].into(),
                 ArtifactExpectation::Absent,
             )
             .await
@@ -3858,7 +4555,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             let saved = self
@@ -3874,7 +4571,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             let saved = self
@@ -3974,7 +4671,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.fail()?;
@@ -3988,7 +4685,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.fail()?;
@@ -4112,6 +4809,176 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct ManualClock(Arc<AtomicU64>);
+
+    impl crate::db_retry::Clock for ManualClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn lost_connection() -> DbErr {
+        DbErr::Exec(sea_orm::RuntimeErr::SqlxError(
+            sea_orm::error::SqlxError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        ))
+    }
+
+    /// A seeded database `a`, and a cold service over it (an empty cache)
+    /// with the operation budget, whose artifact reads fail while
+    /// `repo.failures` is above zero.
+    async fn cold_service_over_a_seeded_database() -> (
+        SqlService,
+        Arc<FlakyArtifactRepository>,
+        SpaceId,
+        Vec<TempDir>,
+    ) {
+        let repo = Arc::new(FlakyArtifactRepository {
+            inner: artifact_repository().await,
+            failures: AtomicU64::new(0),
+            error: lost_connection,
+        });
+        let space = test_space_id("sql-hydration-retry");
+        let seed_cache = TempDir::new().unwrap();
+        let seeder = SqlService::new(
+            seed_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+        seeder
+            .execute(
+                &space,
+                "a",
+                insert("seed"),
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let cold_cache = TempDir::new().unwrap();
+        let cold = SqlService::new(
+            cold_cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        )
+        .with_retry_policy(Some(crate::db_retry::RetryPolicy::new(
+            std::time::Duration::from_secs(10),
+        )));
+        (cold, repo, space, vec![seed_cache, cold_cache])
+    }
+
+    /// TC-2610: a cold read whose hydration meets a lost connection restarts
+    /// its artifact read once, inside the request, and is served.
+    #[tokio::test]
+    async fn a_hydration_read_recovers_in_request_after_a_lost_connection() {
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+
+        let served = crate::db_retry::isolate_overload(cold.execute(
+            &space,
+            "a",
+            count(),
+            None,
+            "tinycloud.sql/read".into(),
+        ))
+        .await
+        .expect("the hydration was retried and served");
+
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0, "the loss was met");
+        match served.response {
+            SqlResponse::Query(query) => assert_eq!(query.rows, vec![vec![SqlValue::Integer(1)]]),
+            other => panic!("expected a query response, got {other:?}"),
+        }
+    }
+
+    /// TC-2610: inside the overload window the hydration read is not
+    /// retried; the same loss after the window is.
+    #[tokio::test]
+    async fn the_overload_signal_suppresses_the_hydration_retry_until_its_window_ends() {
+        use crate::db_retry::{with_overload_signal, OverloadSignal, OVERLOAD_SUPPRESS};
+        let clock = ManualClock::default();
+        let signal = OverloadSignal::new(clock.clone(), OVERLOAD_SUPPRESS);
+        clock.0.store(1_000, Ordering::SeqCst);
+        signal.stamp("request_timeout");
+
+        clock.0.store(1_000 + 29_999, Ordering::SeqCst);
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+        let inside = with_overload_signal(
+            signal.clone(),
+            cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
+        )
+        .await;
+        assert!(
+            matches!(inside, Err(SqlError::Unavailable)),
+            "inside the window: not retried, {inside:?}"
+        );
+        assert_eq!(
+            repo.failures.load(Ordering::SeqCst),
+            0,
+            "one loss, one read"
+        );
+
+        clock.0.store(1_000 + 30_000, Ordering::SeqCst);
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        repo.failures.store(1, Ordering::SeqCst);
+        let after = with_overload_signal(
+            signal,
+            cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into()),
+        )
+        .await
+        .expect("after the window the hydration is retried and served");
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0);
+        assert!(matches!(after.response, SqlResponse::Query(_)));
+    }
+
+    /// TC-2610: work that runs on a spawned task is refused inside a retry
+    /// attempt, since the owner's budget could not stop it: the operation
+    /// task of a request and a cold hydration each spawn nothing and are not
+    /// retried.
+    #[tokio::test]
+    async fn an_attempt_wrapped_around_a_spawn_path_is_refused() {
+        use crate::db_retry::{retry_owner, Replay, RetryPolicy};
+        let (cold, repo, space, _caches) = cold_service_over_a_seeded_database().await;
+        let policy = Some(RetryPolicy::new(std::time::Duration::from_secs(10)));
+        let attempts = AtomicU64::new(0);
+
+        let (request, _) = retry_owner(
+            "test_request",
+            policy.clone(),
+            Replay::Never,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                cold.execute(&space, "a", count(), None, "tinycloud.sql/read".into())
+            },
+            |_: &SqlError| None,
+        )
+        .await;
+        assert!(matches!(request, Err(SqlError::Internal(_))), "{request:?}");
+
+        let (hydration, _) = retry_owner(
+            "test_hydration",
+            policy,
+            Replay::Never,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                cold.handle(&space, "a")
+            },
+            |_: &SqlError| None,
+        )
+        .await;
+        assert!(matches!(hydration, Err(SqlError::Internal(_))));
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "each ran once");
+        assert!(
+            cold.databases
+                .get(&(space.to_string(), "a".to_string()))
+                .is_none(),
+            "no hydration was started"
+        );
+        assert_eq!(repo.failures.load(Ordering::SeqCst), 0, "no read was made");
+    }
+
     struct FailingArtifactRepository;
 
     #[async_trait]
@@ -4141,7 +5008,7 @@ mod tests {
             _service: &str,
             _space: &str,
             _name: &str,
-            _payload: Vec<u8>,
+            _payload: ::bytes::Bytes,
             _expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             Err(DatabaseArtifactError::Backend("forced failure".to_string()))
@@ -4342,7 +5209,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.saves_waiting.fetch_add(1, Ordering::SeqCst);
@@ -4357,7 +5224,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.saves_waiting.fetch_add(1, Ordering::SeqCst);
@@ -4912,7 +5779,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -4925,7 +5792,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -5289,7 +6156,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.inner
@@ -5302,7 +6169,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.inner
@@ -5550,7 +6417,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
             self.note("save");
@@ -5564,7 +6431,7 @@ mod tests {
             service: &str,
             space: &str,
             name: &str,
-            payload: Vec<u8>,
+            payload: ::bytes::Bytes,
             expected: ArtifactExpectation,
         ) -> Result<DeltaSave, DatabaseArtifactError> {
             self.note("save_delta");
@@ -6812,3 +7679,5 @@ mod tests {
             .unwrap();
     }
 }
+
+mod space_purge;

@@ -13,6 +13,11 @@ name: Docker Container
 # (RELEASE_PLZ_TOKEN) and a manual `git push --tags` also emits a normal `push`
 # event, so tag pushes reliably reach this workflow. `on: release` is kept for
 # backward compatibility should a PAT-published Release ever reappear.
+# Group only PR runs together; production and release runs must not supersede one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   push:
     branches: [main]
@@ -80,10 +85,10 @@ on:
         type: boolean
         default: true
       named_keys_v1:
-        description: 'Turn on named keys (TC-1777): sets NAMED_KEYS_V1 in the sealed Phala env. false keeps the routes off.'
+        description: 'Named keys (TC-1777): sets NAMED_KEYS_V1 in the sealed Phala env. Production runs true; false turns the routes off and breaks Share v3 decrypt (TC-3284).'
         required: false
         type: boolean
-        default: false
+        default: true
       image_version:
         description: 'Image version without leading v. Builds must match the selected crate; digest promotions must match the recorded image version (rollback_image_version when supplied).'
         required: false
@@ -109,8 +114,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: tinycloudlabs/tinycloud-node
   # Production dstack OS the tinycloud-node CVM must run (the Phala KMS only releases app keys to this image).
-  PHALA_OS_IMAGE: dstack-0.5.12
-  PHALA_OS_IMAGE_HASH: 8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
+  # TC-3554: Phala's KMS move put its CVMs on dstack 0.5.15 (prod and dev classes); 0.5.12 would be a downgrade.
+  # Hash from Phala /os-images (name dstack-0.5.15). The node CVM itself runs dstack-dev-0.5.15 (allowlist).
+  PHALA_OS_IMAGE: dstack-0.5.15
+  PHALA_OS_IMAGE_HASH: 4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca
 
 jobs:
   rollback-audit:
@@ -121,7 +128,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Audit durable meeting publication footprint without exporting data
         env:
           RECOVERY_DATABASE_URL: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
@@ -129,7 +136,7 @@ jobs:
           # production's Rust TLS client has compiled-in public roots.
           PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
         run: python3 scripts/audit-meeting-rollback.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: meeting-rollback-audit
@@ -147,7 +154,7 @@ jobs:
     outputs:
       image_version: ${{ steps.check.outputs.image_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check published Docker tags
         run: python3 scripts/ci/test-docker-tags.py
 
@@ -157,6 +164,8 @@ jobs:
         run: python3 scripts/ci/test-deploy-recovery.py
       - name: Test the Phala OS image guard
         run: bash scripts/ci/test-phala-os-guard.sh
+      - name: Test the Phala CVM read retry
+        run: bash scripts/ci/test-phala-cvm-json.sh
 
       - name: Validate image version against Cargo.toml
         id: check
@@ -313,14 +322,14 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -350,7 +359,7 @@ jobs:
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: latest=false
@@ -376,7 +385,7 @@ jobs:
       - name: Restore cargo build mounts (pull requests)
         if: github.event_name == 'pull_request'
         id: cargo_mounts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: docker-cache-mounts
           # One entry per commit, restored from the newest earlier one: a run
@@ -394,7 +403,7 @@ jobs:
           skip-extraction: ${{ steps.cargo_mounts.outputs.cache-hit }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
@@ -413,14 +422,17 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # TC-3839: signed build provenance for the image the CVM runs.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -454,7 +466,7 @@ jobs:
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: latest=false
@@ -470,7 +482,7 @@ jobs:
 
       - name: Build and push dstack Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
@@ -479,6 +491,16 @@ jobs:
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
           cache-from: type=gha,scope=dstack
           cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=dstack' || '' }}
+
+      # TC-3839: SLSA build provenance, signed with this workflow's OIDC identity and
+      # pushed next to the image. Check with the pinned command in docs/releasing.md
+      # (signer workflow, source ref, no self-hosted runners), never with -R alone.
+      - name: Attest dstack image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   build-ingress:
     name: Build dstack ingress image
@@ -491,8 +513,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # TC-3839: signed build provenance for the ingress image the CVM runs.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # TC-970: no ticket, identifier or client address in the ingress logs;
       # TC-910 header buffers and the 95 MiB body limit still hold. Runs before
@@ -500,10 +525,13 @@ jobs:
       - name: Test redacted ingress logging
         run: deploy/ingress/test-redacted-logging.sh
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Test temporary ingress failures
+        run: python3 deploy/ingress/test-upstream-unavailable.py
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -511,7 +539,7 @@ jobs:
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/tinycloudlabs/tinycloud-node-ingress
           tags: |
@@ -520,7 +548,7 @@ jobs:
 
       - name: Build and push ingress image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: deploy/ingress
           push: ${{ github.event_name != 'pull_request' }}
@@ -528,6 +556,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=ingress
           cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=ingress' || '' }}
+      - name: Attest ingress image build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/tinycloudlabs/tinycloud-node-ingress
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
       - name: Record ingress image digest
         if: steps.build.outputs.digest != ''
         env:
@@ -553,10 +588,36 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # require-green reads the check runs and workflow runs of the shipped commit.
+      checks: read
+      actions: read
+      # TC-3839: sign provenance for the deployed app-compose.json only.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+
+      # Pre-release security gate: refuse to ship unless main CI passed on the
+      # exact commit being shipped, before this job touches a deploy secret.
+      # A build ships GITHUB_SHA. A rollback or digest promotion with recorded
+      # labels ships ROLLBACK_REVISION, which must itself have passed the
+      # test and capability checks; gitleaks is then read on GITHUB_SHA, whose
+      # main run scans the full history, including that ancestor (the next
+      # step proves ancestry). Required names: docs/security/required-checks.md.
+      - name: Require green main CI on the shipped commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+        run: |
+          set -euo pipefail
+          SHIPPED="${ROLLBACK_REVISION:-${GITHUB_SHA}}"
+          node .github/scripts/require-green.mjs "${GITHUB_REPOSITORY}" "${SHIPPED}" \
+            ".github/workflows/rust.yml=test (workspace, PostgreSQL-backed)" \
+            ".github/workflows/rust.yml=capabilities"
+          node .github/scripts/require-green.mjs "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" \
+            ".github/workflows/security.yml=gitleaks"
 
       # TC-940: production is built and promoted only from main. Refuse any
       # other dispatched ref before this job touches a deploy secret.
@@ -569,14 +630,14 @@ jobs:
           bash scripts/ci/check-deploy-ref.sh
 
       - name: Log in to GHCR for digest validation
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
@@ -595,13 +656,13 @@ jobs:
 
       # Fail closed before any production change unless the CVM runs the pinned production OS, or the one pinned dev OS
       # in scripts/ci/phala-dev-os-allowlist.txt after a fresh integrity check (scripts/ci/phala-os-guard.sh).
-      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`.
+      # To fix it, set the OS by hand: `phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15`.
       - name: Require a permitted OS image on the CVM
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
         run: |
           set -euo pipefail
-          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
+          if ! cvm="$(bash scripts/ci/phala-cvm-json.sh tinycloud-node)"; then
             echo "::error::Cannot read the OS image of tinycloud-node from Phala"
             exit 1
           fi
@@ -624,7 +685,7 @@ jobs:
             exit 1
           fi
           trap 'rm -f "${CVM_JSON}"' EXIT
-          if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
+          if ! bash scripts/ci/phala-cvm-json.sh tinycloud-node >"${CVM_JSON}"; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
@@ -687,8 +748,10 @@ jobs:
             exit 1
           fi
           echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
-          # Later steps refuse a deployment older than what is running.
+          # Later steps refuse a deployment older than what is running, and
+          # accept the running revision only for its own image digest (TC-3765).
           echo "RUNNING_REVISION=${RUNNING_REVISION}" >> "$GITHUB_ENV"
+          echo "RUNNING_IMAGE=${RUNNING_IMAGE}" >> "$GITHUB_ENV"
 
       - name: Preflight quota authority
         env:
@@ -764,11 +827,19 @@ jobs:
           # TC-959: main's N0 compose (#349 c33c2302…) with the 95m ingress body
           # cap (raw d95bfb70…), the TC-1274 + TC-1317 + TC-1482 + c_index + TC-1840 + TC-1843 Vector config and the
           # optional TC-1482 NODE_STATS_READ_TOKEN env line, the TC-950 pool of 10 and the TC-1777 named-keys gate
-          # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes and the TC-2917
-          # storage-headroom event in the Vector config
-          # (raw 5419a6fb…; d703d69b… before TC-2917, 298ea356… before TC-2346, 192dfb7e… before TC-1777),
-          # its single node digest normalized to 64 zeros.
-          n0_template_hash = '90841a34e6ea5b581374f50abe70e580496e6814bc83f61f20fd4c9e090e5d51'
+          # env lines + deletion-ledger volume, the TC-2346 operation-retry warning codes, the TC-2917
+          # storage-headroom event in the Vector config, the TC-1491 artifact read limit env line, the TC-3554
+          # DstackKmsEpoch epoch-0 pins opened from root_wrap, no key-recovery sidecar, the TC-287 retention
+          # sweeper env line, the TC-1791 delegated SQL caveats env line, the TC-1491 SQL size-cap and
+          # free-disk env lines, the TC-3739 node_request DB timing fields, the TC-3834 node_request
+          # error_code, the TC-3284 deletion ledger error events and the TC-3284 named node diagnostics and the TC-3973 startup events in the Vector config
+          # (raw 7cc95bde…; e0f99bcc… / a8fb25f7… before TC-3973; 97a180a4… / bced82d3… before the named diagnostics, db348152… / 27287a38… before TC-3284, cc219eb5… / 02d90755… before TC-3834, c6d05e1e… / 46287bc3… before TC-3739,
+          # e5f1c356… / d1d2ef49… before the TC-1491 caps,
+          # e1cf031b… / f4f51e75… before TC-1791, 6a577c6d… / 272f43b8… before TC-287,
+          # 70c71aa0… / 8e602959… with the sidecar, 417719648a0c… / d6af7a70… before TC-3554,
+          # 5419a6fb… before TC-1491, d703d69b… before TC-2917, 298ea356… before TC-2346,
+          # 192dfb7e… before TC-1777), its single node digest normalized to 64 zeros.
+          n0_template_hash = '8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8'
           node_pin = re.compile(rb'(?m)^    image: ghcr\.io/tinycloudlabs/tinycloud-node@sha256:([0-9a-f]{64})$')
           def n0_template(raw):
               pins = list(node_pin.finditer(raw))
@@ -823,8 +894,12 @@ jobs:
                   raise SystemExit('::error::Refusing to deploy an image older than the running production revision; use the captured pre-N0 rollback for an intentional rollback')
 
           def require_release_descends(revision):
-              if not re.fullmatch(r'[0-9a-f]{40}', running) or running == revision or not is_ancestor(running, revision):
+              if not re.fullmatch(r'[0-9a-f]{40}', running) or not is_ancestor(running, revision):
                   raise SystemExit('::error::Released image must be a strict descendant of the running production revision; deployment not attempted')
+              if running == revision and os.environ.get('RUNNING_IMAGE') != os.environ['RESOLVED_IMAGE']:
+                  # TC-3765: the running revision is accepted only as a config-only
+                  # deployment of the exact image Phala's current compose runs.
+                  raise SystemExit('::error::Released image must be a strict descendant of the running production revision, or the exact running image digest for a config-only deployment; deployment not attempted')
           pre_n0_hash = 'df239749ca0a9c09893a855ae2a8abb94090b8556515ad002105c58ac91f4c91'
           pre_n0_template_hash = '28302d6761d841b7cc5c11314aed2d377735e6bbdcaf85972a752e03bc9fdc93'
           rollback = os.environ.get('ROLLBACK_PRE_N0') == 'true'
@@ -911,6 +986,28 @@ jobs:
           echo "Resolved image: ${RESOLVED_IMAGE} (revision ${REVISION}, version ${VERSION})"
           printf 'Deployment image: `%s` — version `%s`, revision `%s`.\n' \
             "${RESOLVED_IMAGE}" "${VERSION}" "${REVISION}" >> "$GITHUB_STEP_SUMMARY"
+
+      # The guest runs docker compose v2.26.0 (dstack 0.5.15 base image; meta-virtualization
+      # docker-compose_git.bb PV). Its schema refuses e.g. long-form `devices`
+      # ("services.key-recovery.devices.0 must be a string"), which stopped the witness boot.
+      # Validate the exact spliced compose sent to Phala with that version, before any CVM change.
+      # `config -q` needs no Docker daemon. Required `${NAME:?}` inputs get placeholders here; the
+      # sealed values are checked by the existing validation in the deploy step.
+      - name: Validate the compose with the guest's docker compose version
+        env:
+          COMPOSE_VERSION: v2.26.0
+          COMPOSE_SHA256: 59c6b262bedc4a02f46c8400e830e660935684899c770c3f5e804a2b7079fc16
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/docker-compose-guest"
+          curl -fsSL -o "$bin" "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  ${bin}" | sha256sum -c -
+          chmod +x "$bin"
+          "$bin" version | grep -q "${COMPOSE_VERSION}"
+          mapfile -t required < <(grep -oE '\$\{[A-Z_0-9]+:\?' docker-compose.dstack-postgres.yaml | grep -oE '[A-Z_0-9]+' | sort -u)
+          placeholders=()
+          for name in "${required[@]}"; do placeholders+=("${name}=placeholder"); done
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" "${placeholders[@]}" "$bin" -f docker-compose.dstack-postgres.yaml config -q
 
       # TC-500: Phala considers a CVM ready before compose services have
       # started. Validate the production-sealed bundle using the exact image
@@ -1205,8 +1302,10 @@ jobs:
           # The CLI/SDK can include request details in errors. Never forward
           # those responses into Actions logs, even when deployment fails.
           # A failing CLI/update can still have restarted the CVM.
+          # No --image/--no-dev-os: the CVM keeps its OS class (TC-3554: it runs
+          # dstack-dev-0.5.15); the guards before and after check the OS.
           echo "cvm_mutation_attempted=true" >> "$GITHUB_OUTPUT"
-          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --no-dev-os --image "${PHALA_OS_IMAGE}" --wait >/dev/null 2>&1; then
+          if ! phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --no-public-sysinfo --wait >/dev/null 2>&1; then
             echo "::error::Phala deployment failed; inspect the private control plane"
             exit 1
           fi
@@ -1217,18 +1316,6 @@ jobs:
       - name: Remove sealed deployment environment
         if: always()
         run: rm -f .phala-prod.env
-
-      # Fail closed if the deploy left the CVM on a different OS image (same rule as the check before the deploy).
-      - name: Verify the OS image after deploy
-        env:
-          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
-        run: |
-          set -euo pipefail
-          if ! cvm="$(phala cvms get tinycloud-node --json 2>/dev/null)"; then
-            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
-            exit 1
-          fi
-          bash scripts/ci/phala-os-guard.sh <<<"${cvm}"
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
@@ -1352,6 +1439,165 @@ jobs:
             rm -f "${RESPONSE_FILE}"
           done
 
+      # TC-3579: the root_wrap seal/open log lines are INFO and never shipped,
+      # so /info names how this boot obtained the identity root. The
+      # sidecar-free compose can only open the stored row ("sealed"); one
+      # that runs the key-recovery sidecar may seal it this boot
+      # ("sealed-new"). An image built before the field (a rollback or an
+      # older promoted digest) is not checked.
+      - name: Verify the identity root opened from root_wrap
+        env:
+          IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${IMAGE_REVISION}^{commit}"; then
+            echo "::error::Image revision ${IMAGE_REVISION} is not in this checkout's history."
+            exit 1
+          fi
+          if ! git grep -q identityRoot "${IMAGE_REVISION}" -- tinycloud-node-server/src/routes/mod.rs; then
+            echo "Image revision ${IMAGE_REVISION} predates /info identityRoot; not checked."
+            exit 0
+          fi
+          ALLOWED="sealed"
+          if grep -q '^  key-recovery:$' docker-compose.dstack-postgres.yaml; then
+            ALLOWED="sealed sealed-new"
+          fi
+          # TC-3881: a read-only /info; one transient failure is retried once, a second still fails the step.
+          ROOT="$(bash scripts/ci/retry-read.sh curl -fsS --max-time 15 https://tee.node.tinycloud.xyz/info | jq -r '.identityRoot // "absent"')"
+          if ! [[ "${ROOT}" =~ ^[a-z-]{1,32}$ ]]; then
+            echo "::error::/info identityRoot is not a plain word; expected one of: ${ALLOWED}."
+            exit 1
+          fi
+          case " ${ALLOWED} " in
+            *" ${ROOT} "*)
+              echo "identityRoot: ${ROOT}"
+              echo "Identity root: \`${ROOT}\`" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::/info identityRoot is '${ROOT}', expected one of: ${ALLOWED}."
+              exit 1
+              ;;
+          esac
+
+      # TC-3284: a clean boot does not prove the named-keys gate is on. A
+      # deletion ledger that cannot be opened or replayed leaves the node
+      # serving with the gate off, and a dispatch with the wrong input turns
+      # it off (Share v3 decrypt and per-secret keys stop). Both hostnames
+      # must list `encryption-named-keys-v1` in /info exactly when the input
+      # asked for it; otherwise the deploy fails. An image built before the
+      # feature, or the captured pre-N0 rollback (its compose has no gate), is
+      # not checked.
+      - name: Verify named-keys gate
+        if: ${{ success() && !inputs.rollback_pre_n0 }}
+        env:
+          IMAGE_REVISION: ${{ steps.pin.outputs.revision }}
+          NAMED_KEYS_V1: ${{ inputs.named_keys_v1 }}
+        run: |
+          set -euo pipefail
+          case "${NAMED_KEYS_V1}" in true) WANT=1 ;; false) WANT=0 ;; *) echo "::error::named_keys_v1 must be exactly true or false"; exit 1 ;; esac
+          if ! git cat-file -e "${IMAGE_REVISION}^{commit}"; then
+            echo "::error::Image revision ${IMAGE_REVISION} is not in this checkout's history."
+            exit 1
+          fi
+          if ! git grep -q encryption-named-keys-v1 "${IMAGE_REVISION}" -- tinycloud-node-server/src/routes/mod.rs; then
+            echo "Image revision ${IMAGE_REVISION} predates the named-keys feature; not checked."
+            exit 0
+          fi
+          for host in node.tinycloud.xyz tee.node.tinycloud.xyz; do
+            LISTED=""
+            for attempt in $(seq 1 6); do
+              LISTED="$(curl -fsS --max-time 10 "https://${host}/info" | jq -r '[.features[]? | select(. == "encryption-named-keys-v1")] | length' || true)"
+              if [ -n "${LISTED}" ]; then break; fi
+              sleep 5
+            done
+            if [ "${LISTED}" != "${WANT}" ]; then
+              echo "::error::${host} /info lists encryption-named-keys-v1 ${LISTED:-unreadable} time(s), expected ${WANT} for named_keys_v1=${NAMED_KEYS_V1}. Check Better Stack for deletion_ledger_open_failed / deletion_ledger_replay_failed."
+              exit 1
+            fi
+            echo "${host}: named-keys gate matches named_keys_v1=${NAMED_KEYS_V1}."
+            echo "Named-keys gate on ${host}: \`${NAMED_KEYS_V1}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # TC-3839: capture the exact app-compose.json dstack measured (compose file
+      # plus runner settings; the compose hash is its SHA-256) and sign build
+      # provenance for it, so anyone holding the file can check it came from
+      # this workflow on main and compare its hash with an attestation. Phala
+      # serves the manifest as JSON; its compact, key-sorted form is the
+      # measured bytes (checked 2026-11-22 on 1.26.19: 1dc2fe4a…, while the
+      # pretty-printed output does not match). Fails unless that form hashes to
+      # the compose hash the running node reports. CI does not verify the quote
+      # here; the endpoint just requires a nonce.
+      - name: Capture the deployed app-compose.json
+        id: compose
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app-compose"
+          MANIFEST="$RUNNER_TEMP/app-compose/app-compose.json"
+          # Written to a file, not read through $(...): phala 1.1.19 stdout through a pipe is cut at
+          # 64 KiB (TC-3928), and this runs after the deploy mutated the CVM.
+          # TC-3881: the GET is retried once (retry-read.sh writes to a file, then copies it to this one).
+          SERVED="$RUNNER_TEMP/app-compose/served.json"
+          if ! bash scripts/ci/retry-read.sh phala api /cvms/tinycloud-node/compose_file >"${SERVED}"; then
+            echo "::error::Cannot read the compose file of tinycloud-node from Phala"
+            exit 1
+          fi
+          # The compose file never carries sealed values; refuse if it ever does.
+          if [ "$(jq '(type == "object") and (has("encrypted_env") | not)' <"${SERVED}")" != "true" ]; then
+            echo "::error::The Phala compose file is not an object without encrypted_env; not publishing it."
+            exit 1
+          fi
+          jq -cjS . <"${SERVED}" > "${MANIFEST}"
+          rm -f "${SERVED}"
+          HASH="$(sha256sum "${MANIFEST}" | cut -d' ' -f1)"
+          REPORTED=""
+          for _ in 1 2 3; do
+            NONCE="$(openssl rand -hex 16)"
+            REPORTED="$(curl -fsS --max-time 30 "https://tee.node.tinycloud.xyz/attestation?nonce=${NONCE}" | jq -r '.compose_hash // empty' || true)"
+            [ -n "${REPORTED}" ] && break
+            sleep 10
+          done
+          if ! [[ "${REPORTED}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The node reported no well-formed compose hash; not publishing the Phala compose file (${HASH})."
+            exit 1
+          fi
+          if [ "${REPORTED}" != "${HASH}" ]; then
+            echo "::error::The node reports compose hash ${REPORTED}, but the Phala compose file hashes to ${HASH}; not publishing it."
+            exit 1
+          fi
+          mv "${MANIFEST}" "$RUNNER_TEMP/app-compose/app-compose-${HASH}.json"
+          echo "compose_hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Node-reported compose hash (matches app-compose-${HASH}.json): \`${HASH}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign provenance for the deployed app-compose.json
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/app-compose/app-compose-${{ steps.compose.outputs.compose_hash }}.json
+
+      - name: Keep the deployed app-compose.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-compose-${{ steps.compose.outputs.compose_hash }}
+          path: ${{ runner.temp }}/app-compose/app-compose-${{ steps.compose.outputs.compose_hash }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Fail closed if the deploy left the CVM on a different OS image (same rule as the check before the deploy).
+      # TC-3928: it runs last, after the quota restore and the other verifications, so a Phala read failure here
+      # can no longer skip "Restore storage quota overrides" (node 1.26.21). It still fails the run.
+      - name: Verify the OS image after deploy
+        if: ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' }}
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! cvm="$(bash scripts/ci/phala-cvm-json.sh tinycloud-node)"; then
+            echo "::error::Cannot read the OS image of tinycloud-node from Phala after deploy"
+            exit 1
+          fi
+          bash scripts/ci/phala-os-guard.sh <<<"${cvm}"
+
       - name: Report unverified storage overrides
         if: >-
           ${{ always() && steps.deploy.outputs.cvm_mutation_attempted == 'true' && steps.quotas.outcome != 'success' }}
@@ -1391,4 +1637,3 @@ jobs:
             echo "Promote watch after deployment attempt; image validation did not complete."
           fi
           gh workflow run write-probe.yml -R "${GITHUB_REPOSITORY}" --ref main -f mode=dense
-
