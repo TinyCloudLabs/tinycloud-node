@@ -147,7 +147,7 @@ mod tests {
 
     /// Up, down, then up again: `down` removes the column and the table, and
     /// a second `up` restores both. Rows in `session_retire` round-trip.
-    async fn assert_up_down_up(db: &DatabaseConnection) {
+    async fn assert_up_down_up(db: &DatabaseConnection, forward_only_tail: usize) {
         let backend = db.get_database_backend();
         assert_applied(db, true).await;
         let insert = "INSERT INTO session_retire (did, retired_at, expires_at) \
@@ -165,7 +165,7 @@ mod tests {
             .iter()
             .rev()
             .position(|m| m.name() == super::Migration.name())
-            .map(|i| (i + 1) as u32)
+            .map(|i| (i + 1 - forward_only_tail) as u32)
             .expect("session_retire migration is registered");
         Migrator::down(db, Some(steps)).await.unwrap();
         assert_applied(db, false).await;
@@ -198,18 +198,28 @@ mod tests {
     async fn sqlite_session_retire_up_down_up() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        assert_up_down_up(&db).await;
+        assert_up_down_up(&db, 0).await;
     }
 
     #[tokio::test]
     async fn postgres_session_retire_up_down_up() {
-        let Some(fixture) =
-            crate::test_support::PostgresTestSchema::new("postgres_session_retire_up_down_up")
-                .await
+        // The last two migrations (m20261113_020000_artifact_chunk_wal,
+        // m20261113_030000_artifact_part_lifecycle) are forward-only on
+        // PostgreSQL: `down` refuses them. The schema is migrated without
+        // them, so the roll-back covers only what is applied after
+        // session_retire, and `assert_up_down_up`'s final `up` applies them.
+        // The next migration that is forward-only on PostgreSQL and listed
+        // after session_retire must raise this count (TC-2917).
+        const FORWARD_ONLY_TAIL: usize = 2;
+        let Some(fixture) = crate::test_support::PostgresTestSchema::migrated_through(
+            "postgres_session_retire_up_down_up",
+            Some((Migrator::migrations().len() - FORWARD_ONLY_TAIL) as u32),
+        )
+        .await
         else {
             return;
         };
-        assert_up_down_up(&fixture.conn).await;
+        assert_up_down_up(&fixture.conn, FORWARD_ONLY_TAIL).await;
     }
 
     // test-ruling: TC-3755 new tests only (Naomi GO 2026-11-22 04:23Z);
