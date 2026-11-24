@@ -14,10 +14,17 @@ probes. It is **not an installed production control**.
   Sam/Amos action under a Naomi GO.
 - The only network access is read-only: Cloudflare API `GET`s (a scoped
   **read** token from `CLOUDFLARE_READ_TOKEN`, never printed) and HTTPS/TCP
-  probes. All of it is behind injectable clients.
+  probes (`verify` also opens TLS connections to Phala gateway hostnames). All of it is
+  behind injectable clients.
 - The tunnel, the Worker change and the connector deploy (P1 to P4) are
-  prerequisites, not done by this script. Closing `-8000` before they are verified
-  breaks both HTTP routes; `preflight` refuses unless they are observed.
+  prerequisites, not done by this script. Closing `-8000` before they hold breaks both
+  HTTP routes. `preflight` observes the tunnel, DNS, ingress, Worker version, the
+  `ORIGIN_URL` binding type and `/info` on both routes. **It does not observe the
+  origin value**: the Worker's `ORIGIN_URL` is a secret that Cloudflare never returns, so
+  it rests on the operator's `--attest-origin-is-tunnel-host`. **If that attestation is
+  wrong (the secret still points at the `-8000` gateway), `node.*` goes down after the
+  PATCH restart; `verify` then fails, and `undo` is a second restart.** Nothing here can
+  detect that before the restart. Check the set-origin step's own record first.
 
 ## What is and is not tested
 
@@ -98,6 +105,19 @@ refuses unless **all** hold:
 
 `--account-id` and `--zone-id` must be 32 hex characters and `--worker-script` a plain
 script name; they are validated before any URL is built.
+
+**Rollback snapshot.** The unmodified switch stores `verified_origin.worker_origin` in
+the snapshot, and its gate "Worker origin must be the independently verified tunnel
+hostname" is satisfied here only because both values come from `--tunnel-host`.
+`apply-patch` therefore annotates the snapshot in place (atomic replace, still `0600`;
+the switch ignores the added keys on restore) with
+`verified_origin.worker_origin_status = "operator-attested, NOT verified ..."` and a
+top-level `verified_origin_note`, and `verify` refuses a snapshot without that
+annotation. Read `snapshot.verified_origin.worker_origin` as the **attested** value, not
+a read, whatever the switch's key name says. The P3 runbook's "independent origin
+verification" premise is met by attestation, not by observation. The receipt keeps the
+switch's `verified_at_utc` key (the switch requires it); the wrapper prints it as
+`reads_observed_at_utc`.
 
 Node ids are printed only as a short SHA-256 fingerprint. The receipt file holds the
 real value (it is private); do not commit it.

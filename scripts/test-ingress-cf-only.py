@@ -353,6 +353,20 @@ class PlanApplyTest(Base):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
 
+    def test_the_rollback_snapshot_marks_the_origin_as_attested_not_verified_and_nothing_prints_verified(self):
+        plan_out = self.run_cli(["plan", *self.cloudflare_args(), *self.switch_args()])[1]
+        result = self.stage()
+        snap = json.loads(self.snapshot.read_text())
+        self.assertEqual(self.snapshot.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(snap["verified_origin"]["worker_origin"], f"https://{HOST}")
+        self.assertIn("NOT verified", snap["verified_origin"]["worker_origin_status"])
+        self.assertIn("operator-attested", snap["verified_origin_note"])
+        self.assertEqual(snap["after"]["restrict_mode"], True)
+        self.assertFalse(list(self.root.glob("*.annotating")))
+        # Only the negated phrase may contain the word; the switch's own key name is not printed here.
+        for text in (plan_out, json.dumps(result)):
+            self.assertNotIn("verified", text.replace("NOT verified", ""))
+
 
 class VerifyTest(Base):
     def setUp(self):
@@ -464,6 +478,9 @@ class VerifyTest(Base):
         self.save(self.snapshot, dict(snap, app_id="c" * 40))
         self.assertEqual(self.verify()[0], 1)
         self.save(self.snapshot, dict(snap, verified_origin=dict(snap["verified_origin"], tunnel_id="9" * 8 + TUNNEL[8:])))
+        self.assertEqual(self.verify()[0], 1)
+        stripped = {k: v for k, v in snap["verified_origin"].items() if k != "worker_origin_status"}
+        self.save(self.snapshot, dict(snap, verified_origin=stripped))
         self.assertEqual(self.verify()[0], 1)
         self.save(self.snapshot, snap)
         other = json.loads(self.receipt.read_text())

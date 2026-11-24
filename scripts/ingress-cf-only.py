@@ -35,7 +35,11 @@ TUNNEL_SERVICE = "http://tinycloud:8000"
 DEFAULT_WORKER = "tinycloud-tee-proxy"
 MANAGEMENT_PORT = 10022
 GATEWAY_SUFFIXES = ("8000", "8000g", "443", "443s", "443g")
-LABEL = "operator evidence from automated reads, not a cryptographic attestation"
+LABEL = ("operator evidence: automated reads of Cloudflare and node state plus ONE operator attestation (worker_origin), "
+         "not a cryptographic attestation")
+SNAPSHOT_NOTE = ("verified_origin.worker_origin is operator-attested via --attest-origin-is-tunnel-host, NOT verified "
+                 "or read: the key name is the unmodified switch's, and its 'independent verification' gate is satisfied "
+                 "by that attestation")
 ORIGIN_ATTESTATION = ("operator-attested, NOT verified: the Worker's ORIGIN_URL is a secret whose value the Cloudflare "
                       "API never returns; it is recorded as the --tunnel-host the operator says the set-origin step received")
 CONNECTOR_BASIS = "tunnel status healthy with active connections and none pending reconnect, as read from the Cloudflare API"
@@ -366,9 +370,9 @@ def preflight(cfg, clients, now):
 
 def summarize(receipt):
     """Receipt fields safe to print: node ids appear only as short fingerprints."""
-    keys = ("app_id", "worker_origin", "tunnel_id", "worker_version_id", "worker_origin_binding",
-            "tunnel_connections", "verified_at_utc")
-    return dict({k: receipt[k] for k in keys}, node_id_fingerprint=fingerprint(receipt["origin_node_id"]),
+    keys = ("app_id", "worker_origin", "tunnel_id", "worker_version_id", "worker_origin_binding", "tunnel_connections")
+    return dict({k: receipt[k] for k in keys}, reads_observed_at_utc=receipt["verified_at_utc"],
+                node_id_fingerprint=fingerprint(receipt["origin_node_id"]),
                 connector_authenticated_basis=CONNECTOR_BASIS, worker_origin_value=ORIGIN_ATTESTATION,
                 evidence_label=LABEL)
 
@@ -382,13 +386,30 @@ def run_switch(argv):
     return json.loads(result.stdout)
 
 
+def annotate_snapshot(path):
+    """The switch records worker_origin under verified_origin; here it is only operator-attested. Mark it in place
+    (atomic replace, still 0600). The switch ignores the added keys on restore."""
+    p = Path(path)
+    snap = json.loads(p.read_text(encoding="utf-8"))
+    evidence = snap.get("verified_origin")
+    require(isinstance(evidence, dict), "Snapshot has no origin evidence to annotate")
+    snap["verified_origin"] = dict(evidence, worker_origin_status=ORIGIN_ATTESTATION)
+    snap["verified_origin_note"] = SNAPSHOT_NOTE
+    tmp = p.with_name(p.name + ".annotating")
+    write_private(tmp, snap)
+    os.replace(tmp, p)
+
+
 def stage(a, receipt, apply):
     with tempfile.TemporaryDirectory(prefix="ingress-cf-only-") as tmp:
-        proof = Path(tmp) / "verified-origin.json"
+        proof = Path(tmp) / "attested-origin.json"
         write_private(proof, receipt)
-        return run_switch(["--compose", a.compose, "--target", a.target, "--expect-app-id", a.expect_app_id,
-                           "--network", a.network, "--verified-origin", proof, "--snapshot", a.snapshot,
-                           "--apply" if apply else "--dry-run"])
+        staged = run_switch(["--compose", a.compose, "--target", a.target, "--expect-app-id", a.expect_app_id,
+                             "--network", a.network, "--verified-origin", proof, "--snapshot", a.snapshot,
+                             "--apply" if apply else "--dry-run"])
+    if apply:
+        annotate_snapshot(a.snapshot)
+    return staged
 
 
 def plan_hash(a, receipt, switch_plan):
@@ -553,6 +574,8 @@ def verify(a, clients, now):
     require(receipt.get("tunnel_hostname") == a.tunnel_host
             and (snap.get("verified_origin") or {}).get("tunnel_id") == receipt.get("tunnel_id"),
             "Receipt, snapshot and --tunnel-host do not describe the same tunnel")
+    require((snap.get("verified_origin") or {}).get("worker_origin_status") == ORIGIN_ATTESTATION,
+            "Snapshot lacks the operator-attested origin annotation written by apply-patch")
     age = (now - datetime.fromisoformat(receipt["verified_at_utc"].replace("Z", "+00:00"))).total_seconds()
     require(0 <= age <= a.max_receipt_age, "Receipt is stale; rerun preflight")
     check_tunnel_host(a.tunnel_host)
@@ -626,7 +649,7 @@ def cmd_undo(a, clients, now, out):
                          "3. Run the verify command; the Worker must not be pointed back at public -8000 before it passes"],
                "phala_command_for_authorized_operator": phala_command(restore["cvm_id"], a.patch_out),
                "payload": restore["patch"], "patch_file": str(Path(a.patch_out).resolve()),
-               "snapshot_after_to_compare": snap["after"],
+               "snapshot_after_to_compare": snap["after"], "snapshot_origin_note": snap.get("verified_origin_note"),
                "warning": "The PATCH restarts the CVM and interrupts both HTTP paths.",
                "then_verify": verify_command(a, "restored", a.receipt)})
 
