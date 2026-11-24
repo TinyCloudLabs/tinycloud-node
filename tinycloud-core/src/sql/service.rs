@@ -7681,3 +7681,6 @@ mod tests {
 }
 
 mod space_purge;
+
+#[cfg(test)]
+mod rolled_back_wal_tail;
