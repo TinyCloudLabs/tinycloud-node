@@ -48,9 +48,10 @@ END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id 
 END_TO_END_CANNOT = ["that the secret equals the tunnel host (another independent origin serving the same node would "
                      "also pass)", "that no unprobed gateway host or address is used", "anything before the restriction: "
                      "while the gateway is open the secret may still point at it and node.* would also pass"]
-# Closed means a POSITIVE refusal: a connect error (refused), a reset, or no route. Anything that completes TLS or
-# HTTP is open or unknown, and both fail verify. There is no operator-extensible allow-list.
-CLOSED_SIGNALS = ("tcp_refused", "tcp_reset", "no_route")
+# Closed means a POSITIVE refusal by the target: a connect error (refused) or a reset. Anything that completes TLS or
+# HTTP is open or unknown, and both fail verify; so does no_route (the verifier's own network, not the target).
+# There is no operator-extensible allow-list.
+CLOSED_SIGNALS = ("tcp_refused", "tcp_reset")
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_READ_TOKEN"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX32 = re.compile(r"[0-9a-f]{32}")
@@ -182,7 +183,7 @@ class NetworkProbe:
 
     Every probe reports a distinct signal token, never a bare "closed": tcp_refused, tcp_reset,
     tls_rejected, closed_after_tls, http_<status>, http_200_unparsed, malformed_http, node_info,
-    ssh_banner, non_ssh_data, timeout, no_address, error. The caller decides which are acceptable.
+    ssh_banner, non_ssh_data, timeout, no_route, no_aaaa, no_address, error. The caller decides which are acceptable.
     """
     FAMILIES = {"ipv4": socket.AF_INET, "ipv6": socket.AF_INET6}
 
@@ -208,10 +209,20 @@ class NetworkProbe:
         return value if isinstance(value, str) and value else None
 
     def _addresses(self, host, port, family):
+        """-> (addresses, failure). failure is 'no_aaaa' only for an IPv6 lookup that says NODATA/NONAME while the same
+        name resolves over IPv4 (it exists, it has no AAAA); every other failure (NXDOMAIN, resolver error or
+        timeout, an IPv4 miss) is 'no_address'."""
         try:
-            return [i[4] for i in socket.getaddrinfo(host, port, self.FAMILIES[family], socket.SOCK_STREAM)]
-        except socket.gaierror:
-            return []
+            return [i[4] for i in socket.getaddrinfo(host, port, self.FAMILIES[family], socket.SOCK_STREAM)], None
+        except socket.gaierror as error:
+            nodata = {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
+            if family == "ipv6" and error.errno in nodata:
+                try:
+                    if socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+                        return [], "no_aaaa"
+                except socket.gaierror:
+                    pass
+            return [], "no_address"
 
     def _attempt(self, address, host, banner):
         """One connection attempt -> (signal, node_id or None)."""
@@ -267,9 +278,9 @@ class NetworkProbe:
         return ("node_info", node_id) if node_id else ("http_200_unparsed", None)
 
     def _run(self, host, family, port, banner):
-        addresses = self._addresses(host, port, family)
+        addresses, failure = self._addresses(host, port, family)
         if not addresses:
-            return {"outcome": "no_address", "signals": ["no_address"]}
+            return {"outcome": failure, "signals": [failure]}
         attempts = [self._attempt(address, host, banner) for address in addresses]
         signals = [signal for signal, _ in attempts]
         result = {"signals": signals, "outcome": signals[0] if len(set(signals)) == 1 else "mixed"}
@@ -480,7 +491,7 @@ def cmd_apply_patch(a, clients, now, out):
                "warning": "Under a GO only. The PATCH restarts the CVM and interrupts both HTTP paths.",
                "then_verify": verify_command(a, "restricted", a.receipt_out),
                "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify passes only on a "
-                              "positive refusal (refused, reset, no route); anything that completes TLS or HTTP fails.",
+                              "positive refusal (refused or reset); anything that completes TLS or HTTP, and no route, fails.",
                "if_bad": "undo --snapshot " + str(Path(a.snapshot).resolve())})
 
 
@@ -544,13 +555,15 @@ def signals_of(result):
 
 def judge_closed(result, family=None, allow_no_aaaa=False):
     """A path that must be closed passes only on a POSITIVE refusal signal. Anything that completed TLS or HTTP is
-    open or unknown and fails; so does a timeout, an error or a resolver failure."""
+    open or unknown and fails; so do a timeout, an error, no route and a resolver failure. The one waiver:
+    DNS NODATA for AAAA (no_aaaa), IPv6 only, and only with the operator's explicit flag."""
     signals = signals_of(result)
     if "node_info" in signals:
         return "fail", "node answered /info: " + ",".join(signals)
-    if all(s in CLOSED_SIGNALS or (s == "no_address" and family == "ipv6" and allow_no_aaaa) for s in signals):
+    if all(s in CLOSED_SIGNALS or (s == "no_aaaa" and family == "ipv6" and allow_no_aaaa) for s in signals):
         note = ",".join(signals)
-        return "pass", note + (" (explicitly accepted: no AAAA is not proof of no IPv6 path)" if "no_address" in signals else "")
+        return "pass", note + (" (waived by --allow-no-aaaa: DNS NODATA is not proof of no IPv6 path)"
+                               if "no_aaaa" in signals else "")
     return "fail", ",".join(signals) + " is not a positive refusal (open or unknown)"
 
 
@@ -590,10 +603,14 @@ def verify(a, clients, now):
         checks.append(check(f"{label} /info healthy with the recorded node id", "pass" if good else "fail",
                             f"status={info.get('status')} node_id_matches={info.get('node_id') == node}"))
 
+    waived = []
     if a.expect == "restricted":
         for name in hosts:
             for family in ("ipv4", "ipv6"):
-                status, detail = judge_closed(http.probe(name, family, 443), family, a.allow_no_aaaa)
+                result = http.probe(name, family, 443)
+                status, detail = judge_closed(result, family, a.allow_no_aaaa)
+                if status == "pass" and "no_aaaa" in signals_of(result):
+                    waived.append(name)
                 checks.append(check(f"{name} fresh {family} connection is positively refused", status, detail))
     else:
         require(management_allowed(snap["before"].get("value")),
@@ -608,18 +625,35 @@ def verify(a, clients, now):
     status, detail = judge_management(http.mgmt_probe(mgmt, "ipv4"), expect_open)
     checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 untouched "
                         f"(expected {'open' if expect_open else 'denied'})", status, detail))
-    return checks
+    return checks, waived
+
+
+def record_waivers(path, waivers, now):
+    """Write the operator's verify waiver into the receipt (atomic replace, still 0600)."""
+    p = Path(path)
+    receipt = json.loads(p.read_text(encoding="utf-8"))
+    entry = {"at_utc": now.isoformat(), "waiver": "allow-no-aaaa",
+             "scope": "IPv6 probes whose DNS answer was NODATA for AAAA on a name that otherwise resolves; nothing else",
+             "hosts_waived": waivers}
+    receipt["verify_waivers"] = list(receipt.get("verify_waivers") or []) + [entry]
+    tmp = p.with_name(p.name + ".waiver")
+    write_private(tmp, receipt)
+    os.replace(tmp, p)
+    return entry
 
 
 def cmd_verify(a, clients, now, out):
-    checks = verify(a, clients, now)
+    checks, waived = verify(a, clients, now)
+    waivers = record_waivers(a.receipt, waived, now) if a.allow_no_aaaa else None
     result = "pass" if all(c["status"] == "pass" for c in checks) else "FAIL"
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "checks": checks,
                "closed_means": list(CLOSED_SIGNALS),
-               "closed_rule": "Closed is a POSITIVE refusal only: a connect error (refused), a reset, or no route. "
-                              "Anything that completes TLS or HTTP is open or unknown, and open or unknown FAILS verify. "
+               "closed_rule": "Closed is a POSITIVE refusal only: a connect error (refused) or a reset. "
+                              "Anything that completes TLS or HTTP is open or unknown, and open or unknown FAILS verify; "
+                              "so does no route (it describes this verifier's network, not the target). "
                               "On the SNI-shared gateway the real denial may be a TLS/HTTP signature, in which case verify "
                               "fails until a drill observes what a closed gateway really does; it is never loosened silently.",
+               "waivers": waivers or "none (--allow-no-aaaa not given)",
                "worker_origin_value": ORIGIN_ATTESTATION,
                "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
                "what_they_cannot_show": END_TO_END_CANNOT,
@@ -703,7 +737,10 @@ def parser():
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--expect", choices=("restricted", "restored"), default="restricted")
     p.add_argument("--extra-host", action="append")
-    p.add_argument("--allow-no-aaaa", action="store_true", help="accept a missing AAAA record as IPv6 evidence")
+    p.add_argument("--allow-no-aaaa", action="store_true",
+                   help="waive ONLY an IPv6 probe whose DNS answer is NODATA for AAAA on a name that otherwise resolves; "
+                        "an existing AAAA record is still probed; resolver errors/NXDOMAIN are not waived; "
+                        "the waiver is recorded in the receipt")
     p.add_argument("--max-receipt-age", type=int, default=3600)
     p = add("undo", "EMIT the reverse PATCH from the snapshot", verify_inputs)
     p.add_argument("--compose", type=Path, required=True)

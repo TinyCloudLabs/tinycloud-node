@@ -390,7 +390,7 @@ class VerifyTest(Base):
         self.assertEqual(code, 0, out)
         result = json.loads(out)
         self.assertEqual(result["result"], "pass")
-        self.assertEqual(result["closed_means"], ["tcp_refused", "tcp_reset", "no_route"])
+        self.assertEqual(result["closed_means"], ["tcp_refused", "tcp_reset"])
         probed = {(h, f) for h, f, p in self.http.probes}
         for host in (cf_only.TEE_HOST, f"{APP}-443s.{GATEWAY}", f"{INSTANCE}-443s.{GATEWAY}",
                      f"{APP}-8000.{GATEWAY}", f"{INSTANCE}-443.{GATEWAY}"):
@@ -432,6 +432,10 @@ class VerifyTest(Base):
                                     {"outcome": "no_address"}}), f"{APP}-443."),
             "ipv6 without AAAA is unverified": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv6"):
                                                 {"outcome": "no_address"}}), "tee.node.tinycloud.xyz fresh ipv6"),
+            "AAAA missing without the waiver": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv6"):
+                                                {"outcome": "no_aaaa"}}), "tee.node.tinycloud.xyz fresh ipv6"),
+            "no route": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                                                       {"outcome": "no_route"}}), "tee.node.tinycloud.xyz fresh ipv4"),
             "node.* unhealthy": (lambda h: h.info_map["node.tinycloud.xyz"].update(status=502),
                                  "node.tinycloud.xyz /info"),
             "node ids differ": (lambda h: h.info_map[HOST].update(node_id=OTHER_NODE), "tunnel host /info"),
@@ -450,21 +454,58 @@ class VerifyTest(Base):
                 self.assertEqual(json.loads(out)["result"], "FAIL")
                 self.assertTrue(any(expected in c for c in self.not_passed(out)), self.not_passed(out))
 
-    def test_positive_refusals_pass_and_the_accept_flag_no_longer_exists(self):
+    def test_only_refused_and_reset_are_closed_and_the_accept_flag_no_longer_exists(self):
         self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_reset"}
-        self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv4")] = {"outcome": "no_route"}
+        self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv6")] = {"outcome": "tcp_reset"}
         code, out, err = self.verify()
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads(out)["closed_means"], ["tcp_refused", "tcp_reset", "no_route"])
+        self.assertEqual(json.loads(out)["closed_means"], ["tcp_refused", "tcp_reset"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.verify("--accept-closed-signal", "http_421")
 
-    def test_ipv6_without_aaaa_only_passes_when_explicitly_accepted(self):
-        self.http.probe_map = {(h, "ipv6"): {"outcome": "no_address"} for h in self.all_probe_hosts()}
-        self.assertEqual(self.verify()[0], 1)
+    def test_no_route_is_not_closed_over_ipv4_or_ipv6_even_with_the_aaaa_waiver(self):
+        for family in ("ipv4", "ipv6"):
+            for flags in ((), ("--allow-no-aaaa",)):
+                with self.subTest(family=family, flags=flags):
+                    self.http = FakeHttp()
+                    self.http.probe_map[(f"{APP}-443s.{GATEWAY}", family)] = {"outcome": "no_route"}
+                    code, out, err = self.verify(*flags)
+                    self.assertEqual(code, 1, out)
+                    self.assertTrue(any(f"{APP}-443s." in c and family in c for c in self.not_passed(out)))
+
+    def test_allow_no_aaaa_waives_only_dns_nodata_and_records_the_waiver_in_the_receipt(self):
+        nodata = {(h, "ipv6"): {"outcome": "no_aaaa"} for h in self.all_probe_hosts()}
+        self.http.probe_map = dict(nodata)
+        self.assertEqual(self.verify()[0], 1)  # no flag: NODATA is not closed
+        self.assertNotIn("verify_waivers", json.loads(self.receipt.read_text()))
         code, out, err = self.verify("--allow-no-aaaa")
         self.assertEqual(code, 0, out)
         self.assertIn("not proof of no IPv6 path", out)
+        printed = json.loads(out)["waivers"]
+        recorded = json.loads(self.receipt.read_text())["verify_waivers"]
+        self.assertEqual(recorded, [printed])
+        self.assertEqual((printed["waiver"], sorted(printed["hosts_waived"])), ("allow-no-aaaa", sorted(self.all_probe_hosts())))
+        self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(self.root.glob("*.waiver")))
+        self.assertEqual(json.loads(self.verify()[1])["waivers"], "none (--allow-no-aaaa not given)")
+
+    def test_the_waiver_does_not_cover_a_present_aaaa_record_or_a_resolver_error(self):
+        host = f"{APP}-443s.{GATEWAY}"
+        for name, outcome in (("AAAA present, v6 connect gives no route", {"outcome": "no_route"}),
+                              ("AAAA present, v6 answers HTTP", {"outcome": "http_404"}),
+                              ("AAAA present, v6 times out", {"outcome": "timeout"}),
+                              ("resolver error or NXDOMAIN", {"outcome": "no_address"})):
+            with self.subTest(name):
+                self.http = FakeHttp()
+                self.http.probe_map[(host, "ipv6")] = outcome
+                code, out, err = self.verify("--allow-no-aaaa")
+                self.assertEqual(code, 1, out)
+                self.assertTrue(any(host in c and "ipv6" in c for c in self.not_passed(out)))
+                self.assertNotIn(host, json.loads(out)["waivers"]["hosts_waived"])
+        # A waived host elsewhere does not rescue a failing one, and the waiver stays scoped to ipv6.
+        self.http = FakeHttp()
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "no_aaaa"}
+        self.assertEqual(self.verify("--allow-no-aaaa")[0], 1)
 
     def test_refuses_stale_receipt_loose_files_other_app_and_mismatched_tunnel(self):
         self.assertEqual(self.verify(now=datetime.now(timezone.utc) + timedelta(hours=2))[0], 1)
@@ -819,16 +860,41 @@ class ProbeClassifierTest(unittest.TestCase):
     def test_unresolvable_name_is_no_address(self):
         self.assertEqual(self.probe.probe("no-such-host.invalid", "ipv4", 443)["signals"], ["no_address"])
 
-    def test_reset_and_no_route_at_connect_are_positive_refusals_and_other_errors_are_not(self):
+    def test_dns_failure_kinds_decide_whether_a_missing_aaaa_is_nodata(self):
+        def lookup(v4, v6):
+            def fake(host, port, family, kind):
+                outcome = v6 if family == socket.AF_INET6 else v4
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return [(family, kind, 6, "", outcome)]
+            return fake
+
+        nodata = socket.gaierror(getattr(socket, "EAI_NODATA", socket.EAI_NONAME), "no data")
+        nxdomain = socket.gaierror(socket.EAI_NONAME, "unknown")
+        again = socket.gaierror(socket.EAI_AGAIN, "temporary failure")
+        v4_ok = ("192.0.2.1", 443)
+        cases = (("NODATA on a name that resolves over IPv4", lookup(v4_ok, nodata), "no_aaaa"),
+                 ("NONAME for AAAA on a name that resolves over IPv4", lookup(v4_ok, nxdomain), "no_aaaa"),
+                 ("NXDOMAIN (name does not exist at all)", lookup(nxdomain, nxdomain), "no_address"),
+                 ("resolver timeout/error on the AAAA lookup", lookup(v4_ok, again), "no_address"),
+                 ("resolver error on both lookups", lookup(again, again), "no_address"))
+        for name, fake, signal in cases:
+            with self.subTest(name), mock.patch.object(cf_only.socket, "getaddrinfo", fake):
+                self.assertEqual(self.probe.probe("x.example.test", "ipv6", 443)["signals"], [signal])
+        with mock.patch.object(cf_only.socket, "getaddrinfo", lookup(nodata, nodata)):
+            self.assertEqual(self.probe.probe("x.example.test", "ipv4", 443)["signals"], ["no_address"])
+
+    def test_reset_is_a_positive_refusal_no_route_and_other_errors_are_not(self):
         import errno
         for failure, signal, verdict in ((ConnectionResetError(errno.ECONNRESET, "reset"), "tcp_reset", "pass"),
-                                         (OSError(errno.ENETUNREACH, "no route"), "no_route", "pass"),
-                                         (OSError(errno.EHOSTUNREACH, "no route"), "no_route", "pass"),
+                                         (OSError(errno.ENETUNREACH, "no route"), "no_route", "fail"),
+                                         (OSError(errno.EHOSTUNREACH, "no route"), "no_route", "fail"),
                                          (OSError(errno.EACCES, "denied"), "error", "fail")):
             with self.subTest(signal), mock.patch.object(cf_only.socket, "create_connection", side_effect=failure):
                 result = self.probe._attempt(("127.0.0.1", 443), "x.example.test", False)
                 self.assertEqual(result[0], signal)
-                self.assertEqual(cf_only.judge_closed({"signals": [result[0]]})[0], verdict)
+                for family in ("ipv4", "ipv6"):
+                    self.assertEqual(cf_only.judge_closed({"signals": [result[0]]}, family, True)[0], verdict)
 
     def test_management_banner_is_read_after_the_tls_handshake(self):
         port = self.serve(lambda tls: tls.sendall(b"SSH-2.0-OpenSSH_9.6\r\n"))

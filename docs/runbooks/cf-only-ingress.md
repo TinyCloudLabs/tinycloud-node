@@ -164,8 +164,9 @@ Run after the operator has applied the PATCH and the restart finished. The resul
 is evidence.** It opens TLS/TCP connections to Phala **gateway** hostnames (network
 contact with Phala infrastructure, not an API call and not a credentialed one).
 
-**Closed means a positive refusal, nothing else:** a connect error (`tcp_refused`), a
-reset (`tcp_reset`) or no route (`no_route`, ENETUNREACH/EHOSTUNREACH at connect).
+**Closed means a positive refusal by the target, nothing else:** a connect error
+(`tcp_refused`) or a reset (`tcp_reset`). **`no_route`** (ENETUNREACH/EHOSTUNREACH at
+connect) is not closed: it describes this verifier's network, not the target, so it fails.
 Anything that completes TLS or HTTP is open or unknown, and open or unknown **fails**:
 that includes a TLS alert (`tls_rejected`), a close after the handshake
 (`closed_after_tls`), any HTTP status (`http_404`, `http_421`, `http_502`, ...),
@@ -185,9 +186,16 @@ operator flag. Checks:
 - fresh connections to `tee.node.tinycloud.xyz` and to the app and instance
   gateway hosts `-8000`, `-8000g`, `-443`, `-443s`, `-443g` (plus any
   `--extra-host`) over **IPv4 and IPv6** must each be positively refused. An IPv6
-  name with no AAAA record fails unless `--allow-no-aaaa`: that flag is an explicit
-  operator acknowledgement, because the absence of an AAAA answer is a dated DNS
-  observation, not proof that no IPv6 path exists;
+  probe whose DNS answer is NODATA for AAAA (`no_aaaa`: the name resolves over IPv4 but
+  has no AAAA record) fails unless `--allow-no-aaaa`. That flag is an explicit operator
+  waiver and covers **only** that case: an AAAA record that exists is still probed and
+  anything but a refusal (including no route) fails; NXDOMAIN, resolver errors and
+  timeouts (`no_address`) are never waived. A DNS answer is a dated observation, not
+  proof that no IPv6 path exists. When the flag is given, the waiver (UTC time, scope,
+  hosts waived) is appended to the receipt's `verify_waivers` (atomic replace, still
+  `0600`) and printed under `waivers` in the output. NODATA is told apart from
+  NXDOMAIN by a second IPv4 lookup of the same name (resolver error codes differ by
+  platform) [INFERENCE: not run against real DNS];
 - management: **INFERENCE (not run, not observed)** that SSH is reached through the
   gateway TLS route `<app>-10022.<gateway>:443` (the compose comment, with
   `port_mappings` required empty), not a host port 10022. The probe does TLS with that
