@@ -48,6 +48,9 @@ pub mod m20261113_000000_database_artifact_external;
 pub mod m20261114_000000_kv_value_size;
 
 pub mod m20261113_010000_artifact_chunks;
+pub mod m20261113_020000_artifact_chunk_wal;
+pub mod m20261113_030000_artifact_part_lifecycle;
+
 pub mod m20261117_000000_hook_subscription_headers;
 
 pub mod m20261109_000000_hook_delivery_lease;
@@ -123,6 +126,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261124_000000_sql_wal_mark::Migration),
             Box::new(m20261125_000000_revocation_tombstone::Migration),
             Box::new(m20261125_000000_sql_store_mode::Migration),
+            Box::new(m20261113_020000_artifact_chunk_wal::Migration),
+            Box::new(m20261113_030000_artifact_part_lifecycle::Migration),
         ]
     }
 }

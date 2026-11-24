@@ -4,6 +4,7 @@
 //! result formatting, native connection open/close and filesystem work do not.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,11 +13,14 @@ use dashmap::DashMap;
 use sqlparser::ast::Statement;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::hash::Blake3Hasher;
 use crate::request_telemetry::{self, QueryTimer, RequestContext};
 
 use super::{
     caveats::DuckDbCaveats,
-    describe, parser,
+    describe,
+    disk::{self, DuckDbDiskPolicy},
+    parser,
     storage::{self, StorageMode},
     types::*,
 };
@@ -35,7 +39,21 @@ enum DbMessage {
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, DuckDbError>>,
     },
+    Snapshot {
+        response_tx: oneshot::Sender<Result<tempfile::NamedTempFile, DuckDbError>>,
+    },
+    WalSnapshotForCheckpoint {
+        max_bytes: u64,
+        checkpoint_size: u64,
+        checkpoint_hash: String,
+        response_tx: oneshot::Sender<Result<Option<tempfile::NamedTempFile>, DuckDbError>>,
+    },
     Wal {
+        response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
+    },
+    WalForCheckpoint {
+        checkpoint_size: u64,
+        checkpoint_hash: String,
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
     },
     Shutdown {
@@ -96,6 +114,46 @@ impl DatabaseHandle {
             .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
     }
 
+    pub async fn snapshot(&self) -> Result<tempfile::NamedTempFile, DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::Snapshot { response_tx },
+            ))
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".into()))?
+    }
+
+    /// Copy an owned WAL only while its local main file matches the durable
+    /// checkpoint; hashing and copying share this actor's operation fence.
+    pub async fn wal_snapshot_for_checkpoint(
+        &self,
+        max_bytes: u64,
+        checkpoint_size: u64,
+        checkpoint_hash: String,
+    ) -> Result<Option<tempfile::NamedTempFile>, DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::WalSnapshotForCheckpoint {
+                    max_bytes,
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                },
+            ))
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".into()))?
+    }
+
     pub async fn wal(&self) -> Result<Option<Vec<u8>>, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -107,19 +165,50 @@ impl DatabaseHandle {
             .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
     }
 
-    /// Stop the actor and close its database before the cache is discarded.
-    pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
+    /// Copy a WAL only when its local main file still matches the durable
+    /// checkpoint. Both operations run under the same actor fence.
+    pub async fn wal_for_checkpoint(
+        &self,
+        checkpoint_size: u64,
+        checkpoint_hash: String,
+    ) -> Result<Option<Vec<u8>>, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::WalForCheckpoint {
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                },
+            ))
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".into()))?
+    }
+
+    /// Stop the actor and close its database before the cache is discarded.
+    ///
+    /// An actor that has already exited (idle eviction, at the same moment as
+    /// this call) is done too: it drops its receiver only after closing its
+    /// database and running its cleanup.
+    pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .tx
             .send((
                 request_telemetry::current(),
                 DbMessage::Shutdown { response_tx },
             ))
             .await
-            .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
-        response_rx.await.map_err(|_| {
-            DuckDbError::Internal("Database actor dropped shutdown response".to_string())
-        })
+            .is_ok()
+        {
+            // A dropped sender means the actor exited with this message queued.
+            let _ = response_rx.await;
+        }
+        Ok(())
     }
 }
 
@@ -132,6 +221,57 @@ pub fn spawn_actor(
     max_memory_per_connection: String,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
+    spawn_actor_with_parts(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        false,
+        idle_timeout_secs,
+        max_memory_per_connection,
+        databases,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_actor_with_parts(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    force_file: bool,
+    idle_timeout_secs: u64,
+    max_memory_per_connection: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+) -> DatabaseHandle {
+    spawn_actor_with_disk(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        force_file,
+        idle_timeout_secs,
+        max_memory_per_connection,
+        databases,
+        DuckDbDiskPolicy::default(),
+    )
+}
+
+/// [`spawn_actor_with_parts`] under `disk`: its connections spill at most
+/// `disk.max_temp_directory_bytes`, and each statement runs under the disk
+/// watcher.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_actor_with_disk(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    force_file: bool,
+    idle_timeout_secs: u64,
+    max_memory_per_connection: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    disk: DuckDbDiskPolicy,
+) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
@@ -143,8 +283,8 @@ pub fn spawn_actor(
             .join(&space_id)
             .join(format!("{}.duckdb", db_name));
 
-        // Check if file already exists -- if so, open from file
-        let mut mode = if file_path.exists() {
+        // Part-backed actors start file-backed; legacy actors reopen existing caches.
+        let mut mode = if force_file || file_path.exists() {
             StorageMode::File(file_path.clone())
         } else {
             StorageMode::InMemory
@@ -155,7 +295,11 @@ pub fn spawn_actor(
         };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            match storage::open_connection(opening_path, &max_memory_per_connection) {
+            match storage::open_spill_capped_connection(
+                opening_path,
+                &max_memory_per_connection,
+                disk.max_temp_directory_bytes,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to open database");
@@ -175,7 +319,20 @@ pub fn spawn_actor(
                                     e
                                 ))));
                             }
-                            DbMessage::Wal { response_tx } => {
+                            DbMessage::Snapshot { response_tx } => {
+                                let _ = response_tx.send(Err(DuckDbError::Internal(format!(
+                                    "Failed to open: {}",
+                                    e
+                                ))));
+                            }
+                            DbMessage::WalSnapshotForCheckpoint { response_tx, .. } => {
+                                let _ = response_tx.send(Err(DuckDbError::Internal(format!(
+                                    "Failed to open: {}",
+                                    e
+                                ))));
+                            }
+                            DbMessage::Wal { response_tx }
+                            | DbMessage::WalForCheckpoint { response_tx, .. } => {
                                 let _ = response_tx.send(Err(DuckDbError::Internal(format!(
                                     "Failed to open: {}",
                                     e
@@ -186,7 +343,7 @@ pub fn spawn_actor(
                             }
                         }
                     }
-                    databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
+                    deregister_actor(&databases, (space_id, db_name), id, &file_path, force_file);
                     return;
                 }
             }
@@ -212,26 +369,32 @@ pub fn spawn_actor(
                     without_growth,
                     response_tx,
                 } => {
-                    let result = if without_growth {
-                        handle_message_without_growth(
-                            &conn,
-                            &request,
-                            &caveats,
-                            &ability,
-                            arrow_format,
-                        )
-                    } else {
-                        handle_message(&conn, &request, &caveats, &ability, arrow_format, None)
-                    };
+                    let budget_key = disk::budget_key(&space_id, &db_name);
+                    let write =
+                        disk.headroom_checked() && disk::writes(&request, &caveats, &ability);
+                    let result = disk.watch(&budget_key, &file_path, &conn, write, || {
+                        if without_growth {
+                            handle_message_without_growth(
+                                &conn,
+                                &request,
+                                &caveats,
+                                &ability,
+                                arrow_format,
+                            )
+                        } else {
+                            handle_message(&conn, &request, &caveats, &ability, arrow_format, None)
+                        }
+                    });
 
                     // Post-write promotion check
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
                         if let Ok(size) = storage::database_size(&conn) {
                             if size > memory_threshold {
-                                match storage::promote_to_file(
+                                match storage::promote_to_spill_capped_file(
                                     &conn,
                                     &file_path,
                                     &max_memory_per_connection,
+                                    disk.max_temp_directory_bytes,
                                 ) {
                                     Ok(new_conn) => {
                                         conn = new_conn;
@@ -253,8 +416,41 @@ pub fn spawn_actor(
                         handle_export(&conn, &mode, &file_path, &max_memory_per_connection);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::Snapshot { response_tx } => {
+                    let result =
+                        handle_snapshot(&conn, &mode, &file_path, &max_memory_per_connection);
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::WalSnapshotForCheckpoint {
+                    max_bytes,
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                } => {
+                    let result = handle_wal_snapshot_for_checkpoint(
+                        &mode,
+                        &file_path,
+                        max_bytes,
+                        checkpoint_size,
+                        &checkpoint_hash,
+                    );
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Wal { response_tx } => {
                     let result = handle_wal(&mode, &file_path);
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::WalForCheckpoint {
+                    checkpoint_size,
+                    checkpoint_hash,
+                    response_tx,
+                } => {
+                    let result = handle_wal_for_checkpoint(
+                        &mode,
+                        &file_path,
+                        checkpoint_size,
+                        &checkpoint_hash,
+                    );
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Shutdown { response_tx } => {
@@ -272,9 +468,7 @@ pub fn spawn_actor(
         // been hydrated and registered for this key, and evicting it would send
         // the next request through hydration while it is live — deleting and
         // rewriting the files it holds open by path.
-        databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
-            handle.id == id
-        });
+        deregister_actor(&databases, (space_id, db_name), id, &file_path, force_file);
         tracing::debug!("Database actor shutting down");
         if let Some(response_tx) = shutdown {
             let _ = response_tx.send(());
@@ -282,6 +476,261 @@ pub fn spawn_actor(
     });
 
     DatabaseHandle { id, tx }
+}
+
+type ActorEntry<'a> = dashmap::mapref::entry::Entry<'a, (String, String), DatabaseHandle>;
+
+/// Keep registration until the cache paths are free. A replacement actor's
+/// cache must never be removed by its predecessor. Explicit shutdown already
+/// holds the service's per-database operation fence, even if it removed the
+/// entry.
+///
+/// The files are only renamed aside while the map entry is held, so a lookup
+/// of any other database in the same map shard never waits on file deletion.
+/// The order is carried by the types in [`cleanup`]: renaming aside needs the
+/// held entry, releasing consumes it, and only the released form can be
+/// deleted.
+fn deregister_actor(
+    databases: &DashMap<(String, String), DatabaseHandle>,
+    key: (String, String),
+    id: u64,
+    path: &Path,
+    remove_files: bool,
+) {
+    let entry = databases.entry(key);
+    if matches!(&entry, ActorEntry::Occupied(entry) if entry.get().id != id) {
+        return;
+    }
+    let moved = if remove_files {
+        cleanup::move_aside(&entry, path)
+    } else {
+        cleanup::MovedAside::default()
+    };
+    if cleanup::delete_aside(cleanup::release(entry, moved)) {
+        // Value-free event for a local debug-log check of cache-disk headroom. It is `debug!`
+        // on purpose: the log shipper names and ships only warn/error lines, and this one has
+        // no event_code in the pinned schema (a follow-up adds one and promotes it).
+        tracing::debug!(
+            event = "duckdb_cache_cleanup_failed",
+            "Database cache cleanup failed"
+        );
+    }
+}
+
+/// The cleanup steps, in a module of their own so that a [`cleanup::Released`]
+/// can only come from [`cleanup::release`].
+mod cleanup {
+    use std::path::{Path, PathBuf};
+
+    use super::{cache_file_paths, remove_cache_entry, ActorEntry};
+
+    /// Cache files renamed to staging names, not yet deleted.
+    #[derive(Default)]
+    pub(super) struct MovedAside {
+        temps: Vec<PathBuf>,
+        failed: bool,
+    }
+
+    /// [`MovedAside`] once the registration is gone: the only form that can
+    /// be deleted.
+    pub(super) struct Released(MovedAside);
+
+    /// Rename the cache files at `path` aside while `_held` keeps the
+    /// registration, so the paths are free before it can disappear. The
+    /// sweep before each hydration removes the names if the process stops
+    /// before [`delete_aside`].
+    pub(super) fn move_aside(_held: &ActorEntry<'_>, path: &Path) -> MovedAside {
+        let mut moved = MovedAside::default();
+        for candidate in cache_file_paths(path) {
+            let temp = crate::database_artifacts::staging_path(path);
+            match std::fs::rename(&candidate, &temp) {
+                Ok(()) => moved.temps.push(temp),
+                Err(error) => {
+                    moved.failed |= error.kind() != std::io::ErrorKind::NotFound;
+                    crate::database_artifacts::release_staging(&temp);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Drop the registration (or the vacant entry's lock), releasing the
+    /// shard.
+    pub(super) fn release(entry: ActorEntry<'_>, moved: MovedAside) -> Released {
+        match entry {
+            ActorEntry::Occupied(entry) => {
+                entry.remove();
+            }
+            ActorEntry::Vacant(entry) => drop(entry),
+        }
+        Released(moved)
+    }
+
+    /// Delete what was moved aside, outside the map lock. True if anything
+    /// failed, including the renames.
+    pub(super) fn delete_aside(Released(moved): Released) -> bool {
+        let mut failed = moved.failed;
+        for temp in moved.temps {
+            failed |= remove_cache_entry(&temp).is_err();
+            crate::database_artifacts::release_staging(&temp);
+        }
+        failed
+    }
+}
+
+/// The paths DuckDB keeps for the database at `path`: the main file, its WAL
+/// and its spill directory.
+pub(crate) fn cache_file_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}.wal", path.display())),
+        PathBuf::from(format!("{}.tmp", path.display())),
+    ]
+}
+
+/// Remove one cache file, or DuckDB's spill directory with its contents. A
+/// path that is already gone counts as removed.
+pub(crate) fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) => Err(error),
+    };
+    match removed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn handle_wal_snapshot_for_checkpoint(
+    mode: &StorageMode,
+    file_path: &Path,
+    max_bytes: u64,
+    checkpoint_size: u64,
+    checkpoint_hash: &str,
+) -> Result<Option<tempfile::NamedTempFile>, DuckDbError> {
+    if !checkpoint_matches(mode, file_path, checkpoint_size, checkpoint_hash)? {
+        return Ok(None);
+    }
+    let mut source = match std::fs::File::open(format!("{}.wal", file_path.display())) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DuckDbError::Internal(error.to_string())),
+    };
+    let size = source
+        .metadata()
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
+        .len();
+    if size == 0 || size >= max_bytes {
+        return Ok(None);
+    }
+    let mut snapshot =
+        snapshot_file(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    std::io::copy(&mut source, snapshot.as_file_mut())
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    Ok(Some(snapshot))
+}
+
+/// Name prefix of the snapshot copies a save takes. They are made beside the
+/// cache files, on the filesystem whose headroom the disk budget measures
+/// (`$TMPDIR` can be another one), and the startup sweep removes the ones a
+/// stopped process left.
+pub(crate) const SNAPSHOT_PREFIX: &str = ".duckdb-snapshot-";
+
+/// A new empty snapshot file in the cache directory of the database at
+/// `cache_file`.
+pub(crate) fn snapshot_file(cache_file: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let dir = cache_file.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempfile_in(dir)
+}
+
+/// Copy `path` into a snapshot file beside the cache file `cache_file`.
+fn copy_snapshot(path: &Path, cache_file: &Path) -> Result<tempfile::NamedTempFile, DuckDbError> {
+    let mut snapshot =
+        snapshot_file(cache_file).map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    let mut source = std::fs::File::open(path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    std::io::copy(&mut source, snapshot.as_file_mut())
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    Ok(snapshot)
+}
+
+fn handle_snapshot(
+    conn: &duckdb::Connection,
+    mode: &StorageMode,
+    file_path: &Path,
+    max_memory: &str,
+) -> Result<tempfile::NamedTempFile, DuckDbError> {
+    match mode {
+        StorageMode::File(_) => {
+            {
+                let _timer = QueryTimer::new();
+                conn.execute_batch("CHECKPOINT;")
+                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            }
+            copy_snapshot(file_path, file_path)
+        }
+        StorageMode::InMemory => {
+            let dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let path = dir.path().join("snapshot.duckdb");
+            let dest = storage::open_connection(Some(&path), max_memory)?;
+            storage::copy_tables(conn, &dest)?;
+            drop(dest);
+            copy_snapshot(&path, file_path)
+        }
+    }
+}
+
+fn handle_wal_for_checkpoint(
+    mode: &StorageMode,
+    file_path: &Path,
+    checkpoint_size: u64,
+    checkpoint_hash: &str,
+) -> Result<Option<Vec<u8>>, DuckDbError> {
+    if !checkpoint_matches(mode, file_path, checkpoint_size, checkpoint_hash)? {
+        return Ok(None);
+    }
+    handle_wal(mode, file_path)
+}
+
+fn checkpoint_matches(
+    mode: &StorageMode,
+    file_path: &Path,
+    checkpoint_size: u64,
+    checkpoint_hash: &str,
+) -> Result<bool, DuckDbError> {
+    if !matches!(mode, StorageMode::File(_)) {
+        return Ok(false);
+    }
+    let mut file =
+        std::fs::File::open(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
+    if file
+        .metadata()
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
+        .len()
+        != checkpoint_size
+    {
+        return Ok(false);
+    }
+    // DuckDB can place new blocks in the main file while recording only their
+    // references in the WAL. Such a WAL cannot replay on the older checkpoint.
+    let mut hasher = Blake3Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hasher.finalize().to_cid(0x55).to_string() != checkpoint_hash {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, DuckDbError> {
@@ -1105,5 +1554,140 @@ mod tests {
             DuckDbResponse::Execute(ExecuteResponse { changes: 1 })
         ));
         assert_eq!(row_count(&conn, "events"), 1);
+    }
+
+    fn schema_write(sql: &str, schema: &str) -> DuckDbRequest {
+        DuckDbRequest::Execute {
+            sql: sql.to_string(),
+            params: Vec::new(),
+            schema: Some(vec![schema.to_string()]),
+        }
+    }
+
+    fn placeholder_handle(id: u64) -> DatabaseHandle {
+        let (tx, _rx) = mpsc::channel(1);
+        DatabaseHandle { id, tx }
+    }
+
+    fn file_actor(
+        base: &Path,
+        key: &(String, String),
+        idle_timeout_secs: u64,
+        databases: &Arc<DashMap<(String, String), DatabaseHandle>>,
+    ) -> DatabaseHandle {
+        spawn_actor_with_parts(
+            key.0.clone(),
+            key.1.clone(),
+            base.to_string_lossy().into_owned(),
+            u64::MAX,
+            true,
+            idle_timeout_secs,
+            "128MB".into(),
+            databases.clone(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_actor_close_spares_a_replacement_and_its_files() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-a".to_string(), "main".to_string());
+        let actor = file_actor(base.path(), &key, 300, &databases);
+        databases.insert(key.clone(), actor.clone());
+        actor
+            .execute(
+                schema_write("INSERT INTO t VALUES (1)", "CREATE TABLE t(i INTEGER)"),
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let path = base.path().join(&key.0).join("main.duckdb");
+        assert!(path.exists());
+
+        // A replacement registered under the key; its files are at the same path.
+        databases.insert(key.clone(), placeholder_handle(u64::MAX));
+        actor.shutdown().await.unwrap();
+        assert!(
+            path.exists(),
+            "the predecessor removed the replacement's cache"
+        );
+        assert_eq!(databases.get(&key).map(|handle| handle.id), Some(u64::MAX));
+
+        // With the entry vacant (explicit shutdown under the operation fence)
+        // every cache path goes, the spill directory included.
+        databases.remove(&key);
+        let [main, wal, spill] = cache_file_paths(&path);
+        std::fs::create_dir_all(&spill).unwrap();
+        std::fs::write(spill.join("spill"), b"x").unwrap();
+        std::fs::write(&wal, b"w").unwrap();
+        deregister_actor(&databases, key.clone(), 7, &path, true);
+        assert!(!main.exists() && !wal.exists() && !spill.exists());
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
+
+        // Actors that do not own their files never delete them.
+        std::fs::write(&path, b"keep").unwrap();
+        deregister_actor(&databases, key, 7, &path, false);
+        assert!(path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_idle_eviction_frees_cache_paths_before_deregistering() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-evict".to_string(), "main".to_string());
+        let path = base.path().join(&key.0).join("main.duckdb");
+        let [main, wal, spill] = cache_file_paths(&path);
+        // A spill directory a crashed query left behind.
+        std::fs::create_dir_all(&spill).unwrap();
+        for i in 0..2_000 {
+            std::fs::write(spill.join(format!("s{i}")), b"x").unwrap();
+        }
+        let actor = file_actor(base.path(), &key, 1, &databases);
+        databases.insert(key.clone(), actor.clone());
+        actor
+            .execute(
+                schema_write("INSERT INTO t VALUES (1)", "CREATE TABLE t(i INTEGER)"),
+                None,
+                "tinycloud.duckdb/admin".into(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while databases.contains_key(&key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actor must idle-evict"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !main.exists() && !wal.exists() && !spill.exists(),
+            "the registration vanished while cache paths remained"
+        );
+        // The renamed-aside files are deleted after the entry is released.
+        let dir = path.parent().unwrap();
+        while std::fs::read_dir(dir).unwrap().next().is_some() {
+            assert!(std::time::Instant::now() < deadline, "cleanup must finish");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_of_an_exited_actor_succeeds() {
+        let base = tempfile::TempDir::new().unwrap();
+        let databases = Arc::new(DashMap::new());
+        let key = ("space-exit".to_string(), "main".to_string());
+        let actor = file_actor(base.path(), &key, 300, &databases);
+        actor.shutdown().await.unwrap();
+        actor.shutdown().await.unwrap();
     }
 }

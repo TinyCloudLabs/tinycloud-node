@@ -304,6 +304,11 @@ impl ArtifactSink for FileSink<'_> {
         Ok(())
     }
 
+    /// Bytes go straight to the scratch file.
+    fn buffers_in_memory(&self) -> bool {
+        false
+    }
+
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
         self.file.write_all(bytes).await.map_err(io)?;
         self.hasher.update(bytes);
@@ -405,6 +410,11 @@ impl ArtifactSink for RangeSink<'_> {
     async fn begin_part(&mut self, _part: ArtifactPart) -> Result<(), DatabaseArtifactError> {
         self.parts += 1;
         Ok(())
+    }
+
+    /// Bytes go straight to the scratch file.
+    fn buffers_in_memory(&self) -> bool {
+        false
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), DatabaseArtifactError> {
@@ -767,5 +777,94 @@ pub(crate) mod tests {
         .unwrap();
         let source = PgArtifactSource::new(repo);
         assert!(source.wal_marks(&DB, &[1, 2, 3]).await.unwrap().is_empty());
+    }
+
+    /// TC-2917: a database saved as `checkpoint-parts-v1` keeps its WAL as a
+    /// second part. The source must read that WAL, not only the checkpoint
+    /// part, and a row with no WAL has none to read.
+    #[tokio::test]
+    async fn postgres_a_parts_row_with_a_wal_is_read_checkpoint_and_wal() {
+        use crate::database_artifacts::chunks::{ChunkLimits, CHUNK_BYTES};
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_a_parts_row_with_a_wal_is_read_checkpoint_and_wal",
+        )
+        .await
+        else {
+            return;
+        };
+        let space = "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:shadow";
+        let repo = Arc::new(
+            SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone()).with_chunk_limits(Some(
+                ChunkLimits {
+                    artifact_bytes: 8 * CHUNK_BYTES as u64,
+                    account_bytes: 8 * CHUNK_BYTES as u64,
+                },
+            )),
+        );
+        let part = |bytes: &[u8]| {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(bytes).unwrap();
+            file
+        };
+        // Each part spans two chunks.
+        let checkpoint = vec![1u8; CHUNK_BYTES + 17];
+        let wal = vec![2u8; CHUNK_BYTES + 23];
+        let first = repo
+            .save_snapshot(
+                SERVICE,
+                space,
+                "main",
+                part(&checkpoint),
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let db = DbRef {
+            space,
+            db_id: "main",
+        };
+        let source = PgArtifactSource::new(repo.clone());
+        let head = source.head(&db).await.unwrap().unwrap();
+        assert!(!head.has_delta);
+        let (_path, mut file) = scratch().await;
+        assert!(matches!(
+            source.wal_to(&db, &head.head(), &mut file).await,
+            Err(SourceError::MovedOn)
+        ));
+
+        repo.save_wal_snapshot(
+            SERVICE,
+            space,
+            "main",
+            part(&wal),
+            ArtifactExpectation::Derived {
+                revision: first.revision,
+                checkpoint_content_hash: first.checkpoint_content_hash.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let head = source.head(&db).await.unwrap().unwrap();
+        assert!(head.has_delta);
+        assert_eq!(head.checkpoint_bytes, checkpoint.len() as u64);
+        assert_eq!(head.delta_bytes, wal.len() as u64);
+
+        let (path, mut file) = scratch().await;
+        let copied = source
+            .checkpoint_to(&db, &head.cid, &mut file)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), checkpoint);
+        assert_eq!(copied.sha256, sha256(&checkpoint));
+        let copied = source.wal_to(&db, &head.head(), &mut file).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), wal);
+        assert_eq!(
+            copied,
+            Copied {
+                bytes: wal.len() as u64,
+                sha256: sha256(&wal)
+            }
+        );
     }
 }
