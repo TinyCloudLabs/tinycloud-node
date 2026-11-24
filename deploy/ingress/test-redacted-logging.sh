@@ -134,15 +134,16 @@ expect_status 200 "https://$DOMAIN/admin/stats?token=$STATS_TOKEN"
 expect_status 502 "https://$DOMAIN/public/$SPACE/kv/$KEY"
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
 # HTTP/1.1, a client-chosen method, and a 400 raised before routing (a header
-# line over the 32 KB buffers) with the ticket in the request line.
+# line over the 256 KB buffers) with the ticket in the request line.
 expect_status 401 --http1.1 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 401 --http1.1 -X "$METHOD" "https://$DOMAIN/signed/kv/$TICKET"
-expect_status 400 --http1.1 -H "X-Large: $(head -c 40000 /dev/zero | tr '\0' a)" \
+expect_status 400 --http1.1 -H "X-Large: $(head -c 300000 /dev/zero | tr '\0' a)" \
     "https://$DOMAIN/signed/kv/$TICKET"
 
-# TC-910: a single header line of about 30 KB fits the 32 KB buffers.
-LARGE_HEADER="X-Large: $(head -c 30000 /dev/zero | tr '\0' a)"
+# TC-910/TC-4249: a single header line of about 200 KB fits the 256 KB buffers.
+LARGE_HEADER="X-Large: $(head -c 200000 /dev/zero | tr '\0' a)"
 expect_status 200 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
+expect_status 200 --http1.1 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
 
 # TC-1012: CLIENT_MAX_BODY_SIZE=95m admits exactly 95 MiB (99,614,720 bytes)
 # and refuses one byte more, declared or chunked.
@@ -210,9 +211,10 @@ expect_line GET "<other>" 401
 expect_line "<other>" "/signed/kv/<ticket_id>" 401
 expect_line GET "/signed/kv/<ticket_id>" 400
 expect_line GET "/delegate" 200
+expect_line GET "/delegate" 200
 expect_line POST "/invoke" 200
 expect_line POST "/invoke" 413
 
 echo "ingress container output:"
 sed 's/^/  /' <<<"$LOGS"
-echo "PASS: no ticket, identifier or client address in the ingress logs; 32 KB headers and 95 MiB bodies accepted, larger bodies refused"
+echo "PASS: no ticket, identifier or client address in the ingress logs; 256 KB headers and 95 MiB bodies accepted, larger bodies refused"
