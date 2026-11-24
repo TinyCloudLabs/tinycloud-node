@@ -128,10 +128,12 @@ its final chunk is removed, so a partially collected pair stays accounted.
 
 Roll out WAL-capable readers to every instance before enabling the switch.
 Checkpoint-only part readers fail closed on WAL layouts. Schema changes are
-forward-only (the two PostgreSQL migrations' `down` refuses; a deregister-only
-rollback is safe because their `up` is re-runnable: delete both
-`seaql_migrations` rows before booting the old image). Switching the feature off
-keeps existing layouts readable and
+forward-only (the two PostgreSQL migrations' `down` refuses). Both `up` steps
+are re-runnable: running `up` again after deleting BOTH `seaql_migrations` rows
+(`m20261113_020000_artifact_chunk_wal` and
+`m20261113_030000_artifact_part_lifecycle`) is tested. Booting the previous
+image on the changed schema after such a row-only delete is proposed but
+untested. Switching the feature off keeps existing layouts readable and
 writable by the current binary, and does not downgrade their format.
 
 New DuckDB databases with parts enabled start file-backed under the existing
