@@ -463,8 +463,9 @@ class OutputAndClientTest(Base):
             if "deployments" in request.full_url:
                 return Reply(json.dumps({"success": True, "result": {"deployments": [
                     {"versions": [{"version_id": "v9", "percentage": 100}]}]}}).encode())
-            if "content/v2" in request.full_url:
-                return Reply(b'var PHALA_ORIGIN = "https://cf-origin.example.test";\nvar X = 1;')
+            if request.full_url.endswith("/settings"):
+                return Reply(json.dumps({"success": True, "result": {"bindings": [
+                    {"name": "ORIGIN_URL", "type": "plain_text", "text": "https://cf-origin.example.test"}]}}).encode())
             return Reply(json.dumps({"success": True, "result": {"id": TUNNEL}}).encode())
 
         reader = cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
@@ -488,6 +489,47 @@ class OutputAndClientTest(Base):
             with self.assertRaises(cf_only.ClientError) as caught:
                 cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=failing).tunnel(TUNNEL)
             self.assertNotIn(CF_TOKEN, str(caught.exception))
+
+    def test_worker_origin_comes_from_the_deployed_variable_only(self):
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def reader_with(bindings):
+            def opener(request, timeout):
+                url = request.full_url
+                self.assertEqual(request.get_method(), "GET")
+                self.assertNotIn("/content", url)  # the source is never read
+                if url.endswith("/settings"):
+                    return Reply(json.dumps({"success": True, "result": {"bindings": bindings}}).encode())
+                if "deployments" in url:
+                    return Reply(json.dumps({"success": True, "result": {"deployments": [
+                        {"versions": [{"version_id": "v9", "percentage": 100}]}]}}).encode())
+                return Reply(json.dumps({"success": True, "result": []}).encode())
+            return cf_only.CloudflareReader(CF_TOKEN, "acct", "zone", opener=opener)
+
+        var = {"name": "ORIGIN_URL", "type": "plain_text", "text": f"https://{HOST}"}
+        self.assertEqual(reader_with([{"name": "OTHER", "type": "plain_text", "text": "x"}, var]).worker("s")["origin"],
+                         f"https://{HOST}")
+        for name, bindings in {"absent": [], "other var only": [dict(var, name="PHALA_ORIGIN")],
+                               "secret not a var": [dict(var, type="secret_text")],
+                               "duplicated": [var, dict(var, text="https://x.example.test")],
+                               "no text": [{"name": "ORIGIN_URL", "type": "plain_text"}]}.items():
+            with self.subTest(name):
+                self.assertIsNone(reader_with(bindings).worker("s")["origin"])
+
+    def test_preflight_refuses_a_phala_origin_variable_and_a_missing_one(self):
+        for origin in (f"https://{APP}-8000.dstack-pha-prod5.phala.network", None, "http://" + HOST,
+                       f"https://{HOST}/path"):
+            with self.subTest(origin=origin):
+                self.cf.state["worker"]["origin"] = origin
+                code, out, err = self.run_cli(["preflight", *self.cloudflare_args()])
+                self.assertEqual(code, 1, out)
+        self.cf.state["worker"]["origin"] = f"https://{APP}-8000.dstack-pha-prod5.phala.network"
+        self.assertIn("Phala gateway", self.run_cli(["preflight", *self.cloudflare_args()])[2])
 
 
 if __name__ == "__main__":

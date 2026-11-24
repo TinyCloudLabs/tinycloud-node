@@ -26,10 +26,11 @@ existing `scripts/test-ingress-switch.py` (real switch on temp files, fake
 clients for everything remote). **Not run, ever, by this change:** the real
 Cloudflare reader and the real network probe against any live system, any
 Phala call, any drill. The Cloudflare endpoint shapes (tunnel, configurations,
-DNS records, Worker deployments, `content/v2`, routes) and the Worker origin
-extraction (exactly one `const|let|var *ORIGIN = "https://..."` in the script
-source) are [INFERENCE] from API documentation and the recorded Worker source;
-if a read does not match, preflight refuses rather than guessing.
+DNS records, Worker deployments, routes) are [INFERENCE] from API documentation.
+**The Worker script settings/bindings endpoint
+(`GET /accounts/{id}/workers/scripts/{name}/settings`, a `plain_text` binding named
+`ORIGIN_URL`) is [INFERENCE] and was not run.** If any read does not match
+(absent, duplicated, secret or other type), preflight refuses rather than guessing.
 
 ## Honest operating characteristics
 
@@ -68,8 +69,11 @@ refuses unless **all** hold:
 2. its ingress routes the tunnel host to `http://tinycloud:8000`;
 3. the tunnel host has exactly one proxied CNAME to `<tunnel-id>.cfargotunnel.com`;
 4. the Worker has a readable single 100% version (and `--expect-worker-version` if
-   given), its origin is exactly `https://<tunnel-host>`, and `node.tinycloud.xyz/*`
-   routes to that script;
+   given), its **deployed** variable `ORIGIN_URL` (plain-text binding read from the
+   script settings, set with `wrangler deploy --var ORIGIN_URL:<origin>`) is exactly
+   `https://<tunnel-host>` and not a `*.phala.network` host, and
+   `node.tinycloud.xyz/*` routes to that script. The Worker source is never read, and
+   there is no source-constant fallback;
 5. `/info` on the tunnel host and on `node.tinycloud.xyz` returns 200 with the same
    non-empty `nodeId`.
 

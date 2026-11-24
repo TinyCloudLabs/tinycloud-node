@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from uuid import UUID
 
@@ -77,12 +78,11 @@ def write_private(path, value):
 class CloudflareReader:
     """GET-only Cloudflare API reads. The token never appears in any message."""
     API = "https://api.cloudflare.com/client/v4"
-    ORIGIN_CONST = re.compile(r"(?:const|let|var)\s+[A-Z_]*ORIGIN\s*=\s*\"(https://[^\"]+)\"")
 
     def __init__(self, token, account_id, zone_id, opener=urlopen):
         self.token, self.account, self.zone, self.opener = token, account_id, zone_id, opener
 
-    def _get(self, path, raw=False):
+    def _get(self, path):
         request = Request(self.API + path, method="GET", headers={"Authorization": "Bearer " + self.token})
         try:
             with self.opener(request, timeout=15) as response:
@@ -91,8 +91,6 @@ class CloudflareReader:
             raise ClientError(f"Cloudflare read failed: HTTP {error.code}") from None
         except (URLError, OSError):
             raise ClientError("Cloudflare read failed: network error") from None
-        if raw:
-            return body.decode("utf-8", "replace")
         try:
             data = json.loads(body)
         except ValueError:
@@ -115,10 +113,13 @@ class CloudflareReader:
         deployments = self._get(f"/accounts/{self.account}/workers/scripts/{script}/deployments")
         versions = ((deployments or {}).get("deployments") or [{}])[0].get("versions") or []
         version = versions[0].get("version_id") if len(versions) == 1 and versions[0].get("percentage") == 100 else None
-        source = self._get(f"/accounts/{self.account}/workers/scripts/{script}/content/v2", raw=True)
-        found = self.ORIGIN_CONST.findall(source)
+        settings = self._get(f"/accounts/{self.account}/workers/scripts/{script}/settings")
+        # INFERENCE: the deployed variable is a plain_text binding named ORIGIN_URL (set with
+        # `wrangler deploy --var`). Anything else (absent, duplicated, secret, other type) -> None.
+        bindings = [b for b in (settings or {}).get("bindings") or [] if isinstance(b, dict) and b.get("name") == "ORIGIN_URL"]
+        origin = bindings[0].get("text") if len(bindings) == 1 and bindings[0].get("type") == "plain_text" else None
         routes = self._get(f"/zones/{self.zone}/workers/routes") or []
-        return {"version_id": version, "origin": found[0] if len(found) == 1 else None,
+        return {"version_id": version, "origin": origin if isinstance(origin, str) else None,
                 "routes": [{"pattern": r.get("pattern"), "script": r.get("script")} for r in routes]}
 
 
@@ -251,6 +252,8 @@ def preflight(cfg, clients, now):
     worker = cf.worker(cfg["worker_script"])
     require(isinstance(worker, dict) and isinstance(worker.get("version_id"), str) and worker["version_id"],
             "Worker version could not be read")
+    require(isinstance(worker.get("origin"), str) and not (urlsplit(worker["origin"]).hostname or "").endswith(".phala.network"),
+            "Deployed Worker ORIGIN_URL is missing or is a Phala gateway host; not Cloudflare-only")
     require(worker.get("origin") == f"https://{host}", "Worker origin is not the tunnel hostname")
     if cfg.get("expect_worker_version"):
         require(worker["version_id"] == cfg["expect_worker_version"], "Worker version differs from the expected version")
