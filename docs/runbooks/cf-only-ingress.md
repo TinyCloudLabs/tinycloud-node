@@ -170,14 +170,20 @@ distinct exit code. Only `pass` is evidence, and there is no "indeterminate" pas
 It opens TLS/TCP connections to Phala **gateway** hostnames (network
 contact with Phala infrastructure, not an API call and not a credentialed one).
 
-**Decision table (the output prints `verdict`, `exit_code` and `next_action`):**
+**Decision table (key on exit code AND `verdict`; the output prints `verdict`, `exit_code`, `exit_codes` and a per-mode `next_action`):**
 
 | exit | verdict | meaning | action |
 |---|---|---|---|
-| 0 | `pass` | every check proven; **unreachable until a drill signature is accepted** | continue |
-| 1 | `open` | a probed gateway path answered as the node, management answered although the policy denies it, expected-open management was reached but gave no SSH banner, `node.*` or the tunnel host is unhealthy, or `--expect restored` did not reach the node | **undo** (restore) if the path is open or the service is down |
-| 3 | `not_proven_closed` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, HTTP statuses, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits on management) | **hold: run the drill; do NOT undo and do NOT restart on this alone.** With the empty set a **correct** restriction reads `not_proven_closed` today |
-| 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed. **No verdict.** Nothing was changed or judged | **fix the input and re-run; never undo on exit 4** |
+| 0 | `pass` | every check proven; **unreachable for `--expect restricted` until a drill signature is accepted** | continue |
+| 1 | `open`, `--expect restricted` | a probed gateway path answered 2xx (the node or not), management answered although the policy denies it, expected-open management was reached but gave no SSH banner, or `node.*` or the tunnel host is unhealthy | **undo** (restore). If the only failing check is a transport failure of `/info` (no HTTP status, seen from this vantage only), **confirm from a second network before undo** |
+| 1 | `open`, `--expect restored` | the node path is broken after the restore (tee not serving the node, `/info` or management unhealthy) | **do NOT undo again** (the restore is already applied); investigate the tunnel, the Worker secret and the connector, confirm from a second network |
+| 3 | `not_proven_closed`, `--expect restricted` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, non-2xx HTTP, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits on management) | **hold; do NOT undo and do NOT restart on this alone.** From a **second, IPv6-capable network** check that the `-8000` hosts and `tee.node.tinycloud.xyz` `/info` do not return the node, then run the drill. With the empty set a **correct** restriction reads `not_proven_closed` today |
+| 3 | `not_proven_closed`, `--expect restored` | restored not proven from this vantage (typically an IPv4-only vantage while management has an AAAA record) | re-run from a second IPv6-capable network; do NOT undo again; no drill needed |
+| 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed, an IO or parse error, an unexpected exception. **No verdict.** Nothing was changed or judged | **fix the input and re-run; never undo on exit 4** |
+
+**A stale receipt is likely**: the receipt's default max age is 3600 s and the restart
+time is unmeasured, so a verify run after a slow restart is refused (exit 4, stderr
+"Refused ... stale", empty stdout) until you rerun `preflight`. That is not a verdict.
 
 **Exit codes, every subcommand.** `1` is reserved for the `open` verdict of `verify`, so a
 wrapper or tired operator that undoes on exit 1 never undoes a correct restriction
@@ -194,20 +200,33 @@ pass yet: no accepted closed signature yet: drill required.** Reason: on an SNI-
 shared gateway a TCP refusal happens before the SNI is seen, so it can never be
 app-specific. `tcp_refused` means a local or on-path cause (a REJECT rule, wrong DNS,
 a stale or split-horizon answer) or a gateway-wide outage, so it is not accepted.
-`tcp_reset` is not accepted either, and if a reset is ever accepted it will count only
+`tcp_reset` is not accepted either. A connect-time `tcp_reset` happens before the SNI is
+sent, exactly like a refusal, so it is never app-specific either. If a reset is ever
+accepted it will count only
 when the connect itself is reset: a reset after the TCP connect succeeded (during TLS
 or HTTP, e.g. an RST on the ClientHello) is recorded as `reset_after_connect` and is
 never eligible. The real denial signature of a restricted gateway has
 never been observed [INFERENCE]; the drill must record it and the signature is then
 added to `ACCEPTED_CLOSED_SIGNALS` in code, under review. No flag, environment variable
 or file widens the set (`--accept-closed-signal` was removed). The output says so
-(`blocked`). `--expect restored` does not depend on the set, but see the IPv6 management note below. Everything else FAILs as well:
-`no_route` (it describes this verifier's network, not the target), anything that
-completes TLS or HTTP (a TLS alert `tls_rejected`, `closed_after_tls`, any HTTP status,
-`http_200_unparsed`, `malformed_http`), a node answer (`node_info`), a timeout, a
-resolver failure and any other error. A `/info` body is de-chunked before the node id is
-read, so a chunked 200 counts as the node answering. Open and not-proven-closed results FAIL,
-never "indeterminate". Checks:
+(`blocked`). `--expect restored` does not depend on the set, but see the IPv6 management note below. Everything else
+FAILs as well: `no_route` (it describes this verifier's network, not the target), a TLS
+alert `tls_rejected`, `closed_after_tls`, a non-2xx HTTP status, `malformed_http`, a
+timeout, a resolver failure and any other error are `not_proven_closed` (exit 3). **A 2xx
+from a restricted path is `open` (exit 1) even when the body is not the node's**
+(`node_info`, `http_200_unparsed`, any `http_2xx`); 404, 502, 301, TLS alerts and closes
+stay exit 3. A `/info` body is de-chunked before the node id is read, so a chunked 200
+counts as the node answering. Open and not-proven-closed results FAIL, never
+"indeterminate".
+
+**Inherent one-vantage limits (documented, not fixable by this script).** (B) A local
+REJECT rule or an on-path reset produces the same `tcp_refused` as a closed gateway;
+that is why a refusal is never accepted. (A5) An open path reachable only over IPv6 is
+not seen from an IPv4-only vantage: the v6 probe is `no_route`, which is exit 3, never
+pass. Run verify from a second, IPv6-capable network. (NODATA) `--allow-no-aaaa` skips
+IPv6 for a name whose DNS has no AAAA; the gateway's own IPv6 listener may still
+answer that SNI when reached by a literal address or another resolver, and nothing here
+probes it. Checks:
 
 - `/info` on `node.tinycloud.xyz` and on the tunnel host is 200 with the receipt's
   node id (equal ids): otherwise FAIL;

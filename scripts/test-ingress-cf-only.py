@@ -494,7 +494,7 @@ class VerifyTest(Base):
                 code, out, err = self.verify()
                 open_class = ("tee ipv4 still serves", "instance -443s ipv6 still serves", "multi-address answer with one node "
                               "response", "node.* unhealthy", "node ids differ", "management looks closed while it must "
-                              "stay open", "management answers a non-SSH protocol", "management ipv6 refused")
+                              "stay open", "management answers a non-SSH protocol", "management ipv6 refused", "unparsed 200")
                 self.assertEqual(code, 1 if name in open_class else 3, out)
                 self.assertEqual(json.loads(out)["verdict"], "open" if name in open_class else "not_proven_closed")
                 self.assertEqual(json.loads(out)["result"], "FAIL")
@@ -764,6 +764,90 @@ class DefaultClosedSetTest(Base):
         self.assertIn("never undo", json.loads(out)["exit_codes"]["4"])
         self.assertIn("never undo on exit 4", self.applied["after_verify"]["exit 4"])
         self.assertNotIn("undo --snapshot", self.applied["after_verify"]["exit 4"])
+
+    def real_cli(self, *argv):
+        return subprocess.run([sys.executable, str(SCRIPT), *argv], text=True, capture_output=True,
+                              env={"PATH": "/usr/bin:/bin"})
+
+    def test_the_real_cli_exits_4_not_1_for_a_stale_receipt(self):
+        # M5: the default max age is 3600 s and the restart time is unmeasured, so a stale receipt is likely.
+        receipt = json.loads(self.receipt.read_text())
+        receipt["verified_at_utc"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        self.save(self.receipt, receipt)
+        result = self.real_cli("verify", *self.verify_args(expect="restricted"))
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Refused", result.stderr)
+        self.assertIn("stale", result.stderr)
+        self.assertIn("never undo", result.stderr)
+
+    def test_cli_maps_every_unexpected_error_to_4_and_leaves_argparse_at_2(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(cf_only, "main", side_effect=RuntimeError("boom-detail")):
+            self.assertEqual(cf_only.cli([]), 4)
+        self.assertNotIn("boom-detail", err.getvalue())
+        # a record_verify failure (disk full, permissions) is an error, not an open verdict
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out), \
+                mock.patch.object(cf_only, "real_clients", lambda a, env: self.clients()), \
+                mock.patch.object(cf_only, "record_verify", side_effect=OSError("disk-full-detail")):
+            code = cf_only.cli(["verify", *self.verify_args(expect="restricted")])
+        self.assertEqual((code, out.getvalue()), (4, ""))
+        self.assertNotIn("disk-full-detail", err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cf_only.cli(["verify"])
+        self.assertEqual(raised.exception.code, 2)
+        garbage = self.root / "receipt-garbage.json"
+        garbage.write_text("not json")
+        garbage.chmod(0o600)
+        result = self.real_cli("verify", *self.verify_args(expect="restricted", receipt=garbage))
+        self.assertEqual((result.returncode, result.stdout), (4, ""))
+
+    def test_a_2xx_from_a_restricted_path_is_open_but_other_statuses_stay_not_proven_closed(self):
+        for outcome, expected in (("http_200_unparsed", (1, "open")), ("http_204", (1, "open")),
+                                  ("http_404", (3, "not_proven_closed")), ("http_502", (3, "not_proven_closed")),
+                                  ("http_301", (3, "not_proven_closed")), ("tls_rejected", (3, "not_proven_closed")),
+                                  ("closed_after_tls", (3, "not_proven_closed"))):
+            with self.subTest(outcome):
+                self.http = FakeHttp()
+                self.http.probe_map[(f"{APP}-8000.{GATEWAY}", "ipv4")] = {"outcome": outcome}
+                code, out, err = self.verify()
+                self.assertEqual((code, json.loads(out)["verdict"]), expected, out)
+
+    def test_next_action_text_is_per_mode_and_a_vantage_transport_failure_asks_for_a_second_network(self):
+        # restored: exit 1 = the node path is broken after the restore: investigate, never "undo" again
+        self.http = FakeHttp(restricted=False)
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_refused"}
+        code, out, err = self.verify(expect="restored")
+        result = json.loads(out)
+        self.assertEqual((code, result["verdict"]), (1, "open"))
+        self.assertIn("Do NOT undo again", result["next_action"])
+        self.assertIn("do NOT undo again", result["exit_codes"]["1"])
+        self.assertNotIn("drill", result["next_action"])
+        self.assertIsNone(result["blocked"])
+        # restored from a v4-only vantage with a management AAAA: exit 3, re-run from an IPv6-capable network
+        self.http = FakeHttp(restricted=False)
+        self.http.mgmt6 = {"outcome": "no_route"}
+        code, out, err = self.verify(expect="restored")
+        result = json.loads(out)
+        self.assertEqual((code, result["verdict"]), (3, "not_proven_closed"))
+        self.assertIn("second IPv6-capable network", result["next_action"])
+        self.assertIn("Do NOT undo again", result["next_action"])
+        self.assertNotIn("run the drill", result["next_action"])
+        # restricted exit 3 names the concrete check; restricted exit 1 from a /info transport failure asks to confirm
+        self.http = FakeHttp()
+        code, out, err = self.verify()
+        self.assertIn("SECOND, IPv6-capable network", json.loads(out)["next_action"])
+        self.assertIn("tee.node.tinycloud.xyz /info", json.loads(out)["next_action"])
+        self.http = FakeHttp()
+        self.http.info_map["node.tinycloud.xyz"] = {"status": None, "node_id": None}
+        code, out, err = self.verify()
+        result = json.loads(out)
+        self.assertEqual((code, result["verdict"]), (1, "open"))
+        self.assertIn("confirm from a second network before undo", result["next_action"])
+        self.http = FakeHttp()
+        self.http.info_map["node.tinycloud.xyz"] = {"status": 502, "node_id": None}  # an HTTP answer: no such hedge
+        self.assertNotIn("second network before undo", json.loads(self.verify()[1])["next_action"])
 
     def closed_checks(self, out):
         return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]

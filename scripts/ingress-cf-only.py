@@ -618,6 +618,13 @@ def judge_management(result, expect_open, family="ipv4", allow_no_aaaa=False):
                                         "known-open SNI exists on the gateway when management is denied")
 
 
+def answered_as_success(signals):
+    """A restricted path that answers 2xx is open even when the body is not the node's (http_200_unparsed): S9. 404, TLS
+    alerts and other non-2xx stay not_proven_closed."""
+    return any(s == "node_info" or s == "http_200_unparsed"
+               or (s.startswith("http_") and s[5:].isdigit() and 200 <= int(s[5:]) < 300) for s in signals)
+
+
 # Signals that mean the gateway route was reached but did not give the SSH banner. For a management route that must stay
 # open this is a broken service (class open, exit 1). Verifier-side or DNS limits (timeout, no_route, no_aaaa, no_address,
 # error) are not proof of anything and stay not_proven_closed (exit 3): a vantage limit must never read as "undo".
@@ -655,7 +662,8 @@ def verify(a, clients, now):
         info = http.info(name)
         good = info.get("status") == 200 and info.get("node_id") == node
         checks.append(check(f"{label} /info healthy with the recorded node id", "pass" if good else "fail",
-                            f"status={info.get('status')} node_id_matches={info.get('node_id') == node}", kind="broken"))
+                            f"status={info.get('status')} node_id_matches={info.get('node_id') == node}", kind="broken",
+                            transport_failure=info.get("status") is None))
 
     waived = []
     mgmt_open = management_allowed(snap["after"]) if a.expect == "restricted" else None
@@ -705,7 +713,7 @@ def verify(a, clients, now):
                     waived.append(name)
                 checks.append(check(f"{name} fresh {family} connection shows an accepted closed signature "
                                     "(same-address positive control)", status, detail,
-                                    kind="open" if "node_info" in signals else "not_proven_closed", **evidence))
+                                    kind="open" if answered_as_success(signals) else "not_proven_closed", **evidence))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
@@ -755,14 +763,41 @@ def verdict_of(checks):
     return "not_proven_closed", 3
 
 
-NEXT_ACTION = {
-    "pass": "none",
-    "open": "OPEN: a probed path answered as the node, or the service or management is unhealthy. Follow the runbook "
-            "decision table: undo (restore) if the path is open or the service is down.",
-    "not_proven_closed": "NOT PROVEN CLOSED, and nothing was seen open. Do NOT undo and do NOT restart on this result: hold "
-                         "and run the drill. With the empty accepted-signature set a correct restriction also reads like "
-                         "this (see the runbook).",
+EXIT_CODES = {
+    "restricted": {"0": "pass", "1": "open: undo",
+                   "3": "not_proven_closed: hold, check from a second network, run the drill, do not undo",
+                   "4": "refused (no verdict, printed on stderr only): fix the input, never undo"},
+    "restored": {"0": "pass", "1": "restored path broken: investigate from a second network, do NOT undo again",
+                 "3": "restored not proven from this vantage: re-run from a second IPv6-capable network, do NOT undo again",
+                 "4": "refused (no verdict, printed on stderr only): fix the input, never undo"},
 }
+
+
+def next_action(verdict, expect, checks):
+    """Text per mode: after an undo (restored) 'undo' is never the advice. Decision table: exit AND verdict."""
+    if verdict == "pass":
+        return "none"
+    failed = [c for c in checks if c["status"] != "pass"]
+    if expect == "restored":
+        if verdict == "open":
+            return ("RESTORED PATH BROKEN (verdict open): the node path or management is not healthy after the restore. "
+                    "Do NOT undo again: the restore is already applied. Investigate the tunnel, the Worker secret and the "
+                    "connector, and confirm from a second network.")
+        return ("RESTORED NOT PROVEN (verdict not_proven_closed) from this vantage, e.g. an IPv4-only vantage while "
+                "management has an AAAA record: re-run from a second IPv6-capable network. Do NOT undo again. No drill is "
+                "needed for restored.")
+    if verdict == "open":
+        text = ("OPEN (verdict open): a probed path answered as the node, or the service or management is unhealthy. Follow "
+                "the runbook decision table: undo (restore) if the path is open or the service is down.")
+        seen = [c for c in failed if c.get("kind") in ("open", "broken")]
+        if seen and all(c.get("transport_failure") for c in seen):
+            text += (" Every failing check is a transport failure of /info seen from this vantage only (no HTTP answer): "
+                     "confirm from a second network before undo.")
+        return text
+    return ("NOT PROVEN CLOSED (verdict not_proven_closed), and nothing was seen open. Do NOT undo and do NOT restart on "
+            "this result. From a SECOND, IPv6-capable network check that the -8000 hosts and tee.node.tinycloud.xyz /info "
+            "do not return the node, then run the drill. With the empty accepted-signature set a correct restriction also "
+            "reads like this (see the runbook).")
 
 
 def cmd_verify(a, clients, now, out):
@@ -777,9 +812,8 @@ def cmd_verify(a, clients, now, out):
                               "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
                                          for c in checks]}, waiver)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
-               "exit_codes": {"0": "pass", "1": "open: undo", "3": "not_proven_closed: hold, run the drill, do not undo",
-                              "4": "refused (no verdict, printed on stderr only): fix the input, never undo"},
-               "next_action": NEXT_ACTION[verdict], "checks": checks,
+               "exit_codes": EXIT_CODES[a.expect],
+               "next_action": next_action(verdict, a.expect, checks), "checks": checks,
                "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
                "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,
                "closed_rule": "A path is closed only if it shows an ACCEPTED closed signature, and the accepted set is "
@@ -919,12 +953,17 @@ def main(argv=None, clients=None, now=None, out=None, env=None):
     return EXIT_REFUSED
 
 
-if __name__ == "__main__":
+def cli(argv=None):
+    """Process entry: exit code only. Any exception main() did not map (IO, parse, record_verify failure, a bug) is exit 4:
+    an uncaught traceback would exit 1, which means 'open: undo'. argparse's SystemExit(2) passes through."""
     try:
-        code = main()
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return main(argv)
+    except Exception:
         # Parser/IO diagnostics can embed input content; report none of it.
         print("Refused: check inputs, files and permissions. No Phala or provider action was performed. "
               f"Exit {EXIT_REFUSED}: nothing was changed or judged; never undo on this exit.", file=sys.stderr)
-        code = EXIT_REFUSED
-    sys.exit(code)
+        return EXIT_REFUSED
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
