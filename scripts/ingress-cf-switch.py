@@ -18,16 +18,19 @@ import sys
 import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 API = "https://api.cloudflare.com/client/v4"
 PROG = "scripts/ingress-cf-switch.py"
 MARKER = "TC-4194 instant ingress switch (scripts/ingress-cf-switch.py)"
 WAF_PHASE = "http_request_firewall_custom"
 WAF_ACTIONS = ("block", "managed_challenge", "js_challenge", "challenge")
-SNAPSHOT_FORMAT = 1
+SNAPSHOT_FORMAT = 2
 VOLATILE_RULE_KEYS = {"id", "version", "last_updated", "ref"}
 HOST_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
+ZONE_RE = re.compile(r"[0-9a-f]{32}")
+DEFAULT_HOST = "tee.node.tinycloud.xyz"
+ALWAYS_PROTECTED = "node.tinycloud.xyz"  # may not be targeted, whatever other flags say
 LIMITS = [
     "Acts only on requests reaching Cloudflare for a PROXIED hostname; a DNS-only hostname is unaffected.",
     "Does not close the Phala origin hostnames and does not stop L3/L4 floods at the host.",
@@ -67,12 +70,17 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # surfaces the 3xx as an HTTPError instead of re-sending Authorization elsewhere
+
+
 class CloudflareClient:
     """Real client. Not exercised against the network anywhere in this repository."""
 
-    def __init__(self, token, opener=urlopen, timeout=20):
+    def __init__(self, token, opener=None, timeout=20):
         self._token = token
-        self._opener = opener
+        self._opener = opener or build_opener(_NoRedirect).open  # never follow redirects with the token
         self._timeout = timeout
 
     def _call(self, op, method, path, body=None):
@@ -99,18 +107,26 @@ class CloudflareClient:
     def set_security_level(self, zone, value):
         self._call("set_security_level", "PATCH", f"/zones/{zone}/settings/security_level", {"value": value})
 
-    def entrypoint_rules(self, zone):
+    def entrypoint(self, zone):
+        """{id, rules} of the custom-rules entrypoint ruleset, or None if it does not exist."""
         try:
-            result = self._call("entrypoint_rules", "GET", f"/zones/{zone}/rulesets/phases/{WAF_PHASE}/entrypoint")
+            result = self._call("entrypoint", "GET", f"/zones/{zone}/rulesets/phases/{WAF_PHASE}/entrypoint")
         except CfError as error:
             if error.status == 404:
                 return None
             raise
-        return result.get("rules") or []
+        return {"id": result.get("id"), "rules": result.get("rules") or []}
 
-    def put_entrypoint_rules(self, zone, rules):
-        self._call("put_entrypoint_rules", "PUT", f"/zones/{zone}/rulesets/phases/{WAF_PHASE}/entrypoint",
+    def create_entrypoint(self, zone, rules):
+        self._call("create_entrypoint", "PUT", f"/zones/{zone}/rulesets/phases/{WAF_PHASE}/entrypoint",
                    {"rules": rules})
+
+    def add_rule(self, zone, ruleset_id, rule, index):
+        self._call("add_rule", "POST", f"/zones/{zone}/rulesets/{ruleset_id}/rules",
+                   dict(rule, position={"index": index}))
+
+    def delete_rule(self, zone, ruleset_id, rule_id):
+        self._call("delete_rule", "DELETE", f"/zones/{zone}/rulesets/{ruleset_id}/rules/{rule_id}")
 
     def worker_routes(self, zone):
         return self._call("worker_routes", "GET", f"/zones/{zone}/workers/routes")
@@ -155,6 +171,10 @@ class LeverBase:
     def read_lenient(self):
         return self.read()
 
+    def unmanaged(self, current, before):
+        """Field names changed by others that this lever neither judges nor writes (reported only)."""
+        return []
+
 
 class WafLever(LeverBase):
     name = "waf"
@@ -167,8 +187,9 @@ class WafLever(LeverBase):
                 "description": MARKER, "enabled": True}
 
     def read(self):
-        rules = self.client.entrypoint_rules(self.zone)
-        return {"exists": rules is not None, "rules": list(rules or [])}
+        ruleset = self.client.entrypoint(self.zone)
+        return {"exists": ruleset is not None, "id": ruleset["id"] if ruleset else None,
+                "rules": list(ruleset["rules"]) if ruleset else []}
 
     @staticmethod
     def _ours(rules):
@@ -187,7 +208,7 @@ class WafLever(LeverBase):
             require(self.is_applied(state), "A rule carrying this tool's marker exists with different settings "
                     "(or is duplicated); inspect it and undo with the snapshot that created it")
             return state
-        return {"exists": True, "rules": [self.rule()] + state["rules"]}
+        return {"exists": True, "id": state["id"], "rules": [self.rule()] + state["rules"]}
 
     def same(self, a, b):
         return [norm_rule(r) for r in a["rules"]] == [norm_rule(r) for r in b["rules"]]
@@ -195,24 +216,42 @@ class WafLever(LeverBase):
     def rest_equal(self, current, before):
         return self._others(current) == self._others(before)
 
-    def write(self, state):
-        self.client.put_entrypoint_rules(self.zone, state["rules"])
+    def write(self, state, previous=None):
+        """Rule-level writes only: add or delete OUR rule; no other rule is ever sent."""
+        current = self.read()
+        if self._ours(state["rules"]):  # apply
+            require(not self._ours(current["rules"]), "Our rule appeared since the plan; re-run plan")
+            if previous is not None and previous["exists"]:
+                require(current["exists"] and current["id"] == previous["id"],
+                        "The custom-rules ruleset changed identity since the plan; re-run plan")
+            if current["exists"]:
+                self.client.add_rule(self.zone, current["id"], self.rule(), 1)
+            else:
+                self.client.create_entrypoint(self.zone, [self.rule()])
+        else:  # restore: delete exactly the rule(s) carrying our marker
+            for rule in self._ours(current["rules"]):
+                self.client.delete_rule(self.zone, current["id"], rule["id"])
 
     def describe(self, before, after):
         others = self._others(before)
-        return ({"call": f"PUT zones/{tail(self.zone)}/rulesets/phases/{WAF_PHASE}/entrypoint",
-                 "insert_rule_at_position": 1, "rule": self.rule(),
+        base = f"zones/{tail(self.zone)}/rulesets/{tail(before['id'])}/rules" if before["exists"] else None
+        return ({"call": f"POST {base} (position index 1)" if base else
+                 f"PUT zones/{tail(self.zone)}/rulesets/phases/{WAF_PHASE}/entrypoint (creates the ruleset)",
+                 "rule": self.rule(),
                  "existing_rules": {"count": len(others), "sha256": digest(others)},
-                 "entrypoint_existed": before["exists"]},
-                {"call": f"PUT zones/{tail(self.zone)}/rulesets/phases/{WAF_PHASE}/entrypoint",
-                 "restore": "the exact rule list recorded in the snapshot (ids and order preserved)",
-                 "restored_rules": {"count": len(before["rules"]), "sha256": digest(before["rules"])},
-                 "note": "an entrypoint that did not exist is restored as an empty rule list"})
+                 "entrypoint_existed": before["exists"],
+                 "api_shape": "[INFERENCE: not run]"},
+                {"call": "DELETE zones/<zone>/rulesets/<id>/rules/<id of the rule carrying the marker>",
+                 "removes": "only the rule carrying this tool's marker; no other rule is written",
+                 "expected_remaining_rules": {"count": len(before["rules"]), "sha256": digest(before["rules"])},
+                 "note": "an entrypoint that did not exist stays as an empty ruleset",
+                 "api_shape": "[INFERENCE: not run]"})
 
     def extra_guard(self, current, snapshot):
         expression = self._ours(current["rules"])[0]["expression"] if self.is_applied(current) else ""
         # Quoted: "node.example" is a substring of "tee.node.example", but not of its quoted form.
-        return {"our_rule_does_not_match_protected_host": f'"{snapshot["protect_host"]}"' not in expression}
+        return {"our_rule_does_not_match_protected_host":
+                not any(f'"{h}"' in expression for h in snapshot["protect_hosts"])}
 
 
 class SecurityLevelLever(LeverBase):
@@ -227,7 +266,7 @@ class SecurityLevelLever(LeverBase):
                  "host, is challenged; API clients fail the challenge")]
 
     def verify_note(self, snapshot):
-        return (f"zone-wide lever: {snapshot['protect_host']} is challenged by design; "
+        return (f"zone-wide lever: {', '.join(snapshot['protect_hosts'])} is challenged by design; "
                 "its routes/DNS being unchanged does not mean it is unaffected")
 
     def read(self):
@@ -245,7 +284,7 @@ class SecurityLevelLever(LeverBase):
     def rest_equal(self, current, before):
         return True
 
-    def write(self, state):
+    def write(self, state, previous=None):
         self.client.set_security_level(self.zone, state["value"])
 
     def describe(self, before, after):
@@ -285,7 +324,7 @@ class RouteLever(LeverBase):
     def rest_equal(self, current, before):
         return True
 
-    def write(self, state):
+    def write(self, state, previous=None):
         self.client.set_route_script(self.zone, state["id"], state["pattern"], state["script"])
 
     def describe(self, before, after):
@@ -301,9 +340,12 @@ DNS_TYPES = ("A", "AAAA", "CNAME")
 
 
 def dns_record(raw):
-    return {"id": raw.get("id"), "type": raw.get("type"), "name": raw.get("name"), "content": raw.get("content"),
-            "ttl": raw.get("ttl"), "proxied": bool(raw.get("proxied")), "comment": raw.get("comment"),
-            "tags": list(raw.get("tags") or [])}
+    record = {"id": raw.get("id"), "type": raw.get("type"), "name": raw.get("name"), "content": raw.get("content"),
+              "ttl": raw.get("ttl"), "proxied": bool(raw.get("proxied")), "comment": raw.get("comment"),
+              "tags": list(raw.get("tags") or [])}
+    if raw.get("settings"):  # e.g. CNAME flattening [INFERENCE that the field exists]; kept so re-create is exact
+        record["settings"] = raw["settings"]
+    return record
 
 
 def without_id(record):
@@ -339,9 +381,19 @@ class DnsBase(LeverBase):
     def rest_equal(self, current, before):
         return True
 
-    def write(self, state):
-        """Make the record look like `state`: update in place, create (new id) or delete."""
+    def unmanaged(self, current, before):
+        return []
+
+    def write(self, state, previous=None):
+        """Write only the planned record: refuses if the target id differs from the one that was planned."""
         current = self.read_lenient()
+        if previous is not None and previous["present"]:
+            require(current["present"] and current["record"]["id"] == previous["record"]["id"],
+                    "The DNS record is not the one that was planned (id changed or gone); re-run plan")
+        self._send(state, current)
+
+    def _send(self, state, current):
+        """Full-record semantics (dns-remove): update in place, create (new id) or delete."""
         if state["present"]:
             body = without_id(state["record"])
             if current["present"]:
@@ -360,8 +412,11 @@ class DnsProxyFlipLever(DnsBase):
 
     def gates(self, before):
         return [("accept_tls_change", "TLS TRUST CHANGE: Cloudflare terminates TLS instead of passing it through to "
-                 "the TEE, and the existing tee.node Worker route goes LIVE, forwarding to the Phala -8000 origin "
-                 "instead of the in-CVM ingress (nginx limits/CORS no longer in the path)")]
+                 "the TEE, and the existing tee.node Worker route goes LIVE, forwarding to the Worker's configured "
+                 "origin instead of the in-CVM ingress (nginx limits/CORS no longer in the path). PREREQUISITE: an "
+                 "active Cloudflare edge certificate must cover tee.node.tinycloud.xyz; Universal SSL covers only "
+                 "*.tinycloud.xyz [INFERENCE], so without Advanced Certificate Manager, Total TLS or a custom "
+                 "certificate every TLS handshake to tee.node FAILS (an outage)")]
 
     def is_applied(self, state):
         return state["present"] and state["record"]["proxied"] is True
@@ -370,9 +425,15 @@ class DnsProxyFlipLever(DnsBase):
         # Cloudflare forces ttl to 1 (automatic) on a proxied record [INFERENCE].
         return {"present": True, "record": dict(state["record"], proxied=True, ttl=1)}
 
-    def rest_equal(self, current, before):
-        keys = ("type", "name", "content", "comment", "tags")
-        return current["present"] and all(current["record"][k] == before["record"][k] for k in keys)
+    def same(self, a, b):
+        return a["present"] and b["present"] and all(a["record"][k] == b["record"][k] for k in ("proxied", "ttl"))
+
+    def _send(self, state, current):
+        """Only the proxied flag (and ttl on restore) is ever sent: content etc. may be rewritten by others."""
+        require(current["present"], "The DNS record is gone; cannot flip it (restore it from a dns-remove snapshot)")
+        record = state["record"]
+        body = {"proxied": True} if record["proxied"] else {"proxied": False, "ttl": record["ttl"]}
+        self.client.update_dns_record(self.zone, current["record"]["id"], body)
 
     def warnings(self, before):
         return ["Does not stop traffic by itself: it makes the WAF rule / Worker route live. Follow with the `waf` "
@@ -384,12 +445,22 @@ class DnsProxyFlipLever(DnsBase):
     def describe(self, before, after):
         rec, new = before["record"], after["record"]
         call = f"PATCH zones/{tail(self.zone)}/dns_records/{tail(rec['id'])}"
-        return ({"call": call, "type": rec["type"], "proxied": {"from": rec["proxied"], "to": new["proxied"]},
-                 "ttl": {"from": rec["ttl"], "to": new["ttl"]}, "content": rec["content"]},
-                {"call": call, "restore": {"proxied": rec["proxied"], "ttl": rec["ttl"], "content": rec["content"]}})
+        return ({"call": call, "sends": {"proxied": True}, "type": rec["type"],
+                 "proxied": {"from": rec["proxied"], "to": new["proxied"]},
+                 "ttl": {"from": rec["ttl"], "to": "automatic (set by Cloudflare) [INFERENCE]"},
+                 "content_unchanged": rec["content"]},
+                {"call": call, "sends": {"proxied": rec["proxied"], "ttl": rec["ttl"]},
+                 "never_written": ["type", "name", "content", "comment", "tags"],
+                 "note": "only proxied/ttl are judged for drift; other changes are reported, never overwritten"})
 
     def verify_note(self, snapshot):
         return "TLS is now terminated by Cloudflare; tee.node is served by the Worker, not the in-CVM ingress"
+
+    def unmanaged(self, current, before):
+        if not (current["present"] and before["present"]):
+            return []
+        return [k for k in ("type", "name", "content", "comment", "tags")
+                if current["record"].get(k) != before["record"].get(k)]
 
 
 class DnsRemoveLever(DnsBase):
@@ -434,10 +505,11 @@ DNS_LEVERS = {DnsProxyFlipLever.name, DnsRemoveLever.name}
 
 # ---- shared reads and snapshot handling ----
 
-def node_guard(client, zone, protect_host):
-    routes = [r for r in client.worker_routes(zone) if str(r.get("pattern", "")).split("/", 1)[0] == protect_host]
+def node_guard(client, zone, protect_hosts):
+    routes = [r for r in client.worker_routes(zone)
+              if str(r.get("pattern", "")).split("/", 1)[0] in protect_hosts]
     dns = [{k: r.get(k) for k in ("id", "type", "name", "content", "proxied", "ttl")}
-           for r in client.dns_records(zone, protect_host)]
+           for host in protect_hosts for r in client.dns_records(zone, host)]
     return {"worker_routes": sorted(routes, key=canon), "dns_records": sorted(dns, key=canon)}
 
 
@@ -448,13 +520,22 @@ def host_proxied(client, zone, host):
     return any(r.get("proxied") for r in records)
 
 
+def fsync_dir(path):
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_new_private(path, value):
-    """Exclusive create, 0600, fsynced: never replaces the only record of previous values."""
+    """Exclusive create, 0600, fsynced (file and directory): never replaces the only record of previous values."""
     with open(path, "x", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as stream:
         json.dump(value, stream, indent=2)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
+    fsync_dir(path)
 
 
 def replace_private(path, value):
@@ -468,6 +549,7 @@ def replace_private(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
+        fsync_dir(path)
     except BaseException:
         if os.path.exists(name):
             os.unlink(name)
@@ -482,6 +564,12 @@ def load_snapshot(path):
         snap = json.load(stream)
     require(isinstance(snap, dict) and snap.get("format") == SNAPSHOT_FORMAT and snap.get("lever") in LEVERS,
             "Unrecognised snapshot")
+    # The snapshot is trusted input only after the same validation as command-line input (ids go into URLs).
+    require(isinstance(snap.get("zone_id"), str) and ZONE_RE.fullmatch(snap["zone_id"]), "Snapshot zone id invalid")
+    require(isinstance(snap.get("host"), str) and HOST_RE.fullmatch(snap["host"]), "Snapshot host invalid")
+    hosts = snap.get("protect_hosts")
+    require(isinstance(hosts, list) and ALWAYS_PROTECTED in hosts
+            and all(isinstance(h, str) and HOST_RE.fullmatch(h) for h in hosts), "Snapshot protected hosts invalid")
     return snap
 
 
@@ -509,10 +597,13 @@ def emit(value):
 # ---- plan ----
 
 def build_plan(client, args):
-    require(HOST_RE.fullmatch(args.host) and HOST_RE.fullmatch(args.protect_host), "Invalid hostname")
-    require(re.fullmatch(r"[0-9a-f]{32}", args.zone_id), "Expected a 32-hex zone id")
-    require(args.host != args.protect_host and not args.protect_host.endswith("." + args.host),
-            "The target host must not be, or be a parent of, the protected host")
+    require(HOST_RE.fullmatch(args.host), "Invalid hostname")
+    protect = sorted({ALWAYS_PROTECTED, *(args.protect_host or [])})
+    require(all(HOST_RE.fullmatch(h) for h in protect), "Invalid protected hostname")
+    require(ZONE_RE.fullmatch(args.zone_id), "Expected a 32-hex zone id")
+    for protected in protect:
+        require(args.host != protected and not protected.endswith("." + args.host),
+                f"The target host must not be, or be a parent of, a protected host ({protected})")
     params = {"action": args.action} if args.lever == "waf" else {}
     if args.lever in DNS_LEVERS:
         require(args.expect_type, "--expect-type {A,AAAA,CNAME} is required for DNS levers "
@@ -524,6 +615,9 @@ def build_plan(client, args):
     after = lever.desired(before)
     proxied = host_proxied(client, args.zone_id, args.host)
     blockers = []
+    if args.host != DEFAULT_HOST:
+        blockers.append(("other_host", f"NON-STANDARD TARGET: {args.host} is not {DEFAULT_HOST}; this lever will "
+                         "affect that host"))
     if lever.needs_proxied and proxied is not True:
         blockers.append(("allow_inert", "INERT: " + args.host + " is "
                          + ("DNS-only (grey cloud)" if proxied is False else "not found in DNS")
@@ -532,15 +626,15 @@ def build_plan(client, args):
     open_blockers = [m for flag, m in blockers if not getattr(args, flag)]
     change, undo = lever.describe(before, after)
     plan_hash = digest({"v": SNAPSHOT_FORMAT, "lever": args.lever, "zone": args.zone_id, "host": args.host,
-                        "protect_host": args.protect_host, "params": params, "before": before, "after": after})
+                        "protect_hosts": protect, "params": params, "before": before, "after": after})
     doc = {"command": "plan", "lever": args.lever, "zone": tail(args.zone_id), "host": args.host,
-           "protected_host": args.protect_host, "host_proxied": proxied, "already_applied": already,
+           "protected_hosts": protect, "host_proxied": proxied, "already_applied": already,
            "change": change, "undo": undo, "blockers": open_blockers, "warnings": lever.warnings(before),
            "limits": LIMITS,
            "plan_hash": plan_hash,
            "apply_command": f"{PROG} apply --snapshot <new-0600-file> --confirm {plan_hash} <same flags as plan>",
            "undo_command": f"{PROG} undo --snapshot <that-file> --confirm {plan_hash}"}
-    return lever, before, after, params, doc, plan_hash, open_blockers, already
+    return lever, before, after, params, doc, plan_hash, open_blockers, already, protect
 
 
 def cmd_plan(args, client):
@@ -554,7 +648,7 @@ def cmd_plan(args, client):
 def run_verify(client, snap, expect):
     lever = make_lever(client, snap)
     current = lever.read_lenient()
-    guard_now = node_guard(client, snap["zone_id"], snap["protect_host"])
+    guard_now = node_guard(client, snap["zone_id"], snap["protect_hosts"])
     if expect == "applied":
         checks = {"lever_applied": lever.is_applied(current),
                   "no_collateral_change": lever.rest_equal(current, snap["before"])}
@@ -564,6 +658,9 @@ def run_verify(client, snap, expect):
     checks["node_routes_and_dns_untouched"] = guard_now == snap["guard"]
     report = {"command": "verify", "expect": expect, "lever": snap["lever"], "zone": tail(snap["zone_id"]),
               "host": snap["host"], "checks": checks, "ok": all(checks.values())}
+    unmanaged = lever.unmanaged(current, snap["before"])
+    if unmanaged:
+        report["unmanaged_changes_reported_not_written"] = unmanaged
     note = lever.verify_note(snap)
     if note and expect == "applied":
         report["note"] = note
@@ -579,7 +676,7 @@ def cmd_verify(args, client):
 # ---- apply ----
 
 def cmd_apply(args, client):
-    lever, before, after, params, doc, plan_hash, blockers, already = build_plan(client, args)
+    lever, before, after, params, doc, plan_hash, blockers, already, protect = build_plan(client, args)
     doc["command"] = "apply"
     if already:
         doc["result"] = ("already applied; nothing changed. If this run did not create the lever, use the "
@@ -593,16 +690,16 @@ def cmd_apply(args, client):
     require(args.confirm == plan_hash, "--confirm does not match the current plan hash (state changed since "
             "plan, or wrong hash); re-run plan")
     require(not blockers, "; ".join(blockers) + ". Re-run with the matching --allow-* flag if intended")
-    guard = node_guard(client, args.zone_id, args.protect_host)
+    guard = node_guard(client, args.zone_id, protect)
     snap = {"format": SNAPSHOT_FORMAT, "status": "pending", "created_at_utc": now(), "plan_hash": plan_hash,
-            "lever": args.lever, "zone_id": args.zone_id, "host": args.host, "protect_host": args.protect_host,
+            "lever": args.lever, "zone_id": args.zone_id, "host": args.host, "protect_hosts": protect,
             "params": params, "before": before, "after": after, "guard": guard}
     try:
         write_new_private(args.snapshot, snap)  # BEFORE any change
     except FileExistsError:
         raise Refused("Snapshot path already exists; refusing to overwrite a prior rollback record") from None
     try:
-        lever.write(after)
+        lever.write(after, before)
     except Exception as error:
         print(f"APPLY FAILED ({type(error).__name__}). The change may be partial or absent; a snapshot of the "
               f"prior state exists at {args.snapshot} (status pending). Recovery: run "
@@ -628,6 +725,9 @@ def cmd_undo(args, client):
     out = {"command": "undo", "lever": snap["lever"], "zone": tail(snap["zone_id"]), "host": snap["host"],
            "plan_hash": snap["plan_hash"]}
     out["restore"] = lever.describe(snap["before"], snap["after"])[1]
+    unmanaged = lever.unmanaged(current, snap["before"])
+    if unmanaged:
+        out["unmanaged_changes_reported_not_written"] = unmanaged
     if lever.same(current, snap["before"]):
         if snap["status"] == "pending":
             snap["status"] = "aborted"
@@ -651,7 +751,7 @@ def cmd_undo(args, client):
     if drift:
         snap.setdefault("forced_undo", []).append({"at_utc": now(), "overwrote": current})
         replace_private(args.snapshot, snap)  # record what is about to be overwritten
-    lever.write(snap["before"])
+    lever.write(snap["before"], snap["after"])
     snap["status"] = "undone"
     snap["undone_at_utc"] = now()
     replace_private(args.snapshot, snap)
@@ -672,8 +772,11 @@ def build_parser():
     source.add_argument("--token-env", help="NAME of an environment variable holding the token (never its value)")
     target = argparse.ArgumentParser(add_help=False)
     target.add_argument("--zone-id", required=True, help="32-hex Cloudflare zone id")
-    target.add_argument("--host", default="tee.node.tinycloud.xyz", help="Hostname to switch off")
-    target.add_argument("--protect-host", default="node.tinycloud.xyz", help="Hostname that must stay untouched")
+    target.add_argument("--host", default=DEFAULT_HOST, help="Hostname to switch off (default is the only host "
+                        "accepted without --other-host)")
+    target.add_argument("--protect-host", action="append", help="EXTRA hostname that must stay untouched; "
+                        f"{ALWAYS_PROTECTED} is always protected")
+    target.add_argument("--other-host", action="store_true", help="Required to target any host but the default")
     target.add_argument("--lever", choices=sorted(LEVERS), default="waf")
     target.add_argument("--action", choices=WAF_ACTIONS, default="block", help="waf lever only")
     target.add_argument("--allow-inert", action="store_true", help="Apply even if the host is not proxied (drills)")

@@ -24,21 +24,21 @@ be seconds [INFERENCE: not measured; measure it in the first drill].
   script reads the host's DNS record and **refuses to apply an inert lever**
   (`--allow-inert` is for drills only). The lever becomes effective once `tee.node`
   is fronted by Cloudflare (the CF-only ingress plan). Re-read DNS before relying on it.
-- `node.tinycloud.xyz` must keep working. `apply` records a "node guard" (node.*
-  Worker routes and DNS records, plus every other WAF rule) in the snapshot and
-  `verify` fails (exit 4) if any of it changed.
+- `node.tinycloud.xyz` must keep working. `apply` records a "node guard" (node.* and
+  any `--protect-host` Worker routes and DNS records, plus every other WAF rule) in the
+  snapshot and `verify` fails (exit 4) if any of it changed.
 
 ## Levers
 
 | `--lever` | What | Stops traffic? | Blast radius | Extra flag | Token scope |
 | --- | --- | --- | --- | --- | --- |
-| `waf` (**default**) | First rule in the zone custom-rules entrypoint: `http.host eq "<host>"`, action `block` (or `--action managed_challenge\|js_challenge\|challenge`) | Yes, at the edge, before the Worker runs | Only that host. A challenge action breaks API/native clients; `block` stops all tee.* clients (intended) | none | Zone WAF: Edit |
+| `waf` (**default**) | A rule inserted first in the zone custom-rules entrypoint (rule-level POST; undo is a rule-level DELETE of only that rule): `http.host eq "<host>"`, action `block` (or `--action managed_challenge\|js_challenge\|challenge`) | Yes, at the edge, before the Worker runs | Only that host. A challenge action breaks API/native clients; `block` stops all tee.* clients (intended) | none | Zone WAF: Edit |
 | `security-level` | Zone `security_level` to `under_attack` | Challenges browsers; API clients fail | **Whole zone, including node.*** | `--allow-zone-wide` | Zone Settings: Edit |
 | `worker-route` | Route `<host>/*` gets `script: null` (route id kept) | **No.** Proxied requests go straight to the DNS origin, i.e. more exposure | That pattern only | `--allow-no-block` | Workers Routes: Edit |
-| `dns-proxy-flip` | PATCH the host's DNS record `proxied=true` (ttl becomes automatic; prior `proxied`/`ttl`/`content` recorded) | **No, it is the enabler**: makes the Worker route and the WAF rule live so Cloudflare fronts the host. Follow with `waf` | That record only. **TLS trust changes**: Cloudflare terminates TLS instead of passthrough to the TEE cert; the existing `tee.node/*` Worker route goes live and forwards to the Phala `-8000` origin, bypassing the in-CVM ingress (nginx limits/CORS) | `--accept-tls-change`, `--expect-type` | Zone DNS: Edit (+ Read) |
+| `dns-proxy-flip` | PATCH the host's DNS record with only `{"proxied": true}` (ttl becomes automatic, set by Cloudflare [INFERENCE]); undo PATCHes only `{"proxied": false, "ttl": <recorded>}`. Other fields are recorded and reported, never written | **No, it is the enabler**: makes the Worker route and the WAF rule live so Cloudflare fronts the host. Follow with `waf` | That record only. **TLS trust changes**: Cloudflare terminates TLS instead of passthrough to the TEE cert; the existing `tee.node/*` Worker route goes live and forwards to the Worker's configured origin, bypassing the in-CVM ingress (nginx limits/CORS). **Edge-certificate prerequisite**: Universal SSL covers only `*.tinycloud.xyz` [INFERENCE], so a host below `tee.node` needs ACM/Total TLS/a custom certificate first, or every tee.node TLS handshake FAILS | `--accept-tls-change`, `--expect-type` | Zone DNS: Edit (+ Read) |
 | `dns-remove` | DELETE the host's A/AAAA/CNAME record; the full record (type, name, content, ttl, proxied, comment, tags) is snapshotted and undo re-creates it | Yes, but **in minutes, NOT instantly**: resolvers keep the old answer until the recorded TTL expires (plan prints it; TTL 1 = automatic, about 300 s [INFERENCE]). Anyone with a cached answer or the literal origin address is unaffected | tee.node becomes unresolvable after caches expire; node.* record untouched. Undo restores every field except the record id (Cloudflare allocates a new one) | `--i-understand-ttl`, `--expect-type` | Zone DNS: Edit (+ Read) |
 
-DNS levers refuse a missing record, a record of a different type than `--expect-type`, and more than one A/AAAA/CNAME record at the name. `dstack-ingress` holds a Cloudflare DNS token and may re-write or re-create the tee.node record when the CVM restarts [INFERENCE: not read]; re-run `verify` after any restart. A Worker-side kill switch is not implemented: the Worker has no bindings, so it needs a separate reviewed Worker change and deploy first.
+DNS levers refuse a missing record, a record of a different type than `--expect-type`, and more than one A/AAAA/CNAME record at the name. The write also refuses if the record id is no longer the planned one. `dstack-ingress` holds a Cloudflare DNS token and may re-write or re-create the tee.node record when the CVM restarts [INFERENCE: not read]; re-run `verify` after any restart. A Worker-side kill switch is not implemented: the Worker has no bindings, so it needs a separate reviewed Worker change and deploy first.
 
 ## Tokens
 
@@ -82,8 +82,16 @@ Guarantees (all tested against fakes):
 - `apply` is idempotent: if the lever is already in place it reports so and changes
   nothing (and creates no new snapshot; undo with the snapshot of the run that applied it).
 - `undo` restores the recorded prior state. If the current state is neither that nor
-  what `apply` produced, it refuses; `--force-drift` overwrites and records what it
-  overwrote under `forced_undo` in the snapshot.
+  what `apply` produced, it refuses; `--force-drift` proceeds and records what it
+  found under `forced_undo` in the snapshot. WAF undo deletes only our rule (never
+  rewrites the list). `dns-proxy-flip` undo sends only `proxied` and `ttl`; if
+  `type`/`name`/`content`/`comment`/`tags` changed meanwhile (for example
+  `dstack-ingress` rewrote the target) they are reported as
+  `unmanaged_changes_reported_not_written` and never written back.
+- Targets are pinned: the default `--host` is `tee.node.tinycloud.xyz`; any other host
+  needs `--other-host`. `node.tinycloud.xyz` is always protected and can not be
+  targeted (nor a parent domain of it); `--protect-host H` (repeatable) adds more
+  protected hosts, it never removes `node.*`.
 - Exit codes: 0 ok, 1 refused (nothing changed), 3 Cloudflare/IO failure, 4 verify failed.
 
 ## Failure recovery
@@ -96,17 +104,28 @@ snapshot (`before`) in the Cloudflare dashboard.
 
 ## Unverified (check in the first drill, not run)
 
-- Cloudflare accepting back rules that carry `version`/`last_updated` in the WAF
-  `PUT` (the undo sends the recorded list verbatim; semantics from API docs only).
-- DNS: that a PATCH of `proxied`/`ttl`/`content` restores a record exactly, that
-  setting `proxied=true` forces `ttl=1`, that `comment: null`/`tags: []` are accepted on
-  create and PATCH, and how Cloudflare proxying behaves in front of the Phala TLS
-  passthrough gateway (SSL mode, SNI to origin).
+Nothing in this tool has run against Cloudflare. Everything below is from API docs only.
+
+- WAF rule-level endpoints: `POST /zones/{z}/rulesets/{id}/rules` with
+  `position.index` (insert first), `DELETE /zones/{z}/rulesets/{id}/rules/{rule_id}`,
+  and `PUT .../phases/http_request_firewall_custom/entrypoint` only when the ruleset
+  does not exist yet. `undo` only deletes the rule carrying this tool's marker; other
+  rules are never written, so a rule someone else adds between our read and write
+  survives (`verify` then reports the list differs and exits 4; nothing is lost).
 - A missing entrypoint ruleset is restored as an empty rule list, not deleted.
+- DNS: that PATCH `{"proxied": true}` forces `ttl=1`, and that `{"proxied": false,
+  "ttl": N}` restores the prior state; that the DNS record has a `settings` object that
+  is recorded and accepted back on create (recorded only when non-empty); how Cloudflare
+  proxying behaves in front of the Phala TLS passthrough gateway (SSL mode, SNI to
+  origin).
 - `script: null` on a Workers route meaning "no Worker".
 - Propagation time of a custom rule, and that the rule applies before the Worker.
-- The `PUT` replaces the whole list: a concurrent edit in the gap between the final
-  read and the write is lost (hash/drift checks narrow, not remove, that gap).
+- **Host-header variants (drill before relying on `waf`).** The rule is
+  `http.host eq "<host>"`. Send each of these at the proxied host and confirm all are
+  blocked; if any gets through, widen the expression (`lower(http.host)` and the
+  trailing-dot form) before an incident:
+  `curl -H 'Host: TEE.NODE.TINYCLOUD.XYZ'`, `-H 'Host: tee.node.tinycloud.xyz.'`,
+  `-H 'Host: tee.node.tinycloud.xyz:443'`. UNVERIFIED.
 - Unit tests are not wired into CI (the existing `test-ingress-switch.py` is not
   either); run `python3 scripts/test-ingress-cf-switch.py` locally.
 

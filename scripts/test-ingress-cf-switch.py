@@ -23,7 +23,7 @@ HOST = "tee.node.tinycloud.xyz"
 NODE = "node.tinycloud.xyz"
 TOKEN = "cfpat-" + "Zq8" * 12  # fake, test-only
 ENV = "TC_CF_SWITCH_TEST_TOKEN"
-MUTATORS = {"put_entrypoint_rules", "set_security_level", "set_route_script"}
+MUTATORS = {"create_entrypoint", "add_rule", "delete_rule", "set_security_level", "set_route_script"}
 
 
 class FakeCF:
@@ -46,8 +46,9 @@ class FakeCF:
             {"id": "dns-tee-2", "type": "CNAME", "name": HOST, "content": "y.example.test", "proxied": True, "ttl": 1},
         ]
         self.calls = []
-        self.before_put = None  # hook run at the start of a put
+        self.before_put = None  # hook run at the start of a rule write
         self.fail_put = False
+        self.ruleset_id = "rs-7777"
         self._n = 0
 
     def writes(self):
@@ -61,22 +62,38 @@ class FakeCF:
         self.calls.append(("set_security_level", zone, value))
         self.level = value
 
-    def entrypoint_rules(self, zone):
-        self.calls.append(("entrypoint_rules", zone))
-        return copy.deepcopy(self.rules)
+    def entrypoint(self, zone):
+        self.calls.append(("entrypoint", zone))
+        if self.rules is None:
+            return None
+        return {"id": self.ruleset_id, "rules": copy.deepcopy(self.rules)}
 
-    def put_entrypoint_rules(self, zone, rules):
-        self.calls.append(("put_entrypoint_rules", zone, copy.deepcopy(rules)))
+    def _hooks(self, op):
         if self.before_put:
             self.before_put()
         if self.fail_put:
-            raise sw.CfError(f"put_entrypoint_rules: HTTP 500 Authorization: Bearer {TOKEN}")
-        stored = copy.deepcopy(rules)
-        for rule in stored:
-            if "id" not in rule:
-                self._n += 1
-                rule.update(id=f"r-new{self._n:04d}", version="1", last_updated="2026-11-24T00:00:00Z")
-        self.rules = stored
+            raise sw.CfError(f"{op}: HTTP 500 Authorization: Bearer {TOKEN}")
+
+    def _assign(self, rule):
+        rule = copy.deepcopy(rule)
+        if "id" not in rule:
+            self._n += 1
+            rule.update(id=f"r-new{self._n:04d}", version="1", last_updated="2026-11-24T00:00:00Z")
+        return rule
+
+    def create_entrypoint(self, zone, rules):
+        self.calls.append(("create_entrypoint", zone, copy.deepcopy(rules)))
+        self._hooks("create_entrypoint")
+        self.rules = [self._assign(r) for r in rules]
+
+    def add_rule(self, zone, ruleset_id, rule, index):
+        self.calls.append(("add_rule", zone, ruleset_id, copy.deepcopy(rule), index))
+        self._hooks("add_rule")
+        self.rules.insert(index - 1, self._assign(rule))
+
+    def delete_rule(self, zone, ruleset_id, rule_id):
+        self.calls.append(("delete_rule", zone, ruleset_id, rule_id))
+        self.rules = [r for r in self.rules if r["id"] != rule_id]
 
     def worker_routes(self, zone):
         self.calls.append(("worker_routes", zone))
@@ -97,6 +114,8 @@ class FakeCF:
         for record in self.dns:
             if record["id"] == record_id:
                 record.update(copy.deepcopy(body))
+                if body.get("proxied") is True and "ttl" not in body:
+                    record["ttl"] = 1  # Cloudflare sets automatic ttl on proxied records [INFERENCE]
 
     def create_dns_record(self, zone, body):
         self.calls.append(("create_dns_record", zone, copy.deepcopy(body)))
@@ -168,8 +187,9 @@ class WafLeverTest(Base):
         self.assertEqual(self.fake.rules, before)
         self.assertEqual(doc["change"]["rule"], {"action": "block", "expression": f'(http.host eq "{HOST}")',
                                                  "description": sw.MARKER, "enabled": True})
-        self.assertEqual(doc["change"]["insert_rule_at_position"], 1)
-        self.assertEqual(doc["undo"]["restored_rules"]["count"], 2)
+        self.assertEqual(doc["change"]["call"], f"POST zones/…{ZONE[-4:]}/rulesets/…7777/rules (position index 1)")
+        self.assertEqual(doc["undo"]["expected_remaining_rules"]["count"], 2)
+        self.assertIn("only the rule carrying this tool's marker", doc["undo"]["removes"])
         self.assertEqual(doc["blockers"], [])
         self.assertRegex(doc["plan_hash"], r"^[0-9a-f]{64}$")
         self.assertEqual(doc["zone"], "…" + ZONE[-4:])
@@ -259,8 +279,9 @@ class WafLeverTest(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.rules), original)
         self.assertEqual(self.fake.calls[-1][0], "dns_records")
-        puts = [c for c in self.fake.calls if c[0] == "put_entrypoint_rules"]
-        self.assertEqual(json.dumps(puts[-1][2]), original)  # the exact recorded list was sent
+        deletes = [c for c in self.fake.calls if c[0] == "delete_rule"]
+        self.assertEqual(len(deletes), 1)  # only our rule is deleted; no list is rewritten
+        self.assertEqual(deletes[0][3], "r-new0001")
         self.assertTrue(self.docs(out)[-1]["ok"])
         self.assertEqual(json.loads(self.snap.read_text())["status"], "undone")
         code, out, _ = self.undo("--confirm", h)  # already restored
@@ -287,11 +308,11 @@ class WafLeverTest(Base):
         self.assertIn(added, self.fake.rules)
         self.assertEqual(self.snap.read_bytes(), snapshot_before)
         code, out, err = self.undo("--confirm", h, "--force-drift")
-        self.assertEqual(code, 0, err)
-        self.assertNotIn(added, self.fake.rules)
+        self.assertEqual(code, 4, err)  # ours removed; verify says the list still differs from the recorded one
+        self.assertEqual([r["id"] for r in self.fake.rules], ["r-aaaa1111", "r-bbbb2222", "r-dddd4444"])
         forced = json.loads(self.snap.read_text())["forced_undo"]
         self.assertEqual(len(forced), 1)
-        self.assertIn(added, forced[0]["overwrote"]["rules"])
+        self.assertIn(added, forced[0]["overwrote"]["rules"])  # the state at the time is recorded
 
     def test_edited_lever_rule_counts_as_drift(self):
         h = self.applied()
@@ -342,7 +363,7 @@ class WafLeverTest(Base):
         self.assertEqual([r for r in self.fake.routes if r["pattern"].startswith(NODE)], node_routes)
         self.assertEqual([r for r in self.fake.dns if r["name"] == NODE], node_dns)
         self.assertNotIn(f'"{NODE}"', self.fake.rules[0]["expression"])
-        self.assertEqual(self.fake.writes()[0][0], "put_entrypoint_rules")
+        self.assertEqual(self.fake.writes()[0][0], "add_rule")
         code, out, _ = self.run_cli("verify", "--snapshot", str(self.snap))
         self.assertEqual(code, 0)
         self.assertTrue(self.docs(out)[0]["checks"]["node_routes_and_dns_untouched"])
@@ -445,8 +466,11 @@ class DnsLeversTest(Base):
         self.assertEqual(self.fake.writes(), [])
         self.assertEqual(self.dns_writes(), [])
         self.assertEqual(doc["change"]["proxied"], {"from": False, "to": True})
-        self.assertEqual(doc["change"]["ttl"], {"from": 300, "to": 1})
-        self.assertEqual(doc["undo"]["restore"], {"proxied": False, "ttl": 300, "content": "y.example.test"})
+        self.assertEqual(doc["change"]["sends"], {"proxied": True})
+        self.assertEqual(doc["undo"]["sends"], {"proxied": False, "ttl": 300})
+        self.assertEqual(doc["undo"]["never_written"], ["type", "name", "content", "comment", "tags"])
+        self.assertIn("edge certificate", doc["blockers"][0])
+        self.assertIn("*.tinycloud.xyz", doc["blockers"][0])
         self.assertEqual(len(doc["blockers"]), 1)
         self.assertIn("TLS TRUST CHANGE", doc["blockers"][0])
         self.assertIn("Cloudflare terminates TLS", doc["blockers"][0])
@@ -472,9 +496,8 @@ class DnsLeversTest(Base):
         code, _, err = self.undo("--confirm", h)
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.dns), self.original)  # byte-identical
-        update = [c for c in self.fake.calls if c[0] == "update_dns_record"][-1]
-        self.assertEqual(update[3], {"type": "CNAME", "name": HOST, "content": "y.example.test", "ttl": 300,
-                                     "proxied": False, "comment": "managed by dstack-ingress", "tags": ["env:prod"]})
+        updates = [c[3] for c in self.fake.calls if c[0] == "update_dns_record"]
+        self.assertEqual(updates, [{"proxied": True}, {"proxied": False, "ttl": 300}])  # nothing else is sent
 
     def test_flip_apply_twice_is_idempotent(self):
         h = self.plan(*self.FLIP)["plan_hash"]
@@ -487,18 +510,50 @@ class DnsLeversTest(Base):
         self.assertEqual(len(self.dns_writes()), writes)
         self.assertFalse(second.exists())
 
-    def test_flip_drift_refused_then_forced_and_recorded(self):
+    def test_flip_after_a_rewrite_by_others_undo_restores_only_proxied_and_ttl(self):
         h = self.plan(*self.FLIP)["plan_hash"]
         self.apply(h, *self.FLIP, "--accept-tls-change")
-        self.fake.dns[1]["content"] = "someone-else.example.test"
+        self.fake.dns[1]["content"] = "someone-else.example.test"  # e.g. dstack-ingress rewrote the target
+        self.fake.dns[1]["comment"] = "rewritten"
+        code, out, err = self.undo("--confirm", h)  # not drift: only proxied/ttl are judged
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.docs(out)[0]["unmanaged_changes_reported_not_written"], ["content", "comment"])
+        self.assertEqual(self.docs(out)[-1]["unmanaged_changes_reported_not_written"], ["content", "comment"])
+        self.assertEqual(self.tee()[0]["content"], "someone-else.example.test")  # never written back
+        self.assertEqual(self.tee()[0]["comment"], "rewritten")
+        self.assertEqual((self.tee()[0]["proxied"], self.tee()[0]["ttl"]), (False, 300))
+        self.assertEqual([c[3] for c in self.dns_writes()], [{"proxied": True}, {"proxied": False, "ttl": 300}])
+        self.assertTrue(self.docs(out)[-1]["ok"])
+
+    def test_flip_drift_on_proxied_or_ttl_is_refused_then_forced_and_recorded(self):
+        h = self.plan(*self.FLIP)["plan_hash"]
+        self.apply(h, *self.FLIP, "--accept-tls-change")
+        self.fake.dns[1].update(proxied=False, ttl=120)  # someone flipped it back with another ttl
         code, out, _ = self.undo("--confirm", h)
         self.assertEqual(code, 1)
-        self.assertEqual(self.fake.dns[1]["content"], "someone-else.example.test")
+        self.assertEqual(self.fake.dns[1]["ttl"], 120)
         code, _, err = self.undo("--confirm", h, "--force-drift")
         self.assertEqual(code, 0, err)
         self.assertEqual(json.dumps(self.fake.dns), self.original)
         forced = json.loads(self.snap.read_text())["forced_undo"]
-        self.assertEqual(forced[0]["overwrote"]["record"]["content"], "someone-else.example.test")
+        self.assertEqual(forced[0]["overwrote"]["record"]["ttl"], 120)
+
+    def test_dns_write_refuses_a_record_other_than_the_planned_one(self):
+        lever = sw.DnsRemoveLever(self.fake, ZONE, HOST, {"expect_type": "CNAME"})
+        planned = lever.read()
+        after = lever.desired(planned)
+        self.fake.dns[1]["id"] = "dns-replaced-by-someone"
+        with self.assertRaises(sw.Refused):
+            lever.write(after, planned)
+        self.assertEqual(self.dns_writes(), [])
+
+    def test_record_settings_are_snapshotted_and_recreated(self):
+        self.fake.dns[1]["settings"] = {"flatten_cname": True}
+        h = self.plan(*self.REMOVE)["plan_hash"]
+        self.apply(h, *self.REMOVE, "--i-understand-ttl")
+        self.assertEqual(json.loads(self.snap.read_text())["before"]["record"]["settings"], {"flatten_cname": True})
+        self.undo("--confirm", h)
+        self.assertEqual(self.tee()[0]["settings"], {"flatten_cname": True})
 
     def test_remove_plan_states_ttl_and_that_it_is_not_instant(self):
         doc = self.plan(*self.REMOVE)
@@ -617,6 +672,77 @@ class DnsLeversTest(Base):
         self.assertIn("nothing to undo", self.docs(out)[0]["result"])
 
 
+class ReviewFixesTest(Base):
+    def test_target_host_is_allow_listed_and_node_is_always_protected(self):
+        code, _, err = self.run_cli("plan", *self.target("--host", NODE, "--protect-host", "x.example.test"))
+        self.assertEqual(code, 1)  # --protect-host is additive: it can not un-protect node.*
+        self.assertIn("protected host", err)
+        doc = self.plan("--host", "account.tinycloud.xyz", "--allow-inert")
+        self.assertIn("NON-STANDARD TARGET", doc["blockers"][0])
+        self.assertEqual(doc["protected_hosts"], [NODE])
+        h = doc["plan_hash"]
+        code, _, err = self.apply(h, "--host", "account.tinycloud.xyz", "--allow-inert")
+        self.assertEqual(code, 1)
+        self.assertIn("NON-STANDARD TARGET", err)
+        self.assertEqual(self.fake.writes(), [])
+        self.fake.dns.append({"id": "dns-acc", "type": "CNAME", "name": "account.tinycloud.xyz",
+                              "content": "z.example.test", "proxied": True, "ttl": 1})
+        doc = self.plan("--host", "account.tinycloud.xyz", "--other-host")
+        code, _, err = self.apply(doc["plan_hash"], "--host", "account.tinycloud.xyz", "--other-host")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.rules[0]["expression"], '(http.host eq "account.tinycloud.xyz")')
+
+    def test_extra_protected_hosts_are_guarded_and_listed(self):
+        extra = "billing.tinycloud.xyz"
+        code, _, err = self.run_cli("plan", *self.target("--host", extra, "--protect-host", extra))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.plan("--protect-host", extra)["protected_hosts"], sorted([NODE, extra]))
+
+    def test_rule_added_concurrently_survives_apply_and_forced_undo(self):
+        h = self.plan()["plan_hash"]
+        theirs = {"id": "r-ffff6666", "version": "1", "action": "log", "expression": "(true)",
+                  "description": "added during apply", "enabled": True}
+        self.fake.before_put = lambda: self.fake.rules.append(copy.deepcopy(theirs))
+        code, out, _ = self.apply(h)
+        self.assertEqual(code, 4)  # verify reports the rule set changed under us; nothing was lost
+        self.assertIn(theirs, self.fake.rules)
+        self.assertEqual(self.fake.rules[0]["description"], sw.MARKER)
+        self.fake.before_put = None
+        code, _, _ = self.undo("--confirm", h)
+        self.assertEqual(code, 1)  # drift: refused
+        code, out, err = self.undo("--confirm", h, "--force-drift")
+        self.assertEqual(code, 4, err)  # ours is gone, but verify says the list is not the recorded one
+        self.assertFalse(self.docs(out)[-1]["checks"]["restored_to_recorded_prior_state"])
+        self.assertIn(theirs, self.fake.rules)  # rule-level delete: only ours was removed
+        self.assertEqual([r["description"] for r in self.fake.rules], ["allow monitor", "legacy", "added during apply"])
+        writes = [c[0] for c in self.fake.writes()]
+        self.assertEqual(writes, ["add_rule", "delete_rule"])  # no whole-list write exists any more
+
+    def test_snapshot_ids_are_revalidated_on_load(self):
+        self.applied()
+        saved = json.loads(self.snap.read_text())
+        for key, bad in (("zone_id", "../../x"), ("host", 'x") or true or ("'), ("protect_hosts", ["x.example.test"])):
+            with self.subTest(key=key):
+                broken = dict(saved, **{key: bad})
+                self.snap.write_text(json.dumps(broken))
+                calls = len(self.fake.calls)
+                code, _, err = self.run_cli("verify", "--snapshot", str(self.snap))
+                self.assertEqual(code, 1)
+                self.assertEqual(len(self.fake.calls), calls)  # refused before any API call
+
+    def test_snapshot_file_and_directory_are_fsynced(self):
+        with mock.patch.object(sw, "fsync_dir") as fsync_dir:
+            self.applied()
+        self.assertEqual(fsync_dir.call_count, 2)  # exclusive create + the "applied" replace
+
+    def test_real_client_never_follows_redirects(self):
+        import urllib.request
+        self.assertIsNone(sw._NoRedirect().redirect_request(None, None, 301, "", {}, "https://elsewhere.test/"))
+        opener = sw.CloudflareClient(TOKEN)._opener.__self__
+        self.assertTrue(any(isinstance(h, sw._NoRedirect) for h in opener.handlers))
+        self.assertFalse(any(type(h) is urllib.request.HTTPRedirectHandler for h in opener.handlers))
+
+
 class TokenAndClientTest(Base):
     def test_token_file_must_be_private_regular_file(self):
         token_file = self.dir / "token"
@@ -670,13 +796,19 @@ class TokenAndClientTest(Base):
         self.assertEqual(client.security_level(ZONE), "medium")
         self.assertEqual(sent[0][:2], ("GET", f"{sw.API}/zones/{ZONE}/settings/security_level"))
         self.assertEqual(sent[0][3], "Bearer " + TOKEN)
-        self.assertIsNone(client.entrypoint_rules(ZONE))  # 404 = no entrypoint ruleset yet
+        self.assertIsNone(client.entrypoint(ZONE))  # 404 = no entrypoint ruleset yet
         with self.assertRaises(sw.CfError) as raised:
             client.set_security_level(ZONE, "under_attack")
         self.assertNotIn(TOKEN, str(raised.exception))
         self.assertEqual(sent[-1][2], b'{"value": "under_attack"}')
-        client.put_entrypoint_rules(ZONE, [{"a": 1}])
+        client.create_entrypoint(ZONE, [{"a": 1}])
         self.assertEqual((sent[-1][0], sent[-1][2]), ("PUT", b'{"rules": [{"a": 1}]}'))
+        client.add_rule(ZONE, "rs-1", {"action": "block"}, 1)
+        self.assertEqual((sent[-1][0], sent[-1][1]), ("POST", f"{sw.API}/zones/{ZONE}/rulesets/rs-1/rules"))
+        self.assertEqual(json.loads(sent[-1][2]), {"action": "block", "position": {"index": 1}})
+        client.delete_rule(ZONE, "rs-1", "rule-9")
+        self.assertEqual((sent[-1][0], sent[-1][1], sent[-1][2]),
+                         ("DELETE", f"{sw.API}/zones/{ZONE}/rulesets/rs-1/rules/rule-9", None))
         body = {"type": "CNAME", "name": HOST, "content": "y.example.test", "ttl": 300, "proxied": False,
                 "comment": None, "tags": []}
         client.update_dns_record(ZONE, "dns-tee-2", body)
