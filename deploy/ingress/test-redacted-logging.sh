@@ -137,13 +137,14 @@ expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
 # line over the 256 KB buffers) with the ticket in the request line.
 expect_status 401 --http1.1 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 401 --http1.1 -X "$METHOD" "https://$DOMAIN/signed/kv/$TICKET"
-expect_status 400 --http1.1 -H "X-Large: $(head -c 300000 /dev/zero | tr '\0' a)" \
-    "https://$DOMAIN/signed/kv/$TICKET"
+# Large headers via temp files to avoid ARG_MAX; curl ≥7.55 supports -H @file.
+$DOCKER exec "$CLIENT" sh -c 'printf "X-Large: %s" "$(head -c 300000 /dev/zero | tr "\\0" a)" >/tmp/header-over'
+expect_status 400 --http1.1 -H @/tmp/header-over "https://$DOMAIN/signed/kv/$TICKET"
 
 # TC-910/TC-4249: a single header line of about 200 KB fits the 256 KB buffers.
-LARGE_HEADER="X-Large: $(head -c 200000 /dev/zero | tr '\0' a)"
-expect_status 200 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
-expect_status 200 --http1.1 -H "$LARGE_HEADER" "https://$DOMAIN/delegate"
+$DOCKER exec "$CLIENT" sh -c 'printf "X-Large: %s" "$(head -c 200000 /dev/zero | tr "\\0" a)" >/tmp/header-200k'
+expect_status 200 -H @/tmp/header-200k "https://$DOMAIN/delegate"
+expect_status 200 --http1.1 -H @/tmp/header-200k "https://$DOMAIN/delegate"
 
 # TC-1012: CLIENT_MAX_BODY_SIZE=95m admits exactly 95 MiB (99,614,720 bytes)
 # and refuses one byte more, declared or chunked.
