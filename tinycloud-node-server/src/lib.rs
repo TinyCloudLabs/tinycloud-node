@@ -904,6 +904,35 @@ fn ledger_failure_consequence(named_keys_v1: bool) -> &'static str {
     }
 }
 
+/// The one line a node logs per start about its deletion ledger, after replay
+/// (TC-4177): the file's state (`missing` means this start created it),
+/// size, delete operations, key entries, `committed` and `aborted` lines, and
+/// the newest `deletedAt` (`none` with no operation). Counts and a timestamp
+/// only, so two starts can be compared across an OS move or deploy. It is
+/// info level: a missing or empty ledger is normal on a first start, so this
+/// line states a fact and does not alarm.
+fn log_deletion_ledger_start(path: &std::path::Path, existed_before_open: bool) {
+    use tinycloud_core::encryption_network::deletion_ledger::summarize;
+    match summarize(path, existed_before_open) {
+        Ok(summary) => ::tracing::info!(
+            event = "deletion_ledger_start",
+            ledger_file = summary.file.as_str(),
+            bytes = summary.bytes,
+            operations = summary.operations,
+            key_entries = summary.key_entries,
+            committed = summary.committed,
+            aborted = summary.aborted,
+            newest_deleted_at = summary.newest_deleted_at.as_deref().unwrap_or("none"),
+            "deletion ledger at start"
+        ),
+        Err(error) => ::tracing::info!(
+            event = "deletion_ledger_start",
+            error_kind = error.kind(),
+            "deletion ledger counts unavailable at start"
+        ),
+    }
+}
+
 /// Settings the node no longer reads that a deployment may still set, in
 /// its file or environment. Configuration extraction ignores unknown keys,
 /// so each is named once at startup instead of being dropped silently.
@@ -1178,6 +1207,13 @@ pub async fn app_with_control(
     // replayed stops the start: the node never serves with the gate quietly
     // off. With it off, the failure is logged and the rest of the node serves.
     let named_keys_enabled = tinycloud_config.encryption_network.named_keys_v1;
+    // Taken before the open below, which creates a missing ledger file: only
+    // now can a lost file be told from an empty ledger (TC-4177).
+    let ledger_existed = tinycloud_config
+        .encryption_network
+        .deletion_ledger_path
+        .as_deref()
+        .is_some_and(tinycloud_core::encryption_network::deletion_ledger::file_existed);
     let deletion_ledger = match tinycloud_config
         .encryption_network
         .deletion_ledger_path
@@ -1228,6 +1264,7 @@ pub async fn app_with_control(
                         "deletion ledger replayed at start"
                     );
                 }
+                log_deletion_ledger_start(ledger.path(), ledger_existed);
             }
             Err(error) => {
                 ::tracing::error!(

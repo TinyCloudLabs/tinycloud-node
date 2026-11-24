@@ -255,6 +255,17 @@ opened or replayed, the node logs the event `deletion_ledger_open_failed` or
   off;
 - with `named_keys_v1` off, the rest of the node starts and serves.
 
+After a successful replay, every start logs one info line, `deletion_ledger_start`
+(TC-4177), so an OS move or a deploy can compare the ledger before and after:
+`ledger_file` (`missing` when this start found no file and created an empty one,
+`empty`, or `present`; decided before the open creates the file), `bytes`,
+`operations` (delete operations), `key_entries` (keys they name), `committed`,
+`aborted` and `newest_deleted_at` (`none` with no operation). Counts and one
+timestamp: no operation id, network id or key path. The log shipper drops info
+lines from this target (`filtered_level`) until a shipper route and its schema
+entry are deployed, so on a node with log shipping the line does not yet reach
+Better Stack.
+
 The log shipper sends `deletion_ledger_open_failed`, `deletion_ledger_replay_failed`
 and `deletion_ledger_unrepaired` to Better Stack as individual events with only
 their `error_kind` (`io`, `path`, `encode`, `moved`, `lock_held`, `malformed`,
