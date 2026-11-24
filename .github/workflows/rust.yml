@@ -282,7 +282,7 @@ jobs:
     - name: Run DuckDB policy and request telemetry through node binaries
       if: matrix.group == 'duckdb'
       timeout-minutes: 25
-      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin
+      run: cargo test -p tinycloud-node --features duckdb --test request_telemetry_authenticated --test duckdb_diagnostics_policy --test duckdb_offline_policy --test space_size_restart --test space_purge_restore_prefix --test duckdb_read_only_admin --test duckdb_production_state
 
     # Integration targets do not compile the library's cfg(test) modules.
     # Cover DuckDB replacement-busy, disk-headroom and config-floor unit tests.
@@ -321,7 +321,7 @@ jobs:
   clippy:
     name: clippy (workspace)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -344,7 +344,29 @@ jobs:
     - name: Clippy
       run: RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
 
-    # Default workspace features do not enable DuckDB.
+  # TC-4193: the job above builds without the duckdb feature, so the
+  # DuckDB-gated code in tinycloud-core and tinycloud-node was never linted.
+  # A separate job keeps `clippy (workspace)` unchanged. New check: not
+  # required until the ruleset lists it.
+  clippy-duckdb:
+    name: clippy (workspace, duckdb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@766a42937d994bd78bb4591385445c188ccb3f09 # 1.97.1
+      with:
+        components: clippy
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-clippy-duckdb
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
     - name: Clippy (DuckDB core and node)
       run: cargo clippy -p tinycloud-core -p tinycloud-node --all-targets --features duckdb -- -D warnings
 

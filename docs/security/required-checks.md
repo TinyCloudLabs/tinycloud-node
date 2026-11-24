@@ -72,9 +72,9 @@ run is green. Add `cargo-deny (workspace)` only after the lockfile PR
 ctutils advisories`) has landed and `cargo-deny (workspace)` has passed on
 main.
 
-`clippy (workspace)` is proposed as a required check, not yet required
-(TC-4193). Preserve its existing name; Amos must add it only after its
-default-feature and DuckDB lint steps pass on `main`.
+`clippy (workspace, duckdb)` (TC-4193) is proposed as a required check, not yet
+required: the default-feature `clippy (workspace)` build never compiles the
+DuckDB-gated code. Amos adds it only after it has passed once on `main`.
 
 After (create; `integration_id` 15368 is GitHub Actions, so another app cannot
 satisfy the check):
