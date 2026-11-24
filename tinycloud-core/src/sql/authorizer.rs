@@ -270,6 +270,10 @@ pub fn create_authorizer_tracked(
     scope: StatementScope,
     pragmas: PragmaTracker,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    // TC-1491 P4.2a: on a store-master working copy the node's own tables
+    // (the in-file sequence counter) are refused to every statement, an admin's
+    // included. Off everywhere else, so other databases behave as before.
+    let hide_reserved = authority.store_master();
     let denied = authority.denied_arm().clone();
     let (ability_caveats, delegated_caveats) = if authority.delegated_caveats() {
         (None, caveats)
@@ -278,6 +282,9 @@ pub fn create_authorizer_tracked(
     };
     let mut judge = create_ability_authorizer(ability_caveats, authority, scope, pragmas);
     move |ctx: AuthContext<'_>| {
+        if hide_reserved && crate::sql::store::local::names_reserved(&ctx.action) {
+            return Authorization::Deny;
+        }
         let verdict = judge(ctx);
         if verdict != Authorization::Allow {
             return verdict;

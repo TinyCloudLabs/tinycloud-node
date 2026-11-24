@@ -295,6 +295,13 @@ pub struct SqlService {
     /// [`SqlService::with_shadow`] only when `[sql_store] enabled` and the
     /// space allowlist is non-empty.
     shadow: Arc<dyn crate::sql::store::ShadowSink>,
+    /// Which databases are store-master (TC-1491 P4.2a). `None` (the
+    /// default) means none is: every database is served exactly as before.
+    /// Not wired into the node runtime in P4.2a.
+    store_gate: Option<Arc<dyn crate::sql::store::local::StoreMasterGate>>,
+    /// What the local working copies of store-master databases are known to
+    /// be: checkpoint hash by file identity, WAL marks, last publish.
+    local: Arc<crate::sql::store::local::LocalFiles>,
 }
 
 impl SqlService {
@@ -318,6 +325,8 @@ impl SqlService {
             checkpoint_backoff: Arc::new(DashMap::new()),
             checkpoint_backoff_bounds: (CHECKPOINT_BACKOFF, CHECKPOINT_BACKOFF_MAX),
             shadow: Arc::new(crate::sql::store::NoopSink),
+            store_gate: None,
+            local: Arc::new(crate::sql::store::local::LocalFiles::default()),
         }
     }
 
@@ -539,6 +548,11 @@ impl SqlService {
         growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        if self.is_store_master(space, db_name).await? {
+            return self
+                .execute_store_master(space, db_name, request, caveats, authority, growth)
+                .await;
+        }
         // TC-2961: before hydration, so a backed-off database is not reloaded.
         if request.is_write(caveats.as_ref()) {
             if let Some(error) = self.checkpoint_backoff_error(&key) {
@@ -794,6 +808,9 @@ impl SqlService {
         crate::request_telemetry::observe_space(space);
         let _operation_guard = self.acquire_operation(space, db_name).await?;
         let key = (space.to_string(), db_name.to_string());
+        if self.is_store_master(space, db_name).await? {
+            return self.local_handle(space, db_name).await?.export().await;
+        }
 
         if self
             .bounded(
@@ -853,6 +870,9 @@ impl SqlService {
     /// database warm.
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+        if self.is_store_master(space, db_name).await? {
+            return self.local_handle(space, db_name).await;
+        }
         let started = Instant::now();
         // A hydration that ends `Ready` has published its actor, but an actor
         // that cannot open its files deregisters itself at once. Hydrate at
@@ -7681,3 +7701,4 @@ mod tests {
 }
 
 mod space_purge;
+mod store_master;

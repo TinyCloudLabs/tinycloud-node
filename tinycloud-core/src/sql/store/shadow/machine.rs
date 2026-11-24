@@ -260,6 +260,20 @@ impl DbMachine {
         matches!(self.phase, Phase::InFlight { .. })
     }
 
+    /// The byte window was reached (TC-1491 P4.2a, 8 MiB): a dirty database
+    /// is due on the next tick instead of after `policy.interval`. A database
+    /// that is clean, in flight, backing off or blocked is left as it is, so
+    /// the backoff and every block still hold.
+    pub fn expedite(&mut self, now: Instant, policy: &Policy) {
+        if let Phase::Dirty { since, attempts } = self.phase {
+            let due = now.checked_sub(policy.interval).unwrap_or(since);
+            self.phase = Phase::Dirty {
+                since: since.min(due),
+                attempts,
+            };
+        }
+    }
+
     pub fn last_seq(&self) -> Option<u64> {
         self.have.as_ref().map(|f| f.last_seq)
     }

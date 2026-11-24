@@ -143,6 +143,7 @@ pub struct SqlAuthority {
     ddl_policy: DdlPolicy,
     delegated_caveats: bool,
     denied: DeniedArm,
+    store_master: bool,
 }
 
 impl SqlAuthority {
@@ -156,6 +157,7 @@ impl SqlAuthority {
             ddl_policy: DdlPolicy::default(),
             delegated_caveats: false,
             denied: DeniedArm::default(),
+            store_master: false,
         }
     }
 
@@ -179,6 +181,19 @@ impl SqlAuthority {
 
     pub fn delegated_caveats(&self) -> bool {
         self.delegated_caveats
+    }
+
+    /// The request runs on a store-master working copy (TC-1491 P4.2a): the
+    /// authorizer refuses the reserved `tinycloud_internal_` namespace, and
+    /// the actor counts the write in the in-file sequence before COMMIT. Set
+    /// by the actor, never by a caller; false everywhere else.
+    pub fn with_store_master(mut self, enabled: bool) -> Self {
+        self.store_master = enabled;
+        self
+    }
+
+    pub fn store_master(&self) -> bool {
+        self.store_master
     }
 
     /// The cell the authorizer records a refusing arm in.

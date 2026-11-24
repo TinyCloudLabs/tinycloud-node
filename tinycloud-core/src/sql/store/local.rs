@@ -1,0 +1,468 @@
+//! The local working copy of a store-master SQL database (TC-1491 P4.2a,
+//! design sections 5.3 and 12).
+//!
+//! Everything here is inert until a database's `sql_store_mode` row says
+//! `store_master`; no cutover exists yet, so nothing in production reaches it.
+//!
+//! - **Sequence counter.** One reserved row, written in the same SQLite
+//!   transaction as the write it counts ([`bump_seq`], called by the actor
+//!   before COMMIT). A crash can therefore never reissue a `seq` with other
+//!   content: the counter and the data are in the same WAL commit.
+//! - **Reserved namespace.** Tables whose name starts with
+//!   [`RESERVED_PREFIX`] are refused to user SQL by the authorizer, but only
+//!   while the actor is store-master ([`names_reserved`]).
+//! - **Checkpoint identity.** The manifest lineage anchor
+//!   (`base_checkpoint_cid`) is, for a store-master database, the lowercase
+//!   hex SHA-256 of the local main file (the checkpoint) at the moment it was
+//!   published as a snapshot. The column keeps its meaning (the hash of the
+//!   checkpoint bytes the snapshot object holds); only the bytes' origin
+//!   changes from the Postgres artifact to the local file, because the
+//!   Postgres artifact no longer moves. [`LocalFiles`] caches that hash by
+//!   file identity so a commit never rehashes an unchanged file.
+//! - **Pilot cap.** [`PILOT_CAP_BYTES`] (Sam, 2026-11-23): a store-master
+//!   database whose checkpoint exceeds 64 MiB is refused by the source, which
+//!   keeps the Postgres copy-back as the rollback.
+//! - **Window.** [`WINDOW`] and [`WINDOW_BYTES`] (Sam, 2026-11-23): the
+//!   store may lag the local file by 60 s or 8 MiB, whichever comes first.
+//!   There is no wait-for-store on commit.
+//!
+//! No code here changes a database's mode, owner or epoch. A takeover of a
+//! database after its owner is lost stays a manual operator action behind an
+//! expired lease and a logged loss (P4.2c); nothing in this slice takes over.
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use rusqlite::hooks::AuthAction;
+use rusqlite::Connection;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sha2::{Digest, Sha256};
+
+use super::key::DbRef;
+use super::mode::{read_mode, ModeError, StoreMode};
+use super::shadow::DbKey;
+use crate::database_artifacts::WalMark;
+use crate::models::sql_store_mode as mode_row;
+use crate::sql::durability::Synchronous;
+use crate::sql::storage::{open_store_master_connection, StorageMode};
+use crate::sql::types::SqlError;
+
+/// The largest checkpoint a store-master database may have during the pilot.
+pub const PILOT_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The store may lag the local file by this many bytes ...
+pub const WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// ... or by this long, whichever comes first.
+pub const WINDOW: Duration = Duration::from_secs(60);
+
+/// The reserved counter table.
+pub const SEQ_TABLE: &str = "tinycloud_internal_store_seq";
+
+/// Every name under this prefix is the node's, not the user's (compared
+/// ASCII-case-insensitively, as SQLite compares names).
+pub const RESERVED_PREFIX: &str = "tinycloud_internal_";
+
+/// Marks kept per database: the frontier's and the head's need only the last
+/// two; a few more absorb a retried job.
+const MARKS_KEPT: usize = 8;
+
+/// Whether a checkpoint of `bytes` is within the pilot cap (inclusive).
+pub fn within_pilot_cap(bytes: u64) -> bool {
+    bytes <= PILOT_CAP_BYTES
+}
+
+/// Whether `name` is in the reserved namespace.
+pub fn is_reserved_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..RESERVED_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_PREFIX.as_bytes()))
+}
+
+/// Whether a SQLite authorizer action touches the reserved namespace.
+pub fn names_reserved(action: &AuthAction<'_>) -> bool {
+    use AuthAction::*;
+    match action {
+        CreateIndex {
+            index_name,
+            table_name,
+        }
+        | CreateTempIndex {
+            index_name,
+            table_name,
+        }
+        | DropIndex {
+            index_name,
+            table_name,
+        }
+        | DropTempIndex {
+            index_name,
+            table_name,
+        } => is_reserved_name(index_name) || is_reserved_name(table_name),
+        CreateTrigger {
+            trigger_name,
+            table_name,
+        }
+        | CreateTempTrigger {
+            trigger_name,
+            table_name,
+        }
+        | DropTrigger {
+            trigger_name,
+            table_name,
+        }
+        | DropTempTrigger {
+            trigger_name,
+            table_name,
+        } => is_reserved_name(trigger_name) || is_reserved_name(table_name),
+        CreateTable { table_name }
+        | CreateTempTable { table_name }
+        | DropTable { table_name }
+        | DropTempTable { table_name }
+        | Delete { table_name }
+        | Insert { table_name }
+        | Read { table_name, .. }
+        | Update { table_name, .. }
+        | AlterTable { table_name, .. }
+        | Analyze { table_name }
+        | CreateVtable { table_name, .. }
+        | DropVtable { table_name, .. } => is_reserved_name(table_name),
+        CreateView { view_name }
+        | CreateTempView { view_name }
+        | DropView { view_name }
+        | DropTempView { view_name } => is_reserved_name(view_name),
+        Reindex { index_name } => is_reserved_name(index_name),
+        // `PRAGMA table_info('name')` and friends name a table as the value.
+        Pragma {
+            pragma_value: Some(value),
+            ..
+        } => is_reserved_name(value),
+        _ => false,
+    }
+}
+
+fn sqlite(error: rusqlite::Error) -> SqlError {
+    SqlError::Internal(error.to_string())
+}
+
+/// Create the counter at `start_seq` (at cutover: the frozen Postgres
+/// revision). Refuses to run twice and refuses `0`: the uploader's revisions
+/// start at 1.
+pub fn init_seq(conn: &Connection, start_seq: u64) -> Result<(), SqlError> {
+    let start = i64::try_from(start_seq)
+        .ok()
+        .filter(|seq| *seq >= 1)
+        .ok_or_else(|| SqlError::Internal("store-master seq must start at 1 or more".into()))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE {SEQ_TABLE} (\
+           id INTEGER PRIMARY KEY CHECK (id = 1), \
+           seq INTEGER NOT NULL CHECK (seq >= 1)\
+         )"
+    ))
+    .map_err(sqlite)?;
+    conn.execute(
+        &format!("INSERT INTO {SEQ_TABLE} (id, seq) VALUES (1, ?1)"),
+        [start],
+    )
+    .map_err(sqlite)?;
+    Ok(())
+}
+
+/// The counter's value.
+pub fn read_seq(conn: &Connection) -> Result<u64, SqlError> {
+    let seq: i64 = conn
+        .query_row(
+            &format!("SELECT seq FROM {SEQ_TABLE} WHERE id = 1"),
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sqlite)?;
+    u64::try_from(seq).map_err(|_| SqlError::Internal("store-master seq is negative".into()))
+}
+
+/// Count one more write. Runs inside the write's transaction, before COMMIT,
+/// with no authorizer installed.
+pub fn bump_seq(conn: &Connection) -> Result<(), SqlError> {
+    let changed = conn
+        .execute(
+            &format!("UPDATE {SEQ_TABLE} SET seq = seq + 1 WHERE id = 1"),
+            [],
+        )
+        .map_err(sqlite)?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(SqlError::Internal("store-master seq row is missing".into()))
+    }
+}
+
+/// Turn an existing local database file into a store-master working copy:
+/// create the counter at `start_seq` and fold the WAL into the main file, so
+/// the file's hash is the lineage anchor. The caller (the cutover job, P4.4)
+/// holds the database's operation lock with no actor open.
+pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.to_path_buf()), Synchronous::Full)?;
+    init_seq(&conn, start_seq)?;
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(sqlite)?;
+    if busy != 0 {
+        return Err(SqlError::Internal("Database checkpoint is busy".into()));
+    }
+    Ok(())
+}
+
+/// The counter of the working copy at `path`, read without an actor. Fails
+/// when the file is missing or was never initialised: such a database is
+/// fenced, never created or re-seeded.
+pub fn validate_working_copy(path: &Path) -> Result<u64, SqlError> {
+    if !path.is_file() {
+        return Err(SqlError::Unavailable);
+    }
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.to_path_buf()), Synchronous::Full)?;
+    read_seq(&conn)
+}
+
+/// SHA-256 (lowercase hex) of a whole file.
+pub fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// SHA-256 of the first `len` bytes of a file; `None` if it is shorter.
+pub fn hash_prefix(path: &Path, len: u64) -> std::io::Result<Option<[u8; 32]>> {
+    let file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut reader = file.take(len);
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut seen = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        seen += read as u64;
+    }
+    Ok((seen == len).then(|| hasher.finalize().into()))
+}
+
+/// What the actor reports about its working copy, read right after a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalState {
+    /// The in-file counter.
+    pub seq: u64,
+    /// Length of the `-wal` file (0 when absent).
+    pub wal_bytes: u64,
+    /// Length of the main file, the checkpoint.
+    pub main_bytes: u64,
+}
+
+/// Which database mode a request is served under. The one place the mode is
+/// consulted: `None` gate (the default) means every database is served
+/// exactly as before.
+#[async_trait]
+pub trait StoreMasterGate: Send + Sync {
+    /// Whether the mode row says `store_master`. An error refuses the request
+    /// (retryable); a node that cannot read the row never guesses.
+    async fn is_store_master(&self, db: &DbRef<'_>) -> Result<bool, ModeError>;
+
+    /// Every database whose mode row says `store_master`, for the uploader's
+    /// startup and periodic recovery scan.
+    async fn store_master_databases(&self) -> Result<Vec<DbKey>, ModeError>;
+}
+
+/// [`StoreMasterGate`] over the control database's `sql_store_mode`.
+///
+/// The row is read on every call: the cache with an invalidation spec is
+/// P4.2c's. Not wired into the node runtime in P4.2a.
+pub struct ControlModeGate {
+    control: DatabaseConnection,
+}
+
+impl ControlModeGate {
+    pub fn new(control: DatabaseConnection) -> Self {
+        Self { control }
+    }
+}
+
+#[async_trait]
+impl StoreMasterGate for ControlModeGate {
+    async fn is_store_master(&self, db: &DbRef<'_>) -> Result<bool, ModeError> {
+        Ok(read_mode(&self.control, db)
+            .await?
+            .is_some_and(|row| row.mode == StoreMode::StoreMaster))
+    }
+
+    async fn store_master_databases(&self) -> Result<Vec<DbKey>, ModeError> {
+        let rows = mode_row::Entity::find()
+            .filter(mode_row::Column::Mode.eq(StoreMode::StoreMaster.as_str()))
+            .all(&self.control)
+            .await
+            .map_err(|error| ModeError::Db(error.to_string()))?;
+        Ok(rows.into_iter().map(|r| (r.space, r.db_id)).collect())
+    }
+}
+
+/// Identity of a file as far as a cached hash may trust it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl FileId {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        }
+    }
+}
+
+/// Where the last successful publish of a database ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Published {
+    cid: String,
+    wal_end_bytes: u64,
+}
+
+#[derive(Default)]
+struct Entry {
+    cid: Option<(FileId, String)>,
+    marks: Vec<WalMark>,
+    published: Option<Published>,
+}
+
+/// Per-database memory of the local working copies: the checkpoint hash by
+/// file identity, the WAL marks the source recorded, and where the last
+/// publish ended. All of it is a cache: losing it (a restart) costs a rehash
+/// and a cumulative segment instead of a delta, never correctness.
+#[derive(Default)]
+pub struct LocalFiles {
+    entries: Mutex<HashMap<DbKey, Entry>>,
+}
+
+impl LocalFiles {
+    fn with<T>(&self, key: &DbKey, f: impl FnOnce(&mut Entry) -> T) -> T {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(entries.entry(key.clone()).or_default())
+    }
+
+    /// The hash of the main file at `path`, rehashed only when its identity
+    /// (length, mtime, inode) changed or [`Self::invalidate`] ran. Blocking:
+    /// call from `spawn_blocking`.
+    pub fn checkpoint_cid(&self, key: &DbKey, path: &Path) -> std::io::Result<String> {
+        let id = FileId::of(&std::fs::metadata(path)?);
+        if let Some(cid) = self.with(key, |e| {
+            e.cid
+                .as_ref()
+                .filter(|(cached, _)| *cached == id)
+                .map(|(_, cid)| cid.clone())
+        }) {
+            return Ok(cid);
+        }
+        let cid = hash_file(path)?;
+        // The file may have moved while it was hashed; the next call sees a
+        // different identity then.
+        let after = FileId::of(&std::fs::metadata(path)?);
+        if after == id {
+            self.with(key, |e| e.cid = Some((id, cid.clone())));
+        }
+        Ok(cid)
+    }
+
+    /// Forget the cached hash (the main file is about to change or was
+    /// replaced).
+    pub fn invalidate(&self, key: &DbKey) {
+        self.with(key, |e| e.cid = None);
+    }
+
+    /// Remember where the WAL of `mark.revision` ended.
+    pub fn record_mark(&self, key: &DbKey, mark: WalMark) {
+        self.with(key, |e| {
+            e.marks.retain(|m| m.revision != mark.revision);
+            e.marks.push(mark);
+            if e.marks.len() > MARKS_KEPT {
+                e.marks.remove(0);
+            }
+        });
+    }
+
+    /// The marks recorded for `revisions`.
+    pub fn marks(&self, key: &DbKey, revisions: &[i64]) -> Vec<WalMark> {
+        self.with(key, |e| {
+            e.marks
+                .iter()
+                .filter(|m| revisions.contains(&m.revision))
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// A publish landed: its snapshot hash and the WAL bytes it carried.
+    /// Databases this registry has never read are ignored, so a Postgres
+    /// database's publish leaves no entry behind.
+    pub fn set_published(&self, key: &DbKey, cid: &str, seq: u64) {
+        let Ok(revision) = i64::try_from(seq) else {
+            return;
+        };
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = entries.get_mut(key) else {
+            return;
+        };
+        let wal_end_bytes = entry
+            .marks
+            .iter()
+            .find(|m| m.revision == revision && m.checkpoint_content_hash == cid)
+            .map_or(0, |m| m.wal_end_bytes);
+        entry.published = Some(Published {
+            cid: cid.to_owned(),
+            wal_end_bytes,
+        });
+    }
+
+    /// Bytes the store is behind by, as far as this process knows: the WAL
+    /// bytes past the last publish on the same checkpoint, or the whole
+    /// checkpoint plus WAL when the checkpoint changed or nothing has been
+    /// published since the process started.
+    pub fn ahead_bytes(&self, key: &DbKey, cid: &str, wal_bytes: u64, main_bytes: u64) -> u64 {
+        self.with(key, |e| match &e.published {
+            Some(p) if p.cid == cid => wal_bytes.saturating_sub(p.wal_end_bytes),
+            _ => main_bytes.saturating_add(wal_bytes),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) mod rig;

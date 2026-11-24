@@ -26,6 +26,7 @@ use super::{
     },
     parser,
     storage::{self, StorageMode},
+    store::local::{self as local_copy, LocalState},
     types::*,
 };
 
@@ -62,6 +63,15 @@ enum DbMessage {
     Wal {
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
+    /// Store-master only (TC-1491 P4.2a): the in-file counter and the sizes
+    /// of the working copy's files.
+    LocalState {
+        response_tx: oneshot::Sender<Result<LocalState, SqlError>>,
+    },
+    /// Store-master only: fold the WAL into the main file (TRUNCATE).
+    Rotate {
+        response_tx: oneshot::Sender<Result<(), SqlError>>,
+    },
     Shutdown {
         response_tx: oneshot::Sender<()>,
     },
@@ -91,6 +101,8 @@ static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct DatabaseHandle {
     id: u64,
+    /// The actor serves a store-master working copy (TC-1491 P4.2a).
+    store_master: bool,
     tx: mpsc::Sender<(Option<Arc<RequestContext>>, DbMessage)>,
 }
 
@@ -240,6 +252,43 @@ impl DatabaseHandle {
             .await
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
+
+    /// Whether this actor serves a store-master working copy.
+    pub fn is_store_master(&self) -> bool {
+        self.store_master
+    }
+
+    /// Store-master only: the in-file counter and the working copy's sizes,
+    /// read by the actor itself so they are one consistent view.
+    pub(crate) async fn local_state(&self) -> Result<LocalState, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::LocalState { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    /// Store-master only: `PRAGMA wal_checkpoint(TRUNCATE)`. The caller holds
+    /// the operation lock and republishes the new main file as a snapshot.
+    pub(crate) async fn rotate(&self) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::Rotate { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
 }
 
 pub fn spawn_actor(
@@ -259,6 +308,19 @@ pub fn spawn_actor(
     )
 }
 
+/// The actor for a store-master working copy (TC-1491 P4.2a). The file must
+/// exist and carry the in-file counter; the actor never creates or re-seeds
+/// it, and does not checkpoint when it closes.
+pub(crate) fn spawn_store_master_actor(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    policy: DurabilityPolicy,
+) -> DatabaseHandle {
+    spawn_actor_inner(space_id, db_name, base_path, 0, databases, policy, true)
+}
+
 /// [`spawn_actor`] with the node's durability policy (TC-1491): the
 /// `synchronous` level, the size cap and the disk headroom.
 pub fn spawn_actor_with_policy(
@@ -268,6 +330,26 @@ pub fn spawn_actor_with_policy(
     memory_threshold: u64,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     policy: DurabilityPolicy,
+) -> DatabaseHandle {
+    spawn_actor_inner(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        databases,
+        policy,
+        false,
+    )
+}
+
+fn spawn_actor_inner(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    policy: DurabilityPolicy,
+    store_master: bool,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
@@ -287,7 +369,14 @@ pub fn spawn_actor_with_policy(
         };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            let Ok(connection) = storage::open_connection(&mode, policy.synchronous) else {
+            let opened = if store_master {
+                // The file exists and carries the counter, or no actor starts.
+                storage::open_store_master_connection(&mode, policy.synchronous)
+                    .and_then(|connection| local_copy::read_seq(&connection).map(|_| connection))
+            } else {
+                storage::open_connection(&mode, policy.synchronous)
+            };
+            let Ok(connection) = opened else {
                 tracing::error!("Failed to open database");
                 databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
                 return;
@@ -338,6 +427,11 @@ pub fn spawn_actor_with_policy(
                     growth,
                     response_tx,
                 } => {
+                    let authority = if store_master {
+                        authority.with_store_master(true)
+                    } else {
+                        authority
+                    };
                     let pragmas = PragmaTracker::default();
                     authority.denied_arm().clear();
                     let ctx = WriteContext {
@@ -483,6 +577,19 @@ pub fn spawn_actor_with_policy(
                     let result = handle_wal(&mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::LocalState { response_tx } => {
+                    let result = handle_local_state(&conn, &file_path);
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::Rotate { response_tx } => {
+                    let result = handle_rotate(&conn);
+                    if result.is_ok() {
+                        // The WAL is in the main file now: its growth is on
+                        // the disk and no longer pending.
+                        policy.budget.forget(&key);
+                    }
+                    let _ = response_tx.send(result);
+                }
             }
         };
 
@@ -505,7 +612,47 @@ pub fn spawn_actor_with_policy(
         }
     });
 
-    DatabaseHandle { id, tx }
+    DatabaseHandle {
+        id,
+        store_master,
+        tx,
+    }
+}
+
+/// The counter and file sizes of a store-master working copy.
+fn handle_local_state(
+    conn: &rusqlite::Connection,
+    file_path: &Path,
+) -> Result<LocalState, SqlError> {
+    let len = |path: &Path| match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(SqlError::Internal(error.to_string())),
+    };
+    Ok(LocalState {
+        seq: local_copy::read_seq(conn)?,
+        wal_bytes: len(&PathBuf::from(format!("{}-wal", file_path.display())))?,
+        main_bytes: len(file_path)?,
+    })
+}
+
+/// A rotation (TC-1491 P4.2a): count it as one revision, then fold the WAL
+/// into the main file and truncate it.
+///
+/// The counter moves because the checkpoint changes: the new main file is a
+/// new snapshot, published at the new revision, and a revision is never
+/// reissued with different bytes. The content a reader sees is unchanged.
+fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    local_copy::bump_seq(conn)?;
+    let _timer = QueryTimer::new();
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if busy != 0 {
+        return Err(SqlError::Internal("Database checkpoint is busy".into()));
+    }
+    Ok(())
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
@@ -662,6 +809,13 @@ fn handle_message_without_growth_ctx(
     if result.is_err() && conn.is_autocommit() {
         return result;
     }
+    // Store-master: count the write in the same transaction (TC-1491 P4.2a).
+    let result = match result {
+        Ok(ok) if authority.store_master() && WriteProbe::of(conn).writing() => {
+            local_copy::bump_seq(conn).map(|()| ok)
+        }
+        other => other,
+    };
     let grew = page_count(conn).map(|after| after > before);
     // The disk check before COMMIT, for a request that is about to be kept
     // and has written something. `Some` is what stays held afterwards.
@@ -1156,6 +1310,12 @@ fn run_transaction(
     // `execute`) wrote nothing: there is nothing to check, reserve or hold.
     let result = result.and_then(|ok| {
         if WriteProbe::of(conn).writing() {
+            // Store-master: count the write in the same transaction, so a
+            // crash can never leave data without its seq or a seq without
+            // data (TC-1491 P4.2a).
+            if authority.store_master() {
+                local_copy::bump_seq(conn)?;
+            }
             precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
         } else {
             Ok((ok, None))

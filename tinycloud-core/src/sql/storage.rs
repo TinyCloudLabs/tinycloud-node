@@ -55,6 +55,39 @@ pub fn open_connection(
     Ok(conn)
 }
 
+/// Open the working copy of a store-master database (TC-1491 P4.2a): the file
+/// must exist (it is never created here), runs in WAL mode with
+/// auto-checkpoint off, and does **not** checkpoint when its connection
+/// closes.
+///
+/// The WAL is where the newest acknowledged writes live until the uploader
+/// has published them. A checkpoint-on-close (idle exit, shutdown, retire)
+/// would fold them into the main file and delete the WAL behind the
+/// uploader's back; `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` leaves both files as
+/// they are. The only checkpoint a store-master database gets is the
+/// explicit TRUNCATE the uploader runs under the operation lock (a rotation:
+/// it publishes the new main file as a snapshot).
+pub fn open_store_master_connection(
+    mode: &StorageMode,
+    synchronous: Synchronous,
+) -> Result<Connection, SqlError> {
+    let StorageMode::File(path) = mode else {
+        return Err(SqlError::Internal(
+            "a store-master database must be file-backed".into(),
+        ));
+    };
+    if !path.is_file() {
+        return Err(SqlError::Unavailable);
+    }
+    let conn = open_connection(mode, synchronous)?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(conn)
+}
+
 pub fn database_size(conn: &Connection) -> Result<u64, SqlError> {
     let page_count: u64 = {
         let _timer = QueryTimer::new();

@@ -5,6 +5,7 @@
 //! module is reached unless `[sql_store] enabled = true`.
 
 pub mod key;
+pub mod local;
 pub mod manifest;
 pub mod memory;
 pub mod mode;
