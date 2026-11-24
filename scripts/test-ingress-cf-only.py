@@ -376,82 +376,78 @@ class VerifyTest(Base):
         self.assertEqual(code, 0, out)
         result = json.loads(out)
         self.assertEqual(result["result"], "pass")
-        self.assertEqual(result["accepted_closed_signals"], ["tcp_refused"])
+        self.assertEqual(result["closed_means"], ["tcp_refused", "tcp_reset", "no_route"])
         probed = {(h, f) for h, f, p in self.http.probes}
         for host in (cf_only.TEE_HOST, f"{APP}-443s.{GATEWAY}", f"{INSTANCE}-443s.{GATEWAY}",
                      f"{APP}-8000.{GATEWAY}", f"{INSTANCE}-443.{GATEWAY}"):
             for family in ("ipv4", "ipv6"):
                 self.assertIn((host, family), probed)
         self.assertTrue(result["not_covered"])
-        self.assertIn("never a pass", result["closed_signal_note"])
+        self.assertIn("POSITIVE refusal", result["closed_rule"])
 
     def test_verify_works_from_the_receipt_written_by_apply_patch(self):
         self.assertEqual(self.verify(receipt=self.receipt_out)[0], 0)
 
-    def test_fails_or_is_indeterminate_on_each_condition(self):
-        FAIL, INDET = 1, 2
+    def test_fails_on_each_condition_and_never_reports_indeterminate(self):
         node = {"outcome": "node_info", "node_id": NODE}
         cases = {
-            "tee ipv4 still serves": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"): node}), FAIL,
+            "tee ipv4 still serves": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"): node}),
                                       "tee.node.tinycloud.xyz fresh ipv4"),
             "instance -443s ipv6 still serves": (lambda h: h.probe_map.update({(f"{INSTANCE}-443s.{GATEWAY}", "ipv6"): node}),
-                                                 FAIL, "-443s.gw.example.test fresh ipv6"),
+                                                 "-443s.gw.example.test fresh ipv6"),
             "multi-address answer with one node response": (lambda h: h.probe_map.update({
-                (cf_only.TEE_HOST, "ipv4"): {"outcome": "node_info", "signals": ["tcp_refused", "node_info"]}}), FAIL,
+                (cf_only.TEE_HOST, "ipv4"): {"outcome": "node_info", "signals": ["tcp_refused", "node_info"]}}),
                 "tee.node.tinycloud.xyz fresh ipv4"),
-            "timeout is not a closed signal": (lambda h: h.probe_map.update({(f"{APP}-8000.{GATEWAY}", "ipv4"):
-                                               {"outcome": "timeout"}}), INDET, f"{APP}-8000"),
-            "gateway 502 is not a closed signal": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
-                                                   {"outcome": "http_502"}}), INDET, f"{APP}-443."),
-            "404 is not a closed signal by default": (lambda h: h.probe_map.update({(f"{APP}-443s.{GATEWAY}", "ipv4"):
-                                                      {"outcome": "http_404"}}), INDET, f"{APP}-443s."),
-            "tls alert is not a closed signal by default": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
-                                                            {"outcome": "tls_rejected"}}), INDET, "tee.node.tinycloud.xyz"),
-            "unparsed 200 is not closed": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
-                                           {"outcome": "http_200_unparsed"}}), INDET, "tee.node.tinycloud.xyz"),
-            "ipv4 resolver error is not closed": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
-                                                  {"outcome": "no_address"}}), INDET, f"{APP}-443."),
+            "timeout is unknown": (lambda h: h.probe_map.update({(f"{APP}-8000.{GATEWAY}", "ipv4"):
+                                   {"outcome": "timeout"}}), f"{APP}-8000"),
+            "gateway 502 completed HTTP": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
+                                           {"outcome": "http_502"}}), f"{APP}-443."),
+            "404 completed HTTP": (lambda h: h.probe_map.update({(f"{APP}-443s.{GATEWAY}", "ipv4"):
+                                   {"outcome": "http_404"}}), f"{APP}-443s."),
+            "421 completed HTTP": (lambda h: h.probe_map.update({(f"{APP}-443s.{GATEWAY}", "ipv4"):
+                                   {"outcome": "http_421"}}), f"{APP}-443s."),
+            "tls alert completed TLS": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                                        {"outcome": "tls_rejected"}}), "tee.node.tinycloud.xyz"),
+            "close after TLS": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                                {"outcome": "closed_after_tls"}}), "tee.node.tinycloud.xyz"),
+            "unparsed 200": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                             {"outcome": "http_200_unparsed"}}), "tee.node.tinycloud.xyz"),
+            "generic error": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv4"):
+                              {"outcome": "error"}}), "tee.node.tinycloud.xyz"),
+            "ipv4 resolver error": (lambda h: h.probe_map.update({(f"{APP}-443.{GATEWAY}", "ipv4"):
+                                    {"outcome": "no_address"}}), f"{APP}-443."),
             "ipv6 without AAAA is unverified": (lambda h: h.probe_map.update({(cf_only.TEE_HOST, "ipv6"):
-                                                {"outcome": "no_address"}}), INDET, "tee.node.tinycloud.xyz fresh ipv6"),
-            "node.* unhealthy": (lambda h: h.info_map["node.tinycloud.xyz"].update(status=502), FAIL,
+                                                {"outcome": "no_address"}}), "tee.node.tinycloud.xyz fresh ipv6"),
+            "node.* unhealthy": (lambda h: h.info_map["node.tinycloud.xyz"].update(status=502),
                                  "node.tinycloud.xyz /info"),
-            "node ids differ": (lambda h: h.info_map[HOST].update(node_id=OTHER_NODE), FAIL, "tunnel host /info"),
+            "node ids differ": (lambda h: h.info_map[HOST].update(node_id=OTHER_NODE), "tunnel host /info"),
             "management looks closed while it must stay open": (lambda h: setattr(h, "mgmt", {"outcome": "tcp_refused"}),
-                                                                FAIL, "management route"),
-            "management timeout": (lambda h: setattr(h, "mgmt", {"outcome": "timeout"}), INDET, "management route"),
-            "management answers a non-SSH protocol": (lambda h: setattr(h, "mgmt", {"outcome": "non_ssh_data"}), INDET,
+                                                                "management route"),
+            "management timeout": (lambda h: setattr(h, "mgmt", {"outcome": "timeout"}), "management route"),
+            "management answers a non-SSH protocol": (lambda h: setattr(h, "mgmt", {"outcome": "non_ssh_data"}),
                                                       "management route"),
         }
-        for name, (fn, code_expected, expected) in cases.items():
+        for name, (fn, expected) in cases.items():
             with self.subTest(name):
                 self.http = FakeHttp()
                 fn(self.http)
                 code, out, err = self.verify()
-                self.assertEqual(code, code_expected, out)
-                self.assertEqual(json.loads(out)["result"], {1: "FAIL", 2: "INDETERMINATE"}[code_expected])
+                self.assertEqual(code, 1, out)
+                self.assertEqual(json.loads(out)["result"], "FAIL")
                 self.assertTrue(any(expected in c for c in self.not_passed(out)), self.not_passed(out))
 
-    def test_a_fail_outranks_indeterminate(self):
-        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "node_info", "node_id": NODE}
-        self.http.probe_map[(cf_only.TEE_HOST, "ipv6")] = {"outcome": "timeout"}
+    def test_positive_refusals_pass_and_the_accept_flag_no_longer_exists(self):
+        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "tcp_reset"}
+        self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv4")] = {"outcome": "no_route"}
         code, out, err = self.verify()
-        self.assertEqual((code, json.loads(out)["result"]), (1, "FAIL"))
-
-    def test_other_closed_signals_pass_only_when_the_operator_accepts_them(self):
-        self.http.probe_map[(cf_only.TEE_HOST, "ipv4")] = {"outcome": "http_421"}
-        self.http.probe_map[(f"{APP}-443s.{GATEWAY}", "ipv4")] = {"outcome": "tls_rejected"}
-        self.assertEqual(self.verify()[0], 2)
-        self.assertEqual(self.verify("--accept-closed-signal", "http_421")[0], 2)
-        code, out, err = self.verify("--accept-closed-signal", "http_421", "--accept-closed-signal", "tls_rejected")
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads(out)["accepted_closed_signals"], ["http_421", "tcp_refused", "tls_rejected"])
-        for bad in ("http_200", "node_info", "ssh_banner", "timeout", "http_200_unparsed", "rm -rf"):
-            with self.subTest(bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                self.verify("--accept-closed-signal", bad)
+        self.assertEqual(json.loads(out)["closed_means"], ["tcp_refused", "tcp_reset", "no_route"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.verify("--accept-closed-signal", "http_421")
 
     def test_ipv6_without_aaaa_only_passes_when_explicitly_accepted(self):
         self.http.probe_map = {(h, "ipv6"): {"outcome": "no_address"} for h in self.all_probe_hosts()}
-        self.assertEqual(self.verify()[0], 2)
+        self.assertEqual(self.verify()[0], 1)
         code, out, err = self.verify("--allow-no-aaaa")
         self.assertEqual(code, 0, out)
         self.assertIn("not proof of no IPv6 path", out)
@@ -481,10 +477,10 @@ class VerifyTest(Base):
         self.save(self.snapshot, dict(snap, after={"restrict_mode": True, "ports": []}))
         self.http.mgmt = {"outcome": "tcp_refused"}
         self.assertEqual(self.verify()[0], 0)
-        self.http.mgmt = {"outcome": "ssh_banner"}
-        self.assertEqual(self.verify()[0], 1)
-        self.http.mgmt = {"outcome": "timeout"}
-        self.assertEqual(self.verify()[0], 2)
+        for outcome in ("ssh_banner", "timeout", "tls_rejected", "http_404"):
+            with self.subTest(outcome):
+                self.http.mgmt = {"outcome": outcome}
+                self.assertEqual(self.verify()[0], 1)
 
     def test_restored_expectation_needs_tee_to_serve_the_same_node(self):
         self.http = FakeHttp(restricted=False)
@@ -771,9 +767,9 @@ class ProbeClassifierTest(unittest.TestCase):
         port = self.serve(self.respond(200, self.INFO, chunked=True))
         result = self.result(port)
         self.assertEqual((result["outcome"], result.get("node_id")), ("node_info", NODE))
-        self.assertEqual(cf_only.judge_closed(result, {"tcp_refused", "http_404", "tls_rejected"})[0], "fail")
+        self.assertEqual(cf_only.judge_closed(result)[0], "fail")
 
-    def test_each_non_node_response_has_its_own_signal_and_never_passes_by_default(self):
+    def test_anything_that_completes_http_or_tls_is_open_or_unknown_and_fails(self):
         cases = {"http_404": self.respond(404, b"nope"), "http_502": self.respond(502, b"bad gateway"),
                  "http_421": self.respond(421, b""), "http_200_unparsed": self.respond(200, b"<html>ok</html>"),
                  "http_301": self.respond(301, b"", headers=("Location: https://x.example.test/",)),
@@ -782,31 +778,40 @@ class ProbeClassifierTest(unittest.TestCase):
             with self.subTest(signal):
                 result = self.result(self.serve(handler))
                 self.assertEqual(result["signals"], [signal])
-                self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "indeterminate")
-                if signal.startswith("http_4") or signal.startswith("http_5") or signal.startswith("http_3"):
-                    self.assertEqual(cf_only.judge_closed(result, {signal})[0], "pass")
+                self.assertEqual(cf_only.judge_closed(result)[0], "fail")
 
-    def test_tls_alert_is_tls_rejected_and_not_tcp_refused(self):
+    def test_tls_alert_is_tls_rejected_and_fails(self):
         result = self.result(self.serve("alert"))
         self.assertEqual(result["signals"], ["tls_rejected"])
-        self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "indeterminate")
+        self.assertEqual(cf_only.judge_closed(result)[0], "fail")
 
-    def test_silence_is_a_timeout_and_indeterminate(self):
+    def test_silence_is_a_timeout_and_fails(self):
         result = self.result(self.serve("silent"))
         self.assertEqual(result["signals"], ["timeout"])
-        self.assertEqual(cf_only.judge_closed(result, {"tcp_refused", "tls_rejected"})[0], "indeterminate")
+        self.assertEqual(cf_only.judge_closed(result)[0], "fail")
 
-    def test_a_closed_port_is_tcp_refused_and_the_only_default_pass(self):
+    def test_a_closed_port_is_tcp_refused_and_passes(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         listener.close()
         result = self.result(port)
         self.assertEqual(result["signals"], ["tcp_refused"])
-        self.assertEqual(cf_only.judge_closed(result, set(cf_only.DEFAULT_CLOSED))[0], "pass")
+        self.assertEqual(cf_only.judge_closed(result)[0], "pass")
 
     def test_unresolvable_name_is_no_address(self):
         self.assertEqual(self.probe.probe("no-such-host.invalid", "ipv4", 443)["signals"], ["no_address"])
+
+    def test_reset_and_no_route_at_connect_are_positive_refusals_and_other_errors_are_not(self):
+        import errno
+        for failure, signal, verdict in ((ConnectionResetError(errno.ECONNRESET, "reset"), "tcp_reset", "pass"),
+                                         (OSError(errno.ENETUNREACH, "no route"), "no_route", "pass"),
+                                         (OSError(errno.EHOSTUNREACH, "no route"), "no_route", "pass"),
+                                         (OSError(errno.EACCES, "denied"), "error", "fail")):
+            with self.subTest(signal), mock.patch.object(cf_only.socket, "create_connection", side_effect=failure):
+                result = self.probe._attempt(("127.0.0.1", 443), "x.example.test", False)
+                self.assertEqual(result[0], signal)
+                self.assertEqual(cf_only.judge_closed({"signals": [result[0]]})[0], verdict)
 
     def test_management_banner_is_read_after_the_tls_handshake(self):
         port = self.serve(lambda tls: tls.sendall(b"SSH-2.0-OpenSSH_9.6\r\n"))
@@ -814,8 +819,11 @@ class ProbeClassifierTest(unittest.TestCase):
         port = self.serve(lambda tls: tls.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n"))
         self.assertEqual(self.result(port, banner=True)["signals"], ["non_ssh_data"])
         self.assertEqual(self.result(self.serve(lambda tls: None), banner=True)["signals"], ["closed_after_tls"])
-        self.assertEqual(cf_only.judge_management({"signals": ["non_ssh_data"]}, True, {"tcp_refused"})[0], "indeterminate")
-        self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, True, {"tcp_refused"})[0], "pass")
+        self.assertEqual(cf_only.judge_management({"signals": ["non_ssh_data"]}, True)[0], "fail")
+        self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, True)[0], "pass")
+        self.assertEqual(cf_only.judge_management({"signals": ["tcp_refused"]}, False)[0], "pass")
+        self.assertEqual(cf_only.judge_management({"signals": ["tls_rejected"]}, False)[0], "fail")
+        self.assertEqual(cf_only.judge_management({"signals": ["ssh_banner"]}, False)[0], "fail")
 
 
 if __name__ == "__main__":

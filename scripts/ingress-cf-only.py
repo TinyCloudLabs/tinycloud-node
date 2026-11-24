@@ -10,6 +10,7 @@ authorized operator. See docs/runbooks/cf-only-ingress.md.
 import argparse
 from collections import namedtuple
 from datetime import datetime, timezone
+import errno
 import hashlib
 import hmac
 import http.client
@@ -38,16 +39,14 @@ LABEL = "operator evidence from automated reads, not a cryptographic attestation
 ORIGIN_ATTESTATION = ("operator-attested, NOT verified: the Worker's ORIGIN_URL is a secret whose value the Cloudflare "
                       "API never returns; it is recorded as the --tunnel-host the operator says the set-origin step received")
 CONNECTOR_BASIS = "tunnel status healthy with active connections and none pending reconnect, as read from the Cloudflare API"
-END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path shows an "
-                    "accepted closed signal, so the Worker reaches the node by some route other than the closed gateway")
+END_TO_END_SHOWS = ("node.tinycloud.xyz answers /info with the recorded node id while every probed gateway path shows a "
+                    "positive refusal, so the Worker reaches the node by some route other than the closed gateway")
 END_TO_END_CANNOT = ["that the secret equals the tunnel host (another independent origin serving the same node would "
                      "also pass)", "that no unprobed gateway host or address is used", "anything before the restriction: "
                      "while the gateway is open the secret may still point at it and node.* would also pass"]
-# Closed signals. The gateway hostnames share an SNI-routed IP, so a TCP refusal is probably NOT the real signal;
-# the actual TLS/HTTP denial signature has not been observed and a drill must record it. Until then only
-# tcp_refused is accepted by default and anything else is INDETERMINATE (never a pass).
-DEFAULT_CLOSED = ("tcp_refused",)
-CLOSED_SIGNAL_RE = re.compile(r"tcp_refused|tcp_reset|tls_rejected|closed_after_tls|http_(?!200)[1-5][0-9]{2}")
+# Closed means a POSITIVE refusal: a connect error (refused), a reset, or no route. Anything that completes TLS or
+# HTTP is open or unknown, and both fail verify. There is no operator-extensible allow-list.
+CLOSED_SIGNALS = ("tcp_refused", "tcp_reset", "no_route")
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_READ_TOKEN"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX32 = re.compile(r"[0-9a-f]{32}")
@@ -220,8 +219,8 @@ class NetworkProbe:
             return "tcp_refused", None
         except ConnectionError:
             return "tcp_reset", None
-        except OSError:
-            return "error", None
+        except OSError as error:
+            return ("no_route" if error.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH) else "error"), None
         with raw:
             context = ssl.create_default_context()
             context.check_hostname, context.verify_mode = False, ssl.CERT_NONE  # reachability only
@@ -459,8 +458,8 @@ def cmd_apply_patch(a, clients, now, out):
                "evidence": summarize(receipt),
                "warning": "Under a GO only. The PATCH restarts the CVM and interrupts both HTTP paths.",
                "then_verify": verify_command(a, "restricted", a.receipt_out),
-               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify is INDETERMINATE, "
-                              "not a pass, unless the observed closed signal is accepted with --accept-closed-signal.",
+               "verify_note": "Fill the quoted placeholders (instance id, gateway domain). verify passes only on a "
+                              "positive refusal (refused, reset, no route); anything that completes TLS or HTTP fails.",
                "if_bad": "undo --snapshot " + str(Path(a.snapshot).resolve())})
 
 
@@ -514,7 +513,7 @@ def load_private_snapshot(path):
 
 
 def check(name, status, detail):
-    assert status in ("pass", "fail", "indeterminate")
+    assert status in ("pass", "fail")
     return {"check": name, "status": status, "ok": status == "pass", "detail": detail}
 
 
@@ -522,30 +521,27 @@ def signals_of(result):
     return list(result.get("signals") or [result.get("outcome") or "error"])
 
 
-def judge_closed(result, allowed, family=None, allow_no_aaaa=False):
-    """A path that must be closed: pass only on an accepted closed signal; a node answer is a fail."""
+def judge_closed(result, family=None, allow_no_aaaa=False):
+    """A path that must be closed passes only on a POSITIVE refusal signal. Anything that completed TLS or HTTP is
+    open or unknown and fails; so does a timeout, an error or a resolver failure."""
     signals = signals_of(result)
     if "node_info" in signals:
         return "fail", "node answered /info: " + ",".join(signals)
-    if all(s in allowed or (s == "no_address" and family == "ipv6" and allow_no_aaaa) for s in signals):
+    if all(s in CLOSED_SIGNALS or (s == "no_address" and family == "ipv6" and allow_no_aaaa) for s in signals):
         note = ",".join(signals)
         return "pass", note + (" (explicitly accepted: no AAAA is not proof of no IPv6 path)" if "no_address" in signals else "")
-    return "indeterminate", ",".join(signals) + " is not an accepted closed signal"
+    return "fail", ",".join(signals) + " is not a positive refusal (open or unknown)"
 
 
-def judge_management(result, expect_open, allowed):
+def judge_management(result, expect_open):
     signals = signals_of(result)
     if expect_open:
         if all(s == "ssh_banner" for s in signals):
             return "pass", "SSH-2.0 banner read through the gateway route"
-        if any(s in allowed for s in signals):
-            return "fail", "management looks closed: " + ",".join(signals)
-        return "indeterminate", ",".join(signals)
-    if all(s in allowed for s in signals):
+        return "fail", "no SSH banner: " + ",".join(signals)
+    if all(s in CLOSED_SIGNALS for s in signals):
         return "pass", ",".join(signals)
-    if "ssh_banner" in signals:
-        return "fail", "management still answers although the policy denies it"
-    return "indeterminate", ",".join(signals)
+    return "fail", ",".join(signals) + " is not a positive refusal (open or unknown)"
 
 
 def verify(a, clients, now):
@@ -561,7 +557,6 @@ def verify(a, clients, now):
     require(0 <= age <= a.max_receipt_age, "Receipt is stale; rerun preflight")
     check_tunnel_host(a.tunnel_host)
     hosts, mgmt = direct_hosts(a), management_host(a)
-    allowed = set(DEFAULT_CLOSED) | set(a.accept_closed_signal or [])
     http = clients.http
     node = receipt["origin_node_id"]
     checks = []
@@ -575,8 +570,8 @@ def verify(a, clients, now):
     if a.expect == "restricted":
         for name in hosts:
             for family in ("ipv4", "ipv6"):
-                status, detail = judge_closed(http.probe(name, family, 443), allowed, family, a.allow_no_aaaa)
-                checks.append(check(f"{name} fresh {family} connection shows a closed signal", status, detail))
+                status, detail = judge_closed(http.probe(name, family, 443), family, a.allow_no_aaaa)
+                checks.append(check(f"{name} fresh {family} connection is positively refused", status, detail))
     else:
         require(management_allowed(snap["before"].get("value")),
                 "Previous policy was restrictive; restored expectations are not automated, verify by hand")
@@ -587,29 +582,28 @@ def verify(a, clients, now):
 
     policy = snap["after"] if a.expect == "restricted" else snap["before"].get("value")
     expect_open = management_allowed(policy)
-    status, detail = judge_management(http.mgmt_probe(mgmt, "ipv4"), expect_open, allowed)
+    status, detail = judge_management(http.mgmt_probe(mgmt, "ipv4"), expect_open)
     checks.append(check(f"management route {MANAGEMENT_PORT} via {mgmt}:443 untouched "
                         f"(expected {'open' if expect_open else 'denied'})", status, detail))
-    return checks, sorted(allowed)
+    return checks
 
 
 def cmd_verify(a, clients, now, out):
-    checks, allowed = verify(a, clients, now)
-    statuses = {c["status"] for c in checks}
-    result = "FAIL" if "fail" in statuses else "INDETERMINATE" if "indeterminate" in statuses else "pass"
+    checks = verify(a, clients, now)
+    result = "pass" if all(c["status"] == "pass" for c in checks) else "FAIL"
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "checks": checks,
-               "accepted_closed_signals": allowed,
-               "closed_signal_note": "Only these signals count as closed. The gateway shares an SNI-routed IP, so a TCP "
-                                     "refusal is probably not the real signal; the actual TLS/HTTP denial signature has not "
-                                     "been observed. Record it in the drill, then pass it with --accept-closed-signal. "
-                                     "Anything else is INDETERMINATE, never a pass.",
+               "closed_means": list(CLOSED_SIGNALS),
+               "closed_rule": "Closed is a POSITIVE refusal only: a connect error (refused), a reset, or no route. "
+                              "Anything that completes TLS or HTTP is open or unknown, and open or unknown FAILS verify. "
+                              "On the SNI-shared gateway the real denial may be a TLS/HTTP signature, in which case verify "
+                              "fails until a drill observes what a closed gateway really does; it is never loosened silently.",
                "worker_origin_value": ORIGIN_ATTESTATION,
                "what_the_end_to_end_checks_can_show": END_TO_END_SHOWS if a.expect == "restricted" else None,
                "what_they_cannot_show": END_TO_END_CANNOT,
                "not_covered": ["independent external networks (single vantage)", "cached or literal-IP paths",
                                "existing long-lived connections", "provider read-back of /network and /compose_file",
                                "streaming/SSE behaviour"]})
-    return {"pass": 0, "FAIL": 1, "INDETERMINATE": 2}[result]
+    return 0 if result == "pass" else 1
 
 
 # ---------------------------------------------------------------- undo
@@ -641,13 +635,6 @@ def cmd_undo(a, clients, now, out):
 
 def emit(out, value):
     out.write(json.dumps(value, indent=2) + "\n")
-
-
-def closed_signal(value):
-    if not CLOSED_SIGNAL_RE.fullmatch(value):
-        raise argparse.ArgumentTypeError("not a closed-signal token (tcp_refused, tcp_reset, tls_rejected, "
-                                         "closed_after_tls, http_<non-200 status>)")
-    return value
 
 
 def parser():
@@ -694,8 +681,6 @@ def parser():
     p.add_argument("--expect", choices=("restricted", "restored"), default="restricted")
     p.add_argument("--extra-host", action="append")
     p.add_argument("--allow-no-aaaa", action="store_true", help="accept a missing AAAA record as IPv6 evidence")
-    p.add_argument("--accept-closed-signal", action="append", type=closed_signal,
-                   help="additional signal token recorded by a drill as the real closed signal; default: tcp_refused only")
     p.add_argument("--max-receipt-age", type=int, default=3600)
     p = add("undo", "EMIT the reverse PATCH from the snapshot", verify_inputs)
     p.add_argument("--compose", type=Path, required=True)

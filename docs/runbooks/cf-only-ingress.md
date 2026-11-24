@@ -25,8 +25,9 @@ LOCAL, no external network: `/usr/bin/env python3 scripts/test-ingress-cf-only.p
 the existing `scripts/test-ingress-switch.py`. The real switch runs on temp files;
 Cloudflare and `/info` clients are fakes; `NetworkProbe`'s signal classifier is run
 against a loopback-only TLS server (throwaway certificate from `openssl`) covering a
-normal node 200, a chunked 200, 404, 502, 421, an unparsed 200, a TLS alert, a TLS
-close with no response, silence (timeout), a closed port and an SSH banner.
+normal node 200, a chunked 200, 404, 502, 421, 301, an unparsed 200, a TLS alert, a TLS
+close with no response, silence (timeout), a closed port and an SSH banner; reset and
+no-route connect errors are injected with a patched `socket.create_connection`.
 **Not run, ever, by this change:** the real Cloudflare reader and the real network
 probe against any live system or gateway, any Phala call, any drill. The Cloudflare
 endpoint shapes (tunnel, configurations, DNS records, routes) are [INFERENCE] from API
@@ -135,46 +136,45 @@ instance id and gateway domain, which only you know.
 ```sh
 python3 scripts/ingress-cf-only.py verify --expect restricted --expect-app-id ... \
   --instance-id ... --gateway-domain ... --tunnel-host ... \
-  --snapshot previous-policy.json --receipt receipt.json [--accept-closed-signal TOKEN ...]
+  --snapshot previous-policy.json --receipt receipt.json [--allow-no-aaaa]
 ```
 
 Run after the operator has applied the PATCH and the restart finished. The result is
-`pass` (exit 0), `FAIL` (exit 1, at least one definite failure) or `INDETERMINATE`
-(exit 2). **Only `pass` is evidence; `INDETERMINATE` is never a pass.** It opens
-TLS/TCP connections to Phala **gateway** hostnames (network contact with Phala
-infrastructure, not an API call and not a credentialed one).
+`pass` (exit 0) or `FAIL` (exit 1). **There is no "indeterminate" outcome: only `pass`
+is evidence.** It opens TLS/TCP connections to Phala **gateway** hostnames (network
+contact with Phala infrastructure, not an API call and not a credentialed one).
 
-Each probe reports a distinct signal, never a bare "closed": `tcp_refused`,
-`tcp_reset`, `tls_rejected` (TLS alert), `closed_after_tls`, `http_<status>`,
-`http_200_unparsed`, `malformed_http`, `node_info`, `ssh_banner`, `non_ssh_data`,
-`timeout`, `no_address`, `error`. A `/info` body is de-chunked before the node id is
-read, so a chunked 200 counts as the node answering.
+**Closed means a positive refusal, nothing else:** a connect error (`tcp_refused`), a
+reset (`tcp_reset`) or no route (`no_route`, ENETUNREACH/EHOSTUNREACH at connect).
+Anything that completes TLS or HTTP is open or unknown, and open or unknown **fails**:
+that includes a TLS alert (`tls_rejected`), a close after the handshake
+(`closed_after_tls`), any HTTP status (`http_404`, `http_421`, `http_502`, ...),
+`http_200_unparsed`, `malformed_http`, a node answer (`node_info`), a timeout, a
+resolver failure and any other error. There is no flag to widen the set. A `/info` body
+is de-chunked before the node id is read, so a chunked 200 counts as the node answering.
 
-**Closed signals are an allow-list, default `tcp_refused` only.** The gateway
-hostnames share an SNI-routed IP, so a TCP refusal is probably *not* the real closed
-signal, and the actual TLS/HTTP denial signature has **not been observed** (no
-before/after capture exists) [INFERENCE]. The drill must record it; only then pass it
-with `--accept-closed-signal` (for example `http_421` or `tls_rejected`; `http_200`,
-`node_info`, `timeout` and the like are rejected as tokens). Until then, a correctly
-closed gateway will most likely report `INDETERMINATE`, which is the intended
-outcome. Checks:
+**Known consequence [INFERENCE, not observed]:** the gateway hostnames share an
+SNI-routed IP, so a restricted gateway may deny by a TLS or HTTP signature rather than
+by refusing the TCP connection. If so, `verify` will FAIL on a correctly restricted
+host. That is the intended conservative behaviour: the drill must observe what a closed
+gateway really does, and any change to the closed set is a reviewed code change, not an
+operator flag. Checks:
 
 - `/info` on `node.tinycloud.xyz` and on the tunnel host is 200 with the receipt's
   node id (equal ids): otherwise FAIL;
 - fresh connections to `tee.node.tinycloud.xyz` and to the app and instance
   gateway hosts `-8000`, `-8000g`, `-443`, `-443s`, `-443g` (plus any
-  `--extra-host`) over **IPv4 and IPv6**: a node answer is FAIL; an accepted closed
-  signal is a pass; anything else (timeout, 404/502, TLS alert unless accepted,
-  resolver failure) is INDETERMINATE. An IPv6 name with no AAAA record is
-  INDETERMINATE unless `--allow-no-aaaa`, because the absence of an AAAA answer is a
-  dated DNS observation, not proof that no IPv6 path exists;
+  `--extra-host`) over **IPv4 and IPv6** must each be positively refused. An IPv6
+  name with no AAAA record fails unless `--allow-no-aaaa`: that flag is an explicit
+  operator acknowledgement, because the absence of an AAAA answer is a dated DNS
+  observation, not proof that no IPv6 path exists;
 - management: **INFERENCE (not run, not observed)** that SSH is reached through the
   gateway TLS route `<app>-10022.<gateway>:443` (the compose comment, with
   `port_mappings` required empty), not a host port 10022. The probe does TLS with that
   SNI on 443 and requires an `SSH-2.0-` banner for "open"; the host is derived from
-  `--expect-app-id` and `--gateway-domain`. Expected open when the snapshot policy
-  keeps 10022: banner = pass, an accepted closed signal = FAIL, anything else
-  INDETERMINATE; expected denied: the reverse. If `phala ssh` actually reaches
+  `--expect-app-id` and `--gateway-domain`. Expected open (the snapshot policy keeps
+  10022): only a banner passes. Expected denied: only a positive refusal passes (a
+  banner, a TLS alert, HTTP or a timeout fail). If `phala ssh` actually reaches
   management another way, this check is wrong and must be corrected from evidence
   before relying on it. Key-authenticated access is not tested;
 - the receipt (owner-only file) is not older than `--max-receipt-age` (default 3600 s),
@@ -182,13 +182,12 @@ outcome. Checks:
   snapshot's recorded origin, and the snapshot is an owner-only file for the same app.
 
 What the passing end-to-end checks can show: `node.tinycloud.xyz` answers `/info`
-with the recorded node id **while every probed gateway path shows an accepted closed
-signal**, so the Worker reaches the node by some route other than the closed gateway.
-What they **cannot** show: that the Worker's secret equals the tunnel host (another
-independent origin serving the same node would also pass), that no unprobed gateway
-host or address is used, or anything before the restriction (while the gateway is
-open, `node.*` passes even if the secret still points at it). The script prints these
-limits.
+with the recorded node id **while every probed gateway path is positively refused**, so
+the Worker reaches the node by some route other than the closed gateway. What they
+**cannot** show: that the Worker's secret equals the tunnel host (another independent
+origin serving the same node would also pass), that no unprobed gateway host or address
+is used, or anything before the restriction (while the gateway is open, `node.*` passes
+even if the secret still points at it). The script prints these limits.
 
 It also lists what it does **not** cover: independent external networks (one vantage),
 cached or literal-IP paths, existing long-lived connections, the provider read-back
