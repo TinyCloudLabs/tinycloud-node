@@ -507,7 +507,9 @@ def cmd_apply_patch(a, clients, now, out):
                                           "reached without a banner, or node.* is unhealthy): undo --snapshot "
                                           + str(Path(a.snapshot).resolve()),
                                 "exit 3": "NOT PROVEN CLOSED (nothing seen open): do NOT undo and do NOT restart; hold "
-                                          "and run the drill"}})
+                                          "and run the drill",
+                                "exit 4": "REFUSED (stale receipt, bad input, failed read): nothing was changed or judged; "
+                                          "fix the input and re-run; never undo on exit 4"}})
 
 
 def cmd_preflight(a, clients, now, out):
@@ -775,7 +777,8 @@ def cmd_verify(a, clients, now, out):
                               "checks": [{k: c[k] for k in ("check", "status", "kind", "addresses", "controls") if k in c}
                                          for c in checks]}, waiver)
     emit(out, {"command": "verify", "expect": a.expect, "result": result, "verdict": verdict, "exit_code": code,
-               "exit_codes": {"0": "pass", "1": "open: undo", "3": "not_proven_closed: hold, run the drill, do not undo"},
+               "exit_codes": {"0": "pass", "1": "open: undo", "3": "not_proven_closed: hold, run the drill, do not undo",
+                              "4": "refused (no verdict, printed on stderr only): fix the input, never undo"},
                "next_action": NEXT_ACTION[verdict], "checks": checks,
                "accepted_closed_signals": list(ACCEPTED_CLOSED_SIGNALS),
                "blocked": NO_SIGNATURE_NOTICE if a.expect == "restricted" and not ACCEPTED_CLOSED_SIGNALS else None,
@@ -893,25 +896,35 @@ def real_clients(a, env):
     return Clients(NetworkProbe(), cf)
 
 
+EXIT_REFUSED = 4  # no verdict: bad operator input or a failed read. 1 is reserved for the open verdict (undo), 3 for hold
+
+
 def main(argv=None, clients=None, now=None, out=None, env=None):
+    """Returns the exit code. Refusals and failed reads return EXIT_REFUSED, never 1: nothing was changed or judged, and
+    an operator or wrapper that undoes on exit 1 must never undo because of a stale receipt or a typo."""
     out = out or sys.stdout
     a = parser().parse_args(argv)
-    now = now or utcnow()
-    clients = clients or real_clients(a, os.environ if env is None else env)
-    handler = {"preflight": cmd_preflight, "plan": cmd_plan, "apply-patch": cmd_apply_patch,
-               "verify": cmd_verify, "undo": cmd_undo}[a.command]
-    return handler(a, clients, now, out) or 0
+    try:
+        now = now or utcnow()
+        clients = clients or real_clients(a, os.environ if env is None else env)
+        handler = {"preflight": cmd_preflight, "plan": cmd_plan, "apply-patch": cmd_apply_patch,
+                   "verify": cmd_verify, "undo": cmd_undo}[a.command]
+        return handler(a, clients, now, out) or 0
+    except Refusal as error:
+        print(f"Refused: {error}. No Phala or provider action was performed. Exit {EXIT_REFUSED}: nothing was changed or "
+              "judged; fix the input; never undo on this exit.", file=sys.stderr)
+    except ClientError as error:
+        print(f"Read failed: {error}. Nothing was changed or judged. Exit {EXIT_REFUSED}; never undo on this exit.",
+              file=sys.stderr)
+    return EXIT_REFUSED
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
-    except Refusal as error:
-        print(f"Refused: {error}. No Phala or provider action was performed.", file=sys.stderr)
-    except ClientError as error:
-        print(f"Read failed: {error}. Nothing was changed.", file=sys.stderr)
+        code = main()
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # Parser/IO diagnostics can embed input content; report none of it.
-        print("Refused: check inputs, files and permissions. No Phala or provider action was performed.",
-              file=sys.stderr)
-    sys.exit(1)
+        print("Refused: check inputs, files and permissions. No Phala or provider action was performed. "
+              f"Exit {EXIT_REFUSED}: nothing was changed or judged; never undo on this exit.", file=sys.stderr)
+        code = EXIT_REFUSED
+    sys.exit(code)

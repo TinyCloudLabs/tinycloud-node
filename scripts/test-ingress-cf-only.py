@@ -163,11 +163,8 @@ class Base(unittest.TestCase):
 
     def run_cli(self, argv, now=None):
         out, err = io.StringIO(), io.StringIO()
-        try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = cf_only.main(argv, clients=self.clients(), now=now, out=out)
-        except cf_only.Refusal as error:
-            return 1, out.getvalue(), str(error)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cf_only.main(argv, clients=self.clients(), now=now, out=out)
         return code, out.getvalue(), err.getvalue()
 
     def plan(self):
@@ -238,7 +235,7 @@ class PreflightTest(Base):
                 self.cf, self.http = FakeCf(), FakeHttp()
                 fn(self.cf.state, self.http)
                 code, out, err = self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
-                self.assertEqual(code, 1, out)
+                self.assertEqual(code, 4, out)
                 self.assertFalse(self.receipt.exists())
 
     def test_refuses_bad_arguments_before_any_read(self):
@@ -262,7 +259,7 @@ class PreflightTest(Base):
             with self.subTest(name):
                 self.cf = FakeCf()
                 code, out, err = self.run_cli(["preflight", *argv])
-                self.assertEqual(code, 1, out)
+                self.assertEqual(code, 4, out)
                 if name != "version":
                     self.assertEqual(self.cf.calls, [])
 
@@ -273,19 +270,28 @@ class PreflightTest(Base):
             with self.subTest(name):
                 self.cf.state["worker"]["origin_binding"] = kind
                 code, out, err = self.run_cli(["preflight", *self.cloudflare_args()])
-                self.assertEqual(code, 1, out)
+                self.assertEqual(code, 4, out)
                 self.assertIn(message, err)
         self.cf.state["worker"]["origin_binding"] = "secret_text"
         unattested = [a for a in self.cloudflare_args() if a != "--attest-origin-is-tunnel-host"]
         code, out, err = self.run_cli(["preflight", *unattested])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 4)
         self.assertIn("attest", err)
+
+    def test_a_failed_read_is_exit_4_not_1(self):
+        def fail(*args, **kwargs):
+            raise cf_only.ClientError("Cloudflare read failed")
+        self.cf.tunnel = fail
+        code, out, err = self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])
+        self.assertEqual((code, out), (4, ""))
+        self.assertIn("Nothing was changed or judged", err)
+        self.assertFalse(self.receipt.exists())
 
     def test_receipt_path_must_be_new_and_writable_before_any_read(self):
         self.receipt.write_text("{}")
-        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])[0], 1)
+        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.receipt)])[0], 4)
         self.assertEqual(self.receipt.read_text(), "{}")
-        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.root / "no" / "r.json")])[0], 1)
+        self.assertEqual(self.run_cli(["preflight", *self.cloudflare_args(), "--out", str(self.root / "no" / "r.json")])[0], 4)
         self.assertEqual(self.cf.calls, [])
 
 
@@ -324,7 +330,7 @@ class PlanApplyTest(Base):
         for confirm in ("0" * 64, digest[:-1], ""):
             with self.subTest(confirm=confirm):
                 code, out, err = self.run_cli(self.apply_args(confirm))
-                self.assertEqual(code, 1)
+                self.assertEqual(code, 4)
                 self.assertFalse(self.snapshot.exists() or self.patch.exists() or self.receipt_out.exists())
                 self.assertEqual(json.loads(self.compose.read_text()), self.original)
         spawned = []
@@ -356,23 +362,23 @@ class PlanApplyTest(Base):
         digest = self.plan()["plan_hash"]
         self.set_node_ids(OTHER_NODE)
         code, out, err = self.run_cli(self.apply_args(digest))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 4)
         self.assertFalse(self.snapshot.exists() or self.patch.exists())
 
     def test_unwritable_output_path_is_refused_before_anything_is_staged(self):
         digest = self.plan()["plan_hash"]
         code, out, err = self.run_cli(self.apply_args(digest, patch=self.root / "missing-dir" / "p.json"))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 4)
         self.assertFalse(self.snapshot.exists())
         self.assertEqual(json.loads(self.compose.read_text()), self.original)
         self.receipt_out.write_text("{}")
-        self.assertEqual(self.run_cli(self.apply_args(digest))[0], 1)
+        self.assertEqual(self.run_cli(self.apply_args(digest))[0], 4)
         self.assertFalse(self.snapshot.exists())
 
     def test_plan_and_apply_refuse_when_preflight_refuses(self):
         self.cf.state["tunnel"]["status"] = "down"
         code, out, err = self.run_cli(["plan", *self.cloudflare_args(), *self.switch_args()])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 4)
         self.assertEqual(out, "")
 
     def test_the_rollback_snapshot_marks_the_origin_as_attested_not_verified_and_nothing_prints_verified(self):
@@ -577,25 +583,25 @@ class VerifyTest(Base):
         self.assertEqual(self.verify("--allow-no-aaaa")[0], 3)
 
     def test_refuses_stale_receipt_loose_files_other_app_and_mismatched_tunnel(self):
-        self.assertEqual(self.verify(now=datetime.now(timezone.utc) + timedelta(hours=2))[0], 1)
+        self.assertEqual(self.verify(now=datetime.now(timezone.utc) + timedelta(hours=2))[0], 4)
         self.snapshot.chmod(0o644)
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         self.snapshot.chmod(0o600)
         self.receipt.chmod(0o644)
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         self.receipt.chmod(0o600)
         snap = json.loads(self.snapshot.read_text())
         self.save(self.snapshot, dict(snap, app_id="c" * 40))
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         self.save(self.snapshot, dict(snap, verified_origin=dict(snap["verified_origin"], tunnel_id="9" * 8 + TUNNEL[8:])))
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         stripped = {k: v for k, v in snap["verified_origin"].items() if k != "worker_origin_status"}
         self.save(self.snapshot, dict(snap, verified_origin=stripped))
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         self.save(self.snapshot, snap)
         other = json.loads(self.receipt.read_text())
         self.save(self.receipt, dict(other, tunnel_hostname="other.example.test"))
-        self.assertEqual(self.verify()[0], 1)
+        self.assertEqual(self.verify()[0], 4)
         self.save(self.receipt, other)
         self.assertEqual(self.verify()[0], 0)
 
@@ -672,7 +678,7 @@ class VerifyTest(Base):
             with self.subTest(bad):
                 self.http = FakeHttp()
                 code, out, err = self.verify("--extra-host", bad)
-                self.assertEqual(code, 1)
+                self.assertEqual(code, 4)
                 self.assertEqual(self.http.probes, [])
 
     def test_restored_expectation_needs_tee_to_serve_the_same_node(self):
@@ -743,6 +749,21 @@ class DefaultClosedSetTest(Base):
         self.save(self.snapshot, dict(snap, after={"restrict_mode": True, "ports": []}))
         code, out, err = self.verify()  # management answers although the policy denies it
         self.assertEqual((code, json.loads(out)["verdict"]), (1, "open"))
+
+    def test_exit_codes_1_means_only_open_3_means_hold_4_means_refused_and_never_undo(self):
+        stale = datetime.now(timezone.utc) + timedelta(hours=2)
+        code, out, err = self.run_cli(["verify", *self.verify_args(expect="restricted")], now=stale)  # stale receipt: refused
+        self.assertEqual((code, out), (4, ""))
+        self.assertIn("never undo", err)
+        self.assertEqual(self.http.probes, [])
+        code, out, err = self.verify()  # correctly restricted, no accepted signature yet
+        self.assertEqual((code, json.loads(out)["verdict"]), (3, "not_proven_closed"))
+        self.http = FakeHttp(restricted=False)  # open gateway
+        code, out, err = self.verify()
+        self.assertEqual((code, json.loads(out)["verdict"]), (1, "open"))
+        self.assertIn("never undo", json.loads(out)["exit_codes"]["4"])
+        self.assertIn("never undo on exit 4", self.applied["after_verify"]["exit 4"])
+        self.assertNotIn("undo --snapshot", self.applied["after_verify"]["exit 4"])
 
     def closed_checks(self, out):
         return [c for c in json.loads(out)["checks"] if "accepted closed signature" in c["check"]]
@@ -837,22 +858,22 @@ class UndoTest(Base):
             with self.subTest(flag=flag, value=value):
                 self.undo_patch.unlink(missing_ok=True)
                 code, out, err = self.undo(**{flag: value})
-                self.assertEqual(code, 1, out)
+                self.assertEqual(code, 4, out)
                 self.assertFalse(self.undo_patch.exists())
         self.undo_patch.unlink(missing_ok=True)
         self.receipt.chmod(0o644)
-        self.assertEqual(self.undo()[0], 1)
+        self.assertEqual(self.undo()[0], 4)
 
     def test_apply_stages_local_restore_and_refuses_drift_and_loose_snapshot(self):
         current = json.loads(self.compose.read_text())
         current["port_policy"] = {"restrict_mode": False, "ports": []}
         self.save(self.compose, current)
-        self.assertEqual(self.undo("--apply")[0], 1)
+        self.assertEqual(self.undo("--apply")[0], 4)
         self.assertFalse(self.undo_patch.exists())
         current["port_policy"] = json.loads(self.snapshot.read_text())["after"]
         self.save(self.compose, current)
         self.snapshot.chmod(0o644)
-        self.assertEqual(self.undo("--apply")[0], 1)
+        self.assertEqual(self.undo("--apply")[0], 4)
         self.snapshot.chmod(0o600)
         code, out, err = self.undo("--apply")
         self.assertEqual(code, 0, err)
@@ -860,7 +881,7 @@ class UndoTest(Base):
 
     def test_refuses_to_overwrite_an_existing_patch_file(self):
         self.undo_patch.write_text("{}")
-        self.assertEqual(self.undo()[0], 1)
+        self.assertEqual(self.undo()[0], 4)
         self.assertEqual(self.undo_patch.read_text(), "{}")
 
 
@@ -901,7 +922,7 @@ class OutputAndClientTest(Base):
     def test_cli_refuses_without_a_cloudflare_read_token_before_any_network(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "preflight", *self.cloudflare_args()], text=True,
                                 capture_output=True, env={"PATH": "/usr/bin:/bin"})
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 4)
         self.assertIn("CLOUDFLARE_READ_TOKEN", result.stderr)
         self.assertEqual(result.stdout, "")
 

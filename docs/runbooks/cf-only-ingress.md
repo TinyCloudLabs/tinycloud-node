@@ -177,11 +177,17 @@ contact with Phala infrastructure, not an API call and not a credentialed one).
 | 0 | `pass` | every check proven; **unreachable until a drill signature is accepted** | continue |
 | 1 | `open` | a probed gateway path answered as the node, management answered although the policy denies it, expected-open management was reached but gave no SSH banner, `node.*` or the tunnel host is unhealthy, or `--expect restored` did not reach the node | **undo** (restore) if the path is open or the service is down |
 | 3 | `not_proven_closed` | not proven closed, nothing seen open (every restricted check under the empty set: refusals, resets, TLS alerts, HTTP statuses, timeouts, no route, resolver failures, a failed control or instance binding; plus vantage/DNS limits on management) | **hold: run the drill; do NOT undo and do NOT restart on this alone.** With the empty set a **correct** restriction reads `not_proven_closed` today |
+| 4 | (none: refused) | bad operator input or a failed read: stale receipt, loose file modes, wrong app, bad id or host, missing or odd snapshot, refused validation, a Cloudflare/Phala read that failed. **No verdict.** Nothing was changed or judged | **fix the input and re-run; never undo on exit 4** |
 
-Exit 1 is also used for refusals of bad operator input (stale receipt, loose file
-modes, wrong app); those are not verdicts. `apply-patch` prints the same table under
-`after_verify` (no `if_bad`: it used to say "undo", which is wrong for
-`not_proven_closed`).
+**Exit codes, every subcommand.** `1` is reserved for the `open` verdict of `verify`, so a
+wrapper or tired operator that undoes on exit 1 never undoes a correct restriction
+because of a stale receipt. `3` is `verify` only (hold). `4` is returned by every
+subcommand (`preflight`, `plan`, `apply-patch`, `verify`, `undo`) for a refusal or a
+failed read; the reason is on stderr, with "never undo on this exit". `0` is success
+(`preflight`/`plan`/`apply-patch`/`undo`: staged or printed, nothing executed; `verify`:
+pass). `2` is argparse (bad flags). `preflight`, `plan`, `apply-patch` and `undo` never
+return 1 or 3. `apply-patch` prints the table under `after_verify` (no `if_bad`: it used
+to say "undo", which is wrong for `not_proven_closed`).
 
 **The accepted closed-signature set is EMPTY, so `verify --expect restricted` cannot
 pass yet: no accepted closed signature yet: drill required.** Reason: on an SNI-routed
