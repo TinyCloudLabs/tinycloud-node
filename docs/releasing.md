@@ -659,7 +659,7 @@ its branch policy before any workflow that names it runs.
      `sockets_configured` means the pool connected to a target the vendored
      sqlx-core was not told about, so its connections run without keepalive.
    - Large headers still reach the node (TC-910 raised the ingress header
-     buffers to `4 32k`, TC-4249 to `4 256k`). A ~93 KB and a ~200 KB
+     buffers to `4 32k`, TC-4249 to `4 256k`, TC-4263 to `2 256k`). A ~93 KB and a ~200 KB
      `Authorization` header must get the node's own `401 Unauthorized` page,
      not an nginx `400 Request Header Or Cookie Too Large` or a reset
      connection. curl 7.81 stalled sending a 200 KB header line over TLS, and
