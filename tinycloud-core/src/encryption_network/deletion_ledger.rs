@@ -327,6 +327,8 @@ pub struct DeletionLedger {
     /// Set when a failed append left bytes that could not be removed; later
     /// appends fail rather than write after them.
     unrepaired: AtomicBool,
+    /// There was no ledger file when this open took the lock.
+    created: bool,
     /// Holds the lock; closed with the ledger.
     _lock: Option<File>,
 }
@@ -359,6 +361,7 @@ impl DeletionLedger {
         // Left by a prune that stopped before its rename took effect: the
         // ledger path names a whole file either way.
         remove_if_present(&prune_temp_path(path))?;
+        let created = !file_existed(path);
         let mut file = open_ledger_file(path, true)?;
         let dropped_tail_bytes = repair_tail(&mut file)?;
         file.sync_all()?;
@@ -368,6 +371,7 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes,
             unrepaired: AtomicBool::new(false),
+            created,
             _lock: Some(lock),
         })
     }
@@ -380,12 +384,22 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes: 0,
             unrepaired: AtomicBool::new(false),
+            created: false,
             _lock: None,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This open found no ledger file and created an empty one. Decided under
+    /// the lock, before the file was created, so on a node that has deleted
+    /// keys a `true` here means the ledger was lost. It is `false` for every
+    /// later open: a file that a command such as `purge-ledger reconcile`
+    /// created first is already there when the node starts.
+    pub fn created(&self) -> bool {
+        self.created
     }
 
     /// Bytes of an unfinished final line that [`DeletionLedger::open`] removed.
@@ -900,11 +914,10 @@ impl LedgerFileState {
     }
 }
 
-/// Whether a ledger file exists at `path`. Call it BEFORE
-/// [`DeletionLedger::open`], which creates a missing file, and pass the answer
-/// to [`summarize`]. A path whose existence cannot be read counts as existing,
-/// so that an unreadable path is never reported as a lost file.
-pub fn file_existed(path: &Path) -> bool {
+/// Whether a ledger file exists at `path`. A path whose existence cannot be
+/// read counts as existing, so that an unreadable path is never reported as a
+/// lost file.
+fn file_existed(path: &Path) -> bool {
     !matches!(
         std::fs::metadata(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -931,16 +944,22 @@ pub struct LedgerStartSummary {
     pub torn_tail: bool,
 }
 
-/// Summarizes the ledger at `path`. `existed_before_open` is the answer of
-/// [`file_existed`] taken before the node opened the ledger: opening creates a
-/// missing file, so afterwards a lost file and an empty ledger look the same.
-pub fn summarize(
-    path: &Path,
-    existed_before_open: bool,
-) -> Result<LedgerStartSummary, DeletionLedgerError> {
+impl DeletionLedger {
+    /// Summarizes the ledger file as it stands now, for the line a node logs
+    /// once at start, after [`DeletionLedger::replay_at_start`]. Replay appends
+    /// a `committed` line for each open operation it closes, so the counts and
+    /// size are those after replay. [`LedgerFileState::Missing`] is decided by
+    /// [`DeletionLedger::created`], which `open` took before it created the
+    /// file.
+    pub fn start_summary(&self) -> Result<LedgerStartSummary, DeletionLedgerError> {
+        summarize_file(&self.path, self.created)
+    }
+}
+
+fn summarize_file(path: &Path, created: bool) -> Result<LedgerStartSummary, DeletionLedgerError> {
     let bytes = std::fs::metadata(path)?.len();
     let contents = read(path)?;
-    let file = if !existed_before_open {
+    let file = if created {
         LedgerFileState::Missing
     } else if bytes == 0 {
         LedgerFileState::Empty

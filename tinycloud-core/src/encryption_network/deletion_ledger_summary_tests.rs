@@ -1,8 +1,6 @@
 //! The deletion ledger summary a node logs at start (TC-4177).
 
-use super::deletion_ledger::{
-    file_existed, summarize, DeletionLedger, Intent, LedgerFileState, LedgerKey, Record,
-};
+use super::deletion_ledger::{DeletionLedger, Intent, LedgerFileState, LedgerKey, Record};
 
 const NETWORK: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK:default";
 
@@ -20,21 +18,16 @@ fn intent(op: &str, keys: usize, deleted_at: &str) -> Record {
     })
 }
 
-/// The sequence a node start follows: existence, open, summary.
-fn summary_after_open(path: &std::path::Path) -> super::deletion_ledger::LedgerStartSummary {
-    let existed = file_existed(path);
-    let _ledger = DeletionLedger::open(path).unwrap();
-    summarize(path, existed).unwrap()
-}
-
 #[test]
 fn an_existing_empty_ledger_is_empty_with_no_newest_deletion() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deletions.jsonl");
     std::fs::File::create(&path).unwrap();
 
-    let summary = summary_after_open(&path);
+    let ledger = DeletionLedger::open(&path).unwrap();
+    let summary = ledger.start_summary().unwrap();
 
+    assert!(!ledger.created());
     assert_eq!(summary.file, LedgerFileState::Empty);
     assert_eq!(summary.bytes, 0);
     assert_eq!(
@@ -49,26 +42,33 @@ fn an_existing_empty_ledger_is_empty_with_no_newest_deletion() {
     assert_eq!(summary.newest_deleted_at, None);
 }
 
+/// The open itself decides whether it created the file, under the lock and
+/// before `open_ledger_file` creates it. A capture taken after that creation
+/// answers `false` here, and the first assertion fails.
 #[test]
-fn a_missing_ledger_is_reported_missing_not_empty() {
+fn a_missing_ledger_is_reported_missing_by_the_open_that_creates_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deletions.jsonl");
-    assert!(!file_existed(&path));
+    assert!(!path.exists());
 
-    let summary = summary_after_open(&path);
-
-    // The open created the file; without the answer taken before it, this
-    // summary would be indistinguishable from the empty ledger above.
-    assert!(path.exists());
+    let ledger = DeletionLedger::open(&path).unwrap();
+    assert!(
+        ledger.created(),
+        "open found no file and must say it created one"
+    );
+    let summary = ledger.start_summary().unwrap();
     assert_eq!(summary.file, LedgerFileState::Missing);
     assert_eq!(summary.bytes, 0);
     assert_eq!(summary.operations, 0);
     assert_eq!(summary.newest_deleted_at, None);
-    assert_eq!(
-        summarize(&path, true).unwrap().file,
-        LedgerFileState::Empty,
-        "the same file, had it existed, is an empty ledger"
-    );
+    drop(ledger);
+
+    // The file is there now: the same content is an empty ledger, not a
+    // missing one, for every later open (the node after a `purge-ledger
+    // reconcile` that created it first).
+    let again = DeletionLedger::open(&path).unwrap();
+    assert!(!again.created());
+    assert_eq!(again.start_summary().unwrap().file, LedgerFileState::Empty);
 }
 
 #[test]
@@ -79,6 +79,7 @@ fn a_populated_ledger_counts_by_line_kind_with_the_newest_deletion_and_its_size(
         let ledger = DeletionLedger::open(&path).unwrap();
         // The newest is the latest instant (op1, 2026-11-24T04:30Z), not the
         // last line (op3) nor the greatest string (op2, 2026-11-23T22:30Z).
+        // Aborted intents count (op2).
         for record in [
             intent("op1", 2, "2026-11-23T23:30:00-05:00"),
             Record::committed("op1"),
@@ -93,8 +94,10 @@ fn a_populated_ledger_counts_by_line_kind_with_the_newest_deletion_and_its_size(
     let size = std::fs::metadata(&path).unwrap().len();
     assert!(size > 0);
 
-    let summary = summary_after_open(&path);
+    let ledger = DeletionLedger::open(&path).unwrap();
+    let summary = ledger.start_summary().unwrap();
 
+    assert!(!ledger.created());
     assert_eq!(summary.file, LedgerFileState::Present);
     assert_eq!(summary.bytes, size);
     assert_eq!(summary.operations, 3);
@@ -106,4 +109,27 @@ fn a_populated_ledger_counts_by_line_kind_with_the_newest_deletion_and_its_size(
         Some("2026-11-23T23:30:00-05:00")
     );
     assert!(!summary.torn_tail);
+}
+
+#[test]
+fn an_aborted_intent_is_the_newest_deletion_when_it_is_the_latest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deletions.jsonl");
+    let ledger = DeletionLedger::open(&path).unwrap();
+    for record in [
+        intent("old", 1, "2026-11-01T00:00:00Z"),
+        Record::committed("old"),
+        intent("late", 1, "2026-11-02T00:00:00Z"),
+        Record::aborted("late"),
+    ] {
+        ledger.append(&record).unwrap();
+    }
+
+    let summary = ledger.start_summary().unwrap();
+
+    assert_eq!(
+        summary.newest_deleted_at.as_deref(),
+        Some("2026-11-02T00:00:00Z")
+    );
+    assert_eq!((summary.committed, summary.aborted), (1, 1));
 }

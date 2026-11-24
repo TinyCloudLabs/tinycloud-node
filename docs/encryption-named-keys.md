@@ -257,14 +257,28 @@ opened or replayed, the node logs the event `deletion_ledger_open_failed` or
 
 After a successful replay, every start logs one info line, `deletion_ledger_start`
 (TC-4177), so an OS move or a deploy can compare the ledger before and after:
-`ledger_file` (`missing` when this start found no file and created an empty one,
-`empty`, or `present`; decided before the open creates the file), `bytes`,
-`operations` (delete operations), `key_entries` (keys they name), `committed`,
-`aborted`, `newest_deleted_at` (`none` with no operation) and `torn_tail` (the
-final line is not a whole record). Counts, flags and one
-timestamp: no operation id, network id or key path. This release only logs it:
-it ships to Better Stack after the shipper follow-up (TC-4177 follow-up). Until
-then the log shipper drops it (`filtered_level`).
+`ledger_file` (`missing` when this start's open found no file and created an
+empty one, `empty`, or `present`; the open decides it under the ledger lock,
+before it creates the file), `bytes`, `operations` (intent lines),
+`key_entries` (keys they name), `committed` and `aborted` (lines of each kind),
+`newest_deleted_at` (the latest `deletedAt` of any intent, aborted ones
+included; `none` with no operation) and `torn_tail` (the final line is not a
+whole record). If the file cannot be read the line carries `ledger_file`
+(`missing` or `unread`) and `error_kind` instead of the counts. Counts, flags
+and one timestamp: no operation id, network id or key path.
+
+Read the counts with two things in mind. They are taken after the replay, which
+appends a `committed` line for each operation it closes, so a start that closed
+open operations shows more `committed` lines and bytes than the file held before
+it. And an owner-erasure prune (`prune_owners`) removes settled operations, so
+counts and bytes can drop between starts without the ledger having been lost.
+`missing` is seen only by the first open: `tinycloud node purge-ledger
+reconcile` also creates a missing ledger (it prints a notice on stderr when it
+does), after which the node reports `empty`.
+
+This release only logs the line. It ships to Better Stack with the logship
+bundle (TC-4177/TC-4190); until then the log shipper drops it
+(`filtered_level`).
 
 The log shipper sends `deletion_ledger_open_failed`, `deletion_ledger_replay_failed`
 and `deletion_ledger_unrepaired` to Better Stack as individual events with only
