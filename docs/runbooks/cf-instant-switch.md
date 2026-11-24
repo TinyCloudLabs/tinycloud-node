@@ -122,7 +122,9 @@ first): it restores the prior state, or says there is nothing to undo and marks 
 snapshot `aborted`. For a pending snapshot the dry-run prints the LIVE state read from
 Cloudflare next to the recorded prior state, and the confirm value (`undo_confirm`) is
 bound to that live state: read both, then pass it as `--confirm`. If the live state
-changed since the dry-run the confirm is refused; re-run the dry-run.
+changed since the dry-run the confirm is refused; re-run the dry-run. The printed live
+state has ids redacted to `…last4`: it is an attention gate (you see what will be
+reverted), not a secret, and the binding still refuses any live state that changed.
 
 For `security-level`, `worker-route`, `dns-proxy-flip` and `dns-remove` a pending undo REQUIRES
 `--force-drift` (also on the dry-run): the live state may come from a LATER successful
