@@ -2745,9 +2745,8 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
             )
             .unwrap(),
         );
-        let fence = std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(
-            keys.clone(),
-        ));
+        let fence =
+            std::sync::Arc::new(crate::space_purge_fence::SpacePurgeFence::new(keys.clone()));
         fence.set_serving_ready(true);
         let repo = SeaOrmDatabaseArtifactRepository::new(fixture.conn.clone())
             .with_chunk_limits(Some(ChunkLimits {
@@ -2801,10 +2800,20 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
         };
         assert_eq!(marks().await, 1);
         let second = repo
-            .save_wal_snapshot("sql", space, "main", snapshot(&[2; 32]), expectation(&first))
+            .save_wal_snapshot(
+                "sql",
+                space,
+                "main",
+                snapshot(&[2; 32]),
+                expectation(&first),
+            )
             .await
             .unwrap();
-        assert_eq!(marks().await, 0, "the publish drops the replaced WAL's marks");
+        assert_eq!(
+            marks().await,
+            0,
+            "the publish drops the replaced WAL's marks"
+        );
 
         // The next WAL is uploaded and sealed; before it publishes, the purge
         // fences the space, as its accept transaction does.
@@ -2832,7 +2841,10 @@ CREATE TRIGGER reject_legacy_part_update BEFORE UPDATE ON artifact_part
             {
                 break;
             }
-            assert!(tokio::time::Instant::now() < bound, "the WAL part never sealed");
+            assert!(
+                tokio::time::Instant::now() < bound,
+                "the WAL part never sealed"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let tx = fixture.conn.begin().await.unwrap();

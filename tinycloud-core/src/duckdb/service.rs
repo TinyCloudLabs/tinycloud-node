@@ -437,8 +437,8 @@ impl DuckDbService {
                 .artifact_repository
                 .chunked_checkpoints("duckdb", &key.0, db_name)
             {
-                let snapshot = snapshot_file(&final_path)
-                    .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+                let snapshot =
+                    snapshot_file(&final_path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
                 tokio::fs::write(snapshot.path(), data)
                     .await
                     .map_err(|e| DuckDbError::ImportError(e.to_string()))?;
