@@ -730,10 +730,10 @@ async fn accounting(
 /// TC-4092: remember every revocation this page is about to delete. The
 /// `revocation` row names the revoker and carries the signed bytes, so it goes
 /// with the delegation; without a trace, posting the same signed bytes again
-/// would register a revoked delegation as new. Keyed by canonical hash (read
-/// from the alias row, so before the alias delete). A revocation of a target
-/// outside `page` is included: the foreign key forbids deleting a target that
-/// still has one, so that set is empty unless the key changes.
+/// would register a revoked delegation as new. Keyed as [`insert_tombstones`]
+/// says (read from the alias rows, so before the alias delete). A revocation
+/// of a target outside `page` is included: the foreign key forbids deleting a
+/// target that still has one, so that set is empty unless the key changes.
 async fn write_tombstones(
     tx: &DatabaseTransaction,
     page: &[Hash],
@@ -756,10 +756,15 @@ async fn write_tombstones(
     .await
 }
 
-/// One tombstone per revoked delegation, keyed by canonical hash; `revoked`
-/// holds the stored id and, when known, the revocation time. Shared by the
-/// `revocation` rows and the Policy/v3 revocation stores (`policy::remove`'s
-/// caller). Must run while the delegation and alias rows still exist.
+/// Tombstones for each revoked delegation, keyed by its canonical hash, by
+/// the revoked id, and by the stored id of every encoding with that canonical
+/// hash (a high-S or low-S ECDSA UCAN twin, a historical CACAO encoding).
+/// Registration checks the canonical hash; signed-URL and hook tickets cite
+/// stored ids, and purge deletes the alias rows that would link them.
+/// `revoked` holds the revoked ids and, when known, the revocation time.
+/// Shared by the `revocation` rows and the Policy/v3 revocation stores
+/// (`policy::remove`'s caller). Must run while the delegation and alias rows
+/// still exist.
 pub(super) async fn insert_tombstones(
     tx: &DatabaseTransaction,
     revoked: Vec<(Hash, Option<OffsetDateTime>)>,
@@ -768,13 +773,34 @@ pub(super) async fn insert_tombstones(
         return Ok(());
     }
     let targets: Vec<Hash> = revoked.iter().map(|(id, _)| *id).collect();
-    let canonical: HashMap<Hash, Hash> = delegation_cid_alias::Entity::find()
-        .filter(delegation_cid_alias::Column::Id.is_in(targets.iter().copied()))
+    // The targets' alias rows and every alias row sharing a canonical hash
+    // with one, or naming a target as its canonical hash (a revocation of a
+    // canonical id), in one indexed read.
+    let family = delegation_cid_alias::Entity::find()
+        .filter(
+            Condition::any()
+                .add(delegation_cid_alias::Column::Id.is_in(targets.iter().copied()))
+                .add(delegation_cid_alias::Column::Canonical.is_in(targets.iter().copied()))
+                .add(
+                    delegation_cid_alias::Column::Canonical.in_subquery(
+                        sea_orm::sea_query::Query::select()
+                            .column(delegation_cid_alias::Column::Canonical)
+                            .from(delegation_cid_alias::Entity)
+                            .and_where(
+                                delegation_cid_alias::Column::Id.is_in(targets.iter().copied()),
+                            )
+                            .to_owned(),
+                    ),
+                ),
+        )
         .all(tx)
-        .await?
-        .into_iter()
-        .map(|alias| (alias.id, alias.canonical))
-        .collect();
+        .await?;
+    let mut canonical = HashMap::with_capacity(family.len());
+    let mut encodings: HashMap<Hash, Vec<Hash>> = HashMap::new();
+    for alias in family {
+        canonical.insert(alias.id, alias.canonical);
+        encodings.entry(alias.canonical).or_default().push(alias.id);
+    }
     let expiry: HashMap<Hash, Option<OffsetDateTime>> = delegation::Entity::find()
         .select_only()
         .columns([delegation::Column::Id, delegation::Column::Expiry])
@@ -788,14 +814,17 @@ pub(super) async fn insert_tombstones(
     let mut tombstones = HashMap::new();
     for (target, revoked_at) in revoked {
         let key = canonical.get(&target).copied().unwrap_or(target);
-        tombstones
-            .entry(key)
-            .or_insert_with(|| models::revocation_tombstone::ActiveModel {
-                delegation_canonical: Set(key),
-                delegation_expiry: Set(expiry.get(&target).copied().flatten()),
-                revoked_at: Set(revoked_at),
-                recorded_at: Set(recorded_at),
-            });
+        let stored = encodings.get(&key).into_iter().flatten().copied();
+        for key in [key, target].into_iter().chain(stored) {
+            tombstones
+                .entry(key)
+                .or_insert_with(|| models::revocation_tombstone::ActiveModel {
+                    delegation_canonical: Set(key),
+                    delegation_expiry: Set(expiry.get(&target).copied().flatten()),
+                    revoked_at: Set(revoked_at),
+                    recorded_at: Set(recorded_at),
+                });
+        }
     }
     match models::revocation_tombstone::Entity::insert_many(tombstones.into_values())
         .on_conflict(
@@ -814,10 +843,11 @@ pub(super) async fn insert_tombstones(
 }
 
 /// TC-4092: a deleted delegation takes its renewal rows with it. A lease row
-/// is keyed by the lease delegation's id and the original's canonical hash; a
-/// revocation left it `active`, so after the revocation row went a surviving
-/// row would be a live lease for revoked or deleted records. Stamps first:
-/// `renewal_stamp.lease_cid` has a foreign key to `renewal_lease`.
+/// is keyed by the lease delegation's id and the stored id of its original
+/// (the id the lease names); the original's canonical hash is matched as
+/// well. A revocation left it `active`, so after the revocation row went a
+/// surviving row would be a live lease for revoked or deleted records. Stamps
+/// first: `renewal_stamp.lease_cid` has a foreign key to `renewal_lease`.
 async fn remove_renewal_rows(
     tx: &DatabaseTransaction,
     page: &[Hash],
@@ -1062,11 +1092,12 @@ pub async fn terminate_space_leases<C: ConnectionTrait>(db: &C, space: &str) -> 
             "({column} = CAST($1 AS TEXT) OR substr({column}, 1, length(CAST($1 AS TEXT)) + 1) = CAST($1 AS TEXT) || '/')"
         )
     };
+    // A lease names the stored id of its original (the CID the lease cites),
+    // not its canonical hash.
     let sql = format!(
         "UPDATE renewal_lease SET state = 'revoked' WHERE state <> 'revoked' AND EXISTS (
             SELECT 1 FROM ability a
-            WHERE COALESCE((SELECT x.canonical FROM delegation_cid_alias x WHERE x.id = a.delegation), a.delegation)
-                  = renewal_lease.original_canonical
+            WHERE a.delegation = renewal_lease.original_canonical
               AND {named}
               AND NOT EXISTS (SELECT 1 FROM ability b WHERE b.delegation = a.delegation AND NOT {other}))",
         named = names("a.resource"),

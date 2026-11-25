@@ -62,6 +62,7 @@ pub mod m20261123_000000_delegation_mode;
 pub mod m20261124_000000_sql_wal_mark;
 pub mod m20261125_000000_revocation_tombstone;
 pub mod m20261125_000000_sql_store_mode;
+pub mod m20261125_010000_delegation_cid_alias_rule;
 
 pub struct Migrator;
 
@@ -126,6 +127,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261124_000000_sql_wal_mark::Migration),
             Box::new(m20261125_000000_revocation_tombstone::Migration),
             Box::new(m20261125_000000_sql_store_mode::Migration),
+            Box::new(m20261125_010000_delegation_cid_alias_rule::Migration),
             Box::new(m20261113_020000_artifact_chunk_wal::Migration),
             Box::new(m20261113_030000_artifact_part_lifecycle::Migration),
         ]

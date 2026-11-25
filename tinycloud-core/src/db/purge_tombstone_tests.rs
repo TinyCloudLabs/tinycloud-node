@@ -1388,3 +1388,631 @@ async fn postgres_tc4092_failed_policy_root_delete_rolls_back_tombstones_and_lea
     )
     .await;
 }
+
+/// A revoked high-S delegation, then purged: a signed-URL or hook ticket that
+/// cites it, in either encoding, stays refused.
+async fn high_s_revoke_purge_ticket(conn: sea_orm::DatabaseConnection) {
+    let db = open(conn.clone()).await;
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder2, _) = key(0x22);
+    let holder1_key = tinycloud_auth::ssi::jwk::JWK::generate_p256();
+    let holder1 = tinycloud_auth::resolver::DID_METHODS
+        .generate(&holder1_key, "key")
+        .unwrap()
+        .to_string();
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = token(
+        0x11,
+        &owner_did,
+        &host,
+        "tinycloud.space/host",
+        &[],
+        "host",
+        now + 3600,
+    );
+    let root = token(
+        0x11,
+        &holder1,
+        &kv,
+        "tinycloud.kv/get",
+        &[],
+        "root",
+        now + 3600,
+    );
+    let (low, high) = super::ucan_identity_tests::ecdsa_encodings(
+        &holder1_key,
+        tinycloud_auth::ssi::jwk::Algorithm::ES256,
+        &holder2,
+        &kv,
+        &[cid_of(&root)],
+        now + 3000,
+    );
+    for t in [&host_token, &root, &high] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let revocation = token(
+        0x11,
+        &owner_did,
+        &format!("urn:cid:{}", cid_of(&high).to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        &[],
+        "revoke-high-s",
+        now + 600,
+    );
+    db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    purge(&conn, [&host_token, &root, &high].map(|t| cid_of(t))).await;
+    assert_eq!(count(&conn, "delegation").await, 0);
+    for (encoding, cited) in [("high-S", &high), ("low-S", &low)] {
+        assert_eq!(
+            db.delegation_chains_revocation(&[cid_of(cited).to_cid(0x55)])
+                .await
+                .unwrap(),
+            Some(RevocationCode::DelegationRevoked),
+            "a ticket citing the {encoding} encoding stays revoked after the purge"
+        );
+    }
+    assert_eq!(
+        db.delegation_chains_revocation(&[cid_of(&host_token).to_cid(0x55)])
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn high_s_revoked_purged_delegation_stays_revoked_for_tickets_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("high-s.sqlite").display()
+    );
+    high_s_revoke_purge_ticket(sea_orm::Database::connect(url).await.unwrap()).await;
+}
+
+/// CI-only: needs `TINYCLOUD_TEST_POSTGRES_URL`.
+#[tokio::test]
+async fn postgres_high_s_revoked_purged_delegation_stays_revoked_for_tickets() {
+    let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+        "postgres_high_s_revoked_purged_delegation_stays_revoked_for_tickets",
+    )
+    .await
+    else {
+        return;
+    };
+    high_s_revoke_purge_ticket(fixture.conn.clone()).await;
+}
+
+/// Both encodings of a delegation are stored, the low-S one is revoked, and
+/// a purge deletes only it (with every revocation). A signed-URL or hook
+/// ticket citing the surviving high-S encoding is still refused: the check
+/// looks the cited id's canonical hash up against the tombstones.
+async fn ticket_citing_the_twin_of_a_purged_revocation(conn: sea_orm::DatabaseConnection) {
+    let db = open(conn.clone()).await;
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder2, _) = key(0x22);
+    let holder1_key = tinycloud_auth::ssi::jwk::JWK::generate_p256();
+    let holder1 = tinycloud_auth::resolver::DID_METHODS
+        .generate(&holder1_key, "key")
+        .unwrap()
+        .to_string();
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = token(
+        0x11,
+        &owner_did,
+        &host,
+        "tinycloud.space/host",
+        &[],
+        "host",
+        now + 3600,
+    );
+    let root = token(
+        0x11,
+        &holder1,
+        &kv,
+        "tinycloud.kv/get",
+        &[],
+        "root",
+        now + 3600,
+    );
+    let (low, high) = super::ucan_identity_tests::ecdsa_encodings(
+        &holder1_key,
+        tinycloud_auth::ssi::jwk::Algorithm::ES256,
+        &holder2,
+        &kv,
+        &[cid_of(&root)],
+        now + 3000,
+    );
+    for t in [&host_token, &root, &low, &high] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let revocation = token(
+        0x11,
+        &owner_did,
+        &format!("urn:cid:{}", cid_of(&low).to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        &[],
+        "revoke-low-s",
+        now + 600,
+    );
+    db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    purge(&conn, [cid_of(&low)]).await;
+    assert_eq!(count(&conn, "revocation").await, 0);
+    assert!(
+        crate::models::delegation::Entity::find_by_id(cid_of(&high))
+            .one(&conn)
+            .await
+            .unwrap()
+            .is_some(),
+        "the high-S encoding is still stored"
+    );
+    assert_eq!(
+        db.delegation_chains_revocation(&[cid_of(&high).to_cid(0x55)])
+            .await
+            .unwrap(),
+        Some(RevocationCode::DelegationRevoked),
+        "a ticket citing the stored twin of a purged revoked encoding stays revoked"
+    );
+    assert_eq!(
+        db.delegation_chains_revocation(&[cid_of(&root).to_cid(0x55)])
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn ticket_citing_the_twin_of_a_purged_revocation_is_refused_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("twin-ticket.sqlite").display()
+    );
+    ticket_citing_the_twin_of_a_purged_revocation(sea_orm::Database::connect(url).await.unwrap())
+        .await;
+}
+
+/// CI-only: needs `TINYCLOUD_TEST_POSTGRES_URL`.
+#[tokio::test]
+async fn postgres_ticket_citing_the_twin_of_a_purged_revocation_is_refused() {
+    let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+        "postgres_ticket_citing_the_twin_of_a_purged_revocation_is_refused",
+    )
+    .await
+    else {
+        return;
+    };
+    ticket_citing_the_twin_of_a_purged_revocation(fixture.conn.clone()).await;
+}
+
+/// A lease is keyed by the stored id of its original. Fencing a space stops
+/// the lease of an original that names only that space, also when the
+/// original's canonical hash differs from its id (a high-S ECDSA delegation).
+#[tokio::test]
+async fn fencing_a_space_stops_the_lease_of_an_original_whose_canonical_differs() {
+    use sea_orm_migration::MigratorTrait;
+    let conn = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+    crate::migrations::Migrator::up(&conn, None).await.unwrap();
+    let space = "tinycloud:key:z6MkfencedOwner:default";
+    let original = crate::hash::hash(b"fenced high-S original");
+    let lease = crate::hash::hash(b"fenced high-S lease");
+    let bytes = |hash: Hash| -> sea_orm::Value { Vec::<u8>::from(hash).into() };
+    for (sql, values) in [
+        (
+            "INSERT INTO actor (id) VALUES ($1)",
+            vec!["did:key:z6MkfencedOwner".into()],
+        ),
+        (
+            "INSERT INTO delegation (id, delegator, delegatee, expiry, serialization, serialization_format) VALUES ($1, $2, $2, NULL, $3, 0)",
+            vec![bytes(original), "did:key:z6MkfencedOwner".into(), vec![1u8].into()],
+        ),
+        (
+            "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1, $2, FALSE)",
+            vec![bytes(original), bytes(crate::hash::hash(b"its low-S twin"))],
+        ),
+        (
+            "INSERT INTO ability (resource, ability, delegation, caveats) VALUES ($1, 'tinycloud.kv/get', $2, '{}')",
+            vec![format!("{space}/kv/docs").into(), bytes(original)],
+        ),
+        (
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1, $2, 'active', 1, $3, $4, 1, $5, $5, 86400, $6)",
+            vec![
+                bytes(original),
+                bytes(lease),
+                "did:key:z6MkfencedOwner".into(),
+                "did:key:z6MkfencedRenewer".into(),
+                (OffsetDateTime::now_utc() + time::Duration::days(1)).into(),
+                vec![0u8; 32].into(),
+            ],
+        ),
+    ] {
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    let tx = conn.begin().await.unwrap();
+    let stopped = crate::space_purge_records::terminate_space_leases(&tx, space)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        stopped, 1,
+        "the lease of the space-only original is stopped"
+    );
+}
+
+/// The space owner (seed 0x11) hosts its space and grants a P-256 holder
+/// `kv/get`; both stored. Returns the owner DID, the host and root tokens, and
+/// both encodings (low-S, high-S) of the holder's grant to seed 0x22 with
+/// expiry `exp`, unregistered.
+async fn twin_fixture(db: &TestDb, exp: i64) -> (String, [String; 2], String, String) {
+    let (_, owner_did, _) = key(0x11);
+    let (_, holder2, _) = key(0x22);
+    let holder1_key = tinycloud_auth::ssi::jwk::JWK::generate_p256();
+    let holder1 = tinycloud_auth::resolver::DID_METHODS
+        .generate(&holder1_key, "key")
+        .unwrap()
+        .to_string();
+    let space: SpaceId = format!(
+        "tinycloud:{}:default",
+        owner_did.strip_prefix("did:").unwrap()
+    )
+    .parse()
+    .unwrap();
+    let kv = space
+        .clone()
+        .to_resource(
+            "kv".parse().unwrap(),
+            Some("docs".parse().unwrap()),
+            None,
+            None,
+        )
+        .to_string();
+    let host = space
+        .clone()
+        .to_resource("space".parse().unwrap(), None, None, None)
+        .to_string();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let host_token = token(
+        0x11,
+        &owner_did,
+        &host,
+        "tinycloud.space/host",
+        &[],
+        "host",
+        now + 3600,
+    );
+    let root = token(
+        0x11,
+        &holder1,
+        &kv,
+        "tinycloud.kv/get",
+        &[],
+        "root",
+        now + 3600,
+    );
+    for t in [&host_token, &root] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let (low, high) = super::ucan_identity_tests::ecdsa_encodings(
+        &holder1_key,
+        tinycloud_auth::ssi::jwk::Algorithm::ES256,
+        &holder2,
+        &kv,
+        &[cid_of(&root)],
+        exp,
+    );
+    (owner_did, [host_token, root], low, high)
+}
+
+/// Both encodings of a delegation are stored before the low-S one is revoked;
+/// then a purge deletes both. A ticket citing either encoding stays refused:
+/// the purge remembers every stored encoding of the revoked delegation, not
+/// only the revoked id and its canonical hash.
+async fn purge_of_both_encodings_after_one_was_revoked(conn: sea_orm::DatabaseConnection) {
+    let db = open(conn.clone()).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let (owner_did, [host_token, root], low, high) = twin_fixture(&db, now + 3000).await;
+    for t in [&low, &high] {
+        db.delegate(deleg(t))
+            .await
+            .map_err(|error| error.to_string())
+            .unwrap();
+    }
+    let revocation = token(
+        0x11,
+        &owner_did,
+        &format!("urn:cid:{}", cid_of(&low).to_cid(0x55)),
+        "tinycloud.delegation/revoke",
+        &[],
+        "revoke-low-s",
+        now + 600,
+    );
+    db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    purge(&conn, [&host_token, &root, &low, &high].map(|t| cid_of(t))).await;
+    assert_eq!(count(&conn, "delegation").await, 0);
+    let mut failures = Vec::new();
+    for (encoding, cited) in [("low-S", &low), ("high-S", &high)] {
+        if db
+            .delegation_chains_revocation(&[cid_of(cited).to_cid(0x55)])
+            .await
+            .unwrap()
+            != Some(RevocationCode::DelegationRevoked)
+        {
+            failures.push(format!(
+                "a ticket citing the {encoding} encoding works again"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[tokio::test]
+async fn purge_of_both_encodings_after_one_was_revoked_keeps_both_refused_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("both-purged.sqlite").display()
+    );
+    purge_of_both_encodings_after_one_was_revoked(sea_orm::Database::connect(url).await.unwrap())
+        .await;
+}
+
+/// CI-only: needs `TINYCLOUD_TEST_POSTGRES_URL`.
+#[tokio::test]
+async fn postgres_purge_of_both_encodings_after_one_was_revoked_keeps_both_refused() {
+    let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+        "postgres_purge_of_both_encodings_after_one_was_revoked_keeps_both_refused",
+    )
+    .await
+    else {
+        return;
+    };
+    purge_of_both_encodings_after_one_was_revoked(fixture.conn.clone()).await;
+}
+
+/// The CACAO form of the case above. Today's ingestion stores a CACAO under
+/// its canonical bytes, so a second stored encoding is a historical row an
+/// older image wrote under its raw bytes, aliased to the same canonical hash.
+/// The delegation is revoked by its canonical id and a purge deletes both
+/// rows; a ticket citing the historical row's id stays refused.
+#[tokio::test]
+async fn purge_of_two_stored_cacao_encodings_keeps_both_refused_for_tickets() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cacao-both.sqlite").display()
+    );
+    let conn = sea_orm::Database::connect(url).await.unwrap();
+    let db = open(conn.clone()).await;
+    let wallet = Wallet::new(0x32);
+    let (_, holder, _) = key(0x21);
+    let space = format!(
+        "tinycloud:{}:default",
+        wallet.did.strip_prefix("did:").unwrap()
+    );
+    let mut recap = RecapCapability::<serde_json::Value>::new();
+    for (resource, ability) in [
+        (format!("{space}/space"), "tinycloud.space/host"),
+        (format!("{space}/kv/docs"), "tinycloud.kv/get"),
+    ] {
+        recap.with_action(
+            resource.parse().unwrap(),
+            ability.parse().unwrap(),
+            [BTreeMap::new()],
+        );
+    }
+    let message = recap
+        .build_message(wallet.message(&holder, "tc4366-cacao"))
+        .unwrap();
+    let canonical = URL_SAFE
+        .decode(
+            TinyCloudDelegation::Cacao(Box::new(wallet.sign(&message)))
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+    let canonical_hash = crate::hash::hash(&canonical);
+    // Recovery byte 0/1 instead of 27/28: how an older image stored it.
+    let mut v0: Ipld = serde_ipld_dagcbor::from_slice(&canonical).unwrap();
+    if let Ipld::Map(root) = &mut v0 {
+        if let Ipld::Map(signature) = root.get_mut("s").unwrap() {
+            if let Ipld::Bytes(bytes) = signature.get_mut("s").unwrap() {
+                bytes[64] -= 27;
+            }
+        }
+    }
+    let historical = serde_ipld_dagcbor::to_vec(&v0).unwrap();
+    let historical_id = crate::hash::hash(&historical);
+    assert_ne!(historical_id, canonical_hash);
+    db.delegate(
+        Delegation::from_header_ser::<TinyCloudDelegation>(&URL_SAFE.encode(&canonical)).unwrap(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+    .unwrap();
+    let bytes = |hash: Hash| -> sea_orm::Value { Vec::<u8>::from(hash).into() };
+    for (sql, values) in [
+        (
+            "INSERT INTO delegation (id, delegator, delegatee, expiry, serialization, serialization_format) VALUES ($1, $2, $3, NULL, $4, 0)",
+            vec![
+                bytes(historical_id),
+                wallet.did.clone().into(),
+                holder.clone().into(),
+                historical.clone().into(),
+            ],
+        ),
+        (
+            "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1, $2, FALSE)",
+            vec![bytes(historical_id), bytes(canonical_hash)],
+        ),
+    ] {
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(count(&conn, "delegation").await, 2);
+    let mut revoke = wallet.message(
+        &format!("ucan:{}", canonical_hash.to_cid(0x55)),
+        "tc4366-revoke",
+    );
+    revoke.statement = Some("Revoke delegation".to_string());
+    let revocation = TinyCloudRevocation::Cacao(Box::new(wallet.sign(&revoke)))
+        .encode()
+        .unwrap();
+    db.revoke(Revocation::from_header_ser::<TinyCloudRevocation>(&revocation).unwrap())
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+    let stored: Vec<Hash> = crate::models::delegation::Entity::find()
+        .all(&conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    purge(&conn, stored).await;
+    assert_eq!(count(&conn, "delegation").await, 0);
+    assert_eq!(
+        db.delegation_chains_revocation(&[historical_id.to_cid(0x55)])
+            .await
+            .unwrap(),
+        Some(RevocationCode::DelegationRevoked),
+        "a ticket citing the historical encoding works again"
+    );
+}
+
+/// A tombstone written before this fix, or by an older image after a
+/// rollback, is keyed only by the stored id of the purged encoding. The other
+/// encoding of the same signed delegation is refused at registration: the
+/// node also checks the hash of the submitted bytes' other ECDSA encoding.
+async fn older_tombstone_of_one_encoding_refuses_the_other(conn: sea_orm::DatabaseConnection) {
+    let db = open(conn.clone()).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let (_, _, low, high) = twin_fixture(&db, now + 3000).await;
+    let (_, _, low2, high2) = twin_fixture(&db, now + 3001).await;
+    // Tombstones as an older image wrote them (its canonical hash of a UCAN
+    // was the stored id): one for a purged high-S encoding, one for a purged
+    // low-S encoding.
+    let recorded_at = OffsetDateTime::now_utc();
+    for purged in [&high, &low2] {
+        crate::models::revocation_tombstone::Entity::insert(
+            crate::models::revocation_tombstone::ActiveModel {
+                delegation_canonical: Set(cid_of(purged)),
+                delegation_expiry: Set(None),
+                revoked_at: Set(None),
+                recorded_at: Set(recorded_at),
+            },
+        )
+        .exec(&conn)
+        .await
+        .unwrap();
+    }
+    let stored = count(&conn, "delegation").await;
+    let mut failures = Vec::new();
+    for (label, other) in [
+        ("low-S, its high-S encoding purged", &low),
+        ("high-S, its low-S encoding purged", &high2),
+    ] {
+        match db.delegate(deleg(other)).await {
+            Ok(_) => failures.push(format!("{label}: registered")),
+            Err(error) if error.revocation_code() == Some(RevocationCode::DelegationRevoked) => {}
+            Err(error) => failures.push(format!("{label}: {error}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        count(&conn, "delegation").await,
+        stored,
+        "nothing registered"
+    );
+}
+
+#[tokio::test]
+async fn older_tombstone_of_one_encoding_refuses_the_other_on_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("older-tombstone.sqlite").display()
+    );
+    older_tombstone_of_one_encoding_refuses_the_other(
+        sea_orm::Database::connect(url).await.unwrap(),
+    )
+    .await;
+}
+
+/// CI-only: needs `TINYCLOUD_TEST_POSTGRES_URL`.
+#[tokio::test]
+async fn postgres_older_tombstone_of_one_encoding_refuses_the_other() {
+    let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+        "postgres_older_tombstone_of_one_encoding_refuses_the_other",
+    )
+    .await
+    else {
+        return;
+    };
+    older_tombstone_of_one_encoding_refuses_the_other(fixture.conn.clone()).await;
+}

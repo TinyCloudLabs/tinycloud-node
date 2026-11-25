@@ -177,7 +177,8 @@ async fn latest_authority_end<C: ConnectionTrait>(
 }
 
 /// `column` of every row of the renewal `table` (stamps or leases) whose
-/// original `did` holds; with `active_only`, of active rows only.
+/// original `did` holds; with `active_only`, of active rows only. A renewal
+/// row names the stored id of its original, not its canonical hash.
 async fn renewal_ends<C: ConnectionTrait>(
     db: &C,
     did: &str,
@@ -201,7 +202,7 @@ async fn renewal_ends<C: ConnectionTrait>(
             renewal.clone(),
             Expr::col((renewal.clone(), Alias::new("original_canonical"))).equals((
                 delegation_cid_alias::Entity,
-                delegation_cid_alias::Column::Canonical,
+                delegation_cid_alias::Column::Id,
             )),
         )
         .and_where(Expr::col((delegation::Entity, delegation::Column::Delegatee)).eq(did))
@@ -409,8 +410,9 @@ impl From<DbErr> for SessionRetireError {
     }
 }
 
-/// Canonical hashes of the delegations stored to `did`: the originals whose
-/// renewal (lease or stamp) could extend its authority.
+/// Stored ids of the delegations stored to `did`: the originals whose
+/// renewal (lease or stamp) could extend its authority, as their renewal
+/// rows and `renewal::lock_original` name them.
 async fn held_originals<C: ConnectionTrait>(
     db: &C,
     did: &str,
@@ -419,7 +421,7 @@ async fn held_originals<C: ConnectionTrait>(
         .distinct()
         .column((
             delegation_cid_alias::Entity,
-            delegation_cid_alias::Column::Canonical,
+            delegation_cid_alias::Column::Id,
         ))
         .from(delegation::Entity)
         .inner_join(
@@ -435,7 +437,7 @@ async fn held_originals<C: ConnectionTrait>(
     db.query_all(db.get_database_backend().build(&query))
         .await?
         .iter()
-        .map(|row| row.try_get("", "canonical"))
+        .map(|row| row.try_get("", "id"))
         .collect()
 }
 
@@ -570,6 +572,56 @@ mod tests {
         grant(&db, lapsed, Some(now - Duration::SECOND)).await;
         assert_eq!(retire(&db, lapsed, now, ttl).await.unwrap(), nothing);
         assert!(Entity::find().all(&db).await.unwrap().is_empty());
+    }
+
+    /// A renewal lease is keyed by the stored id of the original it renews.
+    /// A retire counts the lease of an original the key holds, and locks the
+    /// key a renewal of it locks, also when the original's canonical hash
+    /// differs from its id (a high-S ECDSA delegation).
+    #[tokio::test]
+    async fn retire_counts_and_locks_the_lease_of_an_original_whose_canonical_differs() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let did = "did:key:z6MkretireRenewed";
+        let now = stored_now();
+        let expiry = now + Duration::days(1);
+        grant(&db, did, Some(expiry)).await;
+        let original = crate::hash::hash(format!("{did}{:?}", Some(expiry)).as_bytes());
+        let lease_end = now + Duration::days(10);
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO delegation_cid_alias (id, canonical, encrypted) VALUES ($1, $2, FALSE)",
+            [
+                Vec::<u8>::from(original).into(),
+                Vec::<u8>::from(crate::hash::hash(b"its low-S twin")).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO renewal_lease (original_canonical, lease_cid, state, generation, grantor, renewer_did, renewer_epoch, lease_expiry, original_expiry, period_seconds, audience_public_key) VALUES ($1, $2, 'active', 1, $3, $4, 1, $5, $6, 86400, $7)",
+            [
+                Vec::<u8>::from(original).into(),
+                Vec::<u8>::from(crate::hash::hash(b"its lease")).into(),
+                "did:key:z6MkretireOwner".into(),
+                "did:key:z6MkretireRenewer".into(),
+                lease_end.into(),
+                expiry.into(),
+                vec![0u8; 32].into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            retire(&db, did, now, Duration::minutes(1))
+                .await
+                .unwrap()
+                .expires_at,
+            Some(lease_end),
+            "the retire row outlasts the lease that may still renew the original"
+        );
+        assert_eq!(held_originals(&db, did).await.unwrap(), vec![original]);
     }
 
     mod request {

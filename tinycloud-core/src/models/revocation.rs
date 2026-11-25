@@ -101,7 +101,9 @@ pub enum ChainTraversalError {
 
 /// Resolve revocation targets through the persisted canonical identity. The
 /// exact-target branch also handles graph rows created directly by unit tests;
-/// matching the canonical column covers a canonical CID with no stored row.
+/// matching the canonical column covers a canonical CID with no stored row:
+/// a CACAO is revoked by its canonical CID, and a historical CACAO row stored
+/// under other bytes has an alias whose canonical hash differs from its id.
 fn target_condition(id: SimpleExpr) -> Condition {
     use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
     let canonical = Query::select()
@@ -233,9 +235,10 @@ pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
 /// when the server would refuse it as `root-revoked`.
 ///
 /// `policy_v3_root.root_cid` is the text CID of the root's content hash, which
-/// SQL cannot derive from the binary hashes of the alias table, so the policy
-/// side matches the CIDs of the chain and `target` themselves; a root is keyed
-/// by that CID, and `target` is the CID a caller names.
+/// SQL cannot derive from the binary hashes of the alias table, so the stored
+/// encodings of the chain and `target` are read first and the policy side
+/// matches their CIDs: a root revoked under one encoding is revoked under
+/// every encoding (TC-4366).
 ///
 /// A chain past the traversal budget still reports a revoked `target` as
 /// revoked and is otherwise [`ChainTraversalError::LimitExceeded`].
@@ -261,9 +264,11 @@ pub(crate) async fn chain_revoked<C: ConnectionTrait>(
     Ok(any_revoked(db, &ids).await?)
 }
 
-/// One `SELECT 1 WHERE EXISTS(generic) OR EXISTS(policy root)` over `ids`.
+/// `SELECT 1 WHERE EXISTS(generic) OR EXISTS(policy root)` over `ids`, after
+/// one read of their stored encodings.
 async fn any_revoked<C: ConnectionTrait>(db: &C, ids: &[Hash]) -> Result<bool, DbErr> {
     use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let encodings = stored_encodings(db, ids).await?;
     let canonical = Query::select()
         .column(AliasColumn::Canonical)
         .from(AliasEntity)
@@ -291,8 +296,11 @@ async fn any_revoked<C: ConnectionTrait>(db: &C, ids: &[Hash]) -> Result<bool, D
         .expr(Expr::value(1))
         .from(policy_v3_root::Entity)
         .and_where(
-            Expr::col(policy_v3_root::Column::RootCid)
-                .is_in(ids.iter().map(|id| id.to_cid(0x55).to_string())),
+            Expr::col(policy_v3_root::Column::RootCid).is_in(
+                encodings
+                    .iter()
+                    .map(|(_, encoding)| encoding.to_cid(0x55).to_string()),
+            ),
         )
         .cond_where(
             Condition::any()
@@ -308,6 +316,90 @@ async fn any_revoked<C: ConnectionTrait>(db: &C, ids: &[Hash]) -> Result<bool, D
         .query_one(db.get_database_backend().build(&statement))
         .await?
         .is_some())
+}
+
+/// Each of `ids` paired with itself and with every other stored encoding of
+/// the same delegation (TC-4366): the two encodings of an ECDSA signature
+/// share one canonical alias.
+pub(crate) async fn stored_encodings<C: ConnectionTrait>(
+    db: &C,
+    ids: &[Hash],
+) -> Result<Vec<(Hash, Hash)>, DbErr> {
+    use delegation_cid_alias::{Column as AliasColumn, Entity as AliasEntity};
+    let mut pairs: Vec<(Hash, Hash)> = ids.iter().map(|id| (*id, *id)).collect();
+    if ids.is_empty() {
+        return Ok(pairs);
+    }
+    let source = Alias::new("source_alias");
+    let twin = Alias::new("twin_alias");
+    let query = Query::select()
+        .expr_as(
+            Expr::col((source.clone(), AliasColumn::Id)),
+            Alias::new("id"),
+        )
+        .expr_as(
+            Expr::col((twin.clone(), AliasColumn::Id)),
+            Alias::new("twin"),
+        )
+        .from_as(AliasEntity, source.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            AliasEntity,
+            twin.clone(),
+            Expr::col((source.clone(), AliasColumn::Canonical))
+                .equals((twin.clone(), AliasColumn::Canonical)),
+        )
+        .and_where(Expr::col((source.clone(), AliasColumn::Id)).is_in(ids.iter().copied()))
+        .and_where(Expr::col((twin, AliasColumn::Id)).not_equals((source, AliasColumn::Id)))
+        .to_owned();
+    for row in db
+        .query_all(db.get_database_backend().build(&query))
+        .await?
+    {
+        pairs.push((row.try_get("", "id")?, row.try_get("", "twin")?));
+    }
+    Ok(pairs)
+}
+
+/// The registered Policy/v3 root rows of every stored encoding of `ids`, as
+/// (queried id, the row's root CID, revoked), in one registry read. A row is
+/// revoked by `revoked_at` or `revocation_bytes`; a root revoked under one
+/// encoding is revoked under every encoding (TC-4366).
+pub(crate) async fn policy_root_rows<C: ConnectionTrait>(
+    db: &C,
+    ids: &[Hash],
+) -> Result<Vec<(Hash, String, bool)>, DbErr> {
+    let encodings = stored_encodings(db, ids)
+        .await?
+        .into_iter()
+        .map(|(id, encoding)| (id, encoding.to_cid(0x55).to_string()))
+        .collect::<Vec<_>>();
+    let rows = policy_v3_root::Entity::find()
+        .select_only()
+        .column(policy_v3_root::Column::RootCid)
+        .expr_as(
+            Expr::col(policy_v3_root::Column::RevokedAt)
+                .is_not_null()
+                .or(Expr::col(policy_v3_root::Column::RevocationBytes).is_not_null()),
+            "revoked",
+        )
+        .filter(
+            policy_v3_root::Column::RootCid.is_in(
+                encodings
+                    .iter()
+                    .map(|(_, cid)| cid.clone())
+                    .collect::<HashSet<_>>(),
+            ),
+        )
+        .into_tuple::<(String, bool)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(encodings
+        .into_iter()
+        .filter_map(|(id, cid)| rows.get(&cid).map(|revoked| (id, cid, *revoked)))
+        .collect())
 }
 
 pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(

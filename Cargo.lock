@@ -9928,6 +9928,7 @@ dependencies = [
  "libc",
  "libp2p",
  "multihash-derive 0.9.1",
+ "p256",
  "pin-project",
  "prometheus",
  "proptest",
