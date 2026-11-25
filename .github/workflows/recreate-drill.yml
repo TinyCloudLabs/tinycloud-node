@@ -1,0 +1,76 @@
+# TC-1491 P4.2b part 1: the container-recreate drill (docs/sql-store-master-design.md
+# section 12). Write acknowledged SQL rows, recreate or SIGKILL the node container,
+# read every acknowledged row back, once with today's layout (SQL datadir in the
+# container's writable layer) and once with /data/sql on a named volume.
+#
+# Not a required check. It runs on a manual dispatch and when the drill itself
+# changes. The Docker drill is isolated: its own compose project, LocalStack for
+# S3, a throwaway Postgres and a throwaway key; no secret is read.
+
+name: Recreate drill
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "test/recreate-drill/**"
+      - ".github/workflows/recreate-drill.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  script-tests:
+    # No Docker, no node: the ledger logic and drill.sh against fakes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: test/recreate-drill
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: test/recreate-drill/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: shellcheck drill.sh test-drill.sh
+      - run: bash test-drill.sh
+
+  drill:
+    needs: script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CI: "true"
+      DRILL_NODE_IMAGE: tinycloud-node:drill
+      DRILL_SUMMARY: ${{ github.workspace }}/recreate-drill-summary.txt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: test/recreate-drill/package-lock.json
+      - name: Build the node image from this checkout
+        run: docker build -t "$DRILL_NODE_IMAGE" .
+      - name: Install the drill client
+        working-directory: test/recreate-drill
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Run the drill (three layouts)
+        working-directory: test/recreate-drill
+        run: bash drill.sh all
+      - name: Keep the summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recreate-drill-summary
+          path: recreate-drill-summary.txt
+          if-no-files-found: ignore
