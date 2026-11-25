@@ -42,8 +42,9 @@ export const CAPPED_CLASSES = Object.freeze({
 
 /**
  * The longest `error_code` a node 5xx line may carry (TC-3834), in bytes. It is the node's own bound (tinycloud-core
- * `MAX_ERROR_CODE_LEN`), not derived here: the capped reserve above has room for a longest code of up to 19 bytes
- * under json-array framing (TC-4308 cap of 8) and a longer code is a node change, not a budget one.
+ * `MAX_ERROR_CODE_LEN`), not derived here, and a FLOOR under the budget, not its exact maximum: the capped reserve above
+ * has room for a longest code of up to 19 bytes under json-array framing and 23 under NDJSON (TC-4308 cap of 8). A longer
+ * code is a node change, not a budget one.
  */
 export const MAX_ERROR_CODE_LEN = 13;
 

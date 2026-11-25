@@ -153,7 +153,7 @@ export const vectorTests = [
   check('integral DB timings and the schema maxima still ship', envelope(nodeRequest({ pool_wait_ms: 0, query_time_ms: 86400000, query_count: 9007199254740991 })), '.event == "node_request" && .pool_wait_ms == 0.0 && .query_time_ms == 86400000.0 && .query_count == 9007199254740991'),
   check('out-of-bounds or mistyped DB accounting is dropped but the request ships', envelope(nodeRequest({ pool_wait_ms: -0.5, query_time_ms: '12.5', query_count: 1.5 })), '.event == "node_request" && .route == "/invoke" && !exists(.pool_wait_ms) && !exists(.query_time_ms) && !exists(.query_count)'),
   check('DB timings above the canonical maximum are dropped', envelope(nodeRequest({ pool_wait_ms: 86400000.5, query_time_ms: 1e12, query_count: -1 })), '.event == "node_request" && !exists(.pool_wait_ms) && !exists(.query_time_ms) && !exists(.query_count)'),
-  // test-ruling: TC-4308 (Naomi 13:22Z, option A, per ruling-request.md) log-shipper/cases.mjs 2a: status 500, 503 and 599 move to the ships branch
+  // test-ruling: TC-4308 (Naomi 13:29Z, option A, corrections per real budget.mjs) log-shipper/cases.mjs 2a: status 500, 503 and 599 move to the ships branch
   ...[399, 400, 404, 499, 500, 503, 599].map(status => check(`DB accounting ships on status ${status} below 400 and from 500, not on 4xx`, envelope(nodeRequest({ status, pool_wait_ms: 0.004, query_time_ms: 12.5, query_count: 9 })), status < 400 || status >= 500
     ? `.event == "node_request" && .status == ${status} && .pool_wait_ms == 0.004 && .query_time_ms == 12.5 && .query_count == 9`
     : `.event == "node_request" && .status == ${status} && !exists(.pool_wait_ms) && !exists(.query_time_ms) && !exists(.query_count)`)),
