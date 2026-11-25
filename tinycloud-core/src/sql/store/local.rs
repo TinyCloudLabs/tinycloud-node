@@ -100,6 +100,71 @@ pub fn within_pilot_cap(bytes: u64) -> bool {
     bytes <= PILOT_CAP_BYTES
 }
 
+/// The length of the WAL of the working copy at `main` through its last
+/// COMMITTED frame, in bytes (0 when none).
+///
+/// The `-wal` file can be longer: a write that outgrows the page cache puts
+/// frames into it before its COMMIT, and when it rolls back they stay in the
+/// file as a dead tail until a checkpoint resets it. The size limits (the
+/// backstop and the refusal), the rotation trigger and the bytes-behind figure
+/// judge what is committed, never the file: a rolled-back spill is not data
+/// anyone has to upload, and rotating (republishing the whole main file) over
+/// it would only amplify.
+///
+/// Read from the WAL index SQLite keeps next to the file (`<main>-shm`,
+/// documented at sqlite.org/walformat.html): its header holds the committed
+/// frame count and the page size, 48 bytes read, no scan. When the index is
+/// not there, unreadable, not two equal copies of an initialised header, or
+/// names more than the file holds, the WAL is scanned instead
+/// ([`committed_wal_len`](super::shadow::restore::committed_wal_len)).
+pub fn committed_wal_bytes(main: &Path) -> std::io::Result<u64> {
+    let mut wal = main.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    if let Some(len) = wal_index_len(main) {
+        let on_disk = match std::fs::metadata(&wal) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if len <= on_disk {
+            return Ok(len);
+        }
+    }
+    super::shadow::restore::committed_wal_len(&wal)
+}
+
+/// The committed WAL length the WAL index header names, or `None` when the
+/// header cannot be trusted. Layout (WalIndexHdr, native byte order, written
+/// twice): version u32 = 3007000, unused u32, change counter u32, isInit u8,
+/// bigEndCksum u8, page size u16 (1 = 65536), mxFrame u32, then more.
+fn wal_index_len(main: &Path) -> Option<u64> {
+    let mut shm = main.as_os_str().to_owned();
+    shm.push("-shm");
+    let mut index = std::fs::File::open(shm).ok()?;
+    let mut both = [0u8; 96];
+    index.read_exact(&mut both).ok()?;
+    if both[..48] != both[48..] {
+        return None;
+    }
+    let header = &both[..48];
+    let word = |at: usize| u32::from_ne_bytes(header[at..at + 4].try_into().expect("4 bytes"));
+    if word(0) != 3_007_000 || header[12] != 1 {
+        return None;
+    }
+    let page = match u16::from_ne_bytes([header[14], header[15]]) {
+        1 => 65_536,
+        n => u64::from(n),
+    };
+    if !(512..=65_536).contains(&page) || !page.is_power_of_two() {
+        return None;
+    }
+    Some(match u64::from(word(16)) {
+        0 => 0,
+        frames => 32 + frames * (24 + page),
+    })
+}
+
 fn sqlite(error: rusqlite::Error) -> SqlError {
     SqlError::Internal(error.to_string())
 }
@@ -285,7 +350,8 @@ pub fn hash_prefix(path: &Path, len: u64) -> std::io::Result<Option<[u8; 32]>> {
 pub struct LocalState {
     /// The in-file counter.
     pub seq: u64,
-    /// Length of the `-wal` file (0 when absent).
+    /// Length of the committed part of the `-wal` file (0 when absent or
+    /// empty): [`committed_wal_bytes`], not the file's size.
     pub wal_bytes: u64,
     /// Length of the main file, the checkpoint.
     pub main_bytes: u64,

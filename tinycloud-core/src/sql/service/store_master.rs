@@ -190,7 +190,7 @@ impl SqlService {
         );
         let mut handle = self.local_handle(space, db_name).await?;
         begin_write()?;
-        let result = match handle
+        let outcome = match handle
             .execute_authorized(request.clone(), caveats.clone(), authority.clone(), growth)
             .await
         {
@@ -203,7 +203,15 @@ impl SqlService {
                     .await
             }
             other => other,
-        }?;
+        };
+        // A write refused for the WAL bound moved the counter (the actor
+        // rotated to clear the bound): the uploader is told, like after a
+        // commit, or it would keep a stale view of a database it has not
+        // been asked about.
+        if matches!(outcome, Err(SqlError::DiskHeadroom)) {
+            self.after_local_commit(space, db_name, &handle).await;
+        }
+        let result = outcome?;
         if !result.write_targets.is_empty() {
             self.after_local_commit(space, db_name, &handle).await;
         }

@@ -11,9 +11,10 @@
 //!   (contract 11.5 / R7), so a slow store never stalls a write.
 //! - **Wakes on local commits.** The service calls
 //!   [`ShadowSink::notify_local`](super::ShadowSink::notify_local) after each
-//!   commit; the 8 MiB trigger is that notice's `ahead_bytes`.
-//! - **`seq` is the in-file counter.** `head().revision` is the counter the
-//!   actor wrote in the write's own transaction.
+//!   commit; the 8 MiB trigger is that notice's `ahead_bytes`, counted over
+//!   the COMMITTED WAL (a rolled-back write's frames are not bytes to upload).
+//! - **`seq` is the counter file's value.** `head().revision` is the counter
+//!   the actor wrote to its own file before the write committed.
 //! - **The WAL cannot be reset behind the uploader's back.** Auto-checkpoint
 //!   is off and the working copy does not checkpoint on close. The only
 //!   checkpoints are rotations: [`LocalFileSource::head`]'s, which runs when
@@ -62,13 +63,18 @@ struct View {
     cid: String,
 }
 
-/// Whether [`LocalFileSource::view`] may rotate and record a WAL mark.
+/// What [`LocalFileSource::view`] may do.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// The upload job's head: rotates a full WAL, records the head's mark.
     Publish,
-    /// A recovery scan's head: changes nothing.
+    /// A read that sends the WAL (a segment or a delta): changes nothing and
+    /// checks the committed length against the file.
     Peek,
+    /// A read that needs only the counter, the checkpoint hash and the sizes
+    /// (the recovery scan's heads, the checkpoint copy): changes nothing and
+    /// reads no WAL.
+    Light,
 }
 
 pub struct LocalFileSource {
@@ -183,10 +189,13 @@ impl LocalFileSource {
             self.files.invalidate(&key);
             state = handle.local_state().await.map_err(sql_error)?;
         }
-        // The WAL file can be longer than what SQLite would replay (frames of
-        // a write that spilled and rolled back). Everything below, the hash
-        // prefix, the mark and the delta, uses the committed length only.
-        if state.wal_bytes > 0 {
+        // The actor's figure is the committed length (the WAL file can be
+        // longer: frames of a write that spilled and rolled back), taken from
+        // SQLite's own WAL index. What is uploaded is checked against the
+        // file itself: the same length by a scan of the frames, so a WAL the
+        // index misdescribes is never published. A read that sends no WAL
+        // (the checkpoint, the recovery scan's heads) does not pay for it.
+        if mode != Mode::Light && state.wal_bytes > 0 {
             let wal = wal.clone();
             state.wal_bytes = tokio::task::spawn_blocking(move || committed_wal_len(&wal))
                 .await
@@ -279,7 +288,7 @@ impl ShadowSource for LocalFileSource {
             .lock_local(&space, db.db_id)
             .await
             .map_err(sql_error)?;
-        let Some((_, view)) = self.view(&space, db, Mode::Peek).await? else {
+        let Some((_, view)) = self.view(&space, db, Mode::Light).await? else {
             return Err(SourceError::Gone);
         };
         if view.cid != expected_cid {
@@ -386,7 +395,7 @@ impl ShadowSource for LocalFileSource {
             let Ok(_lock) = self.service.lock_local(&space, db.db_id).await else {
                 continue;
             };
-            match self.view(&space, &db, Mode::Peek).await {
+            match self.view(&space, &db, Mode::Light).await {
                 Ok(Some((_, view))) => {
                     if let Ok(revision) = i64::try_from(view.state.seq) {
                         heads.push((

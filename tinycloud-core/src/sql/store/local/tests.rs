@@ -379,3 +379,104 @@ fn a_crash_at_each_step_of_one_write_leaves_a_gap_at_worst_and_no_reused_seq() {
     after_gap.execute_batch("COMMIT").unwrap();
     assert_eq!(recovered(&bumped), (12, 1));
 }
+
+/// The committed WAL length by the frame scan, the reference the index read
+/// must agree with.
+fn scanned(main: &std::path::Path) -> u64 {
+    crate::sql::store::shadow::restore::committed_wal_len(&std::path::PathBuf::from(format!(
+        "{}-wal",
+        main.display()
+    )))
+    .unwrap()
+}
+
+#[test]
+fn the_committed_wal_length_is_what_the_frame_scan_finds_and_not_the_file_length() {
+    let (_dir, path) = working_copy(10);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.pragma_update(None, "cache_size", 10).unwrap();
+    let file_len = || {
+        std::fs::metadata(format!("{}-wal", path.display()))
+            .unwrap()
+            .len()
+    };
+
+    assert_eq!(committed_wal_bytes(&path).unwrap(), scanned(&path));
+    conn.execute("INSERT INTO items (v) VALUES ('a')", [])
+        .unwrap();
+    let one_commit = committed_wal_bytes(&path).unwrap();
+    assert!(one_commit > 0);
+    assert_eq!(one_commit, scanned(&path));
+
+    // A write that spills into the WAL and rolls back: the file grows, what is
+    // committed does not.
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute("INSERT INTO items (v) VALUES (zeroblob(2000000))", [])
+        .unwrap();
+    assert_eq!(
+        committed_wal_bytes(&path).unwrap(),
+        one_commit,
+        "an open write is not committed"
+    );
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        file_len() > one_commit + 1024 * 1024,
+        "the dead tail is in the file"
+    );
+    assert_eq!(committed_wal_bytes(&path).unwrap(), one_commit);
+    assert_eq!(scanned(&path), one_commit);
+
+    // The next commit overwrites the start of the tail; the file does not
+    // shrink, the committed length moves by that commit only.
+    conn.execute("INSERT INTO items (v) VALUES ('b')", [])
+        .unwrap();
+    let two_commits = committed_wal_bytes(&path).unwrap();
+    assert!(two_commits > one_commit);
+    assert!(two_commits < one_commit + 64 * 1024);
+    assert_eq!(two_commits, scanned(&path));
+
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 0);
+    assert_eq!(committed_wal_bytes(&path).unwrap(), 0);
+}
+
+#[test]
+fn without_a_usable_wal_index_the_committed_length_is_scanned() {
+    let (dir, path) = working_copy(10);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.pragma_update(None, "cache_size", 10).unwrap();
+    conn.execute("INSERT INTO items (v) VALUES ('a')", [])
+        .unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute("INSERT INTO items (v) VALUES (zeroblob(2000000))", [])
+        .unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+    let committed = committed_wal_bytes(&path).unwrap();
+
+    // A copy of the files has no index at all.
+    let image = crash_image(&path, &dir.path().join("no-index"));
+    assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
+
+    // An index that is not an initialised header, a header whose two copies
+    // differ, and one that names more frames than the file holds are not
+    // believed.
+    let shm = std::path::PathBuf::from(format!("{}-shm", image.display()));
+    let real = std::fs::read(format!("{}-shm", path.display())).unwrap();
+    std::fs::write(&shm, [0u8; 96]).unwrap();
+    assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
+    let mut torn = real.clone();
+    torn[60] ^= 0xff;
+    std::fs::write(&shm, &torn).unwrap();
+    assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
+    let mut long = real;
+    long[16..20].copy_from_slice(&u32::MAX.to_ne_bytes());
+    long[64..68].copy_from_slice(&u32::MAX.to_ne_bytes());
+    std::fs::write(&shm, &long).unwrap();
+    assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
+}

@@ -464,6 +464,15 @@ fn spawn_actor_inner(
                         (result, _) => result,
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                    // Store-master: a write refused for the WAL bound clears
+                    // its own cause, in every state of the uploader.
+                    if store_master
+                        && matches!(result, Err(SqlError::DiskHeadroom))
+                        && conn.is_autocommit()
+                        && rotate_after_refusal(&conn, &file_path)
+                    {
+                        policy.budget.forget(&key);
+                    }
                     inject_open_transaction(&conn, &space_id, &db_name);
 
                     // A request ends its transaction, by commit or rollback.
@@ -621,17 +630,17 @@ fn spawn_actor_inner(
 
 /// The counter and file sizes of a store-master working copy. The counter is
 /// read from its file, under the operation lock the caller holds: it is what
-/// the uploader publishes.
+/// the uploader publishes. The WAL length is the committed one
+/// ([`local_copy::committed_wal_bytes`]), not the file's.
 fn handle_local_state(file_path: &Path) -> Result<LocalState, SqlError> {
-    let len = |path: &Path| match std::fs::metadata(path) {
-        Ok(meta) => Ok(meta.len()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(SqlError::Internal(error.to_string())),
-    };
+    let main_bytes = std::fs::metadata(file_path)
+        .map_err(|error| SqlError::Internal(error.to_string()))?
+        .len();
     Ok(LocalState {
         seq: local_copy::read_seq(file_path)?,
-        wal_bytes: len(&PathBuf::from(format!("{}-wal", file_path.display())))?,
-        main_bytes: len(file_path)?,
+        wal_bytes: local_copy::committed_wal_bytes(file_path)
+            .map_err(|error| SqlError::Internal(error.to_string()))?,
+        main_bytes,
     })
 }
 
@@ -662,21 +671,35 @@ fn handle_rotate(conn: &rusqlite::Connection, file_path: &Path) -> Result<(), Sq
 /// Count one write on a store-master working copy, or refuse it. Called after
 /// the write's statements ran and BEFORE its COMMIT: the counter is bumped and
 /// fsynced first (bump-before-write), so a crash between the two leaves a gap
-/// in the counter and never a revision reused with other bytes. Refused
-/// (retryably, nothing applied) when the WAL already holds
+/// in the counter and never a revision reused with other bytes.
+///
+/// Refused (nothing applied) when the COMMITTED WAL already holds
 /// [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates at a far smaller
-/// size, so reaching it means nothing is draining this WAL and the next write
-/// would only grow the shared disk.
+/// size and the commit path at [`local_copy::WAL_BACKSTOP_BYTES`], so reaching
+/// it means a rotation did not go through (a reader held the checkpoint). The
+/// refusal is retryable: the actor rotates right after it
+/// ([`rotate_after_refusal`]). The file's length is NOT what is judged: a
+/// write that spilled and rolled back leaves a dead tail that is not data,
+/// and refusing on it locked a database out with nothing to clear it.
 fn count_store_master_write(file: &Path) -> Result<(), SqlError> {
-    let wal = match std::fs::metadata(format!("{}-wal", file.display())) {
-        Ok(meta) => meta.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(SqlError::Internal(error.to_string())),
-    };
-    if wal >= local_copy::WAL_REFUSE_BYTES {
+    let committed = local_copy::committed_wal_bytes(file)
+        .map_err(|error| SqlError::Internal(error.to_string()))?;
+    if committed >= local_copy::WAL_REFUSE_BYTES {
         return Err(SqlError::DiskHeadroom);
     }
     local_copy::bump_seq(file).map(|_| ())
+}
+
+/// After a write was refused for the WAL bound: fold the WAL in and truncate
+/// it, here in the actor, so the retry finds room. This path needs no
+/// uploader and no scheduler state (a Clean, Blocked, over-cap or
+/// over-budget database has none to run it) and is never refused. If a
+/// reader holds the checkpoint the rotation reports busy; the counter has
+/// moved ahead (a gap, allowed) and the next refused write tries again.
+fn rotate_after_refusal(conn: &rusqlite::Connection, file: &Path) -> bool {
+    local_copy::committed_wal_bytes(file)
+        .is_ok_and(|committed| committed >= local_copy::WAL_REFUSE_BYTES)
+        && handle_rotate(conn, file).is_ok()
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
