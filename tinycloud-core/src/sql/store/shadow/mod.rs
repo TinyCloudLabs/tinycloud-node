@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 pub mod budget;
+pub mod local;
 pub mod machine;
 pub mod metrics;
 pub mod owner;
@@ -42,10 +43,32 @@ pub struct Notice {
     pub cid: String,
 }
 
+/// One commit of a store-master working copy (TC-1491 P4.2a): what the
+/// local-file source hands the uploader instead of a [`Notice`]. Metadata
+/// only, no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalNotice {
+    pub space: String,
+    pub db_id: String,
+    /// The in-file `seq` after the commit.
+    pub seq: i64,
+    /// SHA-256 of the main file (the checkpoint) the WAL rides on.
+    pub cid: String,
+    /// Bytes the store is behind by, as far as this process knows. At or
+    /// above [`WINDOW_BYTES`](super::local::WINDOW_BYTES) the upload is due
+    /// now instead of at the next 60 s tick.
+    pub ahead_bytes: u64,
+}
+
 /// The save hook's seam. `notify` runs inside the per-database operation
 /// lock: it must be synchronous, infallible and non-blocking.
 pub trait ShadowSink: Send + Sync {
     fn notify(&self, notice: Notice);
+
+    /// A store-master working copy committed (TC-1491 P4.2a). Same contract
+    /// as `notify`. The default ignores it, so sinks written before store
+    /// master keep compiling and behave as before.
+    fn notify_local(&self, _notice: LocalNotice) {}
 }
 
 /// Zero-cost default sink.
@@ -64,6 +87,8 @@ pub type DbKey = (String, String);
 pub struct NoticeBoard {
     allowlist: super::policy::SpaceAllowlist,
     dirty: Mutex<HashMap<DbKey, machine::Head>>,
+    /// Databases whose store lag reached the byte window: due now.
+    urgent: Mutex<std::collections::HashSet<DbKey>>,
     wake: tokio::sync::Notify,
     metrics: std::sync::Arc<dyn ShadowMetrics>,
 }
@@ -76,6 +101,7 @@ impl NoticeBoard {
         Self {
             allowlist,
             dirty: Mutex::default(),
+            urgent: Mutex::default(),
             wake: tokio::sync::Notify::new(),
             metrics,
         }
@@ -88,6 +114,30 @@ impl NoticeBoard {
     /// Everything notified since the last call.
     pub fn take(&self) -> HashMap<DbKey, machine::Head> {
         std::mem::take(&mut *self.dirty.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The databases whose upload is due now (the 8 MiB trigger), since the
+    /// last call.
+    pub fn take_urgent(&self) -> std::collections::HashSet<DbKey> {
+        std::mem::take(&mut *self.urgent.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn accept(&self, key: DbKey, head: machine::Head) {
+        {
+            let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            match dirty.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if head.revision >= held.get().revision {
+                        held.insert(head);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(free) => {
+                    free.insert(head);
+                }
+            }
+        }
+        self.metrics.notice(NoticeResult::Accepted);
+        self.wake.notify_one();
     }
 
     /// Resolves after the next `notify` (or immediately if one is pending).
@@ -107,26 +157,34 @@ impl ShadowSink for NoticeBoard {
             self.metrics.notice(NoticeResult::Disallowed);
             return;
         }
-        let head = machine::Head {
-            revision: notice.revision,
-            cid: notice.cid,
-        };
-        {
-            let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
-            let slot = dirty.entry((notice.space, notice.db_id));
-            match slot {
-                std::collections::hash_map::Entry::Occupied(mut held) => {
-                    if head.revision >= held.get().revision {
-                        held.insert(head);
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(free) => {
-                    free.insert(head);
-                }
-            }
+        self.accept(
+            (notice.space, notice.db_id),
+            machine::Head {
+                revision: notice.revision,
+                cid: notice.cid,
+            },
+        );
+    }
+
+    fn notify_local(&self, notice: LocalNotice) {
+        if !self.allowlist.allows(&notice.space) {
+            self.metrics.notice(NoticeResult::Disallowed);
+            return;
         }
-        self.metrics.notice(NoticeResult::Accepted);
-        self.wake.notify_one();
+        let key = (notice.space, notice.db_id);
+        if notice.ahead_bytes >= crate::sql::store::local::WINDOW_BYTES {
+            self.urgent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key.clone());
+        }
+        self.accept(
+            key,
+            machine::Head {
+                revision: notice.seq,
+                cid: notice.cid,
+            },
+        );
     }
 }
 

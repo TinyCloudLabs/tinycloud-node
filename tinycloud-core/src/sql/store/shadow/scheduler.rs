@@ -392,6 +392,13 @@ impl Scheduler {
                 self.feed(&key, Event::Scanned(uploaded.observed), now);
                 match uploaded.outcome {
                     PublishOutcome::Published(frontier) => {
+                        self.deps.source.published(
+                            &DbRef {
+                                space: &key.0,
+                                db_id: &key.1,
+                            },
+                            &frontier,
+                        );
                         *self.spend.bytes.entry(key.clone()).or_default() += uploaded.bytes;
                         self.deps
                             .metrics
@@ -471,9 +478,18 @@ impl Scheduler {
     }
 
     async fn absorb_notices(&mut self) {
+        // Urgent first: a notice marks its database urgent before it records
+        // its head, so every urgent key taken here has its head in `take`
+        // below or in an earlier round.
+        let urgent = self.board.take_urgent();
         for (key, head) in self.board.take() {
             if self.ensure(&key).await {
                 self.feed(&key, Event::Notified(head), Instant::now());
+            }
+        }
+        for key in urgent {
+            if let Some(machine) = self.machines.get_mut(&key) {
+                machine.expedite(Instant::now(), &self.config.policy);
             }
         }
     }
@@ -495,6 +511,13 @@ impl Scheduler {
                 }
             };
             for row in drift {
+                let db = DbRef {
+                    space: &space,
+                    db_id: &row.db_id,
+                };
+                if !self.deps.source.scan_applies(&db).await {
+                    continue;
+                }
                 let key = (space.clone(), row.db_id.clone());
                 let regressed = row.regressed();
                 self.machines
@@ -504,6 +527,26 @@ impl Scheduler {
                     Event::Regressed(row.head)
                 } else {
                     Event::Scanned(row.head)
+                };
+                self.feed(&key, event, Instant::now());
+            }
+        }
+        for (key, head) in self.deps.source.local_heads().await {
+            if self.board.allowlist().allows(&key.0) && self.ensure(&key).await {
+                // A local file whose revision is below the published frontier
+                // is a volume that went back (an older seq file or main file
+                // put in place): the next writes would reuse numbers the
+                // store already holds. Block the database, as for a Postgres
+                // restore; never publish under a reused number.
+                let behind = self
+                    .machines
+                    .get(&key)
+                    .and_then(|m| m.last_seq())
+                    .is_some_and(|last| head.revision < i64::try_from(last).unwrap_or(i64::MAX));
+                let event = if behind {
+                    Event::Regressed(head)
+                } else {
+                    Event::Scanned(head)
                 };
                 self.feed(&key, event, Instant::now());
             }

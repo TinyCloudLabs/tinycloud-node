@@ -2375,4 +2375,28 @@ mod tests {
         live.write(1);
         assert!(!live.wal().starts_with(&stored));
     }
+
+    #[test]
+    fn a_wal_of_another_format_version_has_no_committed_length_without_a_version_check() {
+        // The version is inside the header checksum, which seeds the frame
+        // chain: a header that names another version (with a checksum that
+        // matches it) verifies no frame, so `committed_wal_len` says 0, as
+        // `check_wal`'s explicit version check says "refused".
+        let mut live = Live::new(4096);
+        live.write(3);
+        let mut wal = live.wal();
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe-wal");
+        std::fs::write(&probe, &wal).unwrap();
+        assert_eq!(committed_wal_len(&probe).unwrap(), wal.len() as u64);
+
+        wal[4..8].copy_from_slice(&(WAL_VERSION + 1).to_be_bytes());
+        let big_endian = be32(&wal, 0) == WAL_MAGIC_BE;
+        let (s1, s2) = wal_checksum(big_endian, &wal[..24], (0, 0));
+        wal[24..28].copy_from_slice(&s1.to_be_bytes());
+        wal[28..32].copy_from_slice(&s2.to_be_bytes());
+        std::fs::write(&probe, &wal).unwrap();
+        assert_eq!(committed_wal_len(&probe).unwrap(), 0);
+        assert!(check_wal(&probe, 4096).is_err());
+    }
 }

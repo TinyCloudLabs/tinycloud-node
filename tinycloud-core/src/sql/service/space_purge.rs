@@ -66,8 +66,18 @@ impl SqlService {
             handle.shutdown().await?;
         }
         self.lineage.retain(|key, _| key.0 != target);
-        crate::space_purge_cache::remove_directory(&self.base_path, &target)
+        // A store-master database's working copy is its only copy, and a
+        // purge deletes it on purpose (below), under the caller's exclusive
+        // lifetime guard and after its durable fence. What the uploader's
+        // registry remembers about it goes too, so a space created later under
+        // the same id starts from nothing. The store objects are not deleted
+        // here (P4.2c, design 8b), and neither actor nor registry can bring
+        // the copy back: a store-master actor is only opened on a file that
+        // exists.
+        let removed = crate::space_purge_cache::remove_directory(&self.base_path, &target)
             .await
-            .map_err(|_| SqlError::Internal("space cache removal failed".into()))
+            .map_err(|_| SqlError::Internal("space cache removal failed".into()));
+        self.local.forget_space(&target);
+        removed
     }
 }

@@ -210,7 +210,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
+            interval: super::super::local::WINDOW,
             backoff_base: Duration::from_secs(5),
             backoff_max: Duration::from_secs(15 * 60),
         }
@@ -258,6 +258,20 @@ impl DbMachine {
 
     pub fn in_flight(&self) -> bool {
         matches!(self.phase, Phase::InFlight { .. })
+    }
+
+    /// The byte window was reached (TC-1491 P4.2a, 8 MiB): a dirty database
+    /// is due on the next tick instead of after `policy.interval`. A database
+    /// that is clean, in flight, backing off or blocked is left as it is, so
+    /// the backoff and every block still hold.
+    pub fn expedite(&mut self, now: Instant, policy: &Policy) {
+        if let Phase::Dirty { since, attempts } = self.phase {
+            let due = now.checked_sub(policy.interval).unwrap_or(since);
+            self.phase = Phase::Dirty {
+                since: since.min(due),
+                attempts,
+            };
+        }
     }
 
     pub fn last_seq(&self) -> Option<u64> {

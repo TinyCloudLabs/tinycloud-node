@@ -26,6 +26,7 @@ use super::{
     },
     parser,
     storage::{self, StorageMode},
+    store::local::{self as local_copy, LocalState},
     store::shadow::restore,
     types::*,
 };
@@ -64,6 +65,15 @@ enum DbMessage {
         max_bytes: u64,
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
+    /// Store-master only (TC-1491 P4.2a): the in-file counter and the sizes
+    /// of the working copy's files.
+    LocalState {
+        response_tx: oneshot::Sender<Result<LocalState, SqlError>>,
+    },
+    /// Store-master only: fold the WAL into the main file (TRUNCATE).
+    Rotate {
+        response_tx: oneshot::Sender<Result<(), SqlError>>,
+    },
     Shutdown {
         response_tx: oneshot::Sender<()>,
     },
@@ -93,6 +103,8 @@ static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct DatabaseHandle {
     id: u64,
+    /// The actor serves a store-master working copy (TC-1491 P4.2a).
+    store_master: bool,
     tx: mpsc::Sender<(Option<Arc<RequestContext>>, DbMessage)>,
 }
 
@@ -248,6 +260,43 @@ impl DatabaseHandle {
             .await
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
+
+    /// Whether this actor serves a store-master working copy.
+    pub fn is_store_master(&self) -> bool {
+        self.store_master
+    }
+
+    /// Store-master only: the in-file counter and the working copy's sizes,
+    /// read by the actor itself so they are one consistent view.
+    pub(crate) async fn local_state(&self) -> Result<LocalState, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::LocalState { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    /// Store-master only: `PRAGMA wal_checkpoint(TRUNCATE)`. The caller holds
+    /// the operation lock and republishes the new main file as a snapshot.
+    pub(crate) async fn rotate(&self) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send((
+                request_telemetry::current(),
+                DbMessage::Rotate { response_tx },
+            ))
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
 }
 
 pub fn spawn_actor(
@@ -267,6 +316,19 @@ pub fn spawn_actor(
     )
 }
 
+/// The actor for a store-master working copy (TC-1491 P4.2a). The file must
+/// exist and carry the in-file counter; the actor never creates or re-seeds
+/// it, and does not checkpoint when it closes.
+pub(crate) fn spawn_store_master_actor(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    policy: DurabilityPolicy,
+) -> DatabaseHandle {
+    spawn_actor_inner(space_id, db_name, base_path, 0, databases, policy, true)
+}
+
 /// [`spawn_actor`] with the node's durability policy (TC-1491): the
 /// `synchronous` level, the size cap and the disk headroom.
 pub fn spawn_actor_with_policy(
@@ -276,6 +338,26 @@ pub fn spawn_actor_with_policy(
     memory_threshold: u64,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     policy: DurabilityPolicy,
+) -> DatabaseHandle {
+    spawn_actor_inner(
+        space_id,
+        db_name,
+        base_path,
+        memory_threshold,
+        databases,
+        policy,
+        false,
+    )
+}
+
+fn spawn_actor_inner(
+    space_id: String,
+    db_name: String,
+    base_path: String,
+    memory_threshold: u64,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    policy: DurabilityPolicy,
+    store_master: bool,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<(Option<Arc<RequestContext>>, DbMessage)>(32);
     let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
@@ -295,7 +377,14 @@ pub fn spawn_actor_with_policy(
         };
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
-            let Ok(connection) = storage::open_connection(&mode, policy.synchronous) else {
+            let opened = if store_master {
+                // The file exists and its seq file checks, or no actor starts.
+                storage::open_store_master_connection(&mode)
+                    .and_then(|connection| local_copy::read_seq(&file_path).map(|_| connection))
+            } else {
+                storage::open_connection(&mode, policy.synchronous)
+            };
+            let Ok(connection) = opened else {
                 tracing::error!("Failed to open database");
                 databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
                 return;
@@ -346,6 +435,11 @@ pub fn spawn_actor_with_policy(
                     growth,
                     response_tx,
                 } => {
+                    let authority = if store_master {
+                        authority.with_store_master(true)
+                    } else {
+                        authority
+                    };
                     let pragmas = PragmaTracker::default();
                     authority.denied_arm().clear();
                     let ctx = WriteContext {
@@ -378,6 +472,15 @@ pub fn spawn_actor_with_policy(
                         (result, _) => result,
                     };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                    // Store-master: a write refused for the WAL bound clears
+                    // its own cause, in every state of the uploader.
+                    if store_master
+                        && matches!(result, Err(SqlError::DiskHeadroom))
+                        && conn.is_autocommit()
+                        && rotate_after_refusal(&conn, &file_path)
+                    {
+                        policy.budget.forget(&key);
+                    }
                     inject_open_transaction(&conn, &space_id, &db_name);
 
                     // A request ends its transaction, by commit or rollback.
@@ -494,6 +597,19 @@ pub fn spawn_actor_with_policy(
                     let result = handle_wal(&mode, &file_path, max_bytes);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::LocalState { response_tx } => {
+                    let result = handle_local_state(&file_path);
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::Rotate { response_tx } => {
+                    let result = handle_rotate(&conn, &file_path);
+                    if result.is_ok() {
+                        // The WAL is in the main file now: its growth is on
+                        // the disk and no longer pending.
+                        policy.budget.forget(&key);
+                    }
+                    let _ = response_tx.send(result);
+                }
             }
         };
 
@@ -516,7 +632,85 @@ pub fn spawn_actor_with_policy(
         }
     });
 
-    DatabaseHandle { id, tx }
+    DatabaseHandle {
+        id,
+        store_master,
+        tx,
+    }
+}
+
+/// The counter and file sizes of a store-master working copy. The counter is
+/// read from its file, under the operation lock the caller holds: it is what
+/// the uploader publishes. The WAL length is the committed one
+/// ([`local_copy::committed_wal_bytes`]), not the file's.
+fn handle_local_state(file_path: &Path) -> Result<LocalState, SqlError> {
+    let main_bytes = std::fs::metadata(file_path)
+        .map_err(|error| SqlError::Internal(error.to_string()))?
+        .len();
+    Ok(LocalState {
+        seq: local_copy::read_seq(file_path)?,
+        wal_bytes: local_copy::committed_wal_bytes(file_path)
+            .map_err(|error| SqlError::Internal(error.to_string()))?,
+        main_bytes,
+    })
+}
+
+/// A rotation (TC-1491 P4.2a): count it as one revision, then fold the WAL
+/// into the main file and truncate it.
+///
+/// The counter moves because the checkpoint changes: the new main file is a
+/// new snapshot, published at the new revision, and a revision is never
+/// reissued with different bytes. The content a reader sees is unchanged.
+///
+/// The bump is first and fsynced, so a rotation whose checkpoint is busy (a
+/// reader) or interrupted by a crash leaves the counter ahead of the files:
+/// a gap, never a reuse. The retry bumps again. What matters is that a
+/// published revision is never reused, and a retry only moves it forward.
+fn handle_rotate(conn: &rusqlite::Connection, file_path: &Path) -> Result<(), SqlError> {
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    local_copy::bump_seq(file_path)?;
+    let _timer = QueryTimer::new();
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if busy != 0 {
+        return Err(SqlError::Internal("Database checkpoint is busy".into()));
+    }
+    Ok(())
+}
+
+/// Count one write on a store-master working copy, or refuse it. Called after
+/// the write's statements ran and BEFORE its COMMIT: the counter is bumped and
+/// fsynced first (bump-before-write), so a crash between the two leaves a gap
+/// in the counter and never a revision reused with other bytes.
+///
+/// Refused (nothing applied) when the COMMITTED WAL already holds
+/// [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates at a far smaller
+/// size and the commit path at [`local_copy::WAL_BACKSTOP_BYTES`], so reaching
+/// it means a rotation did not go through (a reader held the checkpoint). The
+/// refusal is retryable: the actor rotates right after it
+/// ([`rotate_after_refusal`]). The file's length is NOT what is judged: a
+/// write that spilled and rolled back leaves a dead tail that is not data,
+/// and refusing on it locked a database out with nothing to clear it.
+fn count_store_master_write(file: &Path) -> Result<(), SqlError> {
+    let committed = local_copy::committed_wal_bytes(file)
+        .map_err(|error| SqlError::Internal(error.to_string()))?;
+    if committed >= local_copy::WAL_REFUSE_BYTES {
+        return Err(SqlError::DiskHeadroom);
+    }
+    local_copy::bump_seq(file).map(|_| ())
+}
+
+/// After a write was refused for the WAL bound: fold the WAL in and truncate
+/// it, here in the actor, so the retry finds room. This path needs no
+/// uploader and no scheduler state (a Clean, Blocked, over-cap or
+/// over-budget database has none to run it) and is never refused. If a
+/// reader holds the checkpoint the rotation reports busy; the counter has
+/// moved ahead (a gap, allowed) and the next refused write tries again.
+fn rotate_after_refusal(conn: &rusqlite::Connection, file: &Path) -> bool {
+    local_copy::committed_wal_bytes(file)
+        .is_ok_and(|committed| committed >= local_copy::WAL_REFUSE_BYTES)
+        && handle_rotate(conn, file).is_ok()
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
@@ -711,6 +905,13 @@ fn handle_message_without_growth_ctx(
     if result.is_err() && conn.is_autocommit() {
         return result;
     }
+    // Store-master: count the write before it commits (TC-1491 P4.2a).
+    let result = match result {
+        Ok(ok) if authority.store_master() && WriteProbe::of(conn).writing() => {
+            count_store_master_write(ctx.file).map(|()| ok)
+        }
+        other => other,
+    };
     let grew = page_count(conn).map(|after| after > before);
     // The disk check before COMMIT, for a request that is about to be kept
     // and has written something. `Some` is what stays held afterwards.
@@ -1205,6 +1406,12 @@ fn run_transaction(
     // `execute`) wrote nothing: there is nothing to check, reserve or hold.
     let result = result.and_then(|ok| {
         if WriteProbe::of(conn).writing() {
+            // Store-master: bump and fsync the counter before the commit
+            // (bump-before-write), so a crash leaves a gap, never a reused
+            // revision (TC-1491 P4.2a).
+            if authority.store_master() {
+                count_store_master_write(ctx.file)?;
+            }
             precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
         } else {
             Ok((ok, None))

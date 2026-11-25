@@ -96,6 +96,27 @@ pub trait ShadowSource: Send + Sync {
         delta: &DeltaPlan,
         file: &mut tokio::fs::File,
     ) -> Result<Option<Copied>, SourceError>;
+
+    /// The upload job published `frontier` for `db` (TC-1491 P4.2a). A
+    /// source that remembers where its last publish ended (the local-file
+    /// source) learns it here. The default ignores it.
+    fn published(&self, _db: &DbRef<'_>, _frontier: &crate::sql::store::Frontier) {}
+
+    /// Whether the Postgres lag scan covers `db` (TC-1491 P4.2a). A
+    /// store-master database's Postgres artifact is frozen at cutover, so
+    /// the scan would read it as a regression; the default says it applies.
+    async fn scan_applies(&self, _db: &DbRef<'_>) -> bool {
+        true
+    }
+
+    /// The heads of the databases this source reads from local files,
+    /// without changing any of them (TC-1491 P4.2a): the uploader's startup
+    /// and periodic recovery, so a restart uploads what was committed but
+    /// never published without waiting for a new write. The default has
+    /// none.
+    async fn local_heads(&self) -> Vec<(super::DbKey, Head)> {
+        Vec::new()
+    }
 }
 
 /// [`ShadowSource`] over the Postgres artifact repository, including the
@@ -246,12 +267,12 @@ fn source_error(error: DatabaseArtifactError) -> SourceError {
     }
 }
 
-fn sink_error(error: std::io::Error) -> SourceError {
+pub(super) fn sink_error(error: std::io::Error) -> SourceError {
     SourceError::Transient(format!("scratch file: {:?}", error.kind()))
 }
 
 /// Writes the one part it is handed into a scratch file, hashing it.
-struct FileSink<'a> {
+pub(super) struct FileSink<'a> {
     file: &'a mut tokio::fs::File,
     hasher: Sha256,
     bytes: u64,
@@ -259,7 +280,7 @@ struct FileSink<'a> {
 }
 
 impl<'a> FileSink<'a> {
-    fn new(file: &'a mut tokio::fs::File) -> Self {
+    pub(super) fn new(file: &'a mut tokio::fs::File) -> Self {
         Self {
             file,
             hasher: Sha256::new(),
@@ -268,7 +289,7 @@ impl<'a> FileSink<'a> {
         }
     }
 
-    async fn truncate(&mut self) -> std::io::Result<()> {
+    pub(super) async fn truncate(&mut self) -> std::io::Result<()> {
         self.file.set_len(0).await?;
         self.file.rewind().await?;
         self.hasher = Sha256::new();
@@ -277,7 +298,7 @@ impl<'a> FileSink<'a> {
         Ok(())
     }
 
-    async fn done(mut self) -> Result<Copied, SourceError> {
+    pub(super) async fn done(mut self) -> Result<Copied, SourceError> {
         if self.parts != 1 {
             return Err(SourceError::Unreadable("the part was not delivered".into()));
         }
@@ -323,7 +344,7 @@ impl ArtifactSink for FileSink<'_> {
 
 /// Writes the bytes of the one part it is handed that lie between two marks
 /// into a scratch file, hashing the whole prefix up to each mark on the way.
-struct RangeSink<'a> {
+pub(super) struct RangeSink<'a> {
     file: &'a mut tokio::fs::File,
     start: u64,
     end: u64,
@@ -342,7 +363,7 @@ struct RangeSink<'a> {
 }
 
 impl<'a> RangeSink<'a> {
-    fn new(file: &'a mut tokio::fs::File, delta: &DeltaPlan) -> Self {
+    pub(super) fn new(file: &'a mut tokio::fs::File, delta: &DeltaPlan) -> Self {
         Self {
             file,
             start: delta.start.wal_end_bytes,
@@ -359,7 +380,7 @@ impl<'a> RangeSink<'a> {
         }
     }
 
-    async fn truncate(&mut self) -> std::io::Result<()> {
+    pub(super) async fn truncate(&mut self) -> std::io::Result<()> {
         self.file.set_len(0).await?;
         self.file.rewind().await?;
         self.prefix = Sha256::new();
@@ -383,7 +404,7 @@ impl<'a> RangeSink<'a> {
         }
     }
 
-    async fn done(mut self) -> Result<Option<Copied>, SourceError> {
+    pub(super) async fn done(mut self) -> Result<Option<Copied>, SourceError> {
         if self.parts != 1 {
             return Err(SourceError::Unreadable("the part was not delivered".into()));
         }
