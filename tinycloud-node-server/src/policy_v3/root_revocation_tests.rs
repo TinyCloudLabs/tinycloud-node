@@ -406,6 +406,40 @@ async fn a_json_revoked_root_reports_revoked_status(backend: Backend) -> anyhow:
 }
 on_both_backends!(a_json_revoked_root_reports_revoked_status);
 
+/// TC-4321: a root revoked only in the policy projection (the JSON
+/// `RootRevocation/v1` route) is invisible to the core revocation graph, so
+/// a re-POST of the stored session under it must be refused by the policy
+/// admission before the core answers its stored bytes as registered.
+async fn a_json_revoked_root_refuses_a_session_repost(backend: Backend) -> anyhow::Result<()> {
+    let Some(h) = Harness::new(
+        backend,
+        Shape::PkhSession,
+        "a_json_revoked_root_refuses_a_session_repost",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let admitted = admitted(&h).await?;
+    let (status, body) = h.delegate(admitted.session.clone()).await;
+    assert_eq!(status, Status::Ok, "live session re-post: {body}");
+
+    let (status, body) = h
+        .revoke_root_json(&h.owner, &admitted.policy.policy_root_cid, POLICY_AUTHORITY)
+        .await?;
+    assert_eq!(status, Status::Ok, "{body}");
+    // The policy admission refuses it (its stored-root check sees the
+    // revocation); the exact policy refusal string is not the contract here.
+    let (status, body) = h.delegate(admitted.session.clone()).await;
+    assert_eq!(
+        status,
+        Status::Forbidden,
+        "revoked-root session re-post: {body}"
+    );
+    Ok(())
+}
+on_both_backends!(a_json_revoked_root_refuses_a_session_repost);
+
 /// TC-4046: renewal must not hide a policy-only root revocation from a listing.
 async fn renewed_child_query_agrees_with_json_root_revocation(
     backend: Backend,
