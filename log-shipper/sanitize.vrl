@@ -149,10 +149,11 @@ if label == "tinycloud-node" {
       error_code = string(f.error_code) ?? ""
       if includes(__ERROR_CODES__, error_code) { out.error_code = error_code }
     }
-    # TC-3739: per-request DB accounting, on status below 400 only (4xx/5xx are the capped classes; DB-caused 5xx
-    # already carry elapsed_ms on db_failure_5xx). Copied only as plain numbers inside the canonical bounds; anything
-    # else is dropped (the event still ships). They are driver wall times and an attempt count, never identifiers.
-    if status < 400 {
+    # TC-3739/TC-4308: per-request DB accounting, on status below 400 and on 500 and above (4xx is the only band without
+    # it). On a 5xx the pool wait and query time include a cut or failed acquisition/execution (the node's timers
+    # accumulate on drop). Copied only as plain numbers inside the canonical bounds; anything else is dropped (the
+    # event still ships). They are driver wall times and an attempt count, never identifiers.
+    if status < 400 || status >= 500 {
       pool_wait = f.pool_wait_ms
       if is_float(pool_wait) || is_integer(pool_wait) {
         pool_wait = to_float!(pool_wait)

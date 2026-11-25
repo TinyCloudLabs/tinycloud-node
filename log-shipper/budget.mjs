@@ -28,21 +28,23 @@ export const CAPPED_ALLOCATION_BYTES = 600_000_000;
  * worst-valid event in representativeEvents used for the size arithmetic (its status is three digits, as in 4xx).
  * The 4xx cap is the largest whole number that keeps the worst case, including one dropped-count event per class
  * per minute, within CAPPED_ALLOCATION_BYTES: 3. A node 5xx line also carries its `error_code` (TC-3834), at most
- * MAX_ERROR_CODE_LEN bytes; with it the worst case is 597,931,200 bytes NDJSON and 599,702,400 bytes json-array (a
- * 4xx cap of 4 gives 626,529,600 bytes NDJSON).
+ * MAX_ERROR_CODE_LEN bytes, and the three DB accounting fields (TC-4308, +112 bytes). With the DB accounting the
+ * node_request_5xx cap is 8 (TC-4308; it was 10): the worst case is 596,203,200 bytes NDJSON and 597,888,000 bytes
+ * json-array (a node_request_5xx cap of 9 gives 622,987,200 bytes json-array, and the former 10 gives 648,086,400).
  */
 export const CAPPED_CLASSES = Object.freeze({
   db_failure_5xx: Object.freeze({ capPerMinute: 10, representative: 'dbFailure' }),
-  node_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'nodeCapped5xx' }),
+  node_request_5xx: Object.freeze({ capPerMinute: 8, representative: 'nodeCapped5xx' }),
   ingress_request_5xx: Object.freeze({ capPerMinute: 10, representative: 'ingress' }),
   node_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'nodeCapped' }),
   ingress_request_4xx: Object.freeze({ capPerMinute: 3, representative: 'ingress' }),
 });
 
 /**
- * The longest `error_code` a node 5xx line may carry (TC-3834), in bytes. The capped reserve above fits a longest code
- * of 13 bytes and no more under json-array framing (one byte more per 5xx line is 600,134,400 bytes); the node holds
- * its codes to the same bound (tinycloud-core `MAX_ERROR_CODE_LEN`).
+ * The longest `error_code` a node 5xx line may carry (TC-3834), in bytes. It is the node's own bound (tinycloud-core
+ * `MAX_ERROR_CODE_LEN`), not derived here, and a FLOOR under the budget, not its exact maximum: the capped reserve above
+ * has room for a longest code of up to 19 bytes under json-array framing and 23 under NDJSON (TC-4308 cap of 8). A longer
+ * code is a node change, not a budget one.
  */
 export const MAX_ERROR_CODE_LEN = 13;
 
@@ -53,8 +55,8 @@ const correlation = {
   account_hash: 'f'.repeat(64), space_hash: 'f'.repeat(64),
 };
 // Worst-valid per-request DB accounting (TC-3739): two long round-trippable fractional timings and the widest
-// attempt count. The shipper copies them onto node_request lines with status below 400 only, so they count against
-// the request allocation and never against the capped classes.
+// attempt count. The shipper copies them onto node_request lines with status below 400 (the request allocation) and
+// from 500 (the capped 5xx class, TC-4308); 4xx lines never carry them.
 const dbAccounting = {
   pool_wait_ms: 0.0000010000000000000002, query_time_ms: 0.0000010000000000000002,
   query_count: schema.fields.query_count.max,
@@ -73,15 +75,15 @@ const request = {
  * shipper's dropped-count event (errorsDropped) is emitted by the shipper itself, one per capped class per window. The
  * disk headroom event (storageHeadroom, TC-2917) ships once per local store every 5 minutes. `node` is the request
  * allocation's node line (status below 400, so it also carries the TC-3739 DB accounting); `nodeCapped` is the
- * capped classes' node line (status 400 and above), which the shipper never gives DB accounting; `nodeCapped5xx` is
- * the same line for a 5xx, which also carries the longest declared `error_code` (TC-3834).
+ * capped 4xx node line, which the shipper never gives DB accounting; `nodeCapped5xx` is the same line for a 5xx,
+ * which also carries the longest declared `error_code` (TC-3834) and, since TC-4308, the DB accounting.
  * Bytes below are exact for these records, not a proven Vector float-serializer
  * upper bound or a fixed event-size guard. Actual ingestion/billing can differ.
  */
 export const representativeEvents = Object.freeze({
   node: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, status: 399, latency_us: schema.fields.latency_us.max, ...correlation, ...dbAccounting }),
   nodeCapped: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation }),
-  nodeCapped5xx: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation, error_code: longest(schema.fields.error_code.values) }),
+  nodeCapped5xx: Object.freeze({ ...common, event: 'node_request', svc: 'api', ...request, latency_us: schema.fields.latency_us.max, ...correlation, ...dbAccounting, error_code: longest(schema.fields.error_code.values) }),
   ingress: Object.freeze({ ...common, event: 'ingress_request', svc: 'ingress', ...request, request_time_seconds: 0.0000010000000000000002 }),
   diagnostic: Object.freeze({ level: 'warn', ts: common.ts, event: 'node_warning', svc: 'api', event_code: longest(aggregatedCodes), event_count: schema.fields.event_count.max }),
   dbFailure: Object.freeze({
