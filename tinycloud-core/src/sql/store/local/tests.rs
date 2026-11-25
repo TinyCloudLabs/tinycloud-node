@@ -548,3 +548,58 @@ fn creating_the_seq_file_leaves_no_temp_file_and_a_leftover_one_is_never_the_cou
     assert_eq!(read_seq(&path).unwrap(), 5);
     assert!(!tmp.exists());
 }
+
+/// Two `init_working_copy` calls on one database at once (the caller should
+/// not, but nothing else stops it): exactly one wins, every other call is
+/// refused, and the counter on disk is the winner's `start_seq`. A call that
+/// returned `Ok` with another call's number would be a cutover that believes
+/// it seeded the counter at a revision it did not.
+#[test]
+fn concurrent_inits_leave_one_winner_and_the_counter_is_the_winners() {
+    const CALLERS: u64 = 6;
+    for round in 0..100 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE items (v TEXT)")
+            .unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(CALLERS as usize));
+        let results: Vec<(u64, bool)> = (0..CALLERS)
+            .map(|caller| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    (caller, init_working_copy(&path, 100 + caller).is_ok())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let winners: Vec<u64> = results
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(caller, _)| *caller)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: exactly one init may return Ok, got {winners:?}"
+        );
+        assert_eq!(
+            read_seq(&path).unwrap(),
+            100 + winners[0],
+            "round {round}: the counter is the winner's start_seq"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".seq.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "round {round}: temp files {leftovers:?}"
+        );
+    }
+}
