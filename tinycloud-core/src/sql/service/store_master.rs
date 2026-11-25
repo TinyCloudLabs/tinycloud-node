@@ -72,7 +72,7 @@ impl SqlService {
                 let key = (space_text, db_name.to_string());
                 match self.databases.get(&key).map(|h| h.is_store_master()) {
                     Some(mode) => {
-                        tracing::warn!(
+                        tracing::info!(
                             %error,
                             "sql store mode unreadable; serving the live actor in its own mode"
                         );
@@ -225,7 +225,7 @@ impl SqlService {
         let mut state = match handle.local_state().await {
             Ok(state) => state,
             Err(error) => {
-                tracing::warn!(%error, "store-master commit: local state unreadable");
+                tracing::info!(%error, "store-master commit: local state unreadable");
                 return;
             }
         };
@@ -241,7 +241,7 @@ impl SqlService {
                     match handle.local_state().await {
                         Ok(after) => state = after,
                         Err(error) => {
-                            tracing::warn!(%error, "store-master backstop: local state unreadable");
+                            tracing::info!(%error, "store-master backstop: local state unreadable");
                             return;
                         }
                     }
@@ -260,7 +260,7 @@ impl SqlService {
         {
             Ok(Ok(cid)) => cid,
             _ => {
-                tracing::warn!("store-master commit: checkpoint hash unreadable");
+                tracing::info!("store-master commit: checkpoint hash unreadable");
                 return;
             }
         };

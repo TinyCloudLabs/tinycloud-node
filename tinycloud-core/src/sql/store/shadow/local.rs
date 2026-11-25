@@ -381,7 +381,7 @@ impl ShadowSource for LocalFileSource {
         let databases = match self.gate.store_master_databases().await {
             Ok(databases) => databases,
             Err(error) => {
-                tracing::warn!(%error, "sql_store local source could not list store-master databases");
+                tracing::info!(%error, "sql_store local source could not list store-master databases");
                 return Vec::new();
             }
         };
