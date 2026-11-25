@@ -858,6 +858,147 @@ async fn a_write_is_refused_once_the_wal_holds_64_mib_and_resumes_after_a_rotati
     );
 }
 
+/// Free space that can be taken away: a `DiskHeadroom` refusal that has
+/// nothing to do with the WAL.
+struct Room(AtomicBool);
+
+impl crate::sql::durability::FreeSpace for Room {
+    fn free_bytes(&self, _: &Path) -> std::io::Result<u64> {
+        Ok(if self.0.load(Ordering::SeqCst) {
+            u64::MAX / 2
+        } else {
+            0
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_below_the_wal_bound_does_not_rotate() {
+    let rig = Rig::new("refuse-no-room").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let room = Arc::new(Room(AtomicBool::new(true)));
+    let policy = DurabilityPolicy {
+        min_free_bytes: 1 << 20,
+        free_space: room.clone(),
+        ..plain()
+    };
+    let service = rig.service(Arc::new(ProbeSink::default()), policy);
+    insert(&service, &rig.space, "a").await.unwrap();
+    insert(&service, &rig.space, "b").await.unwrap();
+    let seq = validate_working_copy(&rig.main_path()).unwrap();
+    let wal = std::fs::metadata(rig.wal_path()).unwrap().len();
+    assert!(wal > 0);
+
+    // The disk has no room: the write is refused for that, far below the
+    // WAL bound. A rotation here would republish the whole file and spend a
+    // second seq for nothing; the refused write's own count is the only one.
+    room.0.store(false, Ordering::SeqCst);
+    let refused = insert(&service, &rig.space, "c").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        validate_working_copy(&rig.main_path()).unwrap(),
+        seq + 1,
+        "the refused write's own count, and no rotation on top of it"
+    );
+    assert_eq!(
+        std::fs::metadata(rig.wal_path()).unwrap().len(),
+        wal,
+        "the WAL was not truncated"
+    );
+
+    room.0.store(true, Ordering::SeqCst);
+    insert(&service, &rig.space, "d").await.unwrap();
+    assert_eq!(count(&service, &rig.space).await, 3);
+}
+
+/// A refusal at the bound while a reader holds the checkpoint: the actor
+/// tries to rotate, and that is the only attempt. The service does not rotate
+/// again behind it, or the counter would move twice for one refusal.
+#[tokio::test]
+async fn a_refusal_with_the_checkpoint_busy_moves_the_counter_once() {
+    let rig = Rig::new("refuse-busy-once").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "first").await.unwrap();
+    let reader = Connection::open(rig.main_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM items")
+        .unwrap();
+    let big = (WAL_REFUSE_BYTES + 1024 * 1024) as i64;
+    run(
+        &service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({big}))"),
+    )
+    .await
+    .unwrap();
+
+    let before = validate_working_copy(&rig.main_path()).unwrap();
+    let refused = insert(&service, &rig.space, "refused").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        validate_working_copy(&rig.main_path()).unwrap(),
+        before + 1,
+        "one refusal, one rotation attempt, one bump"
+    );
+    drop(reader);
+}
+
+/// The actor clears the bound by itself: asked directly, with no service
+/// around it, a refused write has rotated by the time it answers.
+#[tokio::test]
+async fn the_actor_rotates_after_a_refusal_with_no_service_behind_it() {
+    let rig = Rig::new("actor-rotates").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "first").await.unwrap();
+    let reader = Connection::open(rig.main_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM items")
+        .unwrap();
+    let big = (WAL_REFUSE_BYTES + 1024 * 1024) as i64;
+    run(
+        &service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({big}))"),
+    )
+    .await
+    .unwrap();
+    drop(reader);
+
+    let handle = service.local_handle(&rig.space, DB).await.unwrap();
+    let refused = handle
+        .execute_authorized(
+            SqlRequest::Execute {
+                sql: "INSERT INTO items (v) VALUES ('x')".into(),
+                params: vec![],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".into(),
+            GrowthPolicy::Allow,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(rig.wal_path()).unwrap().len(),
+        0,
+        "the actor's own rotation truncated the WAL"
+    );
+}
+
 /// A gate with a mode per database name, and a switch that makes every read
 /// of it fail.
 #[derive(Default)]

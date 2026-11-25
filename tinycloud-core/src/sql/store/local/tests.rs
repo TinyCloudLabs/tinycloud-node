@@ -472,6 +472,42 @@ fn without_a_usable_wal_index_the_committed_length_is_scanned() {
     assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
 }
 
+/// The WAL index header is written twice and only believed when both copies
+/// are equal. A damaged copy that names FEWER frames than the file holds would
+/// pass every other check, so each copy is damaged on its own: trusting
+/// either one alone gives the wrong length.
+#[test]
+fn a_wal_index_whose_two_header_copies_disagree_is_believed_in_neither_direction() {
+    let (dir, path) = working_copy(10);
+    let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute("INSERT INTO items (v) VALUES ('a')", [])
+        .unwrap();
+    let committed = committed_wal_bytes(&path).unwrap();
+    assert!(committed > 0);
+
+    let image = crash_image(&path, &dir.path().join("two-copies"));
+    let shm = std::path::PathBuf::from(format!("{}-shm", image.display()));
+    let real = std::fs::read(format!("{}-shm", path.display())).unwrap();
+    assert_eq!(real[..48], real[48..96], "the header is written twice");
+    std::fs::write(&shm, &real[..96]).unwrap();
+    assert_eq!(
+        committed_wal_bytes(&image).unwrap(),
+        committed,
+        "both whole"
+    );
+    for (copy, at) in [("first", 0usize), ("second", 48)] {
+        let mut damaged = real[..96].to_vec();
+        damaged[at + 16..at + 20].copy_from_slice(&0u32.to_ne_bytes());
+        std::fs::write(&shm, &damaged).unwrap();
+        assert_eq!(
+            committed_wal_bytes(&image).unwrap(),
+            committed,
+            "only the {copy} copy names no frames: scanned, not believed"
+        );
+    }
+}
+
 #[test]
 fn a_store_master_connection_is_always_synchronous_full() {
     // `open_store_master_connection` takes no policy: a power loss must not

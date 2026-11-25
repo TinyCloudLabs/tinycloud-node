@@ -207,21 +207,31 @@ impl SqlService {
         // A write refused for the WAL bound moved the counter (the actor
         // rotated to clear the bound): the uploader is told, like after a
         // commit, or it would keep a stale view of a database it has not
-        // been asked about.
+        // been asked about. The actor has already tried to rotate, so no
+        // backstop here: a second rotation would move the counter twice for
+        // one refusal.
         if matches!(outcome, Err(SqlError::DiskHeadroom)) {
-            self.after_local_commit(space, db_name, &handle).await;
+            self.after_local_commit(space, db_name, &handle, false)
+                .await;
         }
         let result = outcome?;
         if !result.write_targets.is_empty() {
-            self.after_local_commit(space, db_name, &handle).await;
+            self.after_local_commit(space, db_name, &handle, true).await;
         }
         Ok(result)
     }
 
-    /// Tell the uploader a write committed. Never fails the request: the
-    /// write is durable locally, and a missed notice is found again by the
-    /// uploader's recovery scan.
-    async fn after_local_commit(&self, space: &SpaceId, db_name: &str, handle: &DatabaseHandle) {
+    /// Tell the uploader a write committed (or moved the counter). Never
+    /// fails the request: the write is durable locally, and a missed notice
+    /// is found again by the uploader's recovery scan. `backstop` is false
+    /// for a refused write, whose actor has rotated already.
+    async fn after_local_commit(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        handle: &DatabaseHandle,
+        backstop: bool,
+    ) {
         let mut state = match handle.local_state().await {
             Ok(state) => state,
             Err(error) => {
@@ -233,7 +243,7 @@ impl SqlService {
         // allowlisted, over the cap): fold the WAL in and truncate it here,
         // under the operation lock this request still holds, before it grows
         // to the write refusal.
-        if state.wal_bytes >= WAL_BACKSTOP_BYTES {
+        if backstop && state.wal_bytes >= WAL_BACKSTOP_BYTES {
             let key = (space.to_string(), db_name.to_string());
             match handle.rotate().await {
                 Ok(()) => {
