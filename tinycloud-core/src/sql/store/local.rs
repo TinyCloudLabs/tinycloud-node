@@ -275,7 +275,8 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
 ///
 /// An `Err` returned after the link (the directory fsync failed) leaves the
 /// seq file in place: a retry is refused with "already exists", so the caller
-/// checks the counter with [`validate_working_copy`] after any such refusal.
+/// checks the counter with [`validate_working_copy`] after any such refusal
+/// and requires it to be `>= SEED` (design 5.3), else it refuses.
 pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
