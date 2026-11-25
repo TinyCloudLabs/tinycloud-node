@@ -440,6 +440,65 @@ async fn a_json_revoked_root_refuses_a_session_repost(backend: Backend) -> anyho
 }
 on_both_backends!(a_json_revoked_root_refuses_a_session_repost);
 
+/// TC-4321: a NEW registration whose policy root the node already stores,
+/// revoked over the generic route, is refused with the core revocation
+/// (403) and stores nothing. A stored, live registration still replays as
+/// before: the route answers it before any delegation write.
+async fn a_new_registration_on_a_revoked_stored_root_is_refused(
+    backend: Backend,
+) -> anyhow::Result<()> {
+    use super::unbound_source_tests::{boot, bound_source, grant_owner_key};
+    let Some((h, _ledger)) = boot(
+        backend,
+        "a_new_registration_on_a_revoked_stored_root_is_refused",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    h.grant_owner(Window::until(now() + Duration::days(2)))
+        .await?;
+
+    // Unchanged: the replay of a stored, live registration.
+    let (source, leaf) = bound_source(&h, "immutable", Some(&"aa".repeat(32)));
+    grant_owner_key(&h, &leaf).await?;
+    let (body, _) = h
+        .registration_request(policy_window(), source, &leaf)
+        .await?;
+    let registered = h.post_registration(body.clone()).await;
+    assert_eq!(registered.0, Status::Ok, "{}", registered.1);
+    assert_eq!(h.post_registration(body).await, registered, "replay");
+
+    // A new registration whose policy root is already stored, then revoked
+    // by the space owner.
+    let (source, leaf) = bound_source(&h, "immutable", Some(&"aa".repeat(32)));
+    grant_owner_key(&h, &leaf).await?;
+    let (body, fresh) = h
+        .registration_request(policy_window(), source, &leaf)
+        .await?;
+    let root = decode_delegation(body["policyRoot"].as_str().unwrap())
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+    h.client
+        .rocket()
+        .state::<crate::TinyCloud>()
+        .unwrap()
+        .delegate(root)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    h.revoke(&h.space_owner, &fresh.policy_root_cid).await?;
+    let before = h.stored_rows().await?;
+    let (status, refusal) = h.post_registration(body).await;
+    assert_eq!(status, Status::Forbidden, "{refusal}");
+    assert!(refusal.starts_with("delegation-revoked"), "{refusal}");
+    assert_eq!(h.stored_rows().await?, before, "rows after the refusal");
+    assert_eq!(
+        h.challenge(&fresh).await,
+        (Status::NotFound, "policy-registration-missing".to_owned())
+    );
+    Ok(())
+}
+on_both_backends!(a_new_registration_on_a_revoked_stored_root_is_refused);
+
 /// TC-4046: renewal must not hide a policy-only root revocation from a listing.
 async fn renewed_child_query_agrees_with_json_root_revocation(
     backend: Backend,
