@@ -344,8 +344,19 @@ where
         )
             .into();
     }
+    // A `/delegate` refusal names no CID but the posted delegation's own: a
+    // revoked parent or ancestor is reported by its code alone (TC-4321).
+    // `/invoke` keeps the full text.
     match error.revocation_code() {
-        Some(code) => InvokeError::Revoked(code, error.to_string()),
+        Some(code @ RevocationCode::DelegationRevoked) => {
+            InvokeError::Revoked(code, error.to_string())
+        }
+        Some(code @ RevocationCode::ParentRevoked) => {
+            InvokeError::Revoked(code, "delegation-parent-revoked".into())
+        }
+        Some(code @ RevocationCode::AncestorRevoked) => {
+            InvokeError::Revoked(code, "delegation-ancestor-revoked".into())
+        }
         None => delegation_failure(error, write_may_have_applied).into(),
     }
 }
@@ -359,7 +370,8 @@ pub enum InvokeError {
     Deleted(&'static str),
     Storage(StorageRejection),
     /// A `401` whose JSON body is `{"code": <code>, "error": <message>}`; the
-    /// message is the unchanged human text of the refusal.
+    /// message is the unchanged human text of the refusal, except that
+    /// `/delegate` names no parent or ancestor CID (`delegate_refusal`).
     Revoked(RevocationCode, String),
 }
 
