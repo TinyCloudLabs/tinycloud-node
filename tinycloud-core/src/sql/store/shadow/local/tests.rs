@@ -1133,6 +1133,7 @@ async fn after_the_seq_file_went_back(
         },
         config(Duration::ZERO),
     );
+    tokio::time::sleep(Duration::from_millis(500)).await; // the first scan sees the files as they came back
     insert(&service, &rig.space, "d").await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     uploader.drain(Duration::from_secs(5)).await;
@@ -1153,6 +1154,22 @@ async fn a_seq_file_older_than_the_published_frontier_blocks_the_database_and_pu
     // frontier (`plan_work` answers `None`). This is the backstop the design
     // doc (5.3) leans on for a restored or cut-over seq file.
     assert_eq!(after, before, "no object was put for the fourth write");
+}
+
+#[tokio::test]
+async fn a_seq_file_at_the_published_frontier_is_the_normal_state_and_is_not_blocked() {
+    // Nothing went back: after a clean stop the counter equals the frontier's
+    // `last_seq` (13), as it does after every publish while the database is
+    // idle. The first scan after the restart must not block it, and the next
+    // write (14) is published. This is why the scheduler's "behind" test is
+    // `<`, not the planner's `<=`: at equality the head and the frontier agree.
+    let (blocks, frontier, before, after) = after_the_seq_file_went_back(13).await;
+    assert!(blocks.is_empty(), "blocked: {blocks:?}");
+    assert_eq!(
+        frontier.last_seq, 14,
+        "the write after the restart is published"
+    );
+    assert!(after > before, "and its bytes reached the store");
 }
 
 #[tokio::test]
