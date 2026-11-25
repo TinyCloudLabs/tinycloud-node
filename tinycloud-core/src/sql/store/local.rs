@@ -262,11 +262,14 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
 
 /// Turn an existing local database file into a store-master working copy:
 /// fold the WAL into the main file, so the file's hash is the lineage anchor,
-/// and create the seq file at `start_seq` (at cutover: above the frozen
-/// Postgres revision), atomically: a temp file, fsynced, linked into place. A
-/// crash mid-run leaves no seq file or the whole one. Refuses `0` (the
-/// uploader's revisions start at 1) and refuses to run twice. The caller (the
-/// cutover job, P4.4) holds the database's operation lock with no actor open.
+/// make that file (and its directory entry) durable, and only then create the
+/// seq file at `start_seq` (at cutover: above the frozen Postgres revision),
+/// atomically: a temp file, fsynced, linked into place. A crash mid-run leaves
+/// no seq file or the whole one, and never a seq file in front of a main file
+/// that was not yet on disk. Refuses `0` (the uploader's revisions start at 1)
+/// and refuses to run twice. The caller (the cutover job, P4.4) holds the
+/// database's operation lock with no actor open; if two calls ever overlap,
+/// exactly one returns `Ok` and the counter is that call's `start_seq`.
 pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
@@ -279,18 +282,31 @@ pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     if busy != 0 {
         return Err(SqlError::Internal("Database checkpoint is busy".into()));
     }
+    // The seq file is the fence that lets this database be served. It must not
+    // be durable before the file it fences: SQLite's checkpoint syncs the main
+    // file under `synchronous=FULL`, but that is SQLite's business, so the
+    // file and its directory are synced here, before the link, whatever the
+    // pragma said.
+    sync_file_and_directory(path)?;
     let seq = seq_path(path);
     // Written whole to a temp file, fsynced, then linked into place and the
     // directory fsynced: a crash leaves no seq file (the database stays fenced
-    // and this can be run again) or the whole one, never a short one. A temp
-    // file an earlier run died with is ours; start over. `hard_link` refuses
-    // when the seq file exists, so a second run never replaces a counter.
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq.display()));
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io(error)),
-    }
+    // and this can be run again) or the whole one, never a short one. The temp
+    // name is this call's own (process, counter, random): another call, or a
+    // file an earlier run died with, is never ours to remove or to link. A
+    // leftover temp file is harmless (it is not the counter) and is not swept
+    // here, because a sweep could remove a concurrent call's file. `hard_link`
+    // refuses when the seq file exists, so a second run never replaces a
+    // counter and the loser of a race sees `AlreadyExists`, never the
+    // winner's number.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = std::path::PathBuf::from(format!(
+        "{}.tmp.{}.{}.{:016x}",
+        seq.display(),
+        std::process::id(),
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        rand::random::<u64>()
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -308,7 +324,20 @@ pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
             io(error)
         }
     })?;
-    if let Some(parent) = seq.parent() {
+    sync_directory_of(&seq)?;
+    Ok(())
+}
+
+/// fsync `path` and the directory that holds it.
+fn sync_file_and_directory(path: &Path) -> Result<(), SqlError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(io)?;
+    sync_directory_of(path)
+}
+
+fn sync_directory_of(path: &Path) -> Result<(), SqlError> {
+    if let Some(parent) = path.parent() {
         std::fs::File::open(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(io)?;

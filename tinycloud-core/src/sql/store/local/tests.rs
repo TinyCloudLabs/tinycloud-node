@@ -521,32 +521,47 @@ fn a_store_master_connection_is_always_synchronous_full() {
 }
 
 #[test]
-fn creating_the_seq_file_leaves_no_temp_file_and_a_leftover_one_is_never_the_counter() {
+fn a_leftover_temp_file_is_never_the_counter_and_a_run_leaves_none_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.db");
     Connection::open(&path)
         .unwrap()
         .execute_batch("CREATE TABLE items (v TEXT)")
         .unwrap();
-    // What an `init_working_copy` that died before the link leaves.
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq_path(&path).display()));
-    std::fs::write(&tmp, b"short").unwrap();
+    // What an `init_working_copy` that died before the link leaves. It is not
+    // the counter, and a later run neither reads, links nor removes it.
+    let leftover = std::path::PathBuf::from(format!(
+        "{}.tmp.1.0.0000000000000000",
+        seq_path(&path).display()
+    ));
+    std::fs::write(&leftover, b"short").unwrap();
     assert!(read_seq(&path).is_err(), "a temp file is not a counter");
     assert!(validate_working_copy(&path).is_err());
     assert!(!seq_path(&path).exists());
+    let temp_files = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| file.to_string_lossy().contains(".seq.tmp"))
+            .collect()
+    };
 
     init_working_copy(&path, 5).unwrap();
     assert_eq!(read_seq(&path).unwrap(), 5);
-    assert!(!tmp.exists(), "the leftover is replaced and removed");
+    assert_eq!(
+        temp_files(),
+        vec![leftover.clone()],
+        "the run's own temp file is gone; the dead run's is not ours to remove"
+    );
     assert_eq!(
         std::fs::read(seq_path(&path)).unwrap().len(),
         SEQ_RECORD_LEN
     );
 
-    // A second run refuses, keeps the counter and leaves no temp file.
+    // A second run refuses, keeps the counter and leaves no temp file of its own.
     assert!(init_working_copy(&path, 9).is_err());
     assert_eq!(read_seq(&path).unwrap(), 5);
-    assert!(!tmp.exists());
+    assert_eq!(temp_files(), vec![leftover]);
 }
 
 /// Two `init_working_copy` calls on one database at once (the caller should
@@ -602,4 +617,26 @@ fn concurrent_inits_leave_one_winner_and_the_counter_is_the_winners() {
             "round {round}: temp files {leftovers:?}"
         );
     }
+}
+
+/// A main file that is not there is not made into a working copy: init
+/// creates neither the main file nor the seq file, so nothing is served from a
+/// path that never held the database. (The order "main file durable before the
+/// seq file is linked" is not observable from a test without a power cut; it
+/// is read from `init_working_copy`: `sync_file_and_directory(path)` runs
+/// before the temp file is created. A 0-byte file that does exist is a valid
+/// empty SQLite database that init cannot tell from one that lost its content:
+/// the design's P4.4 rule checks the main file's hash against the artifact's
+/// `checkpoint_content_hash` before the flip.)
+#[test]
+fn init_on_a_missing_main_file_creates_neither_the_main_file_nor_a_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    assert!(matches!(
+        init_working_copy(&path, 5),
+        Err(SqlError::Unavailable)
+    ));
+    assert!(!path.exists(), "no main file was created");
+    assert!(!seq_path(&path).exists(), "no counter was created");
+    assert!(validate_working_copy(&path).is_err());
 }
