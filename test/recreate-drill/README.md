@@ -84,7 +84,9 @@ CI=true DRILL_NODE_IMAGE=tinycloud-node:drill bash drill.sh all   # or: today | 
 
 The result is in `summary.txt` (the path is printed; `DRILL_SUMMARY` overrides it) and
 ends in `DRILL PASSED` or `DRILL FAILED`. The summary holds counts, row ids and the file
-names under `/data/sql` (relative paths, never content), never a value or a key.
+names under `/data/sql` (relative paths, never content), never a value or a key. The
+node names a file `<did>:<space name>/v2<hash>.db`; the DID is cut off (`sql_names` in
+`drill.sh`, pinned by `test-drill.sh`), so no `did:pkh` and no address reaches the log.
 
 ## What runs where
 

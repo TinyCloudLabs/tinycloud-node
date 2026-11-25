@@ -85,10 +85,14 @@ wait_ready() {
 # The files under /data/sql in the node container, one relative path per line,
 # sorted (names only, never content), listed from the host with `docker cp` (the
 # image is FROM scratch: no shell to exec). Empty when the path does not exist.
+# The node names a file `<space id>:<space name>/v2<hash>.db`, and the space id
+# is a DID (even a throwaway key's): the DID is cut off and never printed, so
+# a name reads `<space name>/v2<hash>.db` (and the same with -shm / -wal). A
+# 0x address that survives anyway (an unexpected name shape) is masked.
 sql_names() {
   local id
   id="$(dc ps -aq tinycloud)"
-  docker cp "$id:/data/sql" - 2>/dev/null | tar -t 2>/dev/null | grep -v '/$' | sed 's#^sql/##' | LC_ALL=C sort || true
+  docker cp "$id:/data/sql" - 2>/dev/null | tar -t 2>/dev/null | grep -v '/$' | sed -E 's#^sql/##; s#^[^/]*:##; s#0x[0-9A-Fa-f]{40}#<addr>#g' | LC_ALL=C sort || true
 }
 
 # count_lines <text>: the number of non-empty lines in <text> (0 for none).

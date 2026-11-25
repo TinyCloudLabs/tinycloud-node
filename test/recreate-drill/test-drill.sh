@@ -82,6 +82,13 @@ case "$mode" in
         (sleep 1; mkdir -p "$FAKE/cache"; echo data >"$FAKE/cache/main.db") >/dev/null 2>&1 &
       else
         mkdir -p "$FAKE/cache"; echo data >"$FAKE/cache/main.db"
+        # FAKE_DID_NAMES: the node's real file names start with the space's DID
+        # (`<did>:<space name>/v2<hash>.db`); the drill must never print it.
+        if [[ "${FAKE_DID_NAMES:-}" == 1 ]]; then
+          rm -f "$FAKE/cache/main.db"
+          d="$FAKE/cache/tinycloud:pkh:eip155:1:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:account"
+          mkdir -p "$d"; echo data >"$d/v2abc.db"; echo data >"$d/v2abc.db-wal"
+        fi
       fi
     fi
     id="$(grep -o '"id":[0-9]*' "$ledger" | cut -d: -f2 | sort -n | tail -n 1 || true)"
@@ -160,6 +167,16 @@ run_case no-volume-keeps-the-working-copy 1 'the claim in section 14 is wrong' F
 run_case small-database-gets-a-file 1 'a small database has a local file' FAKE_TODAY_FILE=1
 run_case file-backed-layout-never-gets-a-file 1 'no SQL working copy was created' FAKE_NO_FILES=1
 run_case file-appearing-a-moment-late-is-waited-for 0 'DRILL PASSED' FAKE_FILE_LATE=1 DRILL_FILE_WAIT=5
+# A file name that starts with a DID (as the node's real ones do) is printed
+# without it: neither the summary nor the output carries a did:pkh or an 0x
+# address, and the logical name and its -wal sidecar are still listed.
+run_case did-prefixed-names-are-printed-without-the-did 0 'DRILL PASSED' FAKE_DID_NAMES=1
+grep -q 'info \[files\] before any restart: files: account/v2abc\.db account/v2abc\.db-wal *$' "$tmp/did-prefixed-names-are-printed-without-the-did/summary"
+if grep -q 'pkh\|0x[0-9A-Fa-f]\|eip155' "$tmp/did-prefixed-names-are-printed-without-the-did/summary" "$tmp/did-prefixed-names-are-printed-without-the-did/out"; then
+  echo 'a DID-shaped name was echoed' >&2
+  exit 1
+fi
+printf 'ok  a DID in a file name is never echoed\n'
 
 # The guards.
 if CI='' bash "$here/drill.sh" today >/dev/null 2>&1; then
