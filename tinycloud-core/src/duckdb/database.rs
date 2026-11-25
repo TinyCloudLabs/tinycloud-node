@@ -507,10 +507,9 @@ fn deregister_actor(
         cleanup::MovedAside::default()
     };
     if cleanup::delete_aside(cleanup::release(entry, moved)) {
-        // Value-free event for a local debug-log check of cache-disk headroom. It is `debug!`
-        // on purpose: the log shipper names and ships only warn/error lines, and this one has
-        // no event_code in the pinned schema (a follow-up adds one and promotes it).
-        tracing::debug!(
+        // Value-free: no path or error text, so the log shipper can name it. It ships as the
+        // counted diagnostic `duckdb_cache_cleanup_failed` (log-shipper/diagnostics.json, TC-4190).
+        tracing::warn!(
             event = "duckdb_cache_cleanup_failed",
             "Database cache cleanup failed"
         );
