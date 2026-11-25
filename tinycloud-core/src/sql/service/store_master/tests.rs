@@ -486,6 +486,79 @@ async fn a_user_table_with_the_old_counters_name_is_an_ordinary_table() {
 }
 
 #[tokio::test]
+async fn user_sql_cannot_reach_or_replace_the_seq_file() {
+    // The seq file is not a database the user can open or write: ATTACH and
+    // VACUUM INTO (the two ways SQL names a file) are refused, whatever the
+    // ability, and the file is byte for byte as it was.
+    let rig = Rig::new("seq-unreachable").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+    let seq = seq_path(&rig.main_path());
+    let before = std::fs::read(&seq).unwrap();
+    let name = seq.display();
+    let relative = seq.file_name().unwrap().to_string_lossy().to_string();
+
+    for sql in [
+        format!("ATTACH DATABASE '{name}' AS s"),
+        format!("ATTACH '{relative}' AS s"),
+        format!("VACUUM INTO '{name}'"),
+        format!("VACUUM main INTO '{name}'"),
+        format!("VACUUM INTO '{relative}'"),
+    ] {
+        let result = run(&service, &rig.space, &sql).await;
+        let queried = query(&service, &rig.space, &sql).await;
+        assert!(
+            result.is_err() && queried.is_err(),
+            "{sql}: {result:?} {queried:?}"
+        );
+        assert_eq!(std::fs::read(&seq).unwrap(), before, "{sql}");
+    }
+    insert(&service, &rig.space, "b").await.unwrap();
+    assert_eq!(read_seq(&rig.main_path()).unwrap(), 12);
+}
+
+#[tokio::test]
+async fn no_database_or_space_name_makes_a_path_that_is_another_ones_seq_file() {
+    // A database's seq file is `<name>.db.seq`; every file of a database is
+    // `<name>.db`, `<name>.db-wal`, `<name>.db-shm` or `<name>.db.seq`, so
+    // these four never meet across names, however the names are built.
+    let rig = Rig::new("seq-names").await;
+    let names = [
+        "x",
+        "x.db",
+        "x.db.seq",
+        "x.seq",
+        "x-wal",
+        "x.db-wal",
+        "x.db-shm",
+        "x.db.db",
+        "x.db.db.seq",
+        "main",
+        "main.db",
+    ];
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    let mut seen = std::collections::HashMap::new();
+    for name in names {
+        let (main, wal) = service.local_paths(&rig.space, name);
+        let shm = PathBuf::from(format!("{}-shm", main.display()));
+        let seq = seq_path(&main);
+        for (kind, path) in [("main", main), ("wal", wal), ("shm", shm), ("seq", seq)] {
+            if let Some(other) = seen.insert(path.clone(), format!("{name} {kind}")) {
+                panic!("{} is both {other} and {name} {kind}", path.display());
+            }
+        }
+        // And always beside its database, never in another directory.
+        assert_eq!(
+            seq_path(&service.local_paths(&rig.space, name).0).parent(),
+            service.local_paths(&rig.space, name).0.parent()
+        );
+    }
+    assert_eq!(seen.len(), names.len() * 4);
+}
+
+#[tokio::test]
 async fn without_a_gate_or_a_mode_row_a_database_is_served_as_before() {
     use crate::database_artifacts::DatabaseArtifactRepository;
 

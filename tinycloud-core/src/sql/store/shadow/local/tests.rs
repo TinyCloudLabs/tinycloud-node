@@ -1017,3 +1017,42 @@ async fn the_published_head_is_the_seq_file_read_under_the_lock() {
     assert_eq!(second.revision, 15, "the file says 15");
     assert_eq!(second.cid, first.cid, "the same bytes, a later number");
 }
+
+#[tokio::test]
+async fn the_seq_file_is_read_and_written_only_under_the_operation_lock() {
+    // (3) While someone else holds the operation lock, neither a write (which
+    // bumps the file) nor the uploader's head (which reads it) touches it:
+    // both wait, and the file is as it was. Released, both go through.
+    let rig = Rig::new("seq-under-lock").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+    insert(&service, &rig.space, "a").await.unwrap();
+    let seq = crate::sql::store::local::seq_path(&rig.main_path());
+    let before = std::fs::read(&seq).unwrap();
+
+    let guard = service.lock_local(&rig.space, DB).await.unwrap();
+    let wait = Duration::from_millis(300);
+    assert!(
+        tokio::time::timeout(wait, insert(&service, &rig.space, "b"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&seq).unwrap(),
+        before,
+        "no bump under a held lock"
+    );
+    assert!(tokio::time::timeout(wait, source.head(&db)).await.is_err());
+    assert_eq!(std::fs::read(&seq).unwrap(), before);
+    drop(guard);
+
+    insert(&service, &rig.space, "b").await.unwrap();
+    assert_eq!(source.head(&db).await.unwrap().unwrap().revision, 12);
+}
