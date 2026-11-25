@@ -323,16 +323,24 @@ async fn issuer_case_reimport_cannot_resurrect_revoked_siwe_grant() -> Result<()
         "{revoked_body}"
     );
 
-    let imported: Value = serde_json::from_str(
-        &expect_ok(
-            "case-only reimport",
-            client
-                .post("/delegate")
-                .header(Header::new("Authorization", variant)),
-        )
-        .await?,
-    )?;
-    let alias_cid = imported["cid"].as_str().unwrap();
+    // TC-4321: the equivalent bytes are refused as the revoked canonical
+    // grant, not answered as registered.
+    let (reimport_status, reimport_body) = dispatch(
+        client
+            .post("/delegate")
+            .header(Header::new("Authorization", variant)),
+    )
+    .await;
+    assert_eq!(
+        reimport_status,
+        Status::Unauthorized,
+        "case-only reimport: {reimport_body}"
+    );
+    assert!(
+        reimport_body.contains(&format!("delegation-revoked: {cid}")),
+        "{reimport_body}"
+    );
+    let alias_cid = cid;
     let alias_status = status(&client, &session, alias_cid).await?;
     let (invoke_status, invoke_body) = dispatch(client.post("/invoke").header(Header::new(
         "Authorization",
