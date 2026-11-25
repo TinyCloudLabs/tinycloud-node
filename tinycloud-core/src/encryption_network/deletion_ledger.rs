@@ -327,6 +327,8 @@ pub struct DeletionLedger {
     /// Set when a failed append left bytes that could not be removed; later
     /// appends fail rather than write after them.
     unrepaired: AtomicBool,
+    /// There was no ledger file when this open took the lock.
+    created: bool,
     /// Holds the lock; closed with the ledger.
     _lock: Option<File>,
 }
@@ -359,6 +361,7 @@ impl DeletionLedger {
         // Left by a prune that stopped before its rename took effect: the
         // ledger path names a whole file either way.
         remove_if_present(&prune_temp_path(path))?;
+        let created = !file_existed(path);
         let mut file = open_ledger_file(path, true)?;
         let dropped_tail_bytes = repair_tail(&mut file)?;
         file.sync_all()?;
@@ -368,6 +371,7 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes,
             unrepaired: AtomicBool::new(false),
+            created,
             _lock: Some(lock),
         })
     }
@@ -380,12 +384,22 @@ impl DeletionLedger {
             file: Mutex::new(file),
             dropped_tail_bytes: 0,
             unrepaired: AtomicBool::new(false),
+            created: false,
             _lock: None,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This open found no ledger file and created an empty one. Decided under
+    /// the lock, before the file was created, so on a node that has deleted
+    /// keys a `true` here means the ledger was lost. It is `false` for every
+    /// later open: a file that a command such as `purge-ledger reconcile`
+    /// created first is already there when the node starts.
+    pub fn created(&self) -> bool {
+        self.created
     }
 
     /// Bytes of an unfinished final line that [`DeletionLedger::open`] removed.
@@ -876,4 +890,112 @@ async fn apply<C: ConnectionTrait>(
         }
     }
     Ok(())
+}
+
+/// How the ledger file stood when the node began to open it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerFileState {
+    /// There was no file: [`DeletionLedger::open`] created an empty one. On a
+    /// node that has deleted keys, this is a lost ledger.
+    Missing,
+    /// The file existed and held no bytes.
+    Empty,
+    /// The file existed and held bytes.
+    Present,
+}
+
+impl LedgerFileState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::Present => "present",
+        }
+    }
+}
+
+/// Whether a ledger file exists at `path`. A path whose existence cannot be
+/// read counts as existing, so that an unreadable path is never reported as a
+/// lost file.
+fn file_existed(path: &Path) -> bool {
+    !matches!(
+        std::fs::metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// What the ledger holds, for the line a node logs once at start. Counts and
+/// timestamps only: no operation id, network id or key path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerStartSummary {
+    pub file: LedgerFileState,
+    pub bytes: u64,
+    /// Intent lines: delete operations.
+    pub operations: usize,
+    /// Keys named by all intents.
+    pub key_entries: usize,
+    /// `committed` lines.
+    pub committed: usize,
+    /// `aborted` lines.
+    pub aborted: usize,
+    /// The latest `deletedAt` of any intent, as written.
+    pub newest_deleted_at: Option<String>,
+    /// The final line was not a whole record.
+    pub torn_tail: bool,
+}
+
+impl DeletionLedger {
+    /// Summarizes the ledger file as it stands now, for the line a node logs
+    /// once at start, after [`DeletionLedger::replay_at_start`]. Replay appends
+    /// a `committed` line for each open operation it closes, so the counts and
+    /// size are those after replay. [`LedgerFileState::Missing`] is decided by
+    /// [`DeletionLedger::created`], which `open` took before it created the
+    /// file.
+    pub fn start_summary(&self) -> Result<LedgerStartSummary, DeletionLedgerError> {
+        summarize_file(&self.path, self.created)
+    }
+}
+
+fn summarize_file(path: &Path, created: bool) -> Result<LedgerStartSummary, DeletionLedgerError> {
+    let bytes = std::fs::metadata(path)?.len();
+    let contents = read(path)?;
+    let file = if created {
+        LedgerFileState::Missing
+    } else if bytes == 0 {
+        LedgerFileState::Empty
+    } else {
+        LedgerFileState::Present
+    };
+    let mut summary = LedgerStartSummary {
+        file,
+        bytes,
+        operations: 0,
+        key_entries: 0,
+        committed: 0,
+        aborted: 0,
+        newest_deleted_at: None,
+        torn_tail: contents.torn_tail,
+    };
+    let mut newest: Option<(time::OffsetDateTime, &str)> = None;
+    for record in &contents.records {
+        match record {
+            Record::Intent(intent) => {
+                summary.operations += 1;
+                summary.key_entries += intent.keys.len();
+                let parsed = time::OffsetDateTime::parse(
+                    &intent.deleted_at,
+                    &time::format_description::well_known::Rfc3339,
+                );
+                if let Ok(at) = parsed {
+                    if newest.is_none_or(|(latest, _)| at > latest) {
+                        newest = Some((at, intent.deleted_at.as_str()));
+                    }
+                }
+            }
+            Record::Committed(_) => summary.committed += 1,
+            Record::Aborted(_) => summary.aborted += 1,
+        }
+    }
+    summary.newest_deleted_at = newest.map(|(_, written)| written.to_string());
+    Ok(summary)
 }

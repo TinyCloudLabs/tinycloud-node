@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- The node logs one info line, `deletion_ledger_start`, at every start after the deletion ledger replay: the file's state (`missing` when the start's open created the file, `empty`, `present`), byte size, delete operations, key entries, `committed` and `aborted` lines, the newest `deletedAt` (aborted intents included) and `torn_tail`. Counts, a flag and a timestamp only. It ships to Better Stack with the logship bundle (TC-4177/TC-4190); this release only logs it. `tinycloud node purge-ledger reconcile` prints a notice on stderr when it creates a missing ledger file. Details: TC-4177.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;
