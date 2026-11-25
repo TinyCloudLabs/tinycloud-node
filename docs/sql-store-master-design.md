@@ -133,6 +133,13 @@ The shadow backlog cap is **node-wide** (64 MiB un-uploaded, no time bound; `sto
 - A store outage longer than the age bound makes the database read-only; reads continue.
 - The user-facing copy states the worst case, not the typical case: "copied about every 60 seconds; at worst up to [age bound] of writes can be lost if the node's disk is destroyed".
 
+### 5.5 A small database has no file: cutover creates the working copy (TC-1491 P4.2a, P4.2b drill)
+
+- **The fact.** A SQL database is opened `StorageMode::InMemory` unless its file already exists, and it is promoted to a file only once it grows past `memory_threshold` (`database.rs` `spawn_actor`; 10 MiB by default, and production sets none). Below it there is NO local file: the Postgres artifact save is its only durability. A working copy (main file plus seq file) exists only for promoted databases.
+- **So cutover of a small database is not moving a file; it is creating one.** P4.4 must handle both cases: (1) promoted: a file exists, close the actor and `init_working_copy(main, start_seq)` on it (rule (a) in 5.3); (2) in-memory: no file, so write the main file from the Postgres artifact at the frozen revision R, then `init_working_copy` on it. Case 2 is every database below `memory_threshold`, which is every database under the production default until it grows past 10 MiB. Goal 2 of section 3 is this case.
+- **What the store-master path does with an in-memory database today** (P4.2a; pinned by `an_in_memory_database_under_a_store_master_gate_is_refused_and_never_materialised`): it is refused as `Unavailable`, like a lost working copy. It never creates or hydrates a file and never touches the artifact. A database routed to store-master before its working copy exists is fenced, not served from empty or stale state.
+- **Evidence.** The P4.2b recreate drill's first real run (#757, run 45501421888 attempt 2, head 72aa4d30) found 0 files in `/data/sql` before any restart in the `today` layout (the production config), and the same 0 files in `volume`. The drill now asserts per layout what `/data/sql` holds, because its first draft assumed a file.
+
 ## 6. Cutover: fenced, one database at a time
 
 **No dual-write.** Sam's council plan (2026-11-22) declines Decision 13's dual-write exception. Dual-write has two masters and no atomic commit across them; it can ack a write that only one side has. The cutover below never has two writers or two masters: it freezes, copies, verifies, flips, in that order.

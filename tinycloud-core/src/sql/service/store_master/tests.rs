@@ -435,6 +435,65 @@ async fn a_missing_working_copy_is_unavailable_and_is_never_created() {
     assert!(!rig.main_path().exists(), "nothing was created or hydrated");
 }
 
+/// Below `memory_threshold` a database is in memory: it has no file at all and
+/// its only durability is the Postgres artifact. Routed to the store-master
+/// path it is refused (`Unavailable`), exactly like a lost working copy: the
+/// path never creates, hydrates or seeds a file, so the artifact is neither
+/// read into a file nor changed. Cutting such a database over has to CREATE
+/// the working copy first (design 5.5).
+#[tokio::test]
+async fn an_in_memory_database_under_a_store_master_gate_is_refused_and_never_materialised() {
+    use crate::database_artifacts::DatabaseArtifactRepository;
+    let rig = Rig::new("in-memory").await;
+    let below_the_threshold = u64::MAX;
+    {
+        // Postgres master, small database: served in memory, saved as an artifact.
+        let postgres_master = SqlService::new(rig.base(), below_the_threshold, rig.repo.clone())
+            .with_durability(plain());
+        run(
+            &postgres_master,
+            &rig.space,
+            "CREATE TABLE items (v TEXT NOT NULL)",
+        )
+        .await
+        .unwrap();
+        insert(&postgres_master, &rig.space, "a").await.unwrap();
+    }
+    assert!(
+        !rig.main_path().exists(),
+        "an in-memory database has no file"
+    );
+    let saved = rig
+        .repo
+        .load_meta("sql", &rig.space.to_string(), DB)
+        .await
+        .unwrap();
+    assert!(saved.is_some(), "its only copy is the Postgres artifact");
+
+    rig.make_store_master().await;
+    let service = SqlService::new(rig.base(), below_the_threshold, rig.repo.clone())
+        .with_durability(plain())
+        .with_shadow(Arc::new(ProbeSink::default()))
+        .with_store_master_gate(rig.gate());
+    assert!(matches!(
+        insert(&service, &rig.space, "b").await,
+        Err(SqlError::Unavailable)
+    ));
+    assert!(matches!(
+        query(&service, &rig.space, "SELECT count(*) FROM items").await,
+        Err(SqlError::Unavailable)
+    ));
+    assert!(!rig.main_path().exists(), "no file was created or hydrated");
+    assert_eq!(
+        rig.repo
+            .load_meta("sql", &rig.space.to_string(), DB)
+            .await
+            .unwrap(),
+        saved,
+        "the Postgres artifact was not touched"
+    );
+}
+
 #[tokio::test]
 async fn a_file_without_the_counter_is_refused_not_adopted() {
     let rig = Rig::new("no-counter").await;
