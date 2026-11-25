@@ -4,13 +4,18 @@
 //! Everything here is inert until a database's `sql_store_mode` row says
 //! `store_master`; no cutover exists yet, so nothing in production reaches it.
 //!
-//! - **Sequence counter.** One reserved row, written in the same SQLite
-//!   transaction as the write it counts ([`bump_seq`], called by the actor
-//!   before COMMIT). A crash can therefore never reissue a `seq` with other
-//!   content: the counter and the data are in the same WAL commit.
-//! - **Reserved namespace.** Tables whose name starts with
-//!   [`RESERVED_PREFIX`] are refused to user SQL by the authorizer, but only
-//!   while the actor is store-master ([`names_reserved`]).
+//! - **Sequence counter, bump-before-write.** The counter lives in its own
+//!   file next to the database ([`seq_path`]), not in the database. The actor
+//!   bumps it and fsyncs it ([`bump_seq`]) after a write's statements have
+//!   run and BEFORE that write commits. SQLite cannot commit atomically
+//!   across two files in WAL mode, so the counter and the data are never in
+//!   one commit; the order is what keeps the invariant: **a `seq` is never
+//!   reused for different bytes; gaps are allowed.** A crash after the bump
+//!   and before the commit leaves the counter ahead of the data (a gap); a
+//!   crash after the commit leaves both. The revision the uploader publishes
+//!   is read from this file under the operation lock ([`read_seq`]).
+//!   (Nothing in the database file is the node's: the counter is a separate
+//!   file, so user SQL has no name to shadow, rename or read it by.)
 //! - **Checkpoint identity.** The manifest lineage anchor
 //!   (`base_checkpoint_cid`) is, for a store-master database, the lowercase
 //!   hex SHA-256 of the local main file (the checkpoint) at the moment it was
@@ -31,14 +36,12 @@
 //! expired lease and a logged loss (P4.2c); nothing in this slice takes over.
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusqlite::hooks::AuthAction;
-use rusqlite::Connection;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 
@@ -88,13 +91,6 @@ pub fn rotation_threshold(main_bytes: u64) -> u64 {
         .clamp(WINDOW_BYTES, PILOT_CAP_BYTES / SNAPSHOT_AMPLIFICATION_CAP)
 }
 
-/// The reserved counter table.
-pub const SEQ_TABLE: &str = "tinycloud_internal_store_seq";
-
-/// Every name under this prefix is the node's, not the user's (compared
-/// ASCII-case-insensitively, as SQLite compares names).
-pub const RESERVED_PREFIX: &str = "tinycloud_internal_";
-
 /// Marks kept per database: the frontier's and the head's need only the last
 /// two; a few more absorb a retried job.
 const MARKS_KEPT: usize = 8;
@@ -104,240 +100,143 @@ pub fn within_pilot_cap(bytes: u64) -> bool {
     bytes <= PILOT_CAP_BYTES
 }
 
-/// Whether `name` is in the reserved namespace.
-pub fn is_reserved_name(name: &str) -> bool {
-    name.as_bytes()
-        .get(..RESERVED_PREFIX.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_PREFIX.as_bytes()))
-}
-
-/// Whether a SQLite authorizer action touches the reserved namespace.
-pub fn names_reserved(action: &AuthAction<'_>) -> bool {
-    use AuthAction::*;
-    match action {
-        CreateIndex {
-            index_name,
-            table_name,
-        }
-        | CreateTempIndex {
-            index_name,
-            table_name,
-        }
-        | DropIndex {
-            index_name,
-            table_name,
-        }
-        | DropTempIndex {
-            index_name,
-            table_name,
-        } => is_reserved_name(index_name) || is_reserved_name(table_name),
-        CreateTrigger {
-            trigger_name,
-            table_name,
-        }
-        | CreateTempTrigger {
-            trigger_name,
-            table_name,
-        }
-        | DropTrigger {
-            trigger_name,
-            table_name,
-        }
-        | DropTempTrigger {
-            trigger_name,
-            table_name,
-        } => is_reserved_name(trigger_name) || is_reserved_name(table_name),
-        CreateTable { table_name }
-        | CreateTempTable { table_name }
-        | DropTable { table_name }
-        | DropTempTable { table_name }
-        | Delete { table_name }
-        | Insert { table_name }
-        | Read { table_name, .. }
-        | Update { table_name, .. }
-        | AlterTable { table_name, .. }
-        | Analyze { table_name }
-        | CreateVtable { table_name, .. }
-        | DropVtable { table_name, .. } => is_reserved_name(table_name),
-        CreateView { view_name }
-        | CreateTempView { view_name }
-        | DropView { view_name }
-        | DropTempView { view_name } => is_reserved_name(view_name),
-        Reindex { index_name } => is_reserved_name(index_name),
-        // `PRAGMA table_info('name')` and friends name a table as the value.
-        Pragma {
-            pragma_value: Some(value),
-            ..
-        } => is_reserved_name(value),
-        _ => false,
-    }
-}
-
 fn sqlite(error: rusqlite::Error) -> SqlError {
     SqlError::Internal(error.to_string())
 }
 
-/// Whether any statement renames a table to a reserved name. SQLite's
-/// authorizer sees only the OLD name of `ALTER TABLE .. RENAME TO ..`, so the
-/// new name is judged here, on the parsed statement. (`temp.x` renamed to the
-/// counter's name was accepted before this check.)
-pub fn renames_to_reserved(statements: &[sqlparser::ast::Statement]) -> bool {
-    use sqlparser::ast::{AlterTableOperation, Statement};
-    statements.iter().any(|statement| match statement {
-        Statement::AlterTable { operations, .. } => operations.iter().any(|op| match op {
-            AlterTableOperation::RenameTable { table_name } => table_name
-                .0
-                .last()
-                .is_some_and(|ident| is_reserved_name(&ident.value)),
-            _ => false,
-        }),
-        _ => false,
-    })
+/// Where the counter of the working copy whose main file is `main` lives.
+pub fn seq_path(main: &Path) -> PathBuf {
+    let mut path = main.as_os_str().to_owned();
+    path.push(".seq");
+    PathBuf::from(path)
 }
 
-/// Every statement below names the counter in the `main` schema. An
-/// unqualified name resolves to a TEMP table of the same name first, and a
-/// connection's user SQL can create TEMP tables.
-fn seq_table() -> String {
-    format!("main.{SEQ_TABLE}")
+/// The counter file is one 16-byte record: the counter (little-endian) and
+/// the first 8 bytes of SHA-256 over a tag and the counter. A record that
+/// does not check (a torn write, a hand edit) is refused, never repaired:
+/// guessing a counter could reissue one.
+const SEQ_RECORD_LEN: usize = 16;
+
+fn seq_record(seq: u64) -> [u8; SEQ_RECORD_LEN] {
+    let mut record = [0u8; SEQ_RECORD_LEN];
+    record[..8].copy_from_slice(&seq.to_le_bytes());
+    let digest = Sha256::new()
+        .chain_update(b"tinycloud-store-seq-v1")
+        .chain_update(seq.to_le_bytes())
+        .finalize();
+    record[8..].copy_from_slice(&digest[..8]);
+    record
 }
 
-/// Create the counter at `start_seq` (at cutover: the frozen Postgres
-/// revision). Refuses to run twice and refuses `0`: the uploader's revisions
-/// start at 1.
+fn parse_seq_record(bytes: &[u8]) -> Result<u64, SqlError> {
+    let bytes: &[u8; SEQ_RECORD_LEN] = bytes
+        .try_into()
+        .map_err(|_| SqlError::Internal("the store-master seq file has the wrong length".into()))?;
+    let seq = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+    if seq_record(seq) != *bytes {
+        return Err(SqlError::Internal(
+            "the store-master seq file does not check".into(),
+        ));
+    }
+    Ok(seq)
+}
+
+fn io(error: std::io::Error) -> SqlError {
+    SqlError::Internal(error.to_string())
+}
+
+fn seq_io(error: std::io::Error) -> SqlError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SqlError::Internal("the store-master seq file is missing".into())
+    } else {
+        io(error)
+    }
+}
+
+/// The counter of the working copy whose main file is `main`, read from its
+/// seq file. Fails when the file is missing or does not check.
+pub fn read_seq(main: &Path) -> Result<u64, SqlError> {
+    let bytes = std::fs::read(seq_path(main)).map_err(seq_io)?;
+    parse_seq_record(&bytes)
+}
+
+/// Count one more write (or rotation): move the counter forward by one and
+/// fsync it, then return the new value. The caller commits its write only
+/// after this returns. At `i64::MAX` it refuses instead of overflowing
+/// (revisions are stored as signed integers downstream).
 ///
-/// The column is checked to hold an integer. SQLite turns an overflowing
-/// `seq + 1` into a REAL, which a later open could not read as the counter;
-/// the check makes that update fail instead, and the write is rolled back.
-pub fn init_seq(conn: &Connection, start_seq: u64) -> Result<(), SqlError> {
+/// The record is rewritten in place and synced with `fdatasync`; its length
+/// never changes. It is 16 bytes, inside one sector, so a crash leaves the
+/// old record or the new one; a torn one is refused by [`read_seq`], which
+/// stops the database rather than reissue a revision.
+pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(seq_path(main))
+        .map_err(seq_io)?;
+    let mut bytes = Vec::with_capacity(SEQ_RECORD_LEN);
+    file.read_to_end(&mut bytes).map_err(io)?;
+    let seq = parse_seq_record(&bytes)?;
+    if seq >= i64::MAX as u64 {
+        return Err(SqlError::Internal("store-master seq is exhausted".into()));
+    }
+    let next = seq + 1;
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    file.write_all(&seq_record(next)).map_err(io)?;
+    file.sync_data().map_err(io)?;
+    Ok(next)
+}
+
+/// Turn an existing local database file into a store-master working copy:
+/// fold the WAL into the main file, so the file's hash is the lineage anchor,
+/// and create the seq file at `start_seq` (at cutover: above the frozen
+/// Postgres revision). Refuses `0` (the uploader's revisions start at 1) and
+/// refuses to run twice. The caller (the cutover job, P4.4) holds the
+/// database's operation lock with no actor open.
+pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
         .filter(|seq| *seq >= 1)
         .ok_or_else(|| SqlError::Internal("store-master seq must start at 1 or more".into()))?;
-    let table = seq_table();
-    // A Postgres-mode database may already hold a table of this name (the
-    // prefix is reserved only once a database is store-master), or be the
-    // import of an export of one. Cutover must stop there, and say why: an
-    // existing table is never adopted as the counter.
-    let taken: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
-            [SEQ_TABLE],
-            |r| r.get(0),
-        )
-        .map_err(sqlite)?;
-    if taken != 0 {
-        return Err(SqlError::Internal(format!(
-            "the database already has a table named {SEQ_TABLE} (a user table, or an export of a \
-             store-master database); drop it before cutover"
-        )));
-    }
-    conn.execute_batch(&format!(
-        "CREATE TABLE {table} (\
-           id INTEGER PRIMARY KEY CHECK (id = 1), \
-           seq INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1)\
-         )"
-    ))
-    .map_err(sqlite)?;
-    conn.execute(
-        &format!("INSERT INTO {table} (id, seq) VALUES (1, ?1)"),
-        [start],
-    )
-    .map_err(sqlite)?;
-    Ok(())
-}
-
-/// The counter's value.
-pub fn read_seq(conn: &Connection) -> Result<u64, SqlError> {
-    let seq: i64 = conn
-        .query_row(
-            &format!("SELECT seq FROM {} WHERE id = 1", seq_table()),
-            [],
-            |r| r.get(0),
-        )
-        .map_err(sqlite)?;
-    u64::try_from(seq).map_err(|_| SqlError::Internal("store-master seq is negative".into()))
-}
-
-/// Count one more write. Runs inside the write's transaction, before COMMIT,
-/// with no authorizer installed. At `i64::MAX` it refuses (the transaction is
-/// rolled back by the caller) instead of overflowing.
-pub fn bump_seq(conn: &Connection) -> Result<(), SqlError> {
-    bump(conn, None)
-}
-
-/// As [`bump_seq`], for a write whose counter was read as `expected` before
-/// the user's SQL ran: it refuses unless the row still holds `expected`, so a
-/// change to the counter by anything inside the transaction, whatever path it
-/// took, fails the write instead of being counted.
-pub fn bump_seq_from(conn: &Connection, expected: u64) -> Result<(), SqlError> {
-    bump(conn, Some(expected))
-}
-
-fn bump(conn: &Connection, expected: Option<u64>) -> Result<(), SqlError> {
-    let table = seq_table();
-    let changed = match expected {
-        None => conn.execute(
-            &format!(
-                "UPDATE {table} SET seq = seq + 1 WHERE id = 1 AND seq < {}",
-                i64::MAX
-            ),
-            [],
-        ),
-        Some(expected) => {
-            let expected = i64::try_from(expected)
-                .map_err(|_| SqlError::Internal("store-master seq is out of range".into()))?;
-            conn.execute(
-                &format!(
-                    "UPDATE {table} SET seq = seq + 1 WHERE id = 1 AND seq = ?1 AND seq < {}",
-                    i64::MAX
-                ),
-                [expected],
-            )
-        }
-    }
-    .map_err(sqlite)?;
-    if changed == 1 {
-        return Ok(());
-    }
-    match (read_seq(conn), expected) {
-        (Ok(seq), _) if i64::try_from(seq) == Ok(i64::MAX) => {
-            Err(SqlError::Internal("store-master seq is exhausted".into()))
-        }
-        (Ok(seq), Some(expected)) if seq != expected => Err(SqlError::Internal(
-            "store-master seq changed during the write".into(),
-        )),
-        _ => Err(SqlError::Internal("store-master seq row is missing".into())),
-    }
-}
-
-/// Turn an existing local database file into a store-master working copy:
-/// create the counter at `start_seq` and fold the WAL into the main file, so
-/// the file's hash is the lineage anchor. The caller (the cutover job, P4.4)
-/// holds the database's operation lock with no actor open.
-pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let conn =
         open_store_master_connection(&StorageMode::File(path.to_path_buf()), Synchronous::Full)?;
-    init_seq(&conn, start_seq)?;
     let busy: i64 = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
         .map_err(sqlite)?;
     if busy != 0 {
         return Err(SqlError::Internal("Database checkpoint is busy".into()));
     }
+    let seq = seq_path(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&seq)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                SqlError::Internal("the store-master seq file already exists".into())
+            } else {
+                io(error)
+            }
+        })?;
+    file.write_all(&seq_record(start as u64)).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    if let Some(parent) = seq.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io)?;
+    }
     Ok(())
 }
 
 /// The counter of the working copy at `path`, read without an actor. Fails
-/// when the file is missing or was never initialised: such a database is
-/// fenced, never created or re-seeded.
+/// when the main file is missing or the counter was never initialised: such a
+/// database is fenced, never created or re-seeded.
 pub fn validate_working_copy(path: &Path) -> Result<u64, SqlError> {
     if !path.is_file() {
         return Err(SqlError::Unavailable);
     }
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.to_path_buf()), Synchronous::Full)?;
-    read_seq(&conn)
+    read_seq(path)
 }
 
 /// SHA-256 (lowercase hex) of a whole file.

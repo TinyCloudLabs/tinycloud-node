@@ -130,15 +130,6 @@ pub fn validate_sql_authorized(
         ddl_kind,
     } = analyze_statements(sql)?;
 
-    // Store-master: SQLite's authorizer sees only the old name of a rename, so
-    // a table renamed to a reserved name is refused here (TC-1491 P4.2a).
-    if authority.store_master() && crate::sql::store::local::renames_to_reserved(&statements) {
-        return Err(SqlError::PermissionDenied(format!(
-            "Names starting with '{}' are reserved",
-            crate::sql::store::local::RESERVED_PREFIX
-        )));
-    }
-
     // TC-1581: schema-changing statements need a schema-conferring ability
     // (`schema`; `admin` through the registry's `admin ⊃ schema`; `sql/*`).
     // `write` covers data statements only. `DdlPolicy::Log` and `Off` keep

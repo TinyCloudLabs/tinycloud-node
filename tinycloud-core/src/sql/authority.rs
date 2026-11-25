@@ -184,9 +184,8 @@ impl SqlAuthority {
     }
 
     /// The request runs on a store-master working copy (TC-1491 P4.2a): the
-    /// authorizer refuses the reserved `tinycloud_internal_` namespace, and
-    /// the actor counts the write in the in-file sequence before COMMIT. Set
-    /// by the actor, never by a caller; false everywhere else.
+    /// actor bumps the file-backed sequence counter before COMMIT. Set by the
+    /// actor, never by a caller; false everywhere else.
     pub fn with_store_master(mut self, enabled: bool) -> Self {
         self.store_master = enabled;
         self

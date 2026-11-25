@@ -17,7 +17,7 @@ use crate::sql::service::SqlService;
 use crate::sql::store::key::DbRef;
 use crate::sql::store::local::rig::{count, insert, query, run, ProbeSink, Rig, DB};
 use crate::sql::store::local::{
-    hash_file, read_seq, validate_working_copy, StoreMasterGate, PILOT_CAP_BYTES,
+    hash_file, read_seq, seq_path, validate_working_copy, StoreMasterGate, PILOT_CAP_BYTES,
     WAL_BACKSTOP_BYTES, WAL_REFUSE_BYTES, WINDOW_BYTES,
 };
 use crate::sql::store::mode::ModeError;
@@ -35,19 +35,75 @@ fn key(rig: &Rig) -> (String, String) {
     (rig.space.to_string(), DB.to_string())
 }
 
-/// The counter and the row count of a database file copied at an instant, as
-/// SQLite recovers them on the next open (a crash at that instant).
+/// The counter and the row count of a database image copied at an instant, as
+/// SQLite recovers them on the next open (a crash at that instant). The
+/// counter is the image's seq file.
 fn recovered(dir: &Path) -> (u64, i64) {
-    let conn = Connection::open(dir.join("main.db")).unwrap();
-    let seq = read_seq(&conn).unwrap();
-    let rows = conn
+    let main = dir.join("main.db");
+    let rows = Connection::open(&main)
+        .unwrap()
         .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
         .unwrap();
-    (seq, rows)
+    (read_seq(&main).unwrap(), rows)
+}
+
+/// Copy the main file, the WAL and the seq file of `main` into `dir`, the way
+/// a crash at this instant leaves them.
+fn crash_image(main: &Path, dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::copy(main, dir.join("main.db")).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", main.display()));
+    if wal.exists() {
+        std::fs::copy(&wal, dir.join("main.db-wal")).unwrap();
+    }
+    std::fs::copy(seq_path(main), dir.join("main.db.seq")).unwrap();
+}
+
+type Images = Arc<Mutex<Vec<(&'static str, PathBuf)>>>;
+
+/// A policy whose two commit seams take a crash image each: `before` runs
+/// after the write's statements and its counter bump, immediately before
+/// COMMIT; `after` runs immediately after it.
+fn crash_policy(rig: &Rig, out: &Path) -> (DurabilityPolicy, Images) {
+    let taken = Arc::new(Mutex::new(Vec::<(&'static str, PathBuf)>::new()));
+    let n = Arc::new(AtomicUsize::new(0));
+    let snapshot = |label: &'static str| {
+        let main = rig.main_path();
+        let (out, taken, n) = (out.to_path_buf(), taken.clone(), n.clone());
+        Arc::new(move || {
+            let dir = out.join(format!("{}-{label}", n.fetch_add(1, Ordering::SeqCst)));
+            crash_image(&main, &dir);
+            taken.lock().unwrap().push((label, dir));
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let policy = DurabilityPolicy {
+        seams: CommitSeams {
+            before_commit: Some(snapshot("before")),
+            after_commit: Some(snapshot("after")),
+            before_response: None,
+        },
+        ..DurabilityPolicy::default()
+    };
+    (policy, taken)
+}
+
+/// A rig whose working copy is a crash image: the main file, WAL and seq file
+/// are put in place as they were, nothing else (no shm, no hydration).
+async fn rig_from_image(name: &str, image: &Path) -> Rig {
+    let rig = Rig::new(name).await;
+    let main = rig.main_path();
+    std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+    std::fs::copy(image.join("main.db"), &main).unwrap();
+    if image.join("main.db-wal").exists() {
+        std::fs::copy(image.join("main.db-wal"), rig.wal_path()).unwrap();
+    }
+    std::fs::copy(image.join("main.db.seq"), seq_path(&main)).unwrap();
+    rig.make_store_master().await;
+    rig
 }
 
 #[tokio::test]
-async fn every_write_counts_once_in_its_own_transaction_and_a_read_does_not() {
+async fn every_write_counts_once_and_a_read_does_not() {
     let rig = Rig::new("seq-counts").await;
     rig.create_working_copy(10);
     rig.make_store_master().await;
@@ -131,35 +187,59 @@ async fn a_restart_continues_the_counter_and_never_reissues_a_seq() {
 }
 
 #[tokio::test]
-async fn a_crash_at_any_commit_boundary_never_splits_the_counter_from_its_data() {
-    let rig = Rig::new("seq-crash").await;
+async fn the_counter_is_bumped_and_on_disk_before_its_write_commits() {
+    // (1) The order. At the before-commit seam the seq file already holds the
+    // write's number while the write is not yet in the database; at the
+    // after-commit seam both are. The fsync itself is a `sync_data` in
+    // `bump_seq` (read from the code, not observable from here).
+    let rig = Rig::new("seq-order").await;
     rig.create_working_copy(10);
     rig.make_store_master().await;
 
-    let out = tempfile::tempdir().unwrap();
-    let taken = Arc::new(Mutex::new(Vec::<(&'static str, PathBuf)>::new()));
-    let n = Arc::new(AtomicUsize::new(0));
-    let snapshot = |label: &'static str| {
-        let (main, wal) = (rig.main_path(), rig.wal_path());
-        let (out, taken, n) = (out.path().to_path_buf(), taken.clone(), n.clone());
+    let seen = Arc::new(Mutex::new(Vec::<(&'static str, u64)>::new()));
+    let probe = |label: &'static str| {
+        let (main, seen) = (rig.main_path(), seen.clone());
         Arc::new(move || {
-            let dir = out.join(format!("{}-{label}", n.fetch_add(1, Ordering::SeqCst)));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::copy(&main, dir.join("main.db")).unwrap();
-            if wal.exists() {
-                std::fs::copy(&wal, dir.join("main.db-wal")).unwrap();
-            }
-            taken.lock().unwrap().push((label, dir));
+            let rows: i64 = Connection::open(&main)
+                .unwrap()
+                .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
+                .unwrap();
+            seen.lock()
+                .unwrap()
+                .push((label, read_seq(&main).unwrap() * 1000 + rows as u64));
         }) as Arc<dyn Fn() + Send + Sync>
     };
     let policy = DurabilityPolicy {
         seams: CommitSeams {
-            before_commit: Some(snapshot("before")),
-            after_commit: Some(snapshot("after")),
+            before_commit: Some(probe("before")),
+            after_commit: Some(probe("after")),
             before_response: None,
         },
         ..DurabilityPolicy::default()
     };
+    let service = rig.service(Arc::new(ProbeSink::default()), policy);
+    for v in ["a", "b"] {
+        insert(&service, &rig.space, v).await.unwrap();
+    }
+    // counter * 1000 + rows visible to another connection
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            ("before", 11_000), // bumped to 11, no row yet
+            ("after", 11_001),  // committed
+            ("before", 12_001),
+            ("after", 12_002),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_crash_after_the_bump_and_before_the_write_commits_leaves_a_gap_and_no_reuse() {
+    let rig = Rig::new("seq-crash-gap").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let out = tempfile::tempdir().unwrap();
+    let (policy, taken) = crash_policy(&rig, out.path());
     let service = rig.service(Arc::new(ProbeSink::default()), policy);
     for v in ["a", "b", "c"] {
         insert(&service, &rig.space, v).await.unwrap();
@@ -172,17 +252,130 @@ async fn a_crash_at_any_commit_boundary_never_splits_the_counter_from_its_data()
         6,
         "a before and an after per write, none for the read"
     );
-    for (i, (label, dir)) in taken.iter().enumerate() {
-        let write = (i / 2) as u64 + 1;
-        let (seq, rows) = recovered(dir);
+    let before: Vec<&PathBuf> = taken
+        .iter()
+        .filter(|(l, _)| *l == "before")
+        .map(|(_, d)| d)
+        .collect();
+    for (i, dir) in before.iter().enumerate() {
+        let write = i as u64 + 1;
+        // The write is not there; its number already is: one ahead, a gap.
         assert_eq!(
-            seq as i64 - 10,
-            rows,
-            "{label} write {write}: the counter and the rows agree"
+            recovered(dir),
+            (10 + write, write as i64 - 1),
+            "crash before commit {write}"
         );
-        let expected = if *label == "before" { write - 1 } else { write };
-        assert_eq!(seq, 10 + expected, "{label} write {write}");
     }
+
+    // Restart on the second crash image (rows a; counter already at 12). The
+    // next write must not be numbered 12: that number was taken by the write
+    // that never committed. It gets 13.
+    let restarted = rig_from_image("seq-crash-gap-restart", before[1]).await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = restarted.service(sink.clone(), plain());
+    assert_eq!(count(&service, &restarted.space).await, 1);
+    insert(&service, &restarted.space, "next").await.unwrap();
+    assert_eq!(sink.notices().last().unwrap().seq, 13, "12 is not reissued");
+    assert_eq!(count(&service, &restarted.space).await, 2);
+    assert_eq!(validate_working_copy(&restarted.main_path()).unwrap(), 13);
+}
+
+#[tokio::test]
+async fn a_crash_after_the_commit_has_the_data_and_its_counter_together() {
+    let rig = Rig::new("seq-crash-after").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let out = tempfile::tempdir().unwrap();
+    let (policy, taken) = crash_policy(&rig, out.path());
+    let service = rig.service(Arc::new(ProbeSink::default()), policy);
+    for v in ["a", "b", "c"] {
+        insert(&service, &rig.space, v).await.unwrap();
+    }
+    let after: Vec<PathBuf> = taken
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(l, _)| *l == "after")
+        .map(|(_, d)| d.clone())
+        .collect();
+    assert_eq!(after.len(), 3);
+    for (i, dir) in after.iter().enumerate() {
+        let write = i as u64 + 1;
+        assert_eq!(
+            recovered(dir),
+            (10 + write, write as i64),
+            "crash after commit {write}"
+        );
+    }
+    // And a restart on one of them continues from its counter.
+    let restarted = rig_from_image("seq-crash-after-restart", &after[1]).await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = restarted.service(sink.clone(), plain());
+    insert(&service, &restarted.space, "next").await.unwrap();
+    assert_eq!(sink.notices().last().unwrap().seq, 13);
+    assert_eq!(count(&service, &restarted.space).await, 3);
+}
+
+#[tokio::test]
+async fn a_crash_in_the_middle_of_a_write_leaves_the_data_as_it_was_and_no_reuse() {
+    let rig = Rig::new("seq-crash-mid").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let out = tempfile::tempdir().unwrap();
+    let (policy, taken) = crash_policy(&rig, out.path());
+    let service = rig.service(Arc::new(ProbeSink::default()), policy);
+    insert(&service, &rig.space, "small").await.unwrap();
+
+    // A write larger than the page cache: its pages are in the WAL before it
+    // commits, so the image taken just before COMMIT holds uncommitted frames
+    // (a crash in the middle of the write).
+    run(
+        &service,
+        &rig.space,
+        "INSERT INTO items (v) VALUES (zeroblob(6000000))",
+    )
+    .await
+    .unwrap();
+    let taken = taken.lock().unwrap().clone();
+    let (label, mid) = &taken[2];
+    assert_eq!(*label, "before");
+    let committed_wal = std::fs::metadata(taken[1].1.join("main.db-wal"))
+        .unwrap()
+        .len();
+    let mid_wal = std::fs::metadata(mid.join("main.db-wal")).unwrap().len();
+    assert!(
+        mid_wal > committed_wal + 1_000_000,
+        "the write's pages are already in the WAL ({mid_wal} vs {committed_wal})"
+    );
+    // Recovery drops the uncommitted frames: one row, the counter one ahead.
+    assert_eq!(recovered(mid), (12, 1));
+
+    // A restart numbers its next write 13.
+    let restarted = rig_from_image("seq-crash-mid-restart", mid).await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = restarted.service(sink.clone(), plain());
+    insert(&service, &restarted.space, "next").await.unwrap();
+    assert_eq!(sink.notices().last().unwrap().seq, 13);
+    assert_eq!(count(&service, &restarted.space).await, 2);
+}
+
+#[tokio::test]
+async fn the_seq_a_notice_carries_is_read_from_the_seq_file() {
+    // (2) The revision handed on comes from the file, not from memory: a
+    // counter moved from outside is what the next notice reports.
+    let rig = Rig::new("seq-from-file").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = rig.service(sink.clone(), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+    assert_eq!(sink.notices().last().unwrap().seq, 11);
+
+    for _ in 0..3 {
+        crate::sql::store::local::bump_seq(&rig.main_path()).unwrap();
+    }
+    insert(&service, &rig.space, "b").await.unwrap();
+    assert_eq!(sink.notices().last().unwrap().seq, 15);
 }
 
 #[tokio::test]
@@ -257,54 +450,39 @@ async fn a_file_without_the_counter_is_refused_not_adopted() {
 }
 
 #[tokio::test]
-async fn user_sql_cannot_read_change_or_drop_the_counter_even_as_admin() {
-    let rig = Rig::new("hidden").await;
+async fn a_user_table_with_the_old_counters_name_is_an_ordinary_table() {
+    // The counter is not in the database, so no name is the node's.
+    let rig = Rig::new("no-reserved").await;
     rig.create_working_copy(10);
     rig.make_store_master().await;
-    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    let sink = Arc::new(ProbeSink::default());
+    let service = rig.service(sink.clone(), plain());
     insert(&service, &rig.space, "a").await.unwrap();
 
-    for sql in [
-        "SELECT * FROM tinycloud_internal_store_seq",
-        "SELECT seq FROM TINYCLOUD_INTERNAL_STORE_SEQ",
-        "SELECT count(*) FROM main.tinycloud_internal_store_seq",
-        "PRAGMA table_info(tinycloud_internal_store_seq)",
-    ] {
-        assert!(query(&service, &rig.space, sql).await.is_err(), "{sql}");
-    }
-    for sql in [
-        "UPDATE tinycloud_internal_store_seq SET seq = 1",
-        "UPDATE tinycloud_internal_store_seq SET seq = seq + 100",
-        "DELETE FROM tinycloud_internal_store_seq",
-        "INSERT INTO tinycloud_internal_store_seq (id, seq) VALUES (2, 5)",
-        "DROP TABLE tinycloud_internal_store_seq",
-        "ALTER TABLE tinycloud_internal_store_seq RENAME TO elsewhere",
-        "CREATE TABLE tinycloud_internal_mine (a INTEGER)",
-        "CREATE INDEX tinycloud_internal_ix ON items (v)",
-    ] {
-        assert!(run(&service, &rig.space, sql).await.is_err(), "{sql}");
-    }
-    // A trigger that reaches for the counter is refused when it is created or
-    // when it fires: either way the counter is not changed by it.
-    let _ = run(
+    run(
         &service,
         &rig.space,
-        "CREATE TRIGGER sneaky AFTER INSERT ON items BEGIN \
-         UPDATE tinycloud_internal_store_seq SET seq = 99; END",
+        "CREATE TABLE tinycloud_internal_store_seq (id INTEGER PRIMARY KEY, seq INTEGER)",
     )
-    .await;
-    let _ = insert(&service, &rig.space, "b").await;
-
-    let seq = validate_working_copy(&rig.main_path()).unwrap();
-    assert!(
-        (11..=12).contains(&seq),
-        "only real writes moved the counter, it is {seq}"
-    );
-    assert_ne!(seq, 99);
-    // Ordinary user tables are untouched by the rule.
-    assert!(query(&service, &rig.space, "SELECT count(*) FROM items")
-        .await
-        .is_ok());
+    .await
+    .unwrap();
+    run(
+        &service,
+        &rig.space,
+        "INSERT INTO tinycloud_internal_store_seq VALUES (1, 99)",
+    )
+    .await
+    .unwrap();
+    run(
+        &service,
+        &rig.space,
+        "UPDATE tinycloud_internal_store_seq SET seq = 1000",
+    )
+    .await
+    .unwrap();
+    // Three more writes, counted by the file and by nothing the user holds.
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), 14);
+    assert_eq!(sink.notices().last().unwrap().seq, 14);
 }
 
 #[tokio::test]
@@ -417,16 +595,14 @@ async fn a_temp_table_cannot_stand_in_for_the_counter() {
     )
     .await;
     let _ = run(&service, &rig.space, "INSERT INTO temp.x VALUES(1,3)").await;
-    assert!(
-        run(
-            &service,
-            &rig.space,
-            "ALTER TABLE temp.x RENAME TO tinycloud_internal_store_seq"
-        )
-        .await
-        .is_err(),
-        "a rename to a reserved name is refused"
-    );
+    // With the counter in its own file this statement is just a rename of a
+    // temp table; it is neither refused nor able to reach the counter.
+    let _ = run(
+        &service,
+        &rig.space,
+        "ALTER TABLE temp.x RENAME TO tinycloud_internal_store_seq",
+    )
+    .await;
     insert(&service, &rig.space, "b").await.unwrap();
 
     // Statements that only touch temp tables are not counted, so a notice can
@@ -738,7 +914,7 @@ async fn replacing_an_actor_that_checkpoints_on_close_moves_the_counter_past_wha
     )
     .await
     .unwrap();
-    assert_eq!(read_seq_of(&rig.main_path()), 10, "it does not count");
+    assert_eq!(read_seq(&rig.main_path()).unwrap(), 10, "it does not count");
 
     gate.set(DB, true);
     insert(&service, &rig.space, "new").await.unwrap();
@@ -751,8 +927,4 @@ async fn replacing_an_actor_that_checkpoints_on_close_moves_the_counter_past_wha
     assert_eq!(sink.notices().last().unwrap().seq, 12);
     let wal = std::fs::metadata(rig.wal_path()).map_or(0, |m| m.len());
     assert!(wal > 0, "the write after the settle is in the WAL");
-}
-
-fn read_seq_of(path: &Path) -> u64 {
-    read_seq(&Connection::open(path).unwrap()).unwrap()
 }

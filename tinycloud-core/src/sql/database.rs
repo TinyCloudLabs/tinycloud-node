@@ -370,9 +370,9 @@ fn spawn_actor_inner(
         let mut conn = {
             let _context = request_telemetry::enter(initial_context);
             let opened = if store_master {
-                // The file exists and carries the counter, or no actor starts.
+                // The file exists and its seq file checks, or no actor starts.
                 storage::open_store_master_connection(&mode, policy.synchronous)
-                    .and_then(|connection| local_copy::read_seq(&connection).map(|_| connection))
+                    .and_then(|connection| local_copy::read_seq(&file_path).map(|_| connection))
             } else {
                 storage::open_connection(&mode, policy.synchronous)
             };
@@ -578,11 +578,11 @@ fn spawn_actor_inner(
                     let _ = response_tx.send(result);
                 }
                 DbMessage::LocalState { response_tx } => {
-                    let result = handle_local_state(&conn, &file_path);
+                    let result = handle_local_state(&file_path);
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Rotate { response_tx } => {
-                    let result = handle_rotate(&conn);
+                    let result = handle_rotate(&conn, &file_path);
                     if result.is_ok() {
                         // The WAL is in the main file now: its growth is on
                         // the disk and no longer pending.
@@ -619,18 +619,17 @@ fn spawn_actor_inner(
     }
 }
 
-/// The counter and file sizes of a store-master working copy.
-fn handle_local_state(
-    conn: &rusqlite::Connection,
-    file_path: &Path,
-) -> Result<LocalState, SqlError> {
+/// The counter and file sizes of a store-master working copy. The counter is
+/// read from its file, under the operation lock the caller holds: it is what
+/// the uploader publishes.
+fn handle_local_state(file_path: &Path) -> Result<LocalState, SqlError> {
     let len = |path: &Path| match std::fs::metadata(path) {
         Ok(meta) => Ok(meta.len()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(error) => Err(SqlError::Internal(error.to_string())),
     };
     Ok(LocalState {
-        seq: local_copy::read_seq(conn)?,
+        seq: local_copy::read_seq(file_path)?,
         wal_bytes: len(&PathBuf::from(format!("{}-wal", file_path.display())))?,
         main_bytes: len(file_path)?,
     })
@@ -643,14 +642,13 @@ fn handle_local_state(
 /// new snapshot, published at the new revision, and a revision is never
 /// reissued with different bytes. The content a reader sees is unchanged.
 ///
-/// The bump is its own transaction, before the checkpoint, so a rotation
-/// whose checkpoint is busy (a reader) fails and the retry bumps again. That
-/// is harmless: the counter is a monotonic revision, not a count, and a
-/// revision that was never published leaves a gap. What matters is that a
+/// The bump is first and fsynced, so a rotation whose checkpoint is busy (a
+/// reader) or interrupted by a crash leaves the counter ahead of the files:
+/// a gap, never a reuse. The retry bumps again. What matters is that a
 /// published revision is never reused, and a retry only moves it forward.
-fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
+fn handle_rotate(conn: &rusqlite::Connection, file_path: &Path) -> Result<(), SqlError> {
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-    local_copy::bump_seq(conn)?;
+    local_copy::bump_seq(file_path)?;
     let _timer = QueryTimer::new();
     let busy: i64 = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
@@ -661,33 +659,15 @@ fn handle_rotate(conn: &rusqlite::Connection) -> Result<(), SqlError> {
     Ok(())
 }
 
-/// The counter as it stands when a store-master request's transaction begins,
-/// before any of the user's SQL runs; `None` for every other database. On a
-/// failure the transaction is rolled back, as the caller expects none open.
-fn seq_before_request(
-    conn: &rusqlite::Connection,
-    authority: &SqlAuthority,
-) -> Result<Option<u64>, SqlError> {
-    if !authority.store_master() {
-        return Ok(None);
-    }
-    local_copy::read_seq(conn).map(Some).inspect_err(|_| {
-        let _ = conn.execute_batch("ROLLBACK");
-    })
-}
-
-/// Count one write on a store-master working copy, in the write's own
-/// transaction, or refuse it. Refused (retryably, nothing applied) when the
-/// WAL already holds [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates
-/// at a far smaller size, so reaching it means nothing is draining this WAL
-/// and the next write would only grow the shared disk. `seq_before` is the
-/// counter from [`seq_before_request`]: if the row is no longer that value
-/// the write is refused, however the change was made.
-fn count_store_master_write(
-    conn: &rusqlite::Connection,
-    file: &Path,
-    seq_before: Option<u64>,
-) -> Result<(), SqlError> {
+/// Count one write on a store-master working copy, or refuse it. Called after
+/// the write's statements ran and BEFORE its COMMIT: the counter is bumped and
+/// fsynced first (bump-before-write), so a crash between the two leaves a gap
+/// in the counter and never a revision reused with other bytes. Refused
+/// (retryably, nothing applied) when the WAL already holds
+/// [`local_copy::WAL_REFUSE_BYTES`]: the uploader rotates at a far smaller
+/// size, so reaching it means nothing is draining this WAL and the next write
+/// would only grow the shared disk.
+fn count_store_master_write(file: &Path) -> Result<(), SqlError> {
     let wal = match std::fs::metadata(format!("{}-wal", file.display())) {
         Ok(meta) => meta.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -696,10 +676,7 @@ fn count_store_master_write(
     if wal >= local_copy::WAL_REFUSE_BYTES {
         return Err(SqlError::DiskHeadroom);
     }
-    match seq_before {
-        Some(seq) => local_copy::bump_seq_from(conn, seq),
-        None => local_copy::bump_seq(conn),
-    }
+    local_copy::bump_seq(file).map(|_| ())
 }
 
 /// The nearest existing ancestor of `path`: where `statvfs` can be asked how
@@ -849,7 +826,6 @@ fn handle_message_without_growth_ctx(
         conn.execute_batch(GUARD_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let seq_before = seq_before_request(conn, authority)?;
     let result = handle_message_ctx(conn, request, caveats, authority, pragmas, ctx);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -857,10 +833,10 @@ fn handle_message_without_growth_ctx(
     if result.is_err() && conn.is_autocommit() {
         return result;
     }
-    // Store-master: count the write in the same transaction (TC-1491 P4.2a).
+    // Store-master: count the write before it commits (TC-1491 P4.2a).
     let result = match result {
         Ok(ok) if authority.store_master() && WriteProbe::of(conn).writing() => {
-            count_store_master_write(conn, ctx.file, seq_before).map(|()| ok)
+            count_store_master_write(ctx.file).map(|()| ok)
         }
         other => other,
     };
@@ -1349,7 +1325,6 @@ fn run_transaction(
         conn.execute_batch(REQUEST_BEGIN)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
-    let seq_before = seq_before_request(conn, authority)?;
     let result = handle_request_authorized(conn, request, caveats, authority, pragmas);
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -1359,11 +1334,11 @@ fn run_transaction(
     // `execute`) wrote nothing: there is nothing to check, reserve or hold.
     let result = result.and_then(|ok| {
         if WriteProbe::of(conn).writing() {
-            // Store-master: count the write in the same transaction, so a
-            // crash can never leave data without its seq or a seq without
-            // data (TC-1491 P4.2a).
+            // Store-master: bump and fsync the counter before the commit
+            // (bump-before-write), so a crash leaves a gap, never a reused
+            // revision (TC-1491 P4.2a).
             if authority.store_master() {
-                count_store_master_write(conn, ctx.file, seq_before)?;
+                count_store_master_write(ctx.file)?;
             }
             precommit_gate(conn, ctx, base).map(|pending| (ok, Some(pending)))
         } else {

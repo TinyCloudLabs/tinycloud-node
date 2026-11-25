@@ -1,8 +1,8 @@
-//! TC-1491 P4.2a: the constants, the in-file counter and the reserved
-//! namespace, without a service or an actor.
+//! TC-1491 P4.2a: the constants and the file-backed counter (bump-before-write),
+//! without a service or an actor.
 
 use super::*;
-use rusqlite::hooks::TransactionOperation;
+use rusqlite::Connection;
 
 fn working_copy(start_seq: u64) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -33,128 +33,92 @@ fn the_window_is_60_seconds_or_8_mib() {
 }
 
 #[test]
-fn reserved_names_are_the_prefix_in_any_case_and_nothing_shorter() {
-    assert!(is_reserved_name(SEQ_TABLE));
-    assert!(is_reserved_name("tinycloud_internal_anything"));
-    assert!(is_reserved_name("TINYCLOUD_INTERNAL_X"));
-    assert!(is_reserved_name("Tinycloud_Internal_"));
-    assert!(!is_reserved_name("tinycloud_internal"));
-    assert!(!is_reserved_name("tinycloud_"));
-    assert!(!is_reserved_name("items"));
-    assert!(!is_reserved_name(""));
-    // A multi-byte name shorter than the prefix in bytes must not panic.
-    assert!(!is_reserved_name("é"));
-}
-
-#[test]
-fn every_action_that_names_a_reserved_table_is_caught() {
-    let t = SEQ_TABLE;
-    let hit = [
-        AuthAction::Read {
-            table_name: t,
-            column_name: "seq",
-        },
-        AuthAction::Update {
-            table_name: t,
-            column_name: "seq",
-        },
-        AuthAction::Insert { table_name: t },
-        AuthAction::Delete { table_name: t },
-        AuthAction::DropTable { table_name: t },
-        AuthAction::CreateTable { table_name: t },
-        AuthAction::CreateTempTable { table_name: t },
-        AuthAction::AlterTable {
-            database_name: "main",
-            table_name: t,
-        },
-        AuthAction::CreateIndex {
-            index_name: "i",
-            table_name: t,
-        },
-        AuthAction::CreateTrigger {
-            trigger_name: "g",
-            table_name: t,
-        },
-        AuthAction::CreateView { view_name: t },
-        AuthAction::Analyze { table_name: t },
-        AuthAction::Reindex { index_name: t },
-        AuthAction::Pragma {
-            pragma_name: "table_info",
-            pragma_value: Some(t),
-        },
-    ];
-    for action in &hit {
-        assert!(names_reserved(action), "{action:?}");
-    }
-    let miss = [
-        AuthAction::Read {
-            table_name: "items",
-            column_name: "v",
-        },
-        AuthAction::Select,
-        AuthAction::Transaction {
-            operation: TransactionOperation::Begin,
-        },
-        AuthAction::Pragma {
-            pragma_name: "table_info",
-            pragma_value: Some("items"),
-        },
-        AuthAction::Pragma {
-            pragma_name: "foreign_keys",
-            pragma_value: None,
-        },
-    ];
-    for action in &miss {
-        assert!(!names_reserved(action), "{action:?}");
-    }
-}
-
-#[test]
 fn the_counter_starts_at_one_or_more_and_cannot_be_created_twice() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.db");
-    let conn = Connection::open(&path).unwrap();
-    assert!(init_seq(&conn, 0).is_err(), "seq 0 is not a revision");
-    init_seq(&conn, 7).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), 7);
-    assert!(init_seq(&conn, 9).is_err(), "never re-seeded");
-    assert_eq!(read_seq(&conn).unwrap(), 7);
-}
-
-#[test]
-fn bump_counts_inside_the_callers_transaction_and_rolls_back_with_it() {
-    let (_dir, path) = working_copy(10);
-    let conn = open_store_master_connection(&StorageMode::File(path), Synchronous::Full).unwrap();
-    conn.execute_batch("BEGIN").unwrap();
-    conn.execute("INSERT INTO items (v) VALUES ('a')", [])
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE items (v TEXT)")
         .unwrap();
-    bump_seq(&conn).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), 11);
-    conn.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(
-        read_seq(&conn).unwrap(),
-        10,
-        "the counter rolls back with its write"
+    assert!(
+        init_working_copy(&path, 0).is_err(),
+        "seq 0 is not a revision"
     );
-    let rows: i64 = conn
-        .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(rows, 0);
+    assert!(!seq_path(&path).exists(), "a refused start leaves nothing");
+    init_working_copy(&path, 7).unwrap();
+    assert_eq!(read_seq(&path).unwrap(), 7);
+    assert!(init_working_copy(&path, 9).is_err(), "never re-seeded");
+    assert_eq!(read_seq(&path).unwrap(), 7);
 }
 
 #[test]
-fn the_check_constraints_refuse_a_zero_or_second_row() {
-    let (_dir, path) = working_copy(3);
-    let conn = open_store_master_connection(&StorageMode::File(path), Synchronous::Full).unwrap();
-    assert!(conn
-        .execute(&format!("UPDATE {SEQ_TABLE} SET seq = 0"), [])
-        .is_err());
-    assert!(conn
-        .execute(
-            &format!("INSERT INTO {SEQ_TABLE} (id, seq) VALUES (2, 9)"),
-            []
-        )
-        .is_err());
+fn bump_moves_the_counter_by_one_in_its_own_file_and_leaves_the_database_alone() {
+    let (_dir, path) = working_copy(10);
+    let main_before = hash_file(&path).unwrap();
+    assert_eq!(bump_seq(&path).unwrap(), 11);
+    assert_eq!(bump_seq(&path).unwrap(), 12);
+    assert_eq!(read_seq(&path).unwrap(), 12);
+    assert_eq!(
+        std::fs::metadata(seq_path(&path)).unwrap().len(),
+        SEQ_RECORD_LEN as u64,
+        "the record never grows"
+    );
+    assert_eq!(
+        hash_file(&path).unwrap(),
+        main_before,
+        "the data is not touched"
+    );
+    // The database holds nothing of the node's.
+    let conn = Connection::open(&path).unwrap();
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(names, ["items"]);
+}
+
+#[test]
+fn a_counter_file_that_does_not_check_is_refused_and_not_repaired() {
+    let (_dir, path) = working_copy(10);
+    let seq = seq_path(&path);
+    let good = std::fs::read(&seq).unwrap();
+
+    let mut flipped = good.clone();
+    flipped[0] ^= 1; // a different counter under the old check
+    let mut torn = good.clone();
+    torn[12] ^= 0xff; // the check half torn
+    for (what, bytes) in [
+        ("a changed counter", flipped),
+        ("a torn check", torn),
+        ("a short file", good[..8].to_vec()),
+        ("an empty file", Vec::new()),
+        ("a long file", [good.clone(), vec![0]].concat()),
+    ] {
+        std::fs::write(&seq, &bytes).unwrap();
+        assert!(read_seq(&path).is_err(), "{what}");
+        assert!(bump_seq(&path).is_err(), "{what}");
+        assert!(validate_working_copy(&path).is_err(), "{what}");
+        assert_eq!(std::fs::read(&seq).unwrap(), bytes, "{what}: left as found");
+    }
+    std::fs::remove_file(&seq).unwrap();
+    assert!(read_seq(&path).is_err() && bump_seq(&path).is_err());
+    assert!(
+        !seq.exists(),
+        "a missing counter is never created by a bump"
+    );
+}
+
+#[test]
+fn a_counter_at_the_top_refuses_the_next_bump_instead_of_overflowing() {
+    let top = i64::MAX as u64;
+    let (_dir, path) = working_copy(top - 1);
+    assert_eq!(bump_seq(&path).unwrap(), top);
+    let error = bump_seq(&path).unwrap_err();
+    assert!(error.to_string().contains("exhausted"), "{error}");
+    assert_eq!(validate_working_copy(&path).unwrap(), top, "unchanged");
 }
 
 #[test]
@@ -163,10 +127,11 @@ fn init_working_copy_folds_the_wal_so_the_file_hash_is_the_anchor() {
     let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
     assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0);
     // Everything is in the main file: a plain copy of it alone is the database.
+    // (The counter is not in it: it is the seq file beside it.)
     let copy = path.with_extension("copy");
     std::fs::copy(&path, &copy).unwrap();
     let conn = Connection::open(&copy).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), 5);
+    assert_eq!(read_seq(&path).unwrap(), 5);
     let items: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name = 'items'",
@@ -204,7 +169,7 @@ fn a_store_master_connection_leaves_the_wal_when_it_closes() {
                 .unwrap();
         conn.execute("INSERT INTO items (v) VALUES ('a')", [])
             .unwrap();
-        bump_seq(&conn).unwrap();
+        bump_seq(&path).unwrap();
     }
     let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert!(len > 0, "closing did not checkpoint and delete the WAL");
@@ -226,7 +191,7 @@ fn the_checkpoint_hash_is_cached_by_file_identity_and_follows_the_file() {
                 .unwrap();
         conn.execute("INSERT INTO items (v) VALUES (zeroblob(100000))", [])
             .unwrap();
-        bump_seq(&conn).unwrap();
+        bump_seq(&path).unwrap();
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             r.get::<_, i64>(0)
         })
@@ -294,105 +259,6 @@ fn marks_are_kept_per_revision_and_bounded() {
 }
 
 #[test]
-fn a_temp_table_named_like_the_counter_does_not_shadow_it() {
-    let (_dir, path) = working_copy(10);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TEMP TABLE {SEQ_TABLE} (id INTEGER PRIMARY KEY, seq INTEGER); \
-         INSERT INTO temp.{SEQ_TABLE} VALUES (1, 3);"
-    ))
-    .unwrap();
-    assert_eq!(
-        read_seq(&conn).unwrap(),
-        10,
-        "the file's counter, not temp's"
-    );
-    bump_seq(&conn).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), 11);
-    let temp: i64 = conn
-        .query_row(&format!("SELECT seq FROM temp.{SEQ_TABLE}"), [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(temp, 3, "the temp table is the user's and is left alone");
-    assert_eq!(read_seq(&Connection::open(&path).unwrap()).unwrap(), 11);
-}
-
-#[test]
-fn a_rename_to_a_reserved_name_is_found_in_the_statement() {
-    use sqlparser::dialect::SQLiteDialect;
-    use sqlparser::parser::Parser;
-    let parse = |sql: &str| Parser::parse_sql(&SQLiteDialect {}, sql).unwrap();
-    for sql in [
-        "ALTER TABLE temp.x RENAME TO tinycloud_internal_store_seq",
-        "ALTER TABLE x RENAME TO TinyCloud_Internal_mine",
-        "ALTER TABLE x RENAME TO \"tinycloud_internal_a\"",
-        "ALTER TABLE main.x RENAME TO `TINYCLOUD_INTERNAL_b`",
-    ] {
-        assert!(renames_to_reserved(&parse(sql)), "{sql}");
-    }
-    for sql in [
-        "ALTER TABLE x RENAME TO y",
-        "ALTER TABLE x RENAME TO tinycloud_mine",
-        "ALTER TABLE x ADD COLUMN tinycloud_internal_c INTEGER",
-        "SELECT 1",
-    ] {
-        assert!(!renames_to_reserved(&parse(sql)), "{sql}");
-    }
-}
-
-#[test]
-fn a_counter_at_the_top_refuses_the_next_write_instead_of_overflowing() {
-    let top = i64::MAX as u64;
-    let (_dir, path) = working_copy(top - 1);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
-    bump_seq(&conn).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), top);
-
-    let error = bump_seq(&conn).unwrap_err();
-    assert!(error.to_string().contains("exhausted"), "{error}");
-    assert_eq!(read_seq(&conn).unwrap(), top, "still an integer, unchanged");
-    // Nothing, not even a hand-written update, can turn it into a REAL.
-    assert!(conn
-        .execute(&format!("UPDATE main.{SEQ_TABLE} SET seq = seq + 1"), [])
-        .is_err());
-    drop(conn);
-    assert_eq!(validate_working_copy(&path).unwrap(), top, "it still opens");
-}
-
-#[test]
-fn a_write_whose_counter_was_changed_inside_its_transaction_is_refused() {
-    let (_dir, path) = working_copy(10);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
-
-    // The counter as the request saw it at BEGIN: the bump is exactly +1.
-    let before = read_seq(&conn).unwrap();
-    bump_seq_from(&conn, before).unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), before + 1);
-
-    // Something moved the row between BEGIN and the bump, by any path: the
-    // write is refused, and the row is left as it was found.
-    conn.execute_batch("BEGIN").unwrap();
-    let before = read_seq(&conn).unwrap();
-    conn.execute(&format!("UPDATE main.{SEQ_TABLE} SET seq = seq + 5"), [])
-        .unwrap();
-    let error = bump_seq_from(&conn, before).unwrap_err();
-    assert!(error.to_string().contains("changed during"), "{error}");
-    conn.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(read_seq(&conn).unwrap(), before, "the rollback undoes it");
-
-    // A deleted row is its own error, not a silent success.
-    conn.execute_batch("BEGIN").unwrap();
-    conn.execute(&format!("DELETE FROM main.{SEQ_TABLE}"), [])
-        .unwrap();
-    assert!(bump_seq_from(&conn, before).is_err());
-    conn.execute_batch("ROLLBACK").unwrap();
-}
-
-#[test]
 fn a_space_that_is_forgotten_takes_every_database_of_it_and_no_other() {
     let files = LocalFiles::default();
     let dir = tempfile::tempdir().unwrap();
@@ -441,36 +307,75 @@ fn a_rotation_waits_for_a_wal_in_proportion_to_the_main_file_within_bounds() {
     const { assert!(WAL_BACKSTOP_BYTES < WAL_REFUSE_BYTES) };
 }
 
-#[test]
-fn a_database_that_already_has_a_table_of_the_counters_name_is_not_cut_over() {
-    // A Postgres-mode database can hold such a table (the prefix is reserved
-    // only for store-master), or be the import of an export of one.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("main.db");
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "journal_mode", "wal").unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE \"{}\" (id INTEGER PRIMARY KEY, seq INTEGER); \
-             INSERT INTO \"{}\" VALUES (1, 999)",
-            SEQ_TABLE.to_uppercase(),
-            SEQ_TABLE.to_uppercase()
-        ))
-        .unwrap();
+/// The three files of a working copy at one instant, as a crash leaves them:
+/// the next open replays the WAL and ignores whatever was not committed.
+fn crash_image(path: &std::path::Path, to: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(to).unwrap();
+    let image = to.join("main.db");
+    std::fs::copy(path, &image).unwrap();
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    if wal.exists() {
+        std::fs::copy(&wal, format!("{}-wal", image.display())).unwrap();
     }
-    let error = init_working_copy(&path, 10).unwrap_err();
-    assert!(
-        error.to_string().contains("already has a table named"),
-        "{error}"
-    );
-    // Nothing was adopted or touched.
-    let conn = Connection::open(&path).unwrap();
-    let planted: i64 = conn
-        .query_row(
-            &format!("SELECT seq FROM \"{}\"", SEQ_TABLE.to_uppercase()),
-            [],
-            |r| r.get(0),
-        )
+    std::fs::copy(seq_path(path), seq_path(&image)).unwrap();
+    image
+}
+
+fn recovered(image: &std::path::Path) -> (u64, i64) {
+    let rows = Connection::open(image)
+        .unwrap()
+        .query_row("SELECT count(*) FROM items", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(planted, 999);
+    (read_seq(image).unwrap(), rows)
+}
+
+#[test]
+fn a_crash_at_each_step_of_one_write_leaves_a_gap_at_worst_and_no_reused_seq() {
+    let (dir, path) = working_copy(10);
+    let conn =
+        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    // A small page cache, so the uncommitted write spills into the WAL: a
+    // crash in the middle of a write leaves uncommitted frames behind.
+    conn.pragma_update(None, "cache_size", 10).unwrap();
+    let images = dir.path().join("images");
+
+    // The order the actor follows: statements, bump (fsynced), commit.
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute("INSERT INTO items (v) VALUES (zeroblob(2000000))", [])
+        .unwrap();
+    let mid_write = crash_image(&path, &images.join("mid"));
+    bump_seq(&path).unwrap();
+    let bumped = crash_image(&path, &images.join("bumped"));
+    conn.execute_batch("COMMIT").unwrap();
+    let committed = crash_image(&path, &images.join("committed"));
+
+    let wal_of = |image: &std::path::Path| {
+        std::fs::metadata(format!("{}-wal", image.display()))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    assert!(
+        wal_of(&mid_write) > 0,
+        "the write had spilled uncommitted frames into the WAL"
+    );
+    // Crash mid-write, before the bump: nothing of the write, counter as was.
+    assert_eq!(recovered(&mid_write), (10, 0));
+    // Crash after the bump, before the commit: the data is as it was, the
+    // counter is one ahead. A gap.
+    assert_eq!(recovered(&bumped), (11, 0));
+    // Crash after the commit: the data and its counter.
+    assert_eq!(recovered(&committed), (11, 1));
+
+    // Restart from the gap: the next write gets 12. 11 is never issued for
+    // different bytes (here it never names any bytes at all).
+    let after_gap =
+        open_store_master_connection(&StorageMode::File(bumped.clone()), Synchronous::Full)
+            .unwrap();
+    after_gap.execute_batch("BEGIN").unwrap();
+    after_gap
+        .execute("INSERT INTO items (v) VALUES ('next')", [])
+        .unwrap();
+    assert_eq!(bump_seq(&bumped).unwrap(), 12);
+    after_gap.execute_batch("COMMIT").unwrap();
+    assert_eq!(recovered(&bumped), (12, 1));
 }

@@ -860,7 +860,7 @@ impl SqlObjectStore for CountingStore {
 }
 
 fn local_seq(rig: &Rig) -> u64 {
-    crate::sql::store::local::read_seq(&Connection::open(rig.main_path()).unwrap()).unwrap()
+    crate::sql::store::local::read_seq(&rig.main_path()).unwrap()
 }
 
 /// Waits until the frontier has reached the counter and the counter holds
@@ -988,4 +988,32 @@ async fn a_large_checkpoint_waits_for_proportionally_more_wal_before_it_is_rotat
         "the write and a rotation"
     );
     assert!(!after.has_delta);
+}
+
+#[tokio::test]
+async fn the_published_head_is_the_seq_file_read_under_the_lock() {
+    // (2) The revision the uploader publishes is the one in the seq file when
+    // it looks, not one an actor remembers: moving the file from outside moves
+    // the head, and the bytes (cid) it is published with are the file's.
+    let rig = Rig::new("head-from-file").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    let space = rig.space.to_string();
+    let db = DbRef {
+        space: &space,
+        db_id: DB,
+    };
+    insert(&service, &rig.space, "a").await.unwrap();
+    let first = source.head(&db).await.unwrap().unwrap();
+    assert_eq!(first.revision, 11);
+    assert_eq!(first.revision as u64, local_seq(&rig));
+
+    for _ in 0..4 {
+        crate::sql::store::local::bump_seq(&rig.main_path()).unwrap();
+    }
+    let second = source.head(&db).await.unwrap().unwrap();
+    assert_eq!(second.revision, 15, "the file says 15");
+    assert_eq!(second.cid, first.cid, "the same bytes, a later number");
 }
