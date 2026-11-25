@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Changes
+- Production compose (log shipper): `node_request` events with status 500 and above now keep `pool_wait_ms`, `query_time_ms` and `query_count`, the same three fields the node already logs on every request line, with the same bounds as below 400; 400 to 499 still carry none. A value of the wrong type or out of range is dropped and the event still ships. On a 5xx the timings include a cut or failed wait (the 55 s deadline drops the handler future, and its pool wait is counted up to the cut); SQL-service work runs on a spawned task, so on a cut its timers can read zero or partial. To stay within the 600 MB capped reserve (the line grows by 112 bytes) the `node_request_5xx` cap goes from 10 to 8 per minute per sidecar instance; worst case 596,203,200 bytes NDJSON, 597,888,000 json-array. No node change. Details: TC-4308.
 - `POST /delegate` and `POST /revoke` refuse a validly signed request that has no standing, or is outside its signed time window, before taking any lock. Before, it took the guards of the delegation chain it cited, queued for the write order of the spaces it named and, on PostgreSQL, held a pooled connection in an open transaction until it was refused. Now it is refused at once:
   - a delegation whose issuer has no applicable authority for its requested capabilities;
   - a revocation by someone who may not revoke its target, or of a target that is not stored;

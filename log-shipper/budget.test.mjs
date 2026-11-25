@@ -44,6 +44,20 @@ test('DB accounting sizes only the status < 400 node line; the capped node line 
   assert.ok(serializedEventBytes(node) > serializedEventBytes(nodeCapped));
 });
 
+// test-ruling: TC-4308 log-shipper/budget.test.mjs new test only (2026-11-25)
+test('the capped 5xx node line carries the DB accounting at the schema bounds; the 4xx line still carries none', () => {
+  const { node, nodeCapped, nodeCapped5xx } = representativeEvents;
+  for (const key of ['pool_wait_ms', 'query_time_ms', 'query_count']) {
+    assert.equal(Object.hasOwn(nodeCapped5xx, key), true);
+    assert.equal(nodeCapped5xx[key], node[key]);
+    const field = nodeSchema.fields[key];
+    assert.ok(nodeCapped5xx[key] >= field.min && nodeCapped5xx[key] <= field.max);
+    assert.equal(Object.hasOwn(nodeCapped, key), false);
+  }
+  assert.ok(nodeCapped5xx.status >= 500);
+  assert.ok(serializedEventBytes(nodeCapped5xx) > serializedEventBytes(node));
+});
+
 test('exact serialized bytes account for newlines or singleton JSON array overhead', () => {
   for (const row of Object.values(representativeEvents)) {
     assert.equal(serializedEventBytes(row, 'ndjson'), Buffer.byteLength(`${JSON.stringify(row)}\n`));
@@ -155,17 +169,17 @@ test('capped classes: worst case is cap x worst-valid bytes x 43,200 minutes plu
     assert.equal(budget.totalBytes30Days, budget.requestBytes30Days + budget.diagnosticReserveBytes30Days);
     assert.equal(budget.totalWithCappedBytes30Days, budget.totalBytes30Days + budget.cappedReserveBytes30Days);
   }
-  // The figures quoted in the runbook: 10 per minute for each 5xx class, 3 per minute for each 4xx class.
-  assert.deepEqual(Object.entries(CAPPED_CLASSES).map(([name, row]) => [name, row.capPerMinute]), [['db_failure_5xx', 10], ['node_request_5xx', 10], ['ingress_request_5xx', 10], ['node_request_4xx', 3], ['ingress_request_4xx', 3]]);
+  // The figures quoted in the runbook: 10 per minute for db_failure_5xx and ingress_request_5xx, 8 for node_request_5xx (TC-4308), 3 per minute for each 4xx class.
+  assert.deepEqual(Object.entries(CAPPED_CLASSES).map(([name, row]) => [name, row.capPerMinute]), [['db_failure_5xx', 10], ['node_request_5xx', 8], ['ingress_request_5xx', 10], ['node_request_4xx', 3], ['ingress_request_4xx', 3]]);
   const ndjson = calculateBudget({ requestsPerMinute: 0 });
   assert.equal(ndjson.cappedClasses.node_request_4xx.bytes30Days, 3 * 439 * 43200);
   assert.equal(ndjson.cappedClasses.ingress_request_4xx.bytes30Days, 3 * 223 * 43200);
-  // test-ruling: TC-3834 log-shipper/budget.test.mjs worst-case figures grow by the 5xx error_code (468-byte node 5xx line); still within 600 MB (2026-11-24)
-  assert.equal(ndjson.cappedEventBytes30Days, (10 * (402 + 468 + 223) + 3 * (439 + 223)) * 43200);
-  assert.equal(ndjson.cappedEventBytes30Days, 557_971_200);
+  // test-ruling: TC-4308 (Naomi 13:22Z, option A, per ruling-request.md) log-shipper/budget.test.mjs 2d: node_request_5xx cap 10 -> 8, 580-byte node 5xx line with the DB accounting; reserve 596,203,200 NDJSON / 597,888,000 json-array (the ruling's hand figure 597,542,400 is not what budget.mjs computes)
+  assert.equal(ndjson.cappedEventBytes30Days, (10 * (402 + 223) + 8 * 580 + 3 * (439 + 223)) * 43200);
+  assert.equal(ndjson.cappedEventBytes30Days, 556_243_200);
   assert.equal(ndjson.droppedCountBytes30Days, 39_960_000);
-  assert.equal(ndjson.cappedReserveBytes30Days, 597_931_200);
-  assert.equal(calculateBudget({ requestsPerMinute: 0, framing: 'json-array' }).cappedReserveBytes30Days, 599_702_400);
+  assert.equal(ndjson.cappedReserveBytes30Days, 596_203_200);
+  assert.equal(calculateBudget({ requestsPerMinute: 0, framing: 'json-array' }).cappedReserveBytes30Days, 597_888_000);
   // The 4xx cap is the largest whole number that fits: one more per minute per 4xx class exceeds the reserve.
   assert.ok(ndjson.cappedReserveBytes30Days + (439 + 223) * 43200 > CAPPED_ALLOCATION_BYTES);
 });
@@ -181,15 +195,17 @@ test('a node 5xx line is sized with the longest error_code, and no code may outg
   assert.equal(new Set(codes).size, codes.length);
   const { nodeCapped, nodeCapped5xx } = representativeEvents;
   assert.equal(nodeCapped5xx.error_code.length, Math.max(...codes.map(code => code.length)));
-  const { error_code, ...rest } = nodeCapped5xx;
+  // test-ruling: TC-4308 (Naomi 13:22Z, option A, per ruling-request.md) log-shipper/budget.test.mjs 2c: the 5xx representative also carries the DB accounting
+  const { error_code, pool_wait_ms, query_time_ms, query_count, ...rest } = nodeCapped5xx;
   assert.deepEqual(rest, nodeCapped);
   assert.equal(Object.hasOwn(nodeCapped, 'error_code'), false);
-  // MAX_ERROR_CODE_LEN is derived from the reserve, not chosen: the longest code that keeps the worst case within
-  // CAPPED_ALLOCATION_BYTES under every framing. A cap, allocation or representative change moves it and fails here.
+  // MAX_ERROR_CODE_LEN is the node's bound (tinycloud-core), not derived from the reserve; it must stay within what the
+  // reserve can hold: the longest code that keeps the worst case within CAPPED_ALLOCATION_BYTES under every framing.
+  // A cap, allocation or representative change moves that room and fails here. TC-4308 (cap 8, DB accounting): room for 19 bytes.
   const perByte = CAPPED_CLASSES.node_request_5xx.capPerMinute * MINUTES_30_DAYS;
   const fits = framing => error_code.length + Math.floor((CAPPED_ALLOCATION_BYTES - calculateBudget({ requestsPerMinute: 0, framing }).cappedReserveBytes30Days) / perByte);
-  assert.equal(MAX_ERROR_CODE_LEN, Math.min(fits('ndjson'), fits('json-array')));
-  assert.equal(fits('json-array'), 13);
+  assert.ok(MAX_ERROR_CODE_LEN <= Math.min(fits('ndjson'), fits('json-array')));
+  assert.equal(fits('json-array'), 19);
 });
 
 test('invalid numeric budgets fail rather than hiding impossible volume', () => {
