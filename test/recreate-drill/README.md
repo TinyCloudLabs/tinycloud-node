@@ -92,11 +92,11 @@ names under `/data/sql` (relative paths, never content), never a value or a key.
 |---|---|---|
 | Ledger logic (`drill-core.test.ts`, 10 tests) and the TypeScript types | any machine with node | ran locally |
 | `drill.sh` control flow against a fake `docker`/`curl`/`npx` (`test-drill.sh`, 7 cases and the CI guard) | any machine with bash | ran locally |
-| The real drill, three layouts | CI (`.github/workflows/recreate-drill.yml`, manual dispatch or a change under `test/recreate-drill/`) or a Docker host | **first run: 45501421888 attempt 2, ran to a real result.** Data checks passed in both layouts it had; the three working-copy checks failed because the probe's premise was wrong (a small database has no file under the default config, see "What the first real run found"). Fixed by the `today` / `files` / `volume` split; the fixed script has not been run yet. |
+| The real drill, three layouts | CI (`.github/workflows/recreate-drill.yml`, manual dispatch or a change under `test/recreate-drill/`) or a Docker host | **first run: 45501421888 attempt 2, ran to a real result.** Data checks passed in both layouts it had; the three working-copy checks failed because the probe's premise was wrong (a small database has no file under the default config, see "What the first real run found"). Fixed by the `today` / `files` / `volume` split. **Green: run 45526762964 (head d4c0228c), all three layouts, "DRILL PASSED".** The script then printed the sorted file names next to each count; run 45538274679 (head d56cb25d) is green with them. A run for the head that carries this README line is cited in the PR body, not here. |
 
 ## Known gaps, stated plainly
 
-* **Both layouts are Postgres-master.** P4.2a does not cut any database over, so this
+* **All three layouts are Postgres-master.** P4.2a does not cut any database over, so this
   drill cannot yet lose a write that only the volume holds. It proves the baseline
   (re-hydration works) and that the volume keeps the working copy. The store-master
   version (write to a cut-over database, kill, recreate, read back from the volume with
