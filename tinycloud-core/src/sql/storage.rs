@@ -67,10 +67,13 @@ pub fn open_connection(
 /// they are. The only checkpoint a store-master database gets is the
 /// explicit TRUNCATE the uploader runs under the operation lock (a rotation:
 /// it publishes the new main file as a snapshot).
-pub fn open_store_master_connection(
-    mode: &StorageMode,
-    synchronous: Synchronous,
-) -> Result<Connection, SqlError> {
+///
+/// Always `synchronous = FULL`, whatever the node's durability policy says: a
+/// commit that was answered, published at seq S and counted in the seq file
+/// must survive a power loss. Under NORMAL a WAL commit is not fsynced, so a
+/// power cut could drop it while the seq file (fsynced) and the store keep S:
+/// the local bytes and the store would disagree about what S is.
+pub fn open_store_master_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
     let StorageMode::File(path) = mode else {
         return Err(SqlError::Internal(
             "a store-master database must be file-backed".into(),
@@ -79,7 +82,7 @@ pub fn open_store_master_connection(
     if !path.is_file() {
         return Err(SqlError::Unavailable);
     }
-    let conn = open_connection(mode, synchronous)?;
+    let conn = open_connection(mode, Synchronous::Full)?;
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
         true,

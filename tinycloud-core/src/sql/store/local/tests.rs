@@ -164,9 +164,7 @@ fn a_store_master_connection_leaves_the_wal_when_it_closes() {
     let (_dir, path) = working_copy(1);
     let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
     {
-        let conn =
-            open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full)
-                .unwrap();
+        let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
         conn.execute("INSERT INTO items (v) VALUES ('a')", [])
             .unwrap();
         bump_seq(&path).unwrap();
@@ -186,9 +184,7 @@ fn the_checkpoint_hash_is_cached_by_file_identity_and_follows_the_file() {
     assert_eq!(files.checkpoint_cid(&key, &path).unwrap(), first);
     // A checkpoint changes the main file: a new length or mtime, a new hash.
     {
-        let conn =
-            open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full)
-                .unwrap();
+        let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
         conn.execute("INSERT INTO items (v) VALUES (zeroblob(100000))", [])
             .unwrap();
         bump_seq(&path).unwrap();
@@ -332,8 +328,7 @@ fn recovered(image: &std::path::Path) -> (u64, i64) {
 #[test]
 fn a_crash_at_each_step_of_one_write_leaves_a_gap_at_worst_and_no_reused_seq() {
     let (dir, path) = working_copy(10);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
     // A small page cache, so the uncommitted write spills into the WAL: a
     // crash in the middle of a write leaves uncommitted frames behind.
     conn.pragma_update(None, "cache_size", 10).unwrap();
@@ -368,9 +363,7 @@ fn a_crash_at_each_step_of_one_write_leaves_a_gap_at_worst_and_no_reused_seq() {
 
     // Restart from the gap: the next write gets 12. 11 is never issued for
     // different bytes (here it never names any bytes at all).
-    let after_gap =
-        open_store_master_connection(&StorageMode::File(bumped.clone()), Synchronous::Full)
-            .unwrap();
+    let after_gap = open_store_master_connection(&StorageMode::File(bumped.clone())).unwrap();
     after_gap.execute_batch("BEGIN").unwrap();
     after_gap
         .execute("INSERT INTO items (v) VALUES ('next')", [])
@@ -393,8 +386,7 @@ fn scanned(main: &std::path::Path) -> u64 {
 #[test]
 fn the_committed_wal_length_is_what_the_frame_scan_finds_and_not_the_file_length() {
     let (_dir, path) = working_copy(10);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
     conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     conn.pragma_update(None, "cache_size", 10).unwrap();
     let file_len = || {
@@ -447,8 +439,7 @@ fn the_committed_wal_length_is_what_the_frame_scan_finds_and_not_the_file_length
 #[test]
 fn without_a_usable_wal_index_the_committed_length_is_scanned() {
     let (dir, path) = working_copy(10);
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.clone()), Synchronous::Full).unwrap();
+    let conn = open_store_master_connection(&StorageMode::File(path.clone())).unwrap();
     conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
     conn.pragma_update(None, "cache_size", 10).unwrap();
     conn.execute("INSERT INTO items (v) VALUES ('a')", [])
@@ -479,4 +470,45 @@ fn without_a_usable_wal_index_the_committed_length_is_scanned() {
     long[64..68].copy_from_slice(&u32::MAX.to_ne_bytes());
     std::fs::write(&shm, &long).unwrap();
     assert_eq!(committed_wal_bytes(&image).unwrap(), committed);
+}
+
+#[test]
+fn a_store_master_connection_is_always_synchronous_full() {
+    // `open_store_master_connection` takes no policy: a power loss must not
+    // drop a commit already published at seq S, so NORMAL is not an option.
+    let (_dir, path) = working_copy(1);
+    let conn = open_store_master_connection(&StorageMode::File(path)).unwrap();
+    let level: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(level, 2, "FULL");
+}
+
+#[test]
+fn creating_the_seq_file_leaves_no_temp_file_and_a_leftover_one_is_never_the_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE items (v TEXT)")
+        .unwrap();
+    // What an `init_working_copy` that died before the link leaves.
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq_path(&path).display()));
+    std::fs::write(&tmp, b"short").unwrap();
+    assert!(read_seq(&path).is_err(), "a temp file is not a counter");
+    assert!(validate_working_copy(&path).is_err());
+    assert!(!seq_path(&path).exists());
+
+    init_working_copy(&path, 5).unwrap();
+    assert_eq!(read_seq(&path).unwrap(), 5);
+    assert!(!tmp.exists(), "the leftover is replaced and removed");
+    assert_eq!(
+        std::fs::read(seq_path(&path)).unwrap().len(),
+        SEQ_RECORD_LEN
+    );
+
+    // A second run refuses, keeps the counter and leaves no temp file.
+    assert!(init_working_copy(&path, 9).is_err());
+    assert_eq!(read_seq(&path).unwrap(), 5);
+    assert!(!tmp.exists());
 }

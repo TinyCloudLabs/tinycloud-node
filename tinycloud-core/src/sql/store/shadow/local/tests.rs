@@ -1086,7 +1086,9 @@ impl ShadowMetrics for Blocks {
 /// A volume whose seq file went back to an older copy while the main file
 /// and the store moved on: three writes published (11, 12, 13), the seq file
 /// put back to what it held after `rewind_to`, a fourth write.
-async fn after_the_seq_file_went_back(rewind_to: u64) -> (Vec<&'static str>, Frontier) {
+async fn after_the_seq_file_went_back(
+    rewind_to: u64,
+) -> (Vec<&'static str>, Frontier, usize, usize) {
     let rig = Rig::new("seq-went-back").await;
     rig.create_working_copy(10);
     rig.make_store_master().await;
@@ -1115,6 +1117,7 @@ async fn after_the_seq_file_went_back(rewind_to: u64) -> (Vec<&'static str>, Fro
     assert_eq!(frontier_now(&rig).await.unwrap().last_seq, 13);
     std::fs::write(&seq, &records[rewind_to as usize - 11]).unwrap();
 
+    let before = store.len();
     let blocks = Arc::new(Blocks::default());
     let board = board(&rig);
     let service = rig.service(board.clone(), DurabilityPolicy::default());
@@ -1122,7 +1125,7 @@ async fn after_the_seq_file_went_back(rewind_to: u64) -> (Vec<&'static str>, Fro
         ShadowDeps {
             control: rig.control.clone(),
             manifest: Arc::new(DbSqlManifest::new(rig.control.clone())),
-            store,
+            store: store.clone(),
             source: source(&rig, &service),
             disk: DiskBudget::new(scratch.path(), 512 * 1024 * 1024),
             board,
@@ -1134,7 +1137,7 @@ async fn after_the_seq_file_went_back(rewind_to: u64) -> (Vec<&'static str>, Fro
     tokio::time::sleep(Duration::from_secs(2)).await;
     uploader.drain(Duration::from_secs(5)).await;
     let seen = blocks.0.lock().unwrap().clone();
-    (seen, frontier_now(&rig).await.unwrap())
+    (seen, frontier_now(&rig).await.unwrap(), before, store.len())
 }
 
 #[tokio::test]
@@ -1142,9 +1145,14 @@ async fn a_seq_file_older_than_the_published_frontier_blocks_the_database_and_pu
     // The fourth write is numbered 12 again, a number the store already holds
     // for other bytes. The uploader sees a revision below its frontier and
     // blocks the database (`regressed`); the frontier does not move.
-    let (blocks, frontier) = after_the_seq_file_went_back(11).await;
+    let (blocks, frontier, before, after) = after_the_seq_file_went_back(11).await;
     assert_eq!(blocks, ["regressed"]);
     assert_eq!(frontier.last_seq, 13);
+    // Nothing was written to the store for the number it already holds, or
+    // for any other: the uploader never publishes a seq at or below its
+    // frontier (`plan_work` answers `None`). This is the backstop the design
+    // doc (5.3) leans on for a restored or cut-over seq file.
+    assert_eq!(after, before, "no object was put for the fourth write");
 }
 
 #[tokio::test]
@@ -1490,4 +1498,24 @@ async fn a_rolled_back_spill_neither_rotates_nor_skips_the_window_nor_republishe
         bytes < 1024 * 1024,
         "{bytes} bytes uploaded: the checkpoint was republished"
     );
+}
+
+#[tokio::test]
+async fn the_reviewers_two_amplification_cases_upload_nothing_for_the_rolled_back_bytes() {
+    // Bobbie's probes against 9e38f2b0: a 24 MiB checkpoint with a 17 MiB
+    // rolled-back spill before each of 5 one-row commits (126 MB uploaded,
+    // against 20 KB without the spill), and a 60 MiB checkpoint with a 36 MiB
+    // spill (315 MB).
+    for (main, spill, rounds) in [(24, 17, 5), (60, 36, 2)] {
+        let (bytes, counter_moved) = cost_of_rolled_back_spills(main, spill, rounds).await;
+        eprintln!(
+            "MEASURED, {main} MiB checkpoint, {rounds} rounds of a {spill} MiB rolled-back \
+             spill + 1 row: {bytes} bytes uploaded, counter moved {counter_moved}"
+        );
+        assert_eq!(counter_moved, rounds, "one number per write, no rotation");
+        assert!(
+            bytes < 1024 * 1024,
+            "{bytes} bytes uploaded for {main}/{spill}: the checkpoint was republished"
+        );
+    }
 }

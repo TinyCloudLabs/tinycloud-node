@@ -983,12 +983,7 @@ pub fn check_wal(path: &Path, db_page_size: u32) -> Result<u64, MaterialiseError
 ///
 /// Reads the whole file once (the same conditions as [`check_wal`], but where
 /// that refuses, this stops): header magic, page size and checksum, then
-/// frames while salts and the cumulative checksum hold. The format version
-/// (header bytes 4..8) has no check of its own: it is inside the 24 bytes the
-/// header checksum covers, and that checksum seeds the frame chain, so a header
-/// of another version verifies no frame and the answer is 0, as `check_wal`'s
-/// explicit check refuses (test:
-/// `a_wal_of_another_format_version_has_no_committed_length_without_a_version_check`).
+/// frames while salts and the cumulative checksum hold.
 pub fn committed_wal_len(path: &Path) -> std::io::Result<u64> {
     let file = match File::open(path) {
         Ok(file) => file,

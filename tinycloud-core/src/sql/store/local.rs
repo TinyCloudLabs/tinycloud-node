@@ -50,7 +50,6 @@ use super::mode::{read_mode, ModeError, StoreMode};
 use super::shadow::DbKey;
 use crate::database_artifacts::WalMark;
 use crate::models::sql_store_mode as mode_row;
-use crate::sql::durability::Synchronous;
 use crate::sql::storage::{open_store_master_connection, StorageMode};
 use crate::sql::types::SqlError;
 
@@ -264,16 +263,16 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
 /// Turn an existing local database file into a store-master working copy:
 /// fold the WAL into the main file, so the file's hash is the lineage anchor,
 /// and create the seq file at `start_seq` (at cutover: above the frozen
-/// Postgres revision). Refuses `0` (the uploader's revisions start at 1) and
-/// refuses to run twice. The caller (the cutover job, P4.4) holds the
-/// database's operation lock with no actor open.
+/// Postgres revision), atomically: a temp file, fsynced, linked into place. A
+/// crash mid-run leaves no seq file or the whole one. Refuses `0` (the
+/// uploader's revisions start at 1) and refuses to run twice. The caller (the
+/// cutover job, P4.4) holds the database's operation lock with no actor open.
 pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
         .filter(|seq| *seq >= 1)
         .ok_or_else(|| SqlError::Internal("store-master seq must start at 1 or more".into()))?;
-    let conn =
-        open_store_master_connection(&StorageMode::File(path.to_path_buf()), Synchronous::Full)?;
+    let conn = open_store_master_connection(&StorageMode::File(path.to_path_buf()))?;
     let busy: i64 = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
         .map_err(sqlite)?;
@@ -281,19 +280,34 @@ pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
         return Err(SqlError::Internal("Database checkpoint is busy".into()));
     }
     let seq = seq_path(path);
+    // Written whole to a temp file, fsynced, then linked into place and the
+    // directory fsynced: a crash leaves no seq file (the database stays fenced
+    // and this can be run again) or the whole one, never a short one. A temp
+    // file an earlier run died with is ours; start over. `hard_link` refuses
+    // when the seq file exists, so a second run never replaces a counter.
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq.display()));
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(error)),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&seq)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                SqlError::Internal("the store-master seq file already exists".into())
-            } else {
-                io(error)
-            }
-        })?;
+        .open(&tmp)
+        .map_err(io)?;
     file.write_all(&seq_record(start as u64)).map_err(io)?;
     file.sync_all().map_err(io)?;
+    drop(file);
+    let linked = std::fs::hard_link(&tmp, &seq);
+    std::fs::remove_file(&tmp).map_err(io)?;
+    linked.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            SqlError::Internal("the store-master seq file already exists".into())
+        } else {
+            io(error)
+        }
+    })?;
     if let Some(parent) = seq.parent() {
         std::fs::File::open(parent)
             .and_then(|dir| dir.sync_all())

@@ -371,7 +371,7 @@ fn spawn_actor_inner(
             let _context = request_telemetry::enter(initial_context);
             let opened = if store_master {
                 // The file exists and its seq file checks, or no actor starts.
-                storage::open_store_master_connection(&mode, policy.synchronous)
+                storage::open_store_master_connection(&mode)
                     .and_then(|connection| local_copy::read_seq(&file_path).map(|_| connection))
             } else {
                 storage::open_connection(&mode, policy.synchronous)
