@@ -104,6 +104,17 @@ impl SqlService {
         self.acquire_operation(space, db_name).await
     }
 
+    /// Stop the actor of `db_name`, if any, so a test can put its files back
+    /// the way a restart would find them.
+    #[cfg(test)]
+    pub(crate) async fn stop_actor(&self, space: &SpaceId, db_name: &str) {
+        let key = (space.to_string(), db_name.to_string());
+        let handle = self.databases.remove(&key).map(|(_, handle)| handle);
+        if let Some(handle) = handle {
+            handle.shutdown().await.unwrap();
+        }
+    }
+
     /// The actor of a store-master working copy, started on the existing
     /// local file. Never creates, hydrates or seeds the file. The caller
     /// holds the operation lock.

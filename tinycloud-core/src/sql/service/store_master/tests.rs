@@ -559,6 +559,51 @@ async fn no_database_or_space_name_makes_a_path_that_is_another_ones_seq_file() 
 }
 
 #[tokio::test]
+async fn a_missing_or_damaged_seq_file_refuses_every_write_and_is_never_reset() {
+    // The two files disagree about whether the database exists: a main file
+    // with no usable seq file. Every write is refused and rolled back, a
+    // cold start refuses to open the database at all, and nothing is
+    // recreated, repaired or reset to a number: the file stays as found.
+    let rig = Rig::new("seq-damaged").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+    let seq = seq_path(&rig.main_path());
+    let good = std::fs::read(&seq).unwrap();
+
+    for damage in [Some(vec![0u8; 5]), Some(vec![0u8; 16]), None] {
+        match &damage {
+            Some(bytes) => std::fs::write(&seq, bytes).unwrap(),
+            None => std::fs::remove_file(&seq).unwrap(),
+        }
+        assert!(
+            insert(&service, &rig.space, "x").await.is_err(),
+            "a running actor, {damage:?}"
+        );
+        let cold = rig.service(Arc::new(ProbeSink::default()), plain());
+        assert!(
+            insert(&cold, &rig.space, "x").await.is_err(),
+            "cold, {damage:?}"
+        );
+        assert!(query(&cold, &rig.space, "SELECT count(*) FROM items")
+            .await
+            .is_err());
+        match &damage {
+            Some(bytes) => assert_eq!(&std::fs::read(&seq).unwrap(), bytes),
+            None => assert!(!seq.exists(), "never recreated"),
+        }
+    }
+
+    // Put the real file back: nothing was committed meanwhile, and the
+    // counter carries on from where it was.
+    std::fs::write(&seq, &good).unwrap();
+    assert_eq!(count(&service, &rig.space).await, 1);
+    insert(&service, &rig.space, "b").await.unwrap();
+    assert_eq!(read_seq(&rig.main_path()).unwrap(), 12);
+}
+
+#[tokio::test]
 async fn without_a_gate_or_a_mode_row_a_database_is_served_as_before() {
     use crate::database_artifacts::DatabaseArtifactRepository;
 

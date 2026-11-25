@@ -26,7 +26,9 @@ use crate::sql::store::shadow::budget::DiskBudget;
 use crate::sql::store::shadow::machine::{
     plan_delta, step, BlockReason, Command, DbMachine, Event, Phase, Policy,
 };
-use crate::sql::store::shadow::metrics::{NoopMetrics, RestoreResult};
+use crate::sql::store::shadow::metrics::{
+    NoopMetrics, NoticeResult, PublishResult, RestoreResult, ShadowMetrics, UploadResult,
+};
 use crate::sql::store::shadow::restore::{check_database, RestoreDeps};
 use crate::sql::store::shadow::scheduler::{spawn, SchedulerConfig, SchedulerHandle, ShadowDeps};
 use crate::sql::store::shadow::NoticeBoard;
@@ -1055,4 +1057,148 @@ async fn the_seq_file_is_read_and_written_only_under_the_operation_lock() {
 
     insert(&service, &rig.space, "b").await.unwrap();
     assert_eq!(source.head(&db).await.unwrap().unwrap().revision, 12);
+}
+
+// ---- two files that disagree: the uploader refuses, it does not guess ------------
+
+/// Remembers the reasons a database was blocked for.
+#[derive(Default)]
+struct Blocks(Mutex<Vec<&'static str>>);
+
+impl ShadowMetrics for Blocks {
+    fn notice(&self, _: NoticeResult) {}
+    fn upload(&self, _: &'static str, _: UploadResult, _: u64) {}
+    fn publish(&self, _: PublishResult) {}
+    fn blocked(&self, reason: &'static str) {
+        self.0.lock().unwrap().push(reason);
+    }
+    fn regressed(&self) {}
+    fn owner_marker(&self, _: &'static str) {}
+    fn dirty_databases(&self, _: u64) {}
+    fn oldest_dirty_age_seconds(&self, _: f64) {}
+    fn inflight_bytes(&self, _: u64) {}
+    fn breaker_open(&self, _: bool) {}
+    fn record_cycle_seconds(&self, _: &'static str, _: f64) {}
+}
+
+/// A volume whose seq file went back to an older copy while the main file
+/// and the store moved on: three writes published (11, 12, 13), the seq file
+/// put back to what it held after `rewind_to`, a fourth write.
+async fn after_the_seq_file_went_back(rewind_to: u64) -> (Vec<&'static str>, Frontier) {
+    let rig = Rig::new("seq-went-back").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let seq = crate::sql::store::local::seq_path(&rig.main_path());
+    let mut records = Vec::new();
+    {
+        let board = board(&rig);
+        let service = rig.service(board.clone(), DurabilityPolicy::default());
+        let uploader = start(
+            &rig,
+            source(&rig, &service),
+            store.clone(),
+            board,
+            scratch.path(),
+            Duration::ZERO,
+        );
+        for v in ["a", "b", "c"] {
+            insert(&service, &rig.space, v).await.unwrap();
+            records.push(std::fs::read(&seq).unwrap());
+            frontier_at(&rig, local_seq(&rig)).await;
+        }
+        uploader.drain(Duration::from_secs(5)).await;
+    }
+    assert_eq!(frontier_now(&rig).await.unwrap().last_seq, 13);
+    std::fs::write(&seq, &records[rewind_to as usize - 11]).unwrap();
+
+    let blocks = Arc::new(Blocks::default());
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let uploader = spawn(
+        ShadowDeps {
+            control: rig.control.clone(),
+            manifest: Arc::new(DbSqlManifest::new(rig.control.clone())),
+            store,
+            source: source(&rig, &service),
+            disk: DiskBudget::new(scratch.path(), 512 * 1024 * 1024),
+            board,
+            metrics: blocks.clone(),
+        },
+        config(Duration::ZERO),
+    );
+    insert(&service, &rig.space, "d").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    uploader.drain(Duration::from_secs(5)).await;
+    let seen = blocks.0.lock().unwrap().clone();
+    (seen, frontier_now(&rig).await.unwrap())
+}
+
+#[tokio::test]
+async fn a_seq_file_older_than_the_published_frontier_blocks_the_database_and_publishes_nothing() {
+    // The fourth write is numbered 12 again, a number the store already holds
+    // for other bytes. The uploader sees a revision below its frontier and
+    // blocks the database (`regressed`); the frontier does not move.
+    let (blocks, frontier) = after_the_seq_file_went_back(11).await;
+    assert_eq!(blocks, ["regressed"]);
+    assert_eq!(frontier.last_seq, 13);
+}
+
+#[tokio::test]
+async fn a_main_file_older_than_its_seq_file_is_numbered_forward_and_the_store_converges() {
+    // The other direction: the main file and WAL come back from an older
+    // backup while the seq file stays ahead. Numbers are never reused (the
+    // gap is allowed), the next write is 14, and the restore of what the
+    // store then holds equals the local file.
+    let rig = Rig::new("main-went-back").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let backup = tempfile::tempdir().unwrap();
+    {
+        let board = board(&rig);
+        let service = rig.service(board.clone(), DurabilityPolicy::default());
+        let uploader = start(
+            &rig,
+            source(&rig, &service),
+            store.clone(),
+            board,
+            scratch.path(),
+            Duration::ZERO,
+        );
+        insert(&service, &rig.space, "a").await.unwrap();
+        std::fs::copy(rig.main_path(), backup.path().join("main.db")).unwrap();
+        std::fs::copy(rig.wal_path(), backup.path().join("main.db-wal")).unwrap();
+        for v in ["b", "c"] {
+            insert(&service, &rig.space, v).await.unwrap();
+        }
+        frontier_at(&rig, 13).await;
+        uploader.drain(Duration::from_secs(5)).await;
+        // The old actor must be gone before its files are put back.
+        service.stop_actor(&rig.space, DB).await;
+    }
+    std::fs::copy(backup.path().join("main.db"), rig.main_path()).unwrap();
+    std::fs::copy(backup.path().join("main.db-wal"), rig.wal_path()).unwrap();
+    let _ = std::fs::remove_file(format!("{}-shm", rig.main_path().display()));
+    assert_eq!(local_seq(&rig), 13, "the seq file did not go back");
+
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    let uploader = start(
+        &rig,
+        source.clone(),
+        store.clone(),
+        board,
+        scratch.path(),
+        Duration::ZERO,
+    );
+    assert_eq!(count(&service, &rig.space).await, 1, "the older rows");
+    insert(&service, &rig.space, "d").await.unwrap();
+    assert_eq!(local_seq(&rig), 14);
+    frontier_at(&rig, 14).await;
+    assert_restore_equals_local(&rig, source, store, scratch.path()).await;
+    uploader.drain(Duration::from_secs(5)).await;
 }

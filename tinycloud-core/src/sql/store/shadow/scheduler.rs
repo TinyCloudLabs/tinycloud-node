@@ -533,7 +533,22 @@ impl Scheduler {
         }
         for (key, head) in self.deps.source.local_heads().await {
             if self.board.allowlist().allows(&key.0) && self.ensure(&key).await {
-                self.feed(&key, Event::Scanned(head), Instant::now());
+                // A local file whose revision is below the published frontier
+                // is a volume that went back (an older seq file or main file
+                // put in place): the next writes would reuse numbers the
+                // store already holds. Block the database, as for a Postgres
+                // restore; never publish under a reused number.
+                let behind = self
+                    .machines
+                    .get(&key)
+                    .and_then(|m| m.last_seq())
+                    .is_some_and(|last| head.revision < i64::try_from(last).unwrap_or(i64::MAX));
+                let event = if behind {
+                    Event::Regressed(head)
+                } else {
+                    Event::Scanned(head)
+                };
+                self.feed(&key, event, Instant::now());
             }
         }
         self.deps
