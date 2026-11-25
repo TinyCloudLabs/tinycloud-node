@@ -2127,6 +2127,110 @@ async fn delegate_granted_key_a_cannot_decrypt_key_b_over_invoke() -> Result<()>
     Ok(())
 }
 
+/// TC-4322: a device granted decrypt + key.create on exactly the
+/// bot-history secret key decrypts that key over `/invoke` and nothing else.
+#[tokio::test]
+async fn tc4322_bot_history_grant_decrypts_only_its_key_over_invoke() -> Result<()> {
+    let (fixture, network) = setup().await?;
+    const EXACT: &str = "secrets/scoped/tinychat-bot-history/bot-history";
+    let mut publics = std::collections::BTreeMap::new();
+    for path in [
+        EXACT,
+        "secrets/scoped/tinychat-bot-history/bot-history2",
+        "secrets/scoped/tinychat-bot-history/other",
+        "secrets/scoped/tinychat-bot-history/bot-history/x",
+    ] {
+        let (status, text) = create(&fixture, &network, path, true).await?;
+        assert_eq!(status, Status::Ok, "create {path}: {text}");
+        publics.insert(path, described_public_key(&fixture, &network, path).await);
+    }
+    let exact = key_uri(&network, EXACT);
+    let proof = grant_owner_to_device(
+        &fixture,
+        "tc4322-bot-history",
+        &[
+            (exact.as_str(), DECRYPT_ACTION),
+            (exact.as_str(), KEY_CREATE_ACTION),
+        ],
+    )
+    .await?;
+
+    let (status, text) = device_decrypt(
+        &fixture,
+        proof,
+        &network,
+        EXACT,
+        &DecryptCase::wrapped_to(&publics[EXACT]),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{text}");
+
+    for (case, path) in [
+        (
+            "string-prefix sibling",
+            "secrets/scoped/tinychat-bot-history/bot-history2",
+        ),
+        ("sibling", "secrets/scoped/tinychat-bot-history/other"),
+        ("child", "secrets/scoped/tinychat-bot-history/bot-history/x"),
+    ] {
+        let (status, text) = device_decrypt(
+            &fixture,
+            proof,
+            &network,
+            path,
+            &DecryptCase::wrapped_to(&publics[path]),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{case}: {text}");
+    }
+
+    // Network root: no keyPath, capability on the network itself.
+    let root_case = DecryptCase::wrapped_to(&root_public_key(&fixture, &network).await);
+    let (body, facts) = decrypt_request(&fixture, &network, &root_case, None);
+    let auth = delegated_invocation(
+        &fixture,
+        proof,
+        &fixture.node_did,
+        &[(network.as_str(), DECRYPT_ACTION)],
+        vec![facts],
+    )?;
+    let (status, text) = invoke(&fixture, &auth, &body).await;
+    assert!(
+        status == Status::Forbidden || status == Status::Unauthorized,
+        "root: {status} {text}"
+    );
+
+    // Same path on another owner's network.
+    let service = fixture
+        .client
+        .rocket()
+        .state::<EncryptionService>()
+        .expect("EncryptionService is managed");
+    let other_network = service
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: "net".to_string(),
+            owner_did: "did:pkh:eip155:1:0x0000000000000000000000000000000000000001".to_string(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .network_id
+        .to_string();
+    let (status, text) = device_decrypt(
+        &fixture,
+        proof,
+        &other_network,
+        EXACT,
+        &DecryptCase::wrapped_to(&publics[EXACT]),
+    )
+    .await;
+    assert!(
+        status == Status::Forbidden || status == Status::Unauthorized,
+        "other owner: {status} {text}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn decrypt_invocation_that_is_expired_or_misaddressed_is_refused() -> Result<()> {
     let (fixture, network) = setup().await?;
