@@ -268,8 +268,14 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
 /// no seq file or the whole one, and never a seq file in front of a main file
 /// that was not yet on disk. Refuses `0` (the uploader's revisions start at 1)
 /// and refuses to run twice. The caller (the cutover job, P4.4) holds the
-/// database's operation lock with no actor open; if two calls ever overlap,
-/// exactly one returns `Ok` and the counter is that call's `start_seq`.
+/// database's operation lock with no actor open. Init expects that contract
+/// and does not rely on it for its own counter: if two calls ever overlap, at
+/// most one returns `Ok` (fails closed) and the counter is that call's
+/// `start_seq`.
+///
+/// An `Err` returned after the link (the directory fsync failed) leaves the
+/// seq file in place: a retry is refused with "already exists", so the caller
+/// checks the counter with [`validate_working_copy`] after any such refusal.
 pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
@@ -307,25 +313,52 @@ pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
         CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         rand::random::<u64>()
     ));
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
         .map_err(io)?;
-    file.write_all(&seq_record(start as u64)).map_err(io)?;
+    let linked = write_and_link(file, &tmp, &seq, start as u64);
+    // Best effort, on success and on every failure after the temp file was
+    // created: it is never the counter, and a leftover one is harmless. Its
+    // removal is not why an `Err` is returned.
+    let _ = std::fs::remove_file(&tmp);
+    linked
+}
+
+/// Write the seq record into this call's temp file, fsync it, link it into
+/// place as the seq file and fsync the directory, in that order. Once the link
+/// succeeded the only error left is the directory fsync.
+fn write_and_link(
+    mut file: std::fs::File,
+    tmp: &Path,
+    seq: &Path,
+    start: u64,
+) -> Result<(), SqlError> {
+    file.write_all(&seq_record(start)).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
-    let linked = std::fs::hard_link(&tmp, &seq);
-    std::fs::remove_file(&tmp).map_err(io)?;
-    linked.map_err(|error| {
+    std::fs::hard_link(tmp, seq).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             SqlError::Internal("the store-master seq file already exists".into())
         } else {
             io(error)
         }
     })?;
-    sync_directory_of(&seq)?;
-    Ok(())
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC_AFTER_LINK.with(std::cell::Cell::take) {
+        return Err(io(std::io::Error::other(
+            "injected directory fsync failure",
+        )));
+    }
+    sync_directory_of(seq)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test fault: the next `init_working_copy` on this thread fails its
+    /// directory fsync right after the seq file was linked.
+    static FAIL_DIRECTORY_SYNC_AFTER_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// fsync `path` and the directory that holds it.

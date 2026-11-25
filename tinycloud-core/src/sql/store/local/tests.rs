@@ -640,3 +640,40 @@ fn init_on_a_missing_main_file_creates_neither_the_main_file_nor_a_counter() {
     assert!(!seq_path(&path).exists(), "no counter was created");
     assert!(validate_working_copy(&path).is_err());
 }
+
+/// The directory fsync after the link fails (injected): init returns `Err`
+/// with the seq file already in place, and leaves no temp file of its own. A
+/// retried init is refused with "already exists" and the counter on disk is
+/// still the first call's `start_seq`, which `validate_working_copy` reads
+/// (the P4.4 rule: validate after any "already exists").
+#[test]
+fn a_retry_after_a_failed_directory_fsync_is_refused_and_the_counter_is_the_first_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE items (v TEXT)")
+        .unwrap();
+
+    FAIL_DIRECTORY_SYNC_AFTER_LINK.with(|fail| fail.set(true));
+    assert!(
+        init_working_copy(&path, 7).is_err(),
+        "the directory fsync failed"
+    );
+    assert_eq!(read_seq(&path).unwrap(), 7, "the seq file was linked");
+
+    match init_working_copy(&path, 7) {
+        Err(SqlError::Internal(message)) => assert!(
+            message.contains("already exists"),
+            "a clear refusal, got {message:?}"
+        ),
+        other => panic!("a retry must be refused, got {other:?}"),
+    }
+    assert_eq!(validate_working_copy(&path).unwrap(), 7);
+    let temp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".seq.tmp"))
+        .collect();
+    assert!(temp_files.is_empty(), "temp files {temp_files:?}");
+}
