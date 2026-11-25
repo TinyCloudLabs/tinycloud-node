@@ -27,6 +27,7 @@ use super::{
     parser,
     storage::{self, StorageMode},
     store::local::{self as local_copy, LocalState},
+    store::shadow::restore,
     types::*,
 };
 
@@ -61,6 +62,7 @@ enum DbMessage {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
     Wal {
+        max_bytes: u64,
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
     /// Store-master only (TC-1491 P4.2a): the in-file counter and the sizes
@@ -242,10 +244,16 @@ impl DatabaseHandle {
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
 
-    pub async fn wal(&self) -> Result<Option<Vec<u8>>, SqlError> {
+    pub async fn wal(&self, max_bytes: u64) -> Result<Option<Vec<u8>>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send((request_telemetry::current(), DbMessage::Wal { response_tx }))
+            .send((
+                request_telemetry::current(),
+                DbMessage::Wal {
+                    max_bytes,
+                    response_tx,
+                },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -582,8 +590,11 @@ fn spawn_actor_inner(
                     }
                     let _ = response_tx.send(result);
                 }
-                DbMessage::Wal { response_tx } => {
-                    let result = handle_wal(&mode, &file_path);
+                DbMessage::Wal {
+                    max_bytes,
+                    response_tx,
+                } => {
+                    let result = handle_wal(&mode, &file_path, max_bytes);
                     let _ = response_tx.send(result);
                 }
                 DbMessage::LocalState { response_tx } => {
@@ -710,6 +721,18 @@ fn existing_ancestor(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// A copy of the actor's WAL cut to its committed prefix, as a delta may carry
+/// it: through the last commit frame, never the raw file (TC-4290). A
+/// transaction that spilled past the page cache and rolled back leaves frames
+/// in the file that a later, smaller commit does not overwrite; they fail the
+/// checksum chain and a restore refuses the artifact that carries them.
+///
+/// `None` makes the caller save a whole checkpoint instead: no WAL, a raw WAL
+/// of `max_bytes` or more (checked on the file size, before anything is read),
+/// no commit frame, or a WAL whose header or first commit does not verify.
+///
+/// The WAL is opened and read once: the committed length is measured on the
+/// copy, so the length and the bytes cannot come from two different files.
 fn handle_wal_snapshot(
     mode: &StorageMode,
     file_path: &Path,
@@ -718,7 +741,7 @@ fn handle_wal_snapshot(
     if !matches!(mode, StorageMode::File(_)) {
         return Ok(None);
     }
-    let mut source = match std::fs::File::open(format!("{}-wal", file_path.display())) {
+    let source = match std::fs::File::open(restore::wal_path(file_path)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SqlError::Internal(error.to_string())),
@@ -732,21 +755,47 @@ fn handle_wal_snapshot(
     }
     let mut snapshot =
         tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
-    std::io::copy(&mut source, snapshot.as_file_mut())
+    let copied = std::io::copy(
+        &mut std::io::Read::take(source, size),
+        snapshot.as_file_mut(),
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if copied != size {
+        tracing::info!(
+            wal_bytes = size,
+            copied,
+            "WAL shrank while it was read; saving a whole checkpoint"
+        );
+        return Ok(None);
+    }
+    let committed = restore::committed_wal_len(snapshot.path())
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if committed == 0 {
+        tracing::info!(
+            wal_bytes = size,
+            "WAL has no verifiable committed frame; saving a whole checkpoint"
+        );
+        return Ok(None);
+    }
+    snapshot
+        .as_file_mut()
+        .set_len(committed)
         .map_err(|e| SqlError::Internal(e.to_string()))?;
     Ok(Some(snapshot))
 }
 
-fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, SqlError> {
-    if !matches!(mode, StorageMode::File(_)) {
+/// [`handle_wal_snapshot`]'s bytes, in a buffer of exactly their length.
+fn handle_wal(
+    mode: &StorageMode,
+    file_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let Some(snapshot) = handle_wal_snapshot(mode, file_path, max_bytes)? else {
         return Ok(None);
-    }
-    match std::fs::read(format!("{}-wal", file_path.display())) {
-        Ok(wal) if !wal.is_empty() => Ok(Some(wal)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(SqlError::Internal(error.to_string())),
-    }
+    };
+    std::fs::read(snapshot.path())
+        .map(Some)
+        .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 fn handle_export(
@@ -3518,3 +3567,6 @@ mod ddl_authority_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod committed_wal_tests;

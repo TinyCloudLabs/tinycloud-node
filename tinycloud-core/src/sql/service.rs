@@ -1357,11 +1357,11 @@ impl SqlService {
         // must also bound the resulting image against the durable charge:
         // live state can include partial writes from an earlier failed request.
         let wal = if growth != GrowthPolicy::Forbid && expected != ArtifactExpectation::Absent {
-            handle.wal().await?
+            handle.wal(MAX_WAL_DELTA_BYTES as u64).await?
         } else {
             None
         };
-        if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
+        if let Some(wal) = wal {
             match self
                 .bounded(
                     (space, db_name),
@@ -7710,3 +7710,6 @@ mod tests {
 
 mod space_purge;
 mod store_master;
+
+#[cfg(test)]
+mod rolled_back_wal_tail;

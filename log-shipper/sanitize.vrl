@@ -76,6 +76,35 @@ if label == "tinycloud-node" {
       }
     }
   }
+  # TC-4177: the deletion ledger's one line per start (target `tinycloud`, info) ships as an individual event. Either the
+  # message plus exactly `event`, `ledger_file` (a declared state), five bounded integer counts and `newest_deleted_at`
+  # (`none` or an RFC 3339 instant: digits, `T`, `:`, `.`, `Z`, `+`, `-` only), or the failure message plus exactly
+  # `event` and an `error_kind` from the ledger's fixed kinds. The message is never copied. Anything else leaves
+  # ledger_start null and the info line is dropped below.
+  ledger_start = null
+  if target == __LEDGER_START_TARGET__ && level == "info" && (string(f.event) ?? "") == __LEDGER_START_EVENT__ {
+    if msg == __LEDGER_START_MESSAGE__ && length(f) == 9 {
+      ls_file = string(f.ledger_file) ?? ""
+      ls_newest = string(f.newest_deleted_at) ?? ""
+      if includes(__LEDGER_START_FILES__, ls_file) && match(ls_newest, r'^(none|\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2}))$') {
+        ls_counts = {}
+        for_each(__LEDGER_START_COUNTERS__) -> |_index, field| {
+          value = int(get(f, [field]) ?? null) ?? -1
+          if value >= 0 && value <= 9007199254740991 {
+            ls_counts = set!(ls_counts, [field], value)
+          }
+        }
+        if length(ls_counts) == 5 {
+          ledger_start = merge(ls_counts, {"event": __LEDGER_START_EVENT__, "svc": "api", "level": "info", "ledger_file": ls_file, "newest_deleted_at": ls_newest})
+        }
+      }
+    } else if msg == __LEDGER_START_FAILED_MESSAGE__ && length(f) == 3 {
+      ls_kind = string(f.error_kind) ?? ""
+      if includes(__LEDGER_ERROR_KINDS__, ls_kind) {
+        ledger_start = {"event": __LEDGER_START_EVENT__, "svc": "api", "level": "info", "error_kind": ls_kind}
+      }
+    }
+  }
   # TC-3284: the deletion ledger's three error events (open and replay at start from target `tinycloud`, an unrepaired
   # append from the ledger module) ship individually as their event name and `error_kind`. The input must be an error
   # from that event's own target with exactly the message, `event` and `error_kind` keys, and `error_kind` exactly one
@@ -120,10 +149,11 @@ if label == "tinycloud-node" {
       error_code = string(f.error_code) ?? ""
       if includes(__ERROR_CODES__, error_code) { out.error_code = error_code }
     }
-    # TC-3739: per-request DB accounting, on status below 400 only (4xx/5xx are the capped classes; DB-caused 5xx
-    # already carry elapsed_ms on db_failure_5xx). Copied only as plain numbers inside the canonical bounds; anything
-    # else is dropped (the event still ships). They are driver wall times and an attempt count, never identifiers.
-    if status < 400 {
+    # TC-3739/TC-4308: per-request DB accounting, on status below 400 and on 500 and above (4xx is the only band without
+    # it). On a 5xx the pool wait and query time include a cut or failed acquisition/execution (the node's timers
+    # accumulate on drop). Copied only as plain numbers inside the canonical bounds; anything else is dropped (the
+    # event still ships). They are driver wall times and an attempt count, never identifiers.
+    if status < 400 || status >= 500 {
       pool_wait = f.pool_wait_ms
       if is_float(pool_wait) || is_integer(pool_wait) {
         pool_wait = to_float!(pool_wait)
@@ -146,6 +176,8 @@ if label == "tinycloud-node" {
     out = headroom
   } else if is_object(backfill) {
     out = backfill
+  } else if is_object(ledger_start) {
+    out = ledger_start
   } else if is_object(ledger) {
     out = ledger
   } else {

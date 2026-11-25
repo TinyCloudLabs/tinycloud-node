@@ -23,6 +23,8 @@ mod create_network_tests;
 #[cfg(test)]
 mod delete_auth_tests;
 #[cfg(test)]
+mod deletion_ledger_summary_tests;
+#[cfg(test)]
 mod deletion_ledger_tests;
 #[cfg(test)]
 mod key_delete_tests;

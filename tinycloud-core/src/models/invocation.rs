@@ -2753,6 +2753,121 @@ mod tests {
         );
     }
 
+    /// TC-4322: an owner grant of decrypt + key.create on exactly the
+    /// TinyChat bot-history secret key admits that key and refuses the network
+    /// root, a string-prefix sibling, a sibling, a child, and the same path on
+    /// another owner's network.
+    #[tokio::test]
+    async fn tc4322_bot_history_key_grant_is_exact() {
+        const OTHER_OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let db = empty_db().await;
+        for actor_id in [KEY_OWNER, KEY_OTHER] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let base = format!("urn:tinycloud:encryption:{KEY_OWNER}:default");
+        let key = format!("{base}/secrets/scoped/tinychat-bot-history/bot-history");
+        let abilities_granted = [
+            "tinycloud.encryption/decrypt",
+            "tinycloud.encryption/key.create",
+        ];
+
+        let grant = crate::hash::hash(b"tc4322-owner-bot-history-grant");
+        delegation::ActiveModel {
+            id: Set(grant),
+            delegator: Set(KEY_OWNER.to_string()),
+            delegatee: Set(KEY_OTHER.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(grant.as_ref().to_vec()),
+            serialization_format: Set(0),
+            first_seen_at: Default::default(),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        delegation_mode::ActiveModel {
+            delegation_id: Set(grant),
+            mode: Set("attenuable".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        for ability in abilities_granted {
+            abilities::ActiveModel {
+                delegation: Set(grant),
+                resource: Set(key.parse().unwrap()),
+                ability: Set(ability.to_string().try_into().unwrap()),
+                caveats: Set(Caveats::default()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let refused = [
+            ("root", base.clone()),
+            (
+                "string-prefix sibling",
+                format!("{base}/secrets/scoped/tinychat-bot-history/bot-history2"),
+            ),
+            (
+                "sibling",
+                format!("{base}/secrets/scoped/tinychat-bot-history/other"),
+            ),
+            (
+                "child",
+                format!("{base}/secrets/scoped/tinychat-bot-history/bot-history/x"),
+            ),
+            (
+                "other owner network",
+                format!(
+                    "urn:tinycloud:encryption:{OTHER_OWNER}:default/secrets/scoped/tinychat-bot-history/bot-history"
+                ),
+            ),
+        ];
+
+        for ability in abilities_granted {
+            crate::models::invocation::authorize_holder(
+                &db,
+                KEY_OTHER,
+                &[caveat_capability(&key, ability, Caveats::default())],
+                &[grant.to_cid(0x55)],
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("exact bot-history key is admitted");
+
+            for (case, resource) in &refused {
+                let result = crate::models::invocation::authorize_holder(
+                    &db,
+                    KEY_OTHER,
+                    &[caveat_capability(resource, ability, Caveats::default())],
+                    &[grant.to_cid(0x55)],
+                    OffsetDateTime::now_utc(),
+                )
+                .await;
+                let err = match result {
+                    Ok(()) => panic!("{ability} {case} {resource} was ALLOWED"),
+                    Err(err) => err,
+                };
+                assert!(
+                    matches!(
+                        &err,
+                        Error::InvalidInvocation(InvocationError::UnauthorizedAction(_, _))
+                    ),
+                    "unexpected rejection for {ability} {case}: {err:?}"
+                );
+            }
+        }
+    }
+
     /// The owner invoking an `apps/` key under its own namespace needs no parents.
     #[tokio::test]
     async fn owner_invokes_own_app_key_without_parents() {
