@@ -567,7 +567,7 @@ fn handle_wal_snapshot(
     )
     .map_err(|e| SqlError::Internal(e.to_string()))?;
     if copied != size {
-        tracing::warn!(
+        tracing::info!(
             wal_bytes = size,
             copied,
             "WAL shrank while it was read; saving a whole checkpoint"
@@ -577,7 +577,7 @@ fn handle_wal_snapshot(
     let committed = restore::committed_wal_len(snapshot.path())
         .map_err(|e| SqlError::Internal(e.to_string()))?;
     if committed == 0 {
-        tracing::warn!(
+        tracing::info!(
             wal_bytes = size,
             "WAL has no verifiable committed frame; saving a whole checkpoint"
         );
