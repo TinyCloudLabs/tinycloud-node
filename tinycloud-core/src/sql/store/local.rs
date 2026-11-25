@@ -267,9 +267,15 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
 /// atomically: a temp file, fsynced, linked into place. A crash mid-run leaves
 /// no seq file or the whole one, and never a seq file in front of a main file
 /// that was not yet on disk. Refuses `0` (the uploader's revisions start at 1)
-/// and refuses to run twice. The caller (the cutover job, P4.4) holds the
-/// database's operation lock with no actor open; if two calls ever overlap,
-/// exactly one returns `Ok` and the counter is that call's `start_seq`.
+/// and refuses to run twice.
+///
+/// **Contract: one call at a time per database.** The caller (the cutover job,
+/// P4.4) holds the database's operation lock with no actor open; a concurrent
+/// call on the same database is outside the contract. The temp file has a
+/// fixed name (`<db>.seq.tmp`) and a call removes a leftover one first, so two
+/// overlapping calls can remove and link each other's file and one can return
+/// `Ok` with the other's counter. That is accepted (Naomi, TC-1491 P4.2a
+/// review) rather than defended here: the lock is what makes the call safe.
 pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let start = i64::try_from(start_seq)
         .ok()
@@ -291,22 +297,15 @@ pub fn init_working_copy(path: &Path, start_seq: u64) -> Result<(), SqlError> {
     let seq = seq_path(path);
     // Written whole to a temp file, fsynced, then linked into place and the
     // directory fsynced: a crash leaves no seq file (the database stays fenced
-    // and this can be run again) or the whole one, never a short one. The temp
-    // name is this call's own (process, counter, random): another call, or a
-    // file an earlier run died with, is never ours to remove or to link. A
-    // leftover temp file is harmless (it is not the counter) and is not swept
-    // here, because a sweep could remove a concurrent call's file. `hard_link`
-    // refuses when the seq file exists, so a second run never replaces a
-    // counter and the loser of a race sees `AlreadyExists`, never the
-    // winner's number.
-    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = std::path::PathBuf::from(format!(
-        "{}.tmp.{}.{}.{:016x}",
-        seq.display(),
-        std::process::id(),
-        CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        rand::random::<u64>()
-    ));
+    // and this can be run again) or the whole one, never a short one. A temp
+    // file an earlier run died with is ours; start over. `hard_link` refuses
+    // when the seq file exists, so a second run never replaces a counter.
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq.display()));
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(error)),
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
