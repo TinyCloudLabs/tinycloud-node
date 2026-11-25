@@ -144,6 +144,12 @@ grep -q 'info \[today\] before any restart: 0 file' "$tmp/healthy/summary"
 grep -q 'info \[files\] before any restart: 1 file' "$tmp/healthy/summary"
 grep -q 'info \[files\] after a recreate: 0 file' "$tmp/healthy/summary"
 grep -q 'info \[volume\] after a recreate: 1 file' "$tmp/healthy/summary"
+# The names are printed next to the count (relative to /data/sql), and an empty
+# directory prints none: the count can then be explained from the log itself.
+grep -q 'info \[files\] before any restart: files: main\.db *$' "$tmp/healthy/summary"
+grep -q 'info \[volume\] after a recreate: files: main\.db *$' "$tmp/healthy/summary"
+grep -q 'info \[today\] before any restart: files: *$' "$tmp/healthy/summary"
+grep -q 'info \[files\] after a recreate: files: *$' "$tmp/healthy/summary"
 grep -q 'ok   \[volume\] final' "$tmp/healthy/summary"
 
 run_case acknowledged-write-lost 1 'DRILL FAILED' FAKE_LOSE=1

@@ -82,14 +82,17 @@ wait_ready() {
   return 1
 }
 
-# Files under /data/sql in the node container, counted from the host with
-# `docker cp` (the image is FROM scratch: no shell to exec). 0 when the path
-# does not exist.
-sql_files() {
+# The files under /data/sql in the node container, one relative path per line,
+# sorted (names only, never content), listed from the host with `docker cp` (the
+# image is FROM scratch: no shell to exec). Empty when the path does not exist.
+sql_names() {
   local id
   id="$(dc ps -aq tinycloud)"
-  docker cp "$id:/data/sql" - 2>/dev/null | tar -t 2>/dev/null | grep -vc '/$' || true
+  docker cp "$id:/data/sql" - 2>/dev/null | tar -t 2>/dev/null | grep -v '/$' | sed 's#^sql/##' | LC_ALL=C sort || true
 }
+
+# count_lines <text>: the number of non-empty lines in <text> (0 for none).
+count_lines() { printf '%s' "$1" | grep -c . || true; }
 
 acked() { grep -c '"state":"ack"' "$1" || true; }
 
@@ -108,14 +111,19 @@ verify() {
 # up to DRILL_FILE_WAIT seconds (default 10) for the file to appear: a small
 # database is promoted to a file by the actor right after its first write.
 expect_files() {
-  local n tries=0
-  n="$(sql_files)"
+  local names n tries=0
+  names="$(sql_names)"
+  n="$(count_lines "$names")"
   while [[ "$2" == yes && "$n" -lt 1 && "$tries" -lt "${DRILL_FILE_WAIT:-10}" ]]; do
     sleep 1
     tries=$((tries + 1))
-    n="$(sql_files)"
+    names="$(sql_names)"
+    n="$(count_lines "$names")"
   done
   say "info [$layout] $1: $n file(s) under /data/sql before the first request"
+  # The names, so a count that changes between steps can be explained from the
+  # run's own log (e.g. whether -wal and -shm files are among them).
+  say "info [$layout] $1: files: $(printf '%s' "$names" | tr '\n' ' ')"
   if [[ "$2" == yes && "$n" -lt 1 ]]; then
     if [[ "$1" == "before any restart" ]]; then
       fail "[$layout] $1: no SQL working copy was created (this layout is file-backed: memory_threshold 0)"
