@@ -2,6 +2,9 @@
 #[path = "db/cacao_terminal_mode_tests.rs"]
 mod cacao_terminal_mode_tests;
 #[cfg(test)]
+#[path = "db/peer_revocation_tests.rs"]
+mod peer_revocation_tests;
+#[cfg(test)]
 #[path = "db/purge_readmission_tests.rs"]
 mod purge_readmission_tests;
 #[cfg(test)]
