@@ -810,7 +810,9 @@ where
                 .await?;
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
-        delegation_cid_alias::recompute(&tx, encryption.as_ref()).await?;
+        // Boxed: its page query would otherwise enlarge every caller's
+        // future (and, unoptimized, poll frame) that opens a database.
+        Box::pin(delegation_cid_alias::recompute(&tx, encryption.as_ref())).await?;
         tx.commit().await?;
         // TC-3810: backfill the `delegation_mode` side table from stored signed
         // bytes before returning, without rewriting any historical `delegation`

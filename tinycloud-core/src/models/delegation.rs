@@ -1771,7 +1771,7 @@ async fn save<C: ConnectionTrait>(
             // Not inserted: already stored, or refused by the tombstone or
             // revocation guard in the insert. One lookup tells them apart; a
             // fresh registration never reaches it.
-            return refuse_unstored(db, hash, &tombstone_keys).await;
+            return Box::pin(refuse_unstored(db, hash, &tombstone_keys)).await;
         }
     } else {
         refuse_tombstoned(db, hash, &tombstone_keys).await?;
@@ -1786,17 +1786,7 @@ async fn save<C: ConnectionTrait>(
             }
         };
         // After the insert, so a resubmission stays `Existing` as above.
-        let equivalent = Query::select()
-            .expr(Expr::val(1))
-            .from(revocation::Entity)
-            .cond_where(equivalent_revocation(hash, canonical))
-            .limit(1)
-            .to_owned();
-        if db
-            .query_one(db.get_database_backend().build(&equivalent))
-            .await?
-            .is_some()
-        {
+        if Box::pin(equivalently_revoked(db, hash, canonical)).await? {
             return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
         }
         delegation_cid_alias::Entity::insert(delegation_cid_alias::ActiveModel {
@@ -1899,10 +1889,30 @@ fn equivalent_revocation(hash: Hash, canonical: Hash) -> Condition {
     condition
 }
 
+/// Whether an [`equivalent_revocation`] exists. Its own function and boxed at
+/// the call site: the select it awaits on would otherwise enlarge `save`'s
+/// future and, unoptimized, every poll frame up to the request handler.
+async fn equivalently_revoked<C: ConnectionTrait>(
+    db: &C,
+    hash: Hash,
+    canonical: Hash,
+) -> Result<bool, DbErr> {
+    let equivalent = Query::select()
+        .expr(Expr::val(1))
+        .from(revocation::Entity)
+        .cond_where(equivalent_revocation(hash, canonical))
+        .limit(1)
+        .to_owned();
+    Ok(db
+        .query_one(db.get_database_backend().build(&equivalent))
+        .await?
+        .is_some())
+}
+
 /// PostgreSQL's insert guards refused these bytes or they were already
 /// stored. In one lookup: a tombstone naming any of `tombstone_keys` (see
 /// [`refuse_tombstoned`]) or an equivalent revocation refuses them, and stored
-/// bytes are `Existing`.
+/// bytes are `Existing`. Boxed at the call site, as [`equivalently_revoked`].
 async fn refuse_unstored<C: ConnectionTrait>(
     db: &C,
     hash: Hash,
