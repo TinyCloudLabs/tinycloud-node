@@ -746,8 +746,8 @@ Before any CVM mutation the workflow requires:
 
 - the main compose, with its one node digest replaced by 64 zeros, to hash
   to the reviewed N0 template
-  **`4520ee72189db061788d2a3f09c742fdae5aa8709717a5d983c6ee77e91ca4d0`**
-  (raw `fdcf54f255fd529f029fa1e3e66b5c0ecd5f3b4d3e8f0af96582ae213bd9f46b` normalized). Before the TC-4177 deletion ledger start line (`deletion_ledger_start`) and the TC-4190 `duckdb_cache_cleanup_failed` code in the Vector config the template was `a6902dd53525d2392146ef913f81bbdd19248116304a7f100fab206666e6b71c`
+  **`693f06e86e0ea576a435b891214e9aaf528204c66131d85f53b4a805f8c47a60`**
+  (raw `ef81b59ff3034ff17c049ac281173c4ac69ee8036f4d6333b19ed260c60e71b9` normalized). Before the TC-4177 deletion ledger start line (`deletion_ledger_start`), the TC-4190 `duckdb_cache_cleanup_failed` code and the four TC-1491 P4.2a codes (`store_master_mode_unreadable_refused`, `store_master_backstop_rotation_failed`, `shadow_local_working_copy_missing`, `shadow_local_read_failed`) in the Vector config the template was `a6902dd53525d2392146ef913f81bbdd19248116304a7f100fab206666e6b71c`
   (raw `a52a126def0557db35c46c37477646cb7c2d26490b873b72223235e15c56d69c` normalized, with the TC-4249 ingress pin); before that pin the template was `91802e6cbec5eee1473d8bb63def043cc9e676c807b87904408bf44a2bc12adb`
   (raw `68f008731b6c013a79dad6f17a0d7a4d141505c31b52a8a98f1acdb571c059d4` normalized). Before the TC-4194 `cloudflared` connector service (pinned by digest, no published ports, on its own `cf-edge` network shared only with `tinycloud`, optional sealed `CLOUDFLARE_TUNNEL_TOKEN`) the template was `8c8785fbc80e2dc16358abe0304cec32235367c9b9cfc5e1776704f7019af4f8`
   (raw `7cc95bde531f100148a8bbcc8a8d104144d75e382873362dd6fb76b88403f27e` normalized). Before TC-3973 startup diagnostics and reindex counts in the Vector config the template was `e0f99bcca6f220c65d81cad15504790099d634243ea701350a509e995b672aa0`
@@ -964,7 +964,7 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 
 The served/OCI identity remains **1.20.6-dstack / e18578ff9162986ddd813259c60f73866e3e60d1**.
 With the template lock on main this redeploys exactly main's raw compose
-`fdcf54f255fd529f029fa1e3e66b5c0ecd5f3b4d3e8f0af96582ae213bd9f46b`
+`ef81b59ff3034ff17c049ac281173c4ac69ee8036f4d6333b19ed260c60e71b9`
 (the 1.21.0 compose `d95bfb70…` with the TC-1274, TC-1317, TC-1482, `current_kv_c_index_*`, `db_failure_5xx`, the 4xx and 5xx caps, `errors_dropped`, TC-2346 `db_operation_retried` / `db_operation_retry_skipped_slow`, TC-2917 `node_storage_headroom`, TC-3739 `node_request` DB timing, TC-3834 `node_request` `error_code`, TC-3284 deletion ledger error event and TC-3284 named node diagnostics and TC-3973 startup events and TC-4177 `deletion_ledger_start` and TC-4190 `duckdb_cache_cleanup_failed` in the Vector config, the optional TC-1482 `NODE_STATS_READ_TOKEN` env line, the TC-950 pool of 10, the TC-1777 `NAMED_KEYS_V1` gate env lines with the `deletion-ledger` volume, the TC-1491 artifact read limit env line, the TC-3554 `TINYCLOUD_KEYS__TYPE: DstackKmsEpoch` pins with no key-recovery sidecar, the TC-287 `TINYCLOUD_RETENTION__ENABLED: "true"` env line, the TC-1791 `TINYCLOUD_SQL__DELEGATED_CAVEATS_ENFORCED: "true"` env line and the TC-1491 `TINYCLOUD_STORAGE__SQL__MAX_DATABASE_BYTES: "320 MiB"` / `MIN_FREE_BYTES: "1 GiB"` env lines), whatever digest
 main's template currently pins. **Since TC-3554 only 1.26.15 or later boots
 on this compose, and only once the database holds the `root_wrap` blob:**

@@ -44,3 +44,17 @@ test('the DuckDB cache cleanup warning is a warn! carrying its event and a mappe
   assert.equal(diagnostics.exact['Database cache cleanup failed'], 'duckdb_cache_cleanup_failed');
   assert.ok(nodeSchema.fields.event_code.values.includes('duckdb_cache_cleanup_failed'));
 });
+
+test('the four TC-1491 P4.2a messages map to schema codes before their emitting code lands', async () => {
+  const { exact } = JSON.parse(await source('log-shipper/diagnostics.json'));
+  const expected = {
+    'sql store mode unreadable; refusing the request': 'store_master_mode_unreadable_refused',
+    'store-master backstop rotation failed': 'store_master_backstop_rotation_failed',
+    'sql_store: a store-master database has no working copy': 'shadow_local_working_copy_missing',
+    'sql_store local source could not read a working copy': 'shadow_local_read_failed',
+  };
+  for (const [message, code] of Object.entries(expected)) {
+    assert.equal(exact[message], code, message);
+    assert.ok(nodeSchema.fields.event_code.values.includes(code), code);
+  }
+});
