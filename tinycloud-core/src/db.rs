@@ -2699,8 +2699,10 @@ where
 
     /// A delegation already stored answers as registered only while every
     /// space it names is live: in a space being purged or deleted it gets the
-    /// purge refusal its first registration would get (TC-2871).
+    /// purge refusal its first registration would get (TC-2871). A revoked
+    /// one is refused as revoked, not answered as registered (TC-4321).
     async fn answer_stored_delegation(&self, delegation: &Delegation) -> Result<(), TxError<B, K>> {
+        delegation::refuse_revoked_stored(&self.conn, delegation, self.encryption.as_ref()).await?;
         if self.space_purge_fence.is_some() {
             let tx = self.begin_graph_transaction().await?;
             space_purge::lock_delegation::<B, K>(
