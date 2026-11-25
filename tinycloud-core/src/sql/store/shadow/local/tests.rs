@@ -1419,6 +1419,88 @@ async fn writes_keep_working_after_a_spill_with_the_database_blocked_as_regresse
     uploader.drain(Duration::from_secs(5)).await;
 }
 
+/// A COMMITTED WAL at the bound that nothing could truncate (a reader held the
+/// checkpoint), on a database the uploader has blocked: the refusal's own
+/// rotation, in the actor, is what clears it. The service rotates nothing
+/// behind a refusal and the blocked uploader cannot, so a WAL that is empty
+/// right after the refusal was emptied by the actor.
+#[tokio::test]
+async fn a_refusal_at_the_bound_on_a_blocked_database_is_cleared_by_the_actors_own_rotation() {
+    let rig = Rig::new("refusal-regressed").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let seq = crate::sql::store::local::seq_path(&rig.main_path());
+    let mut older = Vec::new();
+    {
+        let board = board(&rig);
+        let service = rig.service(board.clone(), DurabilityPolicy::default());
+        let uploader = start(
+            &rig,
+            source(&rig, &service),
+            store.clone(),
+            board,
+            scratch.path(),
+            Duration::ZERO,
+        );
+        for v in ["a", "b"] {
+            insert(&service, &rig.space, v).await.unwrap();
+            older.push(std::fs::read(&seq).unwrap());
+        }
+        frontier_at(&rig, 12).await;
+        uploader.drain(Duration::from_secs(5)).await;
+    }
+    std::fs::write(&seq, &older[0]).unwrap();
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let blocks = Arc::new(Blocks::default());
+    let uploader = start_with_metrics(
+        &rig,
+        source(&rig, &service),
+        store,
+        board,
+        scratch.path(),
+        blocks.clone(),
+        0,
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(blocks.0.lock().unwrap().first(), Some(&"regressed"));
+
+    let reader = Connection::open(rig.main_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM items")
+        .unwrap();
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            WAL_REFUSE_BYTES + 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        std::fs::metadata(rig.wal_path()).unwrap().len() >= WAL_REFUSE_BYTES,
+        "the reader kept the commit path from truncating"
+    );
+    drop(reader);
+
+    let refused = insert(&service, &rig.space, "refused").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(rig.wal_path()).unwrap().len(),
+        0,
+        "emptied by the refusal's own rotation"
+    );
+    insert(&service, &rig.space, "retry").await.unwrap();
+    uploader.drain(Duration::from_secs(5)).await;
+}
+
 /// What a database with a `main_mib` checkpoint costs the store when, `rounds`
 /// times, a write spills `spill_mib` of rolled-back frames into the WAL and a
 /// one-row write commits: the bytes the store accepted, and how far the
