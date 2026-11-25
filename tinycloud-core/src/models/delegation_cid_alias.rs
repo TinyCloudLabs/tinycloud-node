@@ -285,6 +285,28 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
 /// `delegation_cid_alias_rule` once [`recompute`] has applied it.
 const CANONICAL_RULE: i32 = 1;
 
+/// Rows per [`recompute`] page.
+const RECOMPUTE_PAGE_SIZE: u64 = 128;
+
+/// One keyset page of [`recompute`] after `after`, bounded on both tables.
+fn recompute_page(after: Option<Hash>) -> Select<delegation::Entity> {
+    let query = delegation::Entity::find()
+        .select_only()
+        .column(delegation::Column::Id)
+        .column(delegation::Column::Serialization)
+        .column(delegation::Column::SerializationFormat)
+        .column(Column::Canonical)
+        .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
+        .order_by_asc(delegation::Column::Id)
+        .limit(RECOMPUTE_PAGE_SIZE);
+    match after {
+        Some(id) => query
+            .filter(delegation::Column::Id.gt(id))
+            .filter(Column::Id.gt(id)),
+        None => query,
+    }
+}
+
 /// Bring every stored UCAN alias to the current [`canonical_hash`], once per
 /// rule revision. Run in the boot transaction after [`backfill`], which
 /// serializes concurrent boots; any failure rolls back every update.
@@ -300,7 +322,6 @@ pub(crate) async fn recompute<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<(), DbErr> {
     use crate::migrations::m20261125_010000_delegation_cid_alias_rule::DelegationCidAliasRule as Rule;
-    const PAGE_SIZE: u64 = 128;
     let backend = db.get_database_backend();
     let applied = Query::select()
         .expr(Expr::value(1))
@@ -313,19 +334,7 @@ pub(crate) async fn recompute<C: ConnectionTrait>(
     let (mut checked, mut changed, mut undecodable) = (0u64, 0u64, 0u64);
     let mut after = None;
     loop {
-        let mut query = delegation::Entity::find()
-            .select_only()
-            .column(delegation::Column::Id)
-            .column(delegation::Column::Serialization)
-            .column(delegation::Column::SerializationFormat)
-            .column(Column::Canonical)
-            .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
-            .order_by_asc(delegation::Column::Id)
-            .limit(PAGE_SIZE);
-        if let Some(id) = after {
-            query = query.filter(delegation::Column::Id.gt(id));
-        }
-        let rows = query
+        let rows = recompute_page(after)
             .into_tuple::<(Hash, Vec<u8>, i16, Hash)>()
             .all(db)
             .await?;
@@ -1071,5 +1080,82 @@ mod tests {
             Algorithm::ES256,
         )
         .await;
+    }
+
+    /// Each recompute page reads only its own range of the alias index,
+    /// however deep into history the page starts.
+    #[tokio::test]
+    async fn postgres_recompute_page_reads_a_bounded_alias_range() {
+        use sea_orm::{DbBackend, QueryTrait, Statement};
+
+        fn alias_rows_read(node: &serde_json::Value) -> f64 {
+            let own = if node["Relation Name"] == "delegation_cid_alias" {
+                (node["Actual Rows"].as_f64().unwrap()
+                    + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+                    * node["Actual Loops"].as_f64().unwrap()
+            } else {
+                0.0
+            };
+            own + node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(alias_rows_read)
+                .sum::<f64>()
+        }
+
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_recompute_page_reads_a_bounded_alias_range",
+        )
+        .await
+        else {
+            return;
+        };
+        let db = &fixture.conn;
+        actor::ActiveModel {
+            id: Set(ACTOR.into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        const ROWS: u64 = 4096;
+        db.execute_unprepared(&format!(
+            "INSERT INTO delegation (id, delegator, delegatee, serialization) \
+             SELECT '\\x1e20'::bytea || sha256(i::text::bytea), '{ACTOR}', '{ACTOR}', '\\x00'::bytea \
+             FROM generate_series(1, {ROWS}) AS i; \
+             INSERT INTO delegation_cid_alias (id, canonical, encrypted) \
+             SELECT id, id, false FROM delegation; \
+             ANALYZE delegation; ANALYZE delegation_cid_alias;"
+        ))
+        .await
+        .unwrap();
+        let after = delegation::Entity::find()
+            .order_by_asc(delegation::Column::Id)
+            .offset(ROWS / 2)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let page = recompute_page(Some(after)).build(DbBackend::Postgres);
+        let plan = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", page.sql),
+                page.values.map(|values| values.0).unwrap_or_default(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<serde_json::Value>("", "QUERY PLAN")
+            .unwrap();
+        let read = alias_rows_read(&plan[0]["Plan"]);
+        assert!(read > 0.0, "no alias scan in the plan: {plan}");
+        assert!(
+            read <= (2 * RECOMPUTE_PAGE_SIZE) as f64,
+            "a page {} rows deep read {read} alias rows: {plan}",
+            ROWS / 2
+        );
     }
 }
