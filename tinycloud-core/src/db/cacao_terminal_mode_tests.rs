@@ -2735,3 +2735,204 @@ async fn backfill_wrong_or_missing_key_leaves_encrypted_rows_unmarked_refused_an
     assert!(steady.completed);
     assert_eq!(steady.scanned, 0);
 }
+
+/// TC-4321: one kv call by `key` under `proof`; a refusal carries its
+/// revocation code, if any.
+async fn tc4321_kv(
+    f: &Fixture,
+    key: &JWK,
+    ability: &str,
+    resource: &str,
+    path: &Path,
+    proof: Cid,
+) -> Result<(), (Option<crate::models::revocation::RevocationCode>, String)> {
+    let inv = signed_invocation(key, &[(resource, ability)], &[proof]);
+    let mut inputs = HashMap::new();
+    if ability == "tinycloud.kv/put" {
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"courier message").await.unwrap();
+        inputs.insert(
+            (f.space.clone(), path.clone()),
+            (Metadata(BTreeMap::new()), stage),
+        );
+    }
+    f.db.invoke::<MemoryStaging>(inv, inputs)
+        .await
+        .map(|_| ())
+        .map_err(|error| (error.revocation_code(), error.to_string()))
+}
+
+/// TC-4321: the owner revoking a same-owner agent's own wallet-signed grant
+/// (owner -> B, the courier AGENT_GRANT over every mailbox under `to/`; what
+/// the account delegations page revokes) ends B's mailbox reads and writes,
+/// through that grant and through B's per-process session child made before
+/// the revoke, also after B posts both again. A session child made after the
+/// revoke is refused at registration. A second, separately signed owner -> B
+/// grant is separate authority: it keeps working until it is revoked too.
+#[tokio::test]
+async fn revoking_an_agents_owner_grant_ends_its_mailbox_reads_and_writes() {
+    use crate::models::revocation::RevocationCode;
+    let f = Fixture::new(None).await;
+    let res = |path: &str| {
+        f.space
+            .clone()
+            .to_resource(
+                "kv".parse().unwrap(),
+                Some(path.parse().unwrap()),
+                None,
+                None,
+            )
+            .to_string()
+    };
+    let prefix = res("xyz.tinycloud.courier/to/");
+    let mailbox = res("xyz.tinycloud.courier/to/a/");
+    let message = res("xyz.tinycloud.courier/to/a/threads/t1/m1");
+    let message_path: Path = "xyz.tinycloud.courier/to/a/threads/t1/m1".parse().unwrap();
+    let grants: Vec<(&str, &str)> = [
+        "tinycloud.kv/get",
+        "tinycloud.kv/put",
+        "tinycloud.kv/list",
+        "tinycloud.kv/del",
+    ]
+    .into_iter()
+    .map(|ability| (prefix.as_str(), ability))
+    .collect();
+    // (ability, resource) of each call B makes on A's mailbox.
+    let calls = [
+        ("tinycloud.kv/put", message.as_str()),
+        ("tinycloud.kv/get", message.as_str()),
+        ("tinycloud.kv/list", mailbox.as_str()),
+        ("tinycloud.kv/del", message.as_str()),
+    ];
+
+    let b = JWK::generate_ed25519().unwrap();
+    let (b_did, _) = verification_method(&b);
+    let (grant, grant_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &b_did,
+        &grants,
+        &[],
+        Some(DelegationModeFact::Attenuable),
+        "tc4321grant1",
+    );
+    must_ok(f.db.delegate(parse_delegation(&grant)).await);
+    let (second, second_cid, _) = signed_cacao_token(
+        &f.wallet,
+        &b_did,
+        &grants,
+        &[],
+        Some(DelegationModeFact::Attenuable),
+        "tc4321grant2",
+    );
+    must_ok(f.db.delegate(parse_delegation(&second)).await);
+    // B's per-process session key, delegated from the grant before the revoke.
+    let session = JWK::generate_ed25519().unwrap();
+    let (session_did, _) = verification_method(&session);
+    let (session_child, session_cid) =
+        signed_ucan_delegation(&b, &session_did, &grants, &[grant_cid], false);
+    let session_child_bytes = session_child.serialized_bytes().to_vec();
+    must_ok(f.db.delegate(session_child).await);
+
+    for (key, proof, what) in [
+        (&b, grant_cid, "owner -> B"),
+        (&session, session_cid, "B session child"),
+        (&b, second_cid, "second owner -> B"),
+    ] {
+        for (ability, resource) in calls {
+            if let Err((_, error)) =
+                tc4321_kv(&f, key, ability, resource, &message_path, proof).await
+            {
+                panic!("{what} {ability} before the revoke: {error}");
+            }
+        }
+    }
+
+    // The owner's wallet revokes owner -> B.
+    must_ok(
+        f.db.revoke(signed_cacao_revocation(
+            &f.wallet,
+            grant_cid,
+            "tc4321revoke1",
+        ))
+        .await,
+    );
+
+    // A fresh B process posts both stored delegations again; whatever the
+    // answer, the revocation stands.
+    let _ = f.db.delegate(parse_delegation(&grant)).await;
+    let _ =
+        f.db.delegate(
+            Delegation::from_header_ser::<TinyCloudDelegation>(
+                std::str::from_utf8(&session_child_bytes).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+    for (key, proof, code, what) in [
+        (
+            &b,
+            grant_cid,
+            RevocationCode::DelegationRevoked,
+            "owner -> B",
+        ),
+        (
+            &session,
+            session_cid,
+            RevocationCode::ParentRevoked,
+            "B session child made before the revoke",
+        ),
+    ] {
+        for (ability, resource) in calls {
+            match tc4321_kv(&f, key, ability, resource, &message_path, proof).await {
+                Ok(()) => panic!("{what} {ability} still authorized after the revoke"),
+                Err((refused, error)) => {
+                    assert_eq!(refused, Some(code), "{what} {ability}: {error}")
+                }
+            }
+        }
+    }
+
+    // A session child B makes after the revoke is refused at registration.
+    let late = JWK::generate_ed25519().unwrap();
+    let (late_did, _) = verification_method(&late);
+    let (late_child, late_cid) =
+        signed_ucan_delegation(&b, &late_did, &grants, &[grant_cid], false);
+    let refused = must_err(f.db.delegate(late_child).await);
+    assert_eq!(
+        refused.revocation_code(),
+        Some(RevocationCode::ParentRevoked),
+        "{refused}"
+    );
+    for (ability, resource) in calls {
+        assert!(
+            tc4321_kv(&f, &late, ability, resource, &message_path, late_cid)
+                .await
+                .is_err(),
+            "B session child made after the revoke: {ability} authorized"
+        );
+    }
+
+    // The second grant is untouched until the owner revokes it as well.
+    for (ability, resource) in calls {
+        if let Err((_, error)) =
+            tc4321_kv(&f, &b, ability, resource, &message_path, second_cid).await
+        {
+            panic!("second owner -> B {ability} after revoking the first: {error}");
+        }
+    }
+    must_ok(
+        f.db.revoke(signed_cacao_revocation(
+            &f.wallet,
+            second_cid,
+            "tc4321revoke2",
+        ))
+        .await,
+    );
+    for (ability, resource) in calls {
+        let refused = tc4321_kv(&f, &b, ability, resource, &message_path, second_cid).await;
+        assert!(
+            matches!(refused, Err((Some(RevocationCode::DelegationRevoked), _))),
+            "second owner -> B {ability} after its revoke: {refused:?}"
+        );
+    }
+}

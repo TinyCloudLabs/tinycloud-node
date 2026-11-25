@@ -289,13 +289,18 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
             )
         ) && is_stored(db, delegation).await?
         {
+            refuse_revoked_stored(db, delegation, encryption).await?;
             return Ok(DelegationRegistration::Existing(crate::hash::hash(
                 &delegation.1,
             )));
         }
         return Err(error);
     }
-    save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
+    let registration = save(db, delegation.0.clone(), delegation.1.clone(), encryption).await?;
+    if let DelegationRegistration::Existing(_) = registration {
+        refuse_revoked_stored(db, delegation, encryption).await?;
+    }
+    Ok(registration)
 }
 
 async fn is_stored<C: ConnectionTrait>(db: &C, delegation: &Delegation) -> Result<bool, DbErr> {
@@ -306,6 +311,51 @@ async fn is_stored<C: ConnectionTrait>(db: &C, delegation: &Delegation) -> Resul
         .one(db)
         .await?
         .is_some())
+}
+
+/// TC-4321: stored bytes answer as already registered only while they and
+/// their chain are unrevoked (under any persisted equivalent CID), so a
+/// client re-activating a revoked delegation gets the refusal an invocation
+/// under it gets, not a success.
+pub(crate) async fn refuse_revoked_stored<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), Error> {
+    let hash = crate::hash::hash(&delegation.1);
+    let parent_ids: Vec<Hash> = delegation
+        .0
+        .parents
+        .iter()
+        .copied()
+        .map(Hash::from)
+        .collect();
+    let mut roots = parent_ids.clone();
+    roots.push(hash);
+    let graph = crate::auth_graph::AuthGraphSnapshot::load_with_encryption(db, &roots, encryption)
+        .await
+        .map_err(|error| match error {
+            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    if graph.is_revoked(&hash) {
+        return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
+    }
+    for parent in &parent_ids {
+        if graph.is_revoked(parent) {
+            return Err(DelegationError::ParentRevoked(parent.to_cid(0x55).to_string()).into());
+        }
+        if let Some(ancestor_cid) = graph.first_revoked_ancestor(parent) {
+            return Err(DelegationError::AncestorRevoked {
+                ancestor_cid,
+                parent_cid: parent.to_cid(0x55).to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// TC-3443: refuse a delegation issued by a signed-out session key. Callers

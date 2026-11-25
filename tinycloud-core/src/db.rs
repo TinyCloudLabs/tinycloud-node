@@ -2,6 +2,9 @@
 #[path = "db/cacao_terminal_mode_tests.rs"]
 mod cacao_terminal_mode_tests;
 #[cfg(test)]
+#[path = "db/peer_revocation_tests.rs"]
+mod peer_revocation_tests;
+#[cfg(test)]
 #[path = "db/purge_readmission_tests.rs"]
 mod purge_readmission_tests;
 #[cfg(test)]
@@ -2697,7 +2700,10 @@ where
     /// A delegation already stored answers as registered only while every
     /// space it names is live: in a space being purged or deleted it gets the
     /// purge refusal its first registration would get (TC-2871).
+    /// TC-4321: one revoked, or under a revoked parent or ancestor, gets the
+    /// revocation refusal instead of being answered as registered.
     async fn answer_stored_delegation(&self, delegation: &Delegation) -> Result<(), TxError<B, K>> {
+        delegation::refuse_revoked_stored(&self.conn, delegation, self.encryption.as_ref()).await?;
         if self.space_purge_fence.is_some() {
             let tx = self.begin_graph_transaction().await?;
             space_purge::lock_delegation::<B, K>(

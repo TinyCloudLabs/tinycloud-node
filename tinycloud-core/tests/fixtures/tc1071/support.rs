@@ -265,6 +265,19 @@ pub async fn register(db: &TestDb, header: &str) {
         .unwrap();
 }
 
+/// TC-4321: a re-post of a revoked delegation (or one under a revoked
+/// ancestor) is refused with its revocation code, never answered as
+/// registered.
+pub async fn register_revoked(db: &TestDb, header: &str) {
+    let Err(error) = db
+        .delegate(Delegation::from_header_ser::<TinyCloudDelegation>(header).unwrap())
+        .await
+    else {
+        panic!("a revoked delegation re-post was answered as registered");
+    };
+    assert!(error.revocation_code().is_some(), "{error}");
+}
+
 pub async fn revoke(db: &TestDb, target: &str) -> String {
     let header = TinyCloudRevocation::Cacao(Box::new(signed_cacao(
         &format!("ucan:{target}"),

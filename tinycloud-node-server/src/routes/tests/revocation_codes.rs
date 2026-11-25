@@ -479,3 +479,77 @@ async fn encryption_decrypt_under_a_revoked_grant_is_delegation_revoked() -> Res
     assert_code(&reply, "delegation_revoked");
     Ok(())
 }
+
+// TC-4321: a `/delegate` refusal names no CID but the posted delegation's own.
+// A revoked parent or ancestor is reported by its code alone; `/invoke` keeps
+// the CIDs in its text.
+
+fn cid(id: Hash) -> String {
+    id.to_cid(0x55).to_string()
+}
+
+#[tokio::test]
+async fn delegate_refusals_under_a_revoked_parent_or_ancestor_name_no_other_cid() -> Result<()> {
+    let fixture = KvSyncFixture::new().await?;
+    let owner_did = fixture.space.did().to_string();
+    let root = fixture
+        .signed_root_grant(
+            "tc4321-foreign-cid",
+            "tinycloud.kv/get",
+            whole_seconds_from_now(3600),
+            false,
+        )
+        .await?;
+    let device = (&fixture.device, fixture.device_vm.as_str());
+    let (reply, middle) = fixture
+        .post_delegation("tc4321-middle", device, &fixture.device_did(), &[root])
+        .await?;
+    assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+    let middle = middle.expect("middle delegation cid");
+    fixture.revoke("tc4321-foreign-cid-revoke", root).await?;
+
+    let (parent, _) = fixture
+        .post_delegation("tc4321-under-parent", device, &owner_did, &[root])
+        .await?;
+    assert_code(&parent, "parent_revoked");
+    assert_eq!(
+        parent.json["error"], "delegation-parent-revoked",
+        "{}",
+        parent.body
+    );
+
+    let (ancestor, _) = fixture
+        .post_delegation("tc4321-under-ancestor", device, &owner_did, &[middle])
+        .await?;
+    assert_code(&ancestor, "ancestor_revoked");
+    assert_eq!(
+        ancestor.json["error"], "delegation-ancestor-revoked",
+        "{}",
+        ancestor.body
+    );
+
+    for reply in [&parent, &ancestor] {
+        for foreign in [root, middle] {
+            assert!(!reply.body.contains(&cid(foreign)), "{}", reply.body);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invoke_refusals_under_a_revoked_parent_or_ancestor_still_name_it() -> Result<()> {
+    let fixture = KvSyncFixture::new().await?;
+    let chain = fixture.sync_chain("tc4321-invoke", 3).await?;
+    fixture.revoke("tc4321-invoke-revoke", chain[0]).await?;
+    for (leaf, code) in [(chain[1], "parent_revoked"), (chain[2], "ancestor_revoked")] {
+        let reply = fixture.sync("notes/", leaf, &[]).await?;
+        assert_code(&reply, code);
+        let error = reply.json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains(&format!("ancestor={}", cid(chain[0]))),
+            "{}",
+            reply.body
+        );
+    }
+    Ok(())
+}
