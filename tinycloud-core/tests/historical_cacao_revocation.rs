@@ -213,7 +213,7 @@ async fn upgrade_revoked_historical_equivalents_reject_real_kv_list_both_directi
         assert_signed_rows_untouched(&db, &fixture).await;
         assert_denied(&db, &fixture).await;
         for row in &fixture.rows {
-            register(&db, &row.header).await;
+            register_revoked(&db, &row.header).await;
         }
         assert_denied(&db, &fixture).await;
         assert_redelegation_denied(&db, &fixture).await;
@@ -274,7 +274,7 @@ async fn upgrade_active_legacy_children_remain_valid_until_owner_revokes_either_
         assert_eq!(signed.0.revoked.to_string(), *target);
         assert_denied(&db, &fixture).await;
         for row in &fixture.rows {
-            register(&db, &row.header).await;
+            register_revoked(&db, &row.header).await;
         }
         assert_denied(&db, &fixture).await;
         assert_redelegation_denied(&db, &fixture).await;

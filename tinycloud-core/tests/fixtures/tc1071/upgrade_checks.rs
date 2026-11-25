@@ -81,7 +81,7 @@ async fn later_schema_upgrade_preserves_revoked_historical_grants() {
         assert_aliases(&path, &fixture);
         assert_denied(&db, &fixture).await;
         for row in &fixture.rows {
-            register(&db, &row.header).await;
+            register_revoked(&db, &row.header).await;
         }
         assert_denied(&db, &fixture).await;
         drop(db);
@@ -358,8 +358,8 @@ async fn single_legacy_root_without_canonical_row_survives_import_then_revokes_a
     let signed = Revocation::from_header_ser::<TinyCloudRevocation>(&header).unwrap();
     assert_eq!(signed.0.revoked.to_string(), row.raw_cid);
     assert_denied(&db, &fixture).await;
-    register(&db, &row.header).await;
-    register(&db, &fixture.canonical_header).await;
+    register_revoked(&db, &row.header).await;
+    register_revoked(&db, &fixture.canonical_header).await;
     let error = list(&db, &fixture.resource, &canonical, &session, &vm)
         .await
         .unwrap_err();
