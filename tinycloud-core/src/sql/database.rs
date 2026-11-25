@@ -61,6 +61,7 @@ enum DbMessage {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
     Wal {
+        max_bytes: u64,
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
     Shutdown {
@@ -231,10 +232,16 @@ impl DatabaseHandle {
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
 
-    pub async fn wal(&self) -> Result<Option<Vec<u8>>, SqlError> {
+    pub async fn wal(&self, max_bytes: u64) -> Result<Option<Vec<u8>>, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send((request_telemetry::current(), DbMessage::Wal { response_tx }))
+            .send((
+                request_telemetry::current(),
+                DbMessage::Wal {
+                    max_bytes,
+                    response_tx,
+                },
+            ))
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -480,8 +487,11 @@ pub fn spawn_actor_with_policy(
                     }
                     let _ = response_tx.send(result);
                 }
-                DbMessage::Wal { response_tx } => {
-                    let result = handle_wal(&mode, &file_path);
+                DbMessage::Wal {
+                    max_bytes,
+                    response_tx,
+                } => {
+                    let result = handle_wal(&mode, &file_path, max_bytes);
                     let _ = response_tx.send(result);
                 }
             }
@@ -517,30 +527,18 @@ fn existing_ancestor(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// The committed prefix of the actor's WAL, as a delta may carry it: through
-/// the last commit frame, never the raw file (TC-4290). A transaction that
-/// spilled past the page cache and rolled back leaves frames in the file that
-/// a later, smaller commit does not overwrite; they fail the checksum chain
-/// and a restore refuses the artifact that carries them.
+/// A copy of the actor's WAL cut to its committed prefix, as a delta may carry
+/// it: through the last commit frame, never the raw file (TC-4290). A
+/// transaction that spilled past the page cache and rolled back leaves frames
+/// in the file that a later, smaller commit does not overwrite; they fail the
+/// checksum chain and a restore refuses the artifact that carries them.
 ///
-/// `None` makes the caller save a whole checkpoint instead: no WAL, no commit
-/// frame, or a WAL whose header or first commit does not verify.
-fn committed_wal(file_path: &Path, raw_len: u64) -> Result<Option<u64>, SqlError> {
-    let wal = restore::wal_path(file_path);
-    let committed =
-        restore::committed_wal_len(&wal).map_err(|e| SqlError::Internal(e.to_string()))?;
-    if committed == 0 {
-        if raw_len > 0 {
-            tracing::warn!(
-                wal_bytes = raw_len,
-                "WAL has no verifiable committed frame; saving a whole checkpoint"
-            );
-        }
-        return Ok(None);
-    }
-    Ok(Some(committed.min(raw_len)))
-}
-
+/// `None` makes the caller save a whole checkpoint instead: no WAL, a raw WAL
+/// of `max_bytes` or more (checked on the file size, before anything is read),
+/// no commit frame, or a WAL whose header or first commit does not verify.
+///
+/// The WAL is opened and read once: the committed length is measured on the
+/// copy, so the length and the bytes cannot come from two different files.
 fn handle_wal_snapshot(
     mode: &StorageMode,
     file_path: &Path,
@@ -558,38 +556,52 @@ fn handle_wal_snapshot(
         .metadata()
         .map_err(|e| SqlError::Internal(e.to_string()))?
         .len();
-    // The raw size gates the work: the committed prefix is never longer.
     if size == 0 || size >= max_bytes {
         return Ok(None);
     }
-    let Some(committed) = committed_wal(file_path, size)? else {
-        return Ok(None);
-    };
     let mut snapshot =
         tempfile::NamedTempFile::new().map_err(|e| SqlError::Internal(e.to_string()))?;
-    std::io::copy(
-        &mut std::io::Read::take(source, committed),
+    let copied = std::io::copy(
+        &mut std::io::Read::take(source, size),
         snapshot.as_file_mut(),
     )
     .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if copied != size {
+        tracing::warn!(
+            wal_bytes = size,
+            copied,
+            "WAL shrank while it was read; saving a whole checkpoint"
+        );
+        return Ok(None);
+    }
+    let committed = restore::committed_wal_len(snapshot.path())
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if committed == 0 {
+        tracing::warn!(
+            wal_bytes = size,
+            "WAL has no verifiable committed frame; saving a whole checkpoint"
+        );
+        return Ok(None);
+    }
+    snapshot
+        .as_file_mut()
+        .set_len(committed)
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
     Ok(Some(snapshot))
 }
 
-fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, SqlError> {
-    if !matches!(mode, StorageMode::File(_)) {
-        return Ok(None);
-    }
-    let mut wal = match std::fs::read(restore::wal_path(file_path)) {
-        Ok(wal) if !wal.is_empty() => wal,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(SqlError::Internal(error.to_string())),
-    };
-    let Some(committed) = committed_wal(file_path, wal.len() as u64)? else {
+/// [`handle_wal_snapshot`]'s bytes, in a buffer of exactly their length.
+fn handle_wal(
+    mode: &StorageMode,
+    file_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let Some(snapshot) = handle_wal_snapshot(mode, file_path, max_bytes)? else {
         return Ok(None);
     };
-    wal.truncate(committed as usize);
-    Ok(Some(wal))
+    std::fs::read(snapshot.path())
+        .map(Some)
+        .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 fn handle_export(

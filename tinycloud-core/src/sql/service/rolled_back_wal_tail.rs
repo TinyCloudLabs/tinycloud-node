@@ -79,8 +79,8 @@ async fn execute(service: &SqlService, space: &SpaceId, sql: &str) {
 
 /// A transaction that spills past the page cache and then rolls back (its
 /// last statement violates NOT NULL).
-async fn rolled_back_spill(service: &SqlService, space: &SpaceId) {
-    let mut statements: Vec<SqlStatement> = (0..SPILL_BLOBS)
+async fn rolled_back_spill(service: &SqlService, space: &SpaceId, blobs: usize) {
+    let mut statements: Vec<SqlStatement> = (0..blobs)
         .map(|_| {
             statement(&format!(
                 "INSERT INTO t (v) VALUES (zeroblob({SPILL_BLOB_BYTES}))"
@@ -317,8 +317,14 @@ impl DatabaseArtifactRepository for Chunked {
 }
 
 /// Seed one committed row, roll back a write that spills past the cache, then
-/// commit one small row: the save that follows is the one under test.
-async fn spill_then_small_commit(service: &SqlService, space: &SpaceId) {
+/// commit one small row: the save that follows is the one under test. Returns
+/// the size of the actor's `-wal` file after the rollback, before that save.
+async fn spill_then_small_commit(
+    service: &SqlService,
+    space: &SpaceId,
+    cache: &std::path::Path,
+    blobs: usize,
+) -> u64 {
     execute(
         service,
         space,
@@ -326,8 +332,10 @@ async fn spill_then_small_commit(service: &SqlService, space: &SpaceId) {
     )
     .await;
     execute(service, space, "INSERT INTO t (v) VALUES (zeroblob(4))").await;
-    rolled_back_spill(service, space).await;
+    rolled_back_spill(service, space, blobs).await;
+    let raw = raw_wal_bytes(cache);
     execute(service, space, "INSERT INTO t (v) VALUES (zeroblob(5))").await;
+    raw
 }
 
 #[tokio::test]
@@ -343,7 +351,7 @@ async fn tc4290_delta_route_does_not_publish_a_rolled_back_wal_tail() {
         }),
     );
     let space = space_id("tc4290-delta");
-    spill_then_small_commit(&service, &space).await;
+    spill_then_small_commit(&service, &space, cache.path(), SPILL_BLOBS).await;
     assert_restores_committed_rows(&published.lock().unwrap(), cache.path());
 }
 
@@ -359,6 +367,63 @@ async fn tc4290_chunked_route_does_not_publish_a_rolled_back_wal_tail() {
         }),
     );
     let space = space_id("tc4290-chunked");
-    spill_then_small_commit(&service, &space).await;
+    spill_then_small_commit(&service, &space, cache.path(), SPILL_BLOBS).await;
     assert_restores_committed_rows(&published.lock().unwrap(), cache.path());
+}
+
+/// Enough rolled-back blobs that the raw WAL passes the delta bound while the
+/// committed prefix stays tiny.
+const OVERSIZE_BLOBS: usize = 14;
+
+fn assert_whole_checkpoint_published(published: &Published) {
+    assert!(published.wal.is_none(), "no WAL delta is published");
+    let checkpoint = published.checkpoint.as_deref().expect("a checkpoint");
+    let rows = restore(checkpoint, &[])
+        .unwrap_or_else(|error| panic!("the published checkpoint does not restore: {error}"));
+    assert_eq!(rows, vec!["4".to_string(), "5".to_string()]);
+}
+
+#[tokio::test]
+async fn tc4290_delta_route_over_the_bound_saves_a_whole_checkpoint() {
+    let published = Arc::new(Mutex::new(Published::default()));
+    let cache = TempDir::new().unwrap();
+    let service = SqlService::new(
+        cache.path().to_string_lossy().into_owned(),
+        0,
+        Arc::new(Recording {
+            inner: sqlite_repository().await,
+            published: published.clone(),
+        }),
+    );
+    let space = space_id("tc4290-delta-oversize");
+    let raw = spill_then_small_commit(&service, &space, cache.path(), OVERSIZE_BLOBS).await;
+    assert!(
+        raw > MAX_WAL_DELTA_BYTES as u64,
+        "the rolled-back spill must leave a raw WAL over the delta bound; raw wal bytes = {raw}"
+    );
+    // The whole-checkpoint save folds the WAL into the main file: no large
+    // tail is left behind.
+    assert!(raw_wal_bytes(cache.path()) < 1024 * 1024);
+    assert_whole_checkpoint_published(&published.lock().unwrap());
+}
+
+#[tokio::test]
+async fn tc4290_chunked_route_over_the_bound_saves_a_whole_checkpoint_and_truncates() {
+    let published = Arc::new(Mutex::new(Published::default()));
+    let cache = TempDir::new().unwrap();
+    let service = SqlService::new(
+        cache.path().to_string_lossy().into_owned(),
+        0,
+        Arc::new(Chunked {
+            published: published.clone(),
+        }),
+    );
+    let space = space_id("tc4290-chunked-oversize");
+    let raw = spill_then_small_commit(&service, &space, cache.path(), OVERSIZE_BLOBS).await;
+    assert!(
+        raw > MAX_WAL_DELTA_BYTES as u64,
+        "the rolled-back spill must leave a raw WAL over the delta bound; raw wal bytes = {raw}"
+    );
+    assert!(raw_wal_bytes(cache.path()) < 1024 * 1024);
+    assert_whole_checkpoint_published(&published.lock().unwrap());
 }

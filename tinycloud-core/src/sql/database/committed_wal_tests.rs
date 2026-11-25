@@ -77,8 +77,10 @@ fn a_rolled_back_spill_is_cut_off_the_wal() {
         "the raw WAL carries a tail that fails the checksum chain"
     );
 
-    let wal = handle_wal(&live.mode, &live.db).unwrap().unwrap();
+    let wal = handle_wal(&live.mode, &live.db, u64::MAX).unwrap().unwrap();
     assert!(wal.len() < raw.len());
+    // The buffer is the prefix's own, not the raw file's.
+    assert!(wal.capacity() < raw.len());
     assert_eq!(wal, raw[..wal.len()]);
     live.assert_restorable(&wal);
 
@@ -94,7 +96,10 @@ fn a_clean_wal_is_sent_whole() {
     live.small_commit();
     live.small_commit();
     let raw = live.raw_wal();
-    assert_eq!(handle_wal(&live.mode, &live.db).unwrap().unwrap(), raw);
+    assert_eq!(
+        handle_wal(&live.mode, &live.db, u64::MAX).unwrap().unwrap(),
+        raw
+    );
     let snapshot = handle_wal_snapshot(&live.mode, &live.db, u64::MAX)
         .unwrap()
         .unwrap();
@@ -113,7 +118,7 @@ fn a_bad_tail_after_a_commit_is_cut_at_that_commit() {
     let at = raw.len() - 10;
     raw[at] ^= 0xff;
     std::fs::write(wal_path(&live.db), &raw).unwrap();
-    let wal = handle_wal(&live.mode, &live.db).unwrap().unwrap();
+    let wal = handle_wal(&live.mode, &live.db, u64::MAX).unwrap().unwrap();
     assert_eq!(wal.len(), first);
     live.assert_restorable(&wal);
 }
@@ -126,7 +131,7 @@ fn a_wal_without_a_verifiable_commit_is_not_sent() {
         let mut raw = live.raw_wal();
         raw[damage] ^= 0xff;
         std::fs::write(wal_path(&live.db), &raw).unwrap();
-        assert_eq!(handle_wal(&live.mode, &live.db).unwrap(), None);
+        assert_eq!(handle_wal(&live.mode, &live.db, u64::MAX).unwrap(), None);
         assert!(handle_wal_snapshot(&live.mode, &live.db, u64::MAX)
             .unwrap()
             .is_none());
@@ -137,16 +142,16 @@ fn a_wal_without_a_verifiable_commit_is_not_sent() {
 fn an_absent_or_empty_wal_is_not_sent() {
     let live = live();
     std::fs::write(wal_path(&live.db), []).unwrap();
-    assert_eq!(handle_wal(&live.mode, &live.db).unwrap(), None);
+    assert_eq!(handle_wal(&live.mode, &live.db, u64::MAX).unwrap(), None);
     assert!(handle_wal_snapshot(&live.mode, &live.db, u64::MAX)
         .unwrap()
         .is_none());
     std::fs::remove_file(wal_path(&live.db)).unwrap();
-    assert_eq!(handle_wal(&live.mode, &live.db).unwrap(), None);
+    assert_eq!(handle_wal(&live.mode, &live.db, u64::MAX).unwrap(), None);
 }
 
 #[test]
-fn the_raw_size_still_gates_the_snapshot() {
+fn the_raw_size_gates_both_routes() {
     let live = live();
     live.small_commit();
     let raw = live.raw_wal().len() as u64;
@@ -156,4 +161,30 @@ fn the_raw_size_still_gates_the_snapshot() {
     assert!(handle_wal_snapshot(&live.mode, &live.db, raw + 1)
         .unwrap()
         .is_some());
+    assert_eq!(handle_wal(&live.mode, &live.db, raw).unwrap(), None);
+    assert!(handle_wal(&live.mode, &live.db, raw + 1).unwrap().is_some());
+}
+
+#[test]
+fn a_raw_wal_over_the_bound_with_a_small_committed_prefix_is_not_sent() {
+    let live = live();
+    // Rolled-back spills of the same transaction shape, until the raw WAL is
+    // far past the committed data; then one small commit.
+    live.spill_and_roll_back();
+    live.small_commit();
+    let raw = live.raw_wal().len() as u64;
+    let committed = restore::committed_wal_len(&wal_path(&live.db)).unwrap();
+    assert!(
+        committed > 0 && committed < raw / 10,
+        "{committed} of {raw}"
+    );
+    // A bound between the two: the committed prefix would fit, the raw file
+    // does not, and both routes decide on the raw file, as the whole
+    // checkpoint path always did.
+    let bound = raw - 1;
+    assert!(committed < bound);
+    assert_eq!(handle_wal(&live.mode, &live.db, bound).unwrap(), None);
+    assert!(handle_wal_snapshot(&live.mode, &live.db, bound)
+        .unwrap()
+        .is_none());
 }
