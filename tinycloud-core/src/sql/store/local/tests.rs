@@ -521,32 +521,102 @@ fn a_store_master_connection_is_always_synchronous_full() {
 }
 
 #[test]
-fn creating_the_seq_file_leaves_no_temp_file_and_a_leftover_one_is_never_the_counter() {
+fn a_leftover_temp_file_is_never_the_counter_and_a_run_leaves_none_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.db");
     Connection::open(&path)
         .unwrap()
         .execute_batch("CREATE TABLE items (v TEXT)")
         .unwrap();
-    // What an `init_working_copy` that died before the link leaves.
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq_path(&path).display()));
-    std::fs::write(&tmp, b"short").unwrap();
+    // What an `init_working_copy` that died before the link leaves. It is not
+    // the counter, and a later run neither reads, links nor removes it.
+    let leftover = std::path::PathBuf::from(format!(
+        "{}.tmp.1.0.0000000000000000",
+        seq_path(&path).display()
+    ));
+    std::fs::write(&leftover, b"short").unwrap();
     assert!(read_seq(&path).is_err(), "a temp file is not a counter");
     assert!(validate_working_copy(&path).is_err());
     assert!(!seq_path(&path).exists());
+    let temp_files = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| file.to_string_lossy().contains(".seq.tmp"))
+            .collect()
+    };
 
     init_working_copy(&path, 5).unwrap();
     assert_eq!(read_seq(&path).unwrap(), 5);
-    assert!(!tmp.exists(), "the leftover is replaced and removed");
+    assert_eq!(
+        temp_files(),
+        vec![leftover.clone()],
+        "the run's own temp file is gone; the dead run's is not ours to remove"
+    );
     assert_eq!(
         std::fs::read(seq_path(&path)).unwrap().len(),
         SEQ_RECORD_LEN
     );
 
-    // A second run refuses, keeps the counter and leaves no temp file.
+    // A second run refuses, keeps the counter and leaves no temp file of its own.
     assert!(init_working_copy(&path, 9).is_err());
     assert_eq!(read_seq(&path).unwrap(), 5);
-    assert!(!tmp.exists());
+    assert_eq!(temp_files(), vec![leftover]);
+}
+
+/// Two `init_working_copy` calls on one database at once (the caller should
+/// not, but nothing else stops it): exactly one wins, every other call is
+/// refused, and the counter on disk is the winner's `start_seq`. A call that
+/// returned `Ok` with another call's number would be a cutover that believes
+/// it seeded the counter at a revision it did not.
+#[test]
+fn concurrent_inits_leave_one_winner_and_the_counter_is_the_winners() {
+    const CALLERS: u64 = 6;
+    for round in 0..100 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE items (v TEXT)")
+            .unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(CALLERS as usize));
+        let results: Vec<(u64, bool)> = (0..CALLERS)
+            .map(|caller| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    (caller, init_working_copy(&path, 100 + caller).is_ok())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let winners: Vec<u64> = results
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(caller, _)| *caller)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: exactly one init may return Ok, got {winners:?}"
+        );
+        assert_eq!(
+            read_seq(&path).unwrap(),
+            100 + winners[0],
+            "round {round}: the counter is the winner's start_seq"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".seq.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "round {round}: temp files {leftovers:?}"
+        );
+    }
 }
 
 /// A main file that is not there is not made into a working copy: init
