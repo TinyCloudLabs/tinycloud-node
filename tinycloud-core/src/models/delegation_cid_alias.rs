@@ -2,13 +2,19 @@
 
 use std::borrow::Cow;
 
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use sea_orm::{
     entity::prelude::*, sea_query::Query, ActiveValue::Set, ConnectionTrait, JoinType, QueryOrder,
     QuerySelect,
 };
 use sea_orm_migration::{seaql_migrations, MigrationName};
-use tinycloud_auth::authorization::{HeaderEncode, TinyCloudDelegation};
+use tinycloud_auth::{
+    authorization::{HeaderEncode, TinyCloudDelegation},
+    ssi::{jwk::Algorithm, ucan::Ucan},
+};
 
 use crate::encryption::{maybe_decrypt, ColumnEncryption};
 use crate::hash::{hash, Hash};
@@ -46,18 +52,97 @@ impl Related<delegation::Entity> for Entity {
 impl ActiveModelBehavior for ActiveModel {}
 
 /// Derive the same identity as current delegation ingestion, without changing
-/// the stored serialization. UCAN JWT bytes remain exact; CACAO goes through
-/// the public header decoder, including all current canonicalization rules.
+/// the stored serialization. CACAO goes through the public header decoder,
+/// including all current canonicalization rules. A UCAN keeps its exact JWT
+/// bytes as its ID; its canonical form is [`ucan_canonical`].
 /// Decoder rejection is fatal: a guessed self-alias could hide a revocation.
 pub(crate) fn canonical_hash(serialization: &[u8]) -> Result<Hash, DbErr> {
-    let decoded = match std::str::from_utf8(serialization) {
+    Ok(match decode_stored(serialization)? {
+        (TinyCloudDelegation::Ucan(ucan), token) => hash(&ucan_canonical(&ucan, &token)),
+        (TinyCloudDelegation::Cacao(_), canonical) => hash(&canonical),
+    })
+}
+
+/// [`canonical_hash`], and for an ECDSA UCAN also the hash of its other
+/// encoding ([`ucan_twin`]). A tombstone written before TC-4366 names only the
+/// stored id of the encoding it purged, which for a high-S UCAN is not the
+/// canonical hash of the low-S one; registration checks both.
+pub(crate) fn canonical_and_twin_hash(serialization: &[u8]) -> Result<(Hash, Option<Hash>), DbErr> {
+    Ok(match decode_stored(serialization)? {
+        (TinyCloudDelegation::Ucan(ucan), token) => (
+            hash(&ucan_canonical(&ucan, &token)),
+            ucan_twin(&ucan, &token).map(|twin| hash(&twin)),
+        ),
+        (TinyCloudDelegation::Cacao(_), canonical) => (hash(&canonical), None),
+    })
+}
+
+fn decode_stored(serialization: &[u8]) -> Result<(TinyCloudDelegation, Vec<u8>), DbErr> {
+    match std::str::from_utf8(serialization) {
         Ok(token) if token.contains('.') => TinyCloudDelegation::decode(token),
         _ => TinyCloudDelegation::decode(&URL_SAFE.encode(serialization)),
+    }
+    .map_err(|_| DbErr::Custom("delegation CID alias backfill: delegation decoding failed".into()))
+}
+
+/// The canonical bytes of a UCAN JWT: its ECDSA signature `(r, s)` with `s`
+/// in the lower half of the group order. `(r, s)` and `(r, n - s)` verify
+/// alike, so both encodings must name one delegation. Every other algorithm,
+/// and a signature that does not parse, keeps the exact bytes.
+fn ucan_canonical<'a>(ucan: &Ucan, token: &'a [u8]) -> Cow<'a, [u8]> {
+    let signature = ucan.signature().as_bytes();
+    let low_s = match ucan.header().algorithm {
+        Algorithm::ES256 | Algorithm::ESBlake2b => p256::ecdsa::Signature::from_slice(signature)
+            .ok()
+            .and_then(|signature| signature.normalize_s())
+            .map(|signature| signature.to_bytes().to_vec()),
+        Algorithm::ES256K => k256::ecdsa::Signature::from_slice(signature)
+            .ok()
+            .and_then(|signature| signature.normalize_s())
+            .map(|signature| signature.to_bytes().to_vec()),
+        _ => None,
     };
-    let (_, canonical) = decoded.map_err(|_| {
-        DbErr::Custom("delegation CID alias backfill: delegation decoding failed".into())
-    })?;
-    Ok(hash(&canonical))
+    match low_s {
+        Some(low_s) => with_signature(token, &low_s).map_or(Cow::Borrowed(token), Cow::Owned),
+        None => Cow::Borrowed(token),
+    }
+}
+
+/// The other encoding of an ECDSA UCAN JWT: the same header and payload with
+/// signature `(r, n - s)`. `None` for every other algorithm and for a
+/// signature that does not parse.
+fn ucan_twin(ucan: &Ucan, token: &[u8]) -> Option<Vec<u8>> {
+    let signature = ucan.signature().as_bytes();
+    let other = match ucan.header().algorithm {
+        Algorithm::ES256 | Algorithm::ESBlake2b => {
+            let (r, s) = p256::ecdsa::Signature::from_slice(signature)
+                .ok()?
+                .split_scalars();
+            p256::ecdsa::Signature::from_scalars(r, -s)
+                .ok()?
+                .to_bytes()
+                .to_vec()
+        }
+        Algorithm::ES256K => {
+            let (r, s) = k256::ecdsa::Signature::from_slice(signature)
+                .ok()?
+                .split_scalars();
+            k256::ecdsa::Signature::from_scalars(r, -s)
+                .ok()?
+                .to_bytes()
+                .to_vec()
+        }
+        _ => return None,
+    };
+    with_signature(token, &other)
+}
+
+/// `token` with its JWS signature segment replaced by `signature`.
+fn with_signature(token: &[u8], signature: &[u8]) -> Option<Vec<u8>> {
+    let dot = token.iter().rposition(|byte| *byte == b'.')?;
+    let mut replaced = token[..=dot].to_vec();
+    replaced.extend_from_slice(URL_SAFE_NO_PAD.encode(signature).as_bytes());
+    Some(replaced)
 }
 
 /// Validate indexed encrypted and plaintext records on every boot, including
@@ -194,6 +279,109 @@ pub(crate) async fn backfill<C: ConnectionTrait>(
         }
         Entity::insert_many(aliases).exec(db).await?;
     }
+}
+
+/// The revision of [`canonical_hash`] stored UCAN aliases follow, recorded in
+/// `delegation_cid_alias_rule` once [`recompute`] has applied it.
+const CANONICAL_RULE: i32 = 1;
+
+/// Bring every stored UCAN alias to the current [`canonical_hash`], once per
+/// rule revision. Run in the boot transaction after [`backfill`], which
+/// serializes concurrent boots; any failure rolls back every update.
+///
+/// Only `canonical` changes, and only where the current rule gives another
+/// value: IDs, serializations, proof edges and revocations are never
+/// written. CACAO aliases are left as they are. Encrypted rows require the
+/// configured key; decryption and content-hash failures abort startup, as in
+/// [`backfill`]. A stored UCAN the current decoder rejects keeps its alias
+/// (what every older image computed) and is counted in the log.
+pub(crate) async fn recompute<C: ConnectionTrait>(
+    db: &C,
+    encryption: Option<&ColumnEncryption>,
+) -> Result<(), DbErr> {
+    use crate::migrations::m20261125_010000_delegation_cid_alias_rule::DelegationCidAliasRule as Rule;
+    const PAGE_SIZE: u64 = 128;
+    let backend = db.get_database_backend();
+    let applied = Query::select()
+        .expr(Expr::value(1))
+        .from(Rule::Table)
+        .and_where(Expr::col(Rule::Revision).eq(CANONICAL_RULE))
+        .to_owned();
+    if db.query_one(backend.build(&applied)).await?.is_some() {
+        return Ok(());
+    }
+    let (mut checked, mut changed, mut undecodable) = (0u64, 0u64, 0u64);
+    let mut after = None;
+    loop {
+        let mut query = delegation::Entity::find()
+            .select_only()
+            .column(delegation::Column::Id)
+            .column(delegation::Column::Serialization)
+            .column(delegation::Column::SerializationFormat)
+            .column(Column::Canonical)
+            .join_rev(JoinType::InnerJoin, Relation::Delegation.def())
+            .order_by_asc(delegation::Column::Id)
+            .limit(PAGE_SIZE);
+        if let Some(id) = after {
+            query = query.filter(delegation::Column::Id.gt(id));
+        }
+        let rows = query
+            .into_tuple::<(Hash, Vec<u8>, i16, Hash)>()
+            .all(db)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for (id, stored, format, stored_canonical) in rows {
+            after = Some(id);
+            let serialization = stored_plaintext(encryption, id, &stored, format)?;
+            if hash(serialization.as_ref()) != id {
+                return Err(DbErr::Custom(
+                    "delegation CID alias recompute: plaintext content hash does not match stored ID"
+                        .into(),
+                ));
+            }
+            // The same dispatch as `canonical_hash`: a CACAO is not UTF-8 text
+            // with a dot.
+            let Some(token) = std::str::from_utf8(serialization.as_ref())
+                .ok()
+                .filter(|token| token.contains('.'))
+            else {
+                continue;
+            };
+            checked += 1;
+            let Ok((TinyCloudDelegation::Ucan(ucan), bytes)) = TinyCloudDelegation::decode(token)
+            else {
+                undecodable += 1;
+                continue;
+            };
+            let canonical = hash(&ucan_canonical(&ucan, &bytes));
+            if canonical == stored_canonical {
+                continue;
+            }
+            Entity::update_many()
+                .col_expr(Column::Canonical, Expr::value(canonical))
+                .filter(Column::Id.eq(id))
+                .filter(Column::Canonical.eq(stored_canonical))
+                .exec(db)
+                .await?;
+            changed += 1;
+        }
+    }
+    let record = Query::insert()
+        .into_table(Rule::Table)
+        .columns([Rule::Revision, Rule::AppliedAt])
+        .values_panic([CANONICAL_RULE.into(), Expr::current_timestamp().into()])
+        .to_owned();
+    db.execute(backend.build(&record)).await?;
+    tracing::info!(
+        rule = CANONICAL_RULE,
+        checked,
+        changed,
+        undecodable,
+        "delegation CID alias recompute applied"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -596,5 +784,292 @@ mod tests {
             original,
             "concurrent startup must preserve every historical signed row",
         );
+    }
+
+    // TC-4366: `recompute` brings stored UCAN aliases to the current rule.
+
+    /// `(low_s, high_s)` encodings of a fresh UCAN signed with `algorithm`.
+    fn encodings(jwk: &JWK, algorithm: Algorithm) -> (Vec<u8>, Vec<u8>) {
+        let token = signed_ucan(ACTOR, jwk, algorithm).encode().unwrap();
+        let (signed, signature) = token.rsplit_once('.').unwrap();
+        let signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
+        let (low, high) = match algorithm {
+            Algorithm::ES256 => {
+                let signature = p256::ecdsa::Signature::from_slice(&signature).unwrap();
+                let (r, s) = signature.split_scalars();
+                let twin = p256::ecdsa::Signature::from_scalars(r, -s).unwrap();
+                match signature.normalize_s() {
+                    None => (signature.to_vec(), twin.to_vec()),
+                    Some(_) => (twin.to_vec(), signature.to_vec()),
+                }
+            }
+            Algorithm::ES256K => {
+                let signature = k256::ecdsa::Signature::from_slice(&signature).unwrap();
+                let (r, s) = signature.split_scalars();
+                let twin = k256::ecdsa::Signature::from_scalars(r, -s).unwrap();
+                match signature.normalize_s() {
+                    None => (signature.to_vec(), twin.to_vec()),
+                    Some(_) => (twin.to_vec(), signature.to_vec()),
+                }
+            }
+            other => panic!("no second encoding for {other:?}"),
+        };
+        let encode = |signature: Vec<u8>| {
+            format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature)).into_bytes()
+        };
+        (encode(low), encode(high))
+    }
+
+    async fn insert_alias(db: &DbConn, id: Hash, canonical: Hash, encrypted: bool) {
+        ActiveModel {
+            id: Set(id),
+            canonical: Set(canonical),
+            encrypted: Set(encrypted),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn aliases(db: &DbConn) -> std::collections::HashMap<Hash, Hash> {
+        Entity::find()
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|alias| (alias.id, alias.canonical))
+            .collect()
+    }
+
+    async fn delegations(db: &DbConn) -> Vec<delegation::Model> {
+        delegation::Entity::find()
+            .order_by_asc(delegation::Column::Id)
+            .all(db)
+            .await
+            .unwrap()
+    }
+
+    /// A database as an older image left it: every UCAN aliased to the hash of
+    /// its exact bytes, a historical CACAO alias to another hash.
+    async fn recompute_rekeys_only_the_two_high_s_aliases_once(db: &DbConn) {
+        let (es256_low, es256_high) = encodings(&JWK::generate_p256(), Algorithm::ES256);
+        let (es256k_low, es256k_high) = encodings(&JWK::generate_secp256k1(), Algorithm::ES256K);
+        // A second P-256 UCAN stored only in its low-S encoding.
+        let (lone_low, _) = encodings(&JWK::generate_p256(), Algorithm::ES256);
+        let eddsa = ucan_serialization();
+        // CACAO rows are DAG-CBOR, not UTF-8 text.
+        let cacao = vec![0xa3, 0xff, 0x00, 0x2e, 0x01];
+        let mut expected = std::collections::HashMap::new();
+        for serialization in [
+            &es256_low,
+            &es256_high,
+            &es256k_low,
+            &es256k_high,
+            &lone_low,
+            &eddsa,
+        ] {
+            let id = hash(serialization);
+            insert_delegation(db, id, serialization.clone()).await;
+            insert_alias(db, id, id, false).await;
+            expected.insert(id, id);
+        }
+        let cacao_id = hash(&cacao);
+        insert_delegation(db, cacao_id, cacao).await;
+        insert_alias(db, cacao_id, hash(b"historical canonical"), false).await;
+        expected.insert(cacao_id, hash(b"historical canonical"));
+        let stored = delegations(db).await;
+        assert_eq!(aliases(db).await, expected);
+
+        recompute(db, None).await.unwrap();
+        expected.insert(hash(&es256_high), hash(&es256_low));
+        expected.insert(hash(&es256k_high), hash(&es256k_low));
+        assert_eq!(aliases(db).await, expected, "only the high-S aliases move");
+        assert_eq!(delegations(db).await, stored, "signed rows are untouched");
+
+        // A second boot reads the recorded rule and writes nothing, even where
+        // an alias disagrees with it.
+        Entity::update_many()
+            .col_expr(Column::Canonical, Expr::value(hash(&es256_high)))
+            .filter(Column::Id.eq(hash(&es256_high)))
+            .exec(db)
+            .await
+            .unwrap();
+        recompute(db, None).await.unwrap();
+        let mut unchanged = expected.clone();
+        unchanged.insert(hash(&es256_high), hash(&es256_high));
+        assert_eq!(aliases(db).await, unchanged);
+
+        // Applying the migration again (after a rollback deleted its record)
+        // clears the rule, so the next boot recomputes.
+        sea_orm_migration::MigrationTrait::up(
+            &crate::migrations::m20261125_010000_delegation_cid_alias_rule::Migration,
+            &sea_orm_migration::SchemaManager::new(db),
+        )
+        .await
+        .unwrap();
+        recompute(db, None).await.unwrap();
+        assert_eq!(aliases(db).await, expected);
+        assert_eq!(delegations(db).await, stored);
+    }
+
+    #[tokio::test]
+    async fn sqlite_recompute_rekeys_only_the_two_high_s_aliases_once() {
+        recompute_rekeys_only_the_two_high_s_aliases_once(&database().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_recompute_rekeys_only_the_two_high_s_aliases_once() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_recompute_rekeys_only_the_two_high_s_aliases_once",
+        )
+        .await
+        else {
+            return;
+        };
+        actor::ActiveModel {
+            id: Set(ACTOR.into()),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        recompute_rekeys_only_the_two_high_s_aliases_once(&fixture.conn).await;
+    }
+
+    #[tokio::test]
+    async fn recompute_reads_encrypted_rows_only_with_the_key() {
+        let db = database().await;
+        let encryption = ColumnEncryption::new([0x42; 32]);
+        let (low, high) = encodings(&JWK::generate_p256(), Algorithm::ES256);
+        let id = hash(&high);
+        let stored = encryption.encrypt(
+            &high,
+            crate::encryption::RowBinding::new(
+                "delegation",
+                "serialization",
+                &[&Vec::<u8>::from(id)],
+            ),
+        );
+        insert_delegation(&db, id, stored.clone()).await;
+        delegation::Entity::update_many()
+            .col_expr(delegation::Column::SerializationFormat, Expr::value(2))
+            .exec(&db)
+            .await
+            .unwrap();
+        insert_alias(&db, id, id, true).await;
+
+        assert!(recompute(&db, None).await.is_err());
+        assert!(recompute(&db, Some(&ColumnEncryption::new([0x43; 32])))
+            .await
+            .is_err());
+        recompute(&db, Some(&encryption)).await.unwrap();
+        assert_eq!(
+            Entity::find_by_id(id).one(&db).await.unwrap().unwrap(),
+            Model {
+                id,
+                canonical: hash(&low),
+                encrypted: true
+            }
+        );
+        assert_eq!(
+            delegation::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialization,
+            stored
+        );
+    }
+
+    /// Both encodings stored by an older image, each its own identity, and
+    /// the high-S one revoked: after the next boot the low-S one is revoked
+    /// too, in the revocation read authorization uses and in the status route.
+    async fn earlier_twin_reads_revoked_after_boot(db: &DbConn, jwk: JWK, algorithm: Algorithm) {
+        use crate::{
+            db::{DelegationStatus, SpaceDatabase},
+            keys::StaticSecret,
+            models::revocation,
+            storage::memory::MemoryStore,
+        };
+        let (low, high) = encodings(&jwk, algorithm);
+        let (low, high) = ((hash(&low), low.clone()), (hash(&high), high.clone()));
+        for (id, serialization) in [&low, &high] {
+            insert_delegation(db, *id, serialization.clone()).await;
+            insert_alias(db, *id, *id, false).await;
+        }
+        revocation::ActiveModel {
+            id: Set(hash(format!("{algorithm:?} revocation").as_bytes())),
+            revoker: Set(ACTOR.into()),
+            revoked: Set(high.0),
+            serialization: Set(b"revocation".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        assert!(revocation::is_revoked(db, &high.0).await.unwrap());
+        assert!(
+            !revocation::is_revoked(db, &low.0).await.unwrap(),
+            "{algorithm:?}: before the boot the older aliases do not link the two"
+        );
+
+        let space = SpaceDatabase::new(
+            db.clone(),
+            MemoryStore::default(),
+            StaticSecret::new(vec![31; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            revocation::is_revoked(db, &low.0).await.unwrap(),
+            "{algorithm:?}: after the boot the low-S encoding is revoked"
+        );
+        assert!(matches!(
+            space.delegation_status(low.0, ACTOR, &[]).await,
+            Ok(Some(DelegationStatus::Revoked))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_an_earlier_p256_twin_reads_revoked_after_boot() {
+        earlier_twin_reads_revoked_after_boot(
+            &database().await,
+            JWK::generate_p256(),
+            Algorithm::ES256,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_an_earlier_secp256k1_twin_reads_revoked_after_boot() {
+        earlier_twin_reads_revoked_after_boot(
+            &database().await,
+            JWK::generate_secp256k1(),
+            Algorithm::ES256K,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_an_earlier_p256_twin_reads_revoked_after_boot() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_an_earlier_p256_twin_reads_revoked_after_boot",
+        )
+        .await
+        else {
+            return;
+        };
+        actor::ActiveModel {
+            id: Set(ACTOR.into()),
+        }
+        .insert(&fixture.conn)
+        .await
+        .unwrap();
+        earlier_twin_reads_revoked_after_boot(
+            &fixture.conn,
+            JWK::generate_p256(),
+            Algorithm::ES256,
+        )
+        .await;
     }
 }

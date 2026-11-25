@@ -76,6 +76,8 @@ sqlx-core = "=0.8.6"
 uuid = "1"
 sha3 = "0.10"
 k256 = "0.13"
+# The canonical form of an ES256 UCAN signature (`delegation_cid_alias`).
+p256 = { version = "0.13", features = ["ecdsa"] }
 # TC-887: at-rest envelope key derivation and object names; zeroize key
 # material on drop.
 hkdf = "0.12"

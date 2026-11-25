@@ -1456,7 +1456,8 @@ async fn issue_stamp_in_transaction<C: ConnectionTrait>(
     })
 }
 
-/// PostgreSQL advisory-lock key for renewal of `original` (a canonical hash).
+/// PostgreSQL advisory-lock key for renewal of `original` (its stored id, as
+/// the lease cites it).
 pub(crate) fn original_lock_key(original: &Hash) -> i64 {
     let bytes = crate::hash::hash(original.as_ref());
     i64::from_be_bytes(bytes.as_ref()[..8].try_into().unwrap())
@@ -1485,13 +1486,16 @@ async fn lock_original<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Whether `id` or an ancestor is revoked, also through another stored
+/// encoding of any of them (TC-4366): the twin encodings of an ECDSA
+/// delegation share one canonical alias, and revoking either revokes both.
 async fn is_revoked_chain<C: ConnectionTrait>(
     db: &C,
     id: &Hash,
 ) -> Result<bool, RenewalStoreError> {
     let row = db.query_one(Statement::from_sql_and_values(
         db.get_database_backend(),
-        "WITH RECURSIVE chain(id) AS (SELECT $1 UNION SELECT p.parent FROM parent_delegation p JOIN chain c ON p.child = c.id) SELECT 1 AS revoked FROM chain c JOIN revocation r ON r.revoked = c.id LIMIT 1",
+        "WITH RECURSIVE chain(id) AS (SELECT $1 UNION SELECT p.parent FROM parent_delegation p JOIN chain c ON p.child = c.id), equivalent(id) AS (SELECT id FROM chain UNION SELECT twin.id FROM chain c JOIN delegation_cid_alias a ON a.id = c.id JOIN delegation_cid_alias twin ON twin.canonical = a.canonical) SELECT 1 AS revoked FROM equivalent e JOIN revocation r ON r.revoked = e.id LIMIT 1",
         [Value::Bytes(Some(Box::new(Vec::<u8>::from(*id))))],
     )).await?;
     Ok(row.is_some())

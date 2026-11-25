@@ -838,15 +838,14 @@ fn renewal_rows_query() -> SelectStatement {
                         .equals((lease.clone(), Alias::new("lease_cid"))),
                 ),
         )
+        // A lease names the stored id of the original it renews (the CID the
+        // lease cites), not its canonical hash.
         .join_as(
             JoinType::InnerJoin,
             delegation_cid_alias::Entity,
             original_alias.clone(),
-            Expr::col((
-                original_alias.clone(),
-                delegation_cid_alias::Column::Canonical,
-            ))
-            .equals((lease.clone(), Alias::new("original_canonical"))),
+            Expr::col((original_alias.clone(), delegation_cid_alias::Column::Id))
+                .equals((lease.clone(), Alias::new("original_canonical"))),
         )
         .and_where(Expr::cust(
             "renewal_lease.lease_cid = renewal_stamp.lease_cid",
@@ -1926,6 +1925,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(orphan.effective_expiry(&original), None);
+    }
+
+    /// A lease and its stamps are keyed by the stored id of the original they
+    /// renew. When the original's canonical hash differs from its id (a high-S
+    /// ECDSA delegation), its renewal still extends it.
+    #[tokio::test]
+    async fn snapshot_renews_an_original_whose_canonical_differs_from_its_id() {
+        let (db, _) = counted_database().await;
+        let original = hash(b"snapshot-renewal-high-s-original");
+        let lease = hash(b"snapshot-renewal-high-s-lease");
+        let ancestor = hash(b"snapshot-renewal-high-s-ancestor");
+        let (stable_did, renewer_did, epoch) =
+            insert_snapshot_renewal(&db, original, lease, ancestor, 2_000, 2_250, 1_000, false)
+                .await;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE delegation_cid_alias SET canonical = $1 WHERE id = $2",
+            [
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(hash(
+                    b"snapshot-renewal-low-s-original",
+                ))))),
+                Value::Bytes(Some(Box::new(Vec::<u8>::from(original)))),
+            ],
+        ))
+        .await
+        .unwrap();
+        let snapshot = AuthGraphSnapshot::load_with_renewal_identity(
+            &db,
+            &[original],
+            &stable_did,
+            &renewer_did,
+            epoch,
+            2_150,
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.effective_expiry(&original), Some(2_200));
     }
 
     #[tokio::test]

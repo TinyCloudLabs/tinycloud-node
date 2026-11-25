@@ -9,7 +9,7 @@ use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Alias, CommonTableExpression, Expr, OnConflict, Query, WithClause},
+    sea_query::{Alias, CommonTableExpression, Condition, Expr, OnConflict, Query, WithClause},
     ConnectionTrait, DbBackend, Iterable, QuerySelect, Statement,
 };
 use std::collections::BTreeMap;
@@ -1610,7 +1610,12 @@ async fn save<C: ConnectionTrait>(
     // The signed row remains the idempotency gate. Persist its alias in the
     // same transaction; PostgreSQL uses a dependent INSERT CTE to keep the
     // existing registration round-trip budget.
-    let canonical = delegation_cid_alias::canonical_hash(&serialization)?;
+    let (canonical, twin) = delegation_cid_alias::canonical_and_twin_hash(&serialization)?;
+    // TC-4092/TC-4366: tombstones that refuse these bytes. A tombstone written
+    // before TC-4366 (or by an older image after a rollback) names only the
+    // stored id of the encoding it purged, so the other ECDSA encoding of these
+    // bytes is checked as well as their own hash and canonical hash.
+    let tombstone_keys: Vec<Hash> = [hash, canonical].into_iter().chain(twin).collect();
     let now = session_retire::stored_now();
     // TC-3443: a new delegation to a retired key extends its live retire row
     // to outlast it, so the key does not come back when the row expires.
@@ -1639,9 +1644,10 @@ async fn save<C: ConnectionTrait>(
     if db.get_database_backend() == DbBackend::Postgres {
         let claimed = Alias::new("registered_delegation");
         // TC-4092: the row is inserted only while no tombstone names these
-        // bytes or their canonical form. It runs in this statement, after the
-        // shared purge lock of `save_actors` above, so it sees what a purge
-        // that held the exclusive lock committed, and costs no round trip.
+        // bytes, their canonical form or their other ECDSA encoding. It runs
+        // in this statement, after the shared purge lock of `save_actors`
+        // above, so it sees what a purge that held the exclusive lock
+        // committed, and costs no round trip.
         let mut values = Vec::new();
         for column in Column::iter() {
             values.push(Expr::val(model.get(column).into_value().ok_or_else(
@@ -1662,8 +1668,19 @@ async fn save<C: ConnectionTrait>(
                                 .from(revocation_tombstone::Entity)
                                 .and_where(
                                     Expr::col(revocation_tombstone::Column::DelegationCanonical)
-                                        .is_in([hash, canonical]),
+                                        .is_in(tombstone_keys.iter().copied()),
                                 )
+                                .to_owned(),
+                        )
+                        .not(),
+                    )
+                    // An equivalent encoding was revoked: told apart below.
+                    .and_where(
+                        Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1))
+                                .from(revocation::Entity)
+                                .cond_where(equivalent_revocation(hash, canonical))
                                 .to_owned(),
                         )
                         .not(),
@@ -1751,14 +1768,13 @@ async fn save<C: ConnectionTrait>(
             .await?
             .is_none()
         {
-            // Not inserted: either already stored, or refused by the
-            // tombstone guard in the insert. One lookup tells them apart; a
+            // Not inserted: already stored, or refused by the tombstone or
+            // revocation guard in the insert. One lookup tells them apart; a
             // fresh registration never reaches it.
-            refuse_tombstoned(db, hash, canonical).await?;
-            return Ok(DelegationRegistration::Existing(hash));
+            return refuse_unstored(db, hash, &tombstone_keys).await;
         }
     } else {
-        refuse_tombstoned(db, hash, canonical).await?;
+        refuse_tombstoned(db, hash, &tombstone_keys).await?;
         match Entity::insert(model)
             .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
             .exec(db)
@@ -1769,6 +1785,20 @@ async fn save<C: ConnectionTrait>(
                 result?;
             }
         };
+        // After the insert, so a resubmission stays `Existing` as above.
+        let equivalent = Query::select()
+            .expr(Expr::val(1))
+            .from(revocation::Entity)
+            .cond_where(equivalent_revocation(hash, canonical))
+            .limit(1)
+            .to_owned();
+        if db
+            .query_one(db.get_database_backend().build(&equivalent))
+            .await?
+            .is_some()
+        {
+            return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
+        }
         delegation_cid_alias::Entity::insert(delegation_cid_alias::ActiveModel {
             id: Set(hash),
             canonical: Set(canonical),
@@ -1829,17 +1859,90 @@ async fn save<C: ConnectionTrait>(
 }
 
 /// TC-4092: refuse bytes whose delegation was revoked and whose `revocation`
-/// row a space purge deleted. The tombstone is keyed by canonical hash, so
-/// every encoding of the delegation is covered.
+/// row a space purge deleted. `tombstone_keys` are the bytes' own hash, their
+/// canonical hash and the hash of their other ECDSA encoding: a purge since
+/// TC-4366 tombstones the canonical hash and every stored encoding, an older
+/// one only the stored id of the encoding it purged.
 async fn refuse_tombstoned<C: ConnectionTrait>(
     db: &C,
     hash: Hash,
-    canonical: Hash,
+    tombstone_keys: &[Hash],
 ) -> Result<(), Error> {
-    if revocation_tombstone::is_tombstoned(db, &[hash, canonical]).await? {
+    if revocation_tombstone::is_tombstoned(db, tombstone_keys).await? {
         return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
     }
     Ok(())
+}
+
+/// A revocation of another encoding of the same delegation: of a stored row
+/// with the same canonical hash, or of the canonical CID itself. A revocation
+/// of these exact bytes is not included, so a resubmission keeps its answer.
+fn equivalent_revocation(hash: Hash, canonical: Hash) -> Condition {
+    let mut condition = Condition::any().add(
+        Expr::col((revocation::Entity, revocation::Column::Revoked)).in_subquery(
+            Query::select()
+                .column(delegation_cid_alias::Column::Id)
+                .from(delegation_cid_alias::Entity)
+                .and_where(Expr::col(delegation_cid_alias::Column::Canonical).eq(canonical))
+                .and_where(Expr::col(delegation_cid_alias::Column::Id).ne(hash))
+                .to_owned(),
+        ),
+    );
+    // Kept: a CACAO is revoked by its canonical CID, which need not be a
+    // stored row (a historical CACAO row is stored under other bytes, with an
+    // alias whose canonical hash differs from its id). Not provably
+    // unreachable, so removing it could drop a revocation.
+    if canonical != hash {
+        condition = condition
+            .add(Expr::col((revocation::Entity, revocation::Column::Revoked)).eq(canonical));
+    }
+    condition
+}
+
+/// PostgreSQL's insert guards refused these bytes or they were already
+/// stored. In one lookup: a tombstone naming any of `tombstone_keys` (see
+/// [`refuse_tombstoned`]) or an equivalent revocation refuses them, and stored
+/// bytes are `Existing`.
+async fn refuse_unstored<C: ConnectionTrait>(
+    db: &C,
+    hash: Hash,
+    tombstone_keys: &[Hash],
+) -> Result<DelegationRegistration, Error> {
+    let lookup = Query::select()
+        .expr_as(
+            Expr::exists(
+                Query::select()
+                    .expr(Expr::val(1))
+                    .from(revocation_tombstone::Entity)
+                    .and_where(
+                        Expr::col(revocation_tombstone::Column::DelegationCanonical)
+                            .is_in(tombstone_keys.iter().copied()),
+                    )
+                    .to_owned(),
+            ),
+            Alias::new("tombstoned"),
+        )
+        .expr_as(
+            Expr::exists(
+                Query::select()
+                    .expr(Expr::val(1))
+                    .from(Entity)
+                    .and_where(Expr::col(Column::Id).eq(hash))
+                    .to_owned(),
+            ),
+            Alias::new("stored"),
+        )
+        .to_owned();
+    let row = db
+        .query_one(db.get_database_backend().build(&lookup))
+        .await?
+        .ok_or_else(|| DbErr::Custom("delegation insert: lookup returned no row".into()))?;
+    let tombstoned: bool = row.try_get("", "tombstoned")?;
+    let stored: bool = row.try_get("", "stored")?;
+    if tombstoned || !stored {
+        return Err(DelegationError::Revoked(hash.to_cid(0x55).to_string()).into());
+    }
+    Ok(DelegationRegistration::Existing(hash))
 }
 
 async fn save_actors<C: ConnectionTrait>(

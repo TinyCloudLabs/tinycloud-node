@@ -4972,6 +4972,7 @@ mod tests {
     mod revocation_codes;
     mod revocation_scope;
     mod space_purge_privacy;
+    mod ucan_identity;
 
     use super::*;
     use crate::{

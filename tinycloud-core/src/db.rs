@@ -17,6 +17,9 @@ mod space_purge;
 #[cfg(test)]
 #[path = "db/status_snapshot_tests.rs"]
 mod status_snapshot_tests;
+#[cfg(test)]
+#[path = "db/ucan_identity_tests.rs"]
+mod ucan_identity_tests;
 
 use crate::admission::{sealed, AdmittedInput, AdmittedInvocation};
 use crate::db_pool::RecoveringConnection;
@@ -807,6 +810,7 @@ where
                 .await?;
         }
         delegation_cid_alias::backfill(&tx, encryption.as_ref()).await?;
+        delegation_cid_alias::recompute(&tx, encryption.as_ref()).await?;
         tx.commit().await?;
         // TC-3810: backfill the `delegation_mode` side table from stored signed
         // bytes before returning, without rewriting any historical `delegation`
@@ -1420,8 +1424,9 @@ where
         // TC-4092: a cited delegation whose revocation a purge deleted (the
         // delegation is gone with it, so the walk below finds nothing) is
         // still revoked: signed-URL and hook tickets minted from it before the
-        // revocation must not work again.
-        if crate::models::revocation_tombstone::is_tombstoned(&self.conn, &roots).await? {
+        // revocation must not work again. TC-4366: so is a stored delegation
+        // whose other encoding was revoked and purged (its canonical hash).
+        if crate::models::revocation_tombstone::is_cited_tombstoned(&self.conn, &roots).await? {
             return Ok(Some(RevocationCode::DelegationRevoked));
         }
         // The shared traversal budget covers every cited root together.
@@ -7494,27 +7499,12 @@ async fn load_account_ancestor_state_with_renewal<C: ConnectionTrait>(
         .all(db)
         .await?;
     let revocation_rows = revocation::effective_rows(db, &ids).await?;
-    let policy_revocations = policy_v3_root::Entity::find()
-        .select_only()
-        .column(policy_v3_root::Column::RootCid)
-        .filter(
-            policy_v3_root::Column::RootCid.is_in(ids.iter().map(|id| id.to_cid(0x55).to_string())),
-        )
-        .filter(
-            Condition::any()
-                .add(policy_v3_root::Column::RevokedAt.is_not_null())
-                .add(policy_v3_root::Column::RevocationBytes.is_not_null()),
-        )
-        .into_tuple::<String>()
-        .all(db)
+    // A root revoked under any stored encoding is revoked (TC-4366).
+    let policy_revocations = revocation::policy_root_rows(db, &ids)
         .await?
         .into_iter()
-        .map(|cid| {
-            cid.parse::<tinycloud_auth::authorization::Cid>()
-                .map(Hash::from)
-                .map_err(|error| DbErr::Custom(error.to_string()))
-        })
-        .collect::<Result<HashSet<_>, _>>()?;
+        .filter_map(|(id, _, revoked)| revoked.then_some(id))
+        .collect::<HashSet<_>>();
     let delegations = delegation_rows
         .into_iter()
         .map(|row| (row.id, row))

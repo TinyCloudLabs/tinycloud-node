@@ -757,7 +757,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
             // are NOT trusted on their own — they are only authorized when
             // the persisted chain ability row already has a matching or
             // stricter caveat.
-            let mut terminal_cids = std::collections::HashSet::new();
+            let mut terminal_ids = std::collections::HashSet::new();
             for id in root_ids.iter().flat_map(|id| graph.chain_ids_from(id)) {
                 if graph.is_parentless(&id)
                     && graph.delegation(&id).is_some_and(|row| {
@@ -766,13 +766,13 @@ async fn validate_capabilities<C: ConnectionTrait>(
                             .any(|cap| !is_root_authority(cap, &row.delegator))
                     })
                 {
-                    terminal_cids.insert(id.to_cid(0x55).to_string());
+                    terminal_ids.insert(id);
                 }
             }
-            let registered_policy_roots = if terminal_cids.is_empty() {
+            let registered_policy_roots = if terminal_ids.is_empty() {
                 std::collections::HashSet::new()
             } else {
-                Box::pin(live_policy_roots(db, terminal_cids)).await?
+                Box::pin(live_policy_roots(db, terminal_ids)).await?
             };
             for c in &dependant_caps {
                 // TC-119: ability containment is registry-aware. A parent
@@ -876,22 +876,27 @@ async fn validate_capabilities<C: ConnectionTrait>(
     }
 }
 
-/// The live registered policy roots among `root_cids`. Its own function and
-/// boxed at the call site: the sea-orm select held across this await is 1.7 KB
-/// that every `validate_capabilities` caller's future (and, unoptimized, every
-/// poll frame up to the request handler) would otherwise carry.
+/// The CIDs of the live registered policy roots among `roots`: each has its
+/// own registry row, and no stored encoding of it has a revoked row
+/// (TC-4366). Its own function and boxed at the call site: the sea-orm select
+/// held across this await is 1.7 KB that every `validate_capabilities`
+/// caller's future (and, unoptimized, every poll frame up to the request
+/// handler) would otherwise carry.
 async fn live_policy_roots<C: ConnectionTrait>(
     db: &C,
-    root_cids: std::collections::HashSet<String>,
+    roots: std::collections::HashSet<Hash>,
 ) -> Result<std::collections::HashSet<String>, DbErr> {
-    Ok(policy_v3_root::Entity::find()
-        .filter(policy_v3_root::Column::RootCid.is_in(root_cids))
-        .filter(policy_v3_root::Column::RevokedAt.is_null())
-        .filter(policy_v3_root::Column::RevocationBytes.is_null())
-        .all(db)
-        .await?
+    let rows =
+        crate::models::revocation::policy_root_rows(db, &roots.into_iter().collect::<Vec<_>>())
+            .await?;
+    let revoked = rows
+        .iter()
+        .filter_map(|(id, _, revoked)| revoked.then_some(*id))
+        .collect::<std::collections::HashSet<_>>();
+    Ok(rows
         .into_iter()
-        .map(|row| row.root_cid)
+        .filter(|(id, cid, _)| !revoked.contains(id) && *cid == id.to_cid(0x55).to_string())
+        .map(|(_, cid, _)| cid)
         .collect())
 }
 
