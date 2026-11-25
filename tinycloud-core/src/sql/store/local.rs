@@ -161,14 +161,17 @@ pub fn read_seq(main: &Path) -> Result<u64, SqlError> {
 }
 
 /// Count one more write (or rotation): move the counter forward by one and
-/// fsync it, then return the new value. The caller commits its write only
-/// after this returns. At `i64::MAX` it refuses instead of overflowing
-/// (revisions are stored as signed integers downstream).
+/// fsync it (the file, then its directory), then return the new value. The
+/// caller commits its write only after this returns. At `i64::MAX` it
+/// refuses instead of overflowing (revisions are stored as signed integers
+/// downstream).
 ///
 /// The record is rewritten in place and synced with `fdatasync`; its length
 /// never changes. It is 16 bytes, inside one sector, so a crash leaves the
 /// old record or the new one; a torn one is refused by [`read_seq`], which
-/// stops the database rather than reissue a revision.
+/// stops the database rather than reissue a revision. The directory is
+/// synced too, so the file's entry is durable whatever happened to it
+/// before (the bump itself changes no entry).
 pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -185,6 +188,11 @@ pub fn bump_seq(main: &Path) -> Result<u64, SqlError> {
     file.seek(SeekFrom::Start(0)).map_err(io)?;
     file.write_all(&seq_record(next)).map_err(io)?;
     file.sync_data().map_err(io)?;
+    if let Some(parent) = main.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io)?;
+    }
     Ok(next)
 }
 
