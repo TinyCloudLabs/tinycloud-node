@@ -1519,3 +1519,46 @@ async fn the_reviewers_two_amplification_cases_upload_nothing_for_the_rolled_bac
         );
     }
 }
+
+#[tokio::test]
+async fn the_recovery_scan_does_not_read_the_whole_wal_of_every_database() {
+    // 40 MiB committed. The recovery scan asks every store-master database for
+    // its head under that database's operation lock; the head is a counter and
+    // a checkpoint hash and needs no WAL bytes. Reading the WAL (a scan of
+    // 40 MiB, with a write waiting on the lock) separates tens of ms from
+    // about 1 ms per call: the median of 15 calls must stay under 10 ms.
+    let rig = Rig::new("scan-is-light").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = board(&rig);
+    let service = rig.service(board, DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            40 * 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= 40 * 1024 * 1024);
+    let mut times = Vec::new();
+    for _ in 0..15 {
+        let started = Instant::now();
+        let heads = source.local_heads().await;
+        times.push(started.elapsed());
+        assert_eq!(heads.len(), 1);
+    }
+    times.sort();
+    eprintln!(
+        "MEDIAN local_heads beside a 40 MiB WAL: {:?} (all: {times:?})",
+        times[7]
+    );
+    assert!(
+        times[7] < Duration::from_millis(10),
+        "median {:?}: the scan reads the whole WAL",
+        times[7]
+    );
+}
