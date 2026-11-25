@@ -33,10 +33,33 @@ back. The rules are:
 * every row the node acknowledged must come back with exactly the value written;
 * a write the node never answered (the kill came mid-request) may be there or not;
 * a row the ledger never heard of fails the drill;
-* with no volume, the file is gone after a recreate and the reads still succeed (that is
-  the re-hydration path working); with the volume, the file must still be there before
-  the first request. If the no-volume layout keeps the file, the drill fails too,
-  because it means section 14 is wrong and must be re-read.
+* what `/data/sql` holds is asserted per layout (`yes`, `no` or `any`), not guessed:
+  `today` (the production config): a small database is in-memory SQLite (`memory_threshold`
+  10 MiB), so there is **no file** before a restart or after a recreate (`no`); after a
+  SIGKILL and a restart of the same container the hydrated copy is a file (observed,
+  not asserted: `any`). `files` (`memory_threshold` 0, no volume): the file is there
+  from the first write and after a kill and restart, and gone after a recreate (the
+  re-hydration path working). `volume` (`memory_threshold` 0 and the named volume): the
+  file is there at every point. A file where `no` is expected fails the drill too, because
+  it means section 14 is wrong and must be re-read.
+
+## What the first real run found
+
+Run 45501421888 (attempt 2, head 72aa4d30): every data check passed. Three working-copy
+checks failed: `[today]` and `[volume]` "before any restart" (0 files) and `[volume]`
+"after a recreate" (0 files). The probe was right (`docker cp` of `/data/sql` found 3 files
+after each SIGKILL leg, so the path and tool work) and the node was doing what its
+code says: `database.rs` opens a database as `StorageMode::InMemory` unless its file
+already exists, and promotes it to a file only above `memory_threshold` (10 MiB by default,
+`config.rs` `default_sql_memory_threshold`). The drill's database is a few KiB, so it is
+never promoted to a file. Why files showed up after the SIGKILL legs is an INFERENCE
+from the log's counts (0 before the first restart, 3 after each SIGKILL leg, which
+followed a read that re-hydrated the database from Postgres into `/data/sql`): I did not
+see the node's own log. That is a real fact about production
+today (the production compose sets no `memory_threshold`): a small database has no local
+file, and its durability is the Postgres save. It also means the first drill version
+tested nothing about a working copy that survives. The layouts now separate the two
+questions.
 
 ## What it needs
 
@@ -56,7 +79,7 @@ back. The rules are:
 ```
 cd test/recreate-drill
 npm ci
-CI=true DRILL_NODE_IMAGE=tinycloud-node:drill bash drill.sh all   # or: today | volume
+CI=true DRILL_NODE_IMAGE=tinycloud-node:drill bash drill.sh all   # or: today | files | volume
 ```
 
 The result is in `summary.txt` (the path is printed; `DRILL_SUMMARY` overrides it) and
@@ -68,8 +91,8 @@ never a value or a key.
 | Check | Where | Status |
 |---|---|---|
 | Ledger logic (`drill-core.test.ts`, 10 tests) and the TypeScript types | any machine with node | ran locally |
-| `drill.sh` control flow against a fake `docker`/`curl`/`npx` (`test-drill.sh`, 4 cases and the CI guard) | any machine with bash | ran locally |
-| The real drill, both layouts | CI (`.github/workflows/recreate-drill.yml`, manual dispatch or a change under `test/recreate-drill/`) or a Docker host | **not run**: Docker is not used on the dev machine, so the first CI run is the first real run. Expect to adjust the script once. |
+| `drill.sh` control flow against a fake `docker`/`curl`/`npx` (`test-drill.sh`, 7 cases and the CI guard) | any machine with bash | ran locally |
+| The real drill, three layouts | CI (`.github/workflows/recreate-drill.yml`, manual dispatch or a change under `test/recreate-drill/`) or a Docker host | **first run: 45501421888 attempt 2, ran to a real result.** Data checks passed in both layouts it had; the three working-copy checks failed because the probe's premise was wrong (a small database has no file under the default config, see "What the first real run found"). Fixed by the `today` / `files` / `volume` split; the fixed script has not been run yet. |
 
 ## Known gaps, stated plainly
 

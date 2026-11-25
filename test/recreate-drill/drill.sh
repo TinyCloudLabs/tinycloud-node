@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # TC-1491 P4.2b part 1: the container-recreate drill (design doc section 12).
 #
-#   drill.sh today    the production layout as it is: SQL datadir in the
-#                     container's writable layer, Postgres the master copy
-#   drill.sh volume   the same with /data/sql on a named volume
-#   drill.sh all      both, in that order
+#   drill.sh today    the production config as it is: a small database (under
+#                     the 10 MiB memory_threshold) is in-memory SQLite, so there
+#                     is NO local file for it until a restart re-hydrates it;
+#                     SQL datadir in the writable layer, Postgres the master
+#   drill.sh files    memory_threshold 0: the database is a file in /data/sql
+#                     (what a store-master database needs), still no volume
+#   drill.sh volume   memory_threshold 0 and /data/sql on a named volume
+#   drill.sh all      the three, in that order
 #
 # Each layout: write acknowledged rows, then (1) recreate the container,
 # (2) SIGKILL it and start the same container again, (3) SIGKILL it and
@@ -24,7 +28,7 @@ if [[ "${CI:-}" != true && "${DRILL_ALLOW_LOCAL:-}" != 1 ]]; then
 fi
 : "${DRILL_NODE_IMAGE:?build the node image and set DRILL_NODE_IMAGE}"
 layouts="${1:-all}"
-case "$layouts" in today | volume | all) ;; *) printf 'usage: %s today|volume|all\n' "$0" >&2; exit 1 ;; esac
+case "$layouts" in today | files | volume | all) ;; *) printf 'usage: %s today|files|volume|all\n' "$0" >&2; exit 1 ;; esac
 
 port="${DRILL_PORT:-18000}"
 export DRILL_PORT="$port"
@@ -46,11 +50,12 @@ writer_pid=""
 failures=0
 
 dc() {
-  if [[ "$layout" == volume ]]; then
-    docker compose -p "$project" -f "$here/compose.yaml" -f "$here/compose.volume.yaml" "$@"
-  else
-    docker compose -p "$project" -f "$here/compose.yaml" "$@"
-  fi
+  local files=(-f "$here/compose.yaml")
+  # Both layouts that keep a file turn the in-memory threshold off; only
+  # `volume` mounts the volume.
+  if [[ "$layout" == files || "$layout" == volume ]]; then files+=(-f "$here/compose.files.yaml"); fi
+  if [[ "$layout" == volume ]]; then files+=(-f "$here/compose.volume.yaml"); fi
+  docker compose -p "$project" "${files[@]}" "$@"
 }
 drill() { (cd "$here" && npx --no-install tsx drill.ts "$@"); }
 say() { printf '%s\n' "$*" | tee -a "$summary"; }
@@ -98,16 +103,31 @@ verify() {
   fi
 }
 
-# expect_files <label> <survives: yes|no>: checked after the node is back but
-# BEFORE any SQL request, so a surviving file cannot be a re-hydrated one.
+# expect_files <label> <yes|no|any>: checked after the node is back but BEFORE
+# any SQL request, so a surviving file cannot be a re-hydrated one. `yes` waits
+# up to DRILL_FILE_WAIT seconds (default 10) for the file to appear: a small
+# database is promoted to a file by the actor right after its first write.
 expect_files() {
-  local n
+  local n tries=0
   n="$(sql_files)"
+  while [[ "$2" == yes && "$n" -lt 1 && "$tries" -lt "${DRILL_FILE_WAIT:-10}" ]]; do
+    sleep 1
+    tries=$((tries + 1))
+    n="$(sql_files)"
+  done
   say "info [$layout] $1: $n file(s) under /data/sql before the first request"
   if [[ "$2" == yes && "$n" -lt 1 ]]; then
-    fail "[$layout] $1: the SQL working copy did not survive"
+    if [[ "$1" == "before any restart" ]]; then
+      fail "[$layout] $1: no SQL working copy was created (this layout is file-backed: memory_threshold 0)"
+    else
+      fail "[$layout] $1: the SQL working copy did not survive"
+    fi
   elif [[ "$2" == no && "$n" -gt 0 ]]; then
-    fail "[$layout] $1: the working copy survived a recreate on the layout that has no volume (the claim in section 14 is wrong; re-read it)"
+    if [[ "$1" == "before any restart" ]]; then
+      fail "[$layout] $1: a small database has a local file (the node's memory_threshold default changed: the claim in section 14 that it is in memory is wrong; re-read it)"
+    else
+      fail "[$layout] $1: the working copy survived a recreate on the layout that has no volume (the claim in section 14 is wrong; re-read it)"
+    fi
   fi
 }
 
@@ -137,26 +157,33 @@ kill_during_writes() {
 run_layout() {
   layout="$1"
   ledger="$work/ledger-$layout"
-  local survives=no
+  # What /data/sql should hold at each point, by layout (yes | no | any):
+  # `at_first` once the first rows are acknowledged, `after_recreate` after a
+  # recreate, `after_restart` after a SIGKILL and a restart of the same
+  # container. Why each layout differs: see the header.
+  local at_first=no after_recreate=no after_restart=any
   say "== layout: $layout"
-  if [[ "$layout" == volume ]]; then
-    survives=yes
-    docker volume create "$DRILL_SQL_VOLUME" >/dev/null
-    volume_made=1
-    # What the image's own mkdir+chown will do (see compose.volume.yaml).
-    docker run --rm -v "$DRILL_SQL_VOLUME:/d" busybox:1.36 chown 1000:1000 /d
-  fi
+  case "$layout" in
+    files) at_first=yes after_restart=yes ;;
+    volume)
+      at_first=yes after_recreate=yes after_restart=yes
+      docker volume create "$DRILL_SQL_VOLUME" >/dev/null
+      volume_made=1
+      # What the image's own mkdir+chown will do (see compose.volume.yaml).
+      docker run --rm -v "$DRILL_SQL_VOLUME:/d" busybox:1.36 chown 1000:1000 /d
+      ;;
+  esac
   dc up -d
   wait_ready || return 0
 
   drill write "$ledger" 30 || fail "[$layout] initial writes failed"
-  expect_files "before any restart" yes
+  expect_files "before any restart" "$at_first"
   verify "baseline"
 
   # 1. Graceful recreate: the deploy.
   dc up -d --force-recreate --no-deps tinycloud
   wait_ready || return 0
-  expect_files "after a recreate" "$survives"
+  expect_files "after a recreate" "$after_recreate"
   verify "after a recreate"
   drill write "$ledger" 10 || fail "[$layout] writes after the recreate failed"
 
@@ -165,14 +192,14 @@ run_layout() {
   kill_during_writes "kill, restart"
   dc start tinycloud
   wait_ready || return 0
-  expect_files "after a kill and restart" yes
+  expect_files "after a kill and restart" "$after_restart"
   verify "after a kill and restart"
 
   # 3. SIGKILL, then a recreate (a crash during a deploy).
   kill_during_writes "kill, recreate"
   dc up -d --force-recreate --no-deps tinycloud
   wait_ready || return 0
-  expect_files "after a kill and recreate" "$survives"
+  expect_files "after a kill and recreate" "$after_recreate"
   verify "after a kill and recreate"
   drill write "$ledger" 5 || fail "[$layout] writes after the last recreate failed"
   verify "final"
@@ -186,6 +213,7 @@ run_layout() {
 
 layout=today
 if [[ "$layouts" == today || "$layouts" == all ]]; then run_layout today; fi
+if [[ "$layouts" == files || "$layouts" == all ]]; then run_layout files; fi
 if [[ "$layouts" == volume || "$layouts" == all ]]; then run_layout volume; fi
 
 if [[ "$failures" -gt 0 ]]; then

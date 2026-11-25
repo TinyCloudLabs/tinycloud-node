@@ -1,0 +1,10 @@
+# The `files` and `volume` layouts: a database is a file in /data/sql from its
+# first write. Production's default (`memory_threshold` 10 MiB) keeps a small
+# database in memory with no local file, so the drill's own database, a few KiB,
+# has none until a restart re-hydrates it (the `today` layout shows that). A
+# store-master database needs the file, so these layouts turn the threshold off,
+# as scripts/at-rest-harness does.
+services:
+  tinycloud:
+    environment:
+      TINYCLOUD_STORAGE__SQL__MEMORY_THRESHOLD: "0"

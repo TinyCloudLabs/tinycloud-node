@@ -64,7 +64,7 @@ jobs:
       - name: Install the drill client
         working-directory: test/recreate-drill
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Run the drill (both layouts)
+      - name: Run the drill (three layouts)
         working-directory: test/recreate-drill
         run: bash drill.sh all
       - name: Keep the summary

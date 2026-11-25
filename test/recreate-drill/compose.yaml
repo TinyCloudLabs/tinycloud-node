@@ -1,6 +1,9 @@
 # TC-1491 P4.2b part 1: the node as production runs it, in the layout of
-# today: Postgres is the master copy, the SQL working copy (/data/sql) is in
-# the container's writable layer. compose.volume.yaml adds the named volume.
+# today: Postgres is the master copy, the SQL datadir (/data/sql) is in the
+# container's writable layer, and a small database is in memory (the default
+# memory_threshold), so it has no file there. compose.files.yaml turns the
+# threshold off (a file from the first write); compose.volume.yaml adds the
+# named volume.
 #
 # Run it through drill.sh, on an isolated CI runner only. Nothing here is
 # published beyond 127.0.0.1 and nothing is a production secret: the keys are
