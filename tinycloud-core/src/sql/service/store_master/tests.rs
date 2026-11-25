@@ -1001,3 +1001,117 @@ async fn replacing_an_actor_that_checkpoints_on_close_moves_the_counter_past_wha
     let wal = std::fs::metadata(rig.wal_path()).map_or(0, |m| m.len());
     assert!(wal > 0, "the write after the settle is in the WAL");
 }
+
+// ---- the WAL bound judges what is committed, and clears itself ----------------------
+
+/// A write that spills past the page cache and fails on its second row: its
+/// frames are in the WAL file, none of it is committed.
+async fn spill_and_roll_back(service: &SqlService, rig: &Rig, bytes: u64) {
+    let result = run(
+        service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({bytes})), (NULL)"),
+    )
+    .await;
+    assert!(result.is_err(), "the second row must fail the write");
+}
+
+#[tokio::test]
+async fn a_rolled_back_spill_past_the_bound_does_not_lock_writes_out() {
+    let rig = Rig::new("spill-lockout").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let service = rig.service(Arc::new(ProbeSink::default()), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+
+    spill_and_roll_back(&service, &rig, WAL_REFUSE_BYTES + 6 * 1024 * 1024).await;
+    assert!(
+        std::fs::metadata(rig.wal_path()).unwrap().len() >= WAL_REFUSE_BYTES,
+        "the dead tail alone is past the bound, the case that locked a database out"
+    );
+    let before = validate_working_copy(&rig.main_path()).unwrap();
+
+    for v in ["b", "c"] {
+        insert(&service, &rig.space, v).await.unwrap();
+    }
+    assert_eq!(count(&service, &rig.space).await, 3);
+    // Two writes, two numbers: no refusal, no rotation, nothing re-counted.
+    assert_eq!(validate_working_copy(&rig.main_path()).unwrap(), before + 2);
+}
+
+#[tokio::test]
+async fn a_rolled_back_spill_is_not_bytes_the_store_is_behind_by() {
+    let rig = Rig::new("spill-not-urgent").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = Arc::new(NoticeBoard::new(
+        SpaceAllowlist::new([rig.space.to_string()]),
+        Arc::new(NoopMetrics),
+    ));
+    let service = rig.service(board.clone(), plain());
+    insert(&service, &rig.space, "a").await.unwrap();
+    let _ = board.take();
+
+    // More than the 8 MiB window of rolled-back frames in the file, then one
+    // small commit: before, the notice said "9 MiB behind" and the database
+    // was urgent (the 60 s window skipped, a whole snapshot republished).
+    spill_and_roll_back(&service, &rig, WINDOW_BYTES + 4 * 1024 * 1024).await;
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() > WINDOW_BYTES);
+    insert(&service, &rig.space, "b").await.unwrap();
+    assert!(
+        board.take_urgent().is_empty(),
+        "dead frames are not bytes to upload"
+    );
+}
+
+#[tokio::test]
+async fn a_write_refused_at_the_bound_clears_the_bound_itself_and_the_retry_succeeds() {
+    let rig = Rig::new("bound-clears").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let sink = Arc::new(ProbeSink::default());
+    let service = rig.service(sink.clone(), plain());
+
+    // A reader holding an old snapshot keeps the checkpoint busy, so neither
+    // the commit path's backstop rotation nor the refusal's can truncate. No
+    // uploader runs.
+    insert(&service, &rig.space, "first").await.unwrap();
+    let reader = Connection::open(rig.main_path()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM items")
+        .unwrap();
+    let big = (WAL_REFUSE_BYTES + 1024 * 1024) as i64;
+    run(
+        &service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({big}))"),
+    )
+    .await
+    .unwrap();
+    let refused = insert(&service, &rig.space, "while the reader holds").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+
+    // The reader goes away. The next write is refused once more, and that
+    // refusal rotates; nothing else is asked for.
+    drop(reader);
+    let refused = insert(&service, &rig.space, "refused, and rotates").await;
+    assert!(
+        matches!(refused, Err(SqlError::DiskHeadroom)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(rig.wal_path()).unwrap().len(),
+        0,
+        "the refusal's rotation truncated the WAL"
+    );
+    assert_eq!(
+        sink.notices().last().unwrap().seq,
+        read_seq(&rig.main_path()).unwrap() as i64,
+        "the uploader was told about the rotation"
+    );
+    insert(&service, &rig.space, "retry").await.unwrap();
+    assert_eq!(count(&service, &rig.space).await, 3);
+}

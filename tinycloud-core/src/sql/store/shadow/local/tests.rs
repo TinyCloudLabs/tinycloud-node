@@ -15,7 +15,9 @@ use super::*;
 use crate::sql::durability::{CommitSeams, DurabilityPolicy};
 use crate::sql::store::key::{DbRef, Lineage, ObjectKey};
 use crate::sql::store::local::rig::{count, insert, run, ProbeSink, Rig, DB};
-use crate::sql::store::local::{hash_file, PILOT_CAP_BYTES, WINDOW, WINDOW_BYTES};
+use crate::sql::store::local::{
+    hash_file, PILOT_CAP_BYTES, WAL_REFUSE_BYTES, WINDOW, WINDOW_BYTES,
+};
 use crate::sql::store::manifest::{DbSqlManifest, Frontier, SqlManifest};
 use crate::sql::store::memory::MemorySqlObjectStore;
 use crate::sql::store::object::{
@@ -26,7 +28,9 @@ use crate::sql::store::shadow::budget::DiskBudget;
 use crate::sql::store::shadow::machine::{
     plan_delta, step, BlockReason, Command, DbMachine, Event, Phase, Policy,
 };
-use crate::sql::store::shadow::metrics::{NoopMetrics, RestoreResult};
+use crate::sql::store::shadow::metrics::{
+    NoopMetrics, NoticeResult, PublishResult, RestoreResult, ShadowMetrics, UploadResult,
+};
 use crate::sql::store::shadow::restore::{check_database, RestoreDeps};
 use crate::sql::store::shadow::scheduler::{spawn, SchedulerConfig, SchedulerHandle, ShadowDeps};
 use crate::sql::store::shadow::NoticeBoard;
@@ -1055,4 +1059,376 @@ async fn the_seq_file_is_read_and_written_only_under_the_operation_lock() {
 
     insert(&service, &rig.space, "b").await.unwrap();
     assert_eq!(source.head(&db).await.unwrap().unwrap().revision, 12);
+}
+
+// ---- reproducing tests (red on 9e38f2b0) ----
+
+/// Remembers the reasons a database was blocked for.
+#[derive(Default)]
+struct Blocks(Mutex<Vec<&'static str>>);
+
+impl ShadowMetrics for Blocks {
+    fn notice(&self, _: NoticeResult) {}
+    fn upload(&self, _: &'static str, _: UploadResult, _: u64) {}
+    fn publish(&self, _: PublishResult) {}
+    fn blocked(&self, reason: &'static str) {
+        self.0.lock().unwrap().push(reason);
+    }
+    fn regressed(&self) {}
+    fn owner_marker(&self, _: &'static str) {}
+    fn dirty_databases(&self, _: u64) {}
+    fn oldest_dirty_age_seconds(&self, _: f64) {}
+    fn inflight_bytes(&self, _: u64) {}
+    fn breaker_open(&self, _: bool) {}
+    fn record_cycle_seconds(&self, _: &'static str, _: f64) {}
+}
+
+// ---- the WAL bound and the rotation trigger judge what is committed ------------------
+
+fn start_with_metrics(
+    rig: &Rig,
+    source: Arc<LocalFileSource>,
+    store: Arc<dyn SqlObjectStore>,
+    board: Arc<NoticeBoard>,
+    scratch: &Path,
+    metrics: Arc<dyn ShadowMetrics>,
+    daily_upload_byte_budget: u64,
+) -> SchedulerHandle {
+    spawn(
+        ShadowDeps {
+            control: rig.control.clone(),
+            manifest: Arc::new(DbSqlManifest::new(rig.control.clone())),
+            store,
+            source,
+            disk: DiskBudget::new(scratch, 512 * 1024 * 1024),
+            board,
+            metrics,
+        },
+        SchedulerConfig {
+            daily_upload_byte_budget,
+            ..config(Duration::ZERO)
+        },
+    )
+}
+
+/// What a database that is stuck in a scheduler state must still do: take a
+/// write after a rolled-back 70 MiB spill (the file's tail alone is past the
+/// refusal bound), and take an honest insert over the bound and the writes
+/// after it, with nobody asking the source for a head in between.
+async fn writes_keep_working_after_a_spill_and_an_insert_over_the_bound(
+    service: &SqlService,
+    rig: &Rig,
+) {
+    let rows = count(service, &rig.space).await;
+    let spill = WAL_REFUSE_BYTES + 6 * 1024 * 1024;
+    assert!(run(
+        service,
+        &rig.space,
+        &format!("INSERT INTO items (v) VALUES (zeroblob({spill})), (NULL)"),
+    )
+    .await
+    .is_err());
+    assert!(
+        std::fs::metadata(rig.wal_path()).unwrap().len() >= WAL_REFUSE_BYTES,
+        "the dead tail is past the bound"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for v in ["b", "c", "d"] {
+        insert(service, &rig.space, v).await.unwrap();
+    }
+    run(
+        service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            WAL_REFUSE_BYTES + 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for v in ["e", "f", "g"] {
+        insert(service, &rig.space, v).await.unwrap();
+    }
+    assert_eq!(count(service, &rig.space).await, rows + 7);
+}
+
+#[tokio::test]
+async fn writes_keep_working_after_a_spill_with_the_database_clean() {
+    let rig = Rig::new("lockout-clean").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let blocks = Arc::new(Blocks::default());
+    let uploader = start_with_metrics(
+        &rig,
+        source(&rig, &service),
+        Arc::new(MemorySqlObjectStore::default()),
+        board,
+        scratch.path(),
+        blocks.clone(),
+        0,
+    );
+    insert(&service, &rig.space, "a").await.unwrap();
+    frontier_at(&rig, 11).await;
+    // Published and idle: Clean, nothing blocked. (The honest insert over the
+    // bound below takes the checkpoint over the cap, so the database ends up
+    // blocked as too large; that is not what this test is about.)
+    assert!(blocks.0.lock().unwrap().is_empty());
+    writes_keep_working_after_a_spill_and_an_insert_over_the_bound(&service, &rig).await;
+    uploader.drain(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn writes_keep_working_after_a_spill_with_the_database_over_the_cap() {
+    let rig = Rig::new("lockout-too-large").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let blocks = Arc::new(Blocks::default());
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            PILOT_CAP_BYTES + 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    let uploader = start_with_metrics(
+        &rig,
+        source(&rig, &service),
+        Arc::new(MemorySqlObjectStore::default()),
+        board,
+        scratch.path(),
+        blocks.clone(),
+        0,
+    );
+    insert(&service, &rig.space, "a").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(blocks.0.lock().unwrap().first(), Some(&"too_large"));
+    writes_keep_working_after_a_spill_and_an_insert_over_the_bound(&service, &rig).await;
+    uploader.drain(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn writes_keep_working_after_a_spill_with_the_daily_budget_spent() {
+    let rig = Rig::new("lockout-daily-budget").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let blocks = Arc::new(Blocks::default());
+    let uploader = start_with_metrics(
+        &rig,
+        source(&rig, &service),
+        Arc::new(MemorySqlObjectStore::default()),
+        board,
+        scratch.path(),
+        blocks.clone(),
+        1,
+    );
+    insert(&service, &rig.space, "a").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(blocks.0.lock().unwrap().first(), Some(&"daily_budget"));
+    writes_keep_working_after_a_spill_and_an_insert_over_the_bound(&service, &rig).await;
+    uploader.drain(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn writes_keep_working_after_a_spill_with_the_database_blocked_as_regressed() {
+    let rig = Rig::new("lockout-regressed").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySqlObjectStore::default());
+    let seq = crate::sql::store::local::seq_path(&rig.main_path());
+    let mut older = Vec::new();
+    {
+        let board = board(&rig);
+        let service = rig.service(board.clone(), DurabilityPolicy::default());
+        let uploader = start(
+            &rig,
+            source(&rig, &service),
+            store.clone(),
+            board,
+            scratch.path(),
+            Duration::ZERO,
+        );
+        for v in ["a", "b"] {
+            insert(&service, &rig.space, v).await.unwrap();
+            older.push(std::fs::read(&seq).unwrap());
+        }
+        frontier_at(&rig, 12).await;
+        uploader.drain(Duration::from_secs(5)).await;
+    }
+    // The seq file goes back to its first value; the next start finds the
+    // main file ahead of the frontier's counter and blocks the database.
+    std::fs::write(&seq, &older[0]).unwrap();
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let blocks = Arc::new(Blocks::default());
+    let uploader = start_with_metrics(
+        &rig,
+        source(&rig, &service),
+        store,
+        board,
+        scratch.path(),
+        blocks.clone(),
+        0,
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(blocks.0.lock().unwrap().first(), Some(&"regressed"));
+    writes_keep_working_after_a_spill_and_an_insert_over_the_bound(&service, &rig).await;
+    uploader.drain(Duration::from_secs(5)).await;
+}
+
+/// What a database with a `main_mib` checkpoint costs the store when, `rounds`
+/// times, a write spills `spill_mib` of rolled-back frames into the WAL and a
+/// one-row write commits: the bytes the store accepted, and how far the
+/// counter moved. Real scheduler at the 60 s window.
+async fn cost_of_rolled_back_spills(main_mib: u64, spill_mib: u64, rounds: u64) -> (u64, u64) {
+    let rig = Rig::new("rolled-back-cost").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = board(&rig);
+    let service = rig.service(board.clone(), DurabilityPolicy::default());
+    let store = Arc::new(CountingStore {
+        inner: MemorySqlObjectStore::default(),
+        bytes: Default::default(),
+    });
+    let scratch = tempfile::tempdir().unwrap();
+    let uploader = start(
+        &rig,
+        source(&rig, &service),
+        store.clone(),
+        board,
+        scratch.path(),
+        WINDOW,
+    );
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            main_mib * 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    published_up_to_the_counter(&rig).await;
+
+    store.bytes.store(0, Ordering::SeqCst);
+    let seq_before = local_seq(&rig);
+    for round in 0..rounds {
+        assert!(run(
+            &service,
+            &rig.space,
+            &format!(
+                "INSERT INTO items (v) VALUES (zeroblob({})), (NULL)",
+                spill_mib * 1024 * 1024
+            ),
+        )
+        .await
+        .is_err());
+        assert!(
+            std::fs::metadata(rig.wal_path()).unwrap().len() >= spill_mib * 1024 * 1024 / 2,
+            "the spill is in the file"
+        );
+        insert(&service, &rig.space, &format!("r{round}"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    uploader.drain(Duration::from_secs(5)).await;
+    (
+        store.bytes.load(Ordering::SeqCst),
+        local_seq(&rig) - seq_before,
+    )
+}
+
+#[tokio::test]
+async fn a_rolled_back_spill_neither_rotates_nor_skips_the_window_nor_republishes_the_checkpoint() {
+    // A 24 MiB checkpoint (rotation size 12 MiB) and 16 MiB of rolled-back
+    // frames per round, then one row. Counted by the file, each round was a
+    // rotation: a whole 24 MiB snapshot and a window skipped, every round.
+    let (bytes, counter_moved) = cost_of_rolled_back_spills(24, 16, 4).await;
+    eprintln!(
+        "MEASURED, 24 MiB checkpoint, 4 rounds of a 16 MiB rolled-back spill + 1 row: \
+         {bytes} bytes uploaded, counter moved {counter_moved}"
+    );
+    assert_eq!(counter_moved, 4, "one number per write, no rotation");
+    assert!(
+        bytes < 1024 * 1024,
+        "{bytes} bytes uploaded: the checkpoint was republished"
+    );
+}
+
+#[tokio::test]
+async fn the_reviewers_two_amplification_cases_upload_nothing_for_the_rolled_back_bytes() {
+    // Bobbie's probes against 9e38f2b0: a 24 MiB checkpoint with a 17 MiB
+    // rolled-back spill before each of 5 one-row commits (126 MB uploaded,
+    // against 20 KB without the spill), and a 60 MiB checkpoint with a 36 MiB
+    // spill (315 MB).
+    for (main, spill, rounds) in [(24, 17, 5), (60, 36, 2)] {
+        let (bytes, counter_moved) = cost_of_rolled_back_spills(main, spill, rounds).await;
+        eprintln!(
+            "MEASURED, {main} MiB checkpoint, {rounds} rounds of a {spill} MiB rolled-back \
+             spill + 1 row: {bytes} bytes uploaded, counter moved {counter_moved}"
+        );
+        assert_eq!(counter_moved, rounds, "one number per write, no rotation");
+        assert!(
+            bytes < 1024 * 1024,
+            "{bytes} bytes uploaded for {main}/{spill}: the checkpoint was republished"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_recovery_scan_does_not_read_the_whole_wal_of_every_database() {
+    // 40 MiB committed. The recovery scan asks every store-master database for
+    // its head under that database's operation lock; the head is a counter and
+    // a checkpoint hash and needs no WAL bytes. Reading the WAL (a scan of
+    // 40 MiB, with a write waiting on the lock) separates tens of ms from
+    // about 1 ms per call: the median of 15 calls must stay under 10 ms.
+    let rig = Rig::new("scan-is-light").await;
+    rig.create_working_copy(10);
+    rig.make_store_master().await;
+    let board = board(&rig);
+    let service = rig.service(board, DurabilityPolicy::default());
+    let source = source(&rig, &service);
+    run(
+        &service,
+        &rig.space,
+        &format!(
+            "INSERT INTO items (v) VALUES (zeroblob({}))",
+            40 * 1024 * 1024
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::metadata(rig.wal_path()).unwrap().len() >= 40 * 1024 * 1024);
+    let mut times = Vec::new();
+    for _ in 0..15 {
+        let started = Instant::now();
+        let heads = source.local_heads().await;
+        times.push(started.elapsed());
+        assert_eq!(heads.len(), 1);
+    }
+    times.sort();
+    eprintln!(
+        "MEDIAN local_heads beside a 40 MiB WAL: {:?} (all: {times:?})",
+        times[7]
+    );
+    assert!(
+        times[7] < Duration::from_millis(10),
+        "median {:?}: the scan reads the whole WAL",
+        times[7]
+    );
 }

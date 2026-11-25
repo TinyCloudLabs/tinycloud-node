@@ -379,3 +379,45 @@ fn a_crash_at_each_step_of_one_write_leaves_a_gap_at_worst_and_no_reused_seq() {
     after_gap.execute_batch("COMMIT").unwrap();
     assert_eq!(recovered(&bumped), (12, 1));
 }
+
+#[test]
+fn a_store_master_connection_is_always_synchronous_full() {
+    // RED FORM (9e38f2b0): the function takes the node's policy, and a node
+    // configured with `normal` gets NORMAL. At the fix the function takes no
+    // policy; the test there is the same without the argument.
+    let (_dir, path) = working_copy(1);
+    let conn = open_store_master_connection(&StorageMode::File(path), Synchronous::Normal).unwrap();
+    let level: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(level, 2, "FULL");
+}
+
+#[test]
+fn creating_the_seq_file_leaves_no_temp_file_and_a_leftover_one_is_never_the_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE items (v TEXT)")
+        .unwrap();
+    // What an `init_working_copy` that died before the link leaves.
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", seq_path(&path).display()));
+    std::fs::write(&tmp, b"short").unwrap();
+    assert!(read_seq(&path).is_err(), "a temp file is not a counter");
+    assert!(validate_working_copy(&path).is_err());
+    assert!(!seq_path(&path).exists());
+
+    init_working_copy(&path, 5).unwrap();
+    assert_eq!(read_seq(&path).unwrap(), 5);
+    assert!(!tmp.exists(), "the leftover is replaced and removed");
+    assert_eq!(
+        std::fs::read(seq_path(&path)).unwrap().len(),
+        SEQ_RECORD_LEN
+    );
+
+    // A second run refuses, keeps the counter and leaves no temp file.
+    assert!(init_working_copy(&path, 9).is_err());
+    assert_eq!(read_seq(&path).unwrap(), 5);
+    assert!(!tmp.exists());
+}
