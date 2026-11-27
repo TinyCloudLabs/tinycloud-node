@@ -1142,7 +1142,7 @@ impl ThresholdSet {
             return Err(AcceptError::Unavailable("not_a_member"));
         }
         let subject = hex::encode(verified.digest().as_bytes());
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_write_transaction(&self.db, None).await?;
         let new = store(&tx, network, cid, ObjectKind::Cert, &subject, bytes).await?;
         tx.commit().await?;
         Ok(accepted(cid, new, None))
@@ -1168,7 +1168,7 @@ impl ThresholdSet {
             &NodeDidVerifier,
         )
         .map_err(|_| refused("activation_invalid"))?;
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_write_transaction(&self.db, None).await?;
         let genesis = certificate.body().previous().is_none();
         // The owner activated two geneses of N: hold this one too, so every
         // member holding either, in whatever order, holds both and has no
@@ -1256,7 +1256,7 @@ impl ThresholdSet {
             }
         }
         self.require_member(network).await?;
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_write_transaction(&self.db, None).await?;
         let (new, key) = match &change {
             Change::NetworkRevoke => {
                 let new = store(&tx, network, cid, ObjectKind::KeyState, "", bytes).await?;
@@ -1305,22 +1305,13 @@ impl ThresholdSet {
         let plan = verify_revocation(network, bytes).await?;
         self.require_member(network).await?;
         let subject = plan.target.to_cid(RAW_CODEC).to_string();
-        let tx = self.db.begin().await?;
+        let tx = crate::db::begin_write_transaction(&self.db, None).await?;
         // Step 5: the chain goes in under /delegate's admission rules except
         // the time windows, revoked ancestors and its issuers' sign-outs
-        // (`process_carried`), then the revocation row. A chain member a
-        // space purge already erased as revoked leaves the graph as it is:
-        // its descendants are refused.
+        // (`process_carried`), then the revocation row.
         if let Err(error) = self.insert_revocation(&tx, plan).await {
             tx.rollback().await?;
             return match error {
-                delegation::Error::InvalidDelegation(delegation::DelegationError::Revoked(_)) => {
-                    let tx = self.db.begin().await?;
-                    let new =
-                        store(&tx, network, cid, ObjectKind::Revocation, &subject, bytes).await?;
-                    tx.commit().await?;
-                    Ok(accepted(cid, new, None))
-                }
                 delegation::Error::Db(error) => Err(error.into()),
                 // A peer is faulted only for a refusal any node reaches from
                 // the object's bytes alone: signature, DID, structure,
@@ -1346,12 +1337,14 @@ impl ThresholdSet {
         Ok(accepted(cid, new, None))
     }
 
-    /// Writes the chain's delegations, except any admitted only because its
-    /// issuer's sign-out was not checked, and those descending from one
-    /// (TC-3443): they authorize this revocation alone and stay out of the
-    /// delegation graph, held only in the revocation object. The revocation
-    /// row follows when its target is in the graph; otherwise the target is
-    /// tombstoned, so it is refused as revoked wherever it is posted later.
+    /// Writes the chain's delegations, except, with their descendants, any
+    /// admitted only because its issuer's sign-out was not checked (TC-3443)
+    /// and any a tombstone refuses (revoked here, or erased as revoked by a
+    /// space purge). Those authorize this revocation alone and stay out of
+    /// the delegation graph, held only in the revocation object. The
+    /// revocation row follows when its target is in the graph; otherwise the
+    /// target is tombstoned, so it is refused as revoked wherever it is
+    /// posted later.
     async fn insert_revocation(
         &self,
         tx: &DatabaseTransaction,
@@ -1361,12 +1354,15 @@ impl ThresholdSet {
         crate::space_purge_records::operation_actors(tx, &[&revoker]).await?;
         // Each pass admits the links not yet set aside in a savepoint, a
         // descendant checked against its parent there, and is kept only if
-        // no link came back admitted for its issuer's sign-out alone. A
-        // sign-out landing between passes is caught by the next one. One
-        // committed after the last pass's read (PostgreSQL, read committed)
-        // is as with `/delegate`: a link first seen after the sign-out is
-        // refused at invocation while the retire row lives (TC-3443).
+        // no further link came back admitted for its issuer's sign-out alone
+        // or tombstoned. A sign-out landing between passes is caught by the
+        // next one. One committed after the last pass's read (PostgreSQL,
+        // read committed) is as with `/delegate`: a link first seen after
+        // the sign-out is refused at invocation while the retire row lives
+        // (TC-3443).
         let mut unstored = HashSet::new();
+        // Tombstoned links and their descendants: never admitted here.
+        let mut tombstoned = HashSet::new();
         loop {
             let set_aside = unstored.clone();
             let staged = tx.begin().await?;
@@ -1375,15 +1371,26 @@ impl ThresholdSet {
                 .iter()
                 .filter(|item| !set_aside.contains(&hash(&item.1)))
             {
-                let admission = self.process_carried(&staged, item).await?;
-                if matches!(admission, delegation::CarriedAdmission::RetiredIssuer)
-                    || item
-                        .0
-                        .parents
-                        .iter()
-                        .any(|parent| unstored.contains(&Hash::from(*parent)))
+                let id = hash(&item.1);
+                let parents: Vec<Hash> = item.0.parents.iter().copied().map(Hash::from).collect();
+                let admission = if parents.iter().any(|parent| tombstoned.contains(parent)) {
+                    None
+                } else {
+                    match self.process_carried(&staged, item).await {
+                        Ok(admission) => Some(admission),
+                        Err(delegation::Error::InvalidDelegation(
+                            delegation::DelegationError::Revoked(_),
+                        )) => None,
+                        Err(error) => return Err(error),
+                    }
+                };
+                if admission.is_none() {
+                    tombstoned.insert(id);
+                }
+                if admission != Some(delegation::CarriedAdmission::Stored)
+                    || parents.iter().any(|parent| unstored.contains(parent))
                 {
-                    unstored.insert(hash(&item.1));
+                    unstored.insert(id);
                 }
             }
             if unstored.len() == set_aside.len() {

@@ -2461,3 +2461,106 @@ async fn another_genesis_is_not_held_without_an_activated_one() {
         3
     );
 }
+
+// ------------------------------------------------------------ round 5
+
+/// Another member of `f`'s network: its own database, this node's key,
+/// `f`'s genesis activated.
+async fn member_of(f: &Fixture) -> (DatabaseConnection, ThresholdSet) {
+    let db = fresh_db().await;
+    let set =
+        ThresholdSet::new(db.clone(), node_keypair(), None).with_delegation_rules(false, true);
+    for (kind, bytes) in [
+        (ObjectKind::Cert, f.cert()),
+        (ObjectKind::Activation, f.activation()),
+    ] {
+        set.accept(&f.network, kind, &bytes, Source::Client)
+            .await
+            .unwrap();
+    }
+    (db, set)
+}
+
+#[tokio::test]
+async fn a_control_grant_tombstoned_here_still_authorizes_its_revocation() {
+    use crate::models::session_retire;
+    let (f, owner) = did_key_owner().await;
+    let (d, p) = (ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    // T = owner → D, on every member.
+    let target = ucan(
+        &owner,
+        &d.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    // H = owner → P, revocation of T only, posted nowhere.
+    let grant = ucan(
+        &owner,
+        &p.did,
+        &[(&format!("urn:cid:{}", cid_of(&target)), REVOKE_ABILITY)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    // P revokes T under H.
+    let object = revocation_object(
+        &revoke(&p, &target, vec![cid_of(&grant)], t, t + 300),
+        &[&target, &grant],
+    );
+    // A set revocation of H itself is out of scope: only a space purge
+    // tombstones a control grant.
+    assert_eq!(
+        refusal(
+            f.accept(
+                ObjectKind::Revocation,
+                &revocation_object(&revoke(&owner, &grant, vec![], t, t + 300), &[&grant]),
+            )
+            .await
+        ),
+        "out_of_scope"
+    );
+    let at = OffsetDateTime::now_utc();
+    // A: nothing about H. B: the owner signed out. C: H erased as revoked
+    // by a space purge.
+    for (signed_out, tombstoned) in [(false, false), (true, false), (false, true)] {
+        let (db, set) = member_of(&f).await;
+        let posted = Delegation::from_header_ser::<TinyCloudDelegation>(&target).unwrap();
+        delegation::process_with(&db, &posted, None, false, true, None, false)
+            .await
+            .unwrap();
+        if signed_out {
+            session_retire::Entity::insert(session_retire::ActiveModel {
+                did: Set(owner.did.clone()),
+                retired_at: Set(at),
+                expires_at: Set(at + time::Duration::days(1)),
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+        if tombstoned {
+            revocation_tombstone::Entity::insert(revocation_tombstone::ActiveModel {
+                delegation_canonical: Set(hash(grant.as_bytes())),
+                delegation_expiry: Set(None),
+                revoked_at: Set(Some(at)),
+                recorded_at: Set(at),
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+        set.accept(&f.network, ObjectKind::Revocation, &object, Source::Client)
+            .await
+            .unwrap();
+        assert_eq!(revocations(&db, &target).await, 1);
+        let stored = delegation::Entity::find_by_id(hash(grant.as_bytes()))
+            .one(&db)
+            .await
+            .unwrap();
+        assert_eq!(stored.is_some(), !signed_out && !tombstoned);
+    }
+}
