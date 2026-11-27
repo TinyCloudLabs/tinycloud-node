@@ -1294,12 +1294,17 @@ impl ThresholdSet {
                     Ok(accepted(cid, new, None))
                 }
                 delegation::Error::Db(error) => Err(error.into()),
-                // This node's configuration or sign-outs refuse it, not the
-                // object: another member may store it, so no peer is faulted.
+                // A peer is faulted only for a refusal any node reaches from
+                // the object's bytes alone: signature, DID, structure,
+                // containment, policy over the object. A refusal reading this
+                // node's configuration, tables or graph is no fault: another
+                // member may store the object.
                 delegation::Error::InvalidDelegation(
                     delegation::DelegationError::NamedKeysUnavailable
                     | delegation::DelegationError::UnsupportedCaveat(_)
-                    | delegation::DelegationError::SessionRetired(_),
+                    | delegation::DelegationError::SessionRetired(_)
+                    | delegation::DelegationError::MissingParents
+                    | delegation::DelegationError::ChainTraversalLimitExceeded,
                 ) => Err(AcceptError::Unavailable("delegation_unstorable_here")),
                 delegation::Error::InvalidDelegation(_) => Err(refused("delegation_unstorable")),
             };

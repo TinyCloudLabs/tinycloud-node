@@ -1716,9 +1716,10 @@ async fn an_attached_control_grant_to_a_third_party_is_refused() {
         &revoke(&holder, &c.leaf, vec![cid_of(&grant)], 900, 950),
         &[&c.leaf, &c.root, &grant],
     );
+    // Refused as MissingParents, which reads this node's graph: no fault.
     assert_eq!(
-        refusal(f.accept(ObjectKind::Revocation, &object).await),
-        "delegation_unstorable"
+        unavailable(f.accept(ObjectKind::Revocation, &object).await),
+        "delegation_unstorable_here"
     );
     assert_eq!(delegation::Entity::find().count(&f.db).await.unwrap(), 0);
     // To the target's delegatee it is admitted.
