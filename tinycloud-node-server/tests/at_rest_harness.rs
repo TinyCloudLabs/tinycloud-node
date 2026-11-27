@@ -5028,6 +5028,7 @@ fn selftest_salt_piece_labels_do_not_depend_on_filler_bytes() -> Result<()> {
     // Old construction with the coincidence: filler's last byte == dek[15].
     let mut old_half_b = [&random_bytes(16)[..], &dek[16..]].concat();
     old_half_b[15] = dek[15];
+    old_half_b[14] = !dek[14];
     ensure!(
         any_contains(&label_of(&old_half_b), "salt holds bytes 15..31 of"),
         "a filler byte equal to dek[15] did not move the label to 15..31"
