@@ -758,18 +758,14 @@ impl Public {
         self.bind(r6, RECONSTRUCT)?;
         let senders = by_sender(r6);
         // A member publishes R6 only after finding its own R4 and R5 in the
-        // closed rounds; an R6 sender without exactly one of each is refused.
-        if senders
-            .keys()
-            .any(|m| !self.single_r4.contains(m) || !self.single_r5.contains(m))
-        {
-            return Err(Error::OwnMessageOmitted);
-        }
+        // closed rounds; an R6 sender without exactly one of each contributes
+        // no values.
         let t = self.t();
         for i in self.faulted.clone() {
             let commitments = self.commitments.get(&i).ok_or(Error::InvalidRound)?;
             let points: Vec<(Scalar, &Scalar)> = senders
                 .iter()
+                .filter(|(m, _)| self.single_r4.contains(m) && self.single_r5.contains(m))
                 .filter_map(|(m, sent)| {
                     let list = decoded(Some(*sent))?;
                     let (_, pair) = list.values.iter().find(|(k, _)| *k == i)?;

@@ -152,101 +152,145 @@ fn a_member_without_exactly_one_own_r4_or_r5_in_the_closed_round_stops_before_r6
     }
 }
 
+/// A member whose own closed R4 or R5 has no unique envelope.
+#[derive(Clone, Copy, Debug)]
+enum Ineligible {
+    MissingR4,
+    MissingR5,
+    TwoR4,
+    TwoR5,
+}
+
+impl Ineligible {
+    const ALL: [Self; 4] = [Self::MissingR4, Self::MissingR5, Self::TwoR4, Self::TwoR5];
+
+    /// The ineligible member and the dealer whose value its R6 carries.
+    fn sender_and_dealer(self) -> (u16, u16) {
+        match self {
+            Self::MissingR4 => (1, 1),
+            Self::MissingR5 | Self::TwoR5 => (1, 5),
+            Self::TwoR4 => (4, 4),
+        }
+    }
+
+    /// 3-of-5. With `extra`, an R6 from the ineligible member carrying a
+    /// Pedersen-valid value for the reconstructed dealer is closed; the
+    /// honest R6 of `drop_r6` are not.
+    fn run(self, setup: Setup, seed: u8, extra: bool, drop_r6: &[u16]) -> Run {
+        let (sender, dealer) = self.sender_and_dealer();
+        let mut deal = Vec::new();
+        run_in(setup, 3, 5, seed, |out| match out.round() {
+            1 => deal = out.payload(dealer),
+            4 => match self {
+                Self::MissingR4 => out.remove(1),
+                Self::TwoR4 => {
+                    let second = vanishing_feldman(&out.payload(4), &[]);
+                    out.push(4, &second);
+                }
+                Self::MissingR5 | Self::TwoR5 => {
+                    let forged = vanishing_feldman(&out.payload(5), &[]);
+                    out.replace(5, &forged);
+                }
+            },
+            5 => match self {
+                Self::MissingR5 => out.remove(1),
+                Self::TwoR5 => {
+                    let second = DkgExtractionComplaints {
+                        complaints: vec![(idx(2), pair(5, 6))],
+                    };
+                    out.push(1, &second.encode());
+                }
+                Self::MissingR4 | Self::TwoR4 => {}
+            },
+            6 => {
+                for i in drop_r6 {
+                    out.remove(*i);
+                }
+                if extra {
+                    let values = DkgReconstruction {
+                        values: vec![(idx(dealer), opened(out.fixture(), &deal, dealer, sender))],
+                    };
+                    out.push(sender, &values.encode());
+                }
+            }
+            _ => {}
+        })
+    }
+
+    fn finishers(self) -> Vec<u16> {
+        let (sender, _) = self.sender_and_dealer();
+        (1..=5).filter(|i| *i != sender).collect()
+    }
+}
+
+type Unlinked = (
+    Vec<[u8; 96]>,
+    [u8; 96],
+    Vec<[u8; 96]>,
+    BTreeSet<MemberIndex>,
+    BTreeMap<MemberIndex, DisqualifyReason>,
+    BTreeSet<MemberIndex>,
+);
+
+/// Everything in a DKG outcome except the transcript link.
+fn unlinked(output: &DkgOutput) -> Unlinked {
+    let (commitments, mpk, shares, qual, disqualified, reconstructed, _) = view(output);
+    (commitments, mpk, shares, qual, disqualified, reconstructed)
+}
+
 #[test]
-fn r6_from_a_member_whose_own_r4_or_r5_is_missing_or_conflicting_is_refused() {
+fn r6_from_a_member_without_unique_own_r4_and_r5_contributes_no_values() {
     for setup in SETUPS {
-        // Member 1's R4 is missing, and an R6 carrying its own value is closed.
-        let mut deal = Vec::new();
-        let own_r4 = run_in(setup, 3, 5, 0x76, |out| match out.round() {
-            1 => deal = out.payload(1),
-            4 => out.remove(1),
-            6 => {
-                let own = DkgReconstruction {
-                    values: vec![(idx(1), opened(out.fixture(), &deal, 1, 1))],
-                };
-                out.push(1, &own.encode());
+        for (kind, seed) in Ineligible::ALL.into_iter().zip([0x76, 0x77, 0x7d, 0x7e]) {
+            let label = format!("{setup:?} {kind:?}");
+            let (sender, dealer) = kind.sender_and_dealer();
+            let with = kind.run(setup, seed, true, &[]);
+            let without = kind.run(setup, seed, false, &[]);
+            assert!(r6_senders(&with).contains(&sender), "{label}");
+            assert!(!r6_senders(&without).contains(&sender), "{label}");
+            for run in [&with, &without] {
+                assert!(
+                    stopped_with(run, sender, Error::OwnMessageOmitted),
+                    "{label}"
+                );
             }
-            _ => {}
-        });
-        assert!(r6_senders(&own_r4).contains(&1));
-        assert_eq!(own_r4.verify().err(), Some(Error::OwnMessageOmitted));
-        for i in 1..=5 {
-            assert!(stopped_with(&own_r4, i, Error::OwnMessageOmitted), "{i}");
+            // Every finisher and the verifier ignore the same R6 and agree
+            // with the run in which it was never closed.
+            let finishers = kind.finishers();
+            let ignored = agreed(&with, &finishers);
+            let absent = agreed(&without, &finishers);
+            assert!(ignored.reconstructed.contains(&idx(dealer)), "{label}");
+            assert_eq!(unlinked(&ignored), unlinked(&absent), "{label}");
+            assert_ne!(ignored.transcript_hash, absent.transcript_hash, "{label}");
         }
+    }
+}
 
-        // Member 1's R5 is missing, and an R6 from it is closed.
-        let mut deal = Vec::new();
-        let own_r5 = run_in(setup, 3, 5, 0x77, |out| match out.round() {
-            1 => deal = out.payload(5),
-            4 => {
-                let forged = vanishing_feldman(&out.payload(5), &[]);
-                out.replace(5, &forged);
+#[test]
+fn fewer_than_t_eligible_r6_values_is_insufficient_recovery_for_every_member_and_the_verifier() {
+    for setup in SETUPS {
+        for (kind, seed) in Ineligible::ALL.into_iter().zip([0x76, 0x77, 0x7d, 0x7e]) {
+            let label = format!("{setup:?} {kind:?}");
+            let (sender, _) = kind.sender_and_dealer();
+            let finishers = kind.finishers();
+            // Two eligible R6 remain; the ineligible R6 would be the third.
+            let run = kind.run(setup, seed, true, &finishers[2..]);
+            assert_eq!(r6_senders(&run).len(), 3, "{label}");
+            assert_eq!(
+                run.verify().err(),
+                Some(Error::InsufficientRecovery),
+                "{label}"
+            );
+            assert!(
+                stopped_with(&run, sender, Error::OwnMessageOmitted),
+                "{label}"
+            );
+            for i in &finishers {
+                assert!(
+                    stopped_with(&run, *i, Error::InsufficientRecovery),
+                    "{label} member {i}"
+                );
             }
-            5 => out.remove(1),
-            6 => {
-                let values = DkgReconstruction {
-                    values: vec![(idx(5), opened(out.fixture(), &deal, 5, 1))],
-                };
-                out.push(1, &values.encode());
-            }
-            _ => {}
-        });
-        assert!(r6_senders(&own_r5).contains(&1));
-        assert_eq!(own_r5.verify().err(), Some(Error::OwnMessageOmitted));
-        for i in 2..=4 {
-            assert!(stopped_with(&own_r5, i, Error::OwnMessageOmitted), "{i}");
-        }
-
-        // Member 4 has two different R4 in closed R4, and an R6 from it is
-        // closed. The conflict alone is an extraction fault, not an error.
-        let mut deal = Vec::new();
-        let two_r4 = run_in(setup, 3, 5, 0x7d, |out| match out.round() {
-            1 => deal = out.payload(4),
-            4 => {
-                let second = vanishing_feldman(&out.payload(4), &[]);
-                out.push(4, &second);
-            }
-            6 => {
-                let own = DkgReconstruction {
-                    values: vec![(idx(4), opened(out.fixture(), &deal, 4, 4))],
-                };
-                out.push(4, &own.encode());
-            }
-            _ => {}
-        });
-        assert!(r6_senders(&two_r4).contains(&4));
-        assert_eq!(two_r4.verify().err(), Some(Error::OwnMessageOmitted));
-        for i in 1..=5 {
-            assert!(stopped_with(&two_r4, i, Error::OwnMessageOmitted), "{i}");
-        }
-
-        // Member 1 has two different R5 in closed R5, and an R6 from it is
-        // closed. The conflict alone makes its R5 count as empty.
-        let mut deal = Vec::new();
-        let two_r5 = run_in(setup, 3, 5, 0x7e, |out| match out.round() {
-            1 => deal = out.payload(5),
-            4 => {
-                let forged = vanishing_feldman(&out.payload(5), &[]);
-                out.replace(5, &forged);
-            }
-            5 => {
-                let second = DkgExtractionComplaints {
-                    complaints: vec![(idx(2), pair(5, 6))],
-                };
-                out.push(1, &second.encode());
-            }
-            6 => {
-                let values = DkgReconstruction {
-                    values: vec![(idx(5), opened(out.fixture(), &deal, 5, 1))],
-                };
-                out.push(1, &values.encode());
-            }
-            _ => {}
-        });
-        assert!(r6_senders(&two_r5).contains(&1));
-        assert_eq!(two_r5.verify().err(), Some(Error::OwnMessageOmitted));
-        for i in 1..=5 {
-            assert!(stopped_with(&two_r5, i, Error::OwnMessageOmitted), "{i}");
         }
     }
 }
@@ -608,7 +652,7 @@ fn omission_vectors() -> Value {
             Setup::Genesis => ("genesis", 0xa0u8),
             Setup::Rekey => ("rekey", 0xb0),
         };
-        seeds.extend(base..base + 4);
+        seeds.extend(base..base + 5);
         let floor = run_in(setup, 3, 5, base, |out| {
             if out.round() == 4 {
                 for i in 1..=3 {
@@ -616,44 +660,21 @@ fn omission_vectors() -> Value {
                 }
             }
         });
-        let mut deal = Vec::new();
-        let without_r4 = run_in(setup, 3, 5, base + 1, |out| match out.round() {
-            1 => deal = out.payload(1),
-            4 => out.remove(1),
-            6 => {
-                let own = DkgReconstruction {
-                    values: vec![(idx(1), opened(out.fixture(), &deal, 1, 1))],
-                };
-                out.push(1, &own.encode());
-            }
-            _ => {}
-        });
-        let mut deal = Vec::new();
-        let two_r5 = run_in(setup, 3, 5, base + 2, |out| match out.round() {
-            1 => deal = out.payload(5),
-            4 => {
-                let forged = vanishing_feldman(&out.payload(5), &[]);
-                out.replace(5, &forged);
-            }
-            5 => {
-                let second = DkgExtractionComplaints {
-                    complaints: vec![(idx(2), pair(5, 6))],
-                };
-                out.push(1, &second.encode());
-            }
-            6 => {
-                let values = DkgReconstruction {
-                    values: vec![(idx(5), opened(out.fixture(), &deal, 5, 1))],
-                };
-                out.push(1, &values.encode());
-            }
-            _ => {}
-        });
+        let without_r4 = Ineligible::MissingR4.run(setup, base + 1, true, &[]);
+        let no_r6 = Ineligible::MissingR4.run(setup, base + 1, false, &[]);
+        assert_eq!(
+            unlinked(&without_r4.verify().unwrap()),
+            unlinked(&no_r6.verify().unwrap())
+        );
+        let two_r5 = Ineligible::TwoR5.run(setup, base + 2, true, &[]);
         let (chosen, _) = chosen_master_key(setup, 3, 5, base + 3);
+        let short = Ineligible::MissingR4.run(setup, base + 4, true, &[4, 5]);
         cases.extend([
             case(&format!("{kind}_3of5_reconstruction_floor"), "The R4 of dealers 1-3 are missing. Reconstructing them would leave two of the five QUAL dealers, fewer than t = 3, so the ceremony stops after R5 and no R6 round exists.", &floor),
-            case(&format!("{kind}_3of5_r6_from_member_without_r4"), "Member 1's R4 is missing from closed R4, yet an R6 from member 1 is closed. Every R6 sender must have exactly one R4 and one R5 in the closed rounds.", &without_r4),
-            case(&format!("{kind}_3of5_r6_from_member_with_two_r5"), "Member 1 has two different R5 in closed R5, and an R6 from member 1 is closed. Every R6 sender must have exactly one R4 and one R5 in the closed rounds.", &two_r5),
+            case(&format!("{kind}_3of5_r6_from_member_without_r4"), "Member 1's R4 is missing from closed R4, so dealer 1 is reconstructed and member 1 stops after R5. An R6 from member 1 is closed anyway; it contributes no values, and the outputs equal those of the next case apart from the transcript hash.", &without_r4),
+            case(&format!("{kind}_3of5_member_without_r4_sends_no_r6"), "The previous case without member 1's R6: dealer 1 is reconstructed from the R6 of members 2-5.", &no_r6),
+            case(&format!("{kind}_3of5_r6_from_member_with_two_r5"), "Member 1 has two different R5 in closed R5 and stops after R5. An R6 from member 1 is closed anyway and contributes no values; dealer 5 is reconstructed from the R6 of members 2-5.", &two_r5),
+            case(&format!("{kind}_3of5_ineligible_r6_leaves_fewer_than_t_values"), "Member 1's R4 is missing, and only members 2 and 3 send R6 besides member 1. Member 1's R6 contributes no values, so two eligible values remain for dealer 1, fewer than t = 3.", &short),
             case(&format!("{kind}_3of5_chosen_master_key"), "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of honest members 1 and 2 only. Honest member 3's R5 is omitted and it stops after R5; faulty members 4 and 5 send empty R5 and may claim readiness without a matching share. The transcript verifies with nothing reconstructed.", &chosen),
         ]);
         cases.extend(activation_refusals(kind, &chosen));
