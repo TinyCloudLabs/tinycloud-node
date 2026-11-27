@@ -54,6 +54,18 @@ fn default_threshold() -> Threshold {
     Threshold::one_of_one()
 }
 
+/// This node's threshold member keys, when it manages them. A plain request
+/// guard, not `&State`: a node without a share volume still launches.
+pub struct ManagedMemberKeys<'r>(Option<&'r crate::threshold_member::MemberKeys>);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ManagedMemberKeys<'r> {
+    type Error = std::convert::Infallible;
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        Outcome::Success(Self(request.rocket().state()))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct DescriptorView {
     pub descriptor: NetworkDescriptor,
@@ -72,6 +84,7 @@ pub async fn create_network(
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
     policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+    member_keys: ManagedMemberKeys<'_>,
 ) -> Result<Json<DescriptorView>, InvokeError> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -110,7 +123,21 @@ pub async fn create_network(
         threshold: body.threshold,
     };
     let create_start = Instant::now();
-    let create_result = service.create_one_of_one_network(req).await;
+    // A network this node holds a threshold member key for is never created
+    // as a plain one.
+    let create_result = crate::threshold_member::guard_plain_create(
+        member_keys.0,
+        &network_id,
+        service.create_one_of_one_network(req),
+    )
+    .await
+    .map_err(|error| {
+        let status = match &error {
+            crate::threshold_member::MemberKeyError::PendingThresholdMember => Status::Conflict,
+            _ => Status::InternalServerError,
+        };
+        (status, error.to_string())
+    })?;
     crate::prometheus::observe_span(
         "server.encryption.create_network",
         if create_result.is_ok() { "ok" } else { "error" },

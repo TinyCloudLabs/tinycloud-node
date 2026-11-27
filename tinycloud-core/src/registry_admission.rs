@@ -554,16 +554,27 @@ impl RegistryAdmission {
 
     /// Every requested data/encryption action must be served here. A grant's
     /// broad authority never broadens this node's signed membership or mode.
+    ///
+    /// One exception: the owner admits a threshold member (`member.admit` on
+    /// a network URN) on any node, because a threshold network's members are
+    /// not its 1-of-1 encryption node. The owner's current record must still
+    /// exist.
     pub async fn authorize_capabilities(&self, caps: &[Capability]) -> Result<(), RegistryError> {
+        use crate::encryption_network::{
+            key_id::{self, EncryptionResource},
+            protocol::MEMBER_ADMIT_ACTION,
+        };
         let mut records = HashMap::new();
         for cap in caps {
+            let mut member_admit = false;
             let owner = match &cap.resource {
                 Resource::TinyCloud(resource) => resource.space().did().as_str().to_owned(),
                 Resource::Other(uri) if uri.as_str().starts_with("urn:tinycloud:encryption:") => {
-                    crate::encryption_network::key_id::parse(uri.as_str())
-                        .map_err(|_| RegistryError::Denied)?
-                        .owner_did()
-                        .to_owned()
+                    let resource =
+                        key_id::parse(uri.as_str()).map_err(|_| RegistryError::Denied)?;
+                    member_admit = cap.ability.as_ref().as_ref() == MEMBER_ADMIT_ACTION
+                        && matches!(resource, EncryptionResource::Network(_));
+                    resource.owner_did().to_owned()
                 }
                 _ => continue,
             };
@@ -593,7 +604,7 @@ impl RegistryAdmission {
                 );
                 record.allows_space(space, &self.node, !read)
             } else {
-                record.record.encryption_node.as_deref() == Some(&self.node)
+                member_admit || record.record.encryption_node.as_deref() == Some(&self.node)
             };
             if !allowed {
                 return Err(RegistryError::Denied);
@@ -757,5 +768,68 @@ mod tests {
             registry.current(&owner, true).await.unwrap_err(),
             RegistryError::Unavailable
         );
+    }
+
+    /// `member.admit` on a network URN is served on any node of an owner
+    /// with a current record; every other encryption action only on the
+    /// record's encryption node.
+    #[tokio::test]
+    async fn member_admit_is_served_off_the_encryption_node() {
+        use crate::encryption_network::{
+            protocol::{MEMBER_ADMIT_ACTION, NETWORK_CREATE_ACTION},
+            NetworkId,
+        };
+        let (owner, node, body) = first_record();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/registry-v2.json")).unwrap();
+        let encryption_node = fixture["records"][0]["record"]["encryptionNode"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(node, encryption_node);
+        let network = NetworkId::new(owner, "vault").unwrap().to_string();
+        let cap = |resource: &str, ability: &str| Capability {
+            resource: resource.parse().unwrap(),
+            ability: crate::types::Ability::try_from(ability.to_string()).unwrap(),
+            caveats: Default::default(),
+        };
+        let (origin, script, _seen) = scripted().await;
+        let member = RegistryAdmission::new(&origin, node).unwrap();
+
+        script.send((None, 200, body.clone())).unwrap();
+        member
+            .authorize_capabilities(&[cap(&network, MEMBER_ADMIT_ACTION)])
+            .await
+            .unwrap();
+        // Any other ability, or member.admit on a key, needs the encryption node.
+        script.send((None, 200, body.clone())).unwrap();
+        assert_eq!(
+            member
+                .authorize_capabilities(&[cap(&network, NETWORK_CREATE_ACTION)])
+                .await
+                .unwrap_err(),
+            RegistryError::Denied
+        );
+        script.send((None, 200, body.clone())).unwrap();
+        assert_eq!(
+            member
+                .authorize_capabilities(&[cap(&format!("{network}/docs/a"), MEMBER_ADMIT_ACTION)])
+                .await
+                .unwrap_err(),
+            RegistryError::Denied
+        );
+        // Without a current owner record, member.admit is refused too.
+        script.send((None, 404, b"{}".to_vec())).unwrap();
+        assert!(member
+            .authorize_capabilities(&[cap(&network, MEMBER_ADMIT_ACTION)])
+            .await
+            .is_err());
+
+        let primary = RegistryAdmission::new(&origin, encryption_node).unwrap();
+        script.send((None, 200, body)).unwrap();
+        primary
+            .authorize_capabilities(&[cap(&network, NETWORK_CREATE_ACTION)])
+            .await
+            .unwrap();
     }
 }
