@@ -561,7 +561,14 @@ fn bad_missing_and_malformed_r4_are_extraction_faults() {
                 mutate(out);
             }
         });
-        let output = agreed(&run, &[1, 2, 3]);
+        // A member whose own R4 is missing stops after R5 without R6.
+        let finishers: &[u16] = if name == "missing" {
+            assert!(matches!(run.outcomes[&3], Err(Error::OwnMessageOmitted)), "{name}");
+            &[1, 2]
+        } else {
+            &[1, 2, 3]
+        };
+        let output = agreed(&run, finishers);
         assert_eq!(output.qual, members(&[1, 2, 3]), "{name}");
         assert_eq!(output.reconstructed, members(&[3]), "{name}");
         assert_eq!(
@@ -630,7 +637,15 @@ fn missing_or_malformed_r5_counts_as_an_empty_list() {
                 }
             }
         });
-        let output = agreed(&run, &[1, 2, 3]);
+        // A member whose own R5 is missing stops after R5; the others still
+        // count it as an empty list.
+        let finishers: &[u16] = if malformed {
+            &[1, 2, 3]
+        } else {
+            assert!(matches!(run.outcomes[&2], Err(Error::OwnMessageOmitted)));
+            &[1, 3]
+        };
+        let output = agreed(&run, finishers);
         assert!(output.reconstructed.is_empty());
         assert_eq!(output.qual, reference.qual);
         assert_eq!(

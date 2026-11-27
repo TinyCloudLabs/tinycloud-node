@@ -58,6 +58,10 @@ pub enum Error {
     InsufficientRecovery,
     #[error("no valid private value from a qualified dealer")]
     LocalShareUnavailable,
+    #[error("a member's own R4 or R5 is absent from its closed round")]
+    OwnMessageOmitted,
+    #[error("fewer than t qualified dealers would remain unreconstructed")]
+    ExcessiveReconstruction,
 }
 
 /// Verification distinguishes context selection from a member's share equation.

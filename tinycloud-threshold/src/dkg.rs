@@ -450,6 +450,14 @@ fn decoded<'a, M>(sent: Option<Sent<'a, M>>) -> Option<&'a M> {
     }
 }
 
+fn single<M>(senders: &BTreeMap<MemberIndex, Sent<'_, M>>) -> BTreeSet<MemberIndex> {
+    senders
+        .iter()
+        .filter(|(_, sent)| matches!(sent, Sent::One(_)))
+        .map(|(i, _)| *i)
+        .collect()
+}
+
 fn evaluate_points(points: &[G2], x: MemberIndex) -> G2 {
     let x = Scalar::from_u64(u64::from(x.get()));
     points
@@ -513,6 +521,9 @@ struct Public {
     equivocated: BTreeSet<MemberIndex>,
     feldman: BTreeMap<MemberIndex, Vec<G2>>,
     faulted: BTreeSet<MemberIndex>,
+    /// Members with exactly one envelope in closed R4 and in closed R5.
+    single_r4: BTreeSet<MemberIndex>,
+    single_r5: BTreeSet<MemberIndex>,
 }
 
 impl Public {
@@ -531,6 +542,8 @@ impl Public {
             equivocated: BTreeSet::new(),
             feldman: BTreeMap::new(),
             faulted: BTreeSet::new(),
+            single_r4: BTreeSet::new(),
+            single_r5: BTreeSet::new(),
         })
     }
 
@@ -692,6 +705,7 @@ impl Public {
     fn extract(&mut self, r4: &ClosedRound<DkgFeldman>) -> Result<(), Error> {
         self.bind(r4, EXTRACT)?;
         let senders = by_sender(r4);
+        self.single_r4 = single(&senders);
         let t = self.t();
         for i in self.qual() {
             match decoded(senders.get(&i).copied()) {
@@ -710,6 +724,7 @@ impl Public {
     fn barrier(&mut self, r5: &ClosedRound<DkgExtractionComplaints>) -> Result<bool, Error> {
         self.bind(r5, EXTRACTION_COMPLAINTS)?;
         let senders = by_sender(r5);
+        self.single_r5 = single(&senders);
         let mut upheld = BTreeSet::new();
         for (j, sent) in &senders {
             let Some(list) = decoded(Some(*sent)) else {
@@ -732,12 +747,24 @@ impl Public {
             }
         }
         self.faulted.extend(upheld);
+        // At least t QUAL dealers must remain unreconstructed before any R6.
+        if self.commitments.len().saturating_sub(self.faulted.len()) < self.t() {
+            return Err(Error::ExcessiveReconstruction);
+        }
         Ok(!self.faulted.is_empty())
     }
 
     fn reconstruct(&mut self, r6: &ClosedRound<DkgReconstruction>) -> Result<(), Error> {
         self.bind(r6, RECONSTRUCT)?;
         let senders = by_sender(r6);
+        // A member publishes R6 only after finding its own R4 and R5 in the
+        // closed rounds; an R6 sender without exactly one of each is refused.
+        if senders
+            .keys()
+            .any(|m| !self.single_r4.contains(m) || !self.single_r5.contains(m))
+        {
+            return Err(Error::OwnMessageOmitted);
+        }
         let t = self.t();
         for i in self.faulted.clone() {
             let commitments = self.commitments.get(&i).ok_or(Error::InvalidRound)?;
@@ -1137,12 +1164,18 @@ fn candidate(
 }
 
 impl DkgAwaitingBarrier {
-    /// Consume the common closed R5; finish or publish R6 values. Details: TC-2220
+    /// Consume the common closed R5; finish or publish R6 values. A member
+    /// without exactly one envelope of its own in closed R4 and in closed R5
+    /// stops without R6. Details: TC-2220, TC-2226
     pub fn after_barrier(
         mut self,
         r5: &ClosedRound<DkgExtractionComplaints>,
     ) -> Result<AfterBarrier, Error> {
-        if !self.public.barrier(r5)? {
+        let reconstruct = self.public.barrier(r5)?;
+        if !self.public.single_r4.contains(&self.me) || !self.public.single_r5.contains(&self.me) {
+            return Err(Error::OwnMessageOmitted);
+        }
+        if !reconstruct {
             let (share, output) = candidate(&self.public, self.me, &self.pairs)?;
             return Ok(AfterBarrier::Finished(share, output));
         }
