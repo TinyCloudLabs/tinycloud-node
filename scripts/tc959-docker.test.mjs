@@ -476,14 +476,17 @@ test('interpolated volume names and mount paths are refused on the member compos
 
 test('only the member render\'s default network may exist or be used (TC-2224)', () => {
   const external = memberComposeFixture();
+  external.name = 'x';
   external.networks = { default: { name: 'x_default' }, host: { external: true } };
   assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture(), ''), /member_networks_allowlist_host/);
 
   const opts = memberComposeFixture();
+  opts.name = 'x';
   opts.networks = { default: { name: 'x_default', driver_opts: { x: 'y' } } };
   assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture(), ''), /member_network_option_forbidden_default/);
 
   const joined = memberComposeFixture();
+  joined.name = 'x';
   joined.networks = { default: { name: 'x_default' }, dmz: { name: 'x_dmz' } };
   joined.services.postgres.networks = { default: null, dmz: null };
   assert.throws(() => assertThresholdMemberCompose(joined, productionComposeFixture(), ''), /member_networks_allowlist_dmz/);
@@ -495,10 +498,22 @@ test('a non-empty profiles listing is refused (TC-2224)', () => {
 
 test('the member default network name must be the project-shaped render name (TC-2224)', () => {
   const named = memberComposeFixture();
+  named.name = 'x';
   named.networks = { default: { name: 'host' } };
   assert.throws(() => assertThresholdMemberCompose(named, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
 
+  const alias = memberComposeFixture();
+  alias.name = 'x';
+  alias.networks = { default: { name: 'operator_default' } };
+  assert.throws(() => assertThresholdMemberCompose(alias, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
+
+  const bare = memberComposeFixture();
+  bare.name = 'x';
+  bare.networks = { default: { name: '_default' } };
+  assert.throws(() => assertThresholdMemberCompose(bare, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
+
   const interpolated = memberComposeFixture();
+  interpolated.name = 'x';
   interpolated.networks = { default: { name: '${NET:-default}' } };
   assert.throws(() => assertThresholdMemberCompose(interpolated, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
 });

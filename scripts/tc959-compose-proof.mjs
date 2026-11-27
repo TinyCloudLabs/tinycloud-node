@@ -249,9 +249,10 @@ export function assertThresholdMemberCompose(member, production, profilesOutput)
   // external or driver-bridged network could carry member traffic off-CVM.
   for (const [name, definition] of Object.entries(member.networks ?? {})) {
     assert.equal(name, 'default', `member_networks_allowlist_${name}`);
-    // Compose names the default network "<project>_default"; pin that shape
-    // and refuse any interpolation, so it can't alias an operator network.
-    assert.ok(!definition?.name?.includes('$') && definition?.name?.endsWith('_default'), `member_network_name_forbidden_${name}`);
+    // Compose names the default network "<project>_default" from the
+    // render's top-level `name`; pin it exactly and refuse any `$` or a
+    // missing project name, so it can't alias an operator network.
+    assert.ok(!`${member.name ?? ''}`.includes('$') && member.name && definition?.name === `${member.name}_default`, `member_network_name_forbidden_${name}`);
     assert.equal(definition?.external, undefined, `member_external_network_${name}`);
     assert.equal(definition?.driver, undefined, `member_network_option_forbidden_${name}`);
     assert.equal(definition?.driver_opts, undefined, `member_network_option_forbidden_${name}`);
