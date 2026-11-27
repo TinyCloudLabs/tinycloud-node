@@ -10034,6 +10034,7 @@ dependencies = [
  "tinycloud-auth",
  "tinycloud-core",
  "tinycloud-sdk-wasm",
+ "tinycloud-threshold",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",

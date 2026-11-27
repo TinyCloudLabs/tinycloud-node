@@ -154,6 +154,8 @@ pem = "3"
 # `verify`: the stand-in KMS in tests/kms_epoch_identity.rs checks that the
 # RA-TLS client certificate is signed by its temp CA (TC-3554).
 x509-parser = { version = "0.16", features = ["verify"] }
+# Builds signed threshold certificates in the route tests (TC-2225).
+tinycloud-threshold = { path = "../tinycloud-threshold" }
 
 [features]
 renewal-test-clock = ["tinycloud-core/renewal-test-clock"]
