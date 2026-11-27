@@ -1,9 +1,10 @@
 # Encryption at rest: interfaces (TC-887)
 
-> **Status (TC-887):** on `main` today: the envelope, key types, `DataKeyProvider` and the
-> harness. Not on `main` yet: key continuity (`docs/at-rest-escrow.md`, `at_rest::keyring`,
-> node wiring) and sealed KV storage (§7). They land with PRs #325–#327 and #329/#333/#336
-> (#336: the S3 store seals KV blocks).
+> **Status checked 2026-11-27:** the general sealing primitives are on `main`, but
+> storage integration is not wired at `622e78cfc989134f6c38f2edebe98a9c8791ee89`.
+> See [the current delivery map](./DELIVERY.md) for successor PRs #628–#630,
+> #634–#637 and #639. The older #325–#327/#329/#333/#336 references are historical.
+> Sensitive-column encryption is a separate, already wired mechanism.
 
 Normative interface and format for `tinycloud_core::at_rest` and the node's sealed KV block
 storage. Plan: TC-887 (encryption at rest inside the TEE). Key continuity and escrow:
