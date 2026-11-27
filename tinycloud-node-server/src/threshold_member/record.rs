@@ -131,9 +131,36 @@ fn take_field(rest: &mut &[u8], cap: usize) -> Result<String, MemberKeyError> {
     Ok(field)
 }
 
+/// Create `dir`, which is `<share root>/member/<network hash>`, below an
+/// existing share root. The root is never created, so a key can't land off
+/// the share volume when it isn't mounted: a missing root is refused. Each
+/// missing level is created alone with mode 0700, and its parent fsynced.
 pub(super) fn ensure_dir(dir: &Path) -> Result<(), MemberKeyError> {
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    Ok(())
+    let member = dir
+        .parent()
+        .ok_or(MemberKeyError::MalformedRecord("record path"))?;
+    let root = member
+        .parent()
+        .ok_or(MemberKeyError::MalformedRecord("record path"))?;
+    match fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(MemberKeyError::ShareDirMissing),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(MemberKeyError::ShareDirMissing)
+        }
+        Err(error) => return Err(error.into()),
+    }
+    create_level(root, member)?;
+    create_level(member, dir)
+}
+
+/// Create `dir` in `parent` unless it exists, then fsync `parent`.
+fn create_level(parent: &Path, dir: &Path) -> Result<(), MemberKeyError> {
+    match DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => sync_dir(parent),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(super) fn sync_dir(dir: &Path) -> Result<(), MemberKeyError> {
@@ -240,19 +267,41 @@ fn zero_and_remove(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
+/// Zero-overwrite and unlink every temp key record in `dir`, then fsync `dir`
+/// if anything was removed. Returns how many were removed.
+///
+/// A temp record holds a seed until `install_or_load` unlinks it, so a crash
+/// in between leaves one behind. Call only while no install into `dir` can be
+/// in flight: every install runs under `MemberKeys`'s generate lock, so any
+/// temp record seen while holding it is a leftover.
+pub(super) fn sweep_temp_records(dir: &Path) -> Result<usize, MemberKeyError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let prefix = format!("{KEY_FILE}{TEMP_PREFIX}");
+    let mut swept = 0;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            zero_and_remove(&entry.path())?;
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        sync_dir(dir)?;
+    }
+    Ok(swept)
+}
+
 /// Logical unlink of the key in `dir` (D7.4 steps 2-3): zero-overwrite and
 /// fsync the record and any leftover temp record, unlink them, fsync `dir`.
 /// On a copy-on-write filesystem the overwrite writes new blocks; the old
 /// ones are not destroyed.
 pub(super) fn unlink_key(dir: &Path) -> Result<(), MemberKeyError> {
     zero_and_remove(&dir.join(KEY_FILE))?;
-    let prefix = format!("{KEY_FILE}{TEMP_PREFIX}");
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            zero_and_remove(&entry.path())?;
-        }
-    }
+    sweep_temp_records(dir)?;
     sync_dir(dir)
 }
 

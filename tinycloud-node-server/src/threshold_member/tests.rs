@@ -45,8 +45,25 @@ impl Drop for FakeDstack {
     }
 }
 
+/// Holds `/GetQuote` open: `entered` fires when a quote request arrives, and
+/// the reply waits for `release`.
+#[derive(Default)]
+struct QuoteGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 impl FakeDstack {
     fn new(app_id: &str, instance_id: &str) -> Self {
+        Self::serve(app_id, instance_id, None)
+    }
+
+    fn gated(app_id: &str, instance_id: &str) -> (Self, Arc<QuoteGate>) {
+        let gate = Arc::new(QuoteGate::default());
+        (Self::serve(app_id, instance_id, Some(gate.clone())), gate)
+    }
+
+    fn serve(app_id: &str, instance_id: &str, gate: Option<Arc<QuoteGate>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("dstack.sock").to_str().unwrap().to_owned();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -58,6 +75,7 @@ impl FakeDstack {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let seen = seen.clone();
                 let info = info.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let mut raw = Vec::new();
                     stream.read_to_end(&mut raw).await.unwrap();
@@ -68,6 +86,10 @@ impl FakeDstack {
                     let (status, body) = match path.as_str() {
                         "/Info" => ("200 OK", info.to_string()),
                         "/GetQuote" => {
+                            if let Some(gate) = &gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
                             let body: Value = serde_json::from_slice(&raw[split + 4..]).unwrap();
                             let mut padded =
                                 hex::decode(body["report_data"].as_str().unwrap()).unwrap();
@@ -198,10 +220,19 @@ impl Fixture {
         .await
     }
 
-    fn admit(&self, network: &NetworkId, now: SystemTime) -> Result<MemberKey, MemberKeyError> {
+    fn admit(
+        &self,
+        network: &NetworkId,
+        now: SystemTime,
+    ) -> Result<MemberPublicKey, MemberKeyError> {
         self.keys
-            .admit(network, &identity(), &self.holdings, now)
-            .map(|(key, _)| key)
+            .admit(network, &identity(), &self.holdings, now, &mut Vec::new())
+    }
+
+    fn expire(&self, now: SystemTime) -> Result<Vec<MemberKeyAudit>, MemberKeyError> {
+        let mut audit = Vec::new();
+        self.keys.expire_pending(&self.holdings, now, &mut audit)?;
+        Ok(audit)
     }
 }
 
@@ -307,9 +338,7 @@ async fn every_member_key_path_runs_without_key_derivation() {
         .unwrap();
     let identity = LocalIdentity::read(&dstack.socket).await.unwrap();
     fx.keys.load(&net, &identity).unwrap();
-    fx.keys
-        .expire_pending(&fx.holdings, SystemTime::now() + PENDING_KEY_TTL)
-        .unwrap();
+    fx.expire(SystemTime::now() + PENDING_KEY_TTL).unwrap();
     fx.attest(&dstack, &net.to_string(), &[3; 32], &Admit)
         .await
         .result
@@ -455,7 +484,13 @@ async fn a_record_of_another_app_or_instance_is_refused_and_kept() {
         );
         let err = fx
             .keys
-            .admit(&net, &other, &fx.holdings, SystemTime::now())
+            .admit(
+                &net,
+                &other,
+                &fx.holdings,
+                SystemTime::now(),
+                &mut Vec::new(),
+            )
             .unwrap_err();
         assert!(
             matches!(err, MemberKeyError::IdentityMismatch(f) if f == field),
@@ -602,10 +637,33 @@ mod admission_shape {
 
     const NODE: &str = "did:key:z6MkNodeTest";
 
-    fn invocation(audience: &str, resource: &str, ability: &str, facts: Value) -> InvocationInfo {
+    fn owner_key() -> JWK {
         let mut jwk = JWK::generate_ed25519().unwrap();
         jwk.algorithm = Some(Algorithm::EdDSA);
-        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        jwk
+    }
+
+    /// A fresh invoker's admission whose nonce is the challenge `"07" * 32`.
+    fn invocation(audience: &str, resource: &str, ability: &str, facts: Value) -> InvocationInfo {
+        signed(
+            &owner_key(),
+            audience,
+            resource,
+            ability,
+            facts,
+            &"07".repeat(32),
+        )
+    }
+
+    fn signed(
+        jwk: &JWK,
+        audience: &str,
+        resource: &str,
+        ability: &str,
+        facts: Value,
+        nonce: &str,
+    ) -> InvocationInfo {
+        let did = DID_METHODS.generate(jwk, "key").unwrap().to_string();
         let fragment = did.rsplit_once(':').unwrap().1.to_owned();
         let mut caps = Capabilities::<Value>::new();
         caps.with_action(
@@ -619,12 +677,12 @@ mod admission_shape {
             audience: audience.parse().unwrap(),
             not_before: None,
             expiration: NumericDate::try_from_seconds((now + 60) as f64).unwrap(),
-            nonce: Some("admission-nonce".into()),
+            nonce: Some(nonce.into()),
             facts: Some(vec![facts]),
             proof: vec![],
             attenuation: caps,
         };
-        InvocationInfo::try_from(payload.sign(Algorithm::EdDSA, &jwk).unwrap()).unwrap()
+        InvocationInfo::try_from(payload.sign(Algorithm::EdDSA, jwk).unwrap()).unwrap()
     }
 
     fn facts(net: &NetworkId, target: &str, action: &str, body: &Value) -> Value {
@@ -736,39 +794,455 @@ mod admission_shape {
             );
         }
     }
+
+    #[test]
+    fn the_invocation_nonce_must_be_the_request_challenge() {
+        let net = network("default");
+        let body = json!({ "nonce": "07".repeat(32) });
+        let fact = facts(&net, NODE, MEMBER_ADMIT_ACTION, &body);
+        for nonce in [
+            "08".repeat(32),
+            "07".repeat(31),
+            format!("{}0", "07".repeat(32)),
+            "admission".into(),
+        ] {
+            let mismatched = signed(
+                &owner_key(),
+                NODE,
+                &net.to_string(),
+                MEMBER_ADMIT_ACTION,
+                fact.clone(),
+                &nonce,
+            );
+            let refused = check_admission_shape(&mismatched, NODE, &net, &body).unwrap_err();
+            assert!(refused.0.starts_with("challenge_mismatch"), "{refused}");
+        }
+        // With the challenge matching, a fact signed over another body is
+        // still refused on its hash.
+        let other_body = json!({ "nonce": "08".repeat(32) });
+        let ok = invocation(
+            NODE,
+            &net.to_string(),
+            MEMBER_ADMIT_ACTION,
+            facts(&net, NODE, MEMBER_ADMIT_ACTION, &other_body),
+        );
+        let refused = check_admission_shape(&ok, NODE, &net, &body).unwrap_err();
+        assert!(refused.0.contains("bodyHash"), "{refused}");
+    }
+
+    /// The real shape check and challenge consumption, against a real
+    /// `EncryptionService`; the owner-authority steps need a full node and
+    /// are not part of this seam.
+    struct ShapeAndChallenge<'a> {
+        invocation: &'a InvocationInfo,
+        service: &'a tinycloud_core::encryption_network::EncryptionService,
+    }
+
+    #[async_trait]
+    impl OwnerAdmission for ShapeAndChallenge<'_> {
+        async fn verify(&self, network: &NetworkId, body: &Value) -> Result<(), AdmissionRefused> {
+            check_admission_shape(self.invocation, NODE, network, body)?;
+            crate::threshold_member::admission::consume_challenge(
+                self.service,
+                self.invocation,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+        }
+    }
+
+    async fn encryption_service() -> (
+        tempfile::TempDir,
+        tinycloud_core::sea_orm::DatabaseConnection,
+        tinycloud_core::encryption_network::EncryptionService,
+    ) {
+        use tinycloud_core::sea_orm_migration::MigratorTrait;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/caps.db?mode=rwc", dir.path().display());
+        let db = tinycloud_core::sea_orm::Database::connect(url)
+            .await
+            .unwrap();
+        tinycloud_core::migrations::Migrator::up(&db, None)
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(
+            tinycloud_core::encryption_network::LocalOneOfOneBackend::new(
+                tinycloud_core::encryption::ColumnEncryption::new([0xAB; 32]),
+            ),
+        );
+        let service = tinycloud_core::encryption_network::EncryptionService::new(
+            db.clone(),
+            NODE.to_string(),
+            backend,
+        );
+        (dir, db, service)
+    }
+
+    async fn consumed(db: &tinycloud_core::sea_orm::DatabaseConnection) -> u64 {
+        use tinycloud_core::sea_orm::{EntityTrait, PaginatorTrait};
+        tinycloud_core::models::encryption_nonce::Entity::find()
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_challenge_is_consumed_once_and_a_mismatch_consumes_nothing() {
+        let (_db_dir, db, service) = encryption_service().await;
+        let dstack = FakeDstack::new(APP_ID, INSTANCE_ID);
+        let fx = Fixture::new();
+        let net = network("default");
+        let challenge = [7u8; 32];
+        let body = json!({ "nonce": hex::encode(challenge) });
+        let fact = facts(&net, NODE, MEMBER_ADMIT_ACTION, &body);
+        let owner = owner_key();
+        let admit = |nonce: &str| {
+            signed(
+                &owner,
+                NODE,
+                &net.to_string(),
+                MEMBER_ADMIT_ACTION,
+                fact.clone(),
+                nonce,
+            )
+        };
+
+        let mismatched = admit(&"08".repeat(32));
+        let outcome = fx
+            .attest(
+                &dstack,
+                &net.to_string(),
+                &challenge,
+                &ShapeAndChallenge {
+                    invocation: &mismatched,
+                    service: &service,
+                },
+            )
+            .await;
+        assert!(matches!(
+            outcome.result,
+            Err(MemberKeyError::AdmissionRefused(_))
+        ));
+        assert_eq!(outcome.audit[0].reason, "unauthorized");
+        assert_eq!(consumed(&db).await, 0);
+        assert!(dstack.paths().is_empty(), "no identity read, no quote");
+        assert!(!fx.share.path().join("member").exists());
+
+        let first = admit(&hex::encode(challenge));
+        let response = fx
+            .attest(
+                &dstack,
+                &net.to_string(),
+                &challenge,
+                &ShapeAndChallenge {
+                    invocation: &first,
+                    service: &service,
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        verify(&net, &challenge, &response);
+        assert_eq!(consumed(&db).await, 1);
+        let requests = dstack.paths().len();
+
+        // A second admission by the same owner key carrying the same C.
+        let second = admit(&hex::encode(challenge));
+        let outcome = fx
+            .attest(
+                &dstack,
+                &net.to_string(),
+                &challenge,
+                &ShapeAndChallenge {
+                    invocation: &second,
+                    service: &service,
+                },
+            )
+            .await;
+        let Err(MemberKeyError::AdmissionRefused(refused)) = outcome.result else {
+            panic!("replayed challenge admitted: {:?}", outcome.result);
+        };
+        assert!(refused.0.contains("nonce already used"), "{refused}");
+        assert_eq!(consumed(&db).await, 1);
+        assert_eq!(dstack.paths().len(), requests, "no quote for a replay");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // D7.1 pending cap and TTL.
 // ---------------------------------------------------------------------------
 
+/// Network `name` of the `owner`-th test owner (0..64).
+fn owned(owner: usize, name: &str) -> NetworkId {
+    const TAGS: &[u8] = b"abcdefgh";
+    let tag: String = [TAGS[owner / 8] as char, TAGS[owner % 8] as char]
+        .iter()
+        .collect();
+    NetworkId::new(format!("did:key:z6MkExample{tag}"), name).unwrap()
+}
+
+/// Admit [`MAX_PENDING_KEYS`] pending keys, [`MAX_PENDING_KEYS_PER_OWNER`]
+/// per owner.
+fn fill_pending_cap(fx: &Fixture, now: SystemTime) {
+    for i in 0..MAX_PENDING_KEYS {
+        let network = owned(i / MAX_PENDING_KEYS_PER_OWNER, &format!("n{i}"));
+        fx.admit(&network, now).unwrap();
+    }
+}
+
 #[tokio::test]
-async fn the_pending_cap_refuses_new_keys_until_one_holds_a_share() {
+async fn the_owner_pending_cap_refuses_a_third_key_until_one_holds_a_share() {
     let dstack = FakeDstack::new(APP_ID, INSTANCE_ID);
     let fx = Fixture::new();
     let now = SystemTime::now();
-    for i in 0..MAX_PENDING_KEYS {
-        fx.admit(&network(&format!("n{i}")), now).unwrap();
-    }
-    let next = network("next");
+    let (first, second, third) = (owned(0, "a"), owned(0, "b"), owned(0, "c"));
+    fx.admit(&first, now).unwrap();
+    fx.admit(&second, now).unwrap();
     let outcome = fx
-        .attest(&dstack, &next.to_string(), &[1; 32], &Admit)
+        .attest(&dstack, &third.to_string(), &[1; 32], &Admit)
         .await;
-    assert!(matches!(
-        outcome.result,
-        Err(MemberKeyError::PendingCapReached)
-    ));
-    assert_eq!(outcome.audit[0].reason, "pending-cap");
-    assert!(!fx.key_path(&next).exists());
-    // An existing pending key is still served at the cap.
-    fx.admit(&network("n0"), now).unwrap();
+    assert!(
+        matches!(outcome.result, Err(MemberKeyError::OwnerPendingCapReached)),
+        "{:?}",
+        outcome.result
+    );
+    assert_eq!(outcome.audit[0].reason, "owner-pending-cap");
+    assert!(!fx.key_path(&third).exists());
 
-    fx.holdings.hold(&network("n0"));
-    fx.attest(&dstack, &next.to_string(), &[1; 32], &Admit)
+    // Another owner is admitted meanwhile.
+    let other = owned(1, "a");
+    fx.attest(&dstack, &other.to_string(), &[1; 32], &Admit)
         .await
         .result
         .unwrap();
-    assert!(fx.key_path(&next).exists());
+    // An existing pending key is still served at the cap.
+    fx.admit(&first, now).unwrap();
+
+    fx.holdings.hold(&first);
+    fx.attest(&dstack, &third.to_string(), &[1; 32], &Admit)
+        .await
+        .result
+        .unwrap();
+    assert!(fx.key_path(&third).exists());
+}
+
+#[test]
+fn the_global_pending_cap_refuses_a_key_from_any_owner() {
+    let fx = Fixture::new();
+    let now = SystemTime::now();
+    fill_pending_cap(&fx, now);
+    let fresh = owned(MAX_PENDING_KEYS / MAX_PENDING_KEYS_PER_OWNER, "n");
+    let err = fx.admit(&fresh, now).unwrap_err();
+    assert!(matches!(err, MemberKeyError::PendingCapReached), "{err}");
+    assert!(!fx.key_path(&fresh).exists());
+
+    fx.holdings.hold(&owned(0, "n0"));
+    fx.admit(&fresh, now).unwrap();
+}
+
+#[test]
+fn an_expiry_is_audited_even_when_the_admission_is_then_refused() {
+    let fx = Fixture::new();
+    let now = SystemTime::now();
+    let (a, b, c) = (owned(0, "a"), owned(0, "b"), owned(0, "c"));
+    // b and c are installed while held, then released: with a, the owner
+    // has three pending keys.
+    for held in [&b, &c] {
+        fx.admit(held, now).unwrap();
+        fx.holdings.hold(held);
+    }
+    let old = fx.admit(&a, now).unwrap().did();
+    fx.holdings.release(&b);
+    fx.holdings.release(&c);
+
+    let mut audit = Vec::new();
+    let err = fx
+        .keys
+        .admit(
+            &a,
+            &identity(),
+            &fx.holdings,
+            now + PENDING_KEY_TTL + Duration::from_secs(1),
+            &mut audit,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, MemberKeyError::OwnerPendingCapReached),
+        "{err}"
+    );
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].event, "member_key_expired");
+    assert_eq!(audit[0].member_did.as_deref(), Some(old.as_str()));
+    assert!(!fx.key_path(&a).exists());
+}
+
+#[test]
+fn a_missing_share_root_is_refused_and_never_created() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("unmounted");
+    let keys = MemberKeys::new(&root);
+    let err = keys
+        .admit(
+            &network("default"),
+            &identity(),
+            &Holdings::default(),
+            SystemTime::now(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, MemberKeyError::ShareDirMissing), "{err}");
+    assert!(!root.exists());
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn an_overlong_network_is_refused_before_anything_is_created() {
+    let dstack = FakeDstack::new(APP_ID, INSTANCE_ID);
+    let fx = Fixture::new();
+    let overlong = network(&"n".repeat(MAX_URN_BYTES));
+    assert!(overlong.to_string().len() > MAX_URN_BYTES);
+
+    let err = fx.admit(&overlong, SystemTime::now()).unwrap_err();
+    assert!(matches!(err, MemberKeyError::InvalidNetwork(_)), "{err}");
+    let outcome = fx
+        .attest(&dstack, &overlong.to_string(), &[1; 32], &Admit)
+        .await;
+    assert!(
+        matches!(outcome.result, Err(MemberKeyError::InvalidNetwork(_))),
+        "{:?}",
+        outcome.result
+    );
+    assert!(outcome.audit.is_empty());
+    assert!(!fx.share.path().join("member").exists());
+    assert!(dstack.paths().is_empty());
+
+    // The longest accepted URN still installs and binds.
+    let prefix = network("n").to_string().len() - 1;
+    let longest = network(&"n".repeat(MAX_URN_BYTES - prefix));
+    assert_eq!(longest.to_string().len(), MAX_URN_BYTES);
+    let response = fx
+        .attest(&dstack, &longest.to_string(), &[1; 32], &Admit)
+        .await
+        .result
+        .unwrap();
+    verify(&longest, &[1; 32], &response);
+}
+
+#[test]
+fn an_undecodable_record_holds_no_pending_slot_and_is_kept() {
+    let fx = Fixture::new();
+    let damaged = fx.key_path(&network("damaged"));
+    std::fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+    std::fs::write(&damaged, b"not a key record").unwrap();
+
+    let now = SystemTime::now();
+    fill_pending_cap(&fx, now);
+    let fresh = owned(MAX_PENDING_KEYS / MAX_PENDING_KEYS_PER_OWNER, "n");
+    let err = fx.admit(&fresh, now).unwrap_err();
+    assert!(matches!(err, MemberKeyError::PendingCapReached), "{err}");
+
+    let audit = fx.expire(now + PENDING_KEY_TTL * 2).unwrap();
+    assert_eq!(audit.len(), MAX_PENDING_KEYS);
+    assert_eq!(std::fs::read(&damaged).unwrap(), b"not a key record");
+}
+
+#[test]
+fn leftover_temp_records_are_wiped_by_admission_and_the_expiry_sweep() {
+    let fx = Fixture::new();
+    let (net, other, held) = (network("default"), network("other"), network("held"));
+    let now = SystemTime::now();
+    fx.admit(&held, now).unwrap();
+    fx.holdings.hold(&held);
+    // A crash between writing a temp record and unlinking it leaves a
+    // seed-bearing file; one with no key beside it, one beside a held key.
+    let witnesses = fx.share.path().join("witnesses");
+    std::fs::create_dir(&witnesses).unwrap();
+    let mut seeded = Vec::new();
+    for (i, network) in [&net, &other, &held].into_iter().enumerate() {
+        let dir = fx.key_path(network).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join("key.tmp-00112233aabbccdd");
+        std::fs::write(&temp, [0x5eu8; 113]).unwrap();
+        let witness = witnesses.join(i.to_string());
+        std::fs::hard_link(&temp, &witness).unwrap();
+        seeded.push((temp, witness));
+    }
+
+    // Admission wipes the leftovers of its own network.
+    fx.admit(&net, now).unwrap();
+    assert!(!seeded[0].0.exists());
+    assert_eq!(std::fs::read(&seeded[0].1).unwrap(), vec![0u8; 113]);
+    assert!(seeded[1].0.exists());
+
+    // The sweep wipes every other leftover and keeps the held key.
+    fx.expire(now).unwrap();
+    for (temp, witness) in &seeded {
+        assert!(!temp.exists(), "{}", temp.display());
+        assert_eq!(std::fs::read(witness).unwrap(), vec![0u8; 113]);
+    }
+    assert!(fx.key_path(&held).exists());
+    assert!(fx.key_path(&net).exists());
+}
+
+#[tokio::test]
+async fn an_unlink_during_the_quote_leaves_the_attestation_unsigned() {
+    let (dstack, gate) = FakeDstack::gated(APP_ID, INSTANCE_ID);
+    let fx = Fixture::new();
+    let net = network("default");
+    let urn = net.to_string();
+    let unlink = async {
+        gate.entered.notified().await;
+        let unlinked = fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+        gate.release.notify_one();
+        unlinked
+    };
+    let (outcome, unlinked) = tokio::join!(fx.attest(&dstack, &urn, &[1; 32], &Admit), unlink);
+    assert!(
+        matches!(outcome.result, Err(MemberKeyError::Unlinked)),
+        "{:?}",
+        outcome.result
+    );
+    assert_eq!(outcome.audit.last().unwrap().reason, "unlinked");
+    assert_eq!(unlinked.event, "member_key_unlinked");
+    assert!(dstack.paths().contains(&"/GetQuote".to_owned()));
+    let dir = fx.key_path(&net).parent().unwrap().to_path_buf();
+    assert!(dir.join(record::UNLINKED_FILE).exists());
+    assert!(!fx.key_path(&net).exists());
+}
+
+#[test]
+fn a_sign_after_unlink_or_replacement_is_refused() {
+    let fx = Fixture::new();
+    let net = network("default");
+    let now = SystemTime::now();
+    let key = fx.admit(&net, now).unwrap();
+    let signature = fx.keys.sign(&net, &key.public_key(), b"message").unwrap();
+    ed25519_dalek::VerifyingKey::from_bytes(&key.public_key())
+        .unwrap()
+        .verify_strict(
+            b"message",
+            &ed25519_dalek::Signature::from_bytes(&signature),
+        )
+        .unwrap();
+
+    fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+    let refused = fx.keys.sign(&net, &key.public_key(), b"message");
+    assert!(
+        matches!(refused, Err(MemberKeyError::Unlinked)),
+        "{refused:?}"
+    );
+
+    // A new admission installs a new key; the old one still can't sign.
+    let replacement = fx.admit(&net, now).unwrap();
+    assert_ne!(replacement.public_key(), key.public_key());
+    let refused = fx.keys.sign(&net, &key.public_key(), b"message");
+    assert!(
+        matches!(refused, Err(MemberKeyError::Unlinked)),
+        "{refused:?}"
+    );
+    fx.keys
+        .sign(&net, &replacement.public_key(), b"message")
+        .unwrap();
 }
 
 #[test]
@@ -781,15 +1255,11 @@ fn a_pending_key_expires_after_the_ttl_and_a_held_one_never_does() {
     fx.holdings.hold(&held);
 
     let early = now + PENDING_KEY_TTL - Duration::from_secs(60);
-    assert!(fx
-        .keys
-        .expire_pending(&fx.holdings, early)
-        .unwrap()
-        .is_empty());
+    assert!(fx.expire(early).unwrap().is_empty());
     assert_eq!(fx.admit(&pending, early).unwrap().did(), pending_did);
 
     let late = now + PENDING_KEY_TTL + Duration::from_secs(1);
-    let audit = fx.keys.expire_pending(&fx.holdings, late).unwrap();
+    let audit = fx.expire(late).unwrap();
     assert_eq!(
         audit,
         [MemberKeyAudit {
@@ -802,11 +1272,7 @@ fn a_pending_key_expires_after_the_ttl_and_a_held_one_never_does() {
     );
     assert!(!fx.key_path(&pending).exists());
     assert!(fx.key_path(&held).exists());
-    assert!(fx
-        .keys
-        .expire_pending(&fx.holdings, late + PENDING_KEY_TTL * 10)
-        .unwrap()
-        .is_empty());
+    assert!(fx.expire(late + PENDING_KEY_TTL * 10).unwrap().is_empty());
 }
 
 #[test]
@@ -815,13 +1281,15 @@ fn an_admission_after_the_ttl_replaces_the_expired_pending_key() {
     let net = network("default");
     let now = SystemTime::now();
     let old = fx.admit(&net, now).unwrap().did();
-    let (key, audit) = fx
+    let mut audit = Vec::new();
+    let key = fx
         .keys
         .admit(
             &net,
             &identity(),
             &fx.holdings,
             now + PENDING_KEY_TTL + Duration::from_secs(1),
+            &mut audit,
         )
         .unwrap();
     assert_ne!(key.did(), old);

@@ -29,6 +29,8 @@ mod deletion_ledger_tests;
 #[cfg(test)]
 mod key_delete_tests;
 #[cfg(test)]
+mod member_nonce_tests;
+#[cfg(test)]
 mod tests;
 
 pub use backend::{KeyBackend, KeyBackendError, LocalOneOfOneBackend};

@@ -3,7 +3,8 @@
 //! The admission is a node-bound owner invocation of
 //! [`MEMBER_ADMIT_ACTION`] on network N: audience and `targetNode` are this
 //! node's DID, its one capability names N, its `bodyHash` covers the request
-//! body `{nonce}`, and its nonce is consumed. Owner authority comes from N's
+//! body `{nonce}`, and its own nonce is that body nonce, the challenge C, so
+//! consuming the invocation nonce consumes C. Owner authority comes from N's
 //! URN owner through the node's invocation authorization (delegation chain,
 //! including SIWE sessions of `did:pkh` owners). Admission is not a key-state
 //! change, so it is not one of the node-bound admin credentials a threshold
@@ -66,32 +67,52 @@ impl OwnerAdmission for InvocationAdmission<'_> {
             .authorize_invocation(self.tinycloud, self.invocation, None, now)
             .await
             .map_err(|error| AdmissionRefused::new(error.to_string()))?;
-        let payload = self.invocation.invocation.payload();
-        let nonce = payload
-            .nonce
-            .as_deref()
-            .ok_or_else(|| AdmissionRefused::new("missing nonce"))?;
-        self.service
-            .consume_nonce_until(
-                &self.invocation.invoker,
-                nonce,
-                payload.expiration.as_seconds() as i64,
-            )
-            .await
-            .map_err(|error| AdmissionRefused::new(error.to_string()))
+        consume_challenge(self.service, self.invocation, now).await
     }
 }
 
+/// Consumes the invocation nonce, which [`check_admission_shape`] proved is
+/// the challenge C, for the invoker until the invocation expires. An expired
+/// invocation or a reused (invoker, C) is refused.
+pub(super) async fn consume_challenge(
+    service: &EncryptionService,
+    invocation: &InvocationInfo,
+    now: time::OffsetDateTime,
+) -> Result<(), AdmissionRefused> {
+    let payload = invocation.invocation.payload();
+    let nonce = payload
+        .nonce
+        .as_deref()
+        .ok_or_else(|| AdmissionRefused::new("missing nonce"))?;
+    service
+        .consume_unexpired_invocation_nonce(
+            &invocation.invoker,
+            nonce,
+            payload.expiration.as_seconds() as i64,
+            now,
+        )
+        .await
+        .map_err(|error| AdmissionRefused::new(error.to_string()))
+}
+
 /// The checks that need no database: audience, the one `member.admit`
-/// capability on exactly `network`, and the network-admin fact naming this
-/// node, `network`, the action and the hash of `body`.
+/// capability on exactly `network`, the network-admin fact naming this
+/// node, `network`, the action and the hash of `body`, and an invocation
+/// nonce equal to the body nonce.
 pub(super) fn check_admission_shape(
     invocation: &InvocationInfo,
     node_did: &str,
     network: &NetworkId,
     body: &Value,
 ) -> Result<(), AdmissionRefused> {
-    if invocation.invocation.payload().audience != node_did {
+    let payload = invocation.invocation.payload();
+    let challenge = body.get("nonce").and_then(Value::as_str);
+    if challenge.is_none() || payload.nonce.as_deref() != challenge {
+        return Err(AdmissionRefused::new(
+            "challenge_mismatch: the invocation nonce is not the request nonce",
+        ));
+    }
+    if payload.audience != node_did {
         return Err(AdmissionRefused::new("audience is not this node"));
     }
     let [capability] = invocation.capabilities.as_slice() else {

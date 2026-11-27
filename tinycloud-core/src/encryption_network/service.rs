@@ -1541,9 +1541,27 @@ impl EncryptionService {
         self.consume_nonce_until(requester_did, nonce, exp).await
     }
 
+    /// Consumes the nonce of a node-bound invocation for a caller outside
+    /// this crate (the threshold-member admission). Refuses an invocation
+    /// whose expiry is not after `now` before anything is written, then
+    /// records `(invoker, nonce)` until `expires_at` (unix seconds). A second
+    /// use of the same pair is `NonceReplay`.
+    pub async fn consume_unexpired_invocation_nonce(
+        &self,
+        invoker: &str,
+        nonce: &str,
+        expires_at: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), EncryptionServiceError> {
+        if expires_at <= now.unix_timestamp() {
+            return Err(EncryptionServiceError::Expired);
+        }
+        self.consume_nonce_until(invoker, nonce, expires_at).await
+    }
+
     /// Records `(requester_did, nonce)` as used until `expires_at` (unix
     /// seconds). A second insert of the same pair is `NonceReplay`.
-    pub async fn consume_nonce_until(
+    pub(super) async fn consume_nonce_until(
         &self,
         requester_did: &str,
         nonce: &str,

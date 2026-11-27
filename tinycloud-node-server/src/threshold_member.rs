@@ -20,8 +20,9 @@ mod record;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -41,14 +42,20 @@ pub const MEMBER_ADMIT_ACTION: &str = "tinycloud.encryption/member.admit";
 /// HKDF-SHA256 `info` for the member's Ed25519 signing key.
 pub const SIGN_LABEL: &[u8] = b"tinycloud/threshold-member/v1/sign";
 
-/// Most keys this member keeps while it holds no share or candidate of their
-/// network. A pending key exists only between an owner's admission and the
-/// ceremony that hands this member its share. One owner device runs a
-/// handful of ceremonies at once, and 8 leaves room for several owners;
-/// beyond that the member refuses new admissions until a ceremony completes
-/// or a pending key expires, which bounds what a confused or compromised
-/// owner session can make the member create.
-pub const MAX_PENDING_KEYS: usize = 8;
+/// Most keys this member keeps, across all owners, while it holds no share
+/// or candidate of their network. A pending key exists only between an
+/// owner's admission and the ceremony that hands this member its share;
+/// beyond the cap the member refuses new admissions until a ceremony
+/// completes or a pending key expires.
+///
+/// Disk bound: pending key records take at most
+/// `64 × MAX_KEY_RECORD_BYTES = 64 × 1581 = 101,184` bytes, plus their
+/// directories.
+pub const MAX_PENDING_KEYS: usize = 64;
+
+/// Most pending keys one network owner can make this member keep, so one
+/// confused or compromised owner session can't take the global cap.
+pub const MAX_PENDING_KEYS_PER_OWNER: usize = 2;
 
 /// How long a pending key lives before it is unlinked. A ceremony is relayed
 /// by the owner's device within minutes, and a failed one is retried with a
@@ -62,6 +69,11 @@ pub const PENDING_KEY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_URN_BYTES: usize = 1024;
 /// Longest accepted dstack `app_id` or `instance_id`, in bytes.
 pub const MAX_IDENTITY_FIELD_BYTES: usize = 256;
+/// Largest key record file: version byte, length-prefixed URN, `app_id` and
+/// `instance_id` at their caps, and the 32-byte seed (1581 bytes).
+pub const MAX_KEY_RECORD_BYTES: usize =
+    1 + (4 + MAX_URN_BYTES) + 2 * (4 + MAX_IDENTITY_FIELD_BYTES) + 32;
+const _: () = assert!(MAX_KEY_RECORD_BYTES == 1581);
 
 /// True when `urn` is exactly the canonical spelling of a network id.
 pub fn is_canonical_urn(urn: &str) -> bool {
@@ -69,6 +81,22 @@ pub fn is_canonical_urn(urn: &str) -> bool {
         && urn
             .parse::<NetworkId>()
             .is_ok_and(|network| network.to_string() == urn)
+}
+
+/// N's canonical URN, when N can name a member key: canonical and at most
+/// [`MAX_URN_BYTES`], so its record decodes and its binding encodes. Checked
+/// before any file or directory is created.
+fn member_urn(network: &NetworkId) -> Result<String, MemberKeyError> {
+    let urn = network.to_string();
+    if urn.len() > MAX_URN_BYTES {
+        return Err(MemberKeyError::InvalidNetwork("network URN is too long"));
+    }
+    if !is_canonical_urn(&urn) {
+        return Err(MemberKeyError::InvalidNetwork(
+            "network URN is not canonical",
+        ));
+    }
+    Ok(urn)
 }
 
 /// The `did:key` of a raw Ed25519 public key.
@@ -88,8 +116,12 @@ pub enum MemberKeyError {
     AdmissionRefused(#[from] AdmissionRefused),
     #[error("member_key_invalid_request: {0}")]
     InvalidRequest(&'static str),
+    #[error("member_key_invalid_network: {0}")]
+    InvalidNetwork(&'static str),
     #[error("member_key_pending_cap: {MAX_PENDING_KEYS} pending member keys already exist")]
     PendingCapReached,
+    #[error("member_key_owner_pending_cap: the network owner already has {MAX_PENDING_KEYS_PER_OWNER} pending member keys")]
+    OwnerPendingCapReached,
     #[error("member_key_identity_mismatch: the key record names another {0}")]
     IdentityMismatch(&'static str),
     #[error("member_key_record_malformed: {0}")]
@@ -100,6 +132,10 @@ pub enum MemberKeyError {
     NoKey,
     #[error("member_key_still_held: this member still holds a share or candidate of the network")]
     StillHeld,
+    #[error("member_key_unlinked: the member key was unlinked before it could sign")]
+    Unlinked,
+    #[error("member_key_share_dir_missing: the share volume directory does not exist")]
+    ShareDirMissing,
     #[error("member_key_identity_unavailable: {0}")]
     IdentityUnavailable(String),
     #[error("member_key_holdings_unknown: {0}")]
@@ -116,12 +152,16 @@ impl MemberKeyError {
         match self {
             Self::AdmissionRefused(_) => "unauthorized",
             Self::InvalidRequest(_) => "invalid-request",
+            Self::InvalidNetwork(_) => "invalid-network",
             Self::PendingCapReached => "pending-cap",
+            Self::OwnerPendingCapReached => "owner-pending-cap",
             Self::IdentityMismatch(_) => "identity-mismatch",
             Self::MalformedRecord(_) => "malformed-record",
             Self::KeyMissing => "key-missing",
             Self::NoKey => "no-key",
             Self::StillHeld => "still-held",
+            Self::Unlinked => "unlinked",
+            Self::ShareDirMissing => "share-dir-missing",
             Self::IdentityUnavailable(_) => "identity-unavailable",
             Self::HoldingsUnknown(_) => "holdings-unknown",
             Self::Quote(_) => "quote-failed",
@@ -216,9 +256,9 @@ impl UnlinkReason {
     }
 }
 
-/// A loaded member key for one network. The signing key is wiped on drop and
-/// never printed.
-pub struct MemberKey {
+/// A derived member signing key. It lives only in its network's slot in
+/// [`MemberKeys`], is wiped on drop and is never printed.
+struct MemberKey {
     network: String,
     signing: SigningKey,
 }
@@ -245,33 +285,62 @@ impl MemberKey {
         }
     }
 
+    fn public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    fn did(&self) -> String {
+        member_did(&self.public_key())
+    }
+
+    fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing.sign(message).to_bytes()
+    }
+
+    fn public(&self) -> MemberPublicKey {
+        MemberPublicKey {
+            network: self.network.clone(),
+            public_key: self.public_key(),
+        }
+    }
+}
+
+/// The public half of a loaded member key. Signing goes through
+/// [`MemberKeys::sign`], so an unlink revokes every holder at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberPublicKey {
+    network: String,
+    public_key: [u8; 32],
+}
+
+impl MemberPublicKey {
     /// The raw Ed25519 public key `P`.
     pub fn public_key(&self) -> [u8; 32] {
-        self.signing.verifying_key().to_bytes()
+        self.public_key
     }
 
     /// The member DID the certificate names.
     pub fn did(&self) -> String {
-        member_did(&self.public_key())
+        member_did(&self.public_key)
     }
 
     /// The canonical URN of the key's network.
     pub fn network(&self) -> &str {
         &self.network
     }
-
-    /// Sign `message` with the member key.
-    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        self.signing.sign(message).to_bytes()
-    }
 }
 
-/// The threshold-member key records on one share volume.
+/// The threshold-member key records on one share volume, and the signing
+/// keys loaded from them.
 pub struct MemberKeys {
     root: PathBuf,
-    /// Serializes the pending-cap check with key generation in this process.
-    /// The record install itself is single-winner on disk.
+    /// Serializes the pending-cap check with key generation, loading keys
+    /// into their slots and unlinking them, in this process. The record
+    /// install itself is single-winner on disk.
     generate: Mutex<()>,
+    /// One signing-key slot per network URN, the only place a signing key
+    /// lives. Taken after `generate`, never across an await.
+    slots: Mutex<HashMap<String, MemberKey>>,
 }
 
 impl MemberKeys {
@@ -280,6 +349,36 @@ impl MemberKeys {
         Self {
             root: share_dir.to_path_buf(),
             generate: Mutex::new(()),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slots(&self) -> MutexGuard<'_, HashMap<String, MemberKey>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Put the key of `record` in its network's slot, replacing any other.
+    /// Call with `generate` held.
+    fn activate(&self, record: &record::KeyRecord) -> MemberPublicKey {
+        let key = MemberKey::from_record(record);
+        let public = key.public();
+        self.slots().insert(record.network.clone(), key);
+        public
+    }
+
+    /// Sign `message` with the member key of `network`, if that key is still
+    /// `member_pk`. Refused with [`MemberKeyError::Unlinked`] once the key
+    /// was unlinked or replaced, so nothing signs with a key after D7.4's
+    /// first step.
+    pub fn sign(
+        &self,
+        network: &NetworkId,
+        member_pk: &[u8; 32],
+        message: &[u8],
+    ) -> Result<[u8; 64], MemberKeyError> {
+        match self.slots().get(&network.to_string()) {
+            Some(key) if key.public_key() == *member_pk => Ok(key.sign(message)),
+            _ => Err(MemberKeyError::Unlinked),
         }
     }
 
@@ -310,53 +409,64 @@ impl MemberKeys {
         Ok(Some(found))
     }
 
-    /// The member key for `network`, for a member operation. Never creates
-    /// one.
+    /// The member key for `network`, for a member operation: loads it into
+    /// its slot and returns its public half. Never creates one.
     pub fn load(
         &self,
         network: &NetworkId,
         identity: &LocalIdentity,
-    ) -> Result<MemberKey, MemberKeyError> {
+    ) -> Result<MemberPublicKey, MemberKeyError> {
+        let _generate = self.generate.lock().unwrap_or_else(|e| e.into_inner());
         let found = self
             .checked_record(network, identity)?
             .ok_or(MemberKeyError::NoKey)?;
-        Ok(MemberKey::from_record(&found))
+        Ok(self.activate(&found))
     }
 
     /// The member key for `network` after a verified owner admission: the
-    /// installed one, or a new one if there is none. Call only after
-    /// [`OwnerAdmission::verify`] succeeded.
+    /// installed one, or a new one if there is none, loaded into its slot.
+    /// Call only after [`OwnerAdmission::verify`] succeeded.
     ///
     /// A pending key older than [`PENDING_KEY_TTL`] is unlinked first and
     /// replaced. A missing key while the member holds a share or candidate of
-    /// `network` is refused, as is a new key beyond [`MAX_PENDING_KEYS`].
+    /// `network` is refused, as is a new key beyond [`MAX_PENDING_KEYS`] or
+    /// beyond [`MAX_PENDING_KEYS_PER_OWNER`] for N's owner.
+    ///
+    /// Audit events go to `audit` as they happen, so an expiry is recorded
+    /// even when a later step refuses the admission.
     pub fn admit(
         &self,
         network: &NetworkId,
         identity: &LocalIdentity,
         holdings: &dyn MemberHoldings,
         now: SystemTime,
-    ) -> Result<(MemberKey, Vec<MemberKeyAudit>), MemberKeyError> {
+        audit: &mut Vec<MemberKeyAudit>,
+    ) -> Result<MemberPublicKey, MemberKeyError> {
+        let urn = member_urn(network)?;
         let _generate = self.generate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut audit = Vec::new();
+        record::sweep_temp_records(&self.dir(network))?;
         let held = holds(holdings, network)?;
         if let Some(found) = self.checked_record(network, identity)? {
             if held || !self.expired(network, now)? {
-                return Ok((MemberKey::from_record(&found), audit));
+                return Ok(self.activate(&found));
             }
             drop(found);
             audit.push(self.unlink(network, UnlinkReason::PendingTtl)?);
         } else if held {
             return Err(MemberKeyError::KeyMissing);
         }
-        if self.pending_keys(holdings)? >= MAX_PENDING_KEYS {
+        let (pending, owned) = self.pending_keys(holdings, network.owner_did())?;
+        if pending >= MAX_PENDING_KEYS {
             return Err(MemberKeyError::PendingCapReached);
+        }
+        if owned >= MAX_PENDING_KEYS_PER_OWNER {
+            return Err(MemberKeyError::OwnerPendingCapReached);
         }
         let installed = record::install_or_load(
             &self.dir(network),
-            record::KeyRecord::generate(&network.to_string(), identity),
+            record::KeyRecord::generate(&urn, identity),
         )?;
-        Ok((MemberKey::from_record(&installed), audit))
+        Ok(self.activate(&installed))
     }
 
     fn expired(&self, network: &NetworkId, now: SystemTime) -> Result<bool, MemberKeyError> {
@@ -366,55 +476,80 @@ impl MemberKeys {
         Ok(now.duration_since(installed).unwrap_or_default() >= PENDING_KEY_TTL)
     }
 
-    /// The installed key records, each with its network if it decodes.
-    fn installed(&self) -> Result<Vec<Option<NetworkId>>, MemberKeyError> {
+    /// The networks of the installed key records that decode.
+    ///
+    /// A record that doesn't decode names no network this member can prove it
+    /// holds nothing of, so it is never erased (D7.4 positive proof), and it
+    /// is left out of the pending count: every record this module writes
+    /// decodes (`admit` validates N first), so an undecodable one is damage
+    /// or tampering, which an owner admission can't produce, and it must not
+    /// hold a cap slot forever. It stays on disk, refused for its network.
+    fn installed(&self) -> Result<Vec<NetworkId>, MemberKeyError> {
+        let mut found = Vec::new();
+        for dir in self.network_dirs()? {
+            if let Ok(Some(record)) = record::read_record(&dir.join(record::KEY_FILE)) {
+                if let Ok(network) = record.network.parse() {
+                    found.push(network);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Every per-network directory under `member/`.
+    fn network_dirs(&self) -> Result<Vec<PathBuf>, MemberKeyError> {
         let members = self.root.join(record::MEMBER_DIR);
         let entries = match std::fs::read_dir(&members) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        let mut found = Vec::new();
-        for entry in entries {
-            let key = entry?.path().join(record::KEY_FILE);
-            match record::read_record(&key) {
-                Ok(None) => {}
-                Ok(Some(record)) => found.push(record.network.parse().ok()),
-                Err(_) => found.push(None),
-            }
-        }
-        Ok(found)
+        entries
+            .map(|entry| Ok(entry?.path()))
+            .collect::<Result<_, std::io::Error>>()
+            .map_err(Into::into)
     }
 
     /// Installed keys whose network this member holds no share or candidate
-    /// of. A record that doesn't decode counts as pending.
-    fn pending_keys(&self, holdings: &dyn MemberHoldings) -> Result<usize, MemberKeyError> {
-        let mut pending = 0;
+    /// of: all of them, and those of `owner`'s networks.
+    fn pending_keys(
+        &self,
+        holdings: &dyn MemberHoldings,
+        owner: &str,
+    ) -> Result<(usize, usize), MemberKeyError> {
+        let (mut pending, mut owned) = (0, 0);
         for network in self.installed()? {
-            match network {
-                Some(network) if holds(holdings, &network)? => {}
-                _ => pending += 1,
+            if !holds(holdings, &network)? {
+                pending += 1;
+                if network.owner_did() == owner {
+                    owned += 1;
+                }
             }
         }
-        Ok(pending)
+        Ok((pending, owned))
     }
 
     /// Unlink every pending key older than [`PENDING_KEY_TTL`]
-    /// (`member_key_expired`). Keys of networks the member holds a share or
-    /// candidate of, and records that don't decode, are never touched.
+    /// (`member_key_expired`), after wiping every leftover temp record under
+    /// `member/`. Keys of networks the member holds a share or candidate of,
+    /// and records that don't decode, are never touched. Each event goes to
+    /// `audit` as its key is unlinked, so a later failure loses none.
     pub fn expire_pending(
         &self,
         holdings: &dyn MemberHoldings,
         now: SystemTime,
-    ) -> Result<Vec<MemberKeyAudit>, MemberKeyError> {
+        audit: &mut Vec<MemberKeyAudit>,
+    ) -> Result<(), MemberKeyError> {
         let _generate = self.generate.lock().unwrap_or_else(|e| e.into_inner());
-        let mut audit = Vec::new();
-        for network in self.installed()?.into_iter().flatten() {
+        for dir in self.network_dirs()? {
+            record::sweep_temp_records(&dir)?;
+        }
+        for network in self.installed()? {
             if !holds(holdings, &network)? && self.expired(&network, now)? {
                 audit.push(self.unlink(&network, UnlinkReason::PendingTtl)?);
             }
         }
-        Ok(audit)
+        Ok(())
     }
 
     /// Unlink the key of `network` after the member erased its last share and
@@ -432,13 +567,16 @@ impl MemberKeys {
         self.unlink(network, UnlinkReason::LastShare)
     }
 
-    /// D7.4: wipe the in-memory key, zero-overwrite and unlink the record,
-    /// then record `member_key_unlinked_at`.
+    /// D7.4: wipe the in-memory key, so no holder can sign with it any more,
+    /// zero-overwrite and unlink the record, then record
+    /// `member_key_unlinked_at`. Call with `generate` held, so nothing loads
+    /// the key back while the record still exists.
     fn unlink(
         &self,
         network: &NetworkId,
         reason: UnlinkReason,
     ) -> Result<MemberKeyAudit, MemberKeyError> {
+        drop(self.slots().remove(&network.to_string()));
         let dir = self.dir(network);
         let found =
             record::read_record(&dir.join(record::KEY_FILE))?.ok_or(MemberKeyError::NoKey)?;
@@ -540,11 +678,19 @@ pub async fn member_attestation(
     body: &Value,
     admission: &dyn OwnerAdmission,
 ) -> AttestationOutcome {
-    let Ok(network) = network.parse::<NetworkId>() else {
-        return AttestationOutcome {
-            result: Err(MemberKeyError::InvalidRequest("invalid network id")),
-            audit: Vec::new(),
-        };
+    let network = match network
+        .parse::<NetworkId>()
+        .map_err(|_| MemberKeyError::InvalidNetwork("invalid network id"))
+        .and_then(|network| member_urn(&network).map(|_| network))
+    {
+        Ok(network) => network,
+        // No audit event: the request names no network a row could record.
+        Err(error) => {
+            return AttestationOutcome {
+                result: Err(error),
+                audit: Vec::new(),
+            }
+        }
     };
     let mut audit = Vec::new();
     let result = attest(ctx, &network, body, admission, &mut audit).await;
@@ -568,11 +714,12 @@ async fn attest(
     let nonce = parse_nonce(body)?;
     admission.verify(network, body).await?;
     let identity = LocalIdentity::read(ctx.dstack_socket).await?;
-    let (key, expired) = ctx
+    let key = ctx
         .keys
-        .admit(network, &identity, ctx.holdings, SystemTime::now())?;
-    audit.extend(expired);
+        .admit(network, &identity, ctx.holdings, SystemTime::now(), audit)?;
     let urn = network.to_string();
+    // Only P is held across the quote; the signature goes through the slot
+    // afterwards and is refused if the key was unlinked meanwhile.
     let public_key = key.public_key();
     let report_data = binding::report_data(&urn, &public_key, &nonce)
         .map_err(|_| MemberKeyError::InvalidRequest("binding input"))?;
@@ -583,10 +730,11 @@ async fn attest(
         .map_err(|_| MemberKeyError::Quote("quote is not hex".into()))?;
     let pop = binding::pop_message(&urn, &nonce, &raw_quote)
         .map_err(|_| MemberKeyError::InvalidRequest("binding input"))?;
+    let pop_sig = ctx.keys.sign(network, &public_key, &pop)?;
     Ok(AttestationResponse {
         member_pk: hex::encode(public_key),
         quote: hex::encode(&raw_quote),
         event_log: quote.event_log,
-        pop_sig: hex::encode(key.sign(&pop)),
+        pop_sig: hex::encode(pop_sig),
     })
 }
