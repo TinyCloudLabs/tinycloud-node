@@ -460,3 +460,35 @@ test('a source-less tmpfs on postgres is not misreported as a socket mount (TC-2
     (error) => /member_postgres_volumes_allowlist/.test(error.message) && !/dstack_socket/.test(error.message)
   );
 });
+
+test('interpolated volume names and mount paths are refused on the member compose (TC-2224)', () => {
+  const colliding = memberComposeFixture();
+  colliding.volumes.pgdata = { name: '${PG_VOL:-same}' };
+  colliding.volumes['threshold-shares'] = { name: '${SHARE_VOL:-same}' };
+  assert.throws(() => assertThresholdMemberCompose(colliding, productionComposeFixture()), /member_volume_name_interpolated_pgdata/);
+
+  for (const [field, value] of [['source', '${VOL}'], ['target', '/var/lib/${DIR}/data']]) {
+    const member = memberComposeFixture();
+    member.services.postgres.volumes[0] = { type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data', [field]: value };
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_mount_interpolated_postgres/, field);
+  }
+});
+
+test('only the member render\'s default network may exist or be used (TC-2224)', () => {
+  const external = memberComposeFixture();
+  external.networks = { default: { name: 'x_default' }, host: { external: true } };
+  assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture()), /member_networks_allowlist_host/);
+
+  const opts = memberComposeFixture();
+  opts.networks = { default: { name: 'x_default', driver_opts: { x: 'y' } } };
+  assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture()), /member_network_option_forbidden_default/);
+
+  const joined = memberComposeFixture();
+  joined.networks = { default: { name: 'x_default' }, dmz: { name: 'x_dmz' } };
+  joined.services.postgres.networks = { default: null, dmz: null };
+  assert.throws(() => assertThresholdMemberCompose(joined, productionComposeFixture()), /member_networks_allowlist_dmz/);
+});
+
+test('a non-empty profiles listing is refused (TC-2224)', () => {
+  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), productionComposeFixture(), 'tools\n'), /member_profiles_forbidden/);
+});

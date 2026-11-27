@@ -189,11 +189,12 @@ export function diagnosticCounts(events) {
  * `tinycloud` at the `threshold_share_dir` path, no ssh-gateway service
  * exists, and production declares and mounts no `threshold-shares` volume.
  */
-export function assertThresholdMemberCompose(member, production) {
+export function assertThresholdMemberCompose(member, production, profilesOutput = '') {
   const share = 'threshold-shares';
   const target = '/var/lib/tinycloud/threshold';
   const memberServices = member.services ?? {};
   assert.equal(memberServices['ssh-gateway'], undefined, 'member_ssh_gateway_forbidden');
+  assert.equal(profilesOutput.trim(), '', 'member_profiles_forbidden');
   assert.deepEqual(Object.keys(memberServices).sort(), ['postgres', 'tinycloud'], 'member_service_allowlist');
   const volumeEnds = (volume) => {
     if (typeof volume === 'string') {
@@ -210,6 +211,13 @@ export function assertThresholdMemberCompose(member, production) {
   assert.equal(tinycloud[0].type, 'volume', 'member_share_mount_must_be_a_named_volume');
   assert.equal(tinycloud[0].source, share, 'member_share_mount_source');
   assert.ok(Object.keys(member.volumes ?? {}).includes(share), 'member_share_volume_declared');
+  // The render is --no-interpolate, so `$` survives into names and mount
+  // paths: two names that differ literally can still resolve to the same
+  // Docker volume at deploy. Refuse interpolation outright (TC-2224).
+  for (const [name, service] of Object.entries(memberServices)) {
+    const interpolated = (service.volumes ?? []).map(volumeEnds).find(ends => (ends.source ?? '').includes('$') || (ends.target ?? '').includes('$'));
+    assert.equal(interpolated, undefined, `member_mount_interpolated_${name}`);
+  }
   for (const [name, service] of Object.entries(memberServices)) {
     if (name === 'tinycloud') continue;
     // A non-tinycloud service may carry only the keys the reviewed postgres
@@ -234,7 +242,22 @@ export function assertThresholdMemberCompose(member, production) {
     assert.ok(['pgdata', 'threshold-shares'].includes(name), `member_volumes_allowlist_${name}`);
     assert.equal(definition?.driver, undefined, `member_volume_option_forbidden_${name}`);
     assert.equal(definition?.driver_opts, undefined, `member_volume_option_forbidden_${name}`);
+    assert.equal((definition?.name ?? '').includes('$'), false, `member_volume_name_interpolated_${name}`);
     assert.equal(definition?.external, undefined, `member_volume_option_forbidden_${name}`);
+  }
+  // D2-P3-1: only the render's own default network may exist or be used; an
+  // external or driver-bridged network could carry member traffic off-CVM.
+  for (const [name, definition] of Object.entries(member.networks ?? {})) {
+    assert.equal(name, 'default', `member_networks_allowlist_${name}`);
+    assert.equal(definition?.external, undefined, `member_external_network_${name}`);
+    assert.equal(definition?.driver, undefined, `member_network_option_forbidden_${name}`);
+    assert.equal(definition?.driver_opts, undefined, `member_network_option_forbidden_${name}`);
+  }
+  for (const [name, service] of Object.entries(memberServices)) {
+    const nets = service.networks ?? {};
+    for (const net of (Array.isArray(nets) ? nets : Object.keys(nets))) {
+      assert.equal(net, 'default', `member_network_not_allowed_in_${name}_${net}`);
+    }
   }
   assert.ok(!Object.keys(production.volumes ?? {}).includes(share), 'production_share_volume_forbidden');
   for (const [name, service] of Object.entries(production.services ?? {})) {

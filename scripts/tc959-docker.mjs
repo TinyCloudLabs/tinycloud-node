@@ -427,7 +427,8 @@ export async function main(args = process.argv.slice(2)) {
     assert.equal(memberUnresolved.secrets, undefined, 'deployment_secret_files_forbidden');
     assert.equal(memberUnresolved.configs, undefined, 'deployment_config_files_forbidden');
     for (const service of Object.values(memberUnresolved.services)) assert.equal(service.env_file, undefined, 'deployment_env_files_forbidden');
-    assertThresholdMemberCompose(memberUnresolved, rendered);
+    const memberProfiles = docker(...['compose', '--env-file', '/dev/null', '-f', join(root, 'docker-compose.dstack-threshold-member.yaml'), 'config', '--profiles']);
+    assertThresholdMemberCompose(memberUnresolved, rendered, memberProfiles);
     phase = 'compose_networks';
     assert.deepEqual(Object.keys(production.tinycloud.networks).sort(), ['cf-edge', 'default']); // TC-4194
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);
