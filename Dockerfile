@@ -71,7 +71,7 @@ COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud /tinycloud
 COPY --from=builder --chown=tinycloud:tinycloud /app/data ./data
 COPY --from=builder --chown=tinycloud:tinycloud /var/lib/tinycloud/ledger /var/lib/tinycloud/ledger
-COPY --from=builder --chown=tinycloud:tinycloud /var/lib/tinycloud/threshold /var/lib/tinycloud/threshold
+COPY --from=builder --chown=tinycloud:tinycloud --chmod=0700 /var/lib/tinycloud/threshold /var/lib/tinycloud/threshold
 COPY ./tinycloud.toml ./
 COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud
