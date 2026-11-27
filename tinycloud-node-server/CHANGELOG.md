@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.26.24](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.26.24) - 2026-11-27
+
+### Added
+
+- chunked SQL artifacts, WAL parts and DuckDB headroom, flag-off (TC-2917)
+
+### Other
+
+- Fix a 1-in-256 flake in the salt-label selftest
+- Add the threshold-member key store, dormant by default
+- TC-4322 pin the exact bot-history key grant scope
+- log the deletion ledger startup state (read-only), capture moved into DeletionLedger::open_waiting
+- run node DuckDB lib tests and clippy (TC-4193)
+
 - Preserve database failures during delegation and authorization lookups,
   including hook routes, as server errors. Transient failures before any
   data-plane write use `503 unavailable_retryable` instead of an authorization
