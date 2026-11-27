@@ -60,6 +60,19 @@ for (const [kind, setup, pinned] of KINDS) {
     });
   });
 
+  describe(`${kind}: fewer than t qualified dealers ends the transcript after R3`, () => {
+    test('a later record, valid or not, is neither read nor authenticated: InsufficientQualified', () => {
+      const s = setup(`${kind}-qual-after-r3`, 3, 5), alone = s.rounds.map((r, k) => k === 0 ? r.filter(d => d.index === 1) : r);
+      const check = (records: RoundRecord[]) => code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, records, verify, pinned));
+      expect(code(() => run(s, alone.slice(0, 3), pinned))).toBe('InsufficientQualified');
+      expect(code(() => run(s, alone.slice(0, 4), pinned))).toBe('InsufficientQualified');
+      expect(check(unsigned(s, alone.slice(0, 4), 3))).toBe('InsufficientQualified');
+      expect(code(() => run(s, [...alone, []], pinned))).toBe('InsufficientQualified');
+      // R1–R3 are still authenticated: a bad R3 closure decides first.
+      expect(check(unsigned(s, alone.slice(0, 4), 2))).toBe('InvalidSignature');
+    });
+  });
+
   describe(`${kind}: R6 values count only from senders with a unique R4 and R5`, () => {
     const s = setup(`${kind}-own-message`, 3, 5), d5 = s.dealers[4]!;
     const recovered = (rounds: Draft[][], senders: number[]) => run(s, [...rounds, r6(s, [5], senders)], pinned);

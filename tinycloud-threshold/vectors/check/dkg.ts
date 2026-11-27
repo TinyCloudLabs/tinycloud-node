@@ -2,7 +2,7 @@ import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { DST, PEDERSEN_H_MESSAGE, ProtocolError, Reader, bytes, equal, g2, scalar, tagged, type Bytes, type G2 } from './protocol.ts';
 import {
   COHORT, DEFAULT_ERROR, KIND, TAG, authorizeCeremony, checkGenesisShape, checkTranscriptSize, classify, evaluate, fail, listCount,
-  memberIndex, mul, transcriptUpdate, verifyCertificate, verifyChain, verifyClosedRound, type Anchor, type Authenticated, type Ceremony,
+  memberIndex, mul, transcriptUpdate, verifyCertificate, verifyClosedRound, type Anchor, type Authenticated, type Ceremony,
   type Certificate, type Classified, type RoundRecord, type Statement, type Verifier,
 } from './ceremony.ts';
 
@@ -134,17 +134,23 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
   const { t, n } = ceremony, members = ceremony.directory.map(d => d.index);
   const initialTranscript = dkgInitialTranscript(ceremony.digest);
   const recipients = new Map(ceremony.directory.map(d => [d.index, d.did]));
-  // R1–R5 are authenticated here; R6 only when R5 requires it, and records after R6 are refused after reconstruction.
+  // Records are authenticated in order, each just before it is applied; a missing record is InvalidRound.
   const cohorts = { [COHORT.recipients]: recipients };
-  const { rounds, hash: r5Hash } = verifyChain(ceremony.digest, initialTranscript, records.slice(0, 5), 5, cohorts, anchor.owner, verify);
-  if (records.length < 3) fail('InvalidRound');
+  let hash = initialTranscript;
+  const closed = (round: number): Authenticated[] => {
+    const record = records[round - 1];
+    if (!record) fail('InvalidRound');
+    const messages = verifyClosedRound(ceremony.digest, round, hash, record, cohorts, anchor.owner, verify);
+    hash = transcriptUpdate(hash, record.closure);
+    return messages;
+  };
   const sender = (round: Authenticated[], i: number): Classified => classify(round, COHORT.recipients, i);
-  const [r1, r2, r3, r4, r5] = rounds;
+  const r1 = closed(1), r2 = closed(2), r3 = closed(3);
 
   const deals = new Map<number, G2[]>();
   const complainers = new Map<number, Set<number>>(members.map(i => [i, new Set()]));
   for (const j of members) {
-    const m = sender(r2!, j);
+    const m = sender(r2, j);
     if (m.kind !== 'single') continue;
     const dealers = attempt(decodeComplaints, m.payload);
     if (!dealers || dealers.some(i => i > n)) continue;
@@ -153,13 +159,13 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
   const disqualified: Exclusion[] = [];
   for (const i of members) {
     const reason = ((): Exclusion | undefined => {
-      const deal = sender(r1!, i);
+      const deal = sender(r1, i);
       if (deal.kind === 'missing') return { member: i, reason: 'MissingDeal' };
       if (deal.kind === 'conflicting') return { member: i, reason: 'Equivocated', round: 1 };
       const decoded = attempt(decodeDeal, deal.payload);
       if (!decoded || decoded.commitments.length !== t || decoded.recipients.length !== n || decoded.recipients.some((x, k) => x !== k + 1)) return { member: i, reason: 'MalformedDeal' };
-      if (sender(r2!, i).kind === 'conflicting') return { member: i, reason: 'Equivocated', round: 2 };
-      const answer = sender(r3!, i);
+      if (sender(r2, i).kind === 'conflicting') return { member: i, reason: 'Equivocated', round: 2 };
+      const answer = sender(r3, i);
       if (answer.kind === 'conflicting') return { member: i, reason: 'Equivocated', round: 3 };
       const required = complainers.get(i)!;
       if (required.size >= t) return { member: i, reason: 'Complaints' };
@@ -173,21 +179,21 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
     if (reason) disqualified.push(reason);
   }
   const qual = [...deals.keys()];
-  if (qual.length < t) {
-    if (records.length !== 3) fail('InvalidRound');
-    fail('InsufficientQualified');
-  }
-  if (records.length < 5) fail('InvalidRound');
+  // Fewer than t qualified dealers ends the transcript after R3: no later record is read, authenticated or counted.
+  if (qual.length < t) fail('InsufficientQualified');
+
+  const r4 = closed(4);
 
   const extraction = new Map<number, G2[]>();
   for (const i of qual) {
-    const m = sender(r4!, i);
+    const m = sender(r4, i);
     const coefficients = m.kind === 'single' ? attempt(decodeFeldman, m.payload) : undefined;
     if (coefficients && coefficients.length === t) extraction.set(i, coefficients);
   }
   const reconstruct = new Set(qual.filter(i => !extraction.has(i)));
+  const r5 = closed(5);
   for (const j of members) {
-    const m = sender(r5!, j);
+    const m = sender(r5, j);
     const entries = m.kind === 'single' ? attempt(decodePairs, m.payload) : undefined;
     for (const [i, pair] of entries ?? []) {
       const a = extraction.get(i);
@@ -197,14 +203,11 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
   const reconstructed = qual.filter(i => reconstruct.has(i));
   // Floor: reconstruction may not leave fewer than t QUAL dealers. It is an abort after R5: before R6 is read and before the round count.
   if (qual.length - reconstructed.length < t) fail('ExcessiveReconstruction');
-  let hash = r5Hash;
   if (!reconstructed.length && records.length !== 5) fail('InvalidRound');
   // A required R6 is authenticated (missing: InvalidRound) before any of its values is read.
-  if (reconstructed.length && records.length < 6) fail('InvalidRound');
-  const r6 = reconstructed.length ? verifyClosedRound(ceremony.digest, 6, hash, records[5]!, cohorts, anchor.owner, verify) : [];
-  if (reconstructed.length) hash = transcriptUpdate(hash, records[5]!.closure);
+  const r6 = reconstructed.length ? closed(6) : [];
   // R6 values count only from senders with a unique envelope (after byte-identical deduplication) in both closed R4 and R5.
-  const eligible = members.filter(j => sender(r4!, j).kind === 'single' && sender(r5!, j).kind === 'single');
+  const eligible = members.filter(j => sender(r4, j).kind === 'single' && sender(r5, j).kind === 'single');
   for (const i of reconstructed) {
     const values: [number, bigint][] = [];
     for (const j of eligible) {
