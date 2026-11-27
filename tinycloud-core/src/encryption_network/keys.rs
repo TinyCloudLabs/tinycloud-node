@@ -221,6 +221,12 @@ enum CreateStep {
     Raced,
 }
 
+/// D3 (TC-2225): a threshold network refuses every deletable key path, since
+/// its keys are identity-based and no per-key seed can be destroyed.
+pub(crate) fn threshold_refuses_path(path: &str) -> bool {
+    KeyKind::for_path(path) == KeyKind::Deletable
+}
+
 impl EncryptionService {
     /// `key.create`. `deletable` must equal what the path implies (true under
     /// `apps/` and `secrets/`, false elsewhere). Idempotent for an identical
@@ -313,6 +319,11 @@ impl EncryptionService {
         lock_network_row(tx, network).await?;
         let net = load_active_network(tx, network).await?;
         let kind = loc.kind();
+        if super::threshold_set::is_threshold(&net) && threshold_refuses_path(loc.path()) {
+            return Err(EncryptionServiceError::KeyPathInvalid(
+                "deletable key paths are refused on threshold networks".to_string(),
+            ));
+        }
 
         if let Some(row) = find_key_row(tx, network, loc.path()).await? {
             let checked = check_row(row)?;

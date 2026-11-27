@@ -881,6 +881,7 @@ impl EncryptionService {
         invocation: &InvocationInfo,
         body_value: &Value,
     ) -> Result<(), EncryptionServiceError> {
+        super::threshold_set::refuse_node_bound(&self.db, network_id).await?;
         let facts = native_network_admin_facts(invocation)?;
         if facts.ty != NETWORK_ADMIN_TYPE {
             return Err(EncryptionServiceError::WrongInvocationType);
@@ -931,6 +932,7 @@ impl EncryptionService {
         invocation: &InvocationInfo,
         body_value: &Value,
     ) -> Result<(), EncryptionServiceError> {
+        super::threshold_set::refuse_node_bound(&self.db, network_id).await?;
         let facts: KeyAdminFacts = native_typed_fact(invocation, KEY_ADMIN_TYPE)?;
         if invocation.invocation.payload().audience != self.node_did.as_str() {
             return Err(EncryptionServiceError::AudienceMismatch);
