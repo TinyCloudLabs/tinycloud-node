@@ -6529,6 +6529,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -9929,6 +9930,7 @@ dependencies = [
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
+ "poly1305",
  "prometheus",
  "proptest",
  "rand 0.8.6",

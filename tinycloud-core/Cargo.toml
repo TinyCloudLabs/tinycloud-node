@@ -67,8 +67,11 @@ tempfile = "3"
 # ManuallyDrop union with no Drop), the hkdf PRK and the hmac state.
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 aes = { version = "0.8", features = ["zeroize"] }
+# TC-2226: `poly1305` is listed only to enable its `zeroize` feature (feature
+# unification), so the per-message Poly1305 state is wiped; no crate is added.
+poly1305 = { version = "0.8", features = ["zeroize"] }
 rand = "0.8"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 hex.workspace = true
 base64.workspace = true
 sha2 = "0.10"
