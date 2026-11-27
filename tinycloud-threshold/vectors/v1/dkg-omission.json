@@ -523,7 +523,7 @@
       "operation": "dkg_verify_transcript"
     },
     {
-      "description": "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of members 1 and 2 only. The R5 of members 3 and 4 are missing and member 5's is empty, so the transcript verifies with nothing reconstructed; members 3 and 4 stop after R5.",
+      "description": "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of honest members 1 and 2 only. Honest member 3's R5 is omitted and it stops after R5; faulty members 4 and 5 send empty R5 and may claim readiness without a matching share. The transcript verifies with nothing reconstructed.",
       "inputs": {
         "ceremony": {
           "body": "0101a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a30000001b74696e79636c6f75643a746573743a636572746966696361746573000000186469643a6b65793a7463323232322d666978747572652d3000000300050000000000000000000000000000000000050001000000186469643a6b65793a7463323232322d666978747572652d31e1d15677dee1f8f7476b04fba71d1d049df47c2ec311255b1ff4ba87cb789e190002000000186469643a6b65793a7463323232322d666978747572652d32e619cdfac64138f61d69db328d6821edd6d87c17cf53b373f17ab65a552232450003000000186469643a6b65793a7463323232322d666978747572652d33a3c42ecee996fcae9fa7d33131c75e36783c05d6f74cf97aa8a4d87d0e9745300004000000186469643a6b65793a7463323232322d666978747572652d3451c2888b5c2f2fa779b571f7b63cbcaceae3588c3413d6240165e2cdab5db9140005000000186469643a6b65793a7463323232322d666978747572652d35d708f497fcba174bc687a2c1f7c14158e6ad4b5cab0f6750739773cd3c64c668",
@@ -1320,7 +1320,7 @@
       "operation": "dkg_verify_transcript"
     },
     {
-      "description": "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of members 1 and 2 only. The R5 of members 3 and 4 are missing and member 5's is empty, so the transcript verifies with nothing reconstructed; members 3 and 4 stop after R5.",
+      "description": "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of honest members 1 and 2 only. Honest member 3's R5 is omitted and it stops after R5; faulty members 4 and 5 send empty R5 and may claim readiness without a matching share. The transcript verifies with nothing reconstructed.",
       "inputs": {
         "ceremony": {
           "body": "0104b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b30000001b74696e79636c6f75643a746573743a636572746966696361746573000000186469643a6b65793a7463323232322d666978747572652d300104e8e9d6ee5ed5afd83017d9ef4b0fe3c7dd7e11cce8ef81e0ce5396575dd85f000300050000000000000001000000000000000100050001000000186469643a6b65793a7463323232322d666978747572652d31077fb0bdd4c6c3b4d6a0a4838fca1b7c4d567e8b92ed0f67e7f4e68db083e2390002000000186469643a6b65793a7463323232322d666978747572652d3299b080ba993911de5a4737af736f74bfaaa23930881bc73553a312340a9d2e440003000000186469643a6b65793a7463323232322d666978747572652d3380500b39e9af14e1e4b33de1f7651e62ccb567a8bc5adb84e8629349031795670004000000186469643a6b65793a7463323232322d666978747572652d34975345627376ba3c0d922b546ce085bb624c20d1179671299358ea96722511610005000000186469643a6b65793a7463323232322d666978747572652d3500cec00731bbfbde7c80cd3c80a855a86466379b5c8849ba9834ddb52bb53e65",

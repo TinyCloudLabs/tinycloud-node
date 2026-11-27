@@ -654,7 +654,7 @@ fn omission_vectors() -> Value {
             case(&format!("{kind}_3of5_reconstruction_floor"), "The R4 of dealers 1-3 are missing. Reconstructing them would leave two of the five QUAL dealers, fewer than t = 3, so the ceremony stops after R5 and no R6 round exists.", &floor),
             case(&format!("{kind}_3of5_r6_from_member_without_r4"), "Member 1's R4 is missing from closed R4, yet an R6 from member 1 is closed. Every R6 sender must have exactly one R4 and one R5 in the closed rounds.", &without_r4),
             case(&format!("{kind}_3of5_r6_from_member_with_two_r5"), "Member 1 has two different R5 in closed R5, and an R6 from member 1 is closed. Every R6 sender must have exactly one R4 and one R5 in the closed rounds.", &two_r5),
-            case(&format!("{kind}_3of5_chosen_master_key"), "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of members 1 and 2 only. The R5 of members 3 and 4 are missing and member 5's is empty, so the transcript verifies with nothing reconstructed; members 3 and 4 stop after R5.", &chosen),
+            case(&format!("{kind}_3of5_chosen_master_key"), "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of honest members 1 and 2 only. Honest member 3's R5 is omitted and it stops after R5; faulty members 4 and 5 send empty R5 and may claim readiness without a matching share. The transcript verifies with nothing reconstructed.", &chosen),
         ]);
         cases.extend(activation_refusals(kind, &chosen));
     }
