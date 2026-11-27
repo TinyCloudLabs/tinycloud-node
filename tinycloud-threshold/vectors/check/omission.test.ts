@@ -4,7 +4,7 @@ import { describe, expect, test } from 'bun:test';
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { hex } from './protocol.ts';
 import { dkgVerifyTranscript, type DkgOutput } from './dkg.ts';
-import { decodeCertificate, type Statement } from './ceremony.ts';
+import { decodeCertificate, type RoundRecord, type Statement } from './ceremony.ts';
 import { verifyActivation, verifyCertificate, type SigningKeys, type VerifiedCertificate } from './certificates.ts';
 import { activationFor, receiptFor } from './chain-kit.ts';
 import { editDoc, loadJson, runCli, type Loose } from './cli-kit.ts';
@@ -20,6 +20,10 @@ const KINDS = [['genesis', dkgSetup, undefined], ['re-key', rekey, pin]] as cons
 
 function run(s: DkgSetup, rounds: Draft[][], pinned?: Statement): DkgOutput {
   return dkgVerifyTranscript(ANCHOR, s.ceremony, seal(s.digest, s.start, rounds).records, verify, pinned);
+}
+/** The sealed records with record k's owner closure signature zeroed (no longer authentic). */
+function unsigned(s: DkgSetup, rounds: Draft[][], k: number): RoundRecord[] {
+  return seal(s.digest, s.start, rounds).records.map((r, i) => i === k ? { ...r, closure: { ...r.closure, signature: new Uint8Array(64) } } : r);
 }
 function expectRecovered(out: DkgOutput, s: DkgSetup, reconstructed: number[]) {
   const all = s.dealers.map(d => d.index), e = expectedDkg(s.dealers, all, s.n);
@@ -87,6 +91,18 @@ for (const [kind, setup, pinned] of KINDS) {
     test('only ineligible senders leave no values: InsufficientRecovery', () => {
       expect(refused(replace(s, 4, 5), [5])).toBe('InsufficientRecovery');
     });
+    test('check order: a required R6 is authenticated before its values are read; a record after R6 is refused after reconstruction', () => {
+      const rounds = replace(s, 4, 5);
+      expect(code(() => run(s, rounds, pinned))).toBe('InvalidRound');
+      expect(code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, unsigned(s, [...rounds, r6(s, [5], [1, 2, 5])], 5), verify, pinned))).toBe('InvalidSignature');
+      expect(code(() => run(s, [...rounds, r6(s, [5], [1, 2, 5]), []], pinned))).toBe('InsufficientRecovery');
+      expect(code(() => run(s, [...rounds, r6(s, [5], [1, 2, 3]), []], pinned))).toBe('InvalidRound');
+    });
+    test('an R6 record that R5 does not require is not read: the floor or the round count decides', () => {
+      const below = replace(replace(replace(s, 4, 3), 4, 4), 4, 5);
+      expect(code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, unsigned(s, [...below, r6(s, [3, 4, 5], [1, 2])], 5), verify, pinned))).toBe('ExcessiveReconstruction');
+      expect(code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, unsigned(s, [...s.rounds, r6(s, [5], [1, 2, 3])], 5), verify, pinned))).toBe('InvalidRound');
+    });
   });
 }
 
@@ -111,6 +127,22 @@ describe('activation budget of genesis and re-key candidates', () => {
     expect(activate(genesis35, g35, all(5), 2)).toBe('ok');
     expect(activate(genesis35, g35, [1, 2, 4, 5], 2)).toBe('NotEnoughReady');
     expect(activate(genesis35, g35, all(5), null)).toBe('ok');
+  });
+  test('check order: receipts, then quorum and budget, then the ready count, then the activation statement', () => {
+    const signed = all(5).map(i => receiptFor(genesis35, { digest: g35.digest }, i));
+    const receipts = signed.map(r => ({ index: r.member, signature: r.signature }));
+    const good = activationFor({ digest: g35.digest }, signed).signature;
+    const run = (rs: typeof receipts, budget: number, signature: Uint8Array) => code(() => verifyActivation(g35, rs, budget, signature, keys));
+    const forged = new Uint8Array(64);
+    expect(run(receipts, 2, good)).toBe('ok');
+    // A budget below f is refused before the ready count and before the activation signature.
+    expect(run(receipts.slice(0, 3), 1, good)).toBe('InvalidReadiness');
+    expect(run(receipts, 1, forged)).toBe('InvalidReadiness');
+    expect(run(receipts, 2, forged)).toBe('InvalidSignature');
+    // A bad receipt is refused before the ready count.
+    expect(run([...receipts.slice(0, 2), receipts[1]!], 2, good)).toBe('InvalidReadiness');
+    expect(run([receipts[0]!, { ...receipts[1]!, signature: forged }], 2, good)).toBe('InvalidReadiness');
+    expect(run(receipts.slice(0, 4), 2, good)).toBe('NotEnoughReady');
   });
   test('3-of-4 has f = 1 and 2-of-3 has f = t − 1 = 1', () => {
     const genesis34: CertificateSpec = { t: 3, n: 4, coefficients: poly('budget-genesis-3of4', 3) };
@@ -159,10 +191,17 @@ describe('dkg-omission.json', () => {
         expect(activation.inputs.receipts.map(r => r.member)).toEqual([1, 2, 4, 5]);
       }
     });
+    test(`${kind}: an ignored R6 from a member without its R4 gives the outcome of the same transcript without that R6`, () => {
+      const outputs = (name: string) => view.cases.find(c => c.name === `${kind}_3of5_${name}`)!.outputs;
+      const late = outputs('r6_from_member_without_r4'), absent = outputs('member_without_r4_sends_no_r6');
+      expect(late.reconstructed).toEqual([1]);
+      expect({ ...late, transcript_hash: null }).toEqual({ ...absent, transcript_hash: null });
+      expect(late.transcript_hash).not.toBe(absent.transcript_hash);
+    });
   }
   test('the CLI reports a changed expected outcome instead of accepting it', () => {
     const edits = [
-      ['genesis_3of5_reconstruction_floor', 'InvalidRound'], ['rekey_3of5_r6_from_member_with_two_r5', 'InsufficientRecovery'],
+      ['genesis_3of5_reconstruction_floor', 'InvalidRound'], ['rekey_3of5_ineligible_r6_leaves_fewer_than_t_values', 'OwnMessageOmitted'],
       ['genesis_3of5_chosen_master_key_activation_budget_1', 'NotEnoughReady'],
     ];
     for (const [name, error] of edits) {

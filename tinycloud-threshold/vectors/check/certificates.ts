@@ -179,6 +179,21 @@ export function verifyClosedRound(ceremony: VerifiedCeremony, closure: Bytes, ow
   return { ownerPreimage, transcript, messages: authenticated };
 }
 export function verifyActivation(cert: VerifiedCertificate, receipts: Receipt[], budget: number | null, signature: Bytes, keys: SigningKeys): { preimage: Bytes; receipts: CheckedReceipt[] } {
+  // Receipts first: count, membership, signature length and duplicates, then every signature.
+  if (receipts.length > cert.body.members.length) throw new ProtocolError('InvalidReadiness');
+  const seen = new Set<number>();
+  const members = receipts.map(receipt => {
+    const member = cert.body.members.find(m => m.index === receipt.index);
+    if (!member || seen.has(receipt.index) || receipt.signature.length > 512) throw new ProtocolError('InvalidReadiness');
+    seen.add(receipt.index);
+    return member;
+  });
+  const checked = receipts.map((receipt, k) => {
+    const preimage = tagged(CERT_TAGS.readiness, concat(cert.digest, cert.body.transcript, be(BigInt(receipt.index), 2), cert.keyset.publicShares.get(receipt.index)!.toBytes()));
+    if (!signatureValid(keys, members[k]!.did, receipt.signature, preimage)) throw new ProtocolError('InvalidReadiness');
+    return { ...receipt, preimage };
+  });
+  // Then the quorum and budget, then the ready count.
   let quorum = cert.body.members.length;
   if (budget !== null) {
     quorum = cert.body.threshold + budget;
@@ -187,15 +202,6 @@ export function verifyActivation(cert: VerifiedCertificate, receipts: Receipt[],
     const fresh = !cert.body.previous || cert.body.previousMpk !== undefined;
     if (fresh && budget < faultBudget(cert.body.threshold, cert.body.members.length)) throw new ProtocolError('InvalidReadiness');
   }
-  const seen = new Set<number>();
-  const checked = receipts.map(receipt => {
-    const member = cert.body.members.find(m => m.index === receipt.index);
-    if (!member || seen.has(receipt.index) || receipt.signature.length > 512) throw new ProtocolError('InvalidReadiness');
-    seen.add(receipt.index);
-    const preimage = tagged(CERT_TAGS.readiness, concat(cert.digest, cert.body.transcript, be(BigInt(receipt.index), 2), cert.keyset.publicShares.get(receipt.index)!.toBytes()));
-    if (!signatureValid(keys, member.did, receipt.signature, preimage)) throw new ProtocolError('InvalidReadiness');
-    return { ...receipt, preimage };
-  });
   if (checked.length < quorum) throw new ProtocolError('NotEnoughReady');
   const encoded = checked.map(r => {
     const encoding = concat(be(1n, 1), be(BigInt(r.index), 2), lp(r.signature));
