@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn a_member_is_refused_off_linux() {
-        let dir = tempdir::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let error = set_process_nondumpable().unwrap_err();
         assert_eq!(error.kind(), "unsupported");
         let error = guard_threshold_share_dir(dir.path()).unwrap_err();
