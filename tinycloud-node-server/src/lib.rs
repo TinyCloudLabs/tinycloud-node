@@ -976,6 +976,27 @@ pub async fn app_with_control(
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
     let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
+    // TC-2224: a configured threshold share dir means this node is a member.
+    // The member is made non-dumpable as early as the config is known -
+    // before any database connect or migration and long before routes - so
+    // nothing that touches a share ever runs dumpable. Unset: nothing runs.
+    if tinycloud_config
+        .encryption_network
+        .threshold_share_dir
+        .is_some()
+    {
+        if let Err(error) = threshold_share::set_process_nondumpable() {
+            ::tracing::error!(
+                event = "threshold_share_dir_rejected",
+                error_kind = error.kind(),
+                "threshold share process guard failed: the node does not start"
+            );
+            anyhow::bail!(
+                "threshold_share_dir_rejected: {error} (error_kind {})",
+                error.kind()
+            );
+        }
+    }
     let request_id_origins =
         tracing::RequestIdOrigins::new(&tinycloud_config.log.request_id_first_party_origins)
             .map_err(anyhow::Error::msg)?;
@@ -1221,27 +1242,33 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
-    // With `threshold_share_dir` set, the node is a threshold member: the
-    // process is made non-dumpable and the share directory must already be a
-    // private, owned, lockable dir, or the start is refused before any route
-    // is served (TC-2224). Unset, nothing here runs.
-    if let Some(dir) = tinycloud_config
+    // With `threshold_share_dir` set, the node is a threshold member and was
+    // already made non-dumpable at the top of startup. The share directory
+    // must still be a private, owned, lockable dir, or the start is refused
+    // before any route is served (TC-2224). The returned guard holds the
+    // directory's lock until Rocket drops it, so a second node on the same
+    // volume is refused for as long as this one runs. Unset, nothing runs.
+    let threshold_share_guard = match tinycloud_config
         .encryption_network
         .threshold_share_dir
         .as_deref()
     {
-        if let Err(error) = threshold_share::guard_threshold_share_dir(dir) {
-            ::tracing::error!(
-                event = "threshold_share_dir_rejected",
-                error_kind = error.kind(),
-                "threshold share directory guard failed: the node does not start"
-            );
-            anyhow::bail!(
-                "threshold_share_dir_rejected: {error} (error_kind {})",
-                error.kind()
-            );
-        }
-    }
+        Some(dir) => match threshold_share::guard_threshold_share_dir(dir) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                ::tracing::error!(
+                    event = "threshold_share_dir_rejected",
+                    error_kind = error.kind(),
+                    "threshold share directory guard failed: the node does not start"
+                );
+                anyhow::bail!(
+                    "threshold_share_dir_rejected: {error} (error_kind {})",
+                    error.kind()
+                );
+            }
+        },
+        None => None,
+    };
     // With `named_keys_v1` on, a deletion ledger that cannot be opened or
     // replayed stops the start: the node never serves with the gate quietly
     // off. With it off, the failure is logged and the rest of the node serves.
@@ -1845,6 +1872,14 @@ pub async fn app_with_control(
             });
         })
     }));
+
+    // TC-2224: the member holds the share directory's lock for as long as
+    // Rocket lives; a second node on the same volume is refused at its own
+    // guard.
+    let rocket = match threshold_share_guard {
+        Some(guard) => rocket.manage(guard),
+        None => rocket,
+    };
 
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
