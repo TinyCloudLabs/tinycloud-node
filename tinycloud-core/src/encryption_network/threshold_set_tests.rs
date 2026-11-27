@@ -1653,11 +1653,48 @@ async fn an_attached_child_of_a_terminal_grant_is_refused_and_not_stored() {
 }
 
 #[tokio::test]
-async fn an_attached_key_grant_is_refused_without_named_keys() {
+async fn a_key_grant_refused_only_for_lacking_named_keys_faults_no_peer() {
     let (mut f, owner) = did_key_owner().await;
     f.set = f.set.clone().with_delegation_rules(false, false);
+    let (a, b) = (ident(), ident());
+    let t = now();
     let urn = f.key_urn("docs/a");
-    assert_unstorable(&f, &owner, &[(&urn, DECRYPT_ACTION)], vec![]).await;
+    let root = ucan(
+        &owner,
+        &a.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![],
+        None,
+        1_000,
+    );
+    let leaf = ucan(
+        &a,
+        &b.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&root)],
+        None,
+        1_000,
+    );
+    let object = revocation_object(&revoke(&a, &leaf, vec![], t, t + 300), &[&leaf, &root]);
+    let result = f
+        .set
+        .accept(
+            &f.network,
+            ObjectKind::Revocation,
+            &object,
+            Source::Peer(PEER),
+        )
+        .await;
+    assert_eq!(unavailable(result), "delegation_unstorable_here");
+    assert_eq!(f.faults().await, 0);
+    assert_eq!(delegation::Entity::find().count(&f.db).await.unwrap(), 0);
+    assert_eq!(revocations(&f.db, &leaf).await, 0);
+    let held = threshold_set_object::Entity::find()
+        .filter(threshold_set_object::Column::Kind.eq(ObjectKind::Revocation.as_str()))
+        .count(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(held, 0);
 }
 
 #[tokio::test]
@@ -1716,4 +1753,393 @@ async fn a_certificate_naming_other_nodes_only_is_not_held() {
         "not_a_member"
     );
     assert!(f.set.chain(&f.network).await.unwrap().is_empty());
+}
+
+// ------------------------------------------------------------- joiners
+
+/// A network this node joins at the 3-of-4 reshare: the genesis names `x`
+/// and `f.others`, its successor `f.others`, `y` and this node.
+fn joined(f: &Fixture, x: &Ident, y: &Ident) -> (CertificateBody, CertificateBody) {
+    let genesis = spliced_body(
+        0,
+        &f.network,
+        &[&x.did, &f.others[0].did, &f.others[1].did],
+        None,
+    );
+    let successor = spliced_body(
+        1,
+        &f.network,
+        &[&f.others[0].did, &f.others[1].did, &y.did, f.set.node_did()],
+        Some(&genesis),
+    );
+    (genesis, successor)
+}
+
+#[tokio::test]
+async fn a_node_joining_at_a_reshare_holds_the_chain_back_to_its_genesis() {
+    let f = Fixture::did_key().await;
+    let (x, y) = (ident(), ident());
+    let (genesis, successor) = joined(&f, &x, &y);
+    f.accept(ObjectKind::Cert, &f.cert_of(&successor))
+        .await
+        .unwrap();
+    f.accept(ObjectKind::Cert, &f.cert_of(&genesis))
+        .await
+        .unwrap();
+    f.accept(ObjectKind::Activation, &f.activation_of(&genesis, &[&x]))
+        .await
+        .unwrap();
+    f.accept(ObjectKind::Activation, &f.activation_of(&successor, &[&y]))
+        .await
+        .unwrap();
+    f.set.require_member(&f.network).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_joiner_holds_the_genesis_once_it_holds_the_successor() {
+    let f = Fixture::did_key().await;
+    let (x, y) = (ident(), ident());
+    let (genesis, successor) = joined(&f, &x, &y);
+    assert_eq!(
+        unavailable(f.accept(ObjectKind::Cert, &f.cert_of(&genesis)).await),
+        "not_a_member"
+    );
+    f.accept(ObjectKind::Cert, &f.cert_of(&successor))
+        .await
+        .unwrap();
+    assert!(
+        f.accept(ObjectKind::Cert, &f.cert_of(&genesis))
+            .await
+            .unwrap()
+            .new
+    );
+    f.accept(ObjectKind::Activation, &f.activation_of(&genesis, &[&x]))
+        .await
+        .unwrap();
+    f.accept(ObjectKind::Activation, &f.activation_of(&successor, &[&y]))
+        .await
+        .unwrap();
+    f.set.require_member(&f.network).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_certificate_preceding_nothing_held_is_not_held() {
+    let f = Fixture::did_key().await;
+    let (x, y) = (ident(), ident());
+    let (_, successor) = joined(&f, &x, &y);
+    f.accept(ObjectKind::Cert, &f.cert_of(&successor))
+        .await
+        .unwrap();
+    let unrelated = spliced_body(
+        0,
+        &f.network,
+        &[&f.others[0].did, &x.did, &f.others[1].did],
+        None,
+    );
+    assert_eq!(
+        unavailable(f.accept(ObjectKind::Cert, &f.cert_of(&unrelated)).await),
+        "not_a_member"
+    );
+}
+
+// ------------------------------------------------------------ sign-outs
+
+/// Sol's sequence: owner → O → D is on members A (`f`) and B; B signs O
+/// out; O's control grant to D reaches B only inside D's revocation of
+/// O → D (`object`).
+struct SignedOut {
+    f: Fixture,
+    b_db: DatabaseConnection,
+    b: ThresholdSet,
+    d: Ident,
+    target: String,
+    grant: String,
+    object: Vec<u8>,
+}
+
+async fn signed_out() -> SignedOut {
+    let (f, owner) = did_key_owner().await;
+    let b_db = fresh_db().await;
+    let b =
+        ThresholdSet::new(b_db.clone(), node_keypair(), None).with_delegation_rules(false, true);
+    for (kind, bytes) in [
+        (ObjectKind::Cert, f.cert()),
+        (ObjectKind::Activation, f.activation()),
+    ] {
+        b.accept(&f.network, kind, &bytes, Source::Client)
+            .await
+            .unwrap();
+    }
+    let (o, d) = (ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let root = ucan(
+        &owner,
+        &o.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    let target = ucan(
+        &o,
+        &d.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&root)],
+        None,
+        t + 3_600,
+    );
+    for db in [&f.db, &b_db] {
+        for header in [&root, &target] {
+            let posted = Delegation::from_header_ser::<TinyCloudDelegation>(header).unwrap();
+            delegation::process_with(db, &posted, None, false, true, None, false)
+                .await
+                .unwrap();
+        }
+    }
+    let retire = crate::models::session_retire::retire(
+        &b_db,
+        &o.did,
+        OffsetDateTime::now_utc(),
+        time::Duration::days(1),
+    )
+    .await
+    .unwrap();
+    assert!(retire.recorded());
+    let grant = ucan(
+        &o,
+        &d.did,
+        &[(&format!("urn:cid:{}", cid_of(&target)), REVOKE_ABILITY)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    let object = revocation_object(
+        &revoke(&d, &target, vec![cid_of(&grant)], t, t + 300),
+        &[&target, &root, &grant],
+    );
+    SignedOut {
+        f,
+        b_db,
+        b,
+        d,
+        target,
+        grant,
+        object,
+    }
+}
+
+#[tokio::test]
+async fn a_revocation_carrying_a_signed_out_issuers_grant_converges_and_grants_nothing() {
+    use crate::models::{
+        invocation::{self, InvocationError},
+        revocation::{control_proof_decision, ControlAction, ControlProofDecision},
+    };
+    let s = signed_out().await;
+    let network = &s.f.network;
+    for set in [&s.f.set, &s.b] {
+        set.accept(network, ObjectKind::Revocation, &s.object, Source::Client)
+            .await
+            .unwrap();
+    }
+    for db in [&s.f.db, &s.b_db] {
+        assert_eq!(revocations(db, &s.target).await, 1);
+    }
+    let grant = hash(s.grant.as_bytes());
+    let on_a = delegation::Entity::find_by_id(grant).one(&s.f.db).await;
+    assert!(on_a.unwrap().is_some());
+    let on_b = delegation::Entity::find_by_id(grant).one(&s.b_db).await;
+    assert!(on_b.unwrap().is_none());
+
+    // No control proof on B rests on it; A, which holds it, has one.
+    let target = hash(s.target.as_bytes());
+    let proof = [cid_of(&s.grant)];
+    for action in [
+        ControlAction::Revoke,
+        ControlAction::Status,
+        ControlAction::Renew,
+    ] {
+        let decision = control_proof_decision(&s.b_db, &s.d.did, &proof, action, &target)
+            .await
+            .unwrap();
+        assert!(matches!(decision, ControlProofDecision::Denied));
+    }
+    let decision =
+        control_proof_decision(&s.f.db, &s.d.did, &proof, ControlAction::Revoke, &target)
+            .await
+            .unwrap();
+    assert!(matches!(decision, ControlProofDecision::Scoped(_)));
+
+    // D invoking under it on B.
+    let invocation = ucan(
+        &s.d,
+        network.owner_did(),
+        &[(&s.f.key_urn("docs/a"), DECRYPT_ACTION)],
+        proof.to_vec(),
+        None,
+        now() + 300,
+    );
+    let info = crate::util::InvocationInfo::try_from(
+        tinycloud_auth::authorization::TinyCloudInvocation::decode(&invocation).unwrap(),
+    )
+    .unwrap();
+    let result = invocation::verify_and_authorize(&s.b_db, &info, OffsetDateTime::now_utc()).await;
+    assert!(
+        matches!(
+            result,
+            Err(invocation::Error::InvalidInvocation(
+                InvocationError::MissingParents
+            ))
+        ),
+        "{result:?}"
+    );
+    // Posted to B afterwards, as at /delegate, it is refused for the sign-out.
+    let posted = Delegation::from_header_ser::<TinyCloudDelegation>(&s.grant).unwrap();
+    let result = delegation::process_with(&s.b_db, &posted, None, false, true, None, false).await;
+    assert!(
+        matches!(
+            result,
+            Err(delegation::Error::InvalidDelegation(
+                delegation::DelegationError::SessionRetired(_)
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_issuers_grant_carried_for_anything_else_is_refused() {
+    let s = signed_out().await;
+    let grant = Delegation::from_header_ser::<TinyCloudDelegation>(&s.grant).unwrap();
+    let result = delegation::process_carried(
+        &s.b_db,
+        &grant,
+        None,
+        false,
+        true,
+        delegation::CarriedFor::Other,
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(delegation::Error::InvalidDelegation(
+                delegation::DelegationError::SessionRetired(_)
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(delegation::Entity::find().count(&s.b_db).await.unwrap(), 2);
+}
+
+// --------------------------------------------------------- equivocation
+
+/// The genesis of `members` with vector case `material`'s master public
+/// key, commitments and transcript: another key for the same network.
+fn genesis_with_material(
+    material: usize,
+    network: &NetworkId,
+    members: &[&str],
+) -> CertificateBody {
+    fn public_section(v: &[u8]) -> std::ops::Range<usize> {
+        let u16_at = |at: usize| u16::from_be_bytes(v[at..at + 2].try_into().unwrap());
+        let skip_lp =
+            |at: usize| at + 4 + u32::from_be_bytes(v[at..at + 4].try_into().unwrap()) as usize;
+        let mut at = skip_lp(skip_lp(1)) + 22;
+        let count = u16_at(at);
+        at += 2;
+        for _ in 0..count {
+            at = skip_lp(at + 2);
+        }
+        at..at + 96 + 2 + 96 * usize::from(u16_at(at + 96)) + 32
+    }
+    let vectors: Value = serde_json::from_str(CHAIN).unwrap();
+    let other = hex::decode(
+        vectors["cases"][material]["inputs"]["certificate"]["body"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut out = spliced_body(0, network, members, None).encode();
+    let (mine, theirs) = (public_section(&out), public_section(&other));
+    out.splice(mine, other[theirs].iter().copied());
+    CertificateBody::decode(&out).unwrap()
+}
+
+async fn fault_rows(db: &DatabaseConnection) -> Vec<(String, String, String)> {
+    threshold_fault::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|fault| (fault.source_did, fault.object_cid, fault.reason))
+        .collect()
+}
+
+#[tokio::test]
+async fn equivocated_geneses_leave_every_member_without_a_current_certificate() {
+    let f = Fixture::did_key().await;
+    let members = [
+        f.set.node_did(),
+        f.others[0].did.as_str(),
+        f.others[1].did.as_str(),
+    ];
+    let second = genesis_with_material(6, &f.network, &members);
+    assert_ne!(
+        second.public_material().master_public_key().encode(),
+        f.body.public_material().master_public_key().encode()
+    );
+    let geneses = [
+        (f.cert(), f.activation()),
+        (f.cert_of(&second), f.activation_of(&second, &[])),
+    ];
+    let b_db = fresh_db().await;
+    let b = ThresholdSet::new(b_db.clone(), node_keypair(), None);
+    // A takes the first genesis first, B the second.
+    for (set, order) in [(&f.set, [0, 1]), (&b, [1, 0])] {
+        for index in order {
+            let (cert, activation) = &geneses[index];
+            set.accept(&f.network, ObjectKind::Cert, cert, Source::Client)
+                .await
+                .unwrap();
+            set.accept(
+                &f.network,
+                ObjectKind::Activation,
+                activation,
+                Source::Client,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let lowest = [object_cid(&geneses[0].1), object_cid(&geneses[1].1)]
+        .into_iter()
+        .min()
+        .unwrap();
+    let mut held = Vec::new();
+    for (db, set) in [(&f.db, &f.set), (&b_db, &b)] {
+        let mut cids: Vec<String> = set
+            .chain(&f.network)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, cid, _)| cid)
+            .collect();
+        cids.sort();
+        assert_eq!(cids.len(), 4);
+        held.push(cids);
+        assert_eq!(
+            fault_rows(db).await,
+            vec![(
+                f.network.owner_did().to_string(),
+                lowest.clone(),
+                "genesis_conflict".to_string()
+            )]
+        );
+        assert!(matches!(
+            set.require_member(&f.network).await,
+            Err(AcceptError::Unavailable("not_a_member"))
+        ));
+    }
+    assert_eq!(held[0], held[1]);
 }

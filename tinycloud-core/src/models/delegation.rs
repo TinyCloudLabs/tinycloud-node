@@ -269,30 +269,66 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
         named_keys,
         renewal_identity,
         signature_verified,
-        false,
+        None,
     )
     .await
+}
+
+/// TC-2225: the operation a carried delegation is attached to, set by the
+/// caller from that operation's type, never from the delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarriedFor {
+    /// A threshold network's revocation object.
+    Revocation,
+    /// Any other operation. Every carrier is a revocation today; this keeps
+    /// the sign-out check for whatever carries chains next.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Other,
+}
+
+/// What [`process_carried`] admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarriedAdmission {
+    /// Admitted under every rule and written, or already stored.
+    Stored,
+    /// Admitted for a revocation only because its issuer's TC-3443 sign-out
+    /// was not checked: not stored before, and signed out here. It was
+    /// written to `db` so its descendants could be checked; the caller must
+    /// discard that write, keeping it out of every store an authorization
+    /// lookup reads.
+    RetiredIssuer,
 }
 
 /// TC-2225 (gate B GB-5): register a delegation a threshold network's
 /// revocation object carries, its signature already checked. Every
 /// `/delegate` rule applies except those that depend on when, or in which
 /// order, a member receives the object: the delegation's own time window, a
-/// parent's time window now, and a revoked parent or ancestor. A delegation a
-/// space purge erased is refused as `Revoked` before any rule.
+/// parent's time window now, a revoked parent or ancestor and, for a
+/// revocation only, its issuer's sign-out (see
+/// [`CarriedAdmission::RetiredIssuer`]). A delegation a space purge erased is
+/// refused as `Revoked` before any rule.
 pub(crate) async fn process_carried<C: ConnectionTrait>(
     db: &C,
     delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
     delegated_sql_caveats: bool,
     named_keys: bool,
-) -> Result<DelegationRegistration, Error> {
+    carried_for: CarriedFor,
+) -> Result<CarriedAdmission, Error> {
     refuse_tombstoned(
         db,
         crate::hash::hash(&delegation.1),
         delegation_cid_alias::canonical_hash(&delegation.1)?,
     )
     .await?;
+    let retired_issuer = carried_for == CarriedFor::Revocation
+        && match refuse_retired_delegator(db, &delegation.0).await {
+            Ok(()) => false,
+            Err(Error::InvalidDelegation(DelegationError::SessionRetired(_))) => {
+                !is_stored(db, delegation).await?
+            }
+            Err(error) => return Err(error),
+        };
     admit(
         db,
         delegation,
@@ -301,9 +337,14 @@ pub(crate) async fn process_carried<C: ConnectionTrait>(
         named_keys,
         None,
         true,
-        true,
+        Some(carried_for),
     )
-    .await
+    .await?;
+    Ok(if retired_issuer {
+        CarriedAdmission::RetiredIssuer
+    } else {
+        CarriedAdmission::Stored
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,12 +356,12 @@ async fn admit<C: ConnectionTrait>(
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
     signature_verified: bool,
-    carried: bool,
+    carried: Option<CarriedFor>,
 ) -> Result<DelegationRegistration, Error> {
     if !signature_verified {
         check_signature(&delegation.0.delegation).await?;
     }
-    if !carried {
+    if carried.is_none() {
         verify_time(&delegation.0.delegation)?;
     }
     for space in delegation.0.spaces() {
@@ -632,13 +673,14 @@ async fn validate_with<C: ConnectionTrait>(
         named_keys,
         renewal_identity,
         None,
-        false,
+        None,
     )
     .await
 }
 
 /// With `carried` (TC-2225, see [`process_carried`]) a parent's time window
-/// now and a revoked parent or ancestor are not checked.
+/// now and a revoked parent or ancestor are not checked, nor, when carried
+/// for a revocation, the issuer's sign-out.
 async fn validate_with_encryption<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
@@ -646,12 +688,15 @@ async fn validate_with_encryption<C: ConnectionTrait>(
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
     encryption: Option<&ColumnEncryption>,
-    carried: bool,
+    carried: Option<CarriedFor>,
 ) -> Result<(), Error> {
     if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
     }
-    refuse_retired_delegator(db, delegation).await?;
+    if carried != Some(CarriedFor::Revocation) {
+        refuse_retired_delegator(db, delegation).await?;
+    }
+    let carried = carried.is_some();
     refuse_renewal_lease_parents(db, delegation).await?;
     check_capability_rules(delegation, delegated_sql_caveats, named_keys)?;
 
