@@ -123,10 +123,10 @@ describe('R1–R3 and QUAL', () => {
     const conflictingAndComplained = replace(replace(replace(s, 2, 1, msg(1, complaints([])), msg(1, complaints([2]))), 2, 2, msg(2, complaints([1]))), 2, 3, msg(3, complaints([1])));
     expect(run(s, conflictingAndComplained).disqualified).toEqual([{ member: 1, reason: 'Equivocated', round: 2 }]);
   });
-  test('fewer than t qualified dealers aborts only as the last record', () => {
+  test('fewer than t qualified dealers aborts after R3; later records are not read', () => {
     const alone = s.rounds.map((r, k) => k === 0 ? r.filter(d => d.index === 1) : r);
     expect(code(() => run(s, alone.slice(0, 3)))).toBe('InsufficientQualified');
-    expect(code(() => run(s, alone))).toBe('InvalidRound');
+    expect(code(() => run(s, alone))).toBe('InsufficientQualified');
     expect(code(() => run(s, alone.slice(0, 2)))).toBe('InvalidRound');
   });
   for (const length of [0, 15]) {
