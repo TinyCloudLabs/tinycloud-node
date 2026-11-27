@@ -475,6 +475,10 @@ impl CertificateBody {
     pub fn rekey(&self) -> RekeyCounter {
         self.rekey
     }
+    /// Whether this generation's master key came from a genesis or re-key DKG.
+    pub(crate) fn is_dkg_output(&self) -> bool {
+        self.previous.is_none() || self.previous_mpk.is_some()
+    }
 }
 
 /// Raw owner-signed certificate. Details: TC-2222

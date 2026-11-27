@@ -67,6 +67,16 @@ impl Threshold {
         }
         Ok(())
     }
+
+    /// Faulty members a genesis-DKG shape tolerates: one for 3-of-4,
+    /// otherwise `t - 1`.
+    pub(crate) fn genesis_faults(&self) -> u16 {
+        if (self.t, self.n) == (3, 4) {
+            1
+        } else {
+            self.t.saturating_sub(1)
+        }
+    }
 }
 
 macro_rules! text_id {

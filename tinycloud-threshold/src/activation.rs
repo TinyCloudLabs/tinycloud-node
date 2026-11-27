@@ -23,7 +23,9 @@ pub struct ReadinessReceipt {
 pub enum ReadyQuorum {
     /// Every new holder must supply a receipt. Details: TC-2222
     AllHolders,
-    /// Require t plus this positive total unavailable-ready-signer budget, including dishonest claims. Details: TC-2222
+    /// Require t plus this positive total unavailable-ready-signer budget, including dishonest claims.
+    /// For a genesis or re-key candidate the budget must cover the shape's genesis fault budget
+    /// (one for 3-of-4, otherwise t − 1). Details: TC-2222, TC-2226
     WithOutageBudget(u16),
 }
 
@@ -143,7 +145,9 @@ pub fn verify_activation(
                 .t()
                 .checked_add(budget)
                 .ok_or(Error::InvalidReadiness)?;
-            if required > threshold.n() {
+            if required > threshold.n()
+                || (candidate.body().is_dkg_output() && budget < threshold.genesis_faults())
+            {
                 return Err(Error::InvalidReadiness);
             }
             required
