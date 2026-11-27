@@ -277,13 +277,27 @@ impl Fixture {
     /// The owner's activation of `body`, with a readiness receipt from each
     /// member: this node, `others` or `more`.
     fn activation_of(&self, body: &CertificateBody, more: &[&Ident]) -> Vec<u8> {
+        self.activation_with(body, &[&self.node], more)
+    }
+
+    /// The owner's activation of `body`, with a readiness receipt from each
+    /// member: a node of `nodes`, `others` or `more`.
+    fn activation_with(
+        &self,
+        body: &CertificateBody,
+        nodes: &[&Keypair],
+        more: &[&Ident],
+    ) -> Vec<u8> {
         let receipts: Vec<ReadinessReceipt> = body
             .members()
             .iter()
             .map(|member| {
                 let preimage = readiness_preimage(body, member.index).unwrap();
-                let signature = if member.node.as_str() == self.set.node_did() {
-                    self.node.sign(&preimage).unwrap()
+                let node = nodes
+                    .iter()
+                    .find(|node| public_key_to_did_key(node.public()) == member.node.as_str());
+                let signature = if let Some(node) = node {
+                    node.sign(&preimage).unwrap()
                 } else {
                     self.others
                         .iter()
@@ -2143,4 +2157,307 @@ async fn equivocated_geneses_leave_every_member_without_a_current_certificate() 
         ));
     }
     assert_eq!(held[0], held[1]);
+}
+
+// ------------------------------------------------------------ round 4
+
+#[tokio::test]
+async fn a_revoked_delegation_kept_out_of_the_graph_is_refused_when_posted_later() {
+    use crate::models::{
+        invocation::{self, InvocationError},
+        session_retire,
+    };
+    let (f, owner) = did_key_owner().await;
+    let (o, d) = (ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let root = ucan(
+        &owner,
+        &o.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    let posted = Delegation::from_header_ser::<TinyCloudDelegation>(&root).unwrap();
+    delegation::process_with(&f.db, &posted, None, false, true, None, false)
+        .await
+        .unwrap();
+    let retire = session_retire::retire(
+        &f.db,
+        &o.did,
+        OffsetDateTime::now_utc(),
+        time::Duration::days(1),
+    )
+    .await
+    .unwrap();
+    assert!(retire.recorded());
+    // O → D, never posted here, revoked by O with it attached.
+    let target = ucan(
+        &o,
+        &d.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&root)],
+        None,
+        t + 3_600,
+    );
+    let object = revocation_object(&revoke(&o, &target, vec![], t, t + 300), &[&target, &root]);
+    assert!(f.accept(ObjectKind::Revocation, &object).await.unwrap().new);
+    assert_eq!(revocations(&f.db, &target).await, 0);
+
+    // The sign-out expires; D posts O → D.
+    session_retire::Entity::delete_many()
+        .exec(&f.db)
+        .await
+        .unwrap();
+    let posted = Delegation::from_header_ser::<TinyCloudDelegation>(&target).unwrap();
+    let result = delegation::process_with(&f.db, &posted, None, false, true, None, false).await;
+    assert!(
+        matches!(
+            result,
+            Err(delegation::Error::InvalidDelegation(
+                delegation::DelegationError::Revoked(_)
+            ))
+        ),
+        "{result:?}"
+    );
+    let invocation = ucan(
+        &d,
+        f.network.owner_did(),
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&target)],
+        None,
+        now() + 300,
+    );
+    let info = crate::util::InvocationInfo::try_from(
+        tinycloud_auth::authorization::TinyCloudInvocation::decode(&invocation).unwrap(),
+    )
+    .unwrap();
+    let result = invocation::verify_and_authorize(&f.db, &info, OffsetDateTime::now_utc()).await;
+    assert!(
+        matches!(
+            result,
+            Err(invocation::Error::InvalidInvocation(
+                InvocationError::MissingParents
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+fn pass_hook<F>(hook: F) -> PassHook
+where
+    F: for<'a> Fn(&'a DatabaseTransaction) -> futures::future::BoxFuture<'a, ()>
+        + Send
+        + Sync
+        + 'static,
+{
+    std::sync::Arc::new(hook)
+}
+
+#[tokio::test]
+async fn a_sign_out_between_admission_passes_keeps_that_link_out_too() {
+    use crate::models::session_retire;
+    let (mut f, owner) = did_key_owner().await;
+    let (o, p, d) = (ident(), ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let grant = |to: &Ident| {
+        ucan(
+            &owner,
+            &to.did,
+            &[(&urn, DECRYPT_ACTION)],
+            vec![],
+            None,
+            t + 3_600,
+        )
+    };
+    let (to_p, to_o) = (grant(&p), grant(&o));
+    for header in [&to_p, &to_o] {
+        let posted = Delegation::from_header_ser::<TinyCloudDelegation>(header).unwrap();
+        delegation::process_with(&f.db, &posted, None, false, true, None, false)
+            .await
+            .unwrap();
+    }
+    let retire = session_retire::retire(
+        &f.db,
+        &o.did,
+        OffsetDateTime::now_utc(),
+        time::Duration::days(1),
+    )
+    .await
+    .unwrap();
+    assert!(retire.recorded());
+    // owner → P (stored) → O (P's link, new here) → D (O's, new here).
+    let link = ucan(
+        &p,
+        &o.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&to_p)],
+        None,
+        t + 3_600,
+    );
+    let target = ucan(
+        &o,
+        &d.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&link)],
+        None,
+        t + 3_600,
+    );
+    // The first pass sets O → D aside; P signs out before the next.
+    let signing_out = p.did.clone();
+    f.set = f.set.clone().with_between_passes(pass_hook(move |tx| {
+        let did = signing_out.clone();
+        Box::pin(async move {
+            session_retire::retire_in(
+                tx,
+                &did,
+                OffsetDateTime::now_utc(),
+                time::Duration::days(1),
+                None,
+            )
+            .await
+            .unwrap();
+        })
+    }));
+    let object = revocation_object(
+        &revoke(&o, &target, vec![], t, t + 300),
+        &[&target, &link, &to_p],
+    );
+    f.accept(ObjectKind::Revocation, &object).await.unwrap();
+    let stored = delegation::Entity::find_by_id(hash(link.as_bytes()))
+        .one(&f.db)
+        .await
+        .unwrap();
+    assert!(stored.is_none());
+    assert!(
+        revocation_tombstone::is_tombstoned(&f.db, &[hash(target.as_bytes())])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !revocation_tombstone::is_tombstoned(&f.db, &[hash(link.as_bytes())])
+            .await
+            .unwrap()
+    );
+}
+
+fn node_key(seed: u8) -> Keypair {
+    crate::keys::StaticSecret::new(vec![seed; 32])
+        .unwrap()
+        .node_keypair()
+}
+
+#[tokio::test]
+async fn overlapping_equivocated_geneses_fail_closed_on_every_member_holding_either() {
+    let f = Fixture::did_key().await;
+    let (z_key, w_key) = (node_key(0x44), node_key(0x55));
+    let (z_db, w_db) = (fresh_db().await, fresh_db().await);
+    let z = ThresholdSet::new(z_db.clone(), z_key.clone(), None);
+    let w = ThresholdSet::new(w_db.clone(), w_key.clone(), None);
+    let [x, y] = &f.others;
+    // G1 = {X, Y, Z}, G2 = {X, Y, W}, under different keys.
+    let g1 = spliced_body(0, &f.network, &[&x.did, &y.did, z.node_did()], None);
+    let g2 = genesis_with_material(6, &f.network, &[&x.did, &y.did, w.node_did()]);
+    let first = (f.cert_of(&g1), f.activation_with(&g1, &[&z_key], &[]));
+    let second = (f.cert_of(&g2), f.activation_with(&g2, &[&w_key], &[]));
+    let lowest = [object_cid(&first.1), object_cid(&second.1)]
+        .into_iter()
+        .min()
+        .unwrap();
+    // Each takes its own genesis, then the other, as from X or Y.
+    for (set, own, other) in [(&z, &first, &second), (&w, &second, &first)] {
+        for (index, (cert, activation)) in [own, other].into_iter().enumerate() {
+            set.accept(&f.network, ObjectKind::Cert, cert, Source::Client)
+                .await
+                .unwrap();
+            set.accept(
+                &f.network,
+                ObjectKind::Activation,
+                activation,
+                Source::Client,
+            )
+            .await
+            .unwrap();
+            if index == 0 {
+                set.require_member(&f.network).await.unwrap();
+            }
+        }
+    }
+    for (db, set, body) in [(&z_db, &z, &g1), (&w_db, &w, &g2)] {
+        assert_eq!(
+            fault_rows(db).await,
+            vec![(
+                f.network.owner_did().to_string(),
+                lowest.clone(),
+                "genesis_conflict".to_string()
+            )]
+        );
+        assert!(matches!(
+            set.require_member(&f.network).await,
+            Err(AcceptError::Unavailable("not_a_member"))
+        ));
+        // N's rows are the own genesis's alone.
+        let row = encryption_network::Entity::find_by_id(f.network.to_string())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.public_key,
+            body.public_material().master_public_key().encode().to_vec()
+        );
+        let mut members: Vec<String> = encryption_network_member::Entity::find()
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|member| member.node_id)
+            .collect();
+        members.sort();
+        let mut named: Vec<String> = body
+            .members()
+            .iter()
+            .map(|member| member.node.as_str().to_string())
+            .collect();
+        named.sort();
+        assert_eq!(members, named);
+    }
+}
+
+#[tokio::test]
+async fn another_genesis_is_not_held_without_an_activated_one() {
+    let f = Fixture::did_key().await;
+    let x = ident();
+    let other = spliced_body(
+        0,
+        &f.network,
+        &[&x.did, &f.others[0].did, &f.others[1].did],
+        None,
+    );
+    // This node's own genesis is held but not activated.
+    f.accept(ObjectKind::Cert, &f.cert()).await.unwrap();
+    assert_eq!(
+        unavailable(f.accept(ObjectKind::Cert, &f.cert_of(&other)).await),
+        "not_a_member"
+    );
+    f.accept(ObjectKind::Activation, &f.activation())
+        .await
+        .unwrap();
+    // Held once it is, and never this node's network.
+    f.accept(ObjectKind::Cert, &f.cert_of(&other))
+        .await
+        .unwrap();
+    f.accept(ObjectKind::Activation, &f.activation_of(&other, &[&x]))
+        .await
+        .unwrap();
+    assert!(f.set.require_member(&f.network).await.is_err());
+    assert_eq!(
+        encryption_network_member::Entity::find()
+            .count(&f.db)
+            .await
+            .unwrap(),
+        3
+    );
 }

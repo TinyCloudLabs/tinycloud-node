@@ -15,7 +15,8 @@
 //!   carries only, with no validity window checked, then inserted into the
 //!   delegation graph under `/delegate`'s other admission rules, except a
 //!   delegation whose issuer signed out here (TC-3443), which only
-//!   authorizes this revocation and stays out of the graph;
+//!   authorizes this revocation and stays out of the graph. A revoked
+//!   delegation left out of the graph is tombstoned;
 //! - `key-state`: the owner's `key.state` or `network.revoke` statement. Key
 //!   rows follow the highest `stateSeq`.
 //!
@@ -76,8 +77,9 @@ use crate::{
     hash::{hash, Hash},
     keys::{public_key_to_did_key, Keypair},
     models::{
-        delegation, encryption_network, encryption_network_member, revocation, threshold_fault,
-        threshold_key_row, threshold_network_revocation, threshold_set_object,
+        delegation, delegation_cid_alias, encryption_network, encryption_network_member,
+        revocation, revocation_tombstone, threshold_fault, threshold_key_row,
+        threshold_network_revocation, threshold_set_object,
     },
     relationships::parent_delegations,
     util::{Capability, DelegationInfo},
@@ -982,7 +984,16 @@ pub struct ThresholdSet {
     encryption: Option<ColumnEncryption>,
     delegated_sql_caveats: bool,
     named_keys: bool,
+    /// Test seam: runs on the revocation's transaction before each
+    /// admission pass after the first.
+    #[cfg(test)]
+    between_passes: Option<PassHook>,
 }
+
+#[cfg(test)]
+pub(crate) type PassHook = std::sync::Arc<
+    dyn for<'a> Fn(&'a DatabaseTransaction) -> futures::future::BoxFuture<'a, ()> + Send + Sync,
+>;
 
 impl ThresholdSet {
     /// `encryption` is the column key the delegation graph's signed bytes are
@@ -999,6 +1010,8 @@ impl ThresholdSet {
             encryption,
             delegated_sql_caveats: false,
             named_keys: false,
+            #[cfg(test)]
+            between_passes: None,
         }
     }
 
@@ -1008,6 +1021,12 @@ impl ThresholdSet {
     pub fn with_delegation_rules(mut self, delegated_sql_caveats: bool, named_keys: bool) -> Self {
         self.delegated_sql_caveats = delegated_sql_caveats;
         self.named_keys = named_keys;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_between_passes(mut self, hook: PassHook) -> Self {
+        self.between_passes = Some(hook);
         self
     }
 
@@ -1089,7 +1108,11 @@ impl ThresholdSet {
         // A node holds only chains it serves: a certificate naming it, a
         // successor of a certificate it holds, which may leave it out, or the
         // verified predecessor of one it holds, so a node that joined at a
-        // reshare can hold the chain back to the genesis.
+        // reshare can hold the chain back to the genesis. Once it holds an
+        // activated genesis it also holds any other genesis of N, so an owner
+        // who activates two geneses with overlapping member sets is caught
+        // by every member holding either (`accept_activation`). Geneses with
+        // fully disjoint member sets stay undetectable.
         let names_this_node = verified
             .body()
             .members()
@@ -1106,7 +1129,16 @@ impl ThresholdSet {
             .is_some(),
             None => false,
         };
-        if !names_this_node && !continues_held && !self.precedes_held(network, &verified).await? {
+        let another_genesis = verified.body().previous().is_none()
+            && !self
+                .genesis_activations(&self.db, network)
+                .await?
+                .is_empty();
+        if !names_this_node
+            && !continues_held
+            && !another_genesis
+            && !self.precedes_held(network, &verified).await?
+        {
             return Err(AcceptError::Unavailable("not_a_member"));
         }
         let subject = hex::encode(verified.digest().as_bytes());
@@ -1137,30 +1169,26 @@ impl ThresholdSet {
         )
         .map_err(|_| refused("activation_invalid"))?;
         let tx = self.db.begin().await?;
+        let genesis = certificate.body().previous().is_none();
+        // The owner activated two geneses of N: hold this one too, so every
+        // member holding either, in whatever order, holds both and has no
+        // current certificate (`current_certificate`). N's rows stay as the
+        // first genesis made them.
+        let conflict = genesis
+            && self
+                .genesis_activations(&tx, network)
+                .await?
+                .iter()
+                .any(|(_, held)| *held != subject);
         let names_this_node = certificate
             .body()
             .members()
             .iter()
             .any(|member| member.node.as_str() == self.node_did);
-        let mut conflict = false;
-        if certificate.body().previous().is_none() && names_this_node {
-            match create_network(&tx, network, &certificate).await {
-                Ok(GenesisRow::This) => {}
-                Ok(GenesisRow::Another) => {
-                    // The owner activated two geneses of N: hold this one
-                    // too, so every member, whatever the order, holds both
-                    // and has no current certificate (`current_certificate`).
-                    let geneses = self.genesis_activations(&tx, network).await?;
-                    if !geneses.iter().any(|(_, held)| *held != subject) {
-                        tx.rollback().await?;
-                        return Err(AcceptError::Unavailable("network_exists"));
-                    }
-                    conflict = true;
-                }
-                Err(error) => {
-                    tx.rollback().await?;
-                    return Err(error);
-                }
+        if genesis && !conflict && names_this_node {
+            if let Err(error) = create_network(&tx, network, &certificate).await {
+                tx.rollback().await?;
+                return Err(error);
             }
         }
         let new = store(&tx, network, cid, ObjectKind::Activation, &subject, bytes).await?;
@@ -1304,7 +1332,11 @@ impl ThresholdSet {
                     | delegation::DelegationError::UnsupportedCaveat(_)
                     | delegation::DelegationError::SessionRetired(_)
                     | delegation::DelegationError::MissingParents
-                    | delegation::DelegationError::ChainTraversalLimitExceeded,
+                    | delegation::DelegationError::ChainTraversalLimitExceeded
+                    // A parent's effective window reads its revoked ancestry
+                    // and renewals here (`AuthGraphSnapshot`).
+                    | delegation::DelegationError::ExpiryExceedsParent
+                    | delegation::DelegationError::NotBeforePrecedesParent,
                 ) => Err(AcceptError::Unavailable("delegation_unstorable_here")),
                 delegation::Error::InvalidDelegation(_) => Err(refused("delegation_unstorable")),
             };
@@ -1318,7 +1350,8 @@ impl ThresholdSet {
     /// issuer's sign-out was not checked, and those descending from one
     /// (TC-3443): they authorize this revocation alone and stay out of the
     /// delegation graph, held only in the revocation object. The revocation
-    /// row follows when its target is in the graph.
+    /// row follows when its target is in the graph; otherwise the target is
+    /// tombstoned, so it is refused as revoked wherever it is posted later.
     async fn insert_revocation(
         &self,
         tx: &DatabaseTransaction,
@@ -1326,36 +1359,65 @@ impl ThresholdSet {
     ) -> Result<(), delegation::Error> {
         let revoker = plan.revocation.0.revoker.clone();
         crate::space_purge_records::operation_actors(tx, &[&revoker]).await?;
-        // Admit the whole chain in a savepoint first: a descendant of a
-        // signed-out issuer's delegation is checked against it there.
-        let staged = tx.begin().await?;
+        // Each pass admits the links not yet set aside in a savepoint, a
+        // descendant checked against its parent there, and is kept only if
+        // no link came back admitted for its issuer's sign-out alone. A
+        // sign-out landing between passes is caught by the next one. One
+        // committed after the last pass's read (PostgreSQL, read committed)
+        // is as with `/delegate`: a link first seen after the sign-out is
+        // refused at invocation while the retire row lives (TC-3443).
         let mut unstored = HashSet::new();
-        for item in &plan.chain {
-            let admission = self.process_carried(&staged, item).await?;
-            if matches!(admission, delegation::CarriedAdmission::RetiredIssuer)
-                || item
-                    .0
-                    .parents
-                    .iter()
-                    .any(|parent| unstored.contains(&Hash::from(*parent)))
-            {
-                unstored.insert(hash(&item.1));
-            }
-        }
-        if unstored.is_empty() {
-            staged.commit().await?;
-        } else {
-            staged.rollback().await?;
+        loop {
+            let set_aside = unstored.clone();
+            let staged = tx.begin().await?;
             for item in plan
                 .chain
                 .iter()
-                .filter(|item| !unstored.contains(&hash(&item.1)))
+                .filter(|item| !set_aside.contains(&hash(&item.1)))
             {
-                self.process_carried(tx, item).await?;
+                let admission = self.process_carried(&staged, item).await?;
+                if matches!(admission, delegation::CarriedAdmission::RetiredIssuer)
+                    || item
+                        .0
+                        .parents
+                        .iter()
+                        .any(|parent| unstored.contains(&Hash::from(*parent)))
+                {
+                    unstored.insert(hash(&item.1));
+                }
             }
-            if unstored.contains(&plan.target) {
-                return Ok(());
+            if unstored.len() == set_aside.len() {
+                staged.commit().await?;
+                break;
             }
+            staged.rollback().await?;
+            #[cfg(test)]
+            if let Some(hook) = &self.between_passes {
+                hook(tx).await;
+            }
+        }
+        if unstored.contains(&plan.target) {
+            // The target and any carried descendant of it: parents come
+            // before children in the chain.
+            let mut revoked = HashSet::from([plan.target]);
+            for item in &plan.chain {
+                if item
+                    .0
+                    .parents
+                    .iter()
+                    .any(|parent| revoked.contains(&Hash::from(*parent)))
+                {
+                    revoked.insert(hash(&item.1));
+                }
+            }
+            for item in plan
+                .chain
+                .iter()
+                .filter(|item| revoked.contains(&hash(&item.1)))
+            {
+                tombstone(tx, item).await?;
+            }
+            return Ok(());
         }
         let serialization = plan.revocation.1;
         let id = hash(&serialization);
@@ -1617,22 +1679,14 @@ async fn current_certificate<C: ConnectionTrait>(
     }
 }
 
-/// Which genesis N's threshold network row is from.
-enum GenesisRow {
-    This,
-    /// Another genesis's: its master public key differs. The row is left as
-    /// it is.
-    Another,
-}
-
 /// Gate B §4.3: a member creates N's network row and member rows from N's
-/// activated genesis. A row of N that is not a threshold row leaves the
-/// activation unavailable.
+/// activated genesis. A row already there must be this genesis's threshold
+/// row; another row of N leaves the activation unavailable.
 async fn create_network(
     tx: &DatabaseTransaction,
     network: &NetworkId,
     genesis: &VerifiedCertificate,
-) -> Result<GenesisRow, AcceptError> {
+) -> Result<(), AcceptError> {
     let body = genesis.body();
     let public = body.public_material();
     let public_key = public.master_public_key().encode().to_vec();
@@ -1663,11 +1717,8 @@ async fn create_network(
         .one(tx)
         .await?
         .ok_or_else(|| DbErr::RecordNotFound("encryption_network".to_string()))?;
-    if row.key_backend != KeyBackendKind::Threshold.as_str() {
+    if row.key_backend != KeyBackendKind::Threshold.as_str() || row.public_key != public_key {
         return Err(AcceptError::Unavailable("network_exists"));
-    }
-    if row.public_key != public_key {
-        return Ok(GenesisRow::Another);
     }
     for member in body.members() {
         encryption_network_member::Entity::insert(encryption_network_member::ActiveModel {
@@ -1688,7 +1739,7 @@ async fn create_network(
         .exec_without_returning(tx)
         .await?;
     }
-    Ok(GenesisRow::This)
+    Ok(())
 }
 
 async fn find_object<C: ConnectionTrait>(
@@ -1743,6 +1794,38 @@ async fn network_revoked<C: ConnectionTrait>(db: &C, network: &NetworkId) -> Res
             .await?
             .is_some(),
     )
+}
+
+/// Tombstones a revoked delegation this node keeps no row for, under its own
+/// hash and its canonical hash, as a space purge does: `/delegate` and any
+/// later carried path refuse it as revoked.
+async fn tombstone(tx: &DatabaseTransaction, target: &Delegation) -> Result<(), DbErr> {
+    let own = hash(&target.1);
+    let canonical = delegation_cid_alias::canonical_hash(&target.1)?;
+    let now = OffsetDateTime::now_utc();
+    let ids = if own == canonical {
+        vec![own]
+    } else {
+        vec![own, canonical]
+    };
+    let rows = ids.into_iter().map(|id| revocation_tombstone::ActiveModel {
+        delegation_canonical: Set(id),
+        delegation_expiry: Set(target.0.expiry),
+        revoked_at: Set(Some(now)),
+        recorded_at: Set(now),
+    });
+    match revocation_tombstone::Entity::insert_many(rows)
+        .on_conflict(
+            OnConflict::column(revocation_tombstone::Column::DelegationCanonical)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(tx)
+        .await
+    {
+        Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn record_fault<C: ConnectionTrait>(
