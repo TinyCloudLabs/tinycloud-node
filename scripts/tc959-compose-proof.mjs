@@ -189,7 +189,7 @@ export function diagnosticCounts(events) {
  * `tinycloud` at the `threshold_share_dir` path, no ssh-gateway service
  * exists, and production declares and mounts no `threshold-shares` volume.
  */
-export function assertThresholdMemberCompose(member, production, profilesOutput = '') {
+export function assertThresholdMemberCompose(member, production, profilesOutput) {
   const share = 'threshold-shares';
   const target = '/var/lib/tinycloud/threshold';
   const memberServices = member.services ?? {};
@@ -249,6 +249,9 @@ export function assertThresholdMemberCompose(member, production, profilesOutput 
   // external or driver-bridged network could carry member traffic off-CVM.
   for (const [name, definition] of Object.entries(member.networks ?? {})) {
     assert.equal(name, 'default', `member_networks_allowlist_${name}`);
+    // Compose names the default network "<project>_default"; pin that shape
+    // and refuse any interpolation, so it can't alias an operator network.
+    assert.ok(!definition?.name?.includes('$') && definition?.name?.endsWith('_default'), `member_network_name_forbidden_${name}`);
     assert.equal(definition?.external, undefined, `member_external_network_${name}`);
     assert.equal(definition?.driver, undefined, `member_network_option_forbidden_${name}`);
     assert.equal(definition?.driver_opts, undefined, `member_network_option_forbidden_${name}`);
@@ -259,6 +262,8 @@ export function assertThresholdMemberCompose(member, production, profilesOutput 
       assert.equal(net, 'default', `member_network_not_allowed_in_${name}_${net}`);
     }
   }
+  // `host` mode would publish the unauthenticated metrics port off-CVM.
+  assert.equal(memberServices.tinycloud.network_mode, undefined, 'member_network_mode_forbidden_in_tinycloud');
   assert.ok(!Object.keys(production.volumes ?? {}).includes(share), 'production_share_volume_forbidden');
   for (const [name, service] of Object.entries(production.services ?? {})) {
     assert.equal((service?.volumes ?? []).map(volumeEnds).filter(ends => ends.source === share || ends.target === target).length, 0, `production_share_volume_mounted_in_${name}`);

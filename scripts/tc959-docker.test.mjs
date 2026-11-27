@@ -290,75 +290,75 @@ function productionComposeFixture() {
 }
 
 test('the member compose mounts threshold-shares only in tinycloud at the share dir (TC-2224)', () => {
-  assertThresholdMemberCompose(memberComposeFixture(), productionComposeFixture());
+  assertThresholdMemberCompose(memberComposeFixture(), productionComposeFixture(), '');
 });
 
 test('a member compose with ssh-gateway is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services['ssh-gateway'] = { image: 'alpine/socat' };
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_ssh_gateway_forbidden/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_ssh_gateway_forbidden/);
 });
 
 test('a member compose where another service mounts the share volume is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.postgres.volumes.push({ type: 'volume', source: 'threshold-shares', target: '/var/lib/tinycloud/threshold' });
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_in_postgres/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_share_volume_mounted_in_postgres/);
 });
 
 test('a member compose where another service mounts the share path under a different name is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.postgres.volumes.push({ type: 'volume', source: 'pgdata', target: '/var/lib/tinycloud/threshold' });
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_in_postgres/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_share_volume_mounted_in_postgres/);
 });
 
 test('a member compose without the share mount in tinycloud is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.tinycloud.volumes = member.services.tinycloud.volumes.filter(volume => volume.target !== '/var/lib/tinycloud/threshold');
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_once/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_share_volume_mounted_once/);
 });
 
 test('a member compose mounting the share dir as a bind or a second mount is refused (TC-2224)', () => {
   const bound = memberComposeFixture();
   bound.services.tinycloud.volumes[1] = { type: 'bind', source: '/srv/threshold', target: '/var/lib/tinycloud/threshold' };
-  assert.throws(() => assertThresholdMemberCompose(bound, productionComposeFixture()), /member_share_mount_must_be_a_named_volume/);
+  assert.throws(() => assertThresholdMemberCompose(bound, productionComposeFixture(), ''), /member_share_mount_must_be_a_named_volume/);
 
   const twice = memberComposeFixture();
   twice.services.tinycloud.volumes.push({ type: 'volume', source: 'other', target: '/var/lib/tinycloud/threshold' });
-  assert.throws(() => assertThresholdMemberCompose(twice, productionComposeFixture()), /member_share_volume_mounted_once/);
+  assert.throws(() => assertThresholdMemberCompose(twice, productionComposeFixture(), ''), /member_share_volume_mounted_once/);
 });
 
 test('a member compose without threshold_share_dir set is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   delete member.services.tinycloud.environment.TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR;
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_threshold_share_dir_unset/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_threshold_share_dir_unset/);
 });
 
 test('a member compose without a declared threshold-shares volume is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   delete member.volumes['threshold-shares'];
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_declared/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_share_volume_declared/);
 });
 
 test('a production compose with a threshold-shares volume is refused (TC-2224)', () => {
   const declared = productionComposeFixture();
   declared.volumes['threshold-shares'] = {};
-  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), declared), /production_share_volume_forbidden/);
+  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), declared, ''), /production_share_volume_forbidden/);
 
   const mounted = productionComposeFixture();
   mounted.services['ssh-gateway'].volumes.push({ type: 'volume', source: 'threshold-shares', target: '/var/lib/tinycloud/threshold' });
-  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), mounted), /production_share_volume_mounted_in_ssh-gateway/);
+  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), mounted, ''), /production_share_volume_mounted_in_ssh-gateway/);
 });
 
 test('a member compose with any service outside {tinycloud, postgres} is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services['dstack-ingress'] = { image: 'ingress', volumes: [], environment: {} };
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_service_allowlist/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_service_allowlist/);
 });
 
 test('postgres may not inherit volumes through volumes_from (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.postgres.volumes_from = ['tinycloud'];
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_key_not_allowed_in_postgres_volumes_from/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_key_not_allowed_in_postgres_volumes_from/);
 });
 
 test('postgres may not mount the dstack socket or its parent dirs, short or long syntax (TC-2224)', () => {
@@ -369,7 +369,7 @@ test('postgres may not mount the dstack socket or its parent dirs, short or long
   ]) {
     const member = memberComposeFixture();
     member.services.postgres.volumes.push(volume);
-    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_dstack_socket_only_in_tinycloud/, JSON.stringify(volume));
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_dstack_socket_only_in_tinycloud/, JSON.stringify(volume));
   }
   for (const volume of [
     { type: 'bind', source: '/var/run/dstack.sock', target: '/var/run/dstack.sock' },
@@ -379,37 +379,37 @@ test('postgres may not mount the dstack socket or its parent dirs, short or long
   ]) {
     const member = memberComposeFixture();
     member.services.postgres.volumes.push(volume);
-    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_dstack_socket_only_in_tinycloud/, JSON.stringify(volume));
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_dstack_socket_only_in_tinycloud/, JSON.stringify(volume));
   }
 });
 
 test('a member named volume with driver_opts, driver, external or an unlisted key is refused (TC-2224)', () => {
   const opts = memberComposeFixture();
   opts.volumes['threshold-shares'] = { driver_opts: { type: 'local', device: '/var/run', o: 'bind' } };
-  assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture()), /member_volume_option_forbidden_threshold-shares/);
+  assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture(), ''), /member_volume_option_forbidden_threshold-shares/);
 
   const driver = memberComposeFixture();
   driver.volumes['threshold-shares'] = { driver: 'local' };
-  assert.throws(() => assertThresholdMemberCompose(driver, productionComposeFixture()), /member_volume_option_forbidden_threshold-shares/);
+  assert.throws(() => assertThresholdMemberCompose(driver, productionComposeFixture(), ''), /member_volume_option_forbidden_threshold-shares/);
 
   const external = memberComposeFixture();
   external.volumes['threshold-shares'] = { external: true };
-  assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture()), /member_volume_option_forbidden_threshold-shares/);
+  assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture(), ''), /member_volume_option_forbidden_threshold-shares/);
 
   const device = memberComposeFixture();
   device.services.postgres.volumes.push({ type: 'volume', source: 'shadow', target: '/srv/shadow' });
   device.volumes.shadow = { driver_opts: { type: 'local', device: '/var/run', o: 'bind' } };
-  assert.throws(() => assertThresholdMemberCompose(device, productionComposeFixture()), /member_postgres_volumes_allowlist|member_volumes_allowlist_shadow/);
+  assert.throws(() => assertThresholdMemberCompose(device, productionComposeFixture(), ''), /member_postgres_volumes_allowlist|member_volumes_allowlist_shadow/);
 
   const extra = memberComposeFixture();
   extra.volumes['node-data'] = {};
-  assert.throws(() => assertThresholdMemberCompose(extra, productionComposeFixture()), /member_volumes_allowlist_node-data/);
+  assert.throws(() => assertThresholdMemberCompose(extra, productionComposeFixture(), ''), /member_volumes_allowlist_node-data/);
 });
 
 test('two member volume keys rendering the same docker name are refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.volumes['shares-alias'] = { name: 'threshold-shares' };
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_duplicate_volume_name/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_duplicate_volume_name/);
 });
 
 test('a postgres host bind is refused (TC-2224)', () => {
@@ -419,7 +419,7 @@ test('a postgres host bind is refused (TC-2224)', () => {
   ]) {
     const member = memberComposeFixture();
     member.services.postgres.volumes.push(volume);
-    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_host_bind_mount_in_postgres/, JSON.stringify(volume));
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_host_bind_mount_in_postgres/, JSON.stringify(volume));
   }
 });
 
@@ -436,27 +436,27 @@ test('a non-tinycloud service may carry only the postgres render keys (TC-2224)'
   ]) {
     const member = memberComposeFixture();
     member.services.postgres[key] = value;
-    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), new RegExp(`member_key_not_allowed_in_postgres_${key}`), key);
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), new RegExp(`member_key_not_allowed_in_postgres_${key}`), key);
   }
 });
 
 test('a profiled member service is refused (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.postgres.profiles = ['tools'];
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_profiles_forbidden/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_profiles_forbidden/);
 });
 
 test('a profiled extra service is refused by the allowlist after --profile render (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.debug = { image: 'alpine', profiles: ['debug'] };
-  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_service_allowlist/);
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_service_allowlist/);
 });
 
 test('a source-less tmpfs on postgres is not misreported as a socket mount (TC-2224)', () => {
   const member = memberComposeFixture();
   member.services.postgres.volumes.push({ type: 'tmpfs', target: '/run' });
   assert.throws(
-    () => assertThresholdMemberCompose(member, productionComposeFixture()),
+    () => assertThresholdMemberCompose(member, productionComposeFixture(), ''),
     (error) => /member_postgres_volumes_allowlist/.test(error.message) && !/dstack_socket/.test(error.message)
   );
 });
@@ -465,30 +465,46 @@ test('interpolated volume names and mount paths are refused on the member compos
   const colliding = memberComposeFixture();
   colliding.volumes.pgdata = { name: '${PG_VOL:-same}' };
   colliding.volumes['threshold-shares'] = { name: '${SHARE_VOL:-same}' };
-  assert.throws(() => assertThresholdMemberCompose(colliding, productionComposeFixture()), /member_volume_name_interpolated_pgdata/);
+  assert.throws(() => assertThresholdMemberCompose(colliding, productionComposeFixture(), ''), /member_volume_name_interpolated_pgdata/);
 
   for (const [field, value] of [['source', '${VOL}'], ['target', '/var/lib/${DIR}/data']]) {
     const member = memberComposeFixture();
     member.services.postgres.volumes[0] = { type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data', [field]: value };
-    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_mount_interpolated_postgres/, field);
+    assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_mount_interpolated_postgres/, field);
   }
 });
 
 test('only the member render\'s default network may exist or be used (TC-2224)', () => {
   const external = memberComposeFixture();
   external.networks = { default: { name: 'x_default' }, host: { external: true } };
-  assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture()), /member_networks_allowlist_host/);
+  assert.throws(() => assertThresholdMemberCompose(external, productionComposeFixture(), ''), /member_networks_allowlist_host/);
 
   const opts = memberComposeFixture();
   opts.networks = { default: { name: 'x_default', driver_opts: { x: 'y' } } };
-  assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture()), /member_network_option_forbidden_default/);
+  assert.throws(() => assertThresholdMemberCompose(opts, productionComposeFixture(), ''), /member_network_option_forbidden_default/);
 
   const joined = memberComposeFixture();
   joined.networks = { default: { name: 'x_default' }, dmz: { name: 'x_dmz' } };
   joined.services.postgres.networks = { default: null, dmz: null };
-  assert.throws(() => assertThresholdMemberCompose(joined, productionComposeFixture()), /member_networks_allowlist_dmz/);
+  assert.throws(() => assertThresholdMemberCompose(joined, productionComposeFixture(), ''), /member_networks_allowlist_dmz/);
 });
 
 test('a non-empty profiles listing is refused (TC-2224)', () => {
   assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), productionComposeFixture(), 'tools\n'), /member_profiles_forbidden/);
+});
+
+test('the member default network name must be the project-shaped render name (TC-2224)', () => {
+  const named = memberComposeFixture();
+  named.networks = { default: { name: 'host' } };
+  assert.throws(() => assertThresholdMemberCompose(named, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
+
+  const interpolated = memberComposeFixture();
+  interpolated.networks = { default: { name: '${NET:-default}' } };
+  assert.throws(() => assertThresholdMemberCompose(interpolated, productionComposeFixture(), ''), /member_network_name_forbidden_default/);
+});
+
+test('tinycloud may not set network_mode (TC-2224)', () => {
+  const member = memberComposeFixture();
+  member.services.tinycloud.network_mode = 'host';
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture(), ''), /member_network_mode_forbidden_in_tinycloud/);
 });
