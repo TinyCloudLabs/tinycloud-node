@@ -87,6 +87,7 @@ pub mod public;
 pub mod session;
 #[cfg(feature = "tc-bench-v1")]
 pub mod tc_bench;
+pub mod threshold;
 pub mod util;
 use util::LimitedReader;
 

@@ -826,6 +826,16 @@ fn named_key_routes() -> Vec<Route> {
     ]
 }
 
+/// The routes the node serves: [`production_routes`], plus the threshold
+/// authorization set routes when `threshold_v1` is on.
+fn served_routes(named_keys_v1: bool, threshold_v1: bool) -> Vec<Route> {
+    let mut routes = production_routes(named_keys_v1);
+    if threshold_v1 {
+        routes.extend(routes::threshold::threshold_routes());
+    }
+    routes
+}
+
 /// The public Node surface keeps policy admission separate from the generic
 /// delegation and invocation data plane. Share-specific data routes are not
 /// mounted.
@@ -1135,6 +1145,11 @@ pub async fn app_with_control(
     let encryption_seal =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/encryption/network-seal"));
     let encryption_backend = std::sync::Arc::new(LocalOneOfOneBackend::new(encryption_seal));
+    let threshold_set = tinycloud_core::encryption_network::threshold_set::ThresholdSet::new(
+        database_connection.clone(),
+        key_setup.node_keypair(),
+        Some(column_encryption.clone()),
+    );
     let node_keypair = key_setup.node_keypair();
     let encryption_service = EncryptionService::new_with_node_keypair(
         database_connection.clone(),
@@ -1294,7 +1309,10 @@ pub async fn app_with_control(
         }
     }
     let tinycloud = tinycloud.with_named_keys(named_keys_enabled);
-    let routes = production_routes(named_keys_enabled);
+    let routes = served_routes(
+        named_keys_enabled,
+        tinycloud_config.encryption_network.threshold_v1,
+    );
     #[cfg(feature = "tc-bench-v1")]
     let mut routes = routes;
 
@@ -1663,6 +1681,7 @@ pub async fn app_with_control(
         .manage(session_retire_runtime)
         .manage(tee_context)
         .manage(encryption_service)
+        .manage(threshold_set)
         .manage(policy_v3_runtime)
         .manage(seed_conn.clone())
         .manage(tinycloud_config.storage.staging.open().await?);
@@ -2084,6 +2103,28 @@ mod production_route_tests {
             assert!(on.contains(&route), "missing while on: {route}");
         }
         assert_eq!(on.len(), off.len() + 6);
+    }
+
+    /// The threshold routes are mounted only with `threshold_v1` on.
+    #[test]
+    fn threshold_routes_are_mounted_only_when_threshold_v1_is_on() {
+        let describe = |routes: Vec<rocket::Route>| -> Vec<String> {
+            routes
+                .into_iter()
+                .map(|route| format!("{} {}", route.method, route.uri))
+                .collect()
+        };
+        let off = describe(super::served_routes(true, false));
+        let on = describe(super::served_routes(true, true));
+        for route in [
+            "GET /threshold/<network_id>/chain",
+            "POST /threshold/<network_id>/objects",
+        ] {
+            let route = route.to_string();
+            assert!(!off.contains(&route), "mounted while off: {route}");
+            assert!(on.contains(&route), "missing while on: {route}");
+        }
+        assert_eq!(off, describe(production_routes(true)));
     }
 }
 
