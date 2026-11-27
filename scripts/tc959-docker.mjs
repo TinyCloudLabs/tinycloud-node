@@ -423,7 +423,7 @@ export async function main(args = process.argv.slice(2)) {
     phase = 'compose_member_mounts';
     // TC-2224: the threshold member compose shares the tinycloud boundary, so
     // the same no-secret-files rules and the share-volume exclusivity apply.
-    const memberUnresolved = JSON.parse(docker(...['compose', '--env-file', '/dev/null', '-f', join(root, 'docker-compose.dstack-threshold-member.yaml'), 'config', '--no-interpolate', '--no-env-resolution', '--format', 'json']));
+    const memberUnresolved = JSON.parse(docker(...['compose', '--env-file', '/dev/null', '--profile', '*', '-f', join(root, 'docker-compose.dstack-threshold-member.yaml'), 'config', '--no-interpolate', '--no-env-resolution', '--format', 'json']));
     assert.equal(memberUnresolved.secrets, undefined, 'deployment_secret_files_forbidden');
     assert.equal(memberUnresolved.configs, undefined, 'deployment_config_files_forbidden');
     for (const service of Object.values(memberUnresolved.services)) assert.equal(service.env_file, undefined, 'deployment_env_files_forbidden');

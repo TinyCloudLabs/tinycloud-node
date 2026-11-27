@@ -212,16 +212,17 @@ export function assertThresholdMemberCompose(member, production) {
   assert.ok(Object.keys(member.volumes ?? {}).includes(share), 'member_share_volume_declared');
   for (const [name, service] of Object.entries(memberServices)) {
     if (name === 'tinycloud') continue;
-    assert.equal(service.volumes_from, undefined, `member_dstack_socket_only_in_tinycloud_${name}`);
-    for (const key of ['pid', 'ipc', 'privileged', 'cap_add', 'devices', 'network_mode']) {
-      assert.equal(service[key], undefined, `member_${key}_forbidden_in_${name}`);
+    // A non-tinycloud service may carry only the keys the reviewed postgres
+    // render uses; every other key is refused, allowed or not (TC-2224).
+    for (const key of Object.keys(service)) {
+      assert.ok(['environment', 'healthcheck', 'image', 'networks', 'volumes'].includes(key), `member_key_not_allowed_in_${name}_${key}`);
     }
     const volumes = (service.volumes ?? []).map(volumeEnds);
     assert.equal(volumes.filter(ends => ends.source === share || ends.target === target).length, 0, `member_share_volume_mounted_in_${name}`);
-    const socketMount = volumes.find(ends => ends.source === 'dstack.sock' || ends.target === 'dstack.sock' || ends.source === 'tappd.sock' || ends.target === 'tappd.sock'
+    const socketMount = volumes.find(ends => ['bind', 'volume', undefined].includes(ends.type) && (ends.source === 'dstack.sock' || ends.target === 'dstack.sock' || ends.source === 'tappd.sock' || ends.target === 'tappd.sock'
       || (ends.source ?? '').endsWith('/dstack.sock') || (ends.target ?? '').endsWith('/dstack.sock')
       || (ends.source ?? '').endsWith('/tappd.sock') || (ends.target ?? '').endsWith('/tappd.sock')
-      || ['/', '/var', '/run', '/var/run'].includes((ends.source ?? '').replace(/\/+$/, '') || '/'));
+      || ['/', '/var', '/run', '/var/run'].includes((ends.source ?? '').replace(/\/+$/, '') || '/')));
     assert.equal(socketMount, undefined, `member_dstack_socket_only_in_tinycloud_${name}`);
     const hostBind = volumes.find(ends => ends.type === 'bind' || /^(\/|\.|~)/.test(ends.source ?? ''));
     assert.equal(hostBind, undefined, `member_host_bind_mount_in_${name}`);
@@ -231,9 +232,9 @@ export function assertThresholdMemberCompose(member, production) {
   assert.equal(new Set(dockerNames).size, dockerNames.length, 'member_duplicate_volume_name');
   for (const [name, definition] of Object.entries(member.volumes ?? {})) {
     assert.ok(['pgdata', 'threshold-shares'].includes(name), `member_volumes_allowlist_${name}`);
-    assert.equal(definition?.driver, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
-    assert.equal(definition?.driver_opts, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
-    assert.equal(definition?.external, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
+    assert.equal(definition?.driver, undefined, `member_volume_option_forbidden_${name}`);
+    assert.equal(definition?.driver_opts, undefined, `member_volume_option_forbidden_${name}`);
+    assert.equal(definition?.external, undefined, `member_volume_option_forbidden_${name}`);
   }
   assert.ok(!Object.keys(production.volumes ?? {}).includes(share), 'production_share_volume_forbidden');
   for (const [name, service] of Object.entries(production.services ?? {})) {
