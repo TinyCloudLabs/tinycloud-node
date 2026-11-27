@@ -196,11 +196,11 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
   // Floor: reconstruction may not leave fewer than t QUAL dealers. It is an abort after R5, so it precedes the round count.
   if (qual.length - reconstructed.length < t) fail('ExcessiveReconstruction');
   if (rounds.length !== (reconstructed.length ? 6 : 5)) fail('InvalidRound');
-  // Every sender of closed R6 must have exactly one envelope in closed R4 and in closed R5 (presence, not content).
-  if (r6?.some(m => sender(r4!, m.index).kind !== 'single' || sender(r5!, m.index).kind !== 'single')) fail('OwnMessageOmitted');
+  // R6 values count only from senders with a unique envelope (after byte-identical deduplication) in both closed R4 and R5.
+  const eligible = members.filter(j => sender(r4!, j).kind === 'single' && sender(r5!, j).kind === 'single');
   for (const i of reconstructed) {
     const values: [number, bigint][] = [];
-    for (const j of members) {
+    for (const j of eligible) {
       const m = sender(r6!, j);
       const pair = (m.kind === 'single' ? attempt(decodePairs, m.payload) : undefined)?.get(i);
       if (pair && pedersen(deals.get(i)!, j, pair)) values.push([j, pair[0]]);

@@ -1,4 +1,4 @@
-// TC-2226: the R6 reconstruction floor, the R6-sender presence rule and the genesis/re-key activation budget.
+// TC-2226: the R6 reconstruction floor, R6 eligibility by own R4/R5 presence and the genesis/re-key activation budget.
 // Transcripts and certificates are built from SPEC byte layouts in testkit.ts and signed by the fixture keys.
 import { describe, expect, test } from 'bun:test';
 import { ed25519 } from '@noble/curves/ed25519.js';
@@ -56,39 +56,36 @@ for (const [kind, setup, pinned] of KINDS) {
     });
   });
 
-  describe(`${kind}: R6 senders need exactly one R4 and one R5 (OwnMessageOmitted)`, () => {
+  describe(`${kind}: R6 values count only from senders with a unique R4 and R5`, () => {
     const s = setup(`${kind}-own-message`, 3, 5), d5 = s.dealers[4]!;
     const recovered = (rounds: Draft[][], senders: number[]) => run(s, [...rounds, r6(s, [5], senders)], pinned);
     const refused = (rounds: Draft[][], senders: number[]) => code(() => recovered(rounds, senders));
-    test('an R6 from a member whose R4 is missing', () => {
-      const rounds = replace(s, 4, 5);
-      expectRecovered(recovered(rounds, [1, 2, 3]), s, [5]);
-      expect(refused(rounds, [1, 2, 3, 5])).toBe('OwnMessageOmitted');
+    /** The ineligible sender's Pedersen-valid R6 changes nothing with t eligible senders and cannot make up a missing t-th. */
+    function ignored(rounds: Draft[][], eligible: number[], ineligible: number) {
+      expectRecovered(recovered(rounds, eligible), s, [5]);
+      expectRecovered(recovered(rounds, [...eligible, ineligible]), s, [5]);
+      expect(refused(rounds, [...eligible.slice(0, 2), ineligible])).toBe('InsufficientRecovery');
+    }
+    test('an R6 from a member whose R4 is missing is ignored', () => {
+      ignored(replace(s, 4, 5), [1, 2, 3], 5);
     });
-    test('an R6 from a member whose R5 is missing', () => {
-      const rounds = replace(replace(s, 4, 5), 5, 4);
-      expectRecovered(recovered(rounds, [1, 2, 3]), s, [5]);
-      expect(refused(rounds, [1, 2, 3, 4])).toBe('OwnMessageOmitted');
+    test('an R6 from a member whose R5 is missing is ignored', () => {
+      ignored(replace(replace(s, 4, 5), 5, 4), [1, 2, 3], 4);
     });
-    test('an R6 from a member with two different R4', () => {
-      const rounds = replace(s, 4, 5, msg(5, feldman(d5.A)), msg(5, feldman([...d5.A].reverse())));
-      expectRecovered(recovered(rounds, [1, 2, 3]), s, [5]);
-      expect(refused(rounds, [1, 2, 3, 5])).toBe('OwnMessageOmitted');
+    test('an R6 from a member with two different R4 is ignored', () => {
+      ignored(replace(s, 4, 5, msg(5, feldman(d5.A)), msg(5, feldman([...d5.A].reverse()))), [1, 2, 3], 5);
     });
-    test('an R6 from a member with two different R5', () => {
-      const rounds = replace(replace(s, 4, 5), 5, 2, msg(2, pairs([])), msg(2, pairs([[1, ...pair(s.dealers[0]!, 2)]])));
-      expectRecovered(recovered(rounds, [1, 3, 4]), s, [5]);
-      expect(refused(rounds, [1, 2, 3, 4])).toBe('OwnMessageOmitted');
+    test('an R6 from a member with two different R5 is ignored', () => {
+      ignored(replace(replace(s, 4, 5), 5, 2, msg(2, pairs([])), msg(2, pairs([[1, ...pair(s.dealers[0]!, 2)]]))), [1, 3, 4], 2);
     });
     test('presence, not content: a byte-identical repeat is one envelope, and a malformed R4 is still present', () => {
       const repeated = replace(replace(s, 4, 5), 5, 1, msg(1, pairs([])), msg(1, pairs([])));
       expectRecovered(recovered(repeated, [1, 2, 3]), s, [5]);
       const malformed = replace(s, 4, 5, msg(5, feldman(d5.A.slice(0, 2))));
-      expectRecovered(recovered(malformed, [1, 2, 3, 5]), s, [5]);
+      expectRecovered(recovered(malformed, [1, 2, 5]), s, [5]);
     });
-    test('the R6-sender rule is decided before interpolation', () => {
-      expect(refused(replace(s, 4, 5), [5])).toBe('OwnMessageOmitted');
-      expect(refused(replace(s, 4, 5), [1])).toBe('InsufficientRecovery');
+    test('only ineligible senders leave no values: InsufficientRecovery', () => {
+      expect(refused(replace(s, 4, 5), [5])).toBe('InsufficientRecovery');
     });
   });
 }
