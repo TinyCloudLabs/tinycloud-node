@@ -92,6 +92,7 @@ unicode-normalization = "0.1"
 idna = "1"
 reqwest = { version = "0.11", features = ["json"] }
 bs58 = "0.5"
+tinycloud-threshold = { path = "../tinycloud-threshold" }
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
