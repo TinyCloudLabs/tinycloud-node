@@ -75,6 +75,10 @@ pub const PURGED_BY_OWNER: &[(&str, &str)] = &[
     ("encryption_network_member", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
     ("encryption_ceremony", "owner erasure: retired owner, no live space, every purge of the owner complete; after the signed `erased` record"),
     ("encryption_audit", "owner erasure: the key-operation trail of an erased owner's networks; the signed `erased` record is the evidence that replaces it"),
+    ("threshold_set_object", "owner erasure: the authorization set of an erased owner's threshold networks; after the signed `erased` record"),
+    ("threshold_key_row", "owner erasure: key state of an erased owner's threshold networks; after the signed `erased` record"),
+    ("threshold_network_revocation", "owner erasure: revocation marker of an erased owner's threshold networks; after the signed `erased` record"),
+    ("threshold_fault", "owner erasure: fault records of an erased owner's threshold networks; after the signed `erased` record"),
 ];
 
 /// Tables a space purge does not delete by key, and why.
@@ -152,11 +156,15 @@ pub async fn delete_sql_and_hook_rows(
 const NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
 
 /// Tables holding an owner's encryption-network rows, children first.
-const OWNER_ENCRYPTION_TABLES: [&str; 5] = [
+const OWNER_ENCRYPTION_TABLES: [&str; 9] = [
     "encryption_ceremony",
     "encryption_network_member",
     "encryption_network_key",
     "encryption_audit",
+    "threshold_set_object",
+    "threshold_key_row",
+    "threshold_network_revocation",
+    "threshold_fault",
     "encryption_network",
 ];
 
@@ -183,7 +191,11 @@ pub async fn encryption_owners<C: ConnectionTrait>(conn: &C) -> Result<BTreeSet<
              UNION SELECT network_id FROM encryption_network_key
              UNION SELECT network_id FROM encryption_network_member
              UNION SELECT network_id FROM encryption_ceremony
-             UNION SELECT network_id FROM encryption_audit",
+             UNION SELECT network_id FROM encryption_audit
+             UNION SELECT network_id FROM threshold_set_object
+             UNION SELECT network_id FROM threshold_key_row
+             UNION SELECT network_id FROM threshold_network_revocation
+             UNION SELECT network_id FROM threshold_fault",
         ))
         .await?;
     let mut owners = BTreeSet::new();
@@ -248,7 +260,11 @@ async fn owner_network_ids<C: ConnectionTrait>(
              UNION SELECT network_id FROM encryption_network_key WHERE lower(network_id) LIKE $1
              UNION SELECT network_id FROM encryption_network_member WHERE lower(network_id) LIKE $1
              UNION SELECT network_id FROM encryption_ceremony WHERE lower(network_id) LIKE $1
-             UNION SELECT network_id FROM encryption_audit WHERE lower(network_id) LIKE $1",
+             UNION SELECT network_id FROM encryption_audit WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM threshold_set_object WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM threshold_key_row WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM threshold_network_revocation WHERE lower(network_id) LIKE $1
+             UNION SELECT network_id FROM threshold_fault WHERE lower(network_id) LIKE $1",
             [network.into()],
         ))
         .await?;
