@@ -169,6 +169,11 @@
       "status": "active"
     },
     {
+      "urn": "tinycloud.encryption/member.admit",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
       "urn": "tinycloud.encryption/key.create",
       "service": "tinycloud.encryption",
       "status": "active"
