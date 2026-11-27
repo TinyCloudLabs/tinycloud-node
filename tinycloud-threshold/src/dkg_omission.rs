@@ -644,6 +644,72 @@ fn activation_refusals(kind: &str, run: &Run) -> Vec<Value> {
     .collect()
 }
 
+/// A 2-of-3 ceremony where dealers 2 and 3 publish no R1, so |QUAL| = 1 < t
+/// after R3, with a closed R4 appended: member 1's signed R4 under an owner
+/// closure, or the same record with a junk closure signature.
+fn insufficient_qualified_with_r4(setup: Setup, seed: u8, junk: bool) -> Run {
+    let mut run = run_in(setup, 2, 3, seed, |out| {
+        if out.round() == 1 {
+            out.remove(2);
+            out.remove(3);
+        }
+    });
+    let c = &run.fixture.ceremony;
+    let signers = &run.fixture.signers;
+    let rounds = &run.transcript.rounds;
+    assert_eq!(rounds.len(), 3);
+    let mut previous = dkg_initial_transcript(c);
+    let (r1, r2, r3) = (&rounds[0], &rounds[1], &rounds[2]);
+    previous = ClosedRound::<DkgDeal>::verify(c, 1, &previous, &r1.closure, &r1.messages, signers)
+        .unwrap()
+        .transcript_hash();
+    previous =
+        ClosedRound::<DkgComplaints>::verify(c, 2, &previous, &r2.closure, &r2.messages, signers)
+            .unwrap()
+            .transcript_hash();
+    previous =
+        ClosedRound::<DkgAnswers>::verify(c, 3, &previous, &r3.closure, &r3.messages, signers)
+            .unwrap()
+            .transcript_hash();
+    let payload = DkgFeldman {
+        commitments: vec![G2::generator(); 2],
+    }
+    .encode();
+    let bytes = ceremony_message_body(c, 4, MemberCohort::Recipients, idx(1), &payload).unwrap();
+    let message = SignedStatement {
+        signature: signers.sign(
+            &Signers::did(1),
+            &crate::ceremony::ceremony_message_preimage(&bytes).unwrap(),
+        ),
+        bytes,
+    };
+    let messages = vec![message];
+    let bytes = round_closure_body(c, 4, &previous, &messages).unwrap();
+    let mut closure = SignedStatement {
+        signature: signers.sign(
+            &signers.anchor().expected_owner,
+            &round_closure_preimage(&bytes).unwrap(),
+        ),
+        bytes,
+    };
+    let closed = ClosedRound::<DkgFeldman>::verify(c, 4, &previous, &closure, &messages, signers);
+    assert!(closed.is_ok());
+    if junk {
+        closure.signature = vec![0xa5; closure.signature.len()];
+        let closed =
+            ClosedRound::<DkgFeldman>::verify(c, 4, &previous, &closure, &messages, signers);
+        assert!(closed.is_err());
+    }
+    run.transcript
+        .rounds
+        .push(DkgRoundRecord { closure, messages });
+    for i in 1..=3 {
+        assert!(stopped_with(&run, i, Error::InsufficientQualified));
+    }
+    assert_eq!(run.verify().unwrap_err(), Error::InsufficientQualified);
+    run
+}
+
 fn omission_vectors() -> Value {
     let mut cases = Vec::new();
     let mut seeds = Vec::new();
@@ -652,7 +718,7 @@ fn omission_vectors() -> Value {
             Setup::Genesis => ("genesis", 0xa0u8),
             Setup::Rekey => ("rekey", 0xb0),
         };
-        seeds.extend(base..base + 5);
+        seeds.extend(base..base + 6);
         let floor = run_in(setup, 3, 5, base, |out| {
             if out.round() == 4 {
                 for i in 1..=3 {
@@ -678,6 +744,12 @@ fn omission_vectors() -> Value {
             case(&format!("{kind}_3of5_chosen_master_key"), "Dealer 5's R4 is chosen after the other R4 so that mpk is a fixed point; it passes the checks of honest members 1 and 2 only. Honest member 3's R5 is omitted and it stops after R5; faulty members 4 and 5 send empty R5 and may claim readiness without a matching share. The transcript verifies with nothing reconstructed.", &chosen),
         ]);
         cases.extend(activation_refusals(kind, &chosen));
+        let trailing = insufficient_qualified_with_r4(setup, base + 5, false);
+        let bad = insufficient_qualified_with_r4(setup, base + 5, true);
+        cases.extend([
+            case(&format!("{kind}_insufficient_qualified_with_trailing_r4"), "2-of-3: dealers 2 and 3 publish no R1, so QUAL is dealer 1 alone after R3, fewer than t = 2. A validly signed closed R4 carrying member 1's signed R4 follows. The verifier returns InsufficientQualified after R3 without reading any later record.", &trailing),
+            case(&format!("{kind}_insufficient_qualified_with_bad_r4"), "The previous case with the R4 closure signature replaced by junk bytes. The R4 record is never authenticated, so the result is still InsufficientQualified.", &bad),
+        ]);
     }
     let signers: Vec<_> = (0..=5u8)
         .map(|i| {
