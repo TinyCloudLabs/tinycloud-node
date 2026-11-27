@@ -58,6 +58,10 @@ RUN mkdir -p /scratch-tmp && chmod 1777 /scratch-tmp
 # Directory for the deletion ledger (`deletion_ledger_path`), owned by the
 # runtime user so a named volume mounted here is writable by it.
 RUN mkdir -p /var/lib/tinycloud/ledger && chown 1000:1000 /var/lib/tinycloud/ledger && chmod 700 /var/lib/tinycloud/ledger
+# Directory for a threshold member's share volume (`threshold_share_dir`),
+# owned by the runtime user and private to it so a named volume mounted here
+# inherits both (TC-2224).
+RUN mkdir -p /var/lib/tinycloud/threshold && chown 1000:1000 /var/lib/tinycloud/threshold && chmod 700 /var/lib/tinycloud/threshold
 
 # Runtime stage
 FROM ${RUNTIME_BASE} AS runtime
@@ -67,6 +71,7 @@ COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud /tinycloud
 COPY --from=builder --chown=tinycloud:tinycloud /app/data ./data
 COPY --from=builder --chown=tinycloud:tinycloud /var/lib/tinycloud/ledger /var/lib/tinycloud/ledger
+COPY --from=builder --chown=tinycloud:tinycloud /var/lib/tinycloud/threshold /var/lib/tinycloud/threshold
 COPY ./tinycloud.toml ./
 COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud

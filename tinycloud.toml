@@ -127,6 +127,13 @@ cors = true
     ## `tinycloud node deletion-ledger replay`.
     ## Env: TINYCLOUD_ENCRYPTION_NETWORK__DELETION_LEDGER_PATH
     # deletion_ledger_path = "/var/lib/tinycloud/deletion-ledger.jsonl"
+    ## A threshold member's share directory: an absolute path on a private
+    ## volume only this node's container mounts. When set, the node is made
+    ## non-dumpable and the directory must exist with mode 0700, be owned by
+    ## the process and take an exclusive lock, or the start is refused.
+    ## Unset: the node is not a threshold member and no check runs.
+    ## Env: TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR
+    # threshold_share_dir = "/var/lib/tinycloud/threshold"
     ## Caps on live (not deleted) named keys per network; a create or a
     ## reinstall over a cap answers 403 `key_limit_exceeded`. Each must be
     ## above 0. Keys outside `secrets`:

@@ -1,0 +1,51 @@
+# dstack deployment - Threshold member (Postgres in CVM)
+# Derived from docker-compose.dstack-full.yaml: both tinycloud-node and a
+# disposable Postgres run inside the same CVM. The node is a threshold
+# member (TC-2224): the named volume `threshold-shares` is mounted only in
+# the tinycloud service at /var/lib/tinycloud/threshold, where
+# `threshold_share_dir` points. No other service, sidecar or backup job
+# mounts it, and there is no ssh-gateway.
+
+services:
+  tinycloud:
+    image: ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f # 1.20.6-dstack
+    ports:
+      # Port 8001 (Prometheus /metrics) is intentionally NOT published: the
+      # metrics handler is unauthenticated and serves every series to anyone,
+      # so it must stay internal to the CVM rather than reachable via the
+      # dstack gateway.
+      - "8000:8000"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - threshold-shares:/var/lib/tinycloud/threshold
+    environment:
+      TINYCLOUD_KEYS_TYPE: Dstack
+      TINYCLOUD_STORAGE_DATABASE: "postgres://tinycloud:tinycloud@postgres:5432/tinycloud"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: Local
+      TINYCLOUD_STORAGE_BLOCKS_PATH: /data/blocks
+      TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR: /var/lib/tinycloud/threshold
+      TINYCLOUD_LOG_LEVEL: normal
+      TINYCLOUD_CORS: "true"
+      ROCKET_ADDRESS: "0.0.0.0"
+      ROCKET_MAX_BLOCKING: "1024"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tinycloud
+      POSTGRES_PASSWORD: tinycloud
+      POSTGRES_DB: tinycloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinycloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  threshold-shares:
