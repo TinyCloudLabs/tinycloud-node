@@ -143,6 +143,7 @@ impl EncryptionService {
         if is_half_created(tx, &row).await? {
             return Err(EncryptionServiceError::NetworkNotFound);
         }
+        self.require_one_of_one_row(&row.key_backend)?;
 
         let mut rows = if target.is_prefix() {
             rows_under_prefix(tx, network, &target.key_path()).await?

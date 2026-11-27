@@ -312,6 +312,7 @@ impl EncryptionService {
     ) -> Result<CreateStep, EncryptionServiceError> {
         lock_network_row(tx, network).await?;
         let net = load_active_network(tx, network).await?;
+        self.require_one_of_one_row(&net.key_backend)?;
         let kind = loc.kind();
 
         if let Some(row) = find_key_row(tx, network, loc.path()).await? {
@@ -580,6 +581,7 @@ impl EncryptionService {
         }
         let network = network_of(loc)?;
         let net = load_active_network(&self.db, &network).await?;
+        self.require_one_of_one_row(&net.key_backend)?;
         let sealed = net
             .sealed_private_key
             .as_deref()
@@ -609,6 +611,7 @@ impl EncryptionService {
     ) -> Result<(i64, Vec<u8>), EncryptionServiceError> {
         let network = network_of(loc)?;
         let net = load_active_network(&self.db, &network).await?;
+        self.require_one_of_one_row(&net.key_backend)?;
         let row = find_key_row(&self.db, &network, loc.path())
             .await?
             .ok_or(EncryptionServiceError::KeyNotFound)?;

@@ -183,6 +183,10 @@ pub struct EncryptionNetworkConfig {
     pub key_cap_per_app_prefix: Option<u64>,
     #[serde(default)]
     pub key_cap_secrets: Option<u64>,
+    /// Serve encryption networks whose key backend is `threshold`. Off: such
+    /// a network is refused with `threshold_backend_disabled`.
+    #[serde(default)]
+    pub threshold_v1: bool,
 }
 
 impl EncryptionNetworkConfig {

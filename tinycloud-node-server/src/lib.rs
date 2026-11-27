@@ -1143,6 +1143,7 @@ pub async fn app_with_control(
     )
     .with_key_wrap_v2(tinycloud_config.encryption_network.key_wrap_v2)
     .with_key_wrap_require_v2(tinycloud_config.encryption_network.key_wrap_require_v2)
+    .with_threshold_v1(tinycloud_config.encryption_network.threshold_v1)
     .with_key_cap_per_network(
         tinycloud_config
             .encryption_network

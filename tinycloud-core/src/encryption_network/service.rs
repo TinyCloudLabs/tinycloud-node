@@ -50,10 +50,12 @@ use super::protocol::{
     DECRYPT_REQUEST_TYPE, DECRYPT_RESULT_TYPE, KEY_ADMIN_TYPE, KEY_BLOCK_ACTION, KEY_CREATE_ACTION,
     KEY_DESCRIBE_TYPE, KEY_UNBLOCK_ACTION, NETWORK_ADMIN_TYPE,
 };
+use super::threshold::{ThresholdBackendError, ThresholdKeyBackend};
 use super::types::{
     KeyBackendKind, NetworkDescriptor, NetworkMemberDescriptor, NetworkState, Threshold,
     ALG_X25519_AES256GCM, ALG_X25519_HKDF_AES256GCM,
 };
+use tinycloud_threshold::{DecryptRequest, EncryptedKeyShare, Epoch, PublicKeySet};
 
 const DEFAULT_INVOCATION_TTL_SECONDS: i64 = 300;
 
@@ -269,6 +271,14 @@ pub enum EncryptionServiceError {
     StrayAppKeyRows(u64),
     #[error("{0} key rows under secrets/ are not deletable keys; list them with: SELECT network_id, key_path, kind FROM encryption_network_key WHERE (key_path = 'secrets' OR substr(key_path, 1, 8) = 'secrets/') AND kind <> 'deletable'")]
     StraySecretKeyRows(u64),
+    #[error("threshold_backend_disabled: this network uses the threshold key backend, which is off on this node")]
+    ThresholdBackendDisabled,
+    #[error(
+        "key_backend_mismatch: this operation is not available for this network's key backend"
+    )]
+    KeyBackendMismatch,
+    #[error("threshold_backend: {0}")]
+    Threshold(#[from] ThresholdBackendError),
 }
 
 pub struct EncryptionService {
@@ -276,6 +286,10 @@ pub struct EncryptionService {
     pub(super) node_did: String,
     node_keypair: Option<Keypair>,
     pub(super) backend: Arc<dyn KeyBackend>,
+    /// `[global.encryption_network] threshold_v1`. Off: a threshold network
+    /// row is refused everywhere.
+    threshold_v1: bool,
+    threshold_backend: Option<Arc<dyn ThresholdKeyBackend>>,
     invocation_ttl_seconds: i64,
     key_wrap_version: KeyWrapVersion,
     key_wrap_require_v2: bool,
@@ -323,6 +337,8 @@ impl EncryptionService {
             node_did,
             node_keypair: None,
             backend,
+            threshold_v1: false,
+            threshold_backend: None,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             key_wrap_version: KeyWrapVersion::V1,
             key_wrap_require_v2: false,
@@ -349,6 +365,8 @@ impl EncryptionService {
             node_did,
             node_keypair: Some(node_keypair),
             backend,
+            threshold_v1: false,
+            threshold_backend: None,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
             key_wrap_version: KeyWrapVersion::V1,
             key_wrap_require_v2: false,
@@ -416,12 +434,99 @@ impl EncryptionService {
         self
     }
 
+    /// Serve threshold network rows (`[global.encryption_network]
+    /// threshold_v1`). Off by default: every read of such a row is refused
+    /// with `ThresholdBackendDisabled`.
+    pub fn with_threshold_v1(mut self, enabled: bool) -> Self {
+        self.threshold_v1 = enabled;
+        self
+    }
+
+    /// The backend that serves threshold network rows while `threshold_v1`
+    /// is on.
+    pub fn with_threshold_backend(mut self, backend: Arc<dyn ThresholdKeyBackend>) -> Self {
+        self.threshold_backend = Some(backend);
+        self
+    }
+
     pub fn node_did(&self) -> &str {
         &self.node_did
     }
 
     pub fn backend_kind(&self) -> KeyBackendKind {
         self.backend.kind()
+    }
+
+    /// The backend kind of a stored network row. A threshold row is refused
+    /// while `threshold_v1` is off. A string that does not parse is served
+    /// by the one-of-one backend, as it always was.
+    pub(super) fn row_backend(
+        &self,
+        key_backend: &str,
+    ) -> Result<KeyBackendKind, EncryptionServiceError> {
+        match KeyBackendKind::parse(key_backend) {
+            Some(KeyBackendKind::Threshold) if !self.threshold_v1 => {
+                Err(EncryptionServiceError::ThresholdBackendDisabled)
+            }
+            Some(kind) => Ok(kind),
+            None => Ok(KeyBackendKind::LocalOneOfOne),
+        }
+    }
+
+    /// Refuses a threshold network row on an operation of `self.backend`.
+    pub(super) fn require_one_of_one_row(
+        &self,
+        key_backend: &str,
+    ) -> Result<(), EncryptionServiceError> {
+        require_one_of_one(self.row_backend(key_backend)?)
+    }
+
+    /// The threshold backend for an active threshold network.
+    async fn active_threshold_network(
+        &self,
+        network_id: &NetworkId,
+    ) -> Result<&dyn ThresholdKeyBackend, EncryptionServiceError> {
+        let descriptor = self.get_network(network_id).await?;
+        if descriptor.key_backend != KeyBackendKind::Threshold {
+            return Err(EncryptionServiceError::KeyBackendMismatch);
+        }
+        match descriptor.state {
+            NetworkState::Active => {}
+            NetworkState::Revoked => return Err(EncryptionServiceError::NetworkRevoked),
+            other => {
+                return Err(EncryptionServiceError::NetworkNotActive(
+                    other.as_str().to_string(),
+                ))
+            }
+        }
+        self.threshold_backend
+            .as_deref()
+            .ok_or(EncryptionServiceError::Threshold(
+                ThresholdBackendError::NoKeyMaterial,
+            ))
+    }
+
+    /// The public key set of a threshold network at `epoch`.
+    pub async fn threshold_public_material(
+        &self,
+        network_id: &NetworkId,
+        epoch: Epoch,
+    ) -> Result<PublicKeySet, EncryptionServiceError> {
+        let backend = self.active_threshold_network(network_id).await?;
+        Ok(backend.public_material(network_id, epoch)?)
+    }
+
+    /// This member's encrypted decryption share of a threshold network, for
+    /// the key path and version the caller's capability authorized.
+    pub async fn threshold_derive_shares(
+        &self,
+        network_id: &NetworkId,
+        key_path: &str,
+        key_version: u64,
+        request: DecryptRequest,
+    ) -> Result<EncryptedKeyShare, EncryptionServiceError> {
+        let backend = self.active_threshold_network(network_id).await?;
+        Ok(backend.derive_shares(network_id, key_path, key_version, request)?)
     }
 
     /// Create a new network and complete a one-of-one ceremony in a single
@@ -754,8 +859,7 @@ impl EncryptionService {
         if state == NetworkState::Active && members.is_empty() {
             return Err(EncryptionServiceError::NetworkNotFound);
         }
-        let backend =
-            KeyBackendKind::parse(&model.key_backend).unwrap_or(KeyBackendKind::LocalOneOfOne);
+        let backend = self.row_backend(&model.key_backend)?;
 
         let descriptor = NetworkDescriptor {
             network_id: network_id.clone(),
@@ -1063,6 +1167,7 @@ impl EncryptionService {
 
         // ---- Network state ----
         let descriptor = self.get_network(network_id).await?;
+        require_one_of_one(descriptor.key_backend)?;
         match descriptor.state {
             NetworkState::Active => {}
             NetworkState::Revoked => {
@@ -1235,6 +1340,7 @@ impl EncryptionService {
             .ok_or(EncryptionServiceError::Unauthorized)?;
         check_decrypt_scope(target, &capability.resource.to_string(), &body, &facts)?;
         let descriptor = self.get_network(network_id).await?;
+        require_one_of_one(descriptor.key_backend)?;
         if descriptor.state != NetworkState::Active {
             return Err(EncryptionServiceError::NetworkNotActive(
                 descriptor.state.as_str().to_string(),
@@ -1301,6 +1407,7 @@ impl EncryptionService {
         check_decrypt_scope(target, &cap.resource.to_string(), &body, &facts)?;
 
         let (descriptor, sealed_private_key) = self.load_network(network_id).await?;
+        require_one_of_one(descriptor.key_backend)?;
         match descriptor.state {
             NetworkState::Active => {}
             NetworkState::Revoked => {
@@ -1625,6 +1732,14 @@ impl EncryptionService {
             }
         }
         Ok(())
+    }
+}
+
+/// Refuses a threshold network on an operation of the one-of-one backend.
+fn require_one_of_one(kind: KeyBackendKind) -> Result<(), EncryptionServiceError> {
+    match kind {
+        KeyBackendKind::Threshold => Err(EncryptionServiceError::KeyBackendMismatch),
+        KeyBackendKind::LocalOneOfOne | KeyBackendKind::Dstack => Ok(()),
     }
 }
 

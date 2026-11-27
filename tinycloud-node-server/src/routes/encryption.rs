@@ -878,6 +878,20 @@ pub(crate) fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::InvalidBody(_)
         | EncryptionServiceError::InvalidReceiverPublicKey
         | EncryptionServiceError::Base64(_) => Status::BadRequest,
+        EncryptionServiceError::ThresholdBackendDisabled
+        | EncryptionServiceError::KeyBackendMismatch => Status::Conflict,
+        EncryptionServiceError::Threshold(error) => {
+            use tinycloud_core::encryption_network::ThresholdBackendError as T;
+            match error {
+                T::UnauthorizedIdentity => Status::Unauthorized,
+                T::EpochMismatch | T::ContextMismatch => Status::Conflict,
+                T::InvalidRequest(_) => Status::BadRequest,
+                T::NoKeyMaterial | T::Source(_) => {
+                    super::note_error_code(ErrorCode::Encryption);
+                    Status::InternalServerError
+                }
+            }
+        }
     };
     (status, err.to_string())
 }
