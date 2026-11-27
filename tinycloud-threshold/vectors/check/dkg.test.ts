@@ -161,7 +161,7 @@ describe('R4–R6 extraction and reconstruction', () => {
   for (const [label, drafts] of faults) {
     test(`${label} R4 is an extraction fault recovered by R6; the dealer stays in QUAL`, () => {
       const faulted = replace(s, 4, 3, ...drafts);
-      const out = run(s, [...faulted, r6(s, [3])]);
+      const out = run(s, [...faulted, r6(s, [3], [1, 2])]);
       expect(out.reconstructed).toEqual([3]);
       expectPublic(out, s, members);
       expect(code(() => run(s, faulted))).toBe('InvalidRound');
@@ -187,7 +187,7 @@ describe('R4–R6 extraction and reconstruction', () => {
     }
   });
   test('fewer than t Pedersen-valid R6 values is InsufficientRecovery', () => {
-    const faulted = replace(s, 4, 3);
+    const faulted = replace(s, 4, 3, msg(3, feldman(s.dealers[2]!.A.slice(0, 1))));
     expect(code(() => run(s, [...faulted, r6(s, [3], [1])]))).toBe('InsufficientRecovery');
     const [x, y] = pair(s.dealers[2]!, 2);
     expect(code(() => run(s, [...faulted, [...r6(s, [3], [1]), msg(2, pairs([[3, x, (y + 1n) % R]]))]]))).toBe('InsufficientRecovery');
