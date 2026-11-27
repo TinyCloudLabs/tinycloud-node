@@ -183,3 +183,30 @@ export function diagnosticCounts(events) {
   }
   return result;
 }
+
+/**
+ * The threshold member compose (TC-2224): `threshold-shares` mounts only in
+ * `tinycloud` at the `threshold_share_dir` path, no ssh-gateway service
+ * exists, and production declares and mounts no `threshold-shares` volume.
+ */
+export function assertThresholdMemberCompose(member, production) {
+  const share = 'threshold-shares';
+  const target = '/var/lib/tinycloud/threshold';
+  const mountsAtTarget = (service) => (service?.volumes ?? []).filter(volume => volume.target === target);
+  const memberServices = member.services ?? {};
+  assert.equal(memberServices['ssh-gateway'], undefined, 'member_ssh_gateway_forbidden');
+  const tinycloud = mountsAtTarget(memberServices.tinycloud);
+  assert.equal(tinycloud.length, 1, 'member_share_volume_mounted_once');
+  assert.equal(tinycloud[0].type, 'volume', 'member_share_mount_must_be_a_named_volume');
+  assert.equal(tinycloud[0].source, share, 'member_share_mount_source');
+  assert.ok(Object.keys(member.volumes ?? {}).includes(share), 'member_share_volume_declared');
+  for (const [name, service] of Object.entries(memberServices)) {
+    if (name === 'tinycloud') continue;
+    assert.equal((service.volumes ?? []).filter(volume => volume.source === share || volume.target === target).length, 0, `member_share_volume_mounted_in_${name}`);
+  }
+  assert.ok(!Object.keys(production.volumes ?? {}).includes(share), 'production_share_volume_forbidden');
+  for (const [name, service] of Object.entries(production.services ?? {})) {
+    assert.equal((service?.volumes ?? []).filter(volume => volume.source === share || volume.target === target).length, 0, `production_share_volume_mounted_in_${name}`);
+  }
+  assert.equal(memberServices.tinycloud.environment?.TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR, target, 'member_threshold_share_dir_unset');
+}

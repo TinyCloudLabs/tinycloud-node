@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, assertCapture, resourceNames } from './tc959-docker.mjs';
-import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts, assertThresholdMemberCompose } from './tc959-compose-proof.mjs';
 
 const request = { ts: '2026-10-16T12:00:00.000Z', level: 'info', event: 'node_request', svc: 'api', method: 'GET', route: '/healthz', status: 200, latency_us: 12 };
 const ingress = { ...request, event: 'ingress_request', svc: 'ingress', request_time_seconds: 0.001 };
@@ -247,4 +247,104 @@ test('diagnostic acceptance sums aggregated occurrences instead of counting outp
   ]);
   assert.deepEqual(observed, { warn: 2, unclassified: 1, error: 1, dependency_error: 3, total: 107 });
   assert.equal(JSON.stringify(observed).includes('TC959_SYNTHETIC'), false);
+});
+
+// TC-2224: fixtures mirror the rendered `compose config --format json` shape;
+// each case mutates a good render so the assertion can only pass exactly it.
+function memberComposeFixture() {
+  return {
+    services: {
+      tinycloud: {
+        image: 'ghcr.io/tinycloudlabs/tinycloud-node@sha256:4bdae4fc232d886bb56bfbce4ec62ed4b8fb4e1369a01f6afb73d06dd68c188f',
+        volumes: [
+          { type: 'bind', source: '/var/run/dstack.sock', target: '/var/run/dstack.sock' },
+          { type: 'volume', source: 'threshold-shares', target: '/var/lib/tinycloud/threshold' },
+        ],
+        environment: { TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR: '/var/lib/tinycloud/threshold' },
+      },
+      postgres: {
+        image: 'postgres:16',
+        volumes: [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data' }],
+        environment: {},
+      },
+    },
+    volumes: { pgdata: {}, 'threshold-shares': {} },
+  };
+}
+function productionComposeFixture() {
+  return {
+    services: {
+      tinycloud: {
+        volumes: [
+          { type: 'bind', source: '/var/run/dstack.sock', target: '/var/run/dstack.sock' },
+          { type: 'volume', source: 'deletion-ledger', target: '/var/lib/tinycloud/ledger' },
+        ],
+        environment: {},
+      },
+      'dstack-ingress': { volumes: [], environment: {} },
+      'ssh-gateway': { volumes: [], environment: {} },
+      vector: { environment: {} },
+    },
+    volumes: { 'cert-data': {}, 'deletion-ledger': {} },
+  };
+}
+
+test('the member compose mounts threshold-shares only in tinycloud at the share dir (TC-2224)', () => {
+  assertThresholdMemberCompose(memberComposeFixture(), productionComposeFixture());
+});
+
+test('a member compose with ssh-gateway is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  member.services['ssh-gateway'] = { image: 'alpine/socat' };
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_ssh_gateway_forbidden/);
+});
+
+test('a member compose where another service mounts the share volume is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  member.services.postgres.volumes.push({ type: 'volume', source: 'threshold-shares', target: '/var/lib/tinycloud/threshold' });
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_in_postgres/);
+});
+
+test('a member compose where another service mounts the share path under a different name is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  member.services.postgres.volumes.push({ type: 'volume', source: 'pgdata', target: '/var/lib/tinycloud/threshold' });
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_in_postgres/);
+});
+
+test('a member compose without the share mount in tinycloud is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  member.services.tinycloud.volumes = member.services.tinycloud.volumes.filter(volume => volume.target !== '/var/lib/tinycloud/threshold');
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_mounted_once/);
+});
+
+test('a member compose mounting the share dir as a bind or a second mount is refused (TC-2224)', () => {
+  const bound = memberComposeFixture();
+  bound.services.tinycloud.volumes[1] = { type: 'bind', source: '/srv/threshold', target: '/var/lib/tinycloud/threshold' };
+  assert.throws(() => assertThresholdMemberCompose(bound, productionComposeFixture()), /member_share_mount_must_be_a_named_volume/);
+
+  const twice = memberComposeFixture();
+  twice.services.tinycloud.volumes.push({ type: 'volume', source: 'other', target: '/var/lib/tinycloud/threshold' });
+  assert.throws(() => assertThresholdMemberCompose(twice, productionComposeFixture()), /member_share_volume_mounted_once/);
+});
+
+test('a member compose without threshold_share_dir set is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  delete member.services.tinycloud.environment.TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR;
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_threshold_share_dir_unset/);
+});
+
+test('a member compose without a declared threshold-shares volume is refused (TC-2224)', () => {
+  const member = memberComposeFixture();
+  delete member.volumes['threshold-shares'];
+  assert.throws(() => assertThresholdMemberCompose(member, productionComposeFixture()), /member_share_volume_declared/);
+});
+
+test('a production compose with a threshold-shares volume is refused (TC-2224)', () => {
+  const declared = productionComposeFixture();
+  declared.volumes['threshold-shares'] = {};
+  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), declared), /production_share_volume_forbidden/);
+
+  const mounted = productionComposeFixture();
+  mounted.services['ssh-gateway'].volumes.push({ type: 'volume', source: 'threshold-shares', target: '/var/lib/tinycloud/threshold' });
+  assert.throws(() => assertThresholdMemberCompose(memberComposeFixture(), mounted), /production_share_volume_mounted_in_ssh-gateway/);
 });

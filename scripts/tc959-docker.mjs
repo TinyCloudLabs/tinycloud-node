@@ -13,7 +13,7 @@ import { buildConfig, nodeImage, ingressImage, vectorImage, cloudflaredImage } f
 import { canary, nodeRequest } from '../log-shipper/cases.mjs';
 import { LEDGER_EVENTS, LEDGER_ERROR_KINDS } from '../log-shipper/ledger.mjs';
 import { awaitReadiness, classifyProbeError, classifyStartupOutput, hasUdpListener, componentCounters } from './tc959-readiness.mjs';
-import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts } from './tc959-compose-proof.mjs';
+import { owner, assertHostedRunner, cleanupOwnedResources, burstEvidence, assertHealthyBurst, progressEvidence, assertServiceParity, assertLogshipNetwork, composeRuntimeValues, socketEvidence, hostUdpEvidence, numericMetrics, diagnosticCounts, assertThresholdMemberCompose } from './tc959-compose-proof.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const token = 'TC959_SYNTHETIC_HOSTED_SINK_BEARER';
@@ -420,6 +420,14 @@ export async function main(args = process.argv.slice(2)) {
     phase = 'compose_mounts';
     assert.deepEqual(production.tinycloud.volumes.map(value => [value.type, value.source, value.target]), [['bind', '/var/run/dstack.sock', '/var/run/dstack.sock'], ['volume', 'deletion-ledger', '/var/lib/tinycloud/ledger']]);
     assert.deepEqual(production['dstack-ingress'].volumes.map(value => [value.type, value.source, value.target]).sort((a, b) => a[2].localeCompare(b[2])), [['volume', 'cert-data', '/etc/letsencrypt'], ['bind', '/var/run/dstack.sock', '/var/run/dstack.sock']]);
+    phase = 'compose_member_mounts';
+    // TC-2224: the threshold member compose shares the tinycloud boundary, so
+    // the same no-secret-files rules and the share-volume exclusivity apply.
+    const memberUnresolved = JSON.parse(docker(...['compose', '--env-file', '/dev/null', '-f', join(root, 'docker-compose.dstack-threshold-member.yaml'), 'config', '--no-interpolate', '--no-env-resolution', '--format', 'json']));
+    assert.equal(memberUnresolved.secrets, undefined, 'deployment_secret_files_forbidden');
+    assert.equal(memberUnresolved.configs, undefined, 'deployment_config_files_forbidden');
+    for (const service of Object.values(memberUnresolved.services)) assert.equal(service.env_file, undefined, 'deployment_env_files_forbidden');
+    assertThresholdMemberCompose(memberUnresolved, rendered);
     phase = 'compose_networks';
     assert.deepEqual(Object.keys(production.tinycloud.networks).sort(), ['cf-edge', 'default']); // TC-4194
     assert.deepEqual(Object.keys(production['dstack-ingress'].networks), ['default']);

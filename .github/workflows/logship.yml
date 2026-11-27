@@ -8,6 +8,7 @@ on:
       - 'log-shipper/**'
       - 'scripts/tc959-*.mjs'
       - 'docker-compose.dstack-postgres.yaml'
+      - 'docker-compose.dstack-threshold-member.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
   push:
@@ -16,6 +17,7 @@ on:
       - 'log-shipper/**'
       - 'scripts/tc959-*.mjs'
       - 'docker-compose.dstack-postgres.yaml'
+      - 'docker-compose.dstack-threshold-member.yaml'
       - '.github/workflows/logship.yml'
       - 'deploy/ingress/redacted-logging.conf'
 
