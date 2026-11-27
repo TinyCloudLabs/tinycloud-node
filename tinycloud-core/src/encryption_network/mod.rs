@@ -16,6 +16,7 @@ pub mod keys;
 pub mod network_id;
 pub mod protocol;
 pub mod service;
+pub mod threshold;
 pub mod types;
 
 #[cfg(test)]
@@ -43,6 +44,9 @@ pub use protocol::{
 pub use service::{
     CreateNetworkRequest, DecryptTarget, EncryptionService, EncryptionServiceError,
     VerifiedDecrypt, WellKnownRecord,
+};
+pub use threshold::{
+    ShareSource, ShareSourceBackend, ShareSourceError, ThresholdBackendError, ThresholdKeyBackend,
 };
 pub use types::{
     InlineEnvelope, KeyBackendKind, NetworkDescriptor, NetworkState, Threshold,
