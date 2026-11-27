@@ -19,19 +19,18 @@ use tinycloud_auth::{
         siwe::{encode_eip55, Message, TimeStamp},
         siwe_cacao::{Eip191, Payload as CacaoPayload, Signature as CacaoSignature},
     },
-    resolver::DID_METHODS,
     siwe_recap::Capability as Recap,
     ssi::{
         claims::{jws::sign_bytes, jwt::NumericDate},
         dids::{DIDBuf, DIDURLBuf},
-        jwk::{Algorithm, JWK},
+        jwk::{Algorithm, Params, JWK},
         ucan::Payload as UcanPayload,
     },
     ucan_capabilities_object::{Ability, Capabilities},
 };
 use tinycloud_threshold::{
-    activation_preimage, readiness_preimage, CertificateBody, MemberIndex, ReadinessReceipt,
-    SignedCertificate, SignedStatement,
+    activation_preimage, readiness_preimage, CertificateBody, ReadinessReceipt, SignedCertificate,
+    SignedStatement,
 };
 
 use super::*;
@@ -60,7 +59,17 @@ struct Ident {
 fn ident() -> Ident {
     let mut jwk = JWK::generate_ed25519().unwrap();
     jwk.algorithm = Some(Algorithm::EdDSA);
-    let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+    let Params::OKP(okp) = &jwk.params else {
+        unreachable!("an Ed25519 key")
+    };
+    let multicodec = [[0xed, 0x01].as_slice(), okp.public_key.0.as_slice()].concat();
+    let did = format!(
+        "did:key:{}",
+        tinycloud_auth::ipld_core::cid::multibase::encode(
+            tinycloud_auth::ipld_core::cid::multibase::Base::Base58Btc,
+            multicodec
+        )
+    );
     let fragment = did.rsplit_once(':').unwrap().1;
     let vm = format!("{did}#{fragment}");
     Ident { jwk, did, vm }
@@ -156,26 +165,35 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// The genesis 2-of-3 certificate body of the shared vectors, with its
-/// network, owner and member DIDs replaced.
-fn certificate_body(network: &NetworkId, members: &[&str; 3]) -> CertificateBody {
+/// The certificate body of vector chain case `case` (0: genesis 2-of-3,
+/// 1: its reshare 3-of-4), with its network, owner and member DIDs replaced
+/// and, for a successor, `previous` as its predecessor.
+fn spliced_body(
+    case: usize,
+    network: &NetworkId,
+    members: &[&str],
+    previous: Option<&CertificateBody>,
+) -> CertificateBody {
     let vectors: Value = serde_json::from_str(CHAIN).unwrap();
     let v = hex::decode(
-        vectors["cases"][0]["inputs"]["certificate"]["body"]
+        vectors["cases"][case]["inputs"]["certificate"]["body"]
             .as_str()
             .unwrap(),
     )
     .unwrap();
+    let u16_at = |at: usize| u16::from_be_bytes(v[at..at + 2].try_into().unwrap());
     let skip_lp =
         |at: usize| at + 4 + u32::from_be_bytes(v[at..at + 4].try_into().unwrap()) as usize;
     let mut at = skip_lp(skip_lp(1));
     // rekey, epoch, genesis t, t, n
     let fixed = &v[at..at + 22];
     at += 22;
-    let count = u16::from_be_bytes(v[at..at + 2].try_into().unwrap());
-    assert_eq!(count, 3);
+    let count = u16_at(at);
+    assert_eq!(usize::from(count), members.len());
     at += 2;
+    let mut indices = Vec::new();
     for _ in 0..count {
+        indices.push(u16_at(at));
         at = skip_lp(at + 2);
     }
     let mut out = vec![1];
@@ -183,11 +201,21 @@ fn certificate_body(network: &NetworkId, members: &[&str; 3]) -> CertificateBody
     put(&mut out, network.owner_did().as_bytes());
     out.extend_from_slice(fixed);
     out.extend_from_slice(&count.to_be_bytes());
-    for (index, member) in (1u16..).zip(members) {
+    for (index, member) in indices.into_iter().zip(members) {
         out.extend_from_slice(&index.to_be_bytes());
         put(&mut out, member.as_bytes());
     }
-    out.extend_from_slice(&v[at..]);
+    // Master public key, commitments, transcript; then the predecessor.
+    let end = at + 96 + 2 + 96 * usize::from(u16_at(at + 96)) + 32;
+    out.extend_from_slice(&v[at..end]);
+    let mut rest = &v[end..];
+    if let Some(previous) = previous {
+        assert_eq!(rest[0], 1);
+        out.push(1);
+        out.extend_from_slice(previous.digest().as_bytes());
+        rest = &rest[33..];
+    }
+    out.extend_from_slice(rest);
     CertificateBody::decode(&out).unwrap()
 }
 
@@ -206,10 +234,16 @@ impl Fixture {
     async fn new(owner: Owner) -> Self {
         let db = fresh_db().await;
         let node = node_keypair();
-        let set = ThresholdSet::new(db.clone(), node.clone(), None);
+        let set =
+            ThresholdSet::new(db.clone(), node.clone(), None).with_delegation_rules(false, true);
         let network = NetworkId::new(owner.did(), "vault".to_string()).unwrap();
         let others = [ident(), ident()];
-        let body = certificate_body(&network, &[set.node_did(), &others[0].did, &others[1].did]);
+        let body = spliced_body(
+            0,
+            &network,
+            &[set.node_did(), &others[0].did, &others[1].did],
+            None,
+        );
         Self {
             db,
             set,
@@ -226,28 +260,48 @@ impl Fixture {
     }
 
     fn cert(&self) -> Vec<u8> {
+        self.cert_of(&self.body)
+    }
+
+    fn cert_of(&self, body: &CertificateBody) -> Vec<u8> {
         encode_cert(&SignedCertificate {
-            body: self.body.clone(),
-            owner_signature: self.owner.sign_raw(&self.body.owner_statement()),
+            body: body.clone(),
+            owner_signature: self.owner.sign_raw(&body.owner_statement()),
         })
     }
 
     fn activation(&self) -> Vec<u8> {
-        let receipts: Vec<ReadinessReceipt> = (1u16..=3)
-            .map(|i| {
-                let index = MemberIndex::new(i).unwrap();
-                let preimage = readiness_preimage(&self.body, index).unwrap();
-                let signature = match i {
-                    1 => self.node.sign(&preimage).unwrap(),
-                    _ => self.others[usize::from(i) - 2].sign(&preimage),
+        self.activation_of(&self.body, &[])
+    }
+
+    /// The owner's activation of `body`, with a readiness receipt from each
+    /// member: this node, `others` or `more`.
+    fn activation_of(&self, body: &CertificateBody, more: &[&Ident]) -> Vec<u8> {
+        let receipts: Vec<ReadinessReceipt> = body
+            .members()
+            .iter()
+            .map(|member| {
+                let preimage = readiness_preimage(body, member.index).unwrap();
+                let signature = if member.node.as_str() == self.set.node_did() {
+                    self.node.sign(&preimage).unwrap()
+                } else {
+                    self.others
+                        .iter()
+                        .chain(more.iter().copied())
+                        .find(|ident| ident.did == member.node.as_str())
+                        .unwrap()
+                        .sign(&preimage)
                 };
-                ReadinessReceipt { index, signature }
+                ReadinessReceipt {
+                    index: member.index,
+                    signature,
+                }
             })
             .collect();
-        let bytes = activation_preimage(&self.body, &receipts).unwrap();
+        let bytes = activation_preimage(body, &receipts).unwrap();
         let signature = self.owner.sign_raw(&bytes);
         encode_activation(&ActivationObject {
-            certificate: self.body.digest().as_bytes()[..].try_into().unwrap(),
+            certificate: body.digest().as_bytes()[..].try_into().unwrap(),
             receipts,
             activation: SignedStatement { bytes, signature },
         })
@@ -764,12 +818,36 @@ fn ucan(
     nbf: Option<i64>,
     exp: i64,
 ) -> String {
+    ucan_with_caveat(
+        issuer,
+        audience,
+        caps,
+        BTreeMap::new(),
+        vec![],
+        proof,
+        nbf,
+        exp,
+    )
+}
+
+/// As [`ucan`], every capability carrying `caveat`, with `facts`.
+#[allow(clippy::too_many_arguments)]
+fn ucan_with_caveat(
+    issuer: &Ident,
+    audience: &str,
+    caps: &[(&str, &str)],
+    caveat: BTreeMap<String, Value>,
+    facts: Vec<Value>,
+    proof: Vec<Cid>,
+    nbf: Option<i64>,
+    exp: i64,
+) -> String {
     let mut capabilities = Capabilities::new();
     for (resource, ability) in caps {
         capabilities.with_action(
             resource.parse().unwrap(),
             ability.parse::<Ability>().unwrap(),
-            [BTreeMap::<String, Value>::new()],
+            [caveat.clone()],
         );
     }
     UcanPayload {
@@ -778,7 +856,7 @@ fn ucan(
         not_before: nbf.map(|t| NumericDate::try_from_seconds(t as f64).unwrap()),
         expiration: NumericDate::try_from_seconds(exp as f64).unwrap(),
         nonce: Some(format!("n-{}", now())),
-        facts: Some(Vec::<Value>::new()),
+        facts: Some(facts),
         proof,
         attenuation: capabilities,
     }
@@ -932,7 +1010,7 @@ async fn a_control_grant_counts_only_inside_the_authority_window() {
     let t = now();
     let target = format!("urn:cid:{}", cid_of(&c.leaf));
     let expired_grant = ucan(
-        &c.a,
+        &owner,
         &holder.did,
         &[(&target, REVOKE_ABILITY)],
         vec![],
@@ -948,7 +1026,7 @@ async fn a_control_grant_counts_only_inside_the_authority_window() {
         "control_grant_window"
     );
     let grant = ucan(
-        &c.a,
+        &owner,
         &holder.did,
         &[(&target, REVOKE_ABILITY)],
         vec![],
@@ -1097,4 +1175,545 @@ async fn key_create_refuses_deletable_paths_on_a_threshold_network() {
             other => panic!("expected key_path_invalid, got {other:?}"),
         }
     }
+}
+
+// ------------------------------------------- network rows and membership
+
+/// N's network row and its member rows, as `index:node`.
+async fn network_rows(
+    db: &DatabaseConnection,
+    network: &NetworkId,
+) -> (Option<encryption_network::Model>, Vec<String>) {
+    use crate::models::encryption_network_member;
+    let row = encryption_network::Entity::find_by_id(network.to_string())
+        .one(db)
+        .await
+        .unwrap();
+    let mut members: Vec<String> = encryption_network_member::Entity::find()
+        .filter(encryption_network_member::Column::NetworkId.eq(network.to_string()))
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|member| format!("{}:{}", member.share_index, member.node_id))
+        .collect();
+    members.sort();
+    (row, members)
+}
+
+#[tokio::test]
+async fn the_activated_genesis_creates_the_network_and_its_member_rows() {
+    let f = Fixture::did_key().await;
+    f.accept(ObjectKind::Cert, &f.cert()).await.unwrap();
+    assert!(network_rows(&f.db, &f.network).await.0.is_none());
+    f.accept(ObjectKind::Activation, &f.activation())
+        .await
+        .unwrap();
+    let (row, members) = network_rows(&f.db, &f.network).await;
+    let row = row.unwrap();
+    assert_eq!(
+        (
+            row.key_backend.as_str(),
+            row.state.as_str(),
+            row.owner_did.as_str(),
+            row.threshold_t,
+            row.threshold_n,
+            row.sealed_private_key.is_none(),
+        ),
+        ("threshold", "active", f.network.owner_did(), 2, 3, true)
+    );
+    assert_eq!(
+        row.public_key,
+        f.body
+            .public_material()
+            .master_public_key()
+            .encode()
+            .to_vec()
+    );
+    let mut expected: Vec<String> = f
+        .body
+        .members()
+        .iter()
+        .map(|member| format!("{}:{}", member.index.get(), member.node.as_str()))
+        .collect();
+    expected.sort();
+    assert_eq!(members, expected);
+
+    // Accepting the activation again (here after losing its object) keeps
+    // the rows as they are.
+    threshold_set_object::Entity::delete_many()
+        .filter(threshold_set_object::Column::Kind.eq(ObjectKind::Activation.as_str()))
+        .exec(&f.db)
+        .await
+        .unwrap();
+    assert!(
+        f.accept(ObjectKind::Activation, &f.activation())
+            .await
+            .unwrap()
+            .new
+    );
+    assert_eq!(network_rows(&f.db, &f.network).await, (Some(row), members));
+
+    // B3-1 holds for a network that exists only through this path.
+    let service = service(&f.db);
+    let body = json!({});
+    let key = KeyLocation::new(&f.network, "docs/a").unwrap();
+    assert!(matches!(
+        service
+            .verify_network_admin_authorized(&f.network, "x", &invocation(&f.network), &body)
+            .await,
+        Err(EncryptionServiceError::OwnerOnly(_))
+    ));
+    assert!(matches!(
+        service
+            .verify_key_admin_authorized(&f.network, &key, "x", &invocation(&f.network), &body)
+            .await,
+        Err(EncryptionServiceError::OwnerOnly(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_genesis_for_a_network_this_node_serves_otherwise_is_unavailable() {
+    let f = Fixture::did_key().await;
+    threshold_row(&f.db, &f.network, "local", 1).await;
+    f.accept(ObjectKind::Cert, &f.cert()).await.unwrap();
+    assert_eq!(
+        unavailable(f.accept(ObjectKind::Activation, &f.activation()).await),
+        "network_exists"
+    );
+}
+
+#[tokio::test]
+async fn a_member_of_a_superseded_certificate_only_is_not_a_member() {
+    let f = Fixture::activated(Owner::Key(ident())).await;
+    let path = "docs/a";
+    f.accept(
+        ObjectKind::KeyState,
+        &f.key_state(path, "create", 1, "active", 1),
+    )
+    .await
+    .unwrap();
+    // The reshare to four members leaves this node out.
+    let (x, y) = (ident(), ident());
+    let successor = spliced_body(
+        1,
+        &f.network,
+        &[&f.others[0].did, &f.others[1].did, &x.did, &y.did],
+        Some(&f.body),
+    );
+    f.accept(ObjectKind::Cert, &f.cert_of(&successor))
+        .await
+        .unwrap();
+    // Not yet activated: the genesis is still current.
+    f.accept(
+        ObjectKind::KeyState,
+        &f.key_state(path, "block", 2, "blocked", 1),
+    )
+    .await
+    .unwrap();
+    f.accept(
+        ObjectKind::Activation,
+        &f.activation_of(&successor, &[&x, &y]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unavailable(
+            f.accept(
+                ObjectKind::KeyState,
+                &f.key_state(path, "unblock", 3, "active", 1)
+            )
+            .await
+        ),
+        "not_a_member"
+    );
+    assert_eq!(f.row(path).await.state_seq, 2);
+}
+
+// ------------------------------------------------------- more merge cases
+
+#[tokio::test]
+async fn a_block_before_its_create_leaves_the_key_blocked() {
+    let f = Fixture::activated(Owner::Key(ident())).await;
+    let path = "docs/a";
+    f.accept(
+        ObjectKind::KeyState,
+        &f.key_state(path, "block", 2, "blocked", 1),
+    )
+    .await
+    .unwrap();
+    let create = f
+        .accept(
+            ObjectKind::KeyState,
+            &f.key_state(path, "create", 1, "active", 1),
+        )
+        .await
+        .unwrap();
+    assert!(create.new);
+    assert_eq!(
+        create.key,
+        Some(KeyView {
+            path: path.to_string(),
+            state_seq: 2,
+            state: "blocked".to_string(),
+            key_version: 1,
+        })
+    );
+    assert!(!f.row(path).await.conflict);
+}
+
+#[tokio::test]
+async fn statements_with_one_effect_at_one_state_seq_agree_in_any_order() {
+    let owner = ident();
+    let mut rows = Vec::new();
+    for reversed in [false, true] {
+        let owner = Ident {
+            jwk: owner.jwk.clone(),
+            did: owner.did.clone(),
+            vm: owner.vm.clone(),
+        };
+        let f = Fixture::activated(Owner::Key(owner)).await;
+        // Two encodings of one effect: another label, the same state.
+        let a = f.key_state("docs/a", "create", 4, "active", 2);
+        let b = f.key_state("docs/a", "unblock", 4, "active", 2);
+        let order = if reversed { [&b, &a] } else { [&a, &b] };
+        f.accept(ObjectKind::KeyState, order[0]).await.unwrap();
+        f.accept(ObjectKind::KeyState, order[1]).await.unwrap();
+        let row = f.row("docs/a").await;
+        assert_eq!(row.statement_cid, object_cid(&a).min(object_cid(&b)));
+        assert_eq!(f.faults().await, 0);
+        rows.push((
+            row.state,
+            row.state_seq,
+            row.key_version,
+            row.statement_cid,
+            row.conflict,
+        ));
+    }
+    assert_eq!(rows[0], rows[1]);
+    assert_eq!((rows[0].0.as_str(), rows[0].4), ("active", false));
+}
+
+// ------------------------------------- revocations: GB-3, §4.1, selectors
+
+#[tokio::test]
+async fn a_former_grant_holder_backdating_into_the_grant_window_is_accepted() {
+    let (f, owner) = did_key_owner().await;
+    let c = chain(&f, &owner);
+    let holder = ident();
+    let t = now();
+    let target = format!("urn:cid:{}", cid_of(&c.leaf));
+    // The owner's grant ended an hour ago; the holder dates its revocation
+    // inside it. Accepted on purpose (GB-3 residual): it only removes access.
+    let grant = ucan(
+        &owner,
+        &holder.did,
+        &[(&target, REVOKE_ABILITY)],
+        vec![],
+        None,
+        t - 3_600,
+    );
+    let object = revocation_object(
+        &revoke(&holder, &c.leaf, vec![cid_of(&grant)], t - 7_200, t - 7_000),
+        &[&c.leaf, &c.root, &grant],
+    );
+    f.accept(ObjectKind::Revocation, &object).await.unwrap();
+    assert_eq!(revocations(&f.db, &c.leaf).await, 1);
+}
+
+#[tokio::test]
+async fn a_revocation_of_the_control_grant_does_not_change_acceptance() {
+    use sea_orm::ActiveModelTrait;
+    let (f, owner) = did_key_owner().await;
+    let c = chain(&f, &owner);
+    let holder = ident();
+    let t = now();
+    let target = format!("urn:cid:{}", cid_of(&c.leaf));
+    let grant = ucan(
+        &owner,
+        &holder.did,
+        &[(&target, REVOKE_ABILITY)],
+        vec![],
+        None,
+        t + 600,
+    );
+    let first = revocation_object(
+        &revoke(&holder, &c.leaf, vec![cid_of(&grant)], t, t + 300),
+        &[&c.leaf, &c.root, &grant],
+    );
+    f.accept(ObjectKind::Revocation, &first).await.unwrap();
+    // The owner then revokes the grant through the node's own graph.
+    revocation::ActiveModel {
+        id: Set(hash(b"grant-revocation")),
+        revoker: Set(owner.did.clone()),
+        revoked: Set(hash(grant.as_bytes())),
+        serialization: Set(b"grant-revocation".to_vec()),
+        revoked_at: Set(Some(OffsetDateTime::now_utc())),
+    }
+    .insert(&f.db)
+    .await
+    .unwrap();
+    // Another revocation the holder made under the grant is still accepted.
+    let second = revocation_object(
+        &revoke(&holder, &c.leaf, vec![cid_of(&grant)], t - 60, t + 300),
+        &[&c.leaf, &c.root, &grant],
+    );
+    assert!(f.accept(ObjectKind::Revocation, &second).await.unwrap().new);
+    assert_eq!(revocations(&f.db, &c.leaf).await, 2);
+}
+
+#[tokio::test]
+async fn a_revocation_arriving_after_its_own_exp_is_accepted() {
+    let (f, owner) = did_key_owner().await;
+    let c = chain(&f, &owner);
+    let t = now();
+    // Signed for a 5-minute window that ended 10 minutes ago.
+    let object = revocation_object(
+        &revoke(&c.a, &c.leaf, vec![], t - 900, t - 600),
+        &[&c.leaf, &c.root],
+    );
+    f.accept(ObjectKind::Revocation, &object).await.unwrap();
+    assert_eq!(revocations(&f.db, &c.leaf).await, 1);
+}
+
+#[tokio::test]
+async fn an_ancestor_revoked_first_refuses_the_readers_chain_posted_later() {
+    let (f, owner) = did_key_owner().await;
+    let (a, reader) = (ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let root = ucan(
+        &owner,
+        &a.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![],
+        None,
+        t + 3_600,
+    );
+    let object = revocation_object(&revoke(&owner, &root, vec![], t, t + 300), &[&root]);
+    f.accept(ObjectKind::Revocation, &object).await.unwrap();
+
+    let readers = ucan(
+        &a,
+        &reader.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&root)],
+        None,
+        t + 3_600,
+    );
+    let posted = Delegation::from_header_ser::<TinyCloudDelegation>(&readers).unwrap();
+    let result = delegation::process_with(&f.db, &posted, None, false, true, None, false).await;
+    assert!(
+        matches!(
+            result,
+            Err(delegation::Error::InvalidDelegation(
+                delegation::DelegationError::ParentRevoked(_)
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+/// The TC-405 selector caveat: a UCAN capability's caveat object.
+fn selector(kind: &str, value: Option<&str>) -> BTreeMap<String, Value> {
+    let mut selector = BTreeMap::from([
+        ("type".to_string(), json!("xyz.tinycloud.resource/selector")),
+        ("kind".to_string(), json!(kind)),
+    ]);
+    if let Some(value) = value {
+        selector.insert("value".to_string(), json!(value));
+    }
+    selector
+}
+
+#[tokio::test]
+async fn an_attached_chain_follows_the_selector_containment_rule() {
+    let (f, owner) = did_key_owner().await;
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let cases = [
+        // A selector only the child carries.
+        (BTreeMap::new(), selector("exact", Some("docs/a")), false),
+        // Identical but malformed selectors.
+        (selector("exact", None), selector("exact", None), false),
+        // A contained selector.
+        (
+            selector("prefix", Some("docs")),
+            selector("exact", Some("docs/a")),
+            true,
+        ),
+    ];
+    for (parent, child, contained) in cases {
+        let (a, b) = (ident(), ident());
+        let root = ucan_with_caveat(
+            &owner,
+            &a.did,
+            &[(&urn, DECRYPT_ACTION)],
+            parent,
+            vec![],
+            vec![],
+            None,
+            1_000,
+        );
+        let leaf = ucan_with_caveat(
+            &a,
+            &b.did,
+            &[(&urn, DECRYPT_ACTION)],
+            child,
+            vec![],
+            vec![cid_of(&root)],
+            None,
+            1_000,
+        );
+        let object = revocation_object(&revoke(&a, &leaf, vec![], t, t + 300), &[&leaf, &root]);
+        let result = f.accept(ObjectKind::Revocation, &object).await;
+        if contained {
+            result.unwrap();
+            assert_eq!(revocations(&f.db, &leaf).await, 1);
+        } else {
+            assert_eq!(refusal(result), "chain_attenuation");
+        }
+    }
+}
+
+// ----------------------------- the attached chain meets /delegate admission
+
+/// Owner → A carrying `root_caps` and `facts`, then A → B `decrypt`, which
+/// A revokes with both attached; nothing may be stored.
+async fn assert_unstorable(
+    f: &Fixture,
+    owner: &Ident,
+    root_caps: &[(&str, &str)],
+    facts: Vec<Value>,
+) {
+    let (a, b) = (ident(), ident());
+    let t = now();
+    let urn = f.key_urn("docs/a");
+    let root = ucan_with_caveat(
+        owner,
+        &a.did,
+        root_caps,
+        BTreeMap::new(),
+        facts,
+        vec![],
+        None,
+        1_000,
+    );
+    let leaf = ucan(
+        &a,
+        &b.did,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![cid_of(&root)],
+        None,
+        1_000,
+    );
+    let object = revocation_object(&revoke(&a, &leaf, vec![], t, t + 300), &[&leaf, &root]);
+    assert_eq!(
+        refusal(f.accept(ObjectKind::Revocation, &object).await),
+        "delegation_unstorable"
+    );
+    assert_eq!(delegation::Entity::find().count(&f.db).await.unwrap(), 0);
+    assert_eq!(revocations(&f.db, &leaf).await, 0);
+}
+
+#[tokio::test]
+async fn an_attached_key_delete_grant_is_refused_and_not_stored() {
+    let (f, owner) = did_key_owner().await;
+    let urn = f.key_urn("docs/a");
+    assert_unstorable(
+        &f,
+        &owner,
+        &[
+            (&urn, DECRYPT_ACTION),
+            (&urn, "tinycloud.encryption/key.delete"),
+        ],
+        vec![],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_attached_child_of_a_terminal_grant_is_refused_and_not_stored() {
+    let (f, owner) = did_key_owner().await;
+    let urn = f.key_urn("docs/a");
+    assert_unstorable(
+        &f,
+        &owner,
+        &[(&urn, DECRYPT_ACTION)],
+        vec![Value::Object(
+            [(
+                crate::util::DelegationMode::FACT_KEY.to_string(),
+                json!("terminal"),
+            )]
+            .into_iter()
+            .collect(),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_attached_key_grant_is_refused_without_named_keys() {
+    let (mut f, owner) = did_key_owner().await;
+    f.set = f.set.clone().with_delegation_rules(false, false);
+    let urn = f.key_urn("docs/a");
+    assert_unstorable(&f, &owner, &[(&urn, DECRYPT_ACTION)], vec![]).await;
+}
+
+#[tokio::test]
+async fn an_attached_control_grant_to_a_third_party_is_refused() {
+    let (f, owner) = did_key_owner().await;
+    let c = chain(&f, &owner);
+    let holder = ident();
+    // TC-3150: the target's delegator may hand revocation only to the
+    // target's delegatee.
+    let grant = ucan(
+        &c.a,
+        &holder.did,
+        &[(&format!("urn:cid:{}", cid_of(&c.leaf)), REVOKE_ABILITY)],
+        vec![],
+        None,
+        1_000,
+    );
+    let object = revocation_object(
+        &revoke(&holder, &c.leaf, vec![cid_of(&grant)], 900, 950),
+        &[&c.leaf, &c.root, &grant],
+    );
+    assert_eq!(
+        refusal(f.accept(ObjectKind::Revocation, &object).await),
+        "delegation_unstorable"
+    );
+    assert_eq!(delegation::Entity::find().count(&f.db).await.unwrap(), 0);
+    // To the target's delegatee it is admitted.
+    let grant = ucan(
+        &c.a,
+        &c.b.did,
+        &[(&format!("urn:cid:{}", cid_of(&c.leaf)), REVOKE_ABILITY)],
+        vec![],
+        None,
+        1_000,
+    );
+    let object = revocation_object(
+        &revoke(&c.b, &c.leaf, vec![cid_of(&grant)], 900, 950),
+        &[&c.leaf, &c.root, &grant],
+    );
+    f.accept(ObjectKind::Revocation, &object).await.unwrap();
+    assert_eq!(revocations(&f.db, &c.leaf).await, 1);
+}
+
+#[tokio::test]
+async fn a_certificate_naming_other_nodes_only_is_not_held() {
+    let f = Fixture::did_key().await;
+    let x = ident();
+    let body = spliced_body(
+        0,
+        &f.network,
+        &[&f.others[0].did, &f.others[1].did, &x.did],
+        None,
+    );
+    assert_eq!(
+        unavailable(f.accept(ObjectKind::Cert, &f.cert_of(&body)).await),
+        "not_a_member"
+    );
+    assert!(f.set.chain(&f.network).await.unwrap().is_empty());
 }

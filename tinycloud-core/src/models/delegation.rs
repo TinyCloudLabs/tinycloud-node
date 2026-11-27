@@ -261,10 +261,68 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
     renewal_identity: Option<(&str, &str, u64)>,
     signature_verified: bool,
 ) -> Result<DelegationRegistration, Error> {
+    admit(
+        db,
+        delegation,
+        encryption,
+        delegated_sql_caveats,
+        named_keys,
+        renewal_identity,
+        signature_verified,
+        false,
+    )
+    .await
+}
+
+/// TC-2225 (gate B GB-5): register a delegation a threshold network's
+/// revocation object carries, its signature already checked. Every
+/// `/delegate` rule applies except those that depend on when, or in which
+/// order, a member receives the object: the delegation's own time window, a
+/// parent's time window now, and a revoked parent or ancestor. A delegation a
+/// space purge erased is refused as `Revoked` before any rule.
+pub(crate) async fn process_carried<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+) -> Result<DelegationRegistration, Error> {
+    refuse_tombstoned(
+        db,
+        crate::hash::hash(&delegation.1),
+        delegation_cid_alias::canonical_hash(&delegation.1)?,
+    )
+    .await?;
+    admit(
+        db,
+        delegation,
+        encryption,
+        delegated_sql_caveats,
+        named_keys,
+        None,
+        true,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit<C: ConnectionTrait>(
+    db: &C,
+    delegation: &Delegation,
+    encryption: Option<&ColumnEncryption>,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
+    renewal_identity: Option<(&str, &str, u64)>,
+    signature_verified: bool,
+    carried: bool,
+) -> Result<DelegationRegistration, Error> {
     if !signature_verified {
         check_signature(&delegation.0.delegation).await?;
     }
-    verify_time(&delegation.0.delegation)?;
+    if !carried {
+        verify_time(&delegation.0.delegation)?;
+    }
     for space in delegation.0.spaces() {
         crate::request_telemetry::observe_space(space);
     }
@@ -275,6 +333,7 @@ pub(crate) async fn process_with<C: ConnectionTrait>(
         named_keys,
         renewal_identity,
         encryption,
+        carried,
     )
     .await;
     if let Err(error) = validated {
@@ -573,10 +632,13 @@ async fn validate_with<C: ConnectionTrait>(
         named_keys,
         renewal_identity,
         None,
+        false,
     )
     .await
 }
 
+/// With `carried` (TC-2225, see [`process_carried`]) a parent's time window
+/// now and a revoked parent or ancestor are not checked.
 async fn validate_with_encryption<C: ConnectionTrait>(
     db: &C,
     delegation: &util::DelegationInfo,
@@ -584,6 +646,7 @@ async fn validate_with_encryption<C: ConnectionTrait>(
     named_keys: bool,
     renewal_identity: Option<(&str, &str, u64)>,
     encryption: Option<&ColumnEncryption>,
+    carried: bool,
 ) -> Result<(), Error> {
     if renewal_identity.is_some_and(|(_, renewer_did, _)| delegation.delegator == renewer_did) {
         return Err(DelegationError::UnauthorizedDelegator(delegation.delegator.clone()).into());
@@ -720,14 +783,18 @@ async fn validate_with_encryption<C: ConnectionTrait>(
             // A revoked grant cannot authorize new descendants. Check both
             // the directly cited parents and their transitive ancestors on
             // every registration so revocation takes effect immediately.
+            // A carried delegation skips this and the parent's window now.
             let verifier_now = OffsetDateTime::now_utc();
             for parent in &all_parents {
-                if graph.is_revoked(&parent.id) {
+                if !carried && graph.is_revoked(&parent.id) {
                     return Err(
                         DelegationError::ParentRevoked(parent.id.to_cid(0x55).to_string()).into(),
                     );
                 }
-                if let Some(ancestor_cid) = graph.first_revoked_ancestor(&parent.id) {
+                if let Some(ancestor_cid) = graph
+                    .first_revoked_ancestor(&parent.id)
+                    .filter(|_| !carried)
+                {
                     return Err(DelegationError::AncestorRevoked {
                         ancestor_cid,
                         parent_cid: parent.id.to_cid(0x55).to_string(),
@@ -743,10 +810,11 @@ async fn validate_with_encryption<C: ConnectionTrait>(
                     .effective_expiry(&parent.id)
                     .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok())
                     .or(parent.expiry);
-                if effective_expiry.is_some_and(|expiry| verifier_now >= expiry)
-                    || parent
-                        .not_before
-                        .is_some_and(|not_before| verifier_now < not_before)
+                if !carried
+                    && (effective_expiry.is_some_and(|expiry| verifier_now >= expiry)
+                        || parent
+                            .not_before
+                            .is_some_and(|not_before| verifier_now < not_before))
                 {
                     return Err(DelegationError::InvalidTime.into());
                 }
@@ -1554,7 +1622,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     }
 }
 
-pub(crate) async fn save<C: ConnectionTrait>(
+async fn save<C: ConnectionTrait>(
     db: &C,
     delegation: util::DelegationInfo,
     serialization: Vec<u8>,

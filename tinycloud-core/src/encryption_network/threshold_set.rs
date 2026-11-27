@@ -5,13 +5,15 @@
 //! Four kinds:
 //!
 //! - `cert`: an owner-signed network certificate, checked with
-//!   `verify_certificate` under the anchor `{owner of N, N}`;
+//!   `verify_certificate` under the anchor `{owner of N, N}`, held when it
+//!   names this node or succeeds a certificate the set holds;
 //! - `activation`: the owner's activation of a stored certificate with every
-//!   holder's readiness receipt (`ReadyQuorum::AllHolders`);
+//!   holder's readiness receipt (`ReadyQuorum::AllHolders`). A member creates
+//!   N's network and member rows from the activated genesis;
 //! - `revocation`: a UCAN or CACAO revocation with the revoked delegation, its
 //!   proof chain and any control grant chain attached. Accepted on what it
 //!   carries only, with no validity window checked, then inserted into the
-//!   delegation graph;
+//!   delegation graph under `/delegate`'s other admission rules;
 //! - `key-state`: the owner's `key.state` or `network.revoke` statement. Key
 //!   rows follow the highest `stateSeq`.
 //!
@@ -60,9 +62,9 @@ use tinycloud_auth::{
     ucan_capabilities_object::{Ability, Caveats},
 };
 use tinycloud_threshold::{
-    verify_activation, verify_certificate, CertificateBody, Did, DidSignatureVerifier, MemberIndex,
-    NetworkUrn, ReadinessReceipt, ReadyQuorum, SignatureError, SignedCertificate, SignedStatement,
-    TrustAnchor, VerifiedCertificate,
+    verify_activation, verify_certificate, verify_successor, CertificateBody, Did,
+    DidSignatureVerifier, MemberIndex, NetworkUrn, ReadinessReceipt, ReadyQuorum, SignatureError,
+    SignedCertificate, SignedStatement, TrustAnchor, VerifiedCertificate,
 };
 
 use crate::{
@@ -72,8 +74,8 @@ use crate::{
     hash::{hash, Hash},
     keys::{public_key_to_did_key, Keypair},
     models::{
-        delegation, encryption_network, revocation, threshold_fault, threshold_key_row,
-        threshold_network_revocation, threshold_set_object,
+        delegation, encryption_network, encryption_network_member, revocation, threshold_fault,
+        threshold_key_row, threshold_network_revocation, threshold_set_object,
     },
     relationships::parent_delegations,
     util::{Capability, DelegationInfo},
@@ -85,7 +87,7 @@ use super::{
     network_id::NetworkId,
     protocol::NETWORK_REVOKE_ACTION,
     service::{now_rfc3339, EncryptionServiceError},
-    types::KeyBackendKind,
+    types::{KeyBackendKind, NetworkState},
 };
 
 /// Domain of the member's signed acknowledgement of a pushed object.
@@ -105,6 +107,11 @@ const MAX_ATTACHED: usize = revocation::MAX_CHAIN_TRAVERSAL_NODES;
 const MAX_INVOCATION_TTL_SECS: i64 = 3600;
 const RAW_CODEC: u64 = 0x55;
 const REVOKE_ABILITY: &str = "tinycloud.delegation/revoke";
+/// `alg` of a threshold network row: BLS12-381 threshold identity-based
+/// keys (`tinycloud-threshold`). Its public key is the master public key.
+const THRESHOLD_ALG: &str = "tc-threshold-bls12-381/v1";
+/// `role` of a threshold network's member rows.
+const MEMBER_ROLE: &str = "member";
 
 /// What an object of the set is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,12 +284,17 @@ pub(crate) async fn refuse_node_bound<C: ConnectionTrait>(
 
 /// The DIDs a certificate, readiness receipt or activation is signed by:
 /// Ed25519 `did:key` (strict, no small-order key) and `did:pkh:eip155`
-/// (EIP-191 `personal_sign` of the message). Every other method is refused.
+/// (EIP-191 `personal_sign` of the message), each also on the node's offline
+/// DID allow-list (`check_verifiable`). Every other DID is refused.
 pub struct NodeDidVerifier;
 
 impl DidSignatureVerifier for NodeDidVerifier {
     fn verify(&self, signer: &Did, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
         let did = signer.as_str();
+        tinycloud_auth::ssi::dids::DID::new(did.as_bytes())
+            .ok()
+            .and_then(|parsed| crate::did_resolution::check_verifiable(parsed).ok())
+            .ok_or(SignatureError::Invalid)?;
         if did.starts_with("did:key:") {
             tinycloud_auth::share_email_evidence::verify_detached_ed25519(did, message, signature)
                 .map_err(|_| SignatureError::Invalid)
@@ -733,14 +745,22 @@ fn is_root_authority(cap: &Capability, delegator: &str) -> bool {
 }
 
 /// Whether `parent` grants what `child` claims: resource, ability, and
-/// caveats equal to the parent's or under a parent that has none.
+/// caveats. Selector caveats follow `/delegate`'s containment rule, which
+/// also refuses a malformed selector; other caveats must equal the parent's
+/// or sit under a parent that has none.
 fn covers(parent: &Capability, child: &Capability) -> bool {
     child.resource.extends(&parent.resource)
         && crate::policy_capability::ability_matches(
             &parent.ability.to_string(),
             &child.ability.to_string(),
         )
-        && (parent.caveats.0.is_empty() || parent.caveats == child.caveats)
+        && match crate::policy_capability::selector_caveats_contain(
+            &parent.caveats.0,
+            &child.caveats.0,
+        ) {
+            Some(contained) => contained,
+            None => parent.caveats.0.is_empty() || parent.caveats == child.caveats,
+        }
 }
 
 struct Attached {
@@ -958,6 +978,8 @@ pub struct ThresholdSet {
     node_did: String,
     node_keypair: Keypair,
     encryption: Option<ColumnEncryption>,
+    delegated_sql_caveats: bool,
+    named_keys: bool,
 }
 
 impl ThresholdSet {
@@ -973,7 +995,18 @@ impl ThresholdSet {
             node_did: public_key_to_did_key(node_keypair.public()),
             node_keypair,
             encryption,
+            delegated_sql_caveats: false,
+            named_keys: false,
         }
+    }
+
+    /// The node's `/delegate` settings, which a revocation's attached
+    /// delegations are admitted under: delegated SQL caveats (TC-1791) and
+    /// named keys. Both are off by default, as on the node.
+    pub fn with_delegation_rules(mut self, delegated_sql_caveats: bool, named_keys: bool) -> Self {
+        self.delegated_sql_caveats = delegated_sql_caveats;
+        self.named_keys = named_keys;
+        self
     }
 
     pub fn node_did(&self) -> &str {
@@ -1051,6 +1084,27 @@ impl ThresholdSet {
         let signed = decode_cert(bytes).ok_or_else(|| refused("certificate_malformed"))?;
         let verified = verify_certificate(&anchor(network)?, &signed, &NodeDidVerifier)
             .map_err(|_| refused("certificate_invalid"))?;
+        // A node holds only chains it serves: a certificate naming it, or a
+        // successor of a certificate it holds, which may leave it out.
+        let names_this_node = verified
+            .body()
+            .members()
+            .iter()
+            .any(|member| member.node.as_str() == self.node_did);
+        let continues_held = match verified.body().previous() {
+            Some(previous) => find_object(
+                &self.db,
+                network,
+                ObjectKind::Cert,
+                &hex::encode(previous.as_bytes()),
+            )
+            .await?
+            .is_some(),
+            None => false,
+        };
+        if !names_this_node && !continues_held {
+            return Err(AcceptError::Unavailable("not_a_member"));
+        }
         let subject = hex::encode(verified.digest().as_bytes());
         let tx = self.db.begin().await?;
         let new = store(&tx, network, cid, ObjectKind::Cert, &subject, bytes).await?;
@@ -1079,6 +1133,17 @@ impl ThresholdSet {
         )
         .map_err(|_| refused("activation_invalid"))?;
         let tx = self.db.begin().await?;
+        let names_this_node = certificate
+            .body()
+            .members()
+            .iter()
+            .any(|member| member.node.as_str() == self.node_did);
+        if certificate.body().previous().is_none() && names_this_node {
+            if let Err(error) = create_network(&tx, network, &certificate).await {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        }
         let new = store(&tx, network, cid, ObjectKind::Activation, &subject, bytes).await?;
         tx.commit().await?;
         Ok(accepted(cid, new, None))
@@ -1148,8 +1213,9 @@ impl ThresholdSet {
         self.require_member(network).await?;
         let subject = plan.target.to_cid(RAW_CODEC).to_string();
         let tx = self.db.begin().await?;
-        // Step 5: the chain goes in with no validity window checked, then the
-        // revocation row. A chain member a space purge already erased as
+        // Step 5: the chain goes in under /delegate's admission rules except
+        // the time windows and revoked ancestors (`process_carried`), then
+        // the revocation row. A chain member a space purge already erased as
         // revoked leaves the graph as it is: its descendants are refused.
         if let Err(error) = self.insert_revocation(&tx, plan).await {
             tx.rollback().await?;
@@ -1178,7 +1244,14 @@ impl ThresholdSet {
         let revoker = plan.revocation.0.revoker.clone();
         crate::space_purge_records::operation_actors(tx, &[&revoker]).await?;
         for item in plan.chain {
-            delegation::save(tx, item.0, item.1, self.encryption.as_ref()).await?;
+            delegation::process_carried(
+                tx,
+                &item,
+                self.encryption.as_ref(),
+                self.delegated_sql_caveats,
+                self.named_keys,
+            )
+            .await?;
         }
         let serialization = plan.revocation.1;
         let id = hash(&serialization);
@@ -1227,31 +1300,23 @@ impl ThresholdSet {
             .map_err(|_| refused("certificate_invalid"))
     }
 
-    /// Revocations and key-state statements are held only by members: the
-    /// set must hold an activated certificate of `network` naming this node.
+    /// Revocations and key-state statements are held only by members: N's
+    /// current certificate must name this node.
     async fn require_member(&self, network: &NetworkId) -> Result<(), AcceptError> {
-        let activations = threshold_set_object::Entity::find()
-            .filter(threshold_set_object::Column::NetworkId.eq(network.to_string()))
-            .filter(threshold_set_object::Column::Kind.eq(ObjectKind::Activation.as_str()))
-            .all(&self.db)
-            .await?;
-        for activation in activations {
-            let Some(cert) =
-                find_object(&self.db, network, ObjectKind::Cert, &activation.subject).await?
-            else {
-                continue;
-            };
-            if decode_cert(&cert.bytes).is_some_and(|signed| {
-                signed
-                    .body
+        let member = current_certificate(&self.db, network)
+            .await?
+            .is_some_and(|current| {
+                current
+                    .body()
                     .members()
                     .iter()
                     .any(|member| member.node.as_str() == self.node_did)
-            }) {
-                return Ok(());
-            }
+            });
+        if member {
+            Ok(())
+        } else {
+            Err(AcceptError::Unavailable("not_a_member"))
         }
-        Err(AcceptError::Unavailable("not_a_member"))
     }
 
     /// The member's state of key `path`: its row, reported `revoked` once the
@@ -1352,6 +1417,121 @@ fn anchor(network: &NetworkId) -> Result<TrustAnchor, AcceptError> {
     })
 }
 
+/// N's current certificate (gate B §5.5): the end of the activated chain
+/// from N's activated genesis, each step a `verify_successor` with its own
+/// activation. None without exactly one activated genesis. The walk stops
+/// at a certificate with two activated successors (equivocation).
+async fn current_certificate<C: ConnectionTrait>(
+    db: &C,
+    network: &NetworkId,
+) -> Result<Option<VerifiedCertificate>, AcceptError> {
+    let objects = threshold_set_object::Entity::find()
+        .filter(threshold_set_object::Column::NetworkId.eq(network.to_string()))
+        .filter(
+            threshold_set_object::Column::Kind
+                .is_in([ObjectKind::Cert.as_str(), ObjectKind::Activation.as_str()]),
+        )
+        .all(db)
+        .await?;
+    let activated: BTreeSet<&str> = objects
+        .iter()
+        .filter(|object| object.kind == ObjectKind::Activation.as_str())
+        .map(|object| object.subject.as_str())
+        .collect();
+    // One certificate per digest: encodings of one body share it.
+    let certificates: BTreeMap<&str, SignedCertificate> = objects
+        .iter()
+        .filter(|object| {
+            object.kind == ObjectKind::Cert.as_str() && activated.contains(object.subject.as_str())
+        })
+        .filter_map(|object| Some((object.subject.as_str(), decode_cert(&object.bytes)?)))
+        .collect();
+    let anchor = anchor(network)?;
+    let mut geneses = certificates
+        .values()
+        .filter(|signed| signed.body.previous().is_none())
+        .filter_map(|signed| verify_certificate(&anchor, signed, &NodeDidVerifier).ok());
+    let (Some(mut current), None) = (geneses.next(), geneses.next()) else {
+        return Ok(None);
+    };
+    // Each step raises the epoch, so the walk ends.
+    loop {
+        let step = {
+            let mut successors = certificates
+                .values()
+                .filter_map(|signed| verify_successor(&current, signed, &NodeDidVerifier).ok());
+            (successors.next(), successors.next())
+        };
+        match step {
+            (Some(successor), None) => current = successor,
+            _ => return Ok(Some(current)),
+        }
+    }
+}
+
+/// Gate B §4.3: a member creates N's network row and member rows from N's
+/// activated genesis. A row already there must be this genesis's threshold
+/// row; another row of N leaves the activation unavailable.
+async fn create_network(
+    tx: &DatabaseTransaction,
+    network: &NetworkId,
+    genesis: &VerifiedCertificate,
+) -> Result<(), AcceptError> {
+    let body = genesis.body();
+    let public = body.public_material();
+    let public_key = public.master_public_key().encode().to_vec();
+    let now = now_rfc3339();
+    encryption_network::Entity::insert(encryption_network::ActiveModel {
+        network_id: Set(network.to_string()),
+        owner_did: Set(network.owner_did().to_string()),
+        name: Set(network.name().to_string()),
+        alg: Set(THRESHOLD_ALG.to_string()),
+        key_version: Set(1),
+        public_key: Set(public_key.clone()),
+        state: Set(NetworkState::Active.as_str().to_string()),
+        threshold_n: Set(i32::from(public.threshold().n())),
+        threshold_t: Set(i32::from(public.threshold().t())),
+        key_backend: Set(KeyBackendKind::Threshold.as_str().to_string()),
+        sealed_private_key: Set(None),
+        created_at: Set(now.clone()),
+        updated_at: Set(now.clone()),
+    })
+    .on_conflict(
+        OnConflict::column(encryption_network::Column::NetworkId)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(tx)
+    .await?;
+    let row = encryption_network::Entity::find_by_id(network.to_string())
+        .one(tx)
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound("encryption_network".to_string()))?;
+    if row.key_backend != KeyBackendKind::Threshold.as_str() || row.public_key != public_key {
+        return Err(AcceptError::Unavailable("network_exists"));
+    }
+    for member in body.members() {
+        encryption_network_member::Entity::insert(encryption_network_member::ActiveModel {
+            network_id: Set(network.to_string()),
+            node_id: Set(member.node.as_str().to_string()),
+            role: Set(MEMBER_ROLE.to_string()),
+            share_index: Set(i32::from(member.index.get())),
+            joined_at: Set(now.clone()),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                encryption_network_member::Column::NetworkId,
+                encryption_network_member::Column::NodeId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn find_object<C: ConnectionTrait>(
     db: &C,
     network: &NetworkId,
@@ -1431,7 +1611,9 @@ async fn record_fault<C: ConnectionTrait>(
 /// `(state, keyVersion)` blocks the key with `conflict` set until a higher
 /// `stateSeq` arrives. Under a conflict the row keeps the highest key version
 /// and the lowest statement CID, so every arrival order ends in one row.
-/// Returns whether this statement is a conflict.
+/// Returns whether this statement is a conflict. The owner faults recorded do
+/// depend on arrival order: a statement with one effect arriving after a
+/// conflict at its `stateSeq` records another; the row does not.
 async fn merge(
     tx: &DatabaseTransaction,
     network: &NetworkId,

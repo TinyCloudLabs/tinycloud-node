@@ -1149,6 +1149,10 @@ pub async fn app_with_control(
         database_connection.clone(),
         key_setup.node_keypair(),
         Some(column_encryption.clone()),
+    )
+    .with_delegation_rules(
+        tinycloud_config.sql.delegated_caveats_enforced,
+        tinycloud_config.encryption_network.named_keys_v1,
     );
     let node_keypair = key_setup.node_keypair();
     let encryption_service = EncryptionService::new_with_node_keypair(
