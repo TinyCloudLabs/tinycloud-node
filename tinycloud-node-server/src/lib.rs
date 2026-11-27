@@ -71,6 +71,7 @@ pub mod sql_restore_check;
 pub mod sql_store;
 pub mod storage;
 pub mod tee;
+pub mod threshold_share;
 mod tracing;
 pub mod tunnel;
 pub mod webhook_dispatcher;
@@ -1220,6 +1221,27 @@ pub async fn app_with_control(
     tinycloud.set_read_audit_wait(Duration::from_millis(
         tinycloud_config.database.read_audit_wait_ms,
     ));
+    // With `threshold_share_dir` set, the node is a threshold member: the
+    // process is made non-dumpable and the share directory must already be a
+    // private, owned, lockable dir, or the start is refused before any route
+    // is served (TC-2224). Unset, nothing here runs.
+    if let Some(dir) = tinycloud_config
+        .encryption_network
+        .threshold_share_dir
+        .as_deref()
+    {
+        if let Err(error) = threshold_share::guard_threshold_share_dir(dir) {
+            ::tracing::error!(
+                event = "threshold_share_dir_rejected",
+                error_kind = error.kind(),
+                "threshold share directory guard failed: the node does not start"
+            );
+            anyhow::bail!(
+                "threshold_share_dir_rejected: {error} (error_kind {})",
+                error.kind()
+            );
+        }
+    }
     // With `named_keys_v1` on, a deletion ledger that cannot be opened or
     // replayed stops the start: the node never serves with the gate quietly
     // off. With it off, the failure is logged and the rest of the node serves.

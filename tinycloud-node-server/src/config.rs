@@ -177,6 +177,14 @@ pub struct EncryptionNetworkConfig {
     pub key_wrap_require_v2: bool,
     #[serde(default)]
     pub deletion_ledger_path: Option<std::path::PathBuf>,
+    /// A threshold member's share directory: an absolute path on a private
+    /// volume that only this node's container mounts. When set, the node is
+    /// made non-dumpable and the directory must exist with mode 0700, be
+    /// owned by the process and take an exclusive lock, or the start is
+    /// refused (TC-2224). Unset: the node is not a threshold member and no
+    /// check runs.
+    #[serde(default)]
+    pub threshold_share_dir: Option<std::path::PathBuf>,
     #[serde(default)]
     pub key_cap_per_network: Option<u64>,
     #[serde(default)]
@@ -2975,6 +2983,18 @@ mod tests {
             let err = zero.validate().unwrap_err();
             assert!(err.contains(name) && err.contains("above 0"), "{err}");
         }
+    }
+
+    #[test]
+    fn threshold_share_dir_is_unset_by_default_and_parses() {
+        let default: EncryptionNetworkConfig = toml::from_str("").unwrap();
+        assert_eq!(default.threshold_share_dir, None);
+        let set: EncryptionNetworkConfig =
+            toml::from_str("threshold_share_dir = \"/var/lib/tinycloud/threshold\"").unwrap();
+        assert_eq!(
+            set.threshold_share_dir,
+            Some("/var/lib/tinycloud/threshold".into())
+        );
     }
 
     #[test]
