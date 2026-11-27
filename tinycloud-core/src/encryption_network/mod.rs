@@ -16,6 +16,7 @@ pub mod keys;
 pub mod network_id;
 pub mod protocol;
 pub mod service;
+pub mod threshold_set;
 pub mod types;
 
 #[cfg(test)]

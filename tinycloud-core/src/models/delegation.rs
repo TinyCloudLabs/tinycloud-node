@@ -1554,7 +1554,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     }
 }
 
-async fn save<C: ConnectionTrait>(
+pub(crate) async fn save<C: ConnectionTrait>(
     db: &C,
     delegation: util::DelegationInfo,
     serialization: Vec<u8>,
