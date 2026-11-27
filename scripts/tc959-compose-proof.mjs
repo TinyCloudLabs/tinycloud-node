@@ -192,21 +192,52 @@ export function diagnosticCounts(events) {
 export function assertThresholdMemberCompose(member, production) {
   const share = 'threshold-shares';
   const target = '/var/lib/tinycloud/threshold';
-  const mountsAtTarget = (service) => (service?.volumes ?? []).filter(volume => volume.target === target);
   const memberServices = member.services ?? {};
   assert.equal(memberServices['ssh-gateway'], undefined, 'member_ssh_gateway_forbidden');
-  const tinycloud = mountsAtTarget(memberServices.tinycloud);
+  assert.deepEqual(Object.keys(memberServices).sort(), ['postgres', 'tinycloud'], 'member_service_allowlist');
+  const volumeEnds = (volume) => {
+    if (typeof volume === 'string') {
+      const [source, target] = volume.split(':');
+      return { source, target };
+    }
+    return { type: volume?.type, source: volume?.source, target: volume?.target };
+  };
+  for (const service of Object.values(memberServices)) {
+    assert.equal(service.profiles, undefined, 'member_profiles_forbidden');
+  }
+  const tinycloud = (memberServices.tinycloud?.volumes ?? []).map(volumeEnds).filter(ends => ends.target === target);
   assert.equal(tinycloud.length, 1, 'member_share_volume_mounted_once');
   assert.equal(tinycloud[0].type, 'volume', 'member_share_mount_must_be_a_named_volume');
   assert.equal(tinycloud[0].source, share, 'member_share_mount_source');
   assert.ok(Object.keys(member.volumes ?? {}).includes(share), 'member_share_volume_declared');
   for (const [name, service] of Object.entries(memberServices)) {
     if (name === 'tinycloud') continue;
-    assert.equal((service.volumes ?? []).filter(volume => volume.source === share || volume.target === target).length, 0, `member_share_volume_mounted_in_${name}`);
+    assert.equal(service.volumes_from, undefined, `member_dstack_socket_only_in_tinycloud_${name}`);
+    for (const key of ['pid', 'ipc', 'privileged', 'cap_add', 'devices', 'network_mode']) {
+      assert.equal(service[key], undefined, `member_${key}_forbidden_in_${name}`);
+    }
+    const volumes = (service.volumes ?? []).map(volumeEnds);
+    assert.equal(volumes.filter(ends => ends.source === share || ends.target === target).length, 0, `member_share_volume_mounted_in_${name}`);
+    const socketMount = volumes.find(ends => ends.source === 'dstack.sock' || ends.target === 'dstack.sock' || ends.source === 'tappd.sock' || ends.target === 'tappd.sock'
+      || (ends.source ?? '').endsWith('/dstack.sock') || (ends.target ?? '').endsWith('/dstack.sock')
+      || (ends.source ?? '').endsWith('/tappd.sock') || (ends.target ?? '').endsWith('/tappd.sock')
+      || ['/', '/var', '/run', '/var/run'].includes((ends.source ?? '').replace(/\/+$/, '') || '/'));
+    assert.equal(socketMount, undefined, `member_dstack_socket_only_in_tinycloud_${name}`);
+    const hostBind = volumes.find(ends => ends.type === 'bind' || /^(\/|\.|~)/.test(ends.source ?? ''));
+    assert.equal(hostBind, undefined, `member_host_bind_mount_in_${name}`);
+  }
+  assert.deepEqual((memberServices.postgres?.volumes ?? []).map(volumeEnds), [{ type: 'volume', source: 'pgdata', target: '/var/lib/postgresql/data' }], 'member_postgres_volumes_allowlist');
+  const dockerNames = Object.entries(member.volumes ?? {}).map(([key, definition]) => definition?.name ?? key);
+  assert.equal(new Set(dockerNames).size, dockerNames.length, 'member_duplicate_volume_name');
+  for (const [name, definition] of Object.entries(member.volumes ?? {})) {
+    assert.ok(['pgdata', 'threshold-shares'].includes(name), `member_volumes_allowlist_${name}`);
+    assert.equal(definition?.driver, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
+    assert.equal(definition?.driver_opts, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
+    assert.equal(definition?.external, undefined, `member_dstack_socket_only_in_tinycloud_volume_${name}`);
   }
   assert.ok(!Object.keys(production.volumes ?? {}).includes(share), 'production_share_volume_forbidden');
   for (const [name, service] of Object.entries(production.services ?? {})) {
-    assert.equal((service?.volumes ?? []).filter(volume => volume.source === share || volume.target === target).length, 0, `production_share_volume_mounted_in_${name}`);
+    assert.equal((service?.volumes ?? []).map(volumeEnds).filter(ends => ends.source === share || ends.target === target).length, 0, `production_share_volume_mounted_in_${name}`);
   }
   assert.equal(memberServices.tinycloud.environment?.TINYCLOUD_ENCRYPTION_NETWORK__THRESHOLD_SHARE_DIR, target, 'member_threshold_share_dir_unset');
 }
