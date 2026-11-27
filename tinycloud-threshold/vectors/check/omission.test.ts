@@ -60,7 +60,7 @@ for (const [kind, setup, pinned] of KINDS) {
     });
   });
 
-  describe(`${kind}: fewer than t qualified dealers ends the transcript after R3`, () => {
+  describe(`${kind}: records are authenticated in order, each just before it is applied`, () => {
     test('a later record, valid or not, is neither read nor authenticated: InsufficientQualified', () => {
       const s = setup(`${kind}-qual-after-r3`, 3, 5), alone = s.rounds.map((r, k) => k === 0 ? r.filter(d => d.index === 1) : r);
       const check = (records: RoundRecord[]) => code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, records, verify, pinned));
@@ -70,6 +70,12 @@ for (const [kind, setup, pinned] of KINDS) {
       expect(code(() => run(s, [...alone, []], pinned))).toBe('InsufficientQualified');
       // R1–R3 are still authenticated: a bad R3 closure decides first.
       expect(check(unsigned(s, alone.slice(0, 4), 2))).toBe('InvalidSignature');
+    });
+    test('with |QUAL| >= t, R4 is authenticated before R5 is looked for', () => {
+      const s = setup(`${kind}-r4-before-r5`, 3, 5);
+      const check = (records: RoundRecord[]) => code(() => dkgVerifyTranscript(ANCHOR, s.ceremony, records, verify, pinned));
+      expect(code(() => run(s, s.rounds.slice(0, 4), pinned))).toBe('InvalidRound');
+      expect(check(unsigned(s, s.rounds.slice(0, 4), 3))).toBe('InvalidSignature');
     });
   });
 
