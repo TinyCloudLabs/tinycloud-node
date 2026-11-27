@@ -59,6 +59,10 @@ pub mod sql_store_mode;
 pub mod sql_store_object;
 pub mod sql_store_owner;
 pub mod sql_wal_mark;
+pub mod threshold_fault;
+pub mod threshold_key_row;
+pub mod threshold_network_revocation;
+pub mod threshold_set_object;
 
 pub mod space_purge_shared_residue;
 

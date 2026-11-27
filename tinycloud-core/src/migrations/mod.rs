@@ -62,6 +62,7 @@ pub mod m20261123_000000_delegation_mode;
 pub mod m20261124_000000_sql_wal_mark;
 pub mod m20261125_000000_revocation_tombstone;
 pub mod m20261125_000000_sql_store_mode;
+pub mod m20261126_000000_threshold_authset;
 
 pub struct Migrator;
 
@@ -128,6 +129,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261125_000000_sql_store_mode::Migration),
             Box::new(m20261113_020000_artifact_chunk_wal::Migration),
             Box::new(m20261113_030000_artifact_part_lifecycle::Migration),
+            Box::new(m20261126_000000_threshold_authset::Migration),
         ]
     }
 }
