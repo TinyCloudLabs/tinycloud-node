@@ -8045,6 +8045,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
+ "hkdf",
  "hmac 0.12.1",
  "hyper 0.14.32",
  "if-addrs",
@@ -8093,6 +8094,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
