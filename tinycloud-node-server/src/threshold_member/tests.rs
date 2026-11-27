@@ -218,6 +218,18 @@ impl Fixture {
         record::network_dir(self.share.path(), &network.to_string()).join(record::KEY_FILE)
     }
 
+    /// A time past the TTL of `network`'s key record. The TTL runs from the
+    /// record's mtime, which is later than any clock read before the
+    /// install.
+    fn past_ttl(&self, network: &NetworkId) -> SystemTime {
+        std::fs::metadata(self.key_path(network))
+            .unwrap()
+            .modified()
+            .unwrap()
+            + PENDING_KEY_TTL
+            + Duration::from_secs(1)
+    }
+
     async fn attest(
         &self,
         dstack: &FakeDstack,
@@ -1085,13 +1097,7 @@ fn an_expiry_is_audited_even_when_the_admission_is_then_refused() {
     let mut audit = Vec::new();
     let err = fx
         .keys
-        .admit(
-            &a,
-            &identity(),
-            &fx.holdings,
-            now + PENDING_KEY_TTL + Duration::from_secs(1),
-            &mut audit,
-        )
+        .admit(&a, &identity(), &fx.holdings, fx.past_ttl(&a), &mut audit)
         .unwrap_err();
     assert!(
         matches!(err, MemberKeyError::OwnerPendingCapReached),
@@ -1285,7 +1291,7 @@ fn a_pending_key_expires_after_the_ttl_and_a_held_one_never_does() {
     assert!(fx.expire(early).unwrap().is_empty());
     assert_eq!(fx.admit(&pending, early).unwrap().did(), pending_did);
 
-    let late = now + PENDING_KEY_TTL + Duration::from_secs(1);
+    let late = fx.past_ttl(&pending);
     let audit = fx.expire(late).unwrap();
     assert_eq!(
         audit,
@@ -1315,7 +1321,7 @@ fn an_admission_after_the_ttl_replaces_the_expired_pending_key() {
             &net,
             &identity(),
             &fx.holdings,
-            now + PENDING_KEY_TTL + Duration::from_secs(1),
+            fx.past_ttl(&net),
             &mut audit,
         )
         .unwrap();
@@ -1640,8 +1646,7 @@ async fn a_plain_create_is_refused_while_a_member_key_record_exists() {
     fx.holdings.release(&net);
 
     // Once the pending key expires, the create runs.
-    fx.expire(now + PENDING_KEY_TTL + Duration::from_secs(1))
-        .unwrap();
+    fx.expire(fx.past_ttl(&net)).unwrap();
     guard_plain_create(Some(&fx.keys), &net, create())
         .await
         .unwrap();

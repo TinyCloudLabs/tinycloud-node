@@ -72,8 +72,15 @@ async fn a_plain_create_is_refused_while_a_member_key_exists() -> Result<()> {
         .state::<MemberKeys>()
         .expect("MemberKeys is managed");
     let network = NetworkId::new(owner_did(&fixture), "vault".to_string())?;
-    let now = SystemTime::now();
-    keys.admit(&network, &identity(), &HoldsNothing, now, &mut Vec::new())?;
+    keys.admit(
+        &network,
+        &identity(),
+        &HoldsNothing,
+        SystemTime::now(),
+        &mut Vec::new(),
+    )?;
+    // Read after the install: the TTL runs from the record's mtime.
+    let late = SystemTime::now() + PENDING_KEY_TTL + Duration::from_secs(1);
 
     let (status, body) = create_network(&fixture, &network).await?;
     assert_eq!(status, Status::Conflict, "{body}");
@@ -84,12 +91,7 @@ async fn a_plain_create_is_refused_while_a_member_key_exists() -> Result<()> {
 
     // Once the pending key expires, the plain create succeeds.
     let mut audit = Vec::new();
-    keys.expire_pending(
-        &HoldsNothing,
-        &identity(),
-        now + PENDING_KEY_TTL + Duration::from_secs(1),
-        &mut audit,
-    )?;
+    keys.expire_pending(&HoldsNothing, &identity(), late, &mut audit)?;
     assert_eq!(audit.len(), 1);
     let (status, body) = create_network(&fixture, &network).await?;
     assert_eq!(status, Status::Ok, "{body}");

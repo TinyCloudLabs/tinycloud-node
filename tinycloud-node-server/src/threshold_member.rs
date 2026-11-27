@@ -494,7 +494,9 @@ impl MemberKeys {
 
     /// The member key for `network` after a verified owner admission: the
     /// installed one, or a new one if there is none, loaded into its slot.
-    /// Call only after [`OwnerAdmission::verify`] succeeded.
+    /// Call only after [`OwnerAdmission::verify`] succeeded, holding
+    /// `network_gate` after the network-row check; [`member_attestation`]
+    /// does both. Crate-visible for tests only.
     ///
     /// A pending key older than [`PENDING_KEY_TTL`] is unlinked first and
     /// replaced. A missing key while the member holds a share or candidate of
@@ -503,7 +505,7 @@ impl MemberKeys {
     ///
     /// Audit events go to `audit` as they happen, so an expiry is recorded
     /// even when a later step refuses the admission.
-    pub fn admit(
+    pub(crate) fn admit(
         &self,
         network: &NetworkId,
         identity: &LocalIdentity,
