@@ -515,6 +515,7 @@ impl EncryptionService {
         target: KeyState,
     ) -> Result<encryption_network_key::Model, EncryptionServiceError> {
         lock_network_row(tx, network).await?;
+        self.require_one_of_one_network(tx, network).await?;
         let row = find_key_row(tx, network, loc.path())
             .await?
             .ok_or(EncryptionServiceError::KeyNotFound)?;
@@ -562,10 +563,27 @@ impl EncryptionService {
         loc: &KeyLocation,
     ) -> Result<KeyDescriptor, EncryptionServiceError> {
         let network = network_of(loc)?;
+        self.require_one_of_one_network(&self.db, &network).await?;
         let row = find_key_row(&self.db, &network, loc.path())
             .await?
             .ok_or(EncryptionServiceError::KeyNotFound)?;
         descriptor(row)
+    }
+
+    /// Refuses the key rows of a threshold network. Reads the network row
+    /// whatever its state; a missing row is left to the key-row read.
+    async fn require_one_of_one_network<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        network: &NetworkId,
+    ) -> Result<(), EncryptionServiceError> {
+        if let Some(row) = encryption_network::Entity::find_by_id(network.to_string())
+            .one(db)
+            .await?
+        {
+            self.require_one_of_one_row(&row.key_backend)?;
+        }
+        Ok(())
     }
 
     /// Unauthenticated public GET. A deletable key (under `apps/` or

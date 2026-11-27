@@ -545,11 +545,15 @@ impl EncryptionService {
         // TC-2712: a create that found no network and then lost to a concurrent
         // create records its attempt as a failed ceremony. This read only
         // classifies that outcome; the read inside the transaction decides.
+        // An existing threshold row is refused before any key is generated.
         let started_at = now_rfc3339();
-        let absent_at_start = encryption_network::Entity::find_by_id(network_id.to_string())
+        let existing = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
-            .await?
-            .is_none();
+            .await?;
+        if let Some(row) = &existing {
+            self.require_one_of_one_row(&row.key_backend)?;
+        }
+        let absent_at_start = existing.is_none();
 
         // Key generation touches no database row and may call the key
         // backend, so it runs before the transaction opens.
@@ -741,6 +745,7 @@ impl EncryptionService {
         network_id: &NetworkId,
         existing: encryption_network::Model,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
+        self.require_one_of_one_row(&existing.key_backend)?;
         let has_member = encryption_network_member::Entity::find()
             .filter(encryption_network_member::Column::NetworkId.eq(network_id.to_string()))
             .count(tx)
@@ -918,6 +923,7 @@ impl EncryptionService {
             .one(&self.db)
             .await?
             .ok_or(EncryptionServiceError::NetworkNotFound)?;
+        self.require_one_of_one_row(&existing.key_backend)?;
         if is_half_created(&self.db, &existing).await? {
             return Err(EncryptionServiceError::NetworkNotFound);
         }
