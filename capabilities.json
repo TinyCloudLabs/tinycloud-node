@@ -171,7 +171,8 @@
     {
       "urn": "tinycloud.encryption/member.admit",
       "service": "tinycloud.encryption",
-      "status": "active"
+      "status": "reserved",
+      "notes": "The owner's admission of a threshold member, invoked on POST /threshold/<N>/member-attestation. Reserved: that route is not mounted yet, so no node dispatch code serves this ability."
     },
     {
       "urn": "tinycloud.encryption/key.create",
