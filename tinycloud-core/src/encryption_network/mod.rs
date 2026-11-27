@@ -31,6 +31,8 @@ mod deletion_ledger_tests;
 mod key_delete_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod threshold_tests;
 
 pub use backend::{KeyBackend, KeyBackendError, LocalOneOfOneBackend};
 pub use network_id::{NetworkId, NetworkIdError};
