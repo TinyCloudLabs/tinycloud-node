@@ -113,6 +113,10 @@ export function isGenesisShape(t: number, n: number): boolean {
 export function checkGenesisShape(t: number, n: number) {
   if (!isGenesisShape(t, n)) fail('UnsupportedFaultBudget');
 }
+/** The fault budget f of a genesis or re-key shape: one for 3-of-4, otherwise t − 1. */
+export function faultBudget(t: number, n: number): number {
+  return t === 3 && n === 4 ? 1 : t - 1;
+}
 
 export const KIND = { genesis: 1, reshare: 2, refresh: 3, rekey: 4 } as const;
 export interface Ceremony {

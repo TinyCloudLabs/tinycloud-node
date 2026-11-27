@@ -3,9 +3,9 @@ import { checkVectors } from './vectors.ts';
 import { checkCertificateVectors } from './cert-vectors.ts';
 import { checkTranscripts, transcriptKind } from './transcripts.ts';
 
-const defaults = ['../v1/primitives.json', '../v1/cert-core.json', '../v1/dkg-genesis.json', '../v1/reshare.json', '../v1/dkg-rekey.json', '../v1/chain.json']
+const defaults = ['../v1/primitives.json', '../v1/cert-core.json', '../v1/dkg-genesis.json', '../v1/reshare.json', '../v1/dkg-rekey.json', '../v1/chain.json', '../v1/dkg-omission.json']
   .map(p => new URL(p, import.meta.url));
-const LABEL = { dkg: 'DKG', rekey: 'Re-key', reshare: 'Reshare', chain: 'Chain' } as const;
+const LABEL = { dkg: 'DKG', rekey: 'Re-key', reshare: 'Reshare', chain: 'Chain', omission: 'DKG omission' } as const;
 
 function check(input: unknown) {
   if (transcriptKind(input) !== undefined) {

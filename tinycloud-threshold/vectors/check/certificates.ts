@@ -1,7 +1,7 @@
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { Reader, ProtocolError, be, bytes, concat, hex, lp, tagged, g2, decodeRequest, decodeShare, contextDigest, requestDigest, signingPreimage, verifyShare, type Bytes, type G2, type Keyset } from './protocol.ts';
-import { isGenesisShape } from './ceremony.ts';
+import { faultBudget, isGenesisShape } from './ceremony.ts';
 
 export const CERT_TAGS = {
   activation: 'TC-THRESHOLD-V1-ACTIVATE', ceremony: 'TC-THRESHOLD-V1-CEREMONY-AUTH',
@@ -183,6 +183,9 @@ export function verifyActivation(cert: VerifiedCertificate, receipts: Receipt[],
   if (budget !== null) {
     quorum = cert.body.threshold + budget;
     if (!Number.isInteger(budget) || budget <= 0 || budget > 65535 || quorum > 65535 || quorum > cert.body.members.length) throw new ProtocolError('InvalidReadiness');
+    // A genesis or re-key candidate (no predecessor, or a previous master key) needs b >= f of its shape.
+    const fresh = !cert.body.previous || cert.body.previousMpk !== undefined;
+    if (fresh && budget < faultBudget(cert.body.threshold, cert.body.members.length)) throw new ProtocolError('InvalidReadiness');
   }
   const seen = new Set<number>();
   const checked = receipts.map(receipt => {

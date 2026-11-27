@@ -31,18 +31,25 @@ export function exactList<const T extends readonly string[]>(expected: T): Parse
 }
 export const encoding = literal('hex; statements are exact signed bytes; scalars 32-byte big-endian; G2 96-byte compressed');
 
-/** Case records carry either `outputs` (success) or `error` (a typed refusal), never both; names are unique. */
-export function cases<O extends string, I, Out>(operation: O, inputs: Parser<I>, outputs: Parser<Out>) {
+/** One case record: `outputs` (success) or `error` (a typed refusal), never both. */
+export function caseOf<O extends string, I, Out>(operation: O, inputs: Parser<I>, outputs: Parser<Out>) {
   const success = object({ name: text, operation: literal(operation), description: text, inputs, outputs });
   const failure = object({ name: text, operation: literal(operation), description: text, inputs, error: text });
   type Case = Parsed<typeof success> | Parsed<typeof failure>;
   const one: Parser<Case> = (v, p) => v && typeof v === 'object' && 'error' in v ? failure(v, p) : success(v, p);
-  const all: Parser<Case[]> = (v, p) => {
+  return one;
+}
+/** A list of case records with unique names. */
+export function uniqueCases<C extends { name: string }>(one: Parser<C>): Parser<C[]> {
+  return (v, p) => {
     const parsed = list(one, 1, 256)(v, p);
     if (new Set(parsed.map(c => c.name)).size !== parsed.length) invalid(`${p}: duplicate name`);
     return parsed;
   };
-  return all;
+}
+/** Case records carry either `outputs` (success) or `error` (a typed refusal), never both; names are unique. */
+export function cases<O extends string, I, Out>(operation: O, inputs: Parser<I>, outputs: Parser<Out>) {
+  return uniqueCases(caseOf(operation, inputs, outputs));
 }
 
 export function same(label: string, actual: unknown, expected: unknown) {

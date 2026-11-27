@@ -1,19 +1,19 @@
 # Independent vector and transcript checker
 
 Independent TypeScript computation for `../v1/primitives.json`,
-`../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json` and
-`../v1/chain.json` (and the certificate-core document `../v1/cert-core.json`),
-using `@noble/curves` 2.4.0 and Bun 1.4.4. All scalar inputs are public test
-values.
+`../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json`,
+`../v1/chain.json` and `../v1/dkg-omission.json` (and the certificate-core
+document `../v1/cert-core.json`), using `@noble/curves` 2.4.0 and Bun 1.4.4. All
+scalar inputs are public test values.
 
 ```sh
 bun install --frozen-lockfile && bun run check
 ```
 
 `check` runs the Bun tests, TypeScript checking, and the real vector CLI over
-all six committed documents. The existing `threshold` CI job invokes this
+all seven committed documents. The existing `threshold` CI job invokes this
 command. To check one JSON file (primitive, certificate, DKG, re-key,
-redistribution or chain; the transcript kind is read from its `spec_sections`):
+redistribution, chain or DKG omission; the transcript kind is read from its `spec_sections`):
 
 ```sh
 bun run vectors /absolute/path/to/document.json
@@ -224,7 +224,7 @@ Dependency implementation files were not opened or used as design inputs.
 | --- | --- |
 | TinyCloud approved design/plan and `../../SPEC.md` §§3.1–3.6, S0.1 appendix | Equations, DSTs, encodings, error ordering and RequestDigest amendment |
 | `../../SPEC.md` §§3.0, 3.7–3.12, S0.2, S0.3, S0.4 and S0.5 appendices; plan r2 §§3.0–3.11, §5, §6 | Ceremony, certificate, envelope, closure and transcript layouts; DKG, re-key, redistribution and chain rules (TC-2223) |
-| `../v1/primitives.json`, `../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json`, `../v1/chain.json`, `../v1/cert-core.json` seeds | Public inputs, expected bytes and fixture signing seeds |
+| `../v1/primitives.json`, `../v1/dkg-genesis.json`, `../v1/reshare.json`, `../v1/dkg-rekey.json`, `../v1/chain.json`, `../v1/dkg-omission.json`, `../v1/cert-core.json` seeds | Public inputs, expected bytes and fixture signing seeds |
 | [RFC 9380 §§5.2–5.3.1](https://www.rfc-editor.org/rfc/rfc9380#section-5.2) | Scalar-field reduction and SHA-256 XMD algorithm |
 | [RFC 8032 §5.1](https://www.rfc-editor.org/rfc/rfc8032#section-5.1) | Ed25519 encodings for the strict-verification tests |
 | [noble-curves 2.4.0 API documentation](https://github.com/paulmillr/noble-curves/blob/2.4.0/README.md) | Group operations, hash-to-curve, pairings, field API and Ed25519 `zip215: false` |

@@ -193,7 +193,11 @@ export function dkgVerifyTranscript(anchor: Anchor, statement: Statement, record
     }
   }
   const reconstructed = qual.filter(i => reconstruct.has(i));
+  // Floor: reconstruction may not leave fewer than t QUAL dealers. It is an abort after R5, so it precedes the round count.
+  if (qual.length - reconstructed.length < t) fail('ExcessiveReconstruction');
   if (rounds.length !== (reconstructed.length ? 6 : 5)) fail('InvalidRound');
+  // Every sender of closed R6 must have exactly one envelope in closed R4 and in closed R5 (presence, not content).
+  if (r6?.some(m => sender(r4!, m.index).kind !== 'single' || sender(r5!, m.index).kind !== 'single')) fail('OwnMessageOmitted');
   for (const i of reconstructed) {
     const values: [number, bigint][] = [];
     for (const j of members) {
