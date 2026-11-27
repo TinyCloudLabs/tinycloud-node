@@ -711,6 +711,9 @@ mod rekey_scenarios {
     include!("dkg_scenarios.rs");
 }
 
+#[path = "dkg_omission.rs"]
+mod omission;
+
 // ------------------------------------------------------------------ vectors
 
 fn hex_statement(s: &SignedStatement) -> Value {
