@@ -817,7 +817,12 @@ fn an_admission_after_the_ttl_replaces_the_expired_pending_key() {
     let old = fx.admit(&net, now).unwrap().did();
     let (key, audit) = fx
         .keys
-        .admit(&net, &identity(), &fx.holdings, now + PENDING_KEY_TTL)
+        .admit(
+            &net,
+            &identity(),
+            &fx.holdings,
+            now + PENDING_KEY_TTL + Duration::from_secs(1),
+        )
         .unwrap();
     assert_ne!(key.did(), old);
     assert_eq!(audit.len(), 1);
