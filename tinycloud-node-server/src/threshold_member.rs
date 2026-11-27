@@ -1,8 +1,8 @@
 //! Threshold-member key: a member's identity for one threshold network N,
-//! generated inside the CVM and kept on the member's share volume (gate A
-//! v5.1 D7). It is never derived from dstack's key-derivation endpoint, so a
-//! provider KMS rotation, which changes every key that endpoint returns,
-//! leaves it unchanged.
+//! generated inside the CVM and kept on the member's share volume (design:
+//! TC-2224, section D7). It is never derived from dstack's key-derivation
+//! endpoint, so a provider KMS rotation, which changes every key that
+//! endpoint returns, leaves it unchanged.
 //!
 //! - [`MemberKeys`] owns the key records under `<share dir>/member/`
 //!   (D7.1, D7.2, D7.4).

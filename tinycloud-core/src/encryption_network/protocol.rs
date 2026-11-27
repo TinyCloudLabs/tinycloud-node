@@ -26,7 +26,7 @@ pub const KEY_CREATE_ACTION: &str = "tinycloud.encryption/key.create";
 pub const KEY_BLOCK_ACTION: &str = "tinycloud.encryption/key.block";
 pub const KEY_UNBLOCK_ACTION: &str = "tinycloud.encryption/key.unblock";
 pub const KEY_DELETE_ACTION: &str = "tinycloud.encryption/key.delete";
-/// The owner's admission ability for a threshold member (Naomi, 2026-11-27).
+/// The owner's admission ability for a threshold member.
 pub const MEMBER_ADMIT_ACTION: &str = "tinycloud.encryption/member.admit";
 
 /// Body of a POST /encryption/networks/<networkId>/decrypt request.

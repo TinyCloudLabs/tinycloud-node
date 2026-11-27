@@ -17,7 +17,7 @@ const APP_ID: &str = "0b1c3a7e9f2d4c6b8a0e1f2d3c4b5a6978877665";
 const INSTANCE_ID: &str = "5f4e3d2c1b0a99887766554433221100ffeeddcc";
 
 fn network(name: &str) -> NetworkId {
-    NetworkId::new("did:key:z6MkExampleAbcd", name).unwrap()
+    NetworkId::new("did:key:z6MkTestAbcd", name).unwrap()
 }
 
 fn identity() -> LocalIdentity {
@@ -753,7 +753,7 @@ mod admission_shape {
             (
                 "audience",
                 invocation(
-                    "did:key:z6MkOther",
+                    "did:key:z6MkSecondNode",
                     &net.to_string(),
                     MEMBER_ADMIT_ACTION,
                     facts(&net, NODE, MEMBER_ADMIT_ACTION, &body),
@@ -786,7 +786,7 @@ mod admission_shape {
                     NODE,
                     &net.to_string(),
                     MEMBER_ADMIT_ACTION,
-                    facts(&net, "did:key:z6MkOther", MEMBER_ADMIT_ACTION, &body),
+                    facts(&net, "did:key:z6MkSecondNode", MEMBER_ADMIT_ACTION, &body),
                 ),
                 &body,
             ),
@@ -1017,7 +1017,7 @@ fn owned(owner: usize, name: &str) -> NetworkId {
     let tag: String = [TAGS[owner / 8] as char, TAGS[owner % 8] as char]
         .iter()
         .collect();
-    NetworkId::new(format!("did:key:z6MkExample{tag}"), name).unwrap()
+    NetworkId::new(format!("did:key:z6MkTestPeer{tag}"), name).unwrap()
 }
 
 /// Admit [`MAX_PENDING_KEYS`] pending keys, [`MAX_PENDING_KEYS_PER_OWNER`]
