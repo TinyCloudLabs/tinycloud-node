@@ -1543,7 +1543,7 @@ impl EncryptionService {
 
     /// Records `(requester_did, nonce)` as used until `expires_at` (unix
     /// seconds). A second insert of the same pair is `NonceReplay`.
-    pub(super) async fn consume_nonce_until(
+    pub async fn consume_nonce_until(
         &self,
         requester_did: &str,
         nonce: &str,

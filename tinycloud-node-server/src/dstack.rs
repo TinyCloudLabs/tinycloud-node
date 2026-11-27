@@ -195,7 +195,7 @@ const TEE_TYPE_TDX: u32 = 0x81;
 
 /// The REPORTDATA of a structurally complete TDX v4 quote. This checks
 /// layout only; it does not verify the quote's signature or certificates.
-fn quote_report_data(quote: &[u8]) -> Result<&[u8]> {
+pub(crate) fn quote_report_data(quote: &[u8]) -> Result<&[u8]> {
     let sig_len_at = QUOTE_HEADER_LEN + TD_QUOTE_BODY_LEN;
     anyhow::ensure!(
         quote.len() >= sig_len_at + 4,
@@ -223,8 +223,13 @@ fn quote_report_data(quote: &[u8]) -> Result<&[u8]> {
 
 /// Retrieve TEE instance information.
 pub async fn get_info() -> Result<InfoResponse> {
+    get_info_at(&socket_path()).await
+}
+
+/// Retrieve TEE instance information from the guest agent at `socket`.
+pub async fn get_info_at(socket: &str) -> Result<InfoResponse> {
     serde_json::from_value(
-        get_json(&socket_path(), "/Info")
+        get_json(socket, "/Info")
             .await
             .context("dstack Info request")?,
     )

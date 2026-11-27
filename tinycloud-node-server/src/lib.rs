@@ -71,6 +71,7 @@ pub mod sql_restore_check;
 pub mod sql_store;
 pub mod storage;
 pub mod tee;
+pub mod threshold_member;
 mod tracing;
 pub mod tunnel;
 pub mod webhook_dispatcher;

@@ -20,7 +20,7 @@ path = "src/main.rs"
 bytes = "1"
 anyhow = "1"
 # Canonical-point check for pinned issuer keys (issuer_set.rs).
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 aes-gcm = "0.10"
 async-trait.workspace = true
 # No default HTTPS client: the SDK's default pulls in rustls with aws-lc-rs,
@@ -73,12 +73,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# Threshold-member key (src/threshold_member.rs) and the TC-3554 KMS epoch fetch.
+hkdf = "0.12"
+zeroize = "1"
 # TC-3554 historical KMS epoch fetch (src/dstack_kms.rs), `dstack` builds only.
-hkdf = { version = "0.12", optional = true }
 k256 = { version = "0.13.4", features = ["ecdsa"], optional = true }
 sha3 = { version = "0.10", optional = true }
 x509-parser = { version = "0.16", features = ["verify"], optional = true }
-zeroize = { version = "1", optional = true }
 rsa = "0.9"
 if-addrs = "0.13"
 tracing = "0.1"
@@ -163,11 +164,9 @@ default = ["jemalloc"]
 # macOS dev hosts, glibc Linux).
 jemalloc = ["dep:tikv-jemallocator"]
 dstack = [
-    "dep:hkdf",
     "dep:k256",
     "dep:sha3",
     "dep:x509-parser",
-    "dep:zeroize",
     "rcgen/x509-parser",
 ]
 duckdb = ["tinycloud-core/duckdb"]
