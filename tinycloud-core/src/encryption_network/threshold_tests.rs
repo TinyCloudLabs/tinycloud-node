@@ -9,7 +9,10 @@ use std::sync::{Arc, LazyLock};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
+    EntityTrait, QueryFilter,
+};
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -63,7 +66,9 @@ use super::types::{KeyBackendKind, Threshold, ALG_X25519_AES256GCM};
 use crate::encryption::ColumnEncryption;
 use crate::keys::{public_key_to_did_key, Keypair, StaticSecret as NodeStaticSecret};
 use crate::migrations::Migrator;
-use crate::models::encryption_network;
+use crate::models::{
+    encryption_ceremony, encryption_network, encryption_network_key, encryption_network_member,
+};
 
 const NODE_DID: &str = "did:key:z6MkNodeTest";
 const NETWORK_NAME: &str = "default";
@@ -444,6 +449,11 @@ async fn network_row(
         })
         .await
         .unwrap();
+    set_key_backend(db, key_backend).await;
+    descriptor.public_encryption_key
+}
+
+async fn set_key_backend(db: &DatabaseConnection, key_backend: &str) {
     encryption_network::ActiveModel {
         network_id: Set(network_id().to_string()),
         key_backend: Set(key_backend.to_string()),
@@ -452,7 +462,30 @@ async fn network_row(
     .update(db)
     .await
     .unwrap();
-    descriptor.public_encryption_key
+}
+
+/// Every row a network operation can write.
+#[derive(Debug, PartialEq)]
+struct Rows {
+    networks: Vec<encryption_network::Model>,
+    members: Vec<encryption_network_member::Model>,
+    keys: Vec<encryption_network_key::Model>,
+    ceremonies: Vec<encryption_ceremony::Model>,
+}
+
+async fn rows(db: &DatabaseConnection) -> Rows {
+    Rows {
+        networks: encryption_network::Entity::find().all(db).await.unwrap(),
+        members: encryption_network_member::Entity::find()
+            .all(db)
+            .await
+            .unwrap(),
+        keys: encryption_network_key::Entity::find()
+            .all(db)
+            .await
+            .unwrap(),
+        ceremonies: encryption_ceremony::Entity::find().all(db).await.unwrap(),
+    }
 }
 
 /// A root decrypt request body and the facts that bind it.
@@ -945,4 +978,70 @@ async fn a_share_is_issued_only_for_the_authorized_identity_and_key_version() {
         "another epoch",
         epoch_mismatch,
     );
+}
+
+#[tokio::test]
+async fn key_state_revoke_and_re_create_refuse_a_threshold_row_under_both_flag_settings() {
+    for threshold_v1 in [false, true] {
+        let expected = if threshold_v1 { mismatch } else { disabled };
+        let db = fresh_db().await;
+        // A key created while the network was one-of-one, then the parent
+        // row switched to threshold.
+        let setup = node(&db, |service| service);
+        network_row(&setup.service, &db, KeyBackendKind::LocalOneOfOne.as_str()).await;
+        setup.service.create_key(&key_loc(), true).await.unwrap();
+        set_key_backend(&db, KeyBackendKind::Threshold.as_str()).await;
+
+        let node = node(&db, |service| service.with_threshold_v1(threshold_v1));
+        let service = &node.service;
+        let before = rows(&db).await;
+        assert_eq!(before.keys.len(), 1);
+        assert_refused(
+            service.describe_key(&key_loc()).await,
+            "describe_key",
+            expected,
+        );
+        assert_refused(service.block_key(&key_loc()).await, "block_key", expected);
+        assert_refused(
+            service.unblock_key(&key_loc()).await,
+            "unblock_key",
+            expected,
+        );
+        assert_refused(
+            service.revoke_network(&network_id()).await,
+            "revoke_network",
+            expected,
+        );
+        let create = || CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            owner_did: owner_did(),
+            threshold: Threshold::one_of_one(),
+        };
+        assert_refused(
+            service.create_one_of_one_network(create()).await,
+            "re-create",
+            expected,
+        );
+        assert_eq!(rows(&db).await, before, "threshold_v1 = {threshold_v1}");
+
+        // Half-created: no member row, which a create would otherwise repair.
+        encryption_network_member::Entity::delete_many()
+            .filter(encryption_network_member::Column::NetworkId.eq(network_id().to_string()))
+            .exec(&db)
+            .await
+            .unwrap();
+        let half_created = rows(&db).await;
+        assert!(half_created.members.is_empty());
+        assert_refused(
+            service.create_one_of_one_network(create()).await,
+            "repair",
+            expected,
+        );
+        assert_eq!(
+            rows(&db).await,
+            half_created,
+            "threshold_v1 = {threshold_v1}"
+        );
+        assert_eq!(node.calls(), 0, "threshold_v1 = {threshold_v1}");
+    }
 }
