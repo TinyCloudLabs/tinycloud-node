@@ -4972,6 +4972,7 @@ mod tests {
     mod revocation_codes;
     mod revocation_scope;
     mod space_purge_privacy;
+    mod threshold_member_network;
 
     use super::*;
     use crate::{

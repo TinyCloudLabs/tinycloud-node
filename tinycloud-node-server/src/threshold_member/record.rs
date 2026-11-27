@@ -16,7 +16,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{LocalIdentity, MemberKeyError, MAX_IDENTITY_FIELD_BYTES, MAX_URN_BYTES};
+use super::{
+    LocalIdentity, MemberKeyError, MAX_IDENTITY_FIELD_BYTES, MAX_KEY_RECORD_BYTES, MAX_URN_BYTES,
+};
 
 pub(super) const RECORD_VERSION: u8 = 1;
 pub(super) const MEMBER_DIR: &str = "member";
@@ -192,9 +194,10 @@ fn write_temp(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, MemberKey
 }
 
 /// Read the record at `path` without following a symlink. `Ok(None)` when no
-/// record exists.
+/// record exists. A file longer than [`MAX_KEY_RECORD_BYTES`] is refused
+/// without reading past that bound.
 pub(super) fn read_record(path: &Path) -> Result<Option<KeyRecord>, MemberKeyError> {
-    let mut file = match OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -210,7 +213,11 @@ pub(super) fn read_record(path: &Path) -> Result<Option<KeyRecord>, MemberKeyErr
         return Err(MemberKeyError::MalformedRecord("not a regular file"));
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    file.read_to_end(&mut bytes)?;
+    file.take(MAX_KEY_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_KEY_RECORD_BYTES {
+        return Err(MemberKeyError::MalformedRecord("oversize"));
+    }
     KeyRecord::decode(&bytes).map(Some)
 }
 
@@ -235,8 +242,14 @@ pub(super) fn install_or_load(
     match fs::hard_link(&temp, &key) {
         Ok(()) => {
             // `temp` and `key` now share one inode: unlink the temp name
-            // only, never overwrite it.
+            // only, never overwrite it. A marker of an earlier unlinked key
+            // no longer describes this directory.
             fs::remove_file(&temp)?;
+            match fs::remove_file(dir.join(UNLINKED_FILE)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             sync_dir(dir)?;
             Ok(candidate)
         }

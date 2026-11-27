@@ -178,10 +178,28 @@ impl MemberHoldings for Holdings {
     }
 }
 
+/// This node's network rows: one backend per network URN.
+#[derive(Default)]
+struct Rows(Mutex<std::collections::HashMap<String, KeyBackendKind>>);
+
+impl Rows {
+    fn insert(&self, network: &NetworkId, backend: KeyBackendKind) {
+        self.0.lock().unwrap().insert(network.to_string(), backend);
+    }
+}
+
+#[async_trait]
+impl NetworkRows for Rows {
+    async fn backend(&self, network: &NetworkId) -> anyhow::Result<Option<KeyBackendKind>> {
+        Ok(self.0.lock().unwrap().get(&network.to_string()).copied())
+    }
+}
+
 struct Fixture {
     share: tempfile::TempDir,
     keys: MemberKeys,
     holdings: Holdings,
+    rows: Rows,
 }
 
 impl Fixture {
@@ -192,6 +210,7 @@ impl Fixture {
             share,
             keys,
             holdings: Holdings::default(),
+            rows: Rows::default(),
         }
     }
 
@@ -210,6 +229,7 @@ impl Fixture {
             keys: &self.keys,
             dstack_socket: &dstack.socket,
             holdings: &self.holdings,
+            networks: &self.rows,
         };
         member_attestation(
             &ctx,
@@ -231,8 +251,14 @@ impl Fixture {
 
     fn expire(&self, now: SystemTime) -> Result<Vec<MemberKeyAudit>, MemberKeyError> {
         let mut audit = Vec::new();
-        self.keys.expire_pending(&self.holdings, now, &mut audit)?;
+        self.keys
+            .expire_pending(&self.holdings, &identity(), now, &mut audit)?;
         Ok(audit)
+    }
+
+    fn unlink(&self, network: &NetworkId) -> Result<MemberKeyAudit, MemberKeyError> {
+        self.keys
+            .unlink_after_last_share(network, &identity(), &self.holdings)
     }
 }
 
@@ -343,7 +369,7 @@ async fn every_member_key_path_runs_without_key_derivation() {
         .await
         .result
         .unwrap();
-    fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+    fx.unlink(&net).unwrap();
 
     assert!(dstack.paths().contains(&"/GetQuote".to_owned()));
     dstack.assert_no_key_derivation();
@@ -384,6 +410,7 @@ async fn the_handler_accepts_only_a_canonical_nonce_body() {
         keys: &fx.keys,
         dstack_socket: &dstack.socket,
         holdings: &fx.holdings,
+        networks: &fx.rows,
     };
     let bodies = [
         json!({}),
@@ -851,7 +878,7 @@ mod admission_shape {
         }
     }
 
-    async fn encryption_service() -> (
+    pub(super) async fn encryption_service() -> (
         tempfile::TempDir,
         tinycloud_core::sea_orm::DatabaseConnection,
         tinycloud_core::encryption_network::EncryptionService,
@@ -1192,7 +1219,7 @@ async fn an_unlink_during_the_quote_leaves_the_attestation_unsigned() {
     let urn = net.to_string();
     let unlink = async {
         gate.entered.notified().await;
-        let unlinked = fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+        let unlinked = fx.unlink(&net).unwrap();
         gate.release.notify_one();
         unlinked
     };
@@ -1225,7 +1252,7 @@ fn a_sign_after_unlink_or_replacement_is_refused() {
         )
         .unwrap();
 
-    fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+    fx.unlink(&net).unwrap();
     let refused = fx.keys.sign(&net, &key.public_key(), b"message");
     assert!(
         matches!(refused, Err(MemberKeyError::Unlinked)),
@@ -1309,10 +1336,7 @@ fn unlink_after_last_share_zeroes_unlinks_and_records_the_time() {
     let did = fx.admit(&net, SystemTime::now()).unwrap().did();
     fx.holdings.hold(&net);
 
-    let err = fx
-        .keys
-        .unlink_after_last_share(&net, &fx.holdings)
-        .unwrap_err();
+    let err = fx.unlink(&net).unwrap_err();
     assert!(matches!(err, MemberKeyError::StillHeld), "{err}");
     assert!(fx.key_path(&net).exists());
 
@@ -1324,7 +1348,7 @@ fn unlink_after_last_share_zeroes_unlinks_and_records_the_time() {
     std::fs::write(dir.join("key.tmp-0011223344556677"), [9u8; 40]).unwrap();
 
     fx.holdings.release(&net);
-    let audit = fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+    let audit = fx.unlink(&net).unwrap();
     assert_eq!(
         audit,
         MemberKeyAudit {
@@ -1354,10 +1378,7 @@ fn unlink_after_last_share_zeroes_unlinks_and_records_the_time() {
 
     let err = fx.keys.load(&net, &identity()).unwrap_err();
     assert!(matches!(err, MemberKeyError::NoKey), "{err}");
-    let err = fx
-        .keys
-        .unlink_after_last_share(&net, &fx.holdings)
-        .unwrap_err();
+    let err = fx.unlink(&net).unwrap_err();
     assert!(matches!(err, MemberKeyError::NoKey), "{err}");
 }
 
@@ -1523,7 +1544,7 @@ async fn key_material_never_appears_in_logs_or_debug_output() {
     let key = fx.keys.load(&net, &identity()).unwrap();
     let debug = format!("{key:?} {record:?}");
     drop(key);
-    fx.keys.unlink_after_last_share(&net, &fx.holdings).unwrap();
+    fx.unlink(&net).unwrap();
 
     let mut secret = [0u8; 32];
     Hkdf::<Sha256>::new(None, &seed)
@@ -1548,4 +1569,192 @@ async fn key_material_never_appears_in_logs_or_debug_output() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// One network is never both a plain network and a threshold member's.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_member_admit_on_a_plain_network_row_is_refused() {
+    let dstack = FakeDstack::new(APP_ID, INSTANCE_ID);
+    let fx = Fixture::new();
+    for (name, backend) in [
+        ("local", KeyBackendKind::LocalOneOfOne),
+        ("dstack", KeyBackendKind::Dstack),
+    ] {
+        let net = network(name);
+        fx.rows.insert(&net, backend);
+        let outcome = fx.attest(&dstack, &net.to_string(), &[1; 32], &Admit).await;
+        assert!(
+            matches!(outcome.result, Err(MemberKeyError::NotThresholdNetwork)),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(
+            outcome.audit.last().unwrap().reason,
+            "not-threshold-network"
+        );
+        assert!(!fx.key_path(&net).exists());
+    }
+    let net = network("threshold");
+    fx.rows.insert(&net, KeyBackendKind::Threshold);
+    fx.attest(&dstack, &net.to_string(), &[1; 32], &Admit)
+        .await
+        .result
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_plain_create_is_refused_while_a_member_key_record_exists() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let fx = Fixture::new();
+    let net = network("default");
+    let now = SystemTime::now();
+    let ran = AtomicBool::new(false);
+    let create = || async { ran.store(true, SeqCst) };
+
+    // No share volume, or no key for N: the create runs.
+    guard_plain_create(None, &net, create()).await.unwrap();
+    guard_plain_create(Some(&fx.keys), &net, create())
+        .await
+        .unwrap();
+    assert!(ran.swap(false, SeqCst));
+
+    // A pending key, then a held one: refused, and the create never runs.
+    fx.admit(&net, now).unwrap();
+    for hold in [false, true] {
+        if hold {
+            fx.holdings.hold(&net);
+        }
+        let refused = guard_plain_create(Some(&fx.keys), &net, create())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, MemberKeyError::PendingThresholdMember),
+            "{refused}"
+        );
+        assert!(refused.to_string().starts_with("pending_threshold_member"));
+        assert!(!ran.load(SeqCst));
+    }
+    fx.holdings.release(&net);
+
+    // Once the pending key expires, the create runs.
+    fx.expire(now + PENDING_KEY_TTL + Duration::from_secs(1))
+        .unwrap();
+    guard_plain_create(Some(&fx.keys), &net, create())
+        .await
+        .unwrap();
+    assert!(ran.swap(false, SeqCst));
+
+    // Likewise once a key is unlinked after its last share.
+    let other = network("other");
+    fx.admit(&other, now).unwrap();
+    fx.unlink(&other).unwrap();
+    guard_plain_create(Some(&fx.keys), &other, create())
+        .await
+        .unwrap();
+    assert!(ran.load(SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admission_and_a_plain_create_racing_on_one_network_never_both_win() {
+    use tinycloud_core::encryption_network::{CreateNetworkRequest, Threshold};
+    let dstack = FakeDstack::new(APP_ID, INSTANCE_ID);
+    let fx = Fixture::new();
+    let (_dir, _db, service) = admission_shape::encryption_service().await;
+    let ctx = MemberAttestation {
+        keys: &fx.keys,
+        dstack_socket: &dstack.socket,
+        holdings: &fx.holdings,
+        networks: &service,
+    };
+    for i in 0..16 {
+        let net = owned(i, "race");
+        let body = json!({ "nonce": hex::encode([i as u8; 32]) });
+        let urn = net.to_string();
+        let attest = member_attestation(&ctx, &urn, &body, &Admit);
+        let create = guard_plain_create(
+            Some(&fx.keys),
+            &net,
+            service.create_one_of_one_network(CreateNetworkRequest {
+                name: "race".into(),
+                owner_did: net.owner_did().to_owned(),
+                threshold: Threshold::one_of_one(),
+            }),
+        );
+        let (outcome, created) = if i % 2 == 0 {
+            tokio::join!(attest, create)
+        } else {
+            let (created, outcome) = tokio::join!(create, attest);
+            (outcome, created)
+        };
+        match (outcome.result, created) {
+            (Ok(_), Err(MemberKeyError::PendingThresholdMember)) => {
+                assert!(service.get_network(&net).await.is_err());
+            }
+            (Err(MemberKeyError::NotThresholdNetwork), Ok(Ok(_))) => {
+                assert!(!fx.key_path(&net).exists());
+            }
+            other => panic!("both or neither won: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_record_of_another_instance_is_never_expired_or_unlinked() {
+    let fx = Fixture::new();
+    let net = network("default");
+    let other = LocalIdentity {
+        app_id: APP_ID.into(),
+        instance_id: "00".repeat(20),
+    };
+    let dir = fx.key_path(&net).parent().unwrap().to_path_buf();
+    record::install_or_load(&dir, KeyRecord::generate(&net.to_string(), &other)).unwrap();
+
+    let late = SystemTime::now() + 2 * PENDING_KEY_TTL;
+    assert_eq!(fx.expire(late).unwrap(), Vec::new());
+    let err = fx.unlink(&net).unwrap_err();
+    assert!(
+        matches!(err, MemberKeyError::IdentityMismatch("instance_id")),
+        "{err}"
+    );
+    assert!(fx.key_path(&net).exists());
+}
+
+#[test]
+fn a_key_installed_after_an_unlink_clears_the_unlinked_marker() {
+    let fx = Fixture::new();
+    let net = network("default");
+    let now = SystemTime::now();
+    fx.admit(&net, now).unwrap();
+    fx.unlink(&net).unwrap();
+    let marker = fx.key_path(&net).with_file_name(record::UNLINKED_FILE);
+    assert!(marker.exists());
+
+    fx.admit(&net, now).unwrap();
+    assert!(!marker.exists());
+    assert!(fx.key_path(&net).exists());
+}
+
+#[test]
+fn an_oversize_record_is_refused() {
+    let fx = Fixture::new();
+    let net = network("default");
+    fx.admit(&net, SystemTime::now()).unwrap();
+    let path = fx.key_path(&net);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.resize(MAX_KEY_RECORD_BYTES + 1, 0);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = record::read_record(&path).unwrap_err();
+    assert!(
+        matches!(err, MemberKeyError::MalformedRecord("oversize")),
+        "{err}"
+    );
+    let err = fx.keys.load(&net, &identity()).unwrap_err();
+    assert!(
+        matches!(err, MemberKeyError::MalformedRecord("oversize")),
+        "{err}"
+    );
 }

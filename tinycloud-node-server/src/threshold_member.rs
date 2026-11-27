@@ -21,6 +21,7 @@ mod record;
 mod tests;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
@@ -30,14 +31,15 @@ use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use tinycloud_core::encryption_network::NetworkId;
+use tinycloud_core::encryption_network::{
+    EncryptionService, EncryptionServiceError, KeyBackendKind, NetworkId,
+};
 use zeroize::Zeroizing;
 
 pub use admission::{AdmissionRefused, InvocationAdmission, OwnerAdmission};
 pub use record::network_dir_name;
 
-/// The owner's admission ability for a threshold member (Naomi, 2026-11-27).
-pub const MEMBER_ADMIT_ACTION: &str = "tinycloud.encryption/member.admit";
+pub use tinycloud_core::encryption_network::protocol::MEMBER_ADMIT_ACTION;
 
 /// HKDF-SHA256 `info` for the member's Ed25519 signing key.
 pub const SIGN_LABEL: &[u8] = b"tinycloud/threshold-member/v1/sign";
@@ -136,6 +138,15 @@ pub enum MemberKeyError {
     Unlinked,
     #[error("member_key_share_dir_missing: the share volume directory does not exist")]
     ShareDirMissing,
+    /// A conflict (HTTP 409): N is already a plain network on this node.
+    #[error("member_key_network_not_threshold: this node holds a non-threshold network row for the network")]
+    NotThresholdNetwork,
+    /// A conflict (HTTP 409) for a plain network create: N is a threshold
+    /// network this node is a member of.
+    #[error("pending_threshold_member: this node holds a threshold member key for the network")]
+    PendingThresholdMember,
+    #[error("member_key_network_rows_unknown: {0}")]
+    NetworkRowsUnknown(String),
     #[error("member_key_identity_unavailable: {0}")]
     IdentityUnavailable(String),
     #[error("member_key_holdings_unknown: {0}")]
@@ -162,6 +173,9 @@ impl MemberKeyError {
             Self::StillHeld => "still-held",
             Self::Unlinked => "unlinked",
             Self::ShareDirMissing => "share-dir-missing",
+            Self::NotThresholdNetwork => "not-threshold-network",
+            Self::PendingThresholdMember => "pending-threshold-member",
+            Self::NetworkRowsUnknown(_) => "network-rows-unknown",
             Self::IdentityUnavailable(_) => "identity-unavailable",
             Self::HoldingsUnknown(_) => "holdings-unknown",
             Self::Quote(_) => "quote-failed",
@@ -204,6 +218,46 @@ pub trait MemberHoldings: Send + Sync {
     /// True when this member holds a share or a candidate share of `network`.
     /// A key is *pending* while this is false.
     fn holds_share_or_candidate(&self, network: &NetworkId) -> anyhow::Result<bool>;
+}
+
+/// This node's encryption network rows, as the attestation handler needs
+/// them.
+#[async_trait::async_trait]
+pub trait NetworkRows: Send + Sync {
+    /// The key backend of this node's row for `network`, if it has one.
+    async fn backend(&self, network: &NetworkId) -> anyhow::Result<Option<KeyBackendKind>>;
+}
+
+#[async_trait::async_trait]
+impl NetworkRows for EncryptionService {
+    async fn backend(&self, network: &NetworkId) -> anyhow::Result<Option<KeyBackendKind>> {
+        match self.get_network(network).await {
+            Ok(descriptor) => Ok(Some(descriptor.key_backend)),
+            Err(EncryptionServiceError::NetworkNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Run `create`, a plain (non-threshold) network create for `network`,
+/// unless this node keeps a threshold member key record for it, pending or
+/// held; then it is refused with [`MemberKeyError::PendingThresholdMember`].
+/// It runs under the same gate as an admission's row check and key install,
+/// so one N never becomes both. With no `keys` (no share volume), this node
+/// has no member keys and `create` just runs.
+pub async fn guard_plain_create<T>(
+    keys: Option<&MemberKeys>,
+    network: &NetworkId,
+    create: impl Future<Output = T>,
+) -> Result<T, MemberKeyError> {
+    let Some(keys) = keys else {
+        return Ok(create.await);
+    };
+    let _gate = keys.network_gate.lock().await;
+    if keys.has_key_record(network)? {
+        return Err(MemberKeyError::PendingThresholdMember);
+    }
+    Ok(create.await)
 }
 
 /// One non-secret audit event for the caller to record in `encryption_audit`.
@@ -341,6 +395,10 @@ pub struct MemberKeys {
     /// One signing-key slot per network URN, the only place a signing key
     /// lives. Taken after `generate`, never across an await.
     slots: Mutex<HashMap<String, MemberKey>>,
+    /// Serializes an admission's network-row check and key install with a
+    /// plain network create's key-record check and row insert. Held across
+    /// database awaits, never across a dstack quote.
+    network_gate: tokio::sync::Mutex<()>,
 }
 
 impl MemberKeys {
@@ -350,6 +408,7 @@ impl MemberKeys {
             root: share_dir.to_path_buf(),
             generate: Mutex::new(()),
             slots: Mutex::new(HashMap::new()),
+            network_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -384,6 +443,16 @@ impl MemberKeys {
 
     fn dir(&self, network: &NetworkId) -> PathBuf {
         record::network_dir(&self.root, &network.to_string())
+    }
+
+    /// True when any key record exists for `network`, whatever its state,
+    /// identity or contents.
+    fn has_key_record(&self, network: &NetworkId) -> Result<bool, MemberKeyError> {
+        match std::fs::symlink_metadata(self.dir(network).join(record::KEY_FILE)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The key record for `network`, checked against this CVM's identity.
@@ -451,11 +520,11 @@ impl MemberKeys {
                 return Ok(self.activate(&found));
             }
             drop(found);
-            audit.push(self.unlink(network, UnlinkReason::PendingTtl)?);
+            audit.push(self.unlink(network, identity, UnlinkReason::PendingTtl)?);
         } else if held {
             return Err(MemberKeyError::KeyMissing);
         }
-        let (pending, owned) = self.pending_keys(holdings, network.owner_did())?;
+        let (pending, owned) = self.pending_keys(holdings, identity, network.owner_did())?;
         if pending >= MAX_PENDING_KEYS {
             return Err(MemberKeyError::PendingCapReached);
         }
@@ -476,7 +545,8 @@ impl MemberKeys {
         Ok(now.duration_since(installed).unwrap_or_default() >= PENDING_KEY_TTL)
     }
 
-    /// The networks of the installed key records that decode.
+    /// The networks of the installed key records that decode and belong to
+    /// this CVM's app and instance.
     ///
     /// A record that doesn't decode names no network this member can prove it
     /// holds nothing of, so it is never erased (D7.4 positive proof), and it
@@ -484,13 +554,21 @@ impl MemberKeys {
     /// decodes (`admit` validates N first), so an undecodable one is damage
     /// or tampering, which an owner admission can't produce, and it must not
     /// hold a cap slot forever. It stays on disk, refused for its network.
-    fn installed(&self) -> Result<Vec<NetworkId>, MemberKeyError> {
+    /// A record of another app or instance is likewise left out and kept:
+    /// this CVM can't vouch for what that one holds.
+    fn installed(&self, identity: &LocalIdentity) -> Result<Vec<NetworkId>, MemberKeyError> {
         let mut found = Vec::new();
         for dir in self.network_dirs()? {
-            if let Ok(Some(record)) = record::read_record(&dir.join(record::KEY_FILE)) {
-                if let Ok(network) = record.network.parse() {
-                    found.push(network);
-                }
+            let Ok(Some(record)) = record::read_record(&dir.join(record::KEY_FILE)) else {
+                continue;
+            };
+            if record.identity.app_id != identity.app_id
+                || record.identity.instance_id != identity.instance_id
+            {
+                continue;
+            }
+            if let Ok(network) = record.network.parse() {
+                found.push(network);
             }
         }
         Ok(found)
@@ -510,15 +588,16 @@ impl MemberKeys {
             .map_err(Into::into)
     }
 
-    /// Installed keys whose network this member holds no share or candidate
-    /// of: all of them, and those of `owner`'s networks.
+    /// Installed keys of this CVM whose network this member holds no share or
+    /// candidate of: all of them, and those of `owner`'s networks.
     fn pending_keys(
         &self,
         holdings: &dyn MemberHoldings,
+        identity: &LocalIdentity,
         owner: &str,
     ) -> Result<(usize, usize), MemberKeyError> {
         let (mut pending, mut owned) = (0, 0);
-        for network in self.installed()? {
+        for network in self.installed(identity)? {
             if !holds(holdings, &network)? {
                 pending += 1;
                 if network.owner_did() == owner {
@@ -529,14 +608,16 @@ impl MemberKeys {
         Ok((pending, owned))
     }
 
-    /// Unlink every pending key older than [`PENDING_KEY_TTL`]
+    /// Unlink every pending key of this CVM older than [`PENDING_KEY_TTL`]
     /// (`member_key_expired`), after wiping every leftover temp record under
     /// `member/`. Keys of networks the member holds a share or candidate of,
-    /// and records that don't decode, are never touched. Each event goes to
-    /// `audit` as its key is unlinked, so a later failure loses none.
+    /// records of another app or instance, and records that don't decode,
+    /// are never touched. Each event goes to `audit` as its key is unlinked,
+    /// so a later failure loses none.
     pub fn expire_pending(
         &self,
         holdings: &dyn MemberHoldings,
+        identity: &LocalIdentity,
         now: SystemTime,
         audit: &mut Vec<MemberKeyAudit>,
     ) -> Result<(), MemberKeyError> {
@@ -544,9 +625,9 @@ impl MemberKeys {
         for dir in self.network_dirs()? {
             record::sweep_temp_records(&dir)?;
         }
-        for network in self.installed()? {
+        for network in self.installed(identity)? {
             if !holds(holdings, &network)? && self.expired(&network, now)? {
-                audit.push(self.unlink(&network, UnlinkReason::PendingTtl)?);
+                audit.push(self.unlink(&network, identity, UnlinkReason::PendingTtl)?);
             }
         }
         Ok(())
@@ -554,17 +635,19 @@ impl MemberKeys {
 
     /// Unlink the key of `network` after the member erased its last share and
     /// candidate of it. Call only on that positive proof; the key of a
-    /// network the member still holds anything of is never unlinked.
+    /// network the member still holds anything of is never unlinked, nor is
+    /// a record of another app or instance.
     pub fn unlink_after_last_share(
         &self,
         network: &NetworkId,
+        identity: &LocalIdentity,
         holdings: &dyn MemberHoldings,
     ) -> Result<MemberKeyAudit, MemberKeyError> {
         let _generate = self.generate.lock().unwrap_or_else(|e| e.into_inner());
         if holds(holdings, network)? {
             return Err(MemberKeyError::StillHeld);
         }
-        self.unlink(network, UnlinkReason::LastShare)
+        self.unlink(network, identity, UnlinkReason::LastShare)
     }
 
     /// D7.4: wipe the in-memory key, so no holder can sign with it any more,
@@ -574,15 +657,14 @@ impl MemberKeys {
     fn unlink(
         &self,
         network: &NetworkId,
+        identity: &LocalIdentity,
         reason: UnlinkReason,
     ) -> Result<MemberKeyAudit, MemberKeyError> {
         drop(self.slots().remove(&network.to_string()));
         let dir = self.dir(network);
-        let found =
-            record::read_record(&dir.join(record::KEY_FILE))?.ok_or(MemberKeyError::NoKey)?;
-        if found.network != network.to_string() {
-            return Err(MemberKeyError::IdentityMismatch("network"));
-        }
+        let found = self
+            .checked_record(network, identity)?
+            .ok_or(MemberKeyError::NoKey)?;
         let did = MemberKey::from_record(&found).did();
         drop(found);
         record::unlink_key(&dir)?;
@@ -646,6 +728,8 @@ pub struct MemberAttestation<'a> {
     /// The dstack guest agent socket.
     pub dstack_socket: &'a str,
     pub holdings: &'a dyn MemberHoldings,
+    /// This node's encryption network rows (the `EncryptionService`).
+    pub networks: &'a dyn NetworkRows,
 }
 
 fn parse_nonce(body: &Value) -> Result<[u8; 32], MemberKeyError> {
@@ -714,9 +798,19 @@ async fn attest(
     let nonce = parse_nonce(body)?;
     admission.verify(network, body).await?;
     let identity = LocalIdentity::read(ctx.dstack_socket).await?;
-    let key = ctx
-        .keys
-        .admit(network, &identity, ctx.holdings, SystemTime::now(), audit)?;
+    // The row check and the key install run under the gate a plain network
+    // create takes, so N never gets both a plain row and a member key. The
+    // gate is released before the quote.
+    let key = {
+        let _gate = ctx.keys.network_gate.lock().await;
+        match ctx.networks.backend(network).await {
+            Ok(None | Some(KeyBackendKind::Threshold)) => {}
+            Ok(Some(_)) => return Err(MemberKeyError::NotThresholdNetwork),
+            Err(error) => return Err(MemberKeyError::NetworkRowsUnknown(format!("{error:#}"))),
+        }
+        ctx.keys
+            .admit(network, &identity, ctx.holdings, SystemTime::now(), audit)?
+    };
     let urn = network.to_string();
     // Only P is held across the quote; the signature goes through the slot
     // afterwards and is refused if the key was unlinked meanwhile.
